@@ -2,7 +2,7 @@
 /*
 Plugin Name: mobo-core
 Description: بروزرسانی خودکار محصولات از https://mobomobo.ir/
-Version: 7.3
+Version: 7.4
 Author: Pedram Karimi
 Author URI: http://github.com/PedramDev/
 // Requires PHP: <=8.1.0
@@ -125,6 +125,15 @@ function mobo_isLicenseExpired()
         return false;
     }
 }
+
+//force use ipv4 for curl!
+add_action('http_api_curl', function( $handle, $r, $url ) {
+    $host = wp_parse_url( $url, PHP_URL_HOST );
+
+    if ( $host === 'customers.mobomobo.ir' ) {
+        curl_setopt( $handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4 );
+    }
+}, 10, 3);
 
 
 #region DEBUG
