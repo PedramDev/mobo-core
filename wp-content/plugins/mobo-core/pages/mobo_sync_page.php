@@ -35,6 +35,7 @@ function mobo_core_sync_products_24()
     global $is24;
 
     $is24 = true;
+    update_option('mobo_sync_page', 1);
     mobo_core_sync_products();
 }
 
