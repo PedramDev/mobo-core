@@ -1,0 +1,43 @@
+POST /wp-json/mobo-core/v1/sync/start
+X-SEC: SECURITY_CODE
+Content-Type: application/json
+
+{
+  "syncId": "AAAAAAAAAAAAA"
+}
+
+
+
+----------
+
+
+
+بعد هر چند دقیقه:
+POST /wp-json/mobo-core/v1/sync/run
+X-SEC: SECURITY_CODE
+
+----
+
+برای وضعیت:
+GET /wp-json/mobo-core/v1/sync/status
+X-SEC: SECURITY_CODE
+
+نمونه response وضعیت:
+
+{
+  "success": true,
+  "status": "ok",
+  "data": {
+    "syncId": "AAAAAAAAAAAAA",
+    "status": "running",
+    "isRunning": true,
+    "categorySynced": true,
+    "productTotalCount": 472,
+    "processedProducts": 12,
+    "remainingProducts": 460,
+    "progressPercent": 2.54,
+    "currentProductGuid": "21eac8ee-0b55-4389-982c-273300873030",
+    "variantPage": 3,
+    "lastMessage": "UpdateVariant processed."
+  }
+}

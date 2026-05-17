@@ -17,6 +17,7 @@ class Mobo_Core_Migration {
 	public static function activate() {
 		self::ensure_defaults();
 		self::ensure_webhook_dirs();
+		self::delete_webhook_json_files();
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 	}
 
@@ -36,15 +37,18 @@ class Mobo_Core_Migration {
 		self::ensure_webhook_dirs();
 
 		/*
-		 * Important:
-		 * We do not rename or remove old meta keys.
-		 * Existing production data remains compatible:
-		 * product_guid, variant_guid, attribute_guid, category_guid, image_guid, img_guid.
+		 * Do not delete webhook files on normal version migration.
+		 * JSON cleanup is only on activation/install.
 		 */
 
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 	}
 
+	/**
+	 * Add missing defaults only.
+	 *
+	 * @return void
+	 */
 	private static function ensure_defaults() {
 		foreach ( Mobo_Core_Settings::defaults() as $key => $value ) {
 			if ( false === get_option( $key, false ) ) {
@@ -53,11 +57,22 @@ class Mobo_Core_Migration {
 		}
 	}
 
+	/**
+	 * Ensure webhook dirs.
+	 *
+	 * @return void
+	 */
 	private static function ensure_webhook_dirs() {
 		self::protect_dir( MOBO_CORE_WEBHOOK_FILE_DIR );
 		self::protect_dir( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/' );
 	}
 
+	/**
+	 * Protect directory.
+	 *
+	 * @param string $dir Directory.
+	 * @return void
+	 */
 	private static function protect_dir( $dir ) {
 		if ( ! is_dir( $dir ) ) {
 			wp_mkdir_p( $dir );
@@ -73,6 +88,43 @@ class Mobo_Core_Migration {
 
 		if ( ! file_exists( $htaccess ) ) {
 			file_put_contents( $htaccess, "Deny from all\n" );
+		}
+	}
+
+	/**
+	 * Delete all JSON files inside webhook-files recursively.
+	 *
+	 * Runs on plugin activation/install only.
+	 *
+	 * @return void
+	 */
+	private static function delete_webhook_json_files() {
+		if ( ! is_dir( MOBO_CORE_WEBHOOK_FILE_DIR ) ) {
+			return;
+		}
+
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator(
+				MOBO_CORE_WEBHOOK_FILE_DIR,
+				RecursiveDirectoryIterator::SKIP_DOTS
+			),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+
+		foreach ( $iterator as $file ) {
+			if ( ! $file instanceof SplFileInfo ) {
+				continue;
+			}
+
+			if ( ! $file->isFile() ) {
+				continue;
+			}
+
+			$extension = strtolower( pathinfo( $file->getFilename(), PATHINFO_EXTENSION ) );
+
+			if ( 'json' === $extension ) {
+				@unlink( $file->getPathname() );
+			}
 		}
 	}
 }
