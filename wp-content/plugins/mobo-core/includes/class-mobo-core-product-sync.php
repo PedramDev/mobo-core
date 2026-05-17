@@ -276,35 +276,79 @@ class Mobo_Core_Product_Sync
 		return wp_parse_args($state, $default);
 	}
 
-/**
- * Run one manual API sync step.
- *
- * Product manual sync flow:
- * 1. If global_update_categories is enabled, sync categories once first.
- * 2. Fetch paginated products.
- * 3. Upsert one parent product.
- * 4. Fetch paginated variants for current product.
- * 5. Continue until done.
- *
- * @return array
- */
-public function run_manual_sync_step() {
-	$api            = new Mobo_Core_API_Client();
-	$state          = $this->get_manual_sync_state();
-	$products_limit = Mobo_Core_Settings::get_int( 'mobo_core_products_per_page', 1, 1, 20 );
-	$variants_limit = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
-
-	if ( 'done' === $state['status'] ) {
-		return $this->result( true, 'Manual sync already completed.', $state );
-	}
-
-	/*
-	 * Step 1:
-	 * Sync categories before product sync, only if automatic category update is enabled.
+	/**
+	 * Run one manual API sync step.
+	 *
+	 * Product manual sync flow:
+	 * 1. If global_update_categories is enabled, sync categories once first.
+	 * 2. Fetch paginated products.
+	 * 3. Upsert one parent product.
+	 * 4. Fetch paginated variants for current product.
+	 * 5. Continue until done.
+	 *
+	 * @return array
 	 */
-	if ( empty( $state['categorySynced'] ) ) {
-		if ( $this->rules->should_update_categories() ) {
-			$response = $api->get_categories( $state['syncId'] );
+	public function run_manual_sync_step() {
+		$api            = new Mobo_Core_API_Client();
+		$state          = $this->get_manual_sync_state();
+		$products_limit = Mobo_Core_Settings::get_int( 'mobo_core_products_per_page', 1, 1, 20 );
+		$variants_limit = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
+
+		if ( 'done' === $state['status'] ) {
+			return $this->result( true, 'Manual sync already completed.', $state );
+		}
+
+		/*
+		* Step 1:
+		* Sync categories before product sync, only if automatic category update is enabled.
+		*/
+		if ( empty( $state['categorySynced'] ) ) {
+			if ( $this->rules->should_update_categories() ) {
+				$response = $api->get_categories( $state['syncId'] );
+
+				if ( is_wp_error( $response ) ) {
+					$state['lastMessage'] = $response->get_error_message();
+					$this->save_manual_sync_state( $state );
+
+					return $this->result( false, $response->get_error_message(), $state );
+				}
+
+				$category_result = $this->category_sync->sync_categories_payload( $response );
+
+				$state['categorySynced'] = true;
+				$state['lastMessage']    = sprintf(
+					'Categories synced. Created: %d, Updated: %d, Skipped: %d',
+					absint( $category_result['created'] ),
+					absint( $category_result['updated'] ),
+					absint( $category_result['skipped'] )
+				);
+
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, $state['lastMessage'], $state );
+			}
+
+			/*
+			* If automatic categories are disabled, skip category sync.
+			* Products will be assigned to mobo_default_category_id if configured.
+			*/
+			$state['categorySynced'] = true;
+			$state['lastMessage']    = 'Category sync skipped because global_update_categories is disabled.';
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'], $state );
+		}
+
+		/*
+		* Step 2:
+		* Fetch next product page when queue is empty and no product is being processed.
+		*/
+		if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
+			$response = $api->get_products_page(
+				absint( $state['productPage'] ),
+				$products_limit,
+				$state['syncId']
+			);
 
 			if ( is_wp_error( $response ) ) {
 				$state['lastMessage'] = $response->get_error_message();
@@ -313,40 +357,67 @@ public function run_manual_sync_step() {
 				return $this->result( false, $response->get_error_message(), $state );
 			}
 
-			$category_result = $this->category_sync->sync_categories_payload( $response );
+			$items    = $this->get_value( $response, 'data', array() );
+			$has_more = $this->get_value( $response, 'hasMore', false );
 
-			$state['categorySynced'] = true;
-			$state['lastMessage']    = sprintf(
-				'Categories synced. Created: %d, Updated: %d, Skipped: %d',
-				absint( $category_result['created'] ),
-				absint( $category_result['updated'] ),
-				absint( $category_result['skipped'] )
-			);
+			if ( ! is_array( $items ) ) {
+				$items = array();
+			}
 
+			foreach ( $items as $product_data ) {
+				if ( is_array( $product_data ) ) {
+					$state['productQueue'][] = $product_data;
+				}
+			}
+
+			$state['productPage'] = absint( $state['productPage'] ) + 1;
+
+			if ( empty( $state['productQueue'] ) && ! $this->to_bool( $has_more ) ) {
+				$state['status']      = 'done';
+				$state['lastMessage'] = 'Manual sync completed.';
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, 'Manual sync completed.', $state );
+			}
+		}
+
+		/*
+		* Step 3:
+		* Upsert one parent product.
+		*/
+		if ( '' === $state['currentProductGuid'] ) {
+			$product_data = array_shift( $state['productQueue'] );
+			$product_id   = $this->upsert_parent_product( $product_data, false );
+
+			if ( $product_id <= 0 ) {
+				$state['lastMessage'] = 'Skipped invalid product.';
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, 'Skipped invalid product.', $state );
+			}
+
+			$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+
+			$state['currentProductGuid'] = $product_guid;
+			$state['variantPage']        = 1;
+			$state['lastMessage']        = 'Parent product synced: ' . $product_guid;
+
+			$this->reset_seen_variants( $product_guid, $state['syncId'] );
 			$this->save_manual_sync_state( $state );
 
 			return $this->result( true, $state['lastMessage'], $state );
 		}
 
 		/*
-		 * If automatic categories are disabled, skip category sync.
-		 * Products will be assigned to mobo_default_category_id if configured.
-		 */
-		$state['categorySynced'] = true;
-		$state['lastMessage']    = 'Category sync skipped because global_update_categories is disabled.';
-		$this->save_manual_sync_state( $state );
+		* Step 4:
+		* Sync one variants page for current product.
+		*/
+		$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
 
-		return $this->result( true, $state['lastMessage'], $state );
-	}
-
-	/*
-	 * Step 2:
-	 * Fetch next product page when queue is empty and no product is being processed.
-	 */
-	if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
-		$response = $api->get_products_page(
-			absint( $state['productPage'] ),
-			$products_limit,
+		$response = $api->get_variants_page(
+			$product_guid,
+			absint( $state['variantPage'] ),
+			$variants_limit,
 			$state['syncId']
 		);
 
@@ -357,109 +428,172 @@ public function run_manual_sync_step() {
 			return $this->result( false, $response->get_error_message(), $state );
 		}
 
-		$items    = $this->get_value( $response, 'data', array() );
-		$has_more = $this->get_value( $response, 'hasMore', false );
+		$payload = array(
+			'event'         => 'UpdateVariant',
+			'syncId'        => $state['syncId'],
+			'productId'     => $product_guid,
+			'totalCount'    => $this->get_value( $response, 'totalCount', 0 ),
+			'pageNumber'    => $this->get_value( $response, 'pageNumber', $state['variantPage'] ),
+			'recordPerPage' => $this->get_value( $response, 'recordPerPage', $variants_limit ),
+			'hasMore'       => $this->get_value( $response, 'hasMore', false ),
+			'isLastPage'    => $this->get_value( $response, 'isLastPage', null ),
+			'data'          => $this->get_value( $response, 'data', array() ),
+		);
 
-		if ( ! is_array( $items ) ) {
-			$items = array();
-		}
+		$result = $this->process_update_variant_payload( $payload );
 
-		foreach ( $items as $product_data ) {
-			if ( is_array( $product_data ) ) {
-				$state['productQueue'][] = $product_data;
-			}
-		}
-
-		$state['productPage'] = absint( $state['productPage'] ) + 1;
-
-		if ( empty( $state['productQueue'] ) && ! $this->to_bool( $has_more ) ) {
-			$state['status']      = 'done';
-			$state['lastMessage'] = 'Manual sync completed.';
+		if ( empty( $result['success'] ) ) {
+			$state['lastMessage'] = $result['message'];
 			$this->save_manual_sync_state( $state );
 
-			return $this->result( true, 'Manual sync completed.', $state );
-		}
-	}
-
-	/*
-	 * Step 3:
-	 * Upsert one parent product.
-	 */
-	if ( '' === $state['currentProductGuid'] ) {
-		$product_data = array_shift( $state['productQueue'] );
-		$product_id   = $this->upsert_parent_product( $product_data, false );
-
-		if ( $product_id <= 0 ) {
-			$state['lastMessage'] = 'Skipped invalid product.';
-			$this->save_manual_sync_state( $state );
-
-			return $this->result( true, 'Skipped invalid product.', $state );
+			return $result;
 		}
 
-		$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+		if ( $this->to_bool( $payload['hasMore'] ) ) {
+			$state['variantPage'] = absint( $state['variantPage'] ) + 1;
+		} else {
+			$state['currentProductGuid'] = '';
+			$state['variantPage']        = 1;
+		}
 
-		$state['currentProductGuid'] = $product_guid;
-		$state['variantPage']        = 1;
-		$state['lastMessage']        = 'Parent product synced: ' . $product_guid;
-
-		$this->reset_seen_variants( $product_guid, $state['syncId'] );
-		$this->save_manual_sync_state( $state );
-
-		return $this->result( true, $state['lastMessage'], $state );
-	}
-
-	/*
-	 * Step 4:
-	 * Sync one variants page for current product.
-	 */
-	$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
-
-	$response = $api->get_variants_page(
-		$product_guid,
-		absint( $state['variantPage'] ),
-		$variants_limit,
-		$state['syncId']
-	);
-
-	if ( is_wp_error( $response ) ) {
-		$state['lastMessage'] = $response->get_error_message();
-		$this->save_manual_sync_state( $state );
-
-		return $this->result( false, $response->get_error_message(), $state );
-	}
-
-	$payload = array(
-		'event'         => 'UpdateVariant',
-		'syncId'        => $state['syncId'],
-		'productId'     => $product_guid,
-		'totalCount'    => $this->get_value( $response, 'totalCount', 0 ),
-		'pageNumber'    => $this->get_value( $response, 'pageNumber', $state['variantPage'] ),
-		'recordPerPage' => $this->get_value( $response, 'recordPerPage', $variants_limit ),
-		'hasMore'       => $this->get_value( $response, 'hasMore', false ),
-		'isLastPage'    => $this->get_value( $response, 'isLastPage', null ),
-		'data'          => $this->get_value( $response, 'data', array() ),
-	);
-
-	$result = $this->process_update_variant_payload( $payload );
-
-	if ( empty( $result['success'] ) ) {
 		$state['lastMessage'] = $result['message'];
 		$this->save_manual_sync_state( $state );
 
-		return $result;
+		return $this->result( true, $result['message'], $state );
 	}
 
-	if ( $this->to_bool( $payload['hasMore'] ) ) {
-		$state['variantPage'] = absint( $state['variantPage'] ) + 1;
-	} else {
-		$state['currentProductGuid'] = '';
-		$state['variantPage']        = 1;
+/**
+ * Start a new manual product sync.
+ *
+ * @param string $sync_id Optional sync ID from C#.
+ * @param string $source Request source.
+ * @return array
+ */
+public function start_manual_sync( $sync_id = '', $source = 'admin' ) {
+	$sync_id = sanitize_text_field( (string) $sync_id );
+
+	if ( '' === $sync_id ) {
+		$sync_id = wp_generate_uuid4();
 	}
 
-	$state['lastMessage'] = $result['message'];
+	$state = array(
+		'syncId'                       => $sync_id,
+		'status'                       => 'running',
+		'source'                       => sanitize_key( (string) $source ),
+
+		'categorySynced'               => false,
+
+		'productPage'                  => 1,
+		'productQueue'                 => array(),
+		'currentProductGuid'           => '',
+		'variantPage'                  => 1,
+
+		'productTotalCount'            => 0,
+		'productTotalPages'            => 0,
+		'processedProducts'            => 0,
+		'remainingProducts'            => 0,
+
+		'currentVariantTotalCount'     => 0,
+		'currentVariantTotalPages'     => 0,
+		'currentVariantProcessedPages' => 0,
+
+		'startedAt'                    => time(),
+		'completedAt'                  => 0,
+		'updatedAt'                    => time(),
+		'lastMessage'                  => 'Product sync started.',
+		'lastError'                    => '',
+	);
+
+	update_option( self::STATE_OPTION, $state, false );
+
+	return $this->result(
+		true,
+		'Product sync started.',
+		$this->get_manual_sync_status()
+	);
+}
+
+
+/**
+ * Cancel current manual sync.
+ *
+ * @return array
+ */
+public function cancel_manual_sync() {
+	$state = $this->get_manual_sync_state();
+
+	$state['status']      = 'cancelled';
+	$state['completedAt'] = time();
+	$state['updatedAt']   = time();
+	$state['lastMessage'] = 'Product sync cancelled.';
+
 	$this->save_manual_sync_state( $state );
 
-	return $this->result( true, $result['message'], $state );
+	return $this->result(
+		true,
+		'Product sync cancelled.',
+		$this->get_manual_sync_status()
+	);
+}
+
+/**
+ * Get public sync status.
+ *
+ * @return array
+ */
+public function get_manual_sync_status() {
+	$state = $this->get_manual_sync_state();
+
+	$total     = absint( $state['productTotalCount'] );
+	$processed = absint( $state['processedProducts'] );
+
+	$remaining = 0;
+
+	if ( $total > 0 ) {
+		$remaining = max( 0, $total - $processed );
+	}
+
+	$progress = 0;
+
+	if ( $total > 0 ) {
+		$progress = min( 100, round( ( $processed / $total ) * 100, 2 ) );
+	}
+
+	$state['remainingProducts'] = $remaining;
+
+	return array(
+		'syncId'                       => sanitize_text_field( (string) $state['syncId'] ),
+		'status'                       => sanitize_key( (string) $state['status'] ),
+		'source'                       => sanitize_key( (string) $state['source'] ),
+
+		'isRunning'                    => 'running' === $state['status'],
+		'isDone'                       => 'done' === $state['status'],
+		'isCancelled'                  => 'cancelled' === $state['status'],
+
+		'categorySynced'               => (bool) $state['categorySynced'],
+
+		'productPage'                  => absint( $state['productPage'] ),
+		'queuedProducts'               => is_array( $state['productQueue'] ) ? count( $state['productQueue'] ) : 0,
+		'currentProductGuid'           => sanitize_text_field( (string) $state['currentProductGuid'] ),
+		'variantPage'                  => absint( $state['variantPage'] ),
+
+		'productTotalCount'            => $total,
+		'productTotalPages'            => absint( $state['productTotalPages'] ),
+		'processedProducts'            => $processed,
+		'remainingProducts'            => $remaining,
+		'progressPercent'              => $progress,
+
+		'currentVariantTotalCount'     => absint( $state['currentVariantTotalCount'] ),
+		'currentVariantTotalPages'     => absint( $state['currentVariantTotalPages'] ),
+		'currentVariantProcessedPages' => absint( $state['currentVariantProcessedPages'] ),
+
+		'startedAt'                    => absint( $state['startedAt'] ),
+		'completedAt'                  => absint( $state['completedAt'] ),
+		'updatedAt'                    => absint( $state['updatedAt'] ),
+
+		'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
+		'lastError'                    => sanitize_text_field( (string) $state['lastError'] ),
+	);
 }
 
 	/**
@@ -554,7 +688,7 @@ public function run_manual_sync_step() {
 
 		$this->category_sync->assign_product_categories(
 			$product_id,
-			$this->get_value( $data, 'productCategories', array() ),
+			$this->get_value($data, 'productCategories', array()),
 			$this->rules->should_update_categories()
 		);
 

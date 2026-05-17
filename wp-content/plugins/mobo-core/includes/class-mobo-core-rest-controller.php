@@ -46,10 +46,40 @@ class Mobo_Core_Rest_Controller {
 
 		register_rest_route(
 			'mobo-core/v1',
+			'/sync/start',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'start_product_sync' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
 			'/sync/run',
 			array(
 				'methods'             => 'POST',
-				'callback'            => array( $this, 'run_manual_sync' ),
+				'callback'            => array( $this, 'run_product_sync' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/sync/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_product_sync_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/sync/cancel',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'cancel_product_sync' ),
 				'permission_callback' => array( $this, 'check_security' ),
 			)
 		);
@@ -122,7 +152,7 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
-	 * Run queue.
+	 * Run webhook queue.
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response
@@ -134,20 +164,64 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
-	 * Run manual sync step.
+	 * Start product manual sync from C# or external runner.
+	 *
+	 * Optional JSON body:
+	 * {
+	 *   "syncId": "..."
+	 * }
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response
 	 */
-	public function run_manual_sync( $request ) {
-		$lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
+	public function start_product_sync( $request ) {
+		$lock = Mobo_Core_Lock::acquire( 'manual_sync_start', 20 );
 
 		if ( false === $lock ) {
 			return rest_ensure_response(
 				array(
 					'success' => false,
 					'status'  => 'locked',
-					'message' => 'Manual sync is locked.',
+					'message' => 'Sync start is locked.',
+				)
+			);
+		}
+
+		try {
+			$params  = $request->get_json_params();
+			$sync_id = '';
+
+			if ( is_array( $params ) && isset( $params['syncId'] ) ) {
+				$sync_id = sanitize_text_field( (string) $params['syncId'] );
+			}
+
+			$sync   = new Mobo_Core_Product_Sync();
+			$result = $sync->start_manual_sync( $sync_id, 'external' );
+		} finally {
+			Mobo_Core_Lock::release( 'manual_sync_start', $lock );
+		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Run one product sync step.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function run_product_sync( $request ) {
+		$lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
+
+		if ( false === $lock ) {
+			$sync = new Mobo_Core_Product_Sync();
+
+			return rest_ensure_response(
+				array(
+					'success' => false,
+					'status'  => 'locked',
+					'message' => 'Product sync is locked.',
+					'data'    => $sync->get_manual_sync_status(),
 				)
 			);
 		}
@@ -160,5 +234,35 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Get product sync status.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_product_sync_status( $request ) {
+		$sync = new Mobo_Core_Product_Sync();
+
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'ok',
+				'data'    => $sync->get_manual_sync_status(),
+			)
+		);
+	}
+
+	/**
+	 * Cancel product sync.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function cancel_product_sync( $request ) {
+		$sync = new Mobo_Core_Product_Sync();
+
+		return rest_ensure_response( $sync->cancel_manual_sync() );
 	}
 }

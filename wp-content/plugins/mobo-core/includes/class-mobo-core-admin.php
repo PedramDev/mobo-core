@@ -275,45 +275,45 @@ class Mobo_Core_Admin {
 	}
 
 	/**
- * Render product category dropdown.
- *
- * @param string $label Label.
- * @param string $key Option key.
- * @return void
- */
-private function category_dropdown_field( $label, $key ) {
-	$selected = absint( Mobo_Core_Settings::get( $key, 0 ) );
+	 * Render product category dropdown.
+	 *
+	 * @param string $label Label.
+	 * @param string $key Option key.
+	 * @return void
+	 */
+	private function category_dropdown_field( $label, $key ) {
+		$selected = absint( Mobo_Core_Settings::get( $key, 0 ) );
 
-	$terms = get_terms(
-		array(
-			'taxonomy'   => 'product_cat',
-			'hide_empty' => false,
-		)
-	);
+		$terms = get_terms(
+			array(
+				'taxonomy'   => 'product_cat',
+				'hide_empty' => false,
+			)
+		);
 
-	?>
-	<tr>
-		<th>
-			<label for="<?php echo esc_attr( $key ); ?>">
-				<?php echo esc_html( $label ); ?>
-			</label>
-		</th>
-		<td>
-			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
-				<option value="0"><?php echo esc_html__( 'None', 'mobo-core' ); ?></option>
-				<?php if ( ! is_wp_error( $terms ) && is_array( $terms ) ) : ?>
-					<?php foreach ( $terms as $term ) : ?>
-						<option value="<?php echo esc_attr( absint( $term->term_id ) ); ?>" <?php selected( $selected, absint( $term->term_id ) ); ?>>
-							<?php echo esc_html( $term->name ); ?>
-						</option>
-					<?php endforeach; ?>
-				<?php endif; ?>
-			</select>
-			<p class="description">
-				<?php echo esc_html__( 'Used when automatic category update is disabled.', 'mobo-core' ); ?>
-			</p>
-		</td>
-	</tr>
-	<?php
-}
+		?>
+		<tr>
+			<th>
+				<label for="<?php echo esc_attr( $key ); ?>">
+					<?php echo esc_html( $label ); ?>
+				</label>
+			</th>
+			<td>
+				<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
+					<option value="0"><?php echo esc_html__( 'None', 'mobo-core' ); ?></option>
+					<?php if ( ! is_wp_error( $terms ) && is_array( $terms ) ) : ?>
+						<?php foreach ( $terms as $term ) : ?>
+							<option value="<?php echo esc_attr( absint( $term->term_id ) ); ?>" <?php selected( $selected, absint( $term->term_id ) ); ?>>
+								<?php echo esc_html( $term->name ); ?>
+							</option>
+						<?php endforeach; ?>
+					<?php endif; ?>
+				</select>
+				<p class="description">
+					<?php echo esc_html__( 'Used when automatic category update is disabled.', 'mobo-core' ); ?>
+				</p>
+			</td>
+		</tr>
+		<?php
+	}
 }
