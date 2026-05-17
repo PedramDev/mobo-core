@@ -81,8 +81,12 @@ class Mobo_Core_Admin {
 					<?php $this->bool_field( 'Auto Update Caption', 'global_product_auto_caption' ); ?>
 					<?php $this->bool_field( 'Auto Update Compare Price', 'global_product_auto_compare_price' ); ?>
 					<?php $this->bool_field( 'Auto Update Slug', 'global_product_auto_slug' ); ?>
-					<?php $this->bool_field( 'Update Categories', 'global_update_categories' ); ?>
 					<?php $this->bool_field( 'Update Images', 'global_update_images' ); ?>
+
+					
+					<?php $this->bool_field( 'Update Categories', 'global_update_categories' ); ?>
+					<?php $this->category_dropdown_field( 'Default Category', 'mobo_default_category_id' ); ?>
+
 
 					<?php $this->text_field( 'Price Type', 'mobo_price_type' ); ?>
 					<?php $this->number_field( 'Additional Price', 'global_additional_price', 0, 999999999, '0.01' ); ?>
@@ -269,4 +273,47 @@ class Mobo_Core_Admin {
 		</form>
 		<?php
 	}
+
+	/**
+ * Render product category dropdown.
+ *
+ * @param string $label Label.
+ * @param string $key Option key.
+ * @return void
+ */
+private function category_dropdown_field( $label, $key ) {
+	$selected = absint( Mobo_Core_Settings::get( $key, 0 ) );
+
+	$terms = get_terms(
+		array(
+			'taxonomy'   => 'product_cat',
+			'hide_empty' => false,
+		)
+	);
+
+	?>
+	<tr>
+		<th>
+			<label for="<?php echo esc_attr( $key ); ?>">
+				<?php echo esc_html( $label ); ?>
+			</label>
+		</th>
+		<td>
+			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
+				<option value="0"><?php echo esc_html__( 'None', 'mobo-core' ); ?></option>
+				<?php if ( ! is_wp_error( $terms ) && is_array( $terms ) ) : ?>
+					<?php foreach ( $terms as $term ) : ?>
+						<option value="<?php echo esc_attr( absint( $term->term_id ) ); ?>" <?php selected( $selected, absint( $term->term_id ) ); ?>>
+							<?php echo esc_html( $term->name ); ?>
+						</option>
+					<?php endforeach; ?>
+				<?php endif; ?>
+			</select>
+			<p class="description">
+				<?php echo esc_html__( 'Used when automatic category update is disabled.', 'mobo-core' ); ?>
+			</p>
+		</td>
+	</tr>
+	<?php
+}
 }

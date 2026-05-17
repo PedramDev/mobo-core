@@ -12,6 +12,33 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_API_Client {
 
 	/**
+	 * Get categories from API.
+	 *
+	 * Expected payload:
+	 * [
+	 *   {
+	 *     "id": "...",
+	 *     "title": "...",
+	 *     "url": "/products/case",
+	 *     "parentId": null
+	 *   }
+	 * ]
+	 *
+	 * @param string $sync_id Sync ID.
+	 * @return array|WP_Error
+	 */
+	public function get_categories( $sync_id ) {
+		$path = add_query_arg(
+			array(
+				'SyncId' => sanitize_text_field( (string) $sync_id ),
+			),
+			'get-categories'
+		);
+
+		return $this->get_json( $path );
+	}
+
+	/**
 	 * Get products page.
 	 *
 	 * Expected API:
@@ -42,7 +69,7 @@ class Mobo_Core_API_Client {
 	/**
 	 * Get variants page.
 	 *
-	 * Recommended API:
+	 * Expected API:
 	 * /{productGuid}/get-variants?SyncId=...&PageNumber=1&RecordPerPage=5
 	 *
 	 * @param string $product_guid Product GUID.

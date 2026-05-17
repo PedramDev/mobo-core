@@ -30,10 +30,12 @@ class Mobo_Core_Settings {
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
 
-			'mobo_price_type'                     => '0',
+			'mobo_default_category_id'            => '0',
+
+			'mobo_price_type'                     => 'static-price',
 			'global_additional_price'             => '0',
 			'global_additional_percentage'        => '0',
-			'mobo_dynamic_price'                  => '0',
+			'mobo_dynamic_price'                  => '[]',
 
 			'mobo_core_enable_wp_cron'            => 'no',
 			'mobo_core_sync_time_budget_seconds'  => 8,
@@ -120,11 +122,22 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'global_product_auto_slug' );
 		self::save_bool( $post, 'global_update_categories' );
 		self::save_bool( $post, 'global_update_images' );
-		self::save_bool( $post, 'mobo_dynamic_price' );
+
+		update_option(
+			'mobo_default_category_id',
+			absint( isset( $post['mobo_default_category_id'] ) ? wp_unslash( $post['mobo_default_category_id'] ) : 0 ),
+			false
+		);
 
 		self::save_text( $post, 'mobo_price_type' );
 		self::save_decimal( $post, 'global_additional_price' );
 		self::save_decimal( $post, 'global_additional_percentage' );
+
+		update_option(
+			'mobo_dynamic_price',
+			isset( $post['mobo_dynamic_price'] ) ? wp_kses_post( wp_unslash( $post['mobo_dynamic_price'] ) ) : '[]',
+			false
+		);
 
 		update_option(
 			'mobo_core_enable_wp_cron',

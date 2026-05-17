@@ -2,13 +2,20 @@
 /**
  * Category sync service.
  *
- * Payload contract:
+ * Category API payload:
  * [
  *   {
- *     "id": "609f97c4-2011-4186-8729-e1aa8a798c3a",
- *     "title": "🏷️تخفیف 🏷️",
- *     "url": "/takhfif",
+ *     "id": "...",
+ *     "title": "...",
+ *     "url": "/products/case",
  *     "parentId": null
+ *   }
+ * ]
+ *
+ * Product payload category reference:
+ * [
+ *   {
+ *     "categoryId": "..."
  *   }
  * ]
  *
@@ -22,28 +29,33 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Category_Sync {
 
 	/**
-	 * Sync categories in the exact order provided by C# and assign them to product.
+	 * Sync full categories payload from API.
 	 *
-	 * @param int   $product_id Product ID.
-	 * @param mixed $categories Category payload.
+	 * Accepts either:
+	 * - direct array of categories
+	 * - paged object with data[]
+	 *
+	 * @param mixed $payload Category payload.
 	 * @return array
 	 */
-	public function sync_and_assign_to_product( $product_id, $categories ) {
-		$product_id = absint( $product_id );
+	public function sync_categories_payload( $payload ) {
+		$categories = $payload;
 
-		if ( $product_id <= 0 || ! is_array( $categories ) ) {
+		if ( is_array( $payload ) && isset( $payload['data'] ) && is_array( $payload['data'] ) ) {
+			$categories = $payload['data'];
+		}
+
+		if ( ! is_array( $categories ) ) {
 			return array(
-				'assigned' => 0,
-				'created'  => 0,
-				'updated'  => 0,
-				'skipped'  => 0,
+				'created' => 0,
+				'updated' => 0,
+				'skipped' => 0,
 			);
 		}
 
-		$term_ids = array();
-		$created  = 0;
-		$updated  = 0;
-		$skipped  = 0;
+		$created = 0;
+		$updated = 0;
+		$skipped = 0;
 
 		foreach ( $categories as $category_data ) {
 			if ( ! is_array( $category_data ) ) {
@@ -58,12 +70,82 @@ class Mobo_Core_Category_Sync {
 				continue;
 			}
 
-			$term_ids[] = absint( $result['term_id'] );
-
 			if ( ! empty( $result['created'] ) ) {
 				$created++;
 			} else {
 				$updated++;
+			}
+		}
+
+		return array(
+			'created' => $created,
+			'updated' => $updated,
+			'skipped' => $skipped,
+		);
+	}
+
+	/**
+	 * Assign product categories using product payload references.
+	 *
+	 * If automatic categories are disabled, use mobo_default_category_id when configured.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param mixed $categories Product category references.
+	 * @param bool  $auto_categories_enabled Whether global_update_categories is enabled.
+	 * @return array
+	 */
+	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return array(
+				'assigned' => 0,
+				'source'   => 'none',
+			);
+		}
+
+		if ( ! $auto_categories_enabled ) {
+			$default_category_id = absint( get_option( 'mobo_default_category_id', 0 ) );
+
+			if ( $default_category_id > 0 && term_exists( $default_category_id, 'product_cat' ) ) {
+				wp_set_object_terms( $product_id, array( $default_category_id ), 'product_cat', false );
+
+				return array(
+					'assigned' => 1,
+					'source'   => 'default',
+				);
+			}
+
+			return array(
+				'assigned' => 0,
+				'source'   => 'disabled',
+			);
+		}
+
+		if ( ! is_array( $categories ) ) {
+			return array(
+				'assigned' => 0,
+				'source'   => 'auto',
+			);
+		}
+
+		$term_ids = array();
+
+		foreach ( $categories as $category_ref ) {
+			if ( ! is_array( $category_ref ) ) {
+				continue;
+			}
+
+			$category_guid = $this->get_category_guid( $category_ref );
+
+			if ( '' === $category_guid ) {
+				continue;
+			}
+
+			$term_id = $this->find_term_id_by_guid( $category_guid );
+
+			if ( $term_id > 0 ) {
+				$term_ids[] = $term_id;
 			}
 		}
 
@@ -75,14 +157,20 @@ class Mobo_Core_Category_Sync {
 
 		return array(
 			'assigned' => count( $term_ids ),
-			'created'  => $created,
-			'updated'  => $updated,
-			'skipped'  => $skipped,
+			'source'   => 'auto',
 		);
 	}
 
 	/**
 	 * Create or update one WooCommerce product category.
+	 *
+	 * Full category payload:
+	 * {
+	 *   "id": "...",
+	 *   "title": "...",
+	 *   "url": "/products/case",
+	 *   "parentId": null
+	 * }
 	 *
 	 * @param array $category_data Category payload.
 	 * @return array
@@ -92,6 +180,7 @@ class Mobo_Core_Category_Sync {
 		$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
 		$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
 		$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
+
 		if ( '' === $category_guid ) {
 			return array(
 				'term_id' => 0,
@@ -174,7 +263,6 @@ class Mobo_Core_Category_Sync {
 		}
 
 		$term_id = absint( $result['term_id'] );
-
 		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
 
 		return array(
@@ -215,6 +303,30 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return absint( $terms[0]->term_id );
+	}
+
+	/**
+	 * Extract category GUID from full category payload or product category reference.
+	 *
+	 * @param array $category_data Category data.
+	 * @return string
+	 */
+	private function get_category_guid( $category_data ) {
+		$keys = array(
+			'id',
+			'categoryId',
+			'categoryGuid',
+		);
+
+		foreach ( $keys as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) );
+
+			if ( '' !== $value ) {
+				return $value;
+			}
+		}
+
+		return '';
 	}
 
 	/**
@@ -294,29 +406,5 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return $default;
-	}
-
-	/**
-	 * Extract category GUID from full category payload or productCategories item.
-	 *
-	 * @param array $category_data Category data.
-	 * @return string
-	 */
-	private function get_category_guid( $category_data ) {
-		$keys = array(
-			'id',
-			'categoryId',
-			'categoryGuid',
-		);
-
-		foreach ( $keys as $key ) {
-			$value = sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) );
-
-			if ( '' !== $value ) {
-				return $value;
-			}
-		}
-
-		return '';
 	}
 }
