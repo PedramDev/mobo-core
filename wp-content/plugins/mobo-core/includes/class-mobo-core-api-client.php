@@ -1,6 +1,8 @@
 <?php
 /**
  * API client for manual chunked sync.
+ *
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -12,19 +14,24 @@ class Mobo_Core_API_Client {
 	/**
 	 * Get products page.
 	 *
-	 * @param int $page_number Page number.
-	 * @param int $record_per_page Records per page.
+	 * Expected API:
+	 * /get-products?OnlyInStock=true&RemVariants=true&SyncId=...&PageNumber=1&RecordPerPage=2
+	 *
+	 * @param int    $page_number Page number.
+	 * @param int    $record_per_page Records per page.
+	 * @param string $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	public function get_products_page( $page_number, $record_per_page ) {
+	public function get_products_page( $page_number, $record_per_page, $sync_id ) {
 		$only_in_stock = Mobo_Core_Settings::enabled( 'mobo_core_only_in_stock', '0' ) ? 'true' : 'false';
 
 		$path = add_query_arg(
 			array(
+				'OnlyInStock'   => $only_in_stock,
+				'RemVariants'   => 'true',
+				'SyncId'        => sanitize_text_field( (string) $sync_id ),
 				'PageNumber'    => absint( $page_number ),
 				'RecordPerPage' => absint( $record_per_page ),
-				'onlyInStock'   => $only_in_stock,
-				'RemVariants'   => 'true',
 			),
 			'get-products'
 		);
@@ -35,16 +42,21 @@ class Mobo_Core_API_Client {
 	/**
 	 * Get variants page.
 	 *
+	 * Recommended API:
+	 * /{productGuid}/get-variants?SyncId=...&PageNumber=1&RecordPerPage=5
+	 *
 	 * @param string $product_guid Product GUID.
 	 * @param int    $page_number Page number.
 	 * @param int    $record_per_page Records per page.
+	 * @param string $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	public function get_variants_page( $product_guid, $page_number, $record_per_page ) {
+	public function get_variants_page( $product_guid, $page_number, $record_per_page, $sync_id ) {
 		$product_guid = rawurlencode( sanitize_text_field( (string) $product_guid ) );
 
 		$path = add_query_arg(
 			array(
+				'SyncId'        => sanitize_text_field( (string) $sync_id ),
 				'PageNumber'    => absint( $page_number ),
 				'RecordPerPage' => absint( $record_per_page ),
 			),

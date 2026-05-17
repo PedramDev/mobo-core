@@ -88,11 +88,10 @@ class Mobo_Core_Category_Sync {
 	 * @return array
 	 */
 	public function upsert_category( $category_data ) {
-		$category_guid = sanitize_text_field( (string) $this->get_value( $category_data, 'id', '' ) );
+		$category_guid = $this->get_category_guid( $category_data );
 		$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
 		$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
 		$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
-
 		if ( '' === $category_guid ) {
 			return array(
 				'term_id' => 0,
@@ -295,5 +294,29 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return $default;
+	}
+
+	/**
+	 * Extract category GUID from full category payload or productCategories item.
+	 *
+	 * @param array $category_data Category data.
+	 * @return string
+	 */
+	private function get_category_guid( $category_data ) {
+		$keys = array(
+			'id',
+			'categoryId',
+			'categoryGuid',
+		);
+
+		foreach ( $keys as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) );
+
+			if ( '' !== $value ) {
+				return $value;
+			}
+		}
+
+		return '';
 	}
 }

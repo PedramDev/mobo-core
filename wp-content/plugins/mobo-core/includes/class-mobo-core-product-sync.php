@@ -281,7 +281,11 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
-			$response = $api->get_products_page( absint( $state['productPage'] ), $products_limit );
+			$response = $api->get_products_page(
+				absint( $state['productPage'] ),
+				$products_limit,
+				$state['syncId']
+			);
 
 			if ( is_wp_error( $response ) ) {
 				$state['lastMessage'] = $response->get_error_message();
@@ -338,8 +342,13 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
-		$response     = $api->get_variants_page( $product_guid, absint( $state['variantPage'] ), $variants_limit );
-
+		$response = $api->get_variants_page(
+			$product_guid,
+			absint( $state['variantPage'] ),
+			$variants_limit,
+			$state['syncId']
+		);
+		
 		if ( is_wp_error( $response ) ) {
 			$state['lastMessage'] = $response->get_error_message();
 			$this->save_manual_sync_state( $state );
@@ -556,51 +565,45 @@ class Mobo_Core_Product_Sync {
 		return absint( $variation->save() );
 	}
 
-	/**
-	 * Apply price rules.
-	 *
-	 * @param WC_Product $product Product or variation.
-	 * @param array      $data Payload.
-	 * @param string     $context Context.
-	 * @return void
-	 */
-	private function apply_price_to_product( $product, $data, $context ) {
-		if ( $this->rules->should_update_compare_price() ) {
-			$compare_price = $this->price_calculator->calculate(
-				$this->get_value( $data, 'comparePrice', null ),
-				$context . '_compare'
-			);
-
-			if ( null !== $compare_price ) {
-				$product->set_regular_price( $compare_price );
-
-				if ( $this->rules->should_update_price() ) {
-					$sale_price = $this->price_calculator->calculate(
-						$this->get_value( $data, 'price', null ),
-						$context . '_sale'
-					);
-
-					if ( null !== $sale_price ) {
-						$product->set_sale_price( $sale_price );
-					}
-				}
-
-				return;
-			}
-		}
-
-		if ( $this->rules->should_update_price() ) {
-			$price = $this->price_calculator->calculate(
-				$this->get_value( $data, 'price', null ),
-				$context
-			);
-
-			if ( null !== $price ) {
-				$product->set_regular_price( $price );
-				$product->set_sale_price( '' );
-			}
-		}
+/**
+ * Apply legacy price rules.
+ *
+ * This mirrors old set_variant_prices() behavior:
+ * - comparePrice + auto compare controls regular/sale.
+ * - mobo_additional_price on current object overrides global rules.
+ * - global price rules apply only when mobo_additional_price is empty.
+ *
+ * @param WC_Product $product Product or variation.
+ * @param array      $data Payload.
+ * @param string     $context Context.
+ * @return void
+ */
+private function apply_price_to_product( $product, $data, $context ) {
+	if ( ! $product instanceof WC_Product ) {
+		return;
 	}
+
+	if ( ! $this->rules->should_update_price() && ! $this->rules->should_update_compare_price() ) {
+		return;
+	}
+
+	$object_id = absint( $product->get_id() );
+
+	$pair = $this->price_calculator->calculate_price_pair(
+		$object_id,
+		$this->get_value( $data, 'price', null ),
+		$this->get_value( $data, 'comparePrice', null ),
+		$context
+	);
+
+	if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ) {
+		$product->set_regular_price( $pair['regular_price'] );
+	}
+
+	if ( isset( $pair['sale_price'] ) ) {
+		$product->set_sale_price( $pair['sale_price'] );
+	}
+}
 
 	/**
 	 * Build local product attributes.
