@@ -2,25 +2,13 @@
 /**
  * Category sync service.
  *
- * Payload contract from C#:
+ * Payload contract:
  * [
  *   {
  *     "id": "609f97c4-2011-4186-8729-e1aa8a798c3a",
  *     "title": "🏷️تخفیف 🏷️",
  *     "url": "/takhfif",
  *     "parentId": null
- *   },
- *   {
- *     "id": "e753567b-e764-4981-bb0f-2df38414854f",
- *     "title": "محصولات",
- *     "url": "/products",
- *     "parentId": null
- *   },
- *   {
- *     "id": "0e6426d4-7039-485e-93c2-12e5812ab662",
- *     "title": "قاب و کاور گوشی",
- *     "url": "/products/case",
- *     "parentId": "e753567b-e764-4981-bb0f-2df38414854f"
  *   }
  * ]
  *
@@ -35,13 +23,6 @@ class Mobo_Core_Category_Sync {
 
 	/**
 	 * Sync categories in the exact order provided by C# and assign them to product.
-	 *
-	 * Important:
-	 * - C# sends parents first.
-	 * - id is stored as category_guid.
-	 * - title is WooCommerce category name.
-	 * - url is converted to slug.
-	 * - parentId is resolved through category_guid.
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param mixed $categories Category payload.
@@ -121,10 +102,6 @@ class Mobo_Core_Category_Sync {
 
 		$term_id = $this->find_term_id_by_guid( $category_guid );
 
-		/*
-		 * If this category already exists, title can be empty and we still keep it.
-		 * If it does not exist, title is required to create a meaningful term.
-		 */
 		if ( $term_id <= 0 && '' === $title ) {
 			return array(
 				'term_id' => 0,
@@ -157,27 +134,19 @@ class Mobo_Core_Category_Sync {
 		if ( $term_id > 0 ) {
 			$result = wp_update_term( $term_id, 'product_cat', $args );
 
-			if ( is_wp_error( $result ) ) {
-				/*
-				 * If slug conflict happens, retry without slug.
-				 * This keeps production sync from failing because of old/duplicate slugs.
-				 */
-				if ( isset( $args['slug'] ) ) {
-					unset( $args['slug'] );
-					$result = wp_update_term( $term_id, 'product_cat', $args );
-				}
-
-				if ( is_wp_error( $result ) ) {
-					return array(
-						'term_id' => $term_id,
-						'created' => false,
-					);
-				}
+			if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
+				unset( $args['slug'] );
+				$result = wp_update_term( $term_id, 'product_cat', $args );
 			}
 
-			update_term_meta( $term_id, 'category_guid', $category_guid );
-			update_term_meta( $term_id, 'mobo_category_url', $url );
-			update_term_meta( $term_id, 'mobo_parent_category_guid', $parent_guid );
+			if ( is_wp_error( $result ) ) {
+				return array(
+					'term_id' => $term_id,
+					'created' => false,
+				);
+			}
+
+			$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
 
 			return array(
 				'term_id' => $term_id,
@@ -193,35 +162,21 @@ class Mobo_Core_Category_Sync {
 
 		$result = wp_insert_term( $insert_args['name'], 'product_cat', $insert_args );
 
-		if ( is_wp_error( $result ) ) {
-			/*
-			 * Retry without slug if slug already exists.
-			 */
-			if ( isset( $insert_args['slug'] ) ) {
-				unset( $insert_args['slug'] );
-				$result = wp_insert_term( $insert_args['name'], 'product_cat', $insert_args );
-			}
-
-			if ( is_wp_error( $result ) ) {
-				return array(
-					'term_id' => 0,
-					'created' => false,
-				);
-			}
+		if ( is_wp_error( $result ) && isset( $insert_args['slug'] ) ) {
+			unset( $insert_args['slug'] );
+			$result = wp_insert_term( $insert_args['name'], 'product_cat', $insert_args );
 		}
 
-		$term_id = ! empty( $result['term_id'] ) ? absint( $result['term_id'] ) : 0;
-
-		if ( $term_id <= 0 ) {
+		if ( is_wp_error( $result ) || empty( $result['term_id'] ) ) {
 			return array(
 				'term_id' => 0,
 				'created' => false,
 			);
 		}
 
-		update_term_meta( $term_id, 'category_guid', $category_guid );
-		update_term_meta( $term_id, 'mobo_category_url', $url );
-		update_term_meta( $term_id, 'mobo_parent_category_guid', $parent_guid );
+		$term_id = absint( $result['term_id'] );
+
+		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
 
 		return array(
 			'term_id' => $term_id,
@@ -264,14 +219,28 @@ class Mobo_Core_Category_Sync {
 	}
 
 	/**
-	 * Create a stable slug from category url.
+	 * Save category meta.
 	 *
-	 * Examples:
-	 * /products/case      => case
-	 * /takhfif            => takhfif
-	 * /products/iphone/15 => 15
-	 *
-	 * This matches your C# ordering logic where URL path determines hierarchy/slug.
+	 * @param int    $term_id Term ID.
+	 * @param string $category_guid Category GUID.
+	 * @param string $url Category URL.
+	 * @param string $parent_guid Parent GUID.
+	 * @return void
+	 */
+	private function save_category_meta( $term_id, $category_guid, $url, $parent_guid ) {
+		$term_id = absint( $term_id );
+
+		if ( $term_id <= 0 ) {
+			return;
+		}
+
+		update_term_meta( $term_id, 'category_guid', sanitize_text_field( (string) $category_guid ) );
+		update_term_meta( $term_id, 'mobo_category_url', sanitize_text_field( (string) $url ) );
+		update_term_meta( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) );
+	}
+
+	/**
+	 * Create slug from category URL.
 	 *
 	 * @param string $url Category URL.
 	 * @return string
@@ -305,7 +274,7 @@ class Mobo_Core_Category_Sync {
 	/**
 	 * Case-tolerant getter.
 	 *
-	 * @param array  $array Source array.
+	 * @param array  $array Source.
 	 * @param string $key Key.
 	 * @param mixed  $default Default.
 	 * @return mixed

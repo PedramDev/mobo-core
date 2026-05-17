@@ -1,6 +1,9 @@
 <?php
 /**
- * Image sync service with per-run limit and offset support.
+ * Image sync service.
+ *
+ * Uses image_guid/img_guid and processes images in chunks.
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -14,7 +17,7 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param array $images Images.
-	 * @param int   $offset Current offset.
+	 * @param int   $offset Offset.
 	 * @return array
 	 */
 	public function process_images( $product_id, $images, $offset ) {
@@ -36,16 +39,10 @@ class Mobo_Core_Image_Sync {
 			require_once ABSPATH . 'wp-admin/includes/image.php';
 		}
 
-		$total     = count( $images );
-		$processed = 0;
-		$index     = $offset;
-
-		$gallery = get_post_meta( $product_id, '_product_image_gallery', true );
-		$gallery_ids = array();
-
-		if ( is_string( $gallery ) && '' !== $gallery ) {
-			$gallery_ids = array_filter( array_map( 'absint', explode( ',', $gallery ) ) );
-		}
+		$total       = count( $images );
+		$processed   = 0;
+		$index       = $offset;
+		$gallery_ids = $this->get_existing_gallery_ids( $product_id );
 
 		while ( $index < $total && $processed < $limit ) {
 			$image = isset( $images[ $index ] ) && is_array( $images[ $index ] ) ? $images[ $index ] : array();
@@ -59,9 +56,11 @@ class Mobo_Core_Image_Sync {
 				if ( $attachment_id <= 0 ) {
 					$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 
-					if ( ! is_wp_error( $attachment_id ) ) {
+					if ( ! is_wp_error( $attachment_id ) && absint( $attachment_id ) > 0 ) {
+						$attachment_id = absint( $attachment_id );
 						update_post_meta( $attachment_id, 'image_guid', $image_guid );
 						update_post_meta( $attachment_id, 'img_guid', $image_guid );
+						update_post_meta( $attachment_id, 'mobo_source_url', $url );
 					}
 				}
 
@@ -80,9 +79,7 @@ class Mobo_Core_Image_Sync {
 			$index++;
 		}
 
-		if ( ! empty( $gallery_ids ) ) {
-			update_post_meta( $product_id, '_product_image_gallery', implode( ',', array_map( 'absint', $gallery_ids ) ) );
-		}
+		$this->save_gallery_ids( $product_id, $gallery_ids );
 
 		return array(
 			'done'       => $index >= $total,
@@ -92,9 +89,42 @@ class Mobo_Core_Image_Sync {
 	}
 
 	/**
+	 * Get existing gallery IDs.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function get_existing_gallery_ids( $product_id ) {
+		$gallery = get_post_meta( $product_id, '_product_image_gallery', true );
+
+		if ( ! is_string( $gallery ) || '' === $gallery ) {
+			return array();
+		}
+
+		return array_values( array_filter( array_map( 'absint', explode( ',', $gallery ) ) ) );
+	}
+
+	/**
+	 * Save gallery IDs.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $gallery_ids Gallery IDs.
+	 * @return void
+	 */
+	private function save_gallery_ids( $product_id, $gallery_ids ) {
+		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+
+		if ( empty( $gallery_ids ) ) {
+			return;
+		}
+
+		update_post_meta( $product_id, '_product_image_gallery', implode( ',', $gallery_ids ) );
+	}
+
+	/**
 	 * Find attachment by image_guid/img_guid.
 	 *
-	 * @param string $guid Image GUID.
+	 * @param string $guid GUID.
 	 * @return int
 	 */
 	private function find_attachment_by_guid( $guid ) {

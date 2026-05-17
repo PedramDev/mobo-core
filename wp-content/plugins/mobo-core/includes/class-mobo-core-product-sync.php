@@ -1,6 +1,9 @@
 <?php
 /**
  * Product and variation sync.
+ *
+ * Clean v2 implementation, preserving legacy behavior/options/GUIDs.
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -14,19 +17,19 @@ class Mobo_Core_Product_Sync {
 	private $rules;
 	private $price_calculator;
 	private $image_sync;
+	private $category_sync;
 
 	public function __construct() {
 		$this->rules            = new Mobo_Core_Legacy_Rules();
 		$this->price_calculator = new Mobo_Core_Price_Calculator( $this->rules );
 		$this->image_sync       = new Mobo_Core_Image_Sync();
+		$this->category_sync    = new Mobo_Core_Category_Sync();
 	}
 
 	/**
 	 * Process ProductUpdated payload.
 	 *
-	 * Payload may be partially processed if images are chunked.
-	 *
-	 * @param array $payload Payload passed by reference.
+	 * @param array $payload Payload by reference because image chunks update offset in queued file.
 	 * @return array
 	 */
 	public function process_product_updated_payload( &$payload ) {
@@ -56,7 +59,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_data = $items[ $product_index ];
-		$product_id   = $this->upsert_parent_product( $product_data, false );
+		$product_id   = $this->upsert_parent_product( $product_data, true );
 
 		if ( $product_id <= 0 ) {
 			$product_index++;
@@ -228,7 +231,7 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
-	 * Reset manual sync state.
+	 * Reset manual API sync state.
 	 *
 	 * @return void
 	 */
@@ -313,7 +316,7 @@ class Mobo_Core_Product_Sync {
 
 		if ( '' === $state['currentProductGuid'] ) {
 			$product_data = array_shift( $state['productQueue'] );
-			$product_id   = $this->upsert_parent_product( $product_data, true );
+			$product_id   = $this->upsert_parent_product( $product_data, false );
 
 			if ( $product_id <= 0 ) {
 				$state['lastMessage'] = 'Skipped invalid product.';
@@ -378,6 +381,12 @@ class Mobo_Core_Product_Sync {
 		return $this->result( true, $result['message'], $state );
 	}
 
+	/**
+	 * Save manual sync state.
+	 *
+	 * @param array $state State.
+	 * @return void
+	 */
 	private function save_manual_sync_state( $state ) {
 		$state['updatedAt'] = time();
 		update_option( self::STATE_OPTION, $state, false );
@@ -387,7 +396,7 @@ class Mobo_Core_Product_Sync {
 	 * Upsert parent product.
 	 *
 	 * @param array $data Product data.
-	 * @param bool  $skip_images Whether to skip image handling.
+	 * @param bool  $skip_images Skip image processing.
 	 * @return int
 	 */
 	private function upsert_parent_product( $data, $skip_images ) {
@@ -461,7 +470,10 @@ class Mobo_Core_Product_Sync {
 		$this->store_product_attribute_guids( $product_id, $this->get_value( $data, 'attributes', array() ) );
 
 		if ( $this->rules->should_update_categories() ) {
-			$this->assign_existing_categories( $product_id, $this->get_value( $data, 'productCategories', array() ) );
+			$this->category_sync->sync_and_assign_to_product(
+				$product_id,
+				$this->get_value( $data, 'productCategories', array() )
+			);
 		}
 
 		if ( ! $skip_images && $this->rules->should_update_images() ) {
@@ -545,9 +557,9 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
-	 * Apply legacy price rules to product/variation.
+	 * Apply price rules.
 	 *
-	 * @param WC_Product $product Product.
+	 * @param WC_Product $product Product or variation.
 	 * @param array      $data Payload.
 	 * @param string     $context Context.
 	 * @return void
@@ -590,6 +602,12 @@ class Mobo_Core_Product_Sync {
 		}
 	}
 
+	/**
+	 * Build local product attributes.
+	 *
+	 * @param mixed $attributes Attributes.
+	 * @return array
+	 */
 	private function build_product_attributes( $attributes ) {
 		$result   = array();
 		$position = 0;
@@ -650,6 +668,13 @@ class Mobo_Core_Product_Sync {
 		return $result;
 	}
 
+	/**
+	 * Store attribute GUID map.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param mixed $attributes Attributes.
+	 * @return void
+	 */
 	private function store_product_attribute_guids( $product_id, $attributes ) {
 		$product_id = absint( $product_id );
 
@@ -678,6 +703,12 @@ class Mobo_Core_Product_Sync {
 		}
 	}
 
+	/**
+	 * Normalize variation attributes.
+	 *
+	 * @param mixed $attributes Attributes.
+	 * @return array
+	 */
 	private function normalize_variation_attributes( $attributes ) {
 		$result = array();
 
@@ -707,38 +738,14 @@ class Mobo_Core_Product_Sync {
 		return $result;
 	}
 
-	private function assign_existing_categories( $product_id, $categories ) {
-		$product_id = absint( $product_id );
-
-		if ( $product_id <= 0 || ! is_array( $categories ) ) {
-			return;
-		}
-
-		$term_ids = array();
-
-		foreach ( $categories as $category ) {
-			if ( ! is_array( $category ) ) {
-				continue;
-			}
-
-			$guid = sanitize_text_field( (string) $this->get_value( $category, 'categoryId', '' ) );
-
-			if ( '' === $guid ) {
-				continue;
-			}
-
-			$term_id = $this->find_term_id_by_category_guid( $guid );
-
-			if ( $term_id > 0 ) {
-				$term_ids[] = $term_id;
-			}
-		}
-
-		if ( ! empty( $term_ids ) ) {
-			wp_set_object_terms( $product_id, array_map( 'absint', $term_ids ), 'product_cat', false );
-		}
-	}
-
+	/**
+	 * Finalize missing variants.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param string     $product_guid Product GUID.
+	 * @param string     $sync_id Sync ID.
+	 * @return void
+	 */
 	private function finalize_missing_variants( $product, $product_guid, $sync_id ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
@@ -824,34 +831,6 @@ class Mobo_Core_Product_Sync {
 		);
 
 		return ! empty( $query->posts[0] ) ? absint( $query->posts[0] ) : 0;
-	}
-
-	private function find_term_id_by_category_guid( $guid ) {
-		$guid = sanitize_text_field( (string) $guid );
-
-		if ( '' === $guid ) {
-			return 0;
-		}
-
-		$terms = get_terms(
-			array(
-				'taxonomy'   => 'product_cat',
-				'hide_empty' => false,
-				'number'     => 1,
-				'meta_query' => array(
-					array(
-						'key'   => 'category_guid',
-						'value' => $guid,
-					),
-				),
-			)
-		);
-
-		if ( is_wp_error( $terms ) || empty( $terms[0] ) ) {
-			return 0;
-		}
-
-		return absint( $terms[0]->term_id );
 	}
 
 	private function reset_seen_variants( $product_guid, $sync_id ) {

@@ -25,6 +25,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.p
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-lock.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-api-client.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.php';
