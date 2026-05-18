@@ -30,6 +30,64 @@ class Mobo_Core_Product_Sync
 	}
 
 	/**
+	 * Ensure product type is compatible with variant count.
+	 *
+	 * If variant count is greater than zero, product must be variable.
+	 * If variant count is zero, product can be simple.
+	 *
+	 * @param int $product_id Product ID.
+	 * @param int $variant_total_count Variant total count.
+	 * @return WC_Product|null
+	 */
+	private function ensure_product_type_for_variants( $product_id, $variant_total_count ) {
+		$product_id          = absint( $product_id );
+		$variant_total_count = absint( $variant_total_count );
+
+		if ( $product_id <= 0 ) {
+			return null;
+		}
+
+		$current = wc_get_product( $product_id );
+
+		if ( ! $current instanceof WC_Product ) {
+			return null;
+		}
+
+		if ( $variant_total_count > 0 ) {
+			if ( $current instanceof WC_Product_Variable ) {
+				return $current;
+			}
+
+			wp_set_object_terms( $product_id, 'variable', 'product_type', false );
+
+			return new WC_Product_Variable( $product_id );
+		}
+
+		/*
+		* No variants.
+		* Keep existing simple product as simple.
+		* If it was variable before, convert to simple only when it has no children.
+		*/
+		if ( $current instanceof WC_Product_Simple ) {
+			return $current;
+		}
+
+		$children = array();
+
+		if ( $current instanceof WC_Product_Variable ) {
+			$children = $current->get_children();
+		}
+
+		if ( empty( $children ) ) {
+			wp_set_object_terms( $product_id, 'simple', 'product_type', false );
+
+			return new WC_Product_Simple( $product_id );
+		}
+
+		return $current;
+	}
+
+	/**
 	 * Process ProductUpdated payload.
 	 *
 	 * @param array $payload Payload by reference because image chunks update offset in queued file.
@@ -496,6 +554,42 @@ class Mobo_Core_Product_Sync
 			$state['syncId']
 		);
 
+		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
+		$product_id          = $this->find_product_id_by_guid( $product_guid );
+
+		if ( $product_id > 0 ) {
+			$this->ensure_product_type_for_variants( $product_id, $variant_total_count );
+			if ( 0 === $variant_total_count ) {
+				$product_id = $this->find_product_id_by_guid( $product_guid );
+				$product    = $product_id > 0 ? wc_get_product( $product_id ) : null;
+
+				if ( $product instanceof WC_Product ) {
+					/*
+					* Product is simple. Parent product already received price/stock data
+					* from product payload, so we just sync transients.
+					*/
+					wc_delete_product_transients( $product_id );
+				}
+
+				$state['processedProducts']            = absint( $state['processedProducts'] ) + 1;
+				$state['currentProductGuid']           = '';
+				$state['variantPage']                  = 1;
+				$state['currentVariantTotalCount']     = 0;
+				$state['currentVariantTotalPages']     = 0;
+				$state['currentVariantProcessedPages'] = 0;
+				$state['lastError']                    = '';
+				$state['lastMessage']                  = 'محصول ساده پردازش شد.';
+
+				$this->save_manual_sync_state( $state );
+
+				return $this->result(
+					true,
+					'محصول ساده پردازش شد.',
+					$this->get_manual_sync_status()
+				);
+			}
+		}
+
 		if (is_wp_error($response)) {
 			$state['lastError']   = $response->get_error_message();
 			$state['lastMessage'] = 'Variant page fetch failed.';
@@ -728,14 +822,14 @@ class Mobo_Core_Product_Sync
 
 		$product_id = $this->find_product_id_by_guid($product_guid);
 
-		if ($product_id > 0) {
-			$product = wc_get_product($product_id);
+		if ( $product_id > 0 ) {
+			$product = wc_get_product( $product_id );
 
-			if (! $product instanceof WC_Product_Variable) {
-				$product = new WC_Product_Variable($product_id);
+			if ( ! $product instanceof WC_Product ) {
+				$product = new WC_Product_Simple( $product_id );
 			}
 		} else {
-			$product = new WC_Product_Variable();
+			$product = new WC_Product_Simple();
 		}
 
 		if ($this->rules->should_update_title() || 0 === absint($product->get_id())) {
@@ -799,7 +893,45 @@ class Mobo_Core_Product_Sync
 			$this->image_sync->process_images($product_id, $this->get_value($data, 'images', array()), 0);
 		}
 
+		if ( $this->rules->should_update_stock() ) {
+			$this->apply_api_stock(
+				$product,
+				$this->get_value( $data, 'stock', null )
+			);
+		}
+
 		return $product_id;
+	}
+
+	/**
+	 * Apply API stock rules to product or variation.
+	 *
+	 * API stock contract:
+	 * - null means infinite stock / do not manage stock quantity.
+	 * - 0 means out of stock.
+	 * - positive number means limited stock quantity.
+	 *
+	 * @param WC_Product $product Product or variation.
+	 * @param mixed      $stock API stock value.
+	 * @return void
+	 */
+	private function apply_api_stock( $product, $stock ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		if ( null === $stock || '' === $stock ) {
+			$product->set_manage_stock( false );
+			$product->set_stock_quantity( null );
+			$product->set_stock_status( 'instock' );
+			return;
+		}
+
+		$stock_quantity = max( 0, absint( $stock ) );
+
+		$product->set_manage_stock( true );
+		$product->set_stock_quantity( $stock_quantity );
+		$product->set_stock_status( $stock_quantity > 0 ? 'instock' : 'outofstock' );
 	}
 
 	/**
@@ -843,20 +975,11 @@ class Mobo_Core_Product_Sync
 
 		$this->apply_price_to_product($variation, $data, 'variation');
 
-		if ($this->rules->should_update_stock()) {
-			$stock = $this->get_value($data, 'stock', null);
-
-			$variation->set_manage_stock(true);
-
-			if (null === $stock || '' === $stock) {
-				$variation->set_stock_quantity(0);
-				$variation->set_stock_status('outofstock');
-			} else {
-				$stock_quantity = max(0, absint($stock));
-
-				$variation->set_stock_quantity($stock_quantity);
-				$variation->set_stock_status($stock_quantity > 0 ? 'instock' : 'outofstock');
-			}
+		if ( $this->rules->should_update_stock() ) {
+			$this->apply_api_stock(
+				$variation,
+				$this->get_value( $data, 'stock', null )
+			);
 		}
 
 		$attrs = $this->normalize_variation_attributes($this->get_value($data, 'attributes', array()));
