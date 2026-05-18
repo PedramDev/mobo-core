@@ -684,9 +684,9 @@ class Mobo_Core_Admin {
 							<?php $this->bool_field( 'بروزرسانی خودکار عنوان', 'global_product_auto_title' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار قیمت مقایسه‌ای', 'global_product_auto_compare_price' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار آدرس محصول', 'global_product_auto_slug' ); ?>
-							<?php $this->bool_field( 'بروزرسانی خودکار دسته‌بندی‌ها', 'global_update_categories' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار تصاویر', 'global_update_images' ); ?>
-							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض', 'mobo_default_category_id' ); ?>
+							<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
+							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض در حالت غیرفعال بودن دسته‌بندی اتوماتیک', 'mobo_default_category_id' ); ?>
 
 							<div class="mobo-section-title">قیمت‌گذاری</div>
 
@@ -713,6 +713,23 @@ class Mobo_Core_Admin {
 				</div>
 			</div>
 		</div>
+		<script>
+			jQuery(function($) {
+				function toggleDefaultCategoryField() {
+					var autoCategoryValue = $('#global_update_categories').val();
+
+					if (autoCategoryValue === '1') {
+						$('#mobo-default-category-field').slideUp(150);
+					} else {
+						$('#mobo-default-category-field').slideDown(150);
+					}
+				}
+
+				$(document).on('change', '#global_update_categories', toggleDefaultCategoryField);
+
+				toggleDefaultCategoryField();
+			});
+		</script>
 		<?php
 	}
 
@@ -1071,6 +1088,8 @@ class Mobo_Core_Admin {
 	private function category_dropdown_field( $label, $key ) {
 		$selected = absint( Mobo_Core_Settings::get( $key, 0 ) );
 
+		$auto_categories_enabled = '1' === (string) Mobo_Core_Settings::get( 'global_update_categories', '1' );
+
 		$terms = get_terms(
 			array(
 				'taxonomy'   => 'product_cat',
@@ -1079,10 +1098,16 @@ class Mobo_Core_Admin {
 		);
 
 		?>
-		<div class="mobo-field">
+		<div
+			class="mobo-field"
+			id="mobo-default-category-field"
+			style="<?php echo $auto_categories_enabled ? 'display:none;' : ''; ?>"
+		>
 			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
+
 			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
 				<option value="0">انتخاب نشده</option>
+
 				<?php if ( ! is_wp_error( $terms ) && is_array( $terms ) ) : ?>
 					<?php foreach ( $terms as $term ) : ?>
 						<option value="<?php echo esc_attr( absint( $term->term_id ) ); ?>" <?php selected( $selected, absint( $term->term_id ) ); ?>>
@@ -1091,7 +1116,11 @@ class Mobo_Core_Admin {
 					<?php endforeach; ?>
 				<?php endif; ?>
 			</select>
-			<div class="mobo-help">وقتی بروزرسانی خودکار دسته‌بندی خاموش باشد، محصول به این دسته وصل می‌شود.</div>
+
+			<div class="mobo-help">
+				این دسته فقط زمانی استفاده می‌شود که «آپدیت اتوماتیک دسته‌بندی‌های محصول» خاموش باشد.
+				اگر آپدیت اتوماتیک دسته‌بندی فعال باشد، دسته‌بندی‌های ارسال‌شده از موبو استفاده می‌شوند و این مقدار نادیده گرفته می‌شود.
+			</div>
 		</div>
 		<?php
 	}

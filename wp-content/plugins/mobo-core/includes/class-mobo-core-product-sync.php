@@ -1138,7 +1138,7 @@ private function upsert_variation( $parent, $data ) {
 			return;
 		}
 
-		$slug = sanitize_title( (string) $this->get_value( $data, 'slug', '' ) );
+		$slug = sanitize_title( (string) $this->get_value( $data, 'url', '' ) );
 
 		if ( '' === $slug ) {
 			return;

@@ -62,7 +62,7 @@ class Mobo_Core_API_Client {
 			array(
 				'OnlyInStock'   => $only_in_stock,
 				'RemVariants'   => 'true',
-				'SyncId'        => sanitize_text_field( (string) $sync_id ),
+				'SyncId'        => 'TEST_1',// sanitize_text_field( (string) $sync_id ),
 				'PageNumber'    => max( 1, absint( $page_number ) ),
 				'RecordPerPage' => max( 1, absint( $record_per_page ) ),
 			),

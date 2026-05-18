@@ -24,15 +24,9 @@ class Mobo_Core_Image_Sync {
 	 * [
 	 *   {
 	 *     "id": "image-guid",
-	 *     "url": "https://example.com/image.jpg"
+	 *     "url": "https://example.com/image.webp"
 	 *   }
 	 * ]
-	 *
-	 * Also supports:
-	 * - imageId
-	 * - imageGuid
-	 * - guid
-	 * - src
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param mixed $images Images.
@@ -81,12 +75,19 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( $attachment_id > 0 ) {
+				/*
+				 * Re-save identity meta every time.
+				 * If a previous run was interrupted after attachment creation,
+				 * this makes sure identity metadata is repaired.
+				 */
 				update_post_meta( $attachment_id, 'image_guid', $image_guid );
 				update_post_meta( $attachment_id, 'img_guid', $image_guid );
 				update_post_meta( $attachment_id, 'mobo_source_url', $url );
+				update_post_meta( $attachment_id, 'mobo_sync_incomplete', '0' );
 
 				if ( 0 === $index ) {
 					set_post_thumbnail( $product_id, $attachment_id );
+					update_post_meta( $product_id, '_thumbnail_id', $attachment_id );
 				} elseif ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
 					$gallery_ids[] = $attachment_id;
 				}
@@ -99,6 +100,7 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$this->save_gallery_ids( $product_id, $gallery_ids );
+		$this->sync_woocommerce_product_image_objects( $product_id, $gallery_ids );
 
 		return array(
 			'done'       => $index >= $total,
@@ -126,8 +128,6 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * Critical rule:
 	 * image_guid/img_guid must be persisted immediately after attachment is created.
-	 * If host shuts down after download but before gallery assignment,
-	 * next run must find the same attachment and avoid duplicate download.
 	 *
 	 * @param string $url Image URL.
 	 * @param int    $product_id Product ID.
@@ -143,15 +143,16 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
-		/*
-		* Safety check before download.
-		*/
 		$existing_id = $this->find_attachment_by_guid( $image_guid );
 
 		if ( $existing_id > 0 ) {
 			return $existing_id;
 		}
 
+		/*
+		 * media_sideload_image can fail on some hosts for webp or SSL issues.
+		 * The error is intentionally not exposed to users here.
+		 */
 		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 
 		if ( is_wp_error( $attachment_id ) ) {
@@ -164,9 +165,6 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
-		/*
-		* Persist GUID immediately after attachment exists.
-		*/
 		update_post_meta( $attachment_id, 'image_guid', $image_guid );
 		update_post_meta( $attachment_id, 'img_guid', $image_guid );
 		update_post_meta( $attachment_id, 'mobo_source_url', $url );
@@ -176,7 +174,47 @@ class Mobo_Core_Image_Sync {
 	}
 
 	/**
-	 * Find attachment by image_guid, img_guid or source URL fallback.
+	 * Sync WooCommerce product object image fields.
+	 *
+	 * This is important because just updating raw meta may not refresh WooCommerce properly.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $gallery_ids Gallery IDs.
+	 * @return void
+	 */
+	private function sync_woocommerce_product_image_objects( $product_id, $gallery_ids ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		$product = wc_get_product( $product_id );
+
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$thumbnail_id = absint( get_post_thumbnail_id( $product_id ) );
+
+		if ( $thumbnail_id > 0 ) {
+			$product->set_image_id( $thumbnail_id );
+		}
+
+		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+
+		if ( ! empty( $gallery_ids ) ) {
+			$product->set_gallery_image_ids( $gallery_ids );
+		}
+
+		$product->save();
+
+		wc_delete_product_transients( $product_id );
+		clean_post_cache( $product_id );
+	}
+
+	/**
+	 * Find attachment by image_guid or img_guid.
 	 *
 	 * @param string $guid Image GUID.
 	 * @return int
@@ -272,6 +310,7 @@ class Mobo_Core_Image_Sync {
 		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
 
 		if ( empty( $gallery_ids ) ) {
+			delete_post_meta( $product_id, '_product_image_gallery' );
 			return;
 		}
 
