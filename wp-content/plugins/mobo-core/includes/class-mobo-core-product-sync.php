@@ -208,6 +208,9 @@ class Mobo_Core_Product_Sync {
 
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
 			'lastError'                    => sanitize_text_field( (string) $state['lastError'] ),
+			
+			'shouldContinue'     => 'running' === $state['status'] && empty( $state['lastError'] ),
+			'recommendedDelayMs' => 'running' === $state['status'] && empty( $state['lastError'] ) ? 0 : 5000,
 		);
 	}
 

@@ -150,7 +150,7 @@ class Mobo_Core_API_Client {
 		$token = (string) Mobo_Core_Settings::get( 'mobo_core_api_token', '' );
 
 		if ( '' !== trim( $token ) ) {
-			$headers['Authorization'] = 'Bearer ' . trim( $token );
+			$headers['Token'] = trim( $token );
 		}
 
 		$response = wp_remote_get(
@@ -158,6 +158,7 @@ class Mobo_Core_API_Client {
 			array(
 				'timeout'     => 20,
 				'redirection' => 3,
+				'sslverify'   => false,
 				'headers'     => $headers,
 			)
 		);
