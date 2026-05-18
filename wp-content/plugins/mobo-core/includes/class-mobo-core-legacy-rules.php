@@ -28,7 +28,6 @@ class Mobo_Core_Legacy_Rules {
 	 * - global_product_auto_stock
 	 * - global_product_auto_price
 	 * - global_product_auto_title
-	 * - global_product_auto_caption
 	 * - global_product_auto_compare_price
 	 * - global_product_auto_slug
 	 * - global_update_categories
@@ -51,7 +50,6 @@ class Mobo_Core_Legacy_Rules {
 			'global_product_auto_stock',
 			'global_product_auto_price',
 			'global_product_auto_title',
-			'global_product_auto_caption',
 			'global_product_auto_compare_price',
 			'global_product_auto_slug',
 			'global_update_categories',
@@ -110,15 +108,6 @@ class Mobo_Core_Legacy_Rules {
 	 */
 	public function should_update_title() {
 		return $this->enabled( 'global_product_auto_title', '1' );
-	}
-
-	/**
-	 * Should update caption/short description?
-	 *
-	 * @return bool
-	 */
-	public function should_update_caption() {
-		return $this->enabled( 'global_product_auto_caption', '1' );
 	}
 
 	/**
@@ -241,7 +230,6 @@ class Mobo_Core_Legacy_Rules {
 			'global_product_auto_stock'         => '1',
 			'global_product_auto_price'         => '1',
 			'global_product_auto_title'         => '1',
-			'global_product_auto_caption'       => '1',
 			'global_product_auto_compare_price' => '1',
 			'global_product_auto_slug'          => '1',
 			'global_update_categories'          => '1',

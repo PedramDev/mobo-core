@@ -27,7 +27,6 @@ class Mobo_Core_Settings {
 			'global_product_auto_stock'           => '1',
 			'global_product_auto_price'           => '1',
 			'global_product_auto_title'           => '1',
-			'global_product_auto_caption'         => '1',
 			'global_product_auto_compare_price'   => '1',
 			'global_product_auto_slug'            => '1',
 			'global_update_categories'            => '1',
@@ -119,7 +118,6 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'global_product_auto_stock' );
 		self::save_bool( $post, 'global_product_auto_price' );
 		self::save_bool( $post, 'global_product_auto_title' );
-		self::save_bool( $post, 'global_product_auto_caption' );
 		self::save_bool( $post, 'global_product_auto_compare_price' );
 		self::save_bool( $post, 'global_product_auto_slug' );
 		self::save_bool( $post, 'global_update_categories' );

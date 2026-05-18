@@ -682,7 +682,6 @@ class Mobo_Core_Admin {
 							<?php $this->bool_field( 'بروزرسانی خودکار موجودی', 'global_product_auto_stock' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار قیمت', 'global_product_auto_price' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار عنوان', 'global_product_auto_title' ); ?>
-							<?php $this->bool_field( 'بروزرسانی خودکار توضیح کوتاه', 'global_product_auto_caption' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار قیمت مقایسه‌ای', 'global_product_auto_compare_price' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار آدرس محصول', 'global_product_auto_slug' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار دسته‌بندی‌ها', 'global_update_categories' ); ?>

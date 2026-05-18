@@ -176,14 +176,18 @@ class Mobo_Core_Product_Sync {
 
 		$state['remainingProducts'] = $remaining;
 
+		$last_error      = sanitize_text_field( (string) $state['lastError'] );
+		$current_status  = sanitize_key( (string) $state['status'] );
+		$should_continue = 'running' === $current_status && '' === $last_error;
+
 		return array(
 			'syncId'                       => sanitize_text_field( (string) $state['syncId'] ),
-			'status'                       => sanitize_key( (string) $state['status'] ),
+			'status'                       => $current_status,
 			'source'                       => sanitize_key( (string) $state['source'] ),
 
-			'isRunning'                    => 'running' === $state['status'],
-			'isDone'                       => 'done' === $state['status'],
-			'isCancelled'                  => 'cancelled' === $state['status'],
+			'isRunning'                    => 'running' === $current_status,
+			'isDone'                       => 'done' === $current_status,
+			'isCancelled'                  => 'cancelled' === $current_status,
 
 			'categorySynced'               => (bool) $state['categorySynced'],
 
@@ -207,10 +211,10 @@ class Mobo_Core_Product_Sync {
 			'updatedAt'                    => absint( $state['updatedAt'] ),
 
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
-			'lastError'                    => sanitize_text_field( (string) $state['lastError'] ),
-			
-			'shouldContinue'     => 'running' === $state['status'] && empty( $state['lastError'] ),
-			'recommendedDelayMs' => 'running' === $state['status'] && empty( $state['lastError'] ) ? 0 : 5000,
+			'lastError'                    => $last_error,
+
+			'shouldContinue'               => $should_continue,
+			'recommendedDelayMs'           => $should_continue ? 0 : 5000,
 		);
 	}
 
@@ -544,7 +548,10 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_data = $items[ $product_index ];
-		$product_id   = $this->upsert_parent_product( $product_data, true );
+		$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+		$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
+
+		$product_id = $this->upsert_parent_product( $product_data, true );
 
 		if ( $product_id <= 0 ) {
 			$product_index++;
@@ -560,10 +567,15 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
-		if ( $this->rules->should_update_images() ) {
+		/*
+		 * Images rule:
+		 * - new product: always save initial images.
+		 * - existing product: update only when global_update_images is enabled.
+		 */
+		if ( ! $was_existing || $this->rules->should_update_images() ) {
 			$image_result = $this->image_sync->process_images(
 				$product_id,
-				$this->get_value( $product_data, 'images', array() ),
+				$this->get_product_images_from_payload( $product_data ),
 				$image_offset
 			);
 
@@ -735,8 +747,12 @@ class Mobo_Core_Product_Sync {
 	 * Product is initially created as simple.
 	 * It is converted to variable only after variant API confirms totalCount > 0.
 	 *
+	 * Create vs update rule:
+	 * - New product: always save initial core fields.
+	 * - Existing product: respect legacy auto-update options.
+	 *
 	 * @param array $data Product data.
-	 * @param bool  $skip_images Skip image processing.
+	 * @param bool  $skip_images Skip image processing here.
 	 * @return int
 	 */
 	private function upsert_parent_product( $data, $skip_images ) {
@@ -746,7 +762,8 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$product_id = $this->find_product_id_by_guid( $product_guid );
+		$product_id     = $this->find_product_id_by_guid( $product_guid );
+		$is_new_product = $product_id <= 0;
 
 		if ( $product_id > 0 ) {
 			$product = wc_get_product( $product_id );
@@ -758,7 +775,7 @@ class Mobo_Core_Product_Sync {
 			$product = new WC_Product_Simple();
 		}
 
-		if ( $this->rules->should_update_title() || 0 === absint( $product->get_id() ) ) {
+		if ( $is_new_product || $this->rules->should_update_title() ) {
 			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 
 			if ( '' !== $title ) {
@@ -766,30 +783,24 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( $this->rules->should_update_caption() ) {
-			$caption = wp_kses_post( (string) $this->get_value( $data, 'caption', '' ) );
+		/*
+		 * Caption/content is intentionally ignored.
+		 * Current API does not provide useful caption/content data.
+		 */
 
-			if ( '' !== $caption ) {
-				$product->set_short_description( $caption );
-			}
+		if ( $is_new_product || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+			$this->apply_price_to_product( $product, $data, 'product', $is_new_product );
 		}
 
-		$this->apply_price_to_product( $product, $data, 'product' );
-
-		if ( $this->rules->should_update_stock() ) {
+		if ( $is_new_product || $this->rules->should_update_stock() ) {
 			$this->apply_api_stock(
 				$product,
 				$this->get_value( $data, 'stock', null )
 			);
 		}
 
-		if ( $this->rules->should_update_slug() ) {
-			$url  = sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
-			$slug = trim( $url, '/' );
-
-			if ( '' !== $slug ) {
-				$product->set_slug( sanitize_title( $slug ) );
-			}
+		if ( $is_new_product || $this->rules->should_update_slug() ) {
+			$this->apply_product_slug( $product, $data );
 		}
 
 		$published_at = sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) );
@@ -816,14 +827,28 @@ class Mobo_Core_Product_Sync {
 
 		$this->store_product_attribute_guids( $product_id, $this->get_value( $data, 'attributes', array() ) );
 
+		/*
+		 * Categories rule:
+		 * - new product: must get categories/default category.
+		 * - existing product: assign_product_categories internally respects auto-category option.
+		 */
 		$this->category_sync->assign_product_categories(
 			$product_id,
 			$this->get_value( $data, 'productCategories', array() ),
 			$this->rules->should_update_categories()
 		);
 
-		if ( ! $skip_images && $this->rules->should_update_images() ) {
-			$this->image_sync->process_images( $product_id, $this->get_value( $data, 'images', array() ), 0 );
+		/*
+		 * Images rule:
+		 * - new product: always save initial images.
+		 * - existing product: update only when global_update_images is enabled.
+		 */
+		if ( ! $skip_images && ( $is_new_product || $this->rules->should_update_images() ) ) {
+			$this->image_sync->process_images(
+				$product_id,
+				$this->get_product_images_from_payload( $data ),
+				0
+			);
 		}
 
 		return $product_id;
@@ -831,6 +856,10 @@ class Mobo_Core_Product_Sync {
 
 	/**
 	 * Upsert variation.
+	 *
+	 * Create vs update rule:
+	 * - New variation: always save initial core fields.
+	 * - Existing variation: respect legacy auto-update options.
 	 *
 	 * @param WC_Product $parent Parent product.
 	 * @param array      $data Variant data.
@@ -848,7 +877,8 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$variation_id = $this->find_variation_id_by_guid( $variant_guid );
+		$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
+		$is_new_variation = $variation_id <= 0;
 
 		if ( $variation_id > 0 ) {
 			$variation = wc_get_product( $variation_id );
@@ -863,7 +893,7 @@ class Mobo_Core_Product_Sync {
 		$variation->set_parent_id( $parent_id );
 		$variation->set_status( 'publish' );
 
-		if ( $this->rules->should_update_title() || 0 === absint( $variation->get_id() ) ) {
+		if ( $is_new_variation || $this->rules->should_update_title() ) {
 			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 
 			if ( '' !== $title ) {
@@ -871,15 +901,21 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		$this->apply_price_to_product( $variation, $data, 'variation' );
+		if ( $is_new_variation || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+			$this->apply_price_to_product( $variation, $data, 'variation', $is_new_variation );
+		}
 
-		if ( $this->rules->should_update_stock() ) {
+		if ( $is_new_variation || $this->rules->should_update_stock() ) {
 			$this->apply_api_stock(
 				$variation,
 				$this->get_value( $data, 'stock', null )
 			);
 		}
 
+		/*
+		 * Variation attributes are always applied when present.
+		 * Without attributes, variation matching/display can break.
+		 */
 		$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
 
 		if ( ! empty( $attrs ) ) {
@@ -979,19 +1015,43 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * Apply product slug only from explicit slug field.
+	 *
+	 * URL is intentionally not used as slug source anymore.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $data Product payload.
+	 * @return void
+	 */
+	private function apply_product_slug( $product, $data ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$slug = sanitize_title( (string) $this->get_value( $data, 'slug', '' ) );
+
+		if ( '' === $slug ) {
+			return;
+		}
+
+		$product->set_slug( $slug );
+	}
+
+	/**
 	 * Apply legacy price rules.
 	 *
 	 * @param WC_Product $product Product or variation.
 	 * @param array      $data Payload.
 	 * @param string     $context Context.
+	 * @param bool       $is_new_object Whether product/variation is newly created.
 	 * @return void
 	 */
-	private function apply_price_to_product( $product, $data, $context ) {
+	private function apply_price_to_product( $product, $data, $context, $is_new_object = false ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
 		}
 
-		if ( ! $this->rules->should_update_price() && ! $this->rules->should_update_compare_price() ) {
+		if ( ! $is_new_object && ! $this->rules->should_update_price() && ! $this->rules->should_update_compare_price() ) {
 			return;
 		}
 
@@ -1011,6 +1071,21 @@ class Mobo_Core_Product_Sync {
 		if ( isset( $pair['sale_price'] ) ) {
 			$product->set_sale_price( $pair['sale_price'] );
 		}
+	}
+
+	/**
+	 * Get product images from payload.
+	 *
+	 * Current API uses:
+	 * images: [ { id, url } ]
+	 *
+	 * @param array $data Product payload.
+	 * @return array
+	 */
+	private function get_product_images_from_payload( $data ) {
+		$images = $this->get_value( $data, 'images', array() );
+
+		return is_array( $images ) ? $images : array();
 	}
 
 	/**
