@@ -2,20 +2,32 @@
 /**
  * Category sync service.
  *
- * Category API payload:
+ * Full category API payload:
  * [
  *   {
- *     "id": "...",
- *     "title": "...",
- *     "url": "/products/case",
+ *     "id": "609f97c4-2011-4186-8729-e1aa8a798c3a",
+ *     "title": "🏷️تخفیف 🏷️",
+ *     "url": "/takhfif",
  *     "parentId": null
+ *   },
+ *   {
+ *     "id": "e753567b-e764-4981-bb0f-2df38414854f",
+ *     "title": "محصولات",
+ *     "url": "/products",
+ *     "parentId": null
+ *   },
+ *   {
+ *     "id": "0e6426d4-7039-485e-93c2-12e5812ab662",
+ *     "title": "قاب و کاور گوشی",
+ *     "url": "/products/case",
+ *     "parentId": "e753567b-e764-4981-bb0f-2df38414854f"
  *   }
  * ]
  *
- * Product payload category reference:
+ * Product category reference payload:
  * [
  *   {
- *     "categoryId": "..."
+ *     "categoryId": "0e6426d4-7039-485e-93c2-12e5812ab662"
  *   }
  * ]
  *
@@ -31,7 +43,7 @@ class Mobo_Core_Category_Sync {
 	/**
 	 * Sync full categories payload from API.
 	 *
-	 * Accepts either:
+	 * Accepts:
 	 * - direct array of categories
 	 * - paged object with data[]
 	 *
@@ -85,12 +97,16 @@ class Mobo_Core_Category_Sync {
 	}
 
 	/**
-	 * Assign product categories using product payload references.
+	 * Assign product categories.
 	 *
-	 * If automatic categories are disabled, use mobo_default_category_id when configured.
+	 * If automatic categories are disabled:
+	 * - use mobo_default_category_id if configured.
+	 *
+	 * If automatic categories are enabled:
+	 * - find terms by category_guid from productCategories[].categoryId.
 	 *
 	 * @param int   $product_id Product ID.
-	 * @param mixed $categories Product category references.
+	 * @param mixed $categories Product category refs.
 	 * @param bool  $auto_categories_enabled Whether global_update_categories is enabled.
 	 * @return array
 	 */
@@ -105,21 +121,7 @@ class Mobo_Core_Category_Sync {
 		}
 
 		if ( ! $auto_categories_enabled ) {
-			$default_category_id = absint( get_option( 'mobo_default_category_id', 0 ) );
-
-			if ( $default_category_id > 0 && term_exists( $default_category_id, 'product_cat' ) ) {
-				wp_set_object_terms( $product_id, array( $default_category_id ), 'product_cat', false );
-
-				return array(
-					'assigned' => 1,
-					'source'   => 'default',
-				);
-			}
-
-			return array(
-				'assigned' => 0,
-				'source'   => 'disabled',
-			);
+			return $this->assign_default_category( $product_id );
 		}
 
 		if ( ! is_array( $categories ) ) {
@@ -164,13 +166,11 @@ class Mobo_Core_Category_Sync {
 	/**
 	 * Create or update one WooCommerce product category.
 	 *
-	 * Full category payload:
-	 * {
-	 *   "id": "...",
-	 *   "title": "...",
-	 *   "url": "/products/case",
-	 *   "parentId": null
-	 * }
+	 * Mapping:
+	 * id       -> category_guid
+	 * title    -> term name
+	 * url      -> slug
+	 * parentId -> parent category_guid
 	 *
 	 * @param array $category_data Category payload.
 	 * @return array
@@ -263,6 +263,7 @@ class Mobo_Core_Category_Sync {
 		}
 
 		$term_id = absint( $result['term_id'] );
+
 		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
 
 		return array(
@@ -272,7 +273,7 @@ class Mobo_Core_Category_Sync {
 	}
 
 	/**
-	 * Find product category by category_guid.
+	 * Find product category term by category_guid.
 	 *
 	 * @param string $category_guid Category GUID.
 	 * @return int
@@ -306,7 +307,46 @@ class Mobo_Core_Category_Sync {
 	}
 
 	/**
-	 * Extract category GUID from full category payload or product category reference.
+	 * Assign configured default category.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function assign_default_category( $product_id ) {
+		$product_id          = absint( $product_id );
+		$default_category_id = absint( get_option( 'mobo_default_category_id', 0 ) );
+
+		if ( $product_id <= 0 || $default_category_id <= 0 ) {
+			return array(
+				'assigned' => 0,
+				'source'   => 'disabled',
+			);
+		}
+
+		$term = term_exists( $default_category_id, 'product_cat' );
+
+		if ( empty( $term ) || is_wp_error( $term ) ) {
+			return array(
+				'assigned' => 0,
+				'source'   => 'default-missing',
+			);
+		}
+
+		wp_set_object_terms( $product_id, array( $default_category_id ), 'product_cat', false );
+
+		return array(
+			'assigned' => 1,
+			'source'   => 'default',
+		);
+	}
+
+	/**
+	 * Extract category GUID from either full category payload or product category reference.
+	 *
+	 * Supported keys:
+	 * - id
+	 * - categoryId
+	 * - categoryGuid
 	 *
 	 * @param array $category_data Category data.
 	 * @return string
@@ -334,7 +374,7 @@ class Mobo_Core_Category_Sync {
 	 *
 	 * @param int    $term_id Term ID.
 	 * @param string $category_guid Category GUID.
-	 * @param string $url Category URL.
+	 * @param string $url Source URL.
 	 * @param string $parent_guid Parent GUID.
 	 * @return void
 	 */
@@ -352,6 +392,11 @@ class Mobo_Core_Category_Sync {
 
 	/**
 	 * Create slug from category URL.
+	 *
+	 * Examples:
+	 * /products/case      -> case
+	 * /takhfif            -> takhfif
+	 * /products/iphone/15 -> 15
 	 *
 	 * @param string $url Category URL.
 	 * @return string
@@ -385,7 +430,7 @@ class Mobo_Core_Category_Sync {
 	/**
 	 * Case-tolerant getter.
 	 *
-	 * @param array  $array Source.
+	 * @param array  $array Source array.
 	 * @param string $key Key.
 	 * @param mixed  $default Default.
 	 * @return mixed
