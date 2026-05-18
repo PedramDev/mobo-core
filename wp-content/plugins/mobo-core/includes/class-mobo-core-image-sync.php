@@ -75,11 +75,6 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( $attachment_id > 0 ) {
-				/*
-				 * Re-save identity meta every time.
-				 * If a previous run was interrupted after attachment creation,
-				 * this makes sure identity metadata is repaired.
-				 */
 				update_post_meta( $attachment_id, 'image_guid', $image_guid );
 				update_post_meta( $attachment_id, 'img_guid', $image_guid );
 				update_post_meta( $attachment_id, 'mobo_source_url', $url );
@@ -88,7 +83,12 @@ class Mobo_Core_Image_Sync {
 				if ( 0 === $index ) {
 					set_post_thumbnail( $product_id, $attachment_id );
 					update_post_meta( $product_id, '_thumbnail_id', $attachment_id );
-				} elseif ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
+				}
+
+				/*
+				* Include every image in gallery, including the featured image.
+				*/
+				if ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
 					$gallery_ids[] = $attachment_id;
 				}
 			} else {
