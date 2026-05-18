@@ -78,6 +78,55 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * Apply product publish date from API.
+	 *
+	 * Expected payload field:
+	 * publishedAt: ISO-8601 UTC datetime, e.g. 2025-10-15T10:39:00Z
+	 *
+	 * Updates:
+	 * - post_date_gmt
+	 * - post_date
+	 * - post_modified_gmt
+	 * - post_modified
+	 * - published_at meta
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $data Product payload.
+	 * @return void
+	 */
+	private function apply_product_dates( $product, $data ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$published_at = sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) );
+
+		if ( '' === $published_at ) {
+			return;
+		}
+
+		$timestamp = strtotime( $published_at );
+
+		if ( false === $timestamp || $timestamp <= 0 ) {
+			$product->update_meta_data( 'published_at', $published_at );
+			return;
+		}
+
+		$gmt_date   = gmdate( 'Y-m-d H:i:s', $timestamp );
+		$local_date = get_date_from_gmt( $gmt_date, 'Y-m-d H:i:s' );
+
+		$date = new WC_DateTime( '@' . $timestamp );
+		$date->setTimezone( new DateTimeZone( 'UTC' ) );
+
+		$product->set_date_created( $date );
+		$product->set_date_modified( $date );
+
+		$product->update_meta_data( 'published_at', $published_at );
+		$product->update_meta_data( 'mobo_published_at_gmt', $gmt_date );
+		$product->update_meta_data( 'mobo_published_at_local', $local_date );
+	}
+
+	/**
 	 * Cancel current manual sync.
 	 *
 	 * @return array
@@ -845,11 +894,7 @@ class Mobo_Core_Product_Sync {
 			$this->apply_product_slug( $product, $data );
 		}
 
-		$published_at = sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) );
-
-		if ( '' !== $published_at ) {
-			$product->update_meta_data( 'published_at', $published_at );
-		}
+		$this->apply_product_dates( $product, $data );
 
 		$url = sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
 

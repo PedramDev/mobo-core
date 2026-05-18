@@ -177,8 +177,13 @@ class Mobo_Core_Price_Calculator {
 	}
 
 	/**
-	 * Legacy static-percentage:
-	 * regular/sale * floatval('1.' . global_additional_percentage).
+	 * Static percentage:
+	 * regular/sale * (1 + percentage / 100)
+	 *
+	 * Examples:
+	 * 20  => 1.20
+	 * 50  => 1.50
+	 * 100 => 2.00
 	 *
 	 * @param int        $regular_base Regular base.
 	 * @param int|string $sale_base Sale base or empty.
@@ -190,20 +195,22 @@ class Mobo_Core_Price_Calculator {
 	 */
 	private function calculate_static_percentage_pair( $regular_base, $sale_base, $raw_price, $raw_compare_price, $options, $context ) {
 		$percentage = isset( $options['global_additional_percentage'] )
-			? preg_replace( '/[^0-9]/', '', (string) $options['global_additional_percentage'] )
+			? wc_format_decimal( $options['global_additional_percentage'] )
 			: '0';
 
-		if ( '' === $percentage ) {
-			$percentage = '0';
+		$percentage = is_numeric( $percentage ) ? (float) $percentage : 0.0;
+
+		if ( $percentage < 0 ) {
+			$percentage = 0.0;
 		}
 
-		$factor = floatval( '1.' . $percentage );
+		$factor = 1 + ( $percentage / 100 );
 
-		$regular_price = intval( $regular_base ) * $factor;
+		$regular_price = (float) $regular_base * $factor;
 		$sale_price    = '';
 
 		if ( '' !== $sale_base ) {
-			$sale_price = intval( $sale_base ) * $factor;
+			$sale_price = (float) $sale_base * $factor;
 		}
 
 		return $this->format_pair(
@@ -307,11 +314,18 @@ class Mobo_Core_Price_Calculator {
 					$sale_price = intval( $sale_base ) + intval( $benefit );
 				}
 			} else {
-				$factor        = floatval( '1.' . $benefit );
-				$regular_price = intval( $regular_base ) * $factor;
+				$benefit_value = is_numeric( $benefit ) ? (float) $benefit : 0.0;
+
+				if ( $benefit_value < 0 ) {
+					$benefit_value = 0.0;
+				}
+
+				$factor = 1 + ( $benefit_value / 100 );
+
+				$regular_price = (float) $regular_base * $factor;
 
 				if ( '' !== $sale_base ) {
-					$sale_price = intval( $sale_base ) * $factor;
+					$sale_price = (float) $sale_base * $factor;
 				}
 			}
 
