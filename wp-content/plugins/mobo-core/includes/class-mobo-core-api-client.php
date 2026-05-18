@@ -2,6 +2,12 @@
 /**
  * API client for manual chunked sync.
  *
+ * Expected API endpoints:
+ *
+ * GET /get-categories?SyncId=...
+ * GET /get-products?OnlyInStock=true&RemVariants=true&SyncId=...&PageNumber=1&RecordPerPage=2
+ * GET /{productGuid}/get-variants?SyncId=...&PageNumber=1&RecordPerPage=5
+ *
  * PHP 7.4 compatible.
  */
 
@@ -57,8 +63,8 @@ class Mobo_Core_API_Client {
 				'OnlyInStock'   => $only_in_stock,
 				'RemVariants'   => 'true',
 				'SyncId'        => sanitize_text_field( (string) $sync_id ),
-				'PageNumber'    => absint( $page_number ),
-				'RecordPerPage' => absint( $record_per_page ),
+				'PageNumber'    => max( 1, absint( $page_number ) ),
+				'RecordPerPage' => max( 1, absint( $record_per_page ) ),
 			),
 			'get-products'
 		);
@@ -81,16 +87,45 @@ class Mobo_Core_API_Client {
 	public function get_variants_page( $product_guid, $page_number, $record_per_page, $sync_id ) {
 		$product_guid = rawurlencode( sanitize_text_field( (string) $product_guid ) );
 
+		if ( '' === $product_guid ) {
+			return new WP_Error( 'mobo_core_missing_product_guid', 'Product GUID is missing.' );
+		}
+
 		$path = add_query_arg(
 			array(
 				'SyncId'        => sanitize_text_field( (string) $sync_id ),
-				'PageNumber'    => absint( $page_number ),
-				'RecordPerPage' => absint( $record_per_page ),
+				'PageNumber'    => max( 1, absint( $page_number ) ),
+				'RecordPerPage' => max( 1, absint( $record_per_page ) ),
 			),
 			$product_guid . '/get-variants'
 		);
 
 		return $this->get_json( $path );
+	}
+
+	/**
+	 * Get API base URL from plugin/legacy configuration.
+	 *
+	 * Priority:
+	 * 1. mobo_core_api_base_url filter
+	 * 2. mobo_core_api_base_url option fallback
+	 *
+	 * @return string
+	 */
+	private function get_base_url() {
+		$base_url = apply_filters( 'mobo_core_api_base_url', '' );
+
+		if ( is_string( $base_url ) && '' !== trim( $base_url ) ) {
+			return trailingslashit( esc_url_raw( $base_url ) );
+		}
+
+		$base_url = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+
+		if ( '' !== trim( $base_url ) ) {
+			return trailingslashit( esc_url_raw( $base_url ) );
+		}
+
+		return '';
 	}
 
 	/**
@@ -114,23 +149,30 @@ class Mobo_Core_API_Client {
 
 		$token = (string) Mobo_Core_Settings::get( 'mobo_core_api_token', '' );
 
-		if ( '' !== $token ) {
-			$headers['Authorization'] = 'Bearer ' . $token;
+		if ( '' !== trim( $token ) ) {
+			$headers['Authorization'] = 'Bearer ' . trim( $token );
 		}
 
 		$response = wp_remote_get(
 			$url,
 			array(
-				'timeout' => 20,
-				'headers' => $headers,
+				'timeout'     => 20,
+				'redirection' => 3,
+				'headers'     => $headers,
 			)
 		);
 
 		if ( is_wp_error( $response ) ) {
-			return $response;
+			return new WP_Error(
+				'mobo_core_api_request_failed',
+				'API request failed.',
+				array(
+					'original_error' => $response->get_error_code(),
+				)
+			);
 		}
 
-		$code = wp_remote_retrieve_response_code( $response );
+		$code = absint( wp_remote_retrieve_response_code( $response ) );
 
 		if ( $code < 200 || $code >= 300 ) {
 			return new WP_Error(
@@ -143,6 +185,11 @@ class Mobo_Core_API_Client {
 		}
 
 		$body = wp_remote_retrieve_body( $response );
+
+		if ( '' === trim( (string) $body ) ) {
+			return new WP_Error( 'mobo_core_empty_api_response', 'API returned empty response.' );
+		}
+
 		$json = json_decode( $body, true );
 
 		if ( ! is_array( $json ) ) {
@@ -150,34 +197,5 @@ class Mobo_Core_API_Client {
 		}
 
 		return $json;
-	}
-
-	/**
-	 * Get API base URL from legacy/plugin configuration.
-	 *
-	 * @return string
-	 */
-	private function get_base_url() {
-		/**
-		 * First priority:
-		 * Let project override the API base URL from existing plugin logic.
-		 */
-		$base_url = apply_filters( 'mobo_core_api_base_url', '' );
-
-		if ( is_string( $base_url ) && '' !== trim( $base_url ) ) {
-			return trailingslashit( esc_url_raw( $base_url ) );
-		}
-
-		/**
-		 * Fallback:
-		 * Keep option support for compatibility, but UI does not need to expose it.
-		 */
-		$base_url = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
-
-		if ( '' !== trim( $base_url ) ) {
-			return trailingslashit( esc_url_raw( $base_url ) );
-		}
-
-		return '';
 	}
 }

@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Mobo Core
- * Description: Production-ready chunked WooCommerce product, category, image, variation and webhook sync for Mobo.
+ * Description: همگام‌سازی مرحله‌ای محصولات، تنوع‌ها، دسته‌بندی‌ها، تصاویر و وب‌هوک‌ها برای ووکامرس.
  * Version: 2.0.0
  * Author: Mobo
  * Requires at least: 5.8
@@ -19,6 +19,22 @@ define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-files/' );
 
+/*
+ * Optional API base URL constant.
+ *
+ * You can define this in wp-config.php or in your custom environment loader:
+ *
+ * define( 'MOBO_API_BASE_URL', 'https://api.example.com/' );
+ *
+ * If this is empty, API client may still fallback to mobo_core_api_base_url option.
+ */
+if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
+	define( 'MOBO_API_BASE_URL', '' );
+}
+
+/*
+ * Core classes.
+ */
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
@@ -33,19 +49,40 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-variation-fields.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-migration.php';
 
-register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) );
-
-if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', '' );
-}
-
+/**
+ * Resolve API base URL.
+ *
+ * Priority:
+ * 1. Any custom filter added elsewhere.
+ * 2. MOBO_API_BASE_URL constant.
+ * 3. mobo_core_api_base_url option fallback inside API client.
+ */
 add_filter(
 	'mobo_core_api_base_url',
-	function () {
-		return MOBO_API_BASE_URL;
+	function ( $base_url ) {
+		if ( is_string( $base_url ) && '' !== trim( $base_url ) ) {
+			return $base_url;
+		}
+
+		if ( defined( 'MOBO_API_BASE_URL' ) && '' !== trim( (string) MOBO_API_BASE_URL ) ) {
+			return (string) MOBO_API_BASE_URL;
+		}
+
+		return '';
 	}
 );
 
+/**
+ * Activation.
+ *
+ * Creates defaults, protects webhook directories,
+ * and deletes old webhook JSON files on activation/install.
+ */
+register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) );
+
+/**
+ * Bootstrap plugin.
+ */
 add_action(
 	'plugins_loaded',
 	function () {
@@ -60,7 +97,7 @@ add_action(
 					}
 
 					echo '<div class="notice notice-error"><p>';
-					echo esc_html__( 'Mobo Core requires WooCommerce to be installed and active.', 'mobo-core' );
+					echo esc_html__( 'برای استفاده از Mobo Core باید افزونه WooCommerce فعال باشد.', 'mobo-core' );
 					echo '</p></div>';
 				}
 			);
@@ -68,12 +105,22 @@ add_action(
 			return;
 		}
 
+		/*
+		 * Variation custom field:
+		 * mobo_additional_price
+		 */
 		$variation_fields = new Mobo_Core_Variation_Fields();
 		$variation_fields->init();
 
+		/*
+		 * REST endpoints for C# runner and webhooks.
+		 */
 		$rest = new Mobo_Core_Rest_Controller();
 		$rest->init();
 
+		/*
+		 * Admin UI.
+		 */
 		if ( is_admin() ) {
 			$admin = new Mobo_Core_Admin();
 			$admin->init();
