@@ -1,9 +1,11 @@
 <?php
 /**
  * Plugin Name: Mobo Core
+ * Plugin URI: https://github.com/PedramDev/moboplugin.com
  * Description: همگام‌سازی مرحله‌ای محصولات، تنوع‌ها، دسته‌بندی‌ها، تصاویر و وب‌هوک‌ها برای ووکامرس.
- * Version: 2.0.0
- * Author: Mobo
+ * Version: 10.0.0
+ * Author: Pedram Karimi
+ * Author URI: https://customers.mobomobo.ir/
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Text Domain: mobo-core
@@ -13,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '2.0.0' );
+define( 'MOBO_CORE_VERSION', '10.0.0' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );

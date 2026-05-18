@@ -28,6 +28,7 @@ class Mobo_Core_Migration {
 		self::ensure_defaults();
 		self::ensure_webhook_dirs();
 		self::delete_webhook_json_files();
+		self::clear_legacy_cron_hooks();
 
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 	}
@@ -142,6 +143,53 @@ class Mobo_Core_Migration {
 			if ( 'json' === $extension ) {
 				@unlink( $file->getPathname() );
 			}
+		}
+	}
+
+
+	/**
+	 * Clear old WP-Cron hooks from previous plugin versions.
+	 *
+	 * Final v2 architecture does not use WP-Cron.
+	 *
+	 * @return void
+	 */
+	private static function clear_legacy_cron_hooks() {
+		$hooks = array(
+			/*
+			* Add all old cron hook names here.
+			* These are likely names based on old files, but confirm with old cron.php / cron-functions.php.
+			*/
+			'mobo_core_cron',
+			'mobo_core_sync_cron',
+			'mobo_core_product_sync_cron',
+			'mobo_core_products_sync_cron',
+			'mobo_core_webhook_cron',
+			'mobo_core_webhook_queue_cron',
+			'mobo_core_process_webhook_queue',
+			'mobo_core_run_webhooks',
+			'mobo_core_update_products',
+			'mobo_core_update_variants',
+			'mobo_cron_hook',
+			'mobo_sync_cron_hook',
+			'mobo_webhook_cron_hook',
+		);
+
+		/**
+		 * Allow old/custom installs to register extra legacy cron hooks for cleanup.
+		 *
+		 * @param array $hooks Cron hook names.
+		 */
+		$hooks = apply_filters( 'mobo_core_legacy_cron_hooks', $hooks );
+
+		foreach ( $hooks as $hook ) {
+			$hook = sanitize_key( (string) $hook );
+
+			if ( '' === $hook ) {
+				continue;
+			}
+
+			wp_clear_scheduled_hook( $hook );
 		}
 	}
 }

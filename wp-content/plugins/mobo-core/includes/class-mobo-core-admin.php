@@ -624,9 +624,21 @@ class Mobo_Core_Admin {
 					</table>
 
 					<div class="mobo-actions">
-						<?php $this->button_form( 'mobo_core_start_sync', 'شروع همگام‌سازی محصولات', 'mobo-btn mobo-btn-primary' ); ?>
-						<?php $this->button_form( 'mobo_core_cancel_sync', 'توقف همگام‌سازی', 'mobo-btn mobo-btn-red' ); ?>
-						<?php $this->button_form( 'mobo_core_reset_sync', 'ریست وضعیت', 'mobo-btn mobo-btn-gray' ); ?>
+						<?php
+						$current_status = isset( $status['status'] ) ? sanitize_key( (string) $status['status'] ) : 'idle';
+
+						if ( in_array( $current_status, array( 'idle', 'done' ), true ) ) {
+							$this->button_form( 'mobo_core_start_sync', 'شروع همگام‌سازی محصولات', 'mobo-btn mobo-btn-primary' );
+						}
+
+						if ( 'running' === $current_status ) {
+							$this->button_form( 'mobo_core_cancel_sync', 'توقف همگام‌سازی', 'mobo-btn mobo-btn-red' );
+						}
+
+						if ( in_array( $current_status, array( 'cancelled', 'done' ), true ) ) {
+							$this->button_form( 'mobo_core_reset_sync', 'ریست وضعیت', 'mobo-btn mobo-btn-gray' );
+						}
+						?>
 					</div>
 				</div>
 
