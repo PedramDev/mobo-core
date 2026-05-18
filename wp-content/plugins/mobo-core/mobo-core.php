@@ -30,6 +30,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-variation-fields.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-migration.php';
 
 register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) );
@@ -66,6 +67,9 @@ add_action(
 
 			return;
 		}
+
+		$variation_fields = new Mobo_Core_Variation_Fields();
+		$variation_fields->init();
 
 		$rest = new Mobo_Core_Rest_Controller();
 		$rest->init();
