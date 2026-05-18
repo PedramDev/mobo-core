@@ -3,11 +3,27 @@
  * Price calculator.
  *
  * Mirrors legacy set_variant_prices() behavior:
- * - comparePrice controls regular/sale price when auto compare is enabled.
- * - mobo_additional_price on a specific product/variation overrides global pricing rules.
- * - static-price adds global_additional_price.
- * - static-percentage multiplies by floatval('1.' . percentage).
- * - dynamic-price applies first matching active condition.
+ *
+ * 1. Base:
+ *    price        = API price
+ *    comparePrice = API comparePrice
+ *
+ * 2. If comparePrice exists and global_product_auto_compare_price = 1:
+ *    regular_price = comparePrice
+ *    sale_price    = price
+ *
+ * 3. Otherwise:
+ *    regular_price = price
+ *    sale_price    = empty
+ *
+ * 4. If mobo_additional_price exists on current object:
+ *    regular/sale + mobo_additional_price
+ *    global price rules are skipped.
+ *
+ * 5. Otherwise mobo_price_type is used:
+ *    - static-price      => + global_additional_price
+ *    - static-percentage => * floatval('1.' . global_additional_percentage)
+ *    - dynamic-price     => first active matching condition from mobo_dynamic_price
  *
  * PHP 7.4 compatible.
  */
@@ -18,8 +34,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Price_Calculator {
 
+	/**
+	 * Legacy rules.
+	 *
+	 * @var Mobo_Core_Legacy_Rules
+	 */
 	private $rules;
 
+	/**
+	 * Constructor.
+	 *
+	 * @param Mobo_Core_Legacy_Rules $rules Legacy rules.
+	 */
 	public function __construct( Mobo_Core_Legacy_Rules $rules ) {
 		$this->rules = $rules;
 	}
@@ -30,7 +56,7 @@ class Mobo_Core_Price_Calculator {
 	 * @param int    $object_id Product/variation ID. Can be 0 for new objects.
 	 * @param mixed  $price API price.
 	 * @param mixed  $compare_price API comparePrice.
-	 * @param string $context Context.
+	 * @param string $context Context: product|variation.
 	 * @return array
 	 */
 	public function calculate_price_pair( $object_id, $price, $compare_price, $context ) {
@@ -59,7 +85,7 @@ class Mobo_Core_Price_Calculator {
 		$additional_price = $this->get_object_additional_price( $object_id );
 
 		if ( null !== $additional_price ) {
-			$regular_price = $regular_base + $additional_price;
+			$regular_price = intval( $regular_base ) + $additional_price;
 			$sale_price    = '';
 
 			if ( '' !== $sale_base ) {
@@ -119,12 +145,12 @@ class Mobo_Core_Price_Calculator {
 	 * Legacy static-price:
 	 * regular/sale + global_additional_price.
 	 *
-	 * @param int    $regular_base Regular base.
+	 * @param int        $regular_base Regular base.
 	 * @param int|string $sale_base Sale base or empty.
-	 * @param mixed  $raw_price Raw API price.
-	 * @param mixed  $raw_compare_price Raw compare.
-	 * @param array  $options Options.
-	 * @param string $context Context.
+	 * @param mixed      $raw_price Raw API price.
+	 * @param mixed      $raw_compare_price Raw API compare price.
+	 * @param array      $options Options.
+	 * @param string     $context Context.
 	 * @return array
 	 */
 	private function calculate_static_price_pair( $regular_base, $sale_base, $raw_price, $raw_compare_price, $options, $context ) {
@@ -154,18 +180,22 @@ class Mobo_Core_Price_Calculator {
 	 * Legacy static-percentage:
 	 * regular/sale * floatval('1.' . global_additional_percentage).
 	 *
-	 * @param int    $regular_base Regular base.
+	 * @param int        $regular_base Regular base.
 	 * @param int|string $sale_base Sale base or empty.
-	 * @param mixed  $raw_price Raw API price.
-	 * @param mixed  $raw_compare_price Raw compare.
-	 * @param array  $options Options.
-	 * @param string $context Context.
+	 * @param mixed      $raw_price Raw API price.
+	 * @param mixed      $raw_compare_price Raw API compare price.
+	 * @param array      $options Options.
+	 * @param string     $context Context.
 	 * @return array
 	 */
 	private function calculate_static_percentage_pair( $regular_base, $sale_base, $raw_price, $raw_compare_price, $options, $context ) {
 		$percentage = isset( $options['global_additional_percentage'] )
-			? (string) $options['global_additional_percentage']
+			? preg_replace( '/[^0-9]/', '', (string) $options['global_additional_percentage'] )
 			: '0';
+
+		if ( '' === $percentage ) {
+			$percentage = '0';
+		}
 
 		$factor = floatval( '1.' . $percentage );
 
@@ -190,9 +220,9 @@ class Mobo_Core_Price_Calculator {
 	/**
 	 * Legacy dynamic-price:
 	 * Check conditions against raw API price, not comparePrice.
-	 * First matching active condition wins.
+	 * First active matching condition wins.
 	 *
-	 * mobo_dynamic_price JSON example:
+	 * mobo_dynamic_price JSON shape:
 	 * [
 	 *   {
 	 *     "is_active": "true",
@@ -203,12 +233,16 @@ class Mobo_Core_Price_Calculator {
 	 *   }
 	 * ]
 	 *
-	 * @param int    $regular_base Regular base.
+	 * benefit_type:
+	 * - static     => + benefit
+	 * - percentage => * floatval('1.' . benefit)
+	 *
+	 * @param int        $regular_base Regular base.
 	 * @param int|string $sale_base Sale base or empty.
-	 * @param mixed  $raw_price Raw API price.
-	 * @param mixed  $raw_compare_price Raw compare.
-	 * @param array  $options Options.
-	 * @param string $context Context.
+	 * @param mixed      $raw_price Raw API price.
+	 * @param mixed      $raw_compare_price Raw API compare price.
+	 * @param array      $options Options.
+	 * @param string     $context Context.
 	 * @return array
 	 */
 	private function calculate_dynamic_price_pair( $regular_base, $sale_base, $raw_price, $raw_compare_price, $options, $context ) {
@@ -239,9 +273,12 @@ class Mobo_Core_Price_Calculator {
 				continue;
 			}
 
-			$is_active = isset( $condition['is_active'] ) ? (string) $condition['is_active'] : 'false';
-			$low       = isset( $condition['low'] ) ? intval( $condition['low'] ) : 0;
-			$high      = isset( $condition['high'] ) ? intval( $condition['high'] ) : 0;
+			$is_active = isset( $condition['is_active'] )
+				? sanitize_text_field( (string) $condition['is_active'] )
+				: 'false';
+
+			$low  = isset( $condition['low'] ) ? intval( $condition['low'] ) : 0;
+			$high = isset( $condition['high'] ) ? intval( $condition['high'] ) : 0;
 
 			if ( 'true' !== $is_active ) {
 				continue;
@@ -255,7 +292,13 @@ class Mobo_Core_Price_Calculator {
 				? sanitize_key( (string) $condition['benefit_type'] )
 				: 'static';
 
-			$benefit = isset( $condition['benefit'] ) ? (string) $condition['benefit'] : '0';
+			$benefit = isset( $condition['benefit'] )
+				? preg_replace( '/[^0-9]/', '', (string) $condition['benefit'] )
+				: '0';
+
+			if ( '' === $benefit ) {
+				$benefit = '0';
+			}
 
 			if ( 'static' === $benefit_type ) {
 				$regular_price = intval( $regular_base ) + intval( $benefit );
@@ -297,8 +340,11 @@ class Mobo_Core_Price_Calculator {
 	/**
 	 * Get per-product/per-variation additional price.
 	 *
-	 * In legacy code this is stored on variant:
+	 * Legacy meta:
 	 * mobo_additional_price
+	 *
+	 * If this value exists and is greater than zero,
+	 * global pricing rules must not be applied.
 	 *
 	 * @param int $object_id Product/variation ID.
 	 * @return int|null
@@ -316,18 +362,24 @@ class Mobo_Core_Price_Calculator {
 			return null;
 		}
 
-		return intval( $value );
+		$value = absint( $value );
+
+		if ( $value <= 0 ) {
+			return null;
+		}
+
+		return $value;
 	}
 
 	/**
-	 * Format and filter pair.
+	 * Format and filter price pair.
 	 *
 	 * @param mixed  $regular_price Regular price.
 	 * @param mixed  $sale_price Sale price or empty.
 	 * @param mixed  $raw_price Raw API price.
 	 * @param mixed  $raw_compare_price Raw compare price.
-	 * @param array  $options Options.
-	 * @param string $price_type Price type applied.
+	 * @param array  $options Legacy options.
+	 * @param string $price_type Applied price type.
 	 * @param string $context Context.
 	 * @return array
 	 */
@@ -335,22 +387,24 @@ class Mobo_Core_Price_Calculator {
 		$regular_price = is_numeric( $regular_price ) ? max( 0, (float) $regular_price ) : null;
 		$sale_price    = is_numeric( $sale_price ) ? max( 0, (float) $sale_price ) : '';
 
+		$pair = array(
+			'regular_price' => null === $regular_price ? null : wc_format_decimal( $regular_price ),
+			'sale_price'    => '' === $sale_price ? '' : wc_format_decimal( $sale_price ),
+		);
+
 		/**
-		 * Final filter for custom compatibility.
+		 * Final compatibility filter.
 		 *
 		 * @param array  $pair Pair with regular_price and sale_price.
 		 * @param mixed  $raw_price Raw API price.
-		 * @param mixed  $raw_compare_price Raw compare price.
+		 * @param mixed  $raw_compare_price Raw API compare price.
 		 * @param array  $options Legacy options.
 		 * @param string $price_type Applied price type.
 		 * @param string $context Context.
 		 */
-		$pair = apply_filters(
+		$filtered_pair = apply_filters(
 			'mobo_core_calculated_price_pair',
-			array(
-				'regular_price' => null === $regular_price ? null : wc_format_decimal( $regular_price ),
-				'sale_price'    => '' === $sale_price ? '' : wc_format_decimal( $sale_price ),
-			),
+			$pair,
 			$raw_price,
 			$raw_compare_price,
 			$options,
@@ -358,16 +412,13 @@ class Mobo_Core_Price_Calculator {
 			$context
 		);
 
-		if ( ! is_array( $pair ) ) {
-			$pair = array(
-				'regular_price' => null,
-				'sale_price'    => '',
-			);
+		if ( ! is_array( $filtered_pair ) ) {
+			return $pair;
 		}
 
 		return array(
-			'regular_price' => isset( $pair['regular_price'] ) ? $pair['regular_price'] : null,
-			'sale_price'    => isset( $pair['sale_price'] ) ? $pair['sale_price'] : '',
+			'regular_price' => array_key_exists( 'regular_price', $filtered_pair ) ? $filtered_pair['regular_price'] : $pair['regular_price'],
+			'sale_price'    => array_key_exists( 'sale_price', $filtered_pair ) ? $filtered_pair['sale_price'] : $pair['sale_price'],
 		);
 	}
 }
