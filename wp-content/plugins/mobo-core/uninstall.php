@@ -3,7 +3,7 @@
  * Uninstall cleanup.
  *
  * Important:
- * Business data is intentionally preserved.
+ * Business data and legacy customer settings are intentionally preserved.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -24,7 +24,6 @@ delete_option( 'mobo_core_db_version' );
  * Remove runtime/chunking options introduced by v2.
  * Legacy business settings are preserved.
  */
-delete_option( 'mobo_core_enable_wp_cron' );
 delete_option( 'mobo_core_sync_time_budget_seconds' );
 delete_option( 'mobo_core_webhook_files_per_run' );
 delete_option( 'mobo_core_webhook_max_try' );
@@ -33,6 +32,11 @@ delete_option( 'mobo_core_products_per_page' );
 delete_option( 'mobo_core_variants_per_page' );
 delete_option( 'mobo_core_images_per_run' );
 delete_option( 'mobo_core_missing_variants_behavior' );
+
+/*
+ * Remove old v2 beta option if it exists.
+ */
+delete_option( 'mobo_core_enable_wp_cron' );
 
 /*
  * Remove temporary seen-variant options.
@@ -57,7 +61,7 @@ if ( is_array( $option_names ) ) {
 /*
  * Remove transient locks.
  */
-$lock_prefix = $wpdb->esc_like( '_transient_mobo_core_lock_' ) . '%';
+$lock_prefix    = $wpdb->esc_like( '_transient_mobo_core_lock_' ) . '%';
 $timeout_prefix = $wpdb->esc_like( '_transient_timeout_mobo_core_lock_' ) . '%';
 
 $transient_names = $wpdb->get_col(

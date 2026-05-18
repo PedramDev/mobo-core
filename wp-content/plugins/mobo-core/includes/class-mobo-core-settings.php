@@ -1,6 +1,9 @@
 <?php
 /**
  * Settings helper.
+ *
+ * Preserves legacy option names while removing WP-Cron dependency.
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -37,7 +40,6 @@ class Mobo_Core_Settings {
 			'global_additional_percentage'        => '0',
 			'mobo_dynamic_price'                  => '[]',
 
-			'mobo_core_enable_wp_cron'            => 'no',
 			'mobo_core_sync_time_budget_seconds'  => 8,
 			'mobo_core_webhook_files_per_run'     => 1,
 			'mobo_core_webhook_max_try'           => 5,
@@ -67,7 +69,7 @@ class Mobo_Core_Settings {
 	}
 
 	/**
-	 * Get integer option.
+	 * Get integer option with min/max clamp.
 	 *
 	 * @param string $key Option key.
 	 * @param int    $default Default.
@@ -156,12 +158,6 @@ class Mobo_Core_Settings {
 			update_option( 'mobo_dynamic_price', self::sanitize_dynamic_price_rows( $post ), false );
 		}
 
-		update_option(
-			'mobo_core_enable_wp_cron',
-			isset( $post['mobo_core_enable_wp_cron'] ) && 'yes' === sanitize_text_field( wp_unslash( $post['mobo_core_enable_wp_cron'] ) ) ? 'yes' : 'no',
-			false
-		);
-
 		self::save_int( $post, 'mobo_core_sync_time_budget_seconds', 8, 2, 25 );
 		self::save_int( $post, 'mobo_core_webhook_files_per_run', 1, 1, 10 );
 		self::save_int( $post, 'mobo_core_webhook_max_try', 5, 1, 20 );
@@ -226,6 +222,11 @@ class Mobo_Core_Settings {
 				$benefit_type = 'static';
 			}
 
+			/*
+			 * If high is empty/zero but low is set, keep high = 0.
+			 * Old pricing code requires price <= high, so a zero high will not match.
+			 * Admin should normally set both low and high.
+			 */
 			$clean[] = array(
 				'is_active'    => $is_active,
 				'low'          => (string) $low,
@@ -240,6 +241,13 @@ class Mobo_Core_Settings {
 		return false === $json ? '[]' : $json;
 	}
 
+	/**
+	 * Save sanitized text option.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @return void
+	 */
 	private static function save_text( $post, $key ) {
 		update_option(
 			$key,
@@ -248,6 +256,13 @@ class Mobo_Core_Settings {
 		);
 	}
 
+	/**
+	 * Save sanitized URL option.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @return void
+	 */
 	private static function save_url( $post, $key ) {
 		update_option(
 			$key,
@@ -256,6 +271,13 @@ class Mobo_Core_Settings {
 		);
 	}
 
+	/**
+	 * Save boolean-like option as 1/0.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @return void
+	 */
 	private static function save_bool( $post, $key ) {
 		update_option(
 			$key,
@@ -264,6 +286,13 @@ class Mobo_Core_Settings {
 		);
 	}
 
+	/**
+	 * Save decimal option.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @return void
+	 */
 	private static function save_decimal( $post, $key ) {
 		$value = isset( $post[ $key ] ) ? wp_unslash( $post[ $key ] ) : '0';
 		$value = wc_format_decimal( $value );
@@ -271,6 +300,16 @@ class Mobo_Core_Settings {
 		update_option( $key, $value, false );
 	}
 
+	/**
+	 * Save integer option with range clamp.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @param int    $default Default.
+	 * @param int    $min Minimum.
+	 * @param int    $max Maximum.
+	 * @return void
+	 */
 	private static function save_int( $post, $key, $default, $min, $max ) {
 		$value = isset( $post[ $key ] ) ? absint( wp_unslash( $post[ $key ] ) ) : $default;
 		$value = min( $max, max( $min, $value ) );
