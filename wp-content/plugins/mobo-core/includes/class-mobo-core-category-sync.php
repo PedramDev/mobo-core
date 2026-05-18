@@ -99,35 +99,66 @@ class Mobo_Core_Category_Sync {
 	/**
 	 * Assign product categories.
 	 *
-	 * If automatic categories are disabled:
-	 * - use mobo_default_category_id if configured.
+	 * Rules:
 	 *
-	 * If automatic categories are enabled:
-	 * - find terms by category_guid from productCategories[].categoryId.
+	 * New product + automatic categories enabled:
+	 * - assign categories from productCategories[].categoryId
+	 *
+	 * Existing product + automatic categories enabled:
+	 * - update categories from productCategories[].categoryId
+	 *
+	 * New product + automatic categories disabled:
+	 * - assign mobo_default_category_id if configured
+	 *
+	 * Existing product + automatic categories disabled:
+	 * - do not change product categories
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param mixed $categories Product category refs.
 	 * @param bool  $auto_categories_enabled Whether global_update_categories is enabled.
+	 * @param bool  $is_new_product Whether product was newly created.
 	 * @return array
 	 */
-	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled ) {
-		$product_id = absint( $product_id );
+	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled, $is_new_product = false ) {
+		$product_id     = absint( $product_id );
+		$is_new_product = (bool) $is_new_product;
 
 		if ( $product_id <= 0 ) {
 			return array(
 				'assigned' => 0,
 				'source'   => 'none',
+				'changed'  => false,
 			);
 		}
 
+		/*
+		* Automatic category update is disabled.
+		*
+		* Important:
+		* - New product gets default category.
+		* - Existing product category must not be changed.
+		*/
 		if ( ! $auto_categories_enabled ) {
-			return $this->assign_default_category( $product_id );
+			if ( $is_new_product ) {
+				return $this->assign_default_category( $product_id );
+			}
+
+			return array(
+				'assigned' => 0,
+				'source'   => 'disabled-existing-product-unchanged',
+				'changed'  => false,
+			);
 		}
 
+		/*
+		* Automatic category update is enabled.
+		* Apply API categories for both new and existing products.
+		*/
 		if ( ! is_array( $categories ) ) {
 			return array(
 				'assigned' => 0,
-				'source'   => 'auto',
+				'source'   => 'auto-empty',
+				'changed'  => false,
 			);
 		}
 
@@ -153,13 +184,20 @@ class Mobo_Core_Category_Sync {
 
 		$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $term_ids ) ) ) );
 
-		if ( ! empty( $term_ids ) ) {
-			wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
+		if ( empty( $term_ids ) ) {
+			return array(
+				'assigned' => 0,
+				'source'   => 'auto-no-matching-terms',
+				'changed'  => false,
+			);
 		}
+
+		wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
 
 		return array(
 			'assigned' => count( $term_ids ),
 			'source'   => 'auto',
+			'changed'  => true,
 		);
 	}
 
@@ -338,6 +376,10 @@ public function upsert_category( $category_data ) {
 	/**
 	 * Assign configured default category.
 	 *
+	 * Used only when:
+	 * - automatic categories are disabled
+	 * - product is newly created
+	 *
 	 * @param int $product_id Product ID.
 	 * @return array
 	 */
@@ -348,7 +390,8 @@ public function upsert_category( $category_data ) {
 		if ( $product_id <= 0 || $default_category_id <= 0 ) {
 			return array(
 				'assigned' => 0,
-				'source'   => 'disabled',
+				'source'   => 'default-not-configured',
+				'changed'  => false,
 			);
 		}
 
@@ -358,6 +401,7 @@ public function upsert_category( $category_data ) {
 			return array(
 				'assigned' => 0,
 				'source'   => 'default-missing',
+				'changed'  => false,
 			);
 		}
 
@@ -366,6 +410,7 @@ public function upsert_category( $category_data ) {
 		return array(
 			'assigned' => 1,
 			'source'   => 'default',
+			'changed'  => true,
 		);
 	}
 

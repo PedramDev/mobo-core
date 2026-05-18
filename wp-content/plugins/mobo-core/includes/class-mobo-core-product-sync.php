@@ -887,7 +887,8 @@ class Mobo_Core_Product_Sync {
 		$this->category_sync->assign_product_categories(
 			$product_id,
 			$this->get_value( $data, 'productCategories', array() ),
-			$this->rules->should_update_categories()
+			$this->rules->should_update_categories(),
+			$is_new_product
 		);
 
 		/*
