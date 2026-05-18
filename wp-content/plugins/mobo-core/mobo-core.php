@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Mobo Core
- * Description: Production-ready chunked WooCommerce product/variant sync for Mobo.
+ * Description: Production-ready chunked WooCommerce product, category, image, variation and webhook sync for Mobo.
  * Version: 2.0.0
  * Author: Mobo
  * Requires at least: 5.8
@@ -34,12 +34,36 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-migration.php';
 
 register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) );
 
+if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
+	define( 'MOBO_API_BASE_URL', '' );
+}
+
+add_filter(
+	'mobo_core_api_base_url',
+	function () {
+		return MOBO_API_BASE_URL;
+	}
+);
+
 add_action(
 	'plugins_loaded',
 	function () {
 		Mobo_Core_Migration::maybe_run();
 
 		if ( ! class_exists( 'WooCommerce' ) ) {
+			add_action(
+				'admin_notices',
+				function () {
+					if ( ! current_user_can( 'manage_options' ) ) {
+						return;
+					}
+
+					echo '<div class="notice notice-error"><p>';
+					echo esc_html__( 'Mobo Core requires WooCommerce to be installed and active.', 'mobo-core' );
+					echo '</p></div>';
+				}
+			);
+
 			return;
 		}
 

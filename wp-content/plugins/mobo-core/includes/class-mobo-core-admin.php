@@ -524,10 +524,7 @@ class Mobo_Core_Admin {
 
 							<div class="mobo-section-title"><?php echo esc_html__( 'Pricing', 'mobo-core' ); ?></div>
 
-							<?php $this->price_type_field(); ?>
-							<?php $this->number_field( 'Additional Price', 'global_additional_price', 0, 999999999, '1' ); ?>
-							<?php $this->number_field( 'Additional Percentage', 'global_additional_percentage', 0, 1000, '1' ); ?>
-							<?php $this->textarea_field( 'Dynamic Price JSON', 'mobo_dynamic_price', 'Used when mobo_price_type = dynamic-price.' ); ?>
+							<?php $this->pricing_rules_ui(); ?>
 
 							<div class="mobo-section-title"><?php echo esc_html__( 'Chunking & Queue', 'mobo-core' ); ?></div>
 
@@ -644,6 +641,367 @@ class Mobo_Core_Admin {
 
 		$this->redirect( ! empty( $result['messages'][0] ) ? $result['messages'][0] : 'Webhook queue processed.' );
 	}
+
+	/**
+ * Render Persian pricing rules UI.
+ *
+ * @return void
+ */
+private function pricing_rules_ui() {
+	$price_type = Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+
+	if ( ! in_array( $price_type, array( 'static-price', 'static-percentage', 'dynamic-price' ), true ) ) {
+		$price_type = 'static-price';
+	}
+
+	$dynamic_rows = json_decode( (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ), true );
+
+	if ( ! is_array( $dynamic_rows ) ) {
+		$dynamic_rows = array();
+	}
+
+	if ( empty( $dynamic_rows ) ) {
+		$dynamic_rows = array(
+			array(
+				'is_active'    => 'true',
+				'low'          => '',
+				'high'         => '',
+				'benefit_type' => 'static',
+				'benefit'      => '',
+			),
+		);
+	}
+
+	?>
+	<div class="mobo-field mobo-pricing-box" style="grid-column:1/-1;">
+		<style>
+			.mobo-pricing-box {
+				background: #f8fafc;
+				border: 1px solid #e2e8f0;
+				border-radius: 18px;
+				padding: 18px;
+			}
+
+			.mobo-price-type-cards {
+				display: grid;
+				grid-template-columns: repeat(3, 1fr);
+				gap: 12px;
+				margin-top: 10px;
+			}
+
+			@media (max-width: 900px) {
+				.mobo-price-type-cards {
+					grid-template-columns: 1fr;
+				}
+			}
+
+			.mobo-price-card {
+				position: relative;
+				display: block;
+				border: 2px solid #e5e7eb;
+				background: #fff;
+				border-radius: 16px;
+				padding: 16px;
+				cursor: pointer;
+				transition: all .18s ease;
+			}
+
+			.mobo-price-card:hover {
+				border-color: #8b5cf6;
+				box-shadow: 0 10px 25px rgba(139, 92, 246, .12);
+			}
+
+			.mobo-price-card input {
+				position: absolute;
+				opacity: 0;
+				pointer-events: none;
+			}
+
+			.mobo-price-card.active {
+				border-color: #4f46e5;
+				background: #eef2ff;
+			}
+
+			.mobo-price-card strong {
+				display: block;
+				font-size: 15px;
+				color: #111827;
+				margin-bottom: 6px;
+			}
+
+			.mobo-price-card span {
+				display: block;
+				color: #6b7280;
+				font-size: 12px;
+				line-height: 1.8;
+			}
+
+			.mobo-pricing-panel {
+				display: none;
+				margin-top: 18px;
+				background: #fff;
+				border: 1px solid #e5e7eb;
+				border-radius: 16px;
+				padding: 18px;
+			}
+
+			.mobo-pricing-panel.active {
+				display: block;
+			}
+
+			.mobo-pricing-panel h3 {
+				margin: 0 0 12px;
+				font-size: 16px;
+				font-weight: 900;
+				color: #111827;
+			}
+
+			.mobo-inline-fields {
+				display: grid;
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+				gap: 14px;
+			}
+
+			@media (max-width: 800px) {
+				.mobo-inline-fields {
+					grid-template-columns: 1fr;
+				}
+			}
+
+			.mobo-dynamic-table-wrap {
+				overflow-x: auto;
+			}
+
+			.mobo-dynamic-table {
+				width: 100%;
+				border-collapse: separate;
+				border-spacing: 0 10px;
+				min-width: 850px;
+			}
+
+			.mobo-dynamic-table th {
+				text-align: right;
+				color: #475569;
+				font-weight: 900;
+				font-size: 12px;
+				padding: 0 8px 4px;
+			}
+
+			.mobo-dynamic-table td {
+				background: #f8fafc;
+				border-top: 1px solid #e2e8f0;
+				border-bottom: 1px solid #e2e8f0;
+				padding: 10px 8px;
+			}
+
+			.mobo-dynamic-table td:first-child {
+				border-right: 1px solid #e2e8f0;
+				border-radius: 0 12px 12px 0;
+			}
+
+			.mobo-dynamic-table td:last-child {
+				border-left: 1px solid #e2e8f0;
+				border-radius: 12px 0 0 12px;
+			}
+
+			.mobo-dynamic-table input,
+			.mobo-dynamic-table select {
+				width: 100%;
+				border-radius: 10px !important;
+			}
+
+			.mobo-small-btn {
+				border: 0;
+				border-radius: 10px;
+				padding: 8px 12px;
+				font-weight: 800;
+				cursor: pointer;
+			}
+
+			.mobo-add-row {
+				background: #4f46e5;
+				color: #fff;
+			}
+
+			.mobo-remove-row {
+				background: #fee2e2;
+				color: #b91c1c;
+			}
+
+			.mobo-pricing-note {
+				background: #fffbeb;
+				border: 1px solid #fde68a;
+				color: #92400e;
+				padding: 12px;
+				border-radius: 12px;
+				margin-top: 12px;
+				font-size: 13px;
+				line-height: 1.9;
+			}
+		</style>
+
+		<label style="font-size:16px;font-weight:900;color:#111827;">
+			<?php echo esc_html__( 'نوع سود و قیمت‌گذاری', 'mobo-core' ); ?>
+		</label>
+
+		<div class="mobo-price-type-cards" id="mobo-price-type-cards">
+			<label class="mobo-price-card <?php echo 'static-price' === $price_type ? 'active' : ''; ?>" data-price-type="static-price">
+				<input type="radio" name="mobo_price_type" value="static-price" <?php checked( $price_type, 'static-price' ); ?>>
+				<strong>سود ثابت</strong>
+				<span>یک مبلغ ثابت به قیمت محصول یا تنوع اضافه می‌شود.</span>
+			</label>
+
+			<label class="mobo-price-card <?php echo 'static-percentage' === $price_type ? 'active' : ''; ?>" data-price-type="static-percentage">
+				<input type="radio" name="mobo_price_type" value="static-percentage" <?php checked( $price_type, 'static-percentage' ); ?>>
+				<strong>سود درصدی</strong>
+				<span>قیمت با ضریب درصدی محاسبه می‌شود. مثل ۲۰٪ یعنی ضریب ۱.۲۰.</span>
+			</label>
+
+			<label class="mobo-price-card <?php echo 'dynamic-price' === $price_type ? 'active' : ''; ?>" data-price-type="dynamic-price">
+				<input type="radio" name="mobo_price_type" value="dynamic-price" <?php checked( $price_type, 'dynamic-price' ); ?>>
+				<strong>سود داینامیک</strong>
+				<span>بر اساس بازه قیمت، سود ثابت یا درصدی متفاوت اعمال می‌شود.</span>
+			</label>
+		</div>
+
+		<div id="mobo-panel-static-price" class="mobo-pricing-panel <?php echo 'static-price' === $price_type ? 'active' : ''; ?>">
+			<h3>تنظیم سود ثابت</h3>
+			<div class="mobo-inline-fields">
+				<div class="mobo-field">
+					<label for="global_additional_price">مبلغ سود ثابت</label>
+					<input type="number" min="0" step="1" id="global_additional_price" name="global_additional_price" value="<?php echo esc_attr( Mobo_Core_Settings::get( 'global_additional_price', '0' ) ); ?>">
+					<div class="mobo-help">این مبلغ به قیمت اصلی اضافه می‌شود.</div>
+				</div>
+			</div>
+		</div>
+
+		<div id="mobo-panel-static-percentage" class="mobo-pricing-panel <?php echo 'static-percentage' === $price_type ? 'active' : ''; ?>">
+			<h3>تنظیم سود درصدی</h3>
+			<div class="mobo-inline-fields">
+				<div class="mobo-field">
+					<label for="global_additional_percentage">درصد سود</label>
+					<input type="number" min="0" step="1" id="global_additional_percentage" name="global_additional_percentage" value="<?php echo esc_attr( Mobo_Core_Settings::get( 'global_additional_percentage', '0' ) ); ?>">
+					<div class="mobo-help">مثلاً مقدار ۲۰ یعنی قیمت در ۱.۲۰ ضرب می‌شود.</div>
+				</div>
+			</div>
+		</div>
+
+		<div id="mobo-panel-dynamic-price" class="mobo-pricing-panel <?php echo 'dynamic-price' === $price_type ? 'active' : ''; ?>">
+			<h3>تنظیم سود داینامیک</h3>
+
+			<div class="mobo-dynamic-table-wrap">
+				<table class="mobo-dynamic-table" id="mobo-dynamic-price-table">
+					<thead>
+						<tr>
+							<th>فعال</th>
+							<th>از قیمت</th>
+							<th>تا قیمت</th>
+							<th>نوع سود</th>
+							<th>مقدار سود</th>
+							<th>عملیات</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $dynamic_rows as $index => $row ) : ?>
+							<?php
+							$is_active    = isset( $row['is_active'] ) ? (string) $row['is_active'] : 'true';
+							$low          = isset( $row['low'] ) ? (string) $row['low'] : '';
+							$high         = isset( $row['high'] ) ? (string) $row['high'] : '';
+							$benefit_type = isset( $row['benefit_type'] ) ? (string) $row['benefit_type'] : 'static';
+							$benefit      = isset( $row['benefit'] ) ? (string) $row['benefit'] : '';
+							?>
+							<tr>
+								<td>
+									<select name="mobo_dynamic_price_rows[<?php echo esc_attr( $index ); ?>][is_active]">
+										<option value="true" <?php selected( $is_active, 'true' ); ?>>بله</option>
+										<option value="false" <?php selected( $is_active, 'false' ); ?>>خیر</option>
+									</select>
+								</td>
+								<td>
+									<input type="number" min="0" step="1" name="mobo_dynamic_price_rows[<?php echo esc_attr( $index ); ?>][low]" value="<?php echo esc_attr( $low ); ?>">
+								</td>
+								<td>
+									<input type="number" min="0" step="1" name="mobo_dynamic_price_rows[<?php echo esc_attr( $index ); ?>][high]" value="<?php echo esc_attr( $high ); ?>">
+								</td>
+								<td>
+									<select name="mobo_dynamic_price_rows[<?php echo esc_attr( $index ); ?>][benefit_type]">
+										<option value="static" <?php selected( $benefit_type, 'static' ); ?>>مبلغ ثابت</option>
+										<option value="percentage" <?php selected( $benefit_type, 'percentage' ); ?>>درصدی</option>
+									</select>
+								</td>
+								<td>
+									<input type="number" min="0" step="1" name="mobo_dynamic_price_rows[<?php echo esc_attr( $index ); ?>][benefit]" value="<?php echo esc_attr( $benefit ); ?>">
+								</td>
+								<td>
+									<button type="button" class="mobo-small-btn mobo-remove-row">حذف</button>
+								</td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			</div>
+
+			<button type="button" class="mobo-small-btn mobo-add-row" id="mobo-add-dynamic-row">افزودن بازه جدید</button>
+
+			<div class="mobo-pricing-note">
+				در حالت داینامیک، اولین بازه فعالی که قیمت محصول داخل آن قرار بگیرد اعمال می‌شود.
+				اگر نوع سود «درصدی» باشد، مقدار ۲۰ یعنی قیمت در ۱.۲۰ ضرب می‌شود.
+			</div>
+		</div>
+
+		<script>
+			jQuery(function($) {
+				function refreshPricePanels() {
+					var selected = $('input[name="mobo_price_type"]:checked').val();
+
+					$('.mobo-price-card').removeClass('active');
+					$('.mobo-price-card[data-price-type="' + selected + '"]').addClass('active');
+
+					$('.mobo-pricing-panel').removeClass('active');
+					$('#mobo-panel-' + selected).addClass('active');
+				}
+
+				$(document).on('change', 'input[name="mobo_price_type"]', refreshPricePanels);
+
+				$('.mobo-price-card').on('click', function() {
+					$(this).find('input[type="radio"]').prop('checked', true).trigger('change');
+				});
+
+				$('#mobo-add-dynamic-row').on('click', function() {
+					var $tbody = $('#mobo-dynamic-price-table tbody');
+					var index = $tbody.find('tr').length;
+
+					var row = ''
+						+ '<tr>'
+						+ '<td><select name="mobo_dynamic_price_rows[' + index + '][is_active]"><option value="true">بله</option><option value="false">خیر</option></select></td>'
+						+ '<td><input type="number" min="0" step="1" name="mobo_dynamic_price_rows[' + index + '][low]" value=""></td>'
+						+ '<td><input type="number" min="0" step="1" name="mobo_dynamic_price_rows[' + index + '][high]" value=""></td>'
+						+ '<td><select name="mobo_dynamic_price_rows[' + index + '][benefit_type]"><option value="static">مبلغ ثابت</option><option value="percentage">درصدی</option></select></td>'
+						+ '<td><input type="number" min="0" step="1" name="mobo_dynamic_price_rows[' + index + '][benefit]" value=""></td>'
+						+ '<td><button type="button" class="mobo-small-btn mobo-remove-row">حذف</button></td>'
+						+ '</tr>';
+
+					$tbody.append(row);
+				});
+
+				$(document).on('click', '.mobo-remove-row', function() {
+					var $tbody = $('#mobo-dynamic-price-table tbody');
+
+					if ($tbody.find('tr').length <= 1) {
+						$(this).closest('tr').find('input').val('');
+						$(this).closest('tr').find('select').prop('selectedIndex', 0);
+						return;
+					}
+
+					$(this).closest('tr').remove();
+				});
+
+				refreshPricePanels();
+			});
+		</script>
+	</div>
+	<?php
+}
 
 	/**
 	 * Require admin capability and nonce.

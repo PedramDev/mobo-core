@@ -129,15 +129,32 @@ class Mobo_Core_Settings {
 			false
 		);
 
-		self::save_text( $post, 'mobo_price_type' );
-		self::save_decimal( $post, 'global_additional_price' );
-		self::save_decimal( $post, 'global_additional_percentage' );
+		$price_type = isset( $post['mobo_price_type'] )
+			? sanitize_key( wp_unslash( $post['mobo_price_type'] ) )
+			: 'static-price';
 
-		update_option(
-			'mobo_dynamic_price',
-			isset( $post['mobo_dynamic_price'] ) ? wp_kses_post( wp_unslash( $post['mobo_dynamic_price'] ) ) : '[]',
-			false
-		);
+		if ( ! in_array( $price_type, array( 'static-price', 'static-percentage', 'dynamic-price' ), true ) ) {
+			$price_type = 'static-price';
+		}
+
+		update_option( 'mobo_price_type', $price_type, false );
+
+		/*
+		 * Preserve old option names, but only save the relevant value based on selected price type.
+		 */
+		if ( 'static-price' === $price_type ) {
+			self::save_decimal( $post, 'global_additional_price' );
+			update_option( 'global_additional_percentage', '0', false );
+			update_option( 'mobo_dynamic_price', '[]', false );
+		} elseif ( 'static-percentage' === $price_type ) {
+			update_option( 'global_additional_price', '0', false );
+			self::save_decimal( $post, 'global_additional_percentage' );
+			update_option( 'mobo_dynamic_price', '[]', false );
+		} else {
+			update_option( 'global_additional_price', '0', false );
+			update_option( 'global_additional_percentage', '0', false );
+			update_option( 'mobo_dynamic_price', self::sanitize_dynamic_price_rows( $post ), false );
+		}
 
 		update_option(
 			'mobo_core_enable_wp_cron',
@@ -162,6 +179,65 @@ class Mobo_Core_Settings {
 		}
 
 		update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
+	}
+
+	/**
+	 * Convert dynamic pricing UI rows to legacy JSON.
+	 *
+	 * Legacy expected shape:
+	 * [
+	 *   {
+	 *     "is_active": "true",
+	 *     "low": "1000",
+	 *     "high": "5000",
+	 *     "benefit_type": "static",
+	 *     "benefit": "100"
+	 *   }
+	 * ]
+	 *
+	 * @param array $post Raw post.
+	 * @return string
+	 */
+	private static function sanitize_dynamic_price_rows( $post ) {
+		$rows = isset( $post['mobo_dynamic_price_rows'] ) ? wp_unslash( $post['mobo_dynamic_price_rows'] ) : array();
+
+		if ( ! is_array( $rows ) ) {
+			return '[]';
+		}
+
+		$clean = array();
+
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+
+			$low          = isset( $row['low'] ) ? absint( $row['low'] ) : 0;
+			$high         = isset( $row['high'] ) ? absint( $row['high'] ) : 0;
+			$benefit      = isset( $row['benefit'] ) ? absint( $row['benefit'] ) : 0;
+			$benefit_type = isset( $row['benefit_type'] ) ? sanitize_key( $row['benefit_type'] ) : 'static';
+			$is_active    = isset( $row['is_active'] ) && 'true' === sanitize_text_field( $row['is_active'] ) ? 'true' : 'false';
+
+			if ( $low <= 0 && $high <= 0 && $benefit <= 0 ) {
+				continue;
+			}
+
+			if ( ! in_array( $benefit_type, array( 'static', 'percentage' ), true ) ) {
+				$benefit_type = 'static';
+			}
+
+			$clean[] = array(
+				'is_active'    => $is_active,
+				'low'          => (string) $low,
+				'high'         => (string) $high,
+				'benefit_type' => $benefit_type,
+				'benefit'      => (string) $benefit,
+			);
+		}
+
+		$json = wp_json_encode( $clean, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+		return false === $json ? '[]' : $json;
 	}
 
 	private static function save_text( $post, $key ) {

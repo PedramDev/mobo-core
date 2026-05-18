@@ -100,13 +100,13 @@ class Mobo_Core_API_Client {
 	 * @return array|WP_Error
 	 */
 	private function get_json( $path ) {
-		$base_url = esc_url_raw( (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' ) );
+		$base_url = $this->get_base_url();
 
 		if ( '' === $base_url ) {
 			return new WP_Error( 'mobo_core_missing_api_base_url', 'API base URL is missing.' );
 		}
 
-		$url = trailingslashit( $base_url ) . ltrim( $path, '/' );
+		$url = $base_url . ltrim( $path, '/' );
 
 		$headers = array(
 			'Accept' => 'application/json',
@@ -150,5 +150,34 @@ class Mobo_Core_API_Client {
 		}
 
 		return $json;
+	}
+
+	/**
+	 * Get API base URL from legacy/plugin configuration.
+	 *
+	 * @return string
+	 */
+	private function get_base_url() {
+		/**
+		 * First priority:
+		 * Let project override the API base URL from existing plugin logic.
+		 */
+		$base_url = apply_filters( 'mobo_core_api_base_url', '' );
+
+		if ( is_string( $base_url ) && '' !== trim( $base_url ) ) {
+			return trailingslashit( esc_url_raw( $base_url ) );
+		}
+
+		/**
+		 * Fallback:
+		 * Keep option support for compatibility, but UI does not need to expose it.
+		 */
+		$base_url = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+
+		if ( '' !== trim( $base_url ) ) {
+			return trailingslashit( esc_url_raw( $base_url ) );
+		}
+
+		return '';
 	}
 }
