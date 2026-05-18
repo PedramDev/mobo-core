@@ -81,6 +81,10 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( $attachment_id > 0 ) {
+				update_post_meta( $attachment_id, 'image_guid', $image_guid );
+				update_post_meta( $attachment_id, 'img_guid', $image_guid );
+				update_post_meta( $attachment_id, 'mobo_source_url', $url );
+
 				if ( 0 === $index ) {
 					set_post_thumbnail( $product_id, $attachment_id );
 				} elseif ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
@@ -120,6 +124,11 @@ class Mobo_Core_Image_Sync {
 	/**
 	 * Download image and attach to product.
 	 *
+	 * Critical rule:
+	 * image_guid/img_guid must be persisted immediately after attachment is created.
+	 * If host shuts down after download but before gallery assignment,
+	 * next run must find the same attachment and avoid duplicate download.
+	 *
 	 * @param string $url Image URL.
 	 * @param int    $product_id Product ID.
 	 * @param string $image_guid Image GUID.
@@ -134,6 +143,15 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
+		/*
+		* Safety check before download.
+		*/
+		$existing_id = $this->find_attachment_by_guid( $image_guid );
+
+		if ( $existing_id > 0 ) {
+			return $existing_id;
+		}
+
 		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 
 		if ( is_wp_error( $attachment_id ) ) {
@@ -146,15 +164,19 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
+		/*
+		* Persist GUID immediately after attachment exists.
+		*/
 		update_post_meta( $attachment_id, 'image_guid', $image_guid );
 		update_post_meta( $attachment_id, 'img_guid', $image_guid );
 		update_post_meta( $attachment_id, 'mobo_source_url', $url );
+		update_post_meta( $attachment_id, 'mobo_sync_incomplete', '0' );
 
 		return $attachment_id;
 	}
 
 	/**
-	 * Find attachment by image_guid or img_guid.
+	 * Find attachment by image_guid, img_guid or source URL fallback.
 	 *
 	 * @param string $guid Image GUID.
 	 * @return int

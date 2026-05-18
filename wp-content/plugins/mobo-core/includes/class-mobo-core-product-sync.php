@@ -744,6 +744,9 @@ class Mobo_Core_Product_Sync {
 	/**
 	 * Upsert parent product.
 	 *
+	 * Product GUID must be persisted as early as possible.
+	 * This prevents duplicate products if the host shuts down mid-sync.
+	 *
 	 * Product is initially created as simple.
 	 * It is converted to variable only after variant API confirms totalCount > 0.
 	 *
@@ -775,6 +778,45 @@ class Mobo_Core_Product_Sync {
 			$product = new WC_Product_Simple();
 		}
 
+		/*
+		* Critical early persistence:
+		*
+		* Save product_guid as soon as possible.
+		* If host times out/shuts down after this point, the next sync can find
+		* and continue updating the same product instead of creating a duplicate.
+		*/
+		if ( $is_new_product ) {
+			$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+
+			if ( '' === $initial_title ) {
+				$initial_title = 'Mobo Product ' . $product_guid;
+			}
+
+			$product->set_name( $initial_title );
+			$product->set_status( 'publish' );
+			$product->update_meta_data( 'product_guid', $product_guid );
+			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
+
+			$product_id = absint( $product->save() );
+
+			if ( $product_id <= 0 ) {
+				return 0;
+			}
+
+			/*
+			* Reload product after first save so later WooCommerce operations
+			* work with a persisted product ID.
+			*/
+			$product = wc_get_product( $product_id );
+
+			if ( ! $product instanceof WC_Product ) {
+				return 0;
+			}
+		} else {
+			$product->update_meta_data( 'product_guid', $product_guid );
+			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
+		}
+
 		if ( $is_new_product || $this->rules->should_update_title() ) {
 			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 
@@ -784,9 +826,9 @@ class Mobo_Core_Product_Sync {
 		}
 
 		/*
-		 * Caption/content is intentionally ignored.
-		 * Current API does not provide useful caption/content data.
-		 */
+		* Caption/content is intentionally ignored.
+		* Current API does not provide useful caption/content data.
+		*/
 
 		if ( $is_new_product || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
 			$this->apply_price_to_product( $product, $data, 'product', $is_new_product );
@@ -823,15 +865,25 @@ class Mobo_Core_Product_Sync {
 			$product->set_attributes( $attributes );
 		}
 
+		/*
+		* Mark parent product core data as complete before categories/images.
+		* Categories/images can be retried later; product identity must already exist.
+		*/
+		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
+
 		$product_id = absint( $product->save() );
+
+		if ( $product_id <= 0 ) {
+			return 0;
+		}
 
 		$this->store_product_attribute_guids( $product_id, $this->get_value( $data, 'attributes', array() ) );
 
 		/*
-		 * Categories rule:
-		 * - new product: must get categories/default category.
-		 * - existing product: assign_product_categories internally respects auto-category option.
-		 */
+		* Categories rule:
+		* - new product: must get categories/default category.
+		* - existing product: assign_product_categories internally respects auto-category option.
+		*/
 		$this->category_sync->assign_product_categories(
 			$product_id,
 			$this->get_value( $data, 'productCategories', array() ),
@@ -839,10 +891,10 @@ class Mobo_Core_Product_Sync {
 		);
 
 		/*
-		 * Images rule:
-		 * - new product: always save initial images.
-		 * - existing product: update only when global_update_images is enabled.
-		 */
+		* Images rule:
+		* - new product: always save initial images.
+		* - existing product: update only when global_update_images is enabled.
+		*/
 		if ( ! $skip_images && ( $is_new_product || $this->rules->should_update_images() ) ) {
 			$this->image_sync->process_images(
 				$product_id,
@@ -853,85 +905,143 @@ class Mobo_Core_Product_Sync {
 
 		return $product_id;
 	}
-
+	
+	
 	/**
-	 * Upsert variation.
+ * Upsert variation.
+ *
+ * Critical rule:
+ * variant_guid must be persisted as early as possible.
+ * If host shuts down mid-sync, next run must find the same variation
+ * and continue instead of creating duplicate variations.
+ *
+ * Create vs update rule:
+ * - New variation: always save initial core fields.
+ * - Existing variation: respect legacy auto-update options.
+ *
+ * @param WC_Product $parent Parent product.
+ * @param array      $data Variant data.
+ * @return int
+ */
+private function upsert_variation( $parent, $data ) {
+	if ( ! $parent instanceof WC_Product ) {
+		return 0;
+	}
+
+	$parent_id    = absint( $parent->get_id() );
+	$variant_guid = sanitize_text_field( (string) $this->get_value( $data, 'variantId', '' ) );
+
+	if ( $parent_id <= 0 || '' === $variant_guid ) {
+		return 0;
+	}
+
+	$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
+
+	$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
+	$is_new_variation = $variation_id <= 0;
+
+	if ( $variation_id > 0 ) {
+		$variation = wc_get_product( $variation_id );
+
+		if ( ! $variation instanceof WC_Product_Variation ) {
+			$variation = new WC_Product_Variation( $variation_id );
+		}
+	} else {
+		$variation = new WC_Product_Variation();
+	}
+
+	/*
+	 * Critical early persistence:
 	 *
-	 * Create vs update rule:
-	 * - New variation: always save initial core fields.
-	 * - Existing variation: respect legacy auto-update options.
-	 *
-	 * @param WC_Product $parent Parent product.
-	 * @param array      $data Variant data.
-	 * @return int
+	 * Save variant_guid as soon as possible.
+	 * If host times out/shuts down after this point, the next sync can find
+	 * and continue updating the same variation instead of creating duplicate.
 	 */
-	private function upsert_variation( $parent, $data ) {
-		if ( ! $parent instanceof WC_Product ) {
-			return 0;
-		}
+	if ( $is_new_variation ) {
+		$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 
-		$parent_id    = absint( $parent->get_id() );
-		$variant_guid = sanitize_text_field( (string) $this->get_value( $data, 'variantId', '' ) );
-
-		if ( $parent_id <= 0 || '' === $variant_guid ) {
-			return 0;
-		}
-
-		$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
-		$is_new_variation = $variation_id <= 0;
-
-		if ( $variation_id > 0 ) {
-			$variation = wc_get_product( $variation_id );
-
-			if ( ! $variation instanceof WC_Product_Variation ) {
-				$variation = new WC_Product_Variation( $variation_id );
-			}
-		} else {
-			$variation = new WC_Product_Variation();
+		if ( '' === $initial_title ) {
+			$initial_title = 'Mobo Variant ' . $variant_guid;
 		}
 
 		$variation->set_parent_id( $parent_id );
 		$variation->set_status( 'publish' );
-
-		if ( $is_new_variation || $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
-
-			if ( '' !== $title ) {
-				$variation->set_name( $title );
-			}
-		}
-
-		if ( $is_new_variation || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-			$this->apply_price_to_product( $variation, $data, 'variation', $is_new_variation );
-		}
-
-		if ( $is_new_variation || $this->rules->should_update_stock() ) {
-			$this->apply_api_stock(
-				$variation,
-				$this->get_value( $data, 'stock', null )
-			);
-		}
-
-		/*
-		 * Variation attributes are always applied when present.
-		 * Without attributes, variation matching/display can break.
-		 */
-		$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
-
-		if ( ! empty( $attrs ) ) {
-			$variation->set_attributes( $attrs );
-		}
-
-		$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
+		$variation->set_name( $initial_title );
 
 		$variation->update_meta_data( 'variant_guid', $variant_guid );
+		$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
 
 		if ( '' !== $product_guid ) {
 			$variation->update_meta_data( 'product_guid', $product_guid );
 		}
 
-		return absint( $variation->save() );
+		$variation_id = absint( $variation->save() );
+
+		if ( $variation_id <= 0 ) {
+			return 0;
+		}
+
+		$variation = wc_get_product( $variation_id );
+
+		if ( ! $variation instanceof WC_Product_Variation ) {
+			return 0;
+		}
+	} else {
+		$variation->set_parent_id( $parent_id );
+		$variation->set_status( 'publish' );
+
+		$variation->update_meta_data( 'variant_guid', $variant_guid );
+		$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
+
+		if ( '' !== $product_guid ) {
+			$variation->update_meta_data( 'product_guid', $product_guid );
+		}
+
+		/*
+		 * Persist the incomplete marker immediately for existing variations too.
+		 */
+		$variation->save();
 	}
+
+	if ( $is_new_variation || $this->rules->should_update_title() ) {
+		$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+
+		if ( '' !== $title ) {
+			$variation->set_name( $title );
+		}
+	}
+
+	if ( $is_new_variation || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+		$this->apply_price_to_product( $variation, $data, 'variation', $is_new_variation );
+	}
+
+	if ( $is_new_variation || $this->rules->should_update_stock() ) {
+		$this->apply_api_stock(
+			$variation,
+			$this->get_value( $data, 'stock', null )
+		);
+	}
+
+	/*
+	 * Variation attributes are always applied when present.
+	 * Without attributes, variation matching/display can break.
+	 */
+	$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
+
+	if ( ! empty( $attrs ) ) {
+		$variation->set_attributes( $attrs );
+	}
+
+	$variation->update_meta_data( 'variant_guid', $variant_guid );
+
+	if ( '' !== $product_guid ) {
+		$variation->update_meta_data( 'product_guid', $product_guid );
+	}
+
+	$variation->update_meta_data( 'mobo_sync_incomplete', '0' );
+
+	return absint( $variation->save() );
+}
 
 	/**
 	 * Ensure product type is compatible with variant count.

@@ -163,114 +163,143 @@ class Mobo_Core_Category_Sync {
 		);
 	}
 
-	/**
-	 * Create or update one WooCommerce product category.
-	 *
-	 * Mapping:
-	 * id       -> category_guid
-	 * title    -> term name
-	 * url      -> slug
-	 * parentId -> parent category_guid
-	 *
-	 * @param array $category_data Category payload.
-	 * @return array
-	 */
-	public function upsert_category( $category_data ) {
-		$category_guid = $this->get_category_guid( $category_data );
-		$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
-		$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
-		$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
+/**
+ * Create or update one WooCommerce product category.
+ *
+ * Critical rule:
+ * category_guid must be persisted immediately after term creation.
+ * If host shuts down mid-sync, next run must find the same category
+ * and continue instead of creating duplicate categories.
+ *
+ * Mapping:
+ * id       -> category_guid
+ * title    -> term name
+ * url      -> slug
+ * parentId -> parent category_guid
+ *
+ * @param array $category_data Category payload.
+ * @return array
+ */
+public function upsert_category( $category_data ) {
+	$category_guid = $this->get_category_guid( $category_data );
+	$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
+	$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
+	$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
 
-		if ( '' === $category_guid ) {
-			return array(
-				'term_id' => 0,
-				'created' => false,
-			);
+	if ( '' === $category_guid ) {
+		return array(
+			'term_id' => 0,
+			'created' => false,
+		);
+	}
+
+	$term_id = $this->find_term_id_by_guid( $category_guid );
+
+	if ( $term_id <= 0 && '' === $title ) {
+		$title = 'Mobo Category ' . $category_guid;
+	}
+
+	$args = array();
+
+	if ( '' !== $title ) {
+		$args['name'] = $title;
+	}
+
+	$slug = $this->slug_from_url( $url );
+
+	if ( '' !== $slug ) {
+		$args['slug'] = $slug;
+	}
+
+	if ( '' !== $parent_guid ) {
+		$parent_term_id = $this->find_term_id_by_guid( $parent_guid );
+
+		if ( $parent_term_id > 0 ) {
+			$args['parent'] = $parent_term_id;
 		}
+	} else {
+		$args['parent'] = 0;
+	}
 
-		$term_id = $this->find_term_id_by_guid( $category_guid );
+	if ( $term_id > 0 ) {
+		update_term_meta( $term_id, 'category_guid', $category_guid );
+		update_term_meta( $term_id, 'mobo_sync_incomplete', '1' );
 
-		if ( $term_id <= 0 && '' === $title ) {
-			return array(
-				'term_id' => 0,
-				'created' => false,
-			);
-		}
+		$result = wp_update_term( $term_id, 'product_cat', $args );
 
-		$args = array();
-
-		if ( '' !== $title ) {
-			$args['name'] = $title;
-		}
-
-		$slug = $this->slug_from_url( $url );
-
-		if ( '' !== $slug ) {
-			$args['slug'] = $slug;
-		}
-
-		if ( '' !== $parent_guid ) {
-			$parent_term_id = $this->find_term_id_by_guid( $parent_guid );
-
-			if ( $parent_term_id > 0 ) {
-				$args['parent'] = $parent_term_id;
-			}
-		} else {
-			$args['parent'] = 0;
-		}
-
-		if ( $term_id > 0 ) {
+		if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
+			unset( $args['slug'] );
 			$result = wp_update_term( $term_id, 'product_cat', $args );
+		}
 
-			if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
-				unset( $args['slug'] );
-				$result = wp_update_term( $term_id, 'product_cat', $args );
-			}
-
-			if ( is_wp_error( $result ) ) {
-				return array(
-					'term_id' => $term_id,
-					'created' => false,
-				);
-			}
-
-			$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
-
+		if ( is_wp_error( $result ) ) {
 			return array(
 				'term_id' => $term_id,
 				'created' => false,
 			);
 		}
 
-		$insert_args = $args;
-
-		if ( empty( $insert_args['name'] ) ) {
-			$insert_args['name'] = $category_guid;
-		}
-
-		$result = wp_insert_term( $insert_args['name'], 'product_cat', $insert_args );
-
-		if ( is_wp_error( $result ) && isset( $insert_args['slug'] ) ) {
-			unset( $insert_args['slug'] );
-			$result = wp_insert_term( $insert_args['name'], 'product_cat', $insert_args );
-		}
-
-		if ( is_wp_error( $result ) || empty( $result['term_id'] ) ) {
-			return array(
-				'term_id' => 0,
-				'created' => false,
-			);
-		}
-
-		$term_id = absint( $result['term_id'] );
-
 		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+		update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
 
 		return array(
 			'term_id' => $term_id,
-			'created' => true,
+			'created' => false,
 		);
 	}
+
+	/*
+	 * Critical early creation:
+	 * Create a minimal term first, then immediately persist category_guid.
+	 */
+	$insert_name = '' !== $title ? $title : 'Mobo Category ' . $category_guid;
+
+	$insert_args = array();
+
+	if ( isset( $args['slug'] ) ) {
+		$insert_args['slug'] = $args['slug'];
+	}
+
+	$result = wp_insert_term( $insert_name, 'product_cat', $insert_args );
+
+	if ( is_wp_error( $result ) && isset( $insert_args['slug'] ) ) {
+		unset( $insert_args['slug'] );
+		$result = wp_insert_term( $insert_name, 'product_cat', $insert_args );
+	}
+
+	if ( is_wp_error( $result ) || empty( $result['term_id'] ) ) {
+		return array(
+			'term_id' => 0,
+			'created' => false,
+		);
+	}
+
+	$term_id = absint( $result['term_id'] );
+
+	/*
+	 * Persist GUID immediately after term exists.
+	 */
+	update_term_meta( $term_id, 'category_guid', $category_guid );
+	update_term_meta( $term_id, 'mobo_sync_incomplete', '1' );
+
+	/*
+	 * Now safely apply full data including parent.
+	 */
+	$result = wp_update_term( $term_id, 'product_cat', $args );
+
+	if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
+		unset( $args['slug'] );
+		$result = wp_update_term( $term_id, 'product_cat', $args );
+	}
+
+	$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+	update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
+
+	return array(
+		'term_id' => $term_id,
+		'created' => true,
+	);
+}
 
 	/**
 	 * Find product category term by category_guid.
