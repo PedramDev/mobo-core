@@ -1,6 +1,13 @@
 <?php
 /**
  * Migration helper.
+ *
+ * Responsibilities:
+ * - create missing defaults
+ * - ensure webhook directories exist and are protected
+ * - delete old webhook JSON files only on activation/install
+ *
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -12,17 +19,24 @@ class Mobo_Core_Migration {
 	/**
 	 * Activation hook.
 	 *
+	 * Runs on plugin activation/install.
+	 * This is the only place where webhook JSON files are deleted.
+	 *
 	 * @return void
 	 */
 	public static function activate() {
 		self::ensure_defaults();
 		self::ensure_webhook_dirs();
 		self::delete_webhook_json_files();
+
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 	}
 
 	/**
-	 * Maybe run migration.
+	 * Run lightweight migrations if version changed.
+	 *
+	 * Important:
+	 * This method does not delete queued webhook JSON files.
 	 *
 	 * @return void
 	 */
@@ -37,15 +51,18 @@ class Mobo_Core_Migration {
 		self::ensure_webhook_dirs();
 
 		/*
-		 * Do not delete webhook files on normal version migration.
-		 * JSON cleanup is only on activation/install.
+		 * Cleanup old beta option if it exists.
+		 * WP-Cron is not used in final architecture.
 		 */
+		delete_option( 'mobo_core_enable_wp_cron' );
 
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 	}
 
 	/**
-	 * Add missing defaults only.
+	 * Add missing default options only.
+	 *
+	 * Existing customer settings are never overwritten.
 	 *
 	 * @return void
 	 */
@@ -58,7 +75,7 @@ class Mobo_Core_Migration {
 	}
 
 	/**
-	 * Ensure webhook dirs.
+	 * Ensure webhook directories exist and are protected.
 	 *
 	 * @return void
 	 */
@@ -68,7 +85,7 @@ class Mobo_Core_Migration {
 	}
 
 	/**
-	 * Protect directory.
+	 * Protect directory with index.php and .htaccess.
 	 *
 	 * @param string $dir Directory.
 	 * @return void
@@ -94,7 +111,7 @@ class Mobo_Core_Migration {
 	/**
 	 * Delete all JSON files inside webhook-files recursively.
 	 *
-	 * Runs on plugin activation/install only.
+	 * Runs only on activation/install.
 	 *
 	 * @return void
 	 */

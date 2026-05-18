@@ -1,6 +1,11 @@
 <?php
 /**
  * Runtime lock helper.
+ *
+ * Uses transients to prevent concurrent execution.
+ * This is important because C# may call endpoints repeatedly.
+ *
+ * PHP 7.4 compatible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -10,40 +15,96 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Lock {
 
 	/**
-	 * Acquire lock.
+	 * Acquire a named lock.
 	 *
 	 * @param string $name Lock name.
-	 * @param int    $ttl TTL seconds.
-	 * @return string|false
+	 * @param int    $ttl TTL in seconds.
+	 * @return string|false Lock token or false.
 	 */
-	public static function acquire( $name, $ttl ) {
-		$name  = sanitize_key( $name );
-		$ttl   = max( 5, absint( $ttl ) );
-		$key   = 'mobo_core_lock_' . $name;
+	public static function acquire( $name, $ttl = 30 ) {
+		$name = sanitize_key( (string) $name );
+		$ttl  = max( 5, absint( $ttl ) );
+
+		if ( '' === $name ) {
+			return false;
+		}
+
+		$key   = self::key( $name );
 		$token = wp_generate_uuid4();
 
-		if ( get_transient( $key ) ) {
+		$current = get_transient( $key );
+
+		if ( false !== $current && '' !== $current ) {
 			return false;
 		}
 
 		set_transient( $key, $token, $ttl );
 
+		/*
+		 * Verify ownership.
+		 * This reduces race-condition risk on object-cache backed installs.
+		 */
+		$stored = get_transient( $key );
+
+		if ( $stored !== $token ) {
+			return false;
+		}
+
 		return $token;
 	}
 
 	/**
-	 * Release lock.
+	 * Release a named lock.
 	 *
 	 * @param string $name Lock name.
 	 * @param string $token Lock token.
-	 * @return void
+	 * @return bool
 	 */
 	public static function release( $name, $token ) {
-		$name = sanitize_key( $name );
-		$key  = 'mobo_core_lock_' . $name;
+		$name  = sanitize_key( (string) $name );
+		$token = sanitize_text_field( (string) $token );
 
-		if ( get_transient( $key ) === $token ) {
-			delete_transient( $key );
+		if ( '' === $name || '' === $token ) {
+			return false;
 		}
+
+		$key    = self::key( $name );
+		$stored = get_transient( $key );
+
+		if ( $stored !== $token ) {
+			return false;
+		}
+
+		delete_transient( $key );
+
+		return true;
+	}
+
+	/**
+	 * Force delete a lock.
+	 *
+	 * Use only for admin/debug cleanup.
+	 *
+	 * @param string $name Lock name.
+	 * @return void
+	 */
+	public static function force_release( $name ) {
+		$name = sanitize_key( (string) $name );
+
+		if ( '' === $name ) {
+			return;
+		}
+
+		delete_transient( self::key( $name ) );
+	}
+
+	/**
+	 * Build transient key.
+	 *
+	 * @param string $name Lock name.
+	 * @return string
+	 */
+	private static function key( $name ) {
+		return 'mobo_core_lock_' . sanitize_key( (string) $name );
 	}
 }
