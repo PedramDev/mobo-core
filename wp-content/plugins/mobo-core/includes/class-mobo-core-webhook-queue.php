@@ -137,6 +137,10 @@ class Mobo_Core_Webhook_Queue {
 			$item = $this->read_file( $file );
 
 			if ( is_wp_error( $item ) ) {
+				/*
+				* Invalid JSON can never be processed.
+				* Move it away and continue to the next file.
+				*/
 				$this->move_to_failed( $file, 'invalid-json' );
 				$failed++;
 				$messages[] = 'یک فایل وب‌هوک نامعتبر به failed منتقل شد.';
@@ -146,6 +150,10 @@ class Mobo_Core_Webhook_Queue {
 			$item = $this->normalize_queue_item( $item, $file );
 
 			if ( empty( $item['event'] ) || empty( $item['payload'] ) || ! is_array( $item['payload'] ) ) {
+				/*
+				* Invalid envelope can never be processed.
+				* Move it away and continue to the next file.
+				*/
 				$this->move_to_failed( $file, 'invalid-envelope' );
 				$failed++;
 				$messages[] = 'ساختار فایل وب‌هوک نامعتبر بود.';
@@ -153,6 +161,10 @@ class Mobo_Core_Webhook_Queue {
 			}
 
 			if ( ! empty( $item['expiresAt'] ) && time() > absint( $item['expiresAt'] ) ) {
+				/*
+				* Expired item is no longer valid.
+				* Move it away and continue to the next file.
+				*/
 				$this->move_to_failed( $file, 'expired' );
 				$failed++;
 				$messages[] = 'یک وب‌هوک منقضی شد و به failed منتقل شد.';
@@ -188,9 +200,24 @@ class Mobo_Core_Webhook_Queue {
 
 				$processed++;
 				$messages[] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'وب‌هوک پردازش شد.';
+
 				continue;
 			}
 
+			/*
+			* Business/processing failure.
+			*
+			* Important:
+			* Queue is ordered. Later files may depend on this file.
+			* Example:
+			* - ProductUpdated fails
+			* - UpdateVariant for the same product must NOT run
+			*
+			* Therefore:
+			* - keep current file in queue
+			* - increment try
+			* - stop this queue run
+			*/
 			$item['try']       = absint( $item['try'] ) + 1;
 			$item['updatedAt'] = time();
 			$item['lastError'] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'Webhook processing failed.';
@@ -198,16 +225,28 @@ class Mobo_Core_Webhook_Queue {
 			$max_try = Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 );
 
 			if ( $item['try'] >= $max_try ) {
+				/*
+				* This file is blocking the ordered queue and reached max tries.
+				* Move it to failed, then stop this run.
+				*
+				* We intentionally do NOT continue in the same run. The next run can
+				* continue with the next ordered file after the failed blocker is moved.
+				*/
 				$this->write_item( $file, $item );
 				$this->move_to_failed( $file, 'max-try' );
+
 				$failed++;
-				$messages[] = 'یک وب‌هوک پس از چند تلاش ناموفق به failed منتقل شد.';
-				continue;
+				$messages[] = 'یک وب‌هوک پس از چند تلاش ناموفق به failed منتقل شد. پردازش صف در این اجرا متوقف شد.';
+
+				break;
 			}
 
 			$this->write_item( $file, $item );
+
 			$failed++;
-			$messages[] = 'پردازش وب‌هوک ناموفق بود و برای تلاش بعدی در صف ماند.';
+			$messages[] = 'پردازش وب‌هوک ناموفق بود و برای تلاش بعدی در صف ماند. پردازش فایل‌های بعدی متوقف شد.';
+
+			break;
 		}
 
 		return array(
@@ -255,7 +294,7 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
-	 * Get queue files sorted by created time.
+	 * Get queue files sorted by filename.
 	 *
 	 * @return array
 	 */
@@ -272,21 +311,21 @@ class Mobo_Core_Webhook_Queue {
 			return array();
 		}
 
-		usort(
+		$files = array_filter(
 			$files,
-			function ( $a, $b ) {
-				$at = filemtime( $a );
-				$bt = filemtime( $b );
-
-				if ( $at === $bt ) {
-					return strcmp( basename( $a ), basename( $b ) );
-				}
-
-				return $at < $bt ? -1 : 1;
+			static function ( $file ) {
+				return is_string( $file ) && is_file( $file ) && is_readable( $file );
 			}
 		);
 
-		return $files;
+		usort(
+			$files,
+			static function ( $a, $b ) {
+				return strnatcasecmp( basename( $a ), basename( $b ) );
+			}
+		);
+
+		return array_values( $files );
 	}
 
 	/**
@@ -425,14 +464,36 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
-	 * Build queue filename.
+	 * Build sortable queue filename.
+	 *
+	 * Filename starts with UTC microtime so files are processed in receive order
+	 * when queue files are sorted by filename.
 	 *
 	 * @param string $event Event.
-	 * @param string $id ID.
+	 * @param string $id ID, usually webhook id / product id / sync id.
 	 * @return string
 	 */
 	private function build_filename( $event, $id ) {
-		return gmdate( 'Y-m-d_H-i-s' ) . '--' . sanitize_file_name( $event ) . '--' . sanitize_file_name( $id ) . '.json';
+		$microtime = microtime( true );
+		$seconds   = (int) floor( $microtime );
+		$micro     = (int) round( ( $microtime - $seconds ) * 1000000 );
+
+		$prefix = gmdate( 'Ymd-His', $seconds ) . '-' . str_pad( (string) $micro, 6, '0', STR_PAD_LEFT );
+
+		$event = sanitize_file_name( sanitize_key( (string) $event ) );
+		$id    = sanitize_file_name( sanitize_text_field( (string) $id ) );
+
+		if ( '' === $event ) {
+			$event = 'webhook';
+		}
+
+		if ( '' === $id ) {
+			$id = 'no-id';
+		}
+
+		$random = wp_generate_password( 8, false, false );
+
+		return $prefix . '--' . $event . '--' . $id . '--' . $random . '.json';
 	}
 
 	/**
@@ -510,5 +571,27 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		return $default;
+	}
+
+	/**
+	 * Convert mixed value to boolean.
+	 *
+	 * @param mixed $value Value.
+	 * @return bool
+	 */
+	private function to_bool( $value ) {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		if ( is_numeric( $value ) ) {
+			return (int) $value === 1;
+		}
+
+		if ( is_string( $value ) ) {
+			return in_array( strtolower( trim( $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+		}
+
+		return ! empty( $value );
 	}
 }
