@@ -688,6 +688,8 @@ class Mobo_Core_Admin {
 							<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
 							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض در حالت غیرفعال بودن دسته‌بندی اتوماتیک', 'mobo_default_category_id' ); ?>
 
+							<?php $this->textarea_field( 'محصولات مستثنی از همگام‌سازی', 'mobo_core_excluded_product_urls', 'هر خط یک آدرس محصول. اگر آدرس محصول در این لیست باشد، محصول ساخته یا بروزرسانی نمی‌شود.' ); ?>
+
 							<div class="mobo-section-title">قیمت‌گذاری</div>
 
 							<?php $this->pricing_rules_ui(); ?>
@@ -1121,6 +1123,27 @@ class Mobo_Core_Admin {
 				این دسته فقط زمانی استفاده می‌شود که «آپدیت اتوماتیک دسته‌بندی‌های محصول» خاموش باشد.
 				اگر آپدیت اتوماتیک دسته‌بندی فعال باشد، دسته‌بندی‌های ارسال‌شده از موبو استفاده می‌شوند و این مقدار نادیده گرفته می‌شود.
 			</div>
+		</div>
+		<?php
+	}
+
+	private function textarea_field( $label, $key, $help = '' ) {
+		$value = (string) Mobo_Core_Settings::get( $key, '' );
+		?>
+		<div class="mobo-field">
+			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
+
+			<textarea
+				id="<?php echo esc_attr( $key ); ?>"
+				name="<?php echo esc_attr( $key ); ?>"
+				rows="7"
+				dir="ltr"
+				style="width:100%; font-family:monospace;"
+			><?php echo esc_textarea( $value ); ?></textarea>
+
+			<?php if ( '' !== $help ) : ?>
+				<div class="mobo-help"><?php echo esc_html( $help ); ?></div>
+			<?php endif; ?>
 		</div>
 		<?php
 	}

@@ -47,6 +47,8 @@ class Mobo_Core_Settings {
 			'mobo_core_variants_per_page'         => 5,
 			'mobo_core_images_per_run'            => 1,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
+
+			'mobo_core_excluded_product_urls' => '',
 		);
 	}
 
@@ -122,6 +124,14 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'global_product_auto_slug' );
 		self::save_bool( $post, 'global_update_categories' );
 		self::save_bool( $post, 'global_update_images' );
+
+		if ( isset( $_POST['mobo_core_excluded_product_urls'] ) ) {
+			update_option(
+				'mobo_core_excluded_product_urls',
+				sanitize_textarea_field( wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) ),
+				false
+			);
+		}
 
 		update_option(
 			'mobo_default_category_id',

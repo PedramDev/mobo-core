@@ -331,6 +331,22 @@ class Mobo_Core_Product_Sync {
 				return $this->result( true, 'محصول نامعتبر رد شد.', $this->get_manual_sync_status() );
 			}
 
+			if ( $this->should_skip_product_by_url( $product_data ) ) {
+				$skipped_url = sanitize_text_field( (string) $this->get_value( $product_data, 'url', '' ) );
+
+				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
+				$state['lastError']         = '';
+				$state['lastMessage']       = 'محصول به دلیل قرار داشتن آدرس در لیست عدم همگام‌سازی رد شد: ' . $skipped_url;
+
+				$this->save_manual_sync_state( $state );
+
+				return $this->result(
+					true,
+					$state['lastMessage'],
+					$this->get_manual_sync_status()
+				);
+			}
+
 			$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
 			$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
 
@@ -533,6 +549,33 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_data = $items[ $product_index ];
+		if ( $this->should_skip_product_by_url( $product_data ) ) {
+			$product_index++;
+
+			$payload['_moboProductIndex'] = $product_index;
+			$payload['_moboImageOffset']  = 0;
+
+			if ( $product_index < count( $items ) ) {
+				return $this->result(
+					true,
+					'ProductUpdated skipped excluded product; products remaining.',
+					array(
+						'deleteFile' => false,
+					)
+				);
+			}
+
+			unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+
+			return $this->result(
+				true,
+				'ProductUpdated skipped excluded product.',
+				array(
+					'deleteFile' => true,
+				)
+			);
+		}
+
 		$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
 		$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
 
@@ -1422,4 +1465,95 @@ class Mobo_Core_Product_Sync {
 			'data'    => is_array( $data ) ? $data : array(),
 		);
 	}
+
+	/**
+ * Check if product should be excluded by URL.
+ *
+ * @param array $product_data Product payload.
+ * @return bool
+ */
+private function should_skip_product_by_url( $product_data ) {
+	$product_url = sanitize_text_field( (string) $this->get_value( $product_data, 'url', '' ) );
+
+	if ( '' === $product_url ) {
+		return false;
+	}
+
+	$product_url = $this->normalize_product_url_for_exclusion( $product_url );
+
+	if ( '' === $product_url ) {
+		return false;
+	}
+
+	$excluded_urls = $this->get_excluded_product_urls();
+
+	return in_array( $product_url, $excluded_urls, true );
+}
+
+/**
+ * Get excluded product URLs from settings.
+ *
+ * @return array
+ */
+private function get_excluded_product_urls() {
+	$raw = (string) get_option( 'mobo_core_excluded_product_urls', '' );
+
+	if ( '' === trim( $raw ) ) {
+		return array();
+	}
+
+	$lines = preg_split( '/\r\n|\r|\n/', $raw );
+
+	if ( ! is_array( $lines ) ) {
+		return array();
+	}
+
+	$urls = array();
+
+	foreach ( $lines as $line ) {
+		$url = $this->normalize_product_url_for_exclusion( $line );
+
+		if ( '' !== $url ) {
+			$urls[] = $url;
+		}
+	}
+
+	return array_values( array_unique( $urls ) );
+}
+
+/**
+ * Normalize product URL/path for exclusion matching.
+ *
+ * Examples:
+ * https://example.com/products/test/ => /products/test
+ * /products/test/                    => /products/test
+ * products/test                      => /products/test
+ *
+ * @param string $url URL or path.
+ * @return string
+ */
+private function normalize_product_url_for_exclusion( $url ) {
+	$url = trim( sanitize_text_field( (string) $url ) );
+
+	if ( '' === $url ) {
+		return '';
+	}
+
+	$path = wp_parse_url( $url, PHP_URL_PATH );
+
+	if ( ! is_string( $path ) || '' === $path ) {
+		$path = $url;
+	}
+
+	$path = trim( $path );
+
+	if ( '' === $path ) {
+		return '';
+	}
+
+	$path = '/' . ltrim( $path, '/' );
+	$path = untrailingslashit( $path );
+
+	return strtolower( $path );
+}
 }
