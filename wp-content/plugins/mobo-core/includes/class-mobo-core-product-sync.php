@@ -236,6 +236,8 @@ class Mobo_Core_Product_Sync {
 				}
 
 				$category_result = $this->category_sync->sync_categories_payload( $response );
+				
+				update_option( 'mobo_core_categories_last_sync_at', time(), false );
 
 				$state['categorySynced'] = true;
 				$state['lastError']      = '';
@@ -720,6 +722,98 @@ class Mobo_Core_Product_Sync {
 				'updated'     => $updated,
 				'skipped'     => $skipped,
 				'isLastPage'  => $is_last_page,
+			)
+		);
+	}
+
+	/**
+	 * Ensure categories are synced if refresh interval has passed.
+	 *
+	 * This is intended to be called by C# through REST.
+	 * It does not rely on WP-Cron.
+	 *
+	 * @param string $sync_id Optional sync ID.
+	 * @param bool   $force Force sync.
+	 * @return array
+	 */
+	public function ensure_categories_synced_if_due( $sync_id = '', $force = false ) {
+		if ( ! $this->rules->should_update_categories() ) {
+			return $this->result(
+				true,
+				'آپدیت اتوماتیک دسته‌بندی‌ها غیرفعال است.',
+				array(
+					'skipped'  => true,
+					'reason'   => 'disabled',
+					'synced'   => false,
+					'forced'   => (bool) $force,
+				)
+			);
+		}
+
+		$sync_id = sanitize_text_field( (string) $sync_id );
+
+		if ( '' === $sync_id ) {
+			$sync_id = 'category-refresh-' . gmdate( 'YmdHis' );
+		}
+
+		$last_sync_at = absint( get_option( 'mobo_core_categories_last_sync_at', 0 ) );
+
+		$interval_hours = absint( get_option( 'mobo_core_categories_refresh_interval_hours', 12 ) );
+
+		if ( $interval_hours <= 0 ) {
+			$interval_hours = 12;
+		}
+
+		$interval_seconds = $interval_hours * HOUR_IN_SECONDS;
+		$now              = time();
+
+		if ( ! $force && $last_sync_at > 0 && ( $now - $last_sync_at ) < $interval_seconds ) {
+			return $this->result(
+				true,
+				'هنوز زمان بروزرسانی دوره‌ای دسته‌بندی‌ها نرسیده است.',
+				array(
+					'skipped'        => true,
+					'reason'         => 'not-due',
+					'synced'         => false,
+					'forced'         => false,
+					'lastSyncAt'     => $last_sync_at,
+					'nextSyncAt'     => $last_sync_at + $interval_seconds,
+					'intervalHours'  => $interval_hours,
+				)
+			);
+		}
+
+		$api      = new Mobo_Core_API_Client();
+		$response = $api->get_categories( $sync_id );
+
+		if ( is_wp_error( $response ) ) {
+			return $this->result(
+				false,
+				$response->get_error_message(),
+				array(
+					'skipped' => false,
+					'synced'  => false,
+					'forced'  => (bool) $force,
+				)
+			);
+		}
+
+		$category_result = $this->category_sync->sync_categories_payload( $response );
+
+		update_option( 'mobo_core_categories_last_sync_at', $now, false );
+
+		return $this->result(
+			true,
+			'دسته‌بندی‌ها بروزرسانی شدند.',
+			array(
+				'skipped'       => false,
+				'synced'        => true,
+				'forced'        => (bool) $force,
+				'lastSyncAt'    => $now,
+				'intervalHours' => $interval_hours,
+				'created'       => absint( $category_result['created'] ),
+				'updated'       => absint( $category_result['updated'] ),
+				'skippedItems'  => absint( $category_result['skipped'] ),
 			)
 		);
 	}

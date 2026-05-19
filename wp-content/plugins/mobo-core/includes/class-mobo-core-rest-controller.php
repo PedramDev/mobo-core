@@ -35,6 +35,17 @@ class Mobo_Core_Rest_Controller {
 	 * @return void
 	 */
 	public function register_routes() {
+		
+		register_rest_route(
+			'mobo-core/v1',
+			'/categories/ensure-sync',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'ensure_categories_sync' ),
+				'permission_callback' => array( $this, 'permission_callback' ),
+			)
+		);
+
 		register_rest_route(
 			'mobo-core/v1',
 			'/webhook',
@@ -131,6 +142,22 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Ensure categories are synced if due.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function ensure_categories_sync( WP_REST_Request $request ) {
+		$sync_id = sanitize_text_field( (string) $request->get_param( 'syncId' ) );
+		$force   = $this->to_bool( $request->get_param( 'force' ) );
+
+		$product_sync = new Mobo_Core_Product_Sync();
+		$result       = $product_sync->ensure_categories_synced_if_due( $sync_id, $force );
+
+		return rest_ensure_response( $result );
 	}
 
 	/**
@@ -312,5 +339,21 @@ class Mobo_Core_Rest_Controller {
 		$sync = new Mobo_Core_Product_Sync();
 
 		return rest_ensure_response( $sync->cancel_manual_sync() );
+	}
+
+	private function to_bool( $value ) {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		if ( is_numeric( $value ) ) {
+			return (int) $value === 1;
+		}
+
+		if ( is_string( $value ) ) {
+			return in_array( strtolower( trim( $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+		}
+
+		return ! empty( $value );
 	}
 }
