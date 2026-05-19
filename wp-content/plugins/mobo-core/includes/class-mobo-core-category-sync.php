@@ -61,10 +61,17 @@ class Mobo_Core_Category_Sync {
 	 * Assign product categories.
 	 *
 	 * Rules:
-	 * - New product + auto categories enabled: API categories.
-	 * - Existing product + auto categories enabled: API categories.
-	 * - New product + auto categories disabled: default category.
-	 * - Existing product + auto categories disabled: do not change categories.
+	 * - Auto enabled + API categories found:
+	 *   assign API categories for new/existing product.
+	 *
+	 * - Auto enabled + API categories not found:
+	 *   assign default category for new/existing product.
+	 *
+	 * - Auto disabled + new product:
+	 *   assign default category.
+	 *
+	 * - Auto disabled + existing product:
+	 *   do not change categories.
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param mixed $categories Product category refs.
@@ -73,8 +80,9 @@ class Mobo_Core_Category_Sync {
 	 * @return array
 	 */
 	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled, $is_new_product = false ) {
-		$product_id     = absint( $product_id );
-		$is_new_product = (bool) $is_new_product;
+		$product_id              = absint( $product_id );
+		$is_new_product          = (bool) $is_new_product;
+		$auto_categories_enabled = (bool) $auto_categories_enabled;
 
 		if ( $product_id <= 0 ) {
 			return array(
@@ -84,6 +92,11 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
+		/*
+		* Auto category update disabled:
+		* - new product gets default category
+		* - existing product must remain unchanged
+		*/
 		if ( ! $auto_categories_enabled ) {
 			if ( $is_new_product ) {
 				return $this->assign_default_category( $product_id );
@@ -96,51 +109,56 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		if ( ! is_array( $categories ) ) {
-			return array(
-				'assigned' => 0,
-				'source'   => 'auto-empty',
-				'changed'  => false,
-			);
-		}
-
+		/*
+		* Auto category update enabled:
+		* Try API categories first.
+		*/
 		$term_ids = array();
 
-		foreach ( $categories as $category_ref ) {
-			if ( ! is_array( $category_ref ) ) {
-				continue;
-			}
+		if ( is_array( $categories ) ) {
+			foreach ( $categories as $category_ref ) {
+				if ( ! is_array( $category_ref ) ) {
+					continue;
+				}
 
-			$category_guid = $this->get_category_guid( $category_ref );
+				$category_guid = $this->get_category_guid( $category_ref );
 
-			if ( '' === $category_guid ) {
-				continue;
-			}
+				if ( '' === $category_guid ) {
+					continue;
+				}
 
-			$term_id = $this->find_term_id_by_guid( $category_guid );
+				$term_id = $this->find_term_id_by_guid( $category_guid );
 
-			if ( $term_id > 0 ) {
-				$term_ids[] = $term_id;
+				if ( $term_id > 0 ) {
+					$term_ids[] = $term_id;
+				}
 			}
 		}
 
 		$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $term_ids ) ) ) );
 
-		if ( empty( $term_ids ) ) {
+		if ( ! empty( $term_ids ) ) {
+			wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
+
 			return array(
-				'assigned' => 0,
-				'source'   => 'auto-no-matching-terms',
-				'changed'  => false,
+				'assigned' => count( $term_ids ),
+				'source'   => 'auto',
+				'changed'  => true,
 			);
 		}
 
-		wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
+		/*
+		* Important fallback:
+		* Auto category is enabled, but API categories were missing/not found.
+		* Use default category in every case.
+		*/
+		$result = $this->assign_default_category( $product_id );
 
-		return array(
-			'assigned' => count( $term_ids ),
-			'source'   => 'auto',
-			'changed'  => true,
-		);
+		if ( ! empty( $result['changed'] ) ) {
+			$result['source'] = 'auto-fallback-default';
+		}
+
+		return $result;
 	}
 
 	public function upsert_category( $category_data ) {

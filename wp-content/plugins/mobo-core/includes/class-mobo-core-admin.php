@@ -686,7 +686,7 @@ class Mobo_Core_Admin {
 							<?php $this->bool_field( 'بروزرسانی خودکار آدرس محصول', 'global_product_auto_slug' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار تصاویر', 'global_update_images' ); ?>
 							<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
-							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض در حالت غیرفعال بودن دسته‌بندی اتوماتیک', 'mobo_default_category_id' ); ?>
+							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض / جایگزین', 'mobo_default_category_id' ); ?>
 
 							<?php $this->textarea_field( 'محصولات مستثنی از همگام‌سازی', 'mobo_core_excluded_product_urls', 'هر خط یک آدرس محصول. اگر آدرس محصول در این لیست باشد، محصول ساخته یا بروزرسانی نمی‌شود.' ); ?>
 
@@ -1090,8 +1090,6 @@ class Mobo_Core_Admin {
 	private function category_dropdown_field( $label, $key ) {
 		$selected = absint( Mobo_Core_Settings::get( $key, 0 ) );
 
-		$auto_categories_enabled = '1' === (string) Mobo_Core_Settings::get( 'global_update_categories', '1' );
-
 		$terms = get_terms(
 			array(
 				'taxonomy'   => 'product_cat',
@@ -1100,11 +1098,7 @@ class Mobo_Core_Admin {
 		);
 
 		?>
-		<div
-			class="mobo-field"
-			id="mobo-default-category-field"
-			style="<?php echo $auto_categories_enabled ? 'display:none;' : ''; ?>"
-		>
+		<div class="mobo-field" id="mobo-default-category-field">
 			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
 
 			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
@@ -1120,8 +1114,8 @@ class Mobo_Core_Admin {
 			</select>
 
 			<div class="mobo-help">
-				این دسته فقط زمانی استفاده می‌شود که «آپدیت اتوماتیک دسته‌بندی‌های محصول» خاموش باشد.
-				اگر آپدیت اتوماتیک دسته‌بندی فعال باشد، دسته‌بندی‌های ارسال‌شده از موبو استفاده می‌شوند و این مقدار نادیده گرفته می‌شود.
+				این دسته زمانی استفاده می‌شود که دسته‌بندی اتوماتیک خاموش باشد و محصول جدید ساخته شود.
+				همچنین اگر دسته‌بندی اتوماتیک روشن باشد اما دسته‌بندی‌های ارسال‌شده از موبو در وردپرس پیدا نشوند، این دسته به عنوان جایگزین اعمال می‌شود.
 			</div>
 		</div>
 		<?php
