@@ -17,22 +17,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Image_Sync {
 
-	/**
-	 * Process product images with offset.
-	 *
-	 * Expected image payload:
-	 * [
-	 *   {
-	 *     "id": "image-guid",
-	 *     "url": "https://example.com/image.webp"
-	 *   }
-	 * ]
-	 *
-	 * @param int   $product_id Product ID.
-	 * @param mixed $images Images.
-	 * @param int   $offset Offset.
-	 * @return array
-	 */
 	public function process_images( $product_id, $images, $offset ) {
 		$product_id = absint( $product_id );
 		$offset     = max( 0, absint( $offset ) );
@@ -86,8 +70,8 @@ class Mobo_Core_Image_Sync {
 				}
 
 				/*
-				* Include every image in gallery, including the featured image.
-				*/
+				 * Product Image must also be included in Product Gallery.
+				 */
 				if ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
 					$gallery_ids[] = $attachment_id;
 				}
@@ -110,11 +94,6 @@ class Mobo_Core_Image_Sync {
 		);
 	}
 
-	/**
-	 * Load WordPress media dependencies.
-	 *
-	 * @return void
-	 */
 	private function load_media_dependencies() {
 		if ( ! function_exists( 'media_sideload_image' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/media.php';
@@ -123,17 +102,6 @@ class Mobo_Core_Image_Sync {
 		}
 	}
 
-	/**
-	 * Download image and attach to product.
-	 *
-	 * Critical rule:
-	 * image_guid/img_guid must be persisted immediately after attachment is created.
-	 *
-	 * @param string $url Image URL.
-	 * @param int    $product_id Product ID.
-	 * @param string $image_guid Image GUID.
-	 * @return int
-	 */
 	private function download_image( $url, $product_id, $image_guid ) {
 		$url        = esc_url_raw( (string) $url );
 		$product_id = absint( $product_id );
@@ -149,10 +117,6 @@ class Mobo_Core_Image_Sync {
 			return $existing_id;
 		}
 
-		/*
-		 * media_sideload_image can fail on some hosts for webp or SSL issues.
-		 * The error is intentionally not exposed to users here.
-		 */
 		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 
 		if ( is_wp_error( $attachment_id ) ) {
@@ -173,15 +137,6 @@ class Mobo_Core_Image_Sync {
 		return $attachment_id;
 	}
 
-	/**
-	 * Sync WooCommerce product object image fields.
-	 *
-	 * This is important because just updating raw meta may not refresh WooCommerce properly.
-	 *
-	 * @param int   $product_id Product ID.
-	 * @param array $gallery_ids Gallery IDs.
-	 * @return void
-	 */
 	private function sync_woocommerce_product_image_objects( $product_id, $gallery_ids ) {
 		$product_id = absint( $product_id );
 
@@ -205,6 +160,8 @@ class Mobo_Core_Image_Sync {
 
 		if ( ! empty( $gallery_ids ) ) {
 			$product->set_gallery_image_ids( $gallery_ids );
+		} else {
+			$product->set_gallery_image_ids( array() );
 		}
 
 		$product->save();
@@ -213,12 +170,6 @@ class Mobo_Core_Image_Sync {
 		clean_post_cache( $product_id );
 	}
 
-	/**
-	 * Find attachment by image_guid or img_guid.
-	 *
-	 * @param string $guid Image GUID.
-	 * @return int
-	 */
 	private function find_attachment_by_guid( $guid ) {
 		$guid = sanitize_text_field( (string) $guid );
 
@@ -235,13 +186,6 @@ class Mobo_Core_Image_Sync {
 		return $id;
 	}
 
-	/**
-	 * Find attachment by meta key/value.
-	 *
-	 * @param string $meta_key Meta key.
-	 * @param string $meta_value Meta value.
-	 * @return int
-	 */
 	private function find_attachment_by_meta( $meta_key, $meta_value ) {
 		$meta_key   = sanitize_key( $meta_key );
 		$meta_value = sanitize_text_field( (string) $meta_value );
@@ -271,12 +215,6 @@ class Mobo_Core_Image_Sync {
 		return ! empty( $query->posts[0] ) ? absint( $query->posts[0] ) : 0;
 	}
 
-	/**
-	 * Get existing gallery IDs.
-	 *
-	 * @param int $product_id Product ID.
-	 * @return array
-	 */
 	private function get_existing_gallery_ids( $product_id ) {
 		$product_id = absint( $product_id );
 
@@ -293,13 +231,6 @@ class Mobo_Core_Image_Sync {
 		return array_values( array_unique( array_filter( array_map( 'absint', explode( ',', $gallery ) ) ) ) );
 	}
 
-	/**
-	 * Save gallery IDs.
-	 *
-	 * @param int   $product_id Product ID.
-	 * @param array $gallery_ids Gallery IDs.
-	 * @return void
-	 */
 	private function save_gallery_ids( $product_id, $gallery_ids ) {
 		$product_id = absint( $product_id );
 
@@ -317,18 +248,6 @@ class Mobo_Core_Image_Sync {
 		update_post_meta( $product_id, '_product_image_gallery', implode( ',', $gallery_ids ) );
 	}
 
-	/**
-	 * Extract image GUID.
-	 *
-	 * Supported keys:
-	 * - id
-	 * - imageId
-	 * - imageGuid
-	 * - guid
-	 *
-	 * @param array $image Image data.
-	 * @return string
-	 */
 	private function get_image_guid( $image ) {
 		$keys = array(
 			'id',
@@ -348,16 +267,6 @@ class Mobo_Core_Image_Sync {
 		return '';
 	}
 
-	/**
-	 * Extract image URL.
-	 *
-	 * Supported keys:
-	 * - url
-	 * - src
-	 *
-	 * @param array $image Image data.
-	 * @return string
-	 */
 	private function get_image_url( $image ) {
 		$keys = array(
 			'url',
@@ -375,14 +284,6 @@ class Mobo_Core_Image_Sync {
 		return '';
 	}
 
-	/**
-	 * Case-tolerant getter.
-	 *
-	 * @param array  $array Source array.
-	 * @param string $key Key.
-	 * @param mixed  $default Default.
-	 * @return mixed
-	 */
 	private function get_value( $array, $key, $default = null ) {
 		if ( ! is_array( $array ) ) {
 			return $default;

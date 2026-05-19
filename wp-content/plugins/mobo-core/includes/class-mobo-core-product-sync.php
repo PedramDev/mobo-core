@@ -26,13 +26,6 @@ class Mobo_Core_Product_Sync {
 		$this->category_sync    = new Mobo_Core_Category_Sync();
 	}
 
-	/**
-	 * Start a new manual product sync.
-	 *
-	 * @param string $sync_id Optional sync ID from C#.
-	 * @param string $source Request source.
-	 * @return array
-	 */
 	public function start_manual_sync( $sync_id = '', $source = 'admin' ) {
 		$sync_id = sanitize_text_field( (string) $sync_id );
 
@@ -49,7 +42,15 @@ class Mobo_Core_Product_Sync {
 
 			'productPage'                  => 1,
 			'productQueue'                 => array(),
+
 			'currentProductGuid'           => '',
+			'currentProductId'             => 0,
+			'currentProductImages'         => array(),
+			'currentProductImageOffset'    => 0,
+			'currentProductWasExisting'    => false,
+			'currentProductImagesDone'     => false,
+			'currentProductCanHaveVariants'=> false,
+
 			'variantPage'                  => 1,
 
 			'productTotalCount'            => 0,
@@ -77,60 +78,6 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
-	/**
-	 * Apply product publish date from API.
-	 *
-	 * Expected payload field:
-	 * publishedAt: ISO-8601 UTC datetime, e.g. 2025-10-15T10:39:00Z
-	 *
-	 * Updates:
-	 * - post_date_gmt
-	 * - post_date
-	 * - post_modified_gmt
-	 * - post_modified
-	 * - published_at meta
-	 *
-	 * @param WC_Product $product Product.
-	 * @param array      $data Product payload.
-	 * @return void
-	 */
-	private function apply_product_dates( $product, $data ) {
-		if ( ! $product instanceof WC_Product ) {
-			return;
-		}
-
-		$published_at = sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) );
-
-		if ( '' === $published_at ) {
-			return;
-		}
-
-		$timestamp = strtotime( $published_at );
-
-		if ( false === $timestamp || $timestamp <= 0 ) {
-			$product->update_meta_data( 'published_at', $published_at );
-			return;
-		}
-
-		$gmt_date   = gmdate( 'Y-m-d H:i:s', $timestamp );
-		$local_date = get_date_from_gmt( $gmt_date, 'Y-m-d H:i:s' );
-
-		$date = new WC_DateTime( '@' . $timestamp );
-		$date->setTimezone( new DateTimeZone( 'UTC' ) );
-
-		$product->set_date_created( $date );
-		$product->set_date_modified( $date );
-
-		$product->update_meta_data( 'published_at', $published_at );
-		$product->update_meta_data( 'mobo_published_at_gmt', $gmt_date );
-		$product->update_meta_data( 'mobo_published_at_local', $local_date );
-	}
-
-	/**
-	 * Cancel current manual sync.
-	 *
-	 * @return array
-	 */
 	public function cancel_manual_sync() {
 		$state = $this->get_manual_sync_state();
 
@@ -148,20 +95,10 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
-	/**
-	 * Reset manual API sync state.
-	 *
-	 * @return void
-	 */
 	public function reset_manual_sync_state() {
 		delete_option( self::STATE_OPTION );
 	}
 
-	/**
-	 * Get manual sync state.
-	 *
-	 * @return array
-	 */
 	public function get_manual_sync_state() {
 		$default = array(
 			'syncId'                       => '',
@@ -172,7 +109,15 @@ class Mobo_Core_Product_Sync {
 
 			'productPage'                  => 1,
 			'productQueue'                 => array(),
+
 			'currentProductGuid'           => '',
+			'currentProductId'             => 0,
+			'currentProductImages'         => array(),
+			'currentProductImageOffset'    => 0,
+			'currentProductWasExisting'    => false,
+			'currentProductImagesDone'     => false,
+			'currentProductCanHaveVariants'=> false,
+
 			'variantPage'                  => 1,
 
 			'productTotalCount'            => 0,
@@ -200,30 +145,13 @@ class Mobo_Core_Product_Sync {
 		return wp_parse_args( $state, $default );
 	}
 
-	/**
-	 * Get public sync status.
-	 *
-	 * @return array
-	 */
 	public function get_manual_sync_status() {
 		$state = $this->get_manual_sync_state();
 
 		$total     = absint( $state['productTotalCount'] );
 		$processed = absint( $state['processedProducts'] );
-
-		$remaining = 0;
-
-		if ( $total > 0 ) {
-			$remaining = max( 0, $total - $processed );
-		}
-
-		$progress = 0;
-
-		if ( $total > 0 ) {
-			$progress = min( 100, round( ( $processed / $total ) * 100, 2 ) );
-		}
-
-		$state['remainingProducts'] = $remaining;
+		$remaining = $total > 0 ? max( 0, $total - $processed ) : 0;
+		$progress  = $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
 
 		$last_error      = sanitize_text_field( (string) $state['lastError'] );
 		$current_status  = sanitize_key( (string) $state['status'] );
@@ -242,7 +170,14 @@ class Mobo_Core_Product_Sync {
 
 			'productPage'                  => absint( $state['productPage'] ),
 			'queuedProducts'               => is_array( $state['productQueue'] ) ? count( $state['productQueue'] ) : 0,
+
 			'currentProductGuid'           => sanitize_text_field( (string) $state['currentProductGuid'] ),
+			'currentProductId'             => absint( $state['currentProductId'] ),
+			'currentProductImageOffset'    => absint( $state['currentProductImageOffset'] ),
+			'currentProductImagesCount'    => is_array( $state['currentProductImages'] ) ? count( $state['currentProductImages'] ) : 0,
+			'currentProductImagesDone'     => (bool) $state['currentProductImagesDone'],
+			'currentProductCanHaveVariants'=> (bool) $state['currentProductCanHaveVariants'],
+
 			'variantPage'                  => absint( $state['variantPage'] ),
 
 			'productTotalCount'            => $total,
@@ -267,13 +202,6 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
-	/**
-	 * Run one manual API sync step.
-	 *
-	 * Called by C# through /sync/run.
-	 *
-	 * @return array
-	 */
 	public function run_manual_sync_step() {
 		$api            = new Mobo_Core_API_Client();
 		$state          = $this->get_manual_sync_state();
@@ -281,31 +209,19 @@ class Mobo_Core_Product_Sync {
 		$variants_limit = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
 
 		if ( 'idle' === $state['status'] || '' === $state['syncId'] ) {
-			return $this->result(
-				false,
-				'همگام‌سازی شروع نشده است. ابتدا /sync/start را صدا بزنید.',
-				$this->get_manual_sync_status()
-			);
+			return $this->result( false, 'همگام‌سازی شروع نشده است.', $this->get_manual_sync_status() );
 		}
 
 		if ( 'cancelled' === $state['status'] ) {
-			return $this->result(
-				false,
-				'همگام‌سازی متوقف شده است.',
-				$this->get_manual_sync_status()
-			);
+			return $this->result( false, 'همگام‌سازی متوقف شده است.', $this->get_manual_sync_status() );
 		}
 
 		if ( 'done' === $state['status'] ) {
-			return $this->result(
-				true,
-				'همگام‌سازی قبلاً کامل شده است.',
-				$this->get_manual_sync_status()
-			);
+			return $this->result( true, 'همگام‌سازی قبلاً کامل شده است.', $this->get_manual_sync_status() );
 		}
 
 		/*
-		 * Step 1: category sync before products, only when enabled.
+		 * Step 1: Sync categories once before products.
 		 */
 		if ( empty( $state['categorySynced'] ) ) {
 			if ( $this->rules->should_update_categories() ) {
@@ -316,11 +232,7 @@ class Mobo_Core_Product_Sync {
 					$state['lastMessage'] = 'خطا در همگام‌سازی دسته‌بندی‌ها.';
 					$this->save_manual_sync_state( $state );
 
-					return $this->result(
-						false,
-						$response->get_error_message(),
-						$this->get_manual_sync_status()
-					);
+					return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
 				}
 
 				$category_result = $this->category_sync->sync_categories_payload( $response );
@@ -336,27 +248,19 @@ class Mobo_Core_Product_Sync {
 
 				$this->save_manual_sync_state( $state );
 
-				return $this->result(
-					true,
-					$state['lastMessage'],
-					$this->get_manual_sync_status()
-				);
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
 			$state['categorySynced'] = true;
 			$state['lastError']      = '';
-			$state['lastMessage']    = 'همگام‌سازی دسته‌بندی غیرفعال است؛ در صورت تنظیم، دسته پیشفرض استفاده می‌شود.';
+			$state['lastMessage']    = 'همگام‌سازی دسته‌بندی غیرفعال است؛ در صورت ایجاد محصول جدید، دسته پیشفرض استفاده می‌شود.';
 			$this->save_manual_sync_state( $state );
 
-			return $this->result(
-				true,
-				$state['lastMessage'],
-				$this->get_manual_sync_status()
-			);
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
 		/*
-		 * Step 2: fetch product page when queue is empty.
+		 * Step 2: Fetch product page when queue is empty and no current product exists.
 		 */
 		if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
 			$response = $api->get_products_page(
@@ -370,11 +274,7 @@ class Mobo_Core_Product_Sync {
 				$state['lastMessage'] = 'خطا در دریافت صفحه محصولات.';
 				$this->save_manual_sync_state( $state );
 
-				return $this->result(
-					false,
-					$response->get_error_message(),
-					$this->get_manual_sync_status()
-				);
+				return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
 			}
 
 			$items       = $this->get_value( $response, 'data', array() );
@@ -409,55 +309,127 @@ class Mobo_Core_Product_Sync {
 				$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 				$this->save_manual_sync_state( $state );
 
-				return $this->result(
-					true,
-					'همگام‌سازی محصولات کامل شد.',
-					$this->get_manual_sync_status()
-				);
+				return $this->result( true, 'همگام‌سازی محصولات کامل شد.', $this->get_manual_sync_status() );
 			}
+
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, 'صفحه محصولات دریافت شد.', $this->get_manual_sync_status() );
 		}
 
 		/*
-		 * Step 3: upsert one parent product.
+		 * Step 3: Upsert one parent product.
 		 */
 		if ( '' === $state['currentProductGuid'] ) {
 			$product_data = array_shift( $state['productQueue'] );
-			$product_id   = $this->upsert_parent_product( $product_data, false );
+
+			if ( ! is_array( $product_data ) ) {
+				$state['lastError']   = '';
+				$state['lastMessage'] = 'محصول نامعتبر رد شد.';
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, 'محصول نامعتبر رد شد.', $this->get_manual_sync_status() );
+			}
+
+			$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+			$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
+
+			/*
+			 * In manual sync, images are processed as separate chunks after parent save.
+			 */
+			$product_id = $this->upsert_parent_product( $product_data, true );
 
 			if ( $product_id <= 0 ) {
 				$state['lastError']   = '';
 				$state['lastMessage'] = 'محصول نامعتبر رد شد.';
 				$this->save_manual_sync_state( $state );
 
-				return $this->result(
-					true,
-					'محصول نامعتبر رد شد.',
-					$this->get_manual_sync_status()
-				);
+				return $this->result( true, 'محصول نامعتبر رد شد.', $this->get_manual_sync_status() );
 			}
 
-			$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+			$state['currentProductGuid']            = $product_guid;
+			$state['currentProductId']              = absint( $product_id );
+			$state['currentProductImages']          = $this->get_product_images_from_payload( $product_data );
+			$state['currentProductImageOffset']     = 0;
+			$state['currentProductWasExisting']     = $was_existing;
+			$state['currentProductImagesDone']      = false;
+			$state['currentProductCanHaveVariants'] = $this->product_has_variation_attributes( $product_data );
 
-			$state['currentProductGuid']           = $product_guid;
-			$state['variantPage']                  = 1;
-			$state['currentVariantTotalCount']     = 0;
-			$state['currentVariantTotalPages']     = 0;
-			$state['currentVariantProcessedPages'] = 0;
-			$state['lastError']                    = '';
-			$state['lastMessage']                  = 'محصول اصلی همگام شد: ' . $product_guid;
+			$state['variantPage']                   = 1;
+			$state['currentVariantTotalCount']      = 0;
+			$state['currentVariantTotalPages']      = 0;
+			$state['currentVariantProcessedPages']  = 0;
+			$state['lastError']                     = '';
+			$state['lastMessage']                   = 'محصول اصلی همگام شد: ' . $product_guid;
 
 			$this->reset_seen_variants( $product_guid, $state['syncId'] );
 			$this->save_manual_sync_state( $state );
 
-			return $this->result(
-				true,
-				$state['lastMessage'],
-				$this->get_manual_sync_status()
-			);
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
 		/*
-		 * Step 4: sync one variants page for current product.
+		 * Step 4: Process product images in chunks before variants/simple finish.
+		 */
+		if ( empty( $state['currentProductImagesDone'] ) ) {
+			$product_id   = absint( $state['currentProductId'] );
+			$images       = is_array( $state['currentProductImages'] ) ? $state['currentProductImages'] : array();
+			$image_offset = absint( $state['currentProductImageOffset'] );
+			$was_existing = ! empty( $state['currentProductWasExisting'] );
+
+			$should_process_images = $product_id > 0 && ! empty( $images ) && ( ! $was_existing || $this->rules->should_update_images() );
+
+			if ( $should_process_images ) {
+				$image_result = $this->image_sync->process_images(
+					$product_id,
+					$images,
+					$image_offset
+				);
+
+				if ( empty( $image_result['done'] ) ) {
+					$state['currentProductImageOffset'] = absint( $image_result['nextOffset'] );
+					$state['lastError']                 = '';
+					$state['lastMessage']               = 'تصاویر محصول در حال پردازش است.';
+
+					$this->save_manual_sync_state( $state );
+
+					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+				}
+			}
+
+			$state['currentProductImagesDone']   = true;
+			$state['currentProductImageOffset']  = 0;
+			$state['lastError']                  = '';
+			$state['lastMessage']                = 'تصاویر محصول پردازش شد.';
+
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		/*
+		 * Step 5: Product without variation attributes is simple.
+		 */
+		if ( empty( $state['currentProductCanHaveVariants'] ) ) {
+			$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
+			$product_id   = absint( $state['currentProductId'] );
+
+			if ( $product_id <= 0 && '' !== $product_guid ) {
+				$product_id = $this->find_product_id_by_guid( $product_guid );
+			}
+
+			if ( $product_id > 0 ) {
+				$this->force_product_simple_if_needed( $product_id );
+				wc_delete_product_transients( $product_id );
+			}
+
+			$this->finish_current_product_state( $state, 'محصول بدون ویژگی متغیر است؛ به عنوان محصول ساده پردازش شد.' );
+
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		/*
+		 * Step 6: Sync one variants page for current product.
 		 */
 		$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
 
@@ -473,15 +445,15 @@ class Mobo_Core_Product_Sync {
 			$state['lastMessage'] = 'خطا در دریافت تنوع‌های محصول.';
 			$this->save_manual_sync_state( $state );
 
-			return $this->result(
-				false,
-				$response->get_error_message(),
-				$this->get_manual_sync_status()
-			);
+			return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
 		}
 
 		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
-		$product_id          = $this->find_product_id_by_guid( $product_guid );
+		$product_id          = absint( $state['currentProductId'] );
+
+		if ( $product_id <= 0 ) {
+			$product_id = $this->find_product_id_by_guid( $product_guid );
+		}
 
 		if ( $product_id > 0 ) {
 			$this->ensure_product_type_for_variants( $product_id, $variant_total_count );
@@ -489,25 +461,13 @@ class Mobo_Core_Product_Sync {
 
 		if ( 0 === $variant_total_count ) {
 			if ( $product_id > 0 ) {
+				$this->force_product_simple_if_needed( $product_id );
 				wc_delete_product_transients( $product_id );
 			}
 
-			$state['processedProducts']            = absint( $state['processedProducts'] ) + 1;
-			$state['currentProductGuid']           = '';
-			$state['variantPage']                  = 1;
-			$state['currentVariantTotalCount']     = 0;
-			$state['currentVariantTotalPages']     = 0;
-			$state['currentVariantProcessedPages'] = 0;
-			$state['lastError']                    = '';
-			$state['lastMessage']                  = 'محصول ساده پردازش شد.';
+			$this->finish_current_product_state( $state, 'محصول ساده پردازش شد.' );
 
-			$this->save_manual_sync_state( $state );
-
-			return $this->result(
-				true,
-				'محصول ساده پردازش شد.',
-				$this->get_manual_sync_status()
-			);
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
 		$state['currentVariantTotalCount'] = $variant_total_count;
@@ -528,48 +488,30 @@ class Mobo_Core_Product_Sync {
 		$result = $this->process_update_variant_payload( $payload );
 
 		if ( empty( $result['success'] ) ) {
-			$state['lastError']   = $result['message'];
+			$state['lastError']   = isset( $result['message'] ) ? $result['message'] : 'خطا در پردازش تنوع محصول.';
 			$state['lastMessage'] = 'خطا در پردازش تنوع محصول.';
 			$this->save_manual_sync_state( $state );
 
-			return $this->result(
-				false,
-				$result['message'],
-				$this->get_manual_sync_status()
-			);
+			return $this->result( false, $state['lastError'], $this->get_manual_sync_status() );
 		}
 
 		$state['currentVariantProcessedPages'] = absint( $state['currentVariantProcessedPages'] ) + 1;
 
 		if ( $this->to_bool( $payload['hasMore'] ) ) {
 			$state['variantPage'] = absint( $state['variantPage'] ) + 1;
-		} else {
-			$state['processedProducts']            = absint( $state['processedProducts'] ) + 1;
-			$state['currentProductGuid']           = '';
-			$state['variantPage']                  = 1;
-			$state['currentVariantTotalCount']     = 0;
-			$state['currentVariantTotalPages']     = 0;
-			$state['currentVariantProcessedPages'] = 0;
+			$state['lastError']   = '';
+			$state['lastMessage'] = $result['message'];
+
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
-		$state['lastError']   = '';
-		$state['lastMessage'] = $result['message'];
+		$this->finish_current_product_state( $state, $result['message'] );
 
-		$this->save_manual_sync_state( $state );
-
-		return $this->result(
-			true,
-			$result['message'],
-			$this->get_manual_sync_status()
-		);
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
 
-	/**
-	 * Process ProductUpdated webhook payload.
-	 *
-	 * @param array $payload Payload by reference because image chunks update offset in queued file.
-	 * @return array
-	 */
 	public function process_product_updated_payload( &$payload ) {
 		if ( ! is_array( $payload ) ) {
 			return $this->result( false, 'Invalid ProductUpdated payload.' );
@@ -587,13 +529,7 @@ class Mobo_Core_Product_Sync {
 		if ( ! isset( $items[ $product_index ] ) || ! is_array( $items[ $product_index ] ) ) {
 			unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
 
-			return $this->result(
-				true,
-				'ProductUpdated completed.',
-				array(
-					'deleteFile' => true,
-				)
-			);
+			return $this->result( true, 'ProductUpdated completed.', array( 'deleteFile' => true ) );
 		}
 
 		$product_data = $items[ $product_index ];
@@ -607,20 +543,9 @@ class Mobo_Core_Product_Sync {
 			$payload['_moboProductIndex'] = $product_index;
 			$payload['_moboImageOffset']  = 0;
 
-			return $this->result(
-				true,
-				'Skipped invalid product.',
-				array(
-					'deleteFile' => false,
-				)
-			);
+			return $this->result( true, 'Skipped invalid product.', array( 'deleteFile' => false ) );
 		}
 
-		/*
-		 * Images rule:
-		 * - new product: always save initial images.
-		 * - existing product: update only when global_update_images is enabled.
-		 */
 		if ( ! $was_existing || $this->rules->should_update_images() ) {
 			$image_result = $this->image_sync->process_images(
 				$product_id,
@@ -649,32 +574,14 @@ class Mobo_Core_Product_Sync {
 		$payload['_moboImageOffset']  = 0;
 
 		if ( $product_index < count( $items ) ) {
-			return $this->result(
-				true,
-				'ProductUpdated partially processed; products remaining.',
-				array(
-					'deleteFile' => false,
-				)
-			);
+			return $this->result( true, 'ProductUpdated partially processed; products remaining.', array( 'deleteFile' => false ) );
 		}
 
 		unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
 
-		return $this->result(
-			true,
-			'ProductUpdated processed.',
-			array(
-				'deleteFile' => true,
-			)
-		);
+		return $this->result( true, 'ProductUpdated processed.', array( 'deleteFile' => true ) );
 	}
 
-	/**
-	 * Process UpdateVariant payload.
-	 *
-	 * @param array $payload Payload.
-	 * @return array
-	 */
 	public function process_update_variant_payload( $payload ) {
 		if ( ! is_array( $payload ) ) {
 			return $this->result( false, 'Invalid UpdateVariant payload.' );
@@ -706,13 +613,7 @@ class Mobo_Core_Product_Sync {
 		$product_id = $this->find_product_id_by_guid( $product_guid );
 
 		if ( $product_id <= 0 ) {
-			return $this->result(
-				false,
-				'Parent product not found.',
-				array(
-					'productGuid' => $product_guid,
-				)
-			);
+			return $this->result( false, 'Parent product not found.', array( 'productGuid' => $product_guid ) );
 		}
 
 		$product = wc_get_product( $product_id );
@@ -726,6 +627,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$this->ensure_product_type_for_variants( $product_id, absint( $this->get_value( $payload, 'totalCount', count( $variants ) ) ) );
+
 		$product = wc_get_product( $product_id );
 
 		$updated = 0;
@@ -779,34 +681,36 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
-	/**
-	 * Save manual sync state.
-	 *
-	 * @param array $state State.
-	 * @return void
-	 */
 	private function save_manual_sync_state( $state ) {
 		$state['updatedAt'] = time();
 		update_option( self::STATE_OPTION, $state, false );
 	}
 
-	/**
-	 * Upsert parent product.
-	 *
-	 * Product GUID must be persisted as early as possible.
-	 * This prevents duplicate products if the host shuts down mid-sync.
-	 *
-	 * Product is initially created as simple.
-	 * It is converted to variable only after variant API confirms totalCount > 0.
-	 *
-	 * Create vs update rule:
-	 * - New product: always save initial core fields.
-	 * - Existing product: respect legacy auto-update options.
-	 *
-	 * @param array $data Product data.
-	 * @param bool  $skip_images Skip image processing here.
-	 * @return int
-	 */
+	private function finish_current_product_state( &$state, $message ) {
+		$state['processedProducts']              = absint( $state['processedProducts'] ) + 1;
+		$state['currentProductGuid']             = '';
+		$state['currentProductId']               = 0;
+		$state['currentProductImages']           = array();
+		$state['currentProductImageOffset']      = 0;
+		$state['currentProductWasExisting']      = false;
+		$state['currentProductImagesDone']       = false;
+		$state['currentProductCanHaveVariants']  = false;
+		$state['variantPage']                    = 1;
+		$state['currentVariantTotalCount']       = 0;
+		$state['currentVariantTotalPages']       = 0;
+		$state['currentVariantProcessedPages']   = 0;
+		$state['lastError']                      = '';
+		$state['lastMessage']                    = sanitize_text_field( (string) $message );
+
+		if ( absint( $state['productTotalCount'] ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+			$state['status']      = 'done';
+			$state['completedAt'] = time();
+			$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+		}
+
+		$this->save_manual_sync_state( $state );
+	}
+
 	private function upsert_parent_product( $data, $skip_images ) {
 		$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
 
@@ -828,12 +732,8 @@ class Mobo_Core_Product_Sync {
 		}
 
 		/*
-		* Critical early persistence:
-		*
-		* Save product_guid as soon as possible.
-		* If host times out/shuts down after this point, the next sync can find
-		* and continue updating the same product instead of creating a duplicate.
-		*/
+		 * Persist product_guid as early as possible.
+		 */
 		if ( $is_new_product ) {
 			$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 
@@ -852,10 +752,6 @@ class Mobo_Core_Product_Sync {
 				return 0;
 			}
 
-			/*
-			* Reload product after first save so later WooCommerce operations
-			* work with a persisted product ID.
-			*/
 			$product = wc_get_product( $product_id );
 
 			if ( ! $product instanceof WC_Product ) {
@@ -864,6 +760,7 @@ class Mobo_Core_Product_Sync {
 		} else {
 			$product->update_meta_data( 'product_guid', $product_guid );
 			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
+			$product->save();
 		}
 
 		if ( $is_new_product || $this->rules->should_update_title() ) {
@@ -874,20 +771,12 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		/*
-		* Caption/content is intentionally ignored.
-		* Current API does not provide useful caption/content data.
-		*/
-
 		if ( $is_new_product || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
 			$this->apply_price_to_product( $product, $data, 'product', $is_new_product );
 		}
 
 		if ( $is_new_product || $this->rules->should_update_stock() ) {
-			$this->apply_api_stock(
-				$product,
-				$this->get_value( $data, 'stock', null )
-			);
+			$this->apply_api_stock( $product, $this->get_value( $data, 'stock', null ) );
 		}
 
 		if ( $is_new_product || $this->rules->should_update_slug() ) {
@@ -908,12 +797,10 @@ class Mobo_Core_Product_Sync {
 
 		if ( ! empty( $attributes ) ) {
 			$product->set_attributes( $attributes );
+		} else {
+			$product->set_attributes( array() );
 		}
 
-		/*
-		* Mark parent product core data as complete before categories/images.
-		* Categories/images can be retried later; product identity must already exist.
-		*/
 		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
 
 		$product_id = absint( $product->save() );
@@ -924,11 +811,6 @@ class Mobo_Core_Product_Sync {
 
 		$this->store_product_attribute_guids( $product_id, $this->get_value( $data, 'attributes', array() ) );
 
-		/*
-		* Categories rule:
-		* - new product: must get categories/default category.
-		* - existing product: assign_product_categories internally respects auto-category option.
-		*/
 		$this->category_sync->assign_product_categories(
 			$product_id,
 			$this->get_value( $data, 'productCategories', array() ),
@@ -936,11 +818,6 @@ class Mobo_Core_Product_Sync {
 			$is_new_product
 		);
 
-		/*
-		* Images rule:
-		* - new product: always save initial images.
-		* - existing product: update only when global_update_images is enabled.
-		*/
 		if ( ! $skip_images && ( $is_new_product || $this->rules->should_update_images() ) ) {
 			$this->image_sync->process_images(
 				$product_id,
@@ -951,151 +828,188 @@ class Mobo_Core_Product_Sync {
 
 		return $product_id;
 	}
-	
-	
-	/**
- * Upsert variation.
- *
- * Critical rule:
- * variant_guid must be persisted as early as possible.
- * If host shuts down mid-sync, next run must find the same variation
- * and continue instead of creating duplicate variations.
- *
- * Create vs update rule:
- * - New variation: always save initial core fields.
- * - Existing variation: respect legacy auto-update options.
- *
- * @param WC_Product $parent Parent product.
- * @param array      $data Variant data.
- * @return int
- */
-private function upsert_variation( $parent, $data ) {
-	if ( ! $parent instanceof WC_Product ) {
-		return 0;
-	}
 
-	$parent_id    = absint( $parent->get_id() );
-	$variant_guid = sanitize_text_field( (string) $this->get_value( $data, 'variantId', '' ) );
-
-	if ( $parent_id <= 0 || '' === $variant_guid ) {
-		return 0;
-	}
-
-	$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
-
-	$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
-	$is_new_variation = $variation_id <= 0;
-
-	if ( $variation_id > 0 ) {
-		$variation = wc_get_product( $variation_id );
-
-		if ( ! $variation instanceof WC_Product_Variation ) {
-			$variation = new WC_Product_Variation( $variation_id );
-		}
-	} else {
-		$variation = new WC_Product_Variation();
-	}
-
-	/*
-	 * Critical early persistence:
-	 *
-	 * Save variant_guid as soon as possible.
-	 * If host times out/shuts down after this point, the next sync can find
-	 * and continue updating the same variation instead of creating duplicate.
-	 */
-	if ( $is_new_variation ) {
-		$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
-
-		if ( '' === $initial_title ) {
-			$initial_title = 'Mobo Variant ' . $variant_guid;
+	private function upsert_variation( $parent, $data ) {
+		if ( ! $parent instanceof WC_Product ) {
+			return 0;
 		}
 
-		$variation->set_parent_id( $parent_id );
-		$variation->set_status( 'publish' );
-		$variation->set_name( $initial_title );
+		$parent_id    = absint( $parent->get_id() );
+		$variant_guid = sanitize_text_field( (string) $this->get_value( $data, 'variantId', '' ) );
+
+		if ( $parent_id <= 0 || '' === $variant_guid ) {
+			return 0;
+		}
+
+		$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
+
+		$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
+		$is_new_variation = $variation_id <= 0;
+
+		if ( $variation_id > 0 ) {
+			$variation = wc_get_product( $variation_id );
+
+			if ( ! $variation instanceof WC_Product_Variation ) {
+				$variation = new WC_Product_Variation( $variation_id );
+			}
+		} else {
+			$variation = new WC_Product_Variation();
+		}
+
+		if ( $is_new_variation ) {
+			$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+
+			if ( '' === $initial_title ) {
+				$initial_title = 'Mobo Variant ' . $variant_guid;
+			}
+
+			$variation->set_parent_id( $parent_id );
+			$variation->set_status( 'publish' );
+			$variation->set_name( $initial_title );
+			$variation->update_meta_data( 'variant_guid', $variant_guid );
+			$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
+
+			if ( '' !== $product_guid ) {
+				$variation->update_meta_data( 'product_guid', $product_guid );
+			}
+
+			$variation_id = absint( $variation->save() );
+
+			if ( $variation_id <= 0 ) {
+				return 0;
+			}
+
+			$variation = wc_get_product( $variation_id );
+
+			if ( ! $variation instanceof WC_Product_Variation ) {
+				return 0;
+			}
+		} else {
+			$variation->set_parent_id( $parent_id );
+			$variation->set_status( 'publish' );
+			$variation->update_meta_data( 'variant_guid', $variant_guid );
+			$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
+
+			if ( '' !== $product_guid ) {
+				$variation->update_meta_data( 'product_guid', $product_guid );
+			}
+
+			$variation->save();
+		}
+
+		if ( $is_new_variation || $this->rules->should_update_title() ) {
+			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+
+			if ( '' !== $title ) {
+				$variation->set_name( $title );
+			}
+		}
+
+		if ( $is_new_variation || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+			$this->apply_price_to_product( $variation, $data, 'variation', $is_new_variation );
+		}
+
+		if ( $is_new_variation || $this->rules->should_update_stock() ) {
+			$this->apply_api_stock( $variation, $this->get_value( $data, 'stock', null ) );
+		}
+
+		$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
+
+		if ( ! empty( $attrs ) ) {
+			$variation->set_attributes( $attrs );
+		}
 
 		$variation->update_meta_data( 'variant_guid', $variant_guid );
-		$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
 
 		if ( '' !== $product_guid ) {
 			$variation->update_meta_data( 'product_guid', $product_guid );
 		}
 
-		$variation_id = absint( $variation->save() );
+		$variation->update_meta_data( 'mobo_sync_incomplete', '0' );
 
-		if ( $variation_id <= 0 ) {
-			return 0;
+		return absint( $variation->save() );
+	}
+
+	private function product_has_variation_attributes( $data ) {
+		$attributes = $this->get_value( $data, 'attributes', array() );
+
+		if ( ! is_array( $attributes ) || empty( $attributes ) ) {
+			return false;
 		}
 
-		$variation = wc_get_product( $variation_id );
+		foreach ( $attributes as $attribute_data ) {
+			if ( ! is_array( $attribute_data ) ) {
+				continue;
+			}
 
-		if ( ! $variation instanceof WC_Product_Variation ) {
-			return 0;
+			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
+
+			if ( '' === $name ) {
+				continue;
+			}
+
+			$values = $this->get_value( $attribute_data, 'values', array() );
+
+			if ( ! is_array( $values ) || empty( $values ) ) {
+				continue;
+			}
+
+			foreach ( $values as $value_data ) {
+				if ( ! is_array( $value_data ) ) {
+					continue;
+				}
+
+				$value = sanitize_text_field( (string) $this->get_value( $value_data, 'value', '' ) );
+
+				if ( '' !== $value ) {
+					return true;
+				}
+			}
 		}
-	} else {
-		$variation->set_parent_id( $parent_id );
-		$variation->set_status( 'publish' );
 
-		$variation->update_meta_data( 'variant_guid', $variant_guid );
-		$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
+		return false;
+	}
 
-		if ( '' !== $product_guid ) {
-			$variation->update_meta_data( 'product_guid', $product_guid );
+	private function force_product_simple_if_needed( $product_id ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return;
 		}
 
-		/*
-		 * Persist the incomplete marker immediately for existing variations too.
-		 */
-		$variation->save();
-	}
+		$product = wc_get_product( $product_id );
 
-	if ( $is_new_variation || $this->rules->should_update_title() ) {
-		$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
-
-		if ( '' !== $title ) {
-			$variation->set_name( $title );
+		if ( ! $product instanceof WC_Product ) {
+			return;
 		}
+
+		if ( $product instanceof WC_Product_Variable ) {
+			$children = $product->get_children();
+
+			if ( is_array( $children ) ) {
+				foreach ( $children as $variation_id ) {
+					$variation = wc_get_product( absint( $variation_id ) );
+
+					if ( ! $variation instanceof WC_Product_Variation ) {
+						continue;
+					}
+
+					$variation->set_manage_stock( true );
+					$variation->set_stock_quantity( 0 );
+					$variation->set_stock_status( 'outofstock' );
+					$variation->save();
+				}
+			}
+		}
+
+		wp_set_object_terms( $product_id, 'simple', 'product_type', false );
+
+		$simple = new WC_Product_Simple( $product_id );
+		$simple->save();
+
+		wc_delete_product_transients( $product_id );
 	}
 
-	if ( $is_new_variation || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-		$this->apply_price_to_product( $variation, $data, 'variation', $is_new_variation );
-	}
-
-	if ( $is_new_variation || $this->rules->should_update_stock() ) {
-		$this->apply_api_stock(
-			$variation,
-			$this->get_value( $data, 'stock', null )
-		);
-	}
-
-	/*
-	 * Variation attributes are always applied when present.
-	 * Without attributes, variation matching/display can break.
-	 */
-	$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
-
-	if ( ! empty( $attrs ) ) {
-		$variation->set_attributes( $attrs );
-	}
-
-	$variation->update_meta_data( 'variant_guid', $variant_guid );
-
-	if ( '' !== $product_guid ) {
-		$variation->update_meta_data( 'product_guid', $product_guid );
-	}
-
-	$variation->update_meta_data( 'mobo_sync_incomplete', '0' );
-
-	return absint( $variation->save() );
-}
-
-	/**
-	 * Ensure product type is compatible with variant count.
-	 *
-	 * @param int $product_id Product ID.
-	 * @param int $variant_total_count Variant total count.
-	 * @return WC_Product|null
-	 */
 	private function ensure_product_type_for_variants( $product_id, $variant_total_count ) {
 		$product_id          = absint( $product_id );
 		$variant_total_count = absint( $variant_total_count );
@@ -1117,40 +1031,17 @@ private function upsert_variation( $parent, $data ) {
 
 			wp_set_object_terms( $product_id, 'variable', 'product_type', false );
 
-			return new WC_Product_Variable( $product_id );
+			$variable = new WC_Product_Variable( $product_id );
+			$variable->save();
+
+			return $variable;
 		}
 
-		if ( $current instanceof WC_Product_Simple ) {
-			return $current;
-		}
+		$this->force_product_simple_if_needed( $product_id );
 
-		$children = array();
-
-		if ( $current instanceof WC_Product_Variable ) {
-			$children = $current->get_children();
-		}
-
-		if ( empty( $children ) ) {
-			wp_set_object_terms( $product_id, 'simple', 'product_type', false );
-
-			return new WC_Product_Simple( $product_id );
-		}
-
-		return $current;
+		return wc_get_product( $product_id );
 	}
 
-	/**
-	 * Apply API stock rules to product or variation.
-	 *
-	 * API stock contract:
-	 * - null means infinite stock / do not manage stock quantity.
-	 * - 0 means out of stock.
-	 * - positive number means limited stock quantity.
-	 *
-	 * @param WC_Product $product Product or variation.
-	 * @param mixed      $stock API stock value.
-	 * @return void
-	 */
 	private function apply_api_stock( $product, $stock ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
@@ -1170,21 +1061,20 @@ private function upsert_variation( $parent, $data ) {
 		$product->set_stock_status( $stock_quantity > 0 ? 'instock' : 'outofstock' );
 	}
 
-	/**
-	 * Apply product slug only from explicit slug field.
-	 *
-	 * URL is intentionally not used as slug source anymore.
-	 *
-	 * @param WC_Product $product Product.
-	 * @param array      $data Product payload.
-	 * @return void
-	 */
 	private function apply_product_slug( $product, $data ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
 		}
 
-		$slug = sanitize_title( (string) $this->get_value( $data, 'url', '' ) );
+		/*
+		 * Current behavior: use url as slug source.
+		 * If API later sends explicit slug, prefer slug.
+		 */
+		$slug = sanitize_title( (string) $this->get_value( $data, 'slug', '' ) );
+
+		if ( '' === $slug ) {
+			$slug = sanitize_title( trim( (string) $this->get_value( $data, 'url', '' ), '/' ) );
+		}
 
 		if ( '' === $slug ) {
 			return;
@@ -1193,15 +1083,38 @@ private function upsert_variation( $parent, $data ) {
 		$product->set_slug( $slug );
 	}
 
-	/**
-	 * Apply legacy price rules.
-	 *
-	 * @param WC_Product $product Product or variation.
-	 * @param array      $data Payload.
-	 * @param string     $context Context.
-	 * @param bool       $is_new_object Whether product/variation is newly created.
-	 * @return void
-	 */
+	private function apply_product_dates( $product, $data ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$published_at = sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) );
+
+		if ( '' === $published_at ) {
+			return;
+		}
+
+		$timestamp = strtotime( $published_at );
+
+		if ( false === $timestamp || $timestamp <= 0 ) {
+			$product->update_meta_data( 'published_at', $published_at );
+			return;
+		}
+
+		$gmt_date   = gmdate( 'Y-m-d H:i:s', $timestamp );
+		$local_date = get_date_from_gmt( $gmt_date, 'Y-m-d H:i:s' );
+
+		$date = new WC_DateTime( '@' . $timestamp );
+		$date->setTimezone( new DateTimeZone( 'UTC' ) );
+
+		$product->set_date_created( $date );
+		$product->set_date_modified( $date );
+
+		$product->update_meta_data( 'published_at', $published_at );
+		$product->update_meta_data( 'mobo_published_at_gmt', $gmt_date );
+		$product->update_meta_data( 'mobo_published_at_local', $local_date );
+	}
+
 	private function apply_price_to_product( $product, $data, $context, $is_new_object = false ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
@@ -1211,10 +1124,8 @@ private function upsert_variation( $parent, $data ) {
 			return;
 		}
 
-		$object_id = absint( $product->get_id() );
-
 		$pair = $this->price_calculator->calculate_price_pair(
-			$object_id,
+			absint( $product->get_id() ),
 			$this->get_value( $data, 'price', null ),
 			$this->get_value( $data, 'comparePrice', null ),
 			$context
@@ -1229,27 +1140,12 @@ private function upsert_variation( $parent, $data ) {
 		}
 	}
 
-	/**
-	 * Get product images from payload.
-	 *
-	 * Current API uses:
-	 * images: [ { id, url } ]
-	 *
-	 * @param array $data Product payload.
-	 * @return array
-	 */
 	private function get_product_images_from_payload( $data ) {
 		$images = $this->get_value( $data, 'images', array() );
 
 		return is_array( $images ) ? $images : array();
 	}
 
-	/**
-	 * Build local product attributes.
-	 *
-	 * @param mixed $attributes Attributes.
-	 * @return array
-	 */
 	private function build_product_attributes( $attributes ) {
 		$result   = array();
 		$position = 0;
@@ -1310,13 +1206,6 @@ private function upsert_variation( $parent, $data ) {
 		return $result;
 	}
 
-	/**
-	 * Store attribute GUID map.
-	 *
-	 * @param int   $product_id Product ID.
-	 * @param mixed $attributes Attributes.
-	 * @return void
-	 */
 	private function store_product_attribute_guids( $product_id, $attributes ) {
 		$product_id = absint( $product_id );
 
@@ -1345,12 +1234,6 @@ private function upsert_variation( $parent, $data ) {
 		}
 	}
 
-	/**
-	 * Normalize variation attributes.
-	 *
-	 * @param mixed $attributes Attributes.
-	 * @return array
-	 */
 	private function normalize_variation_attributes( $attributes ) {
 		$result = array();
 
@@ -1380,17 +1263,6 @@ private function upsert_variation( $parent, $data ) {
 		return $result;
 	}
 
-	/**
-	 * Finalize missing variants.
-	 *
-	 * Missing variant is different from API stock=null.
-	 * Missing variant must be set out of stock.
-	 *
-	 * @param WC_Product $product Product.
-	 * @param string     $product_guid Product GUID.
-	 * @param string     $sync_id Sync ID.
-	 * @return void
-	 */
 	private function finalize_missing_variants( $product, $product_guid, $sync_id ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
