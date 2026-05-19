@@ -49,6 +49,8 @@ class Mobo_Core_Settings {
 			'mobo_core_missing_variants_behavior' => 'outofstock',
 
 			'mobo_core_excluded_product_urls' => '',
+			'mobo_core_categories_last_sync_at'              => 0,
+			'mobo_core_categories_refresh_interval_hours'    => 12,
 		);
 	}
 

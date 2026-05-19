@@ -685,8 +685,15 @@ class Mobo_Core_Admin {
 							<?php $this->bool_field( 'بروزرسانی خودکار قیمت مقایسه‌ای', 'global_product_auto_compare_price' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار آدرس محصول', 'global_product_auto_slug' ); ?>
 							<?php $this->bool_field( 'بروزرسانی خودکار تصاویر', 'global_update_images' ); ?>
+							
 							<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
 							<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض / جایگزین', 'mobo_default_category_id' ); ?>
+							<?php $this->int_field( 'بازه بروزرسانی دوره‌ای دسته‌بندی‌ها به ساعت', 'mobo_core_categories_refresh_interval_hours', 1, 168 ); ?>
+
+							<div class="mobo-help">
+								اگر آپدیت اتوماتیک دسته‌بندی‌ها فعال باشد، سیستم مرکزی می‌تواند endpoint بروزرسانی دسته‌بندی را صدا بزند.
+								وردپرس فقط زمانی دسته‌بندی‌ها را بروزرسانی می‌کند که از آخرین بروزرسانی، این تعداد ساعت گذشته باشد.
+							</div>
 
 							<?php $this->textarea_field( 'محصولات مستثنی از همگام‌سازی', 'mobo_core_excluded_product_urls', 'هر خط یک آدرس محصول. اگر آدرس محصول در این لیست باشد، محصول ساخته یا بروزرسانی نمی‌شود.' ); ?>
 
