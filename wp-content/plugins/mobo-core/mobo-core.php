@@ -26,12 +26,12 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-files/' );
  *
  * You can define this in wp-config.php or in your custom environment loader:
  *
- * define( 'MOBO_API_BASE_URL', 'https://api.example.com/' );
+ * define( 'MOBO_API_BASE_URL', 'http://dev.mobomobo.ir/' );
  *
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
 if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', '' );
+	define( 'MOBO_API_BASE_URL', 'https://customers.mobomobo.ir/' );
 }
 
 /*
