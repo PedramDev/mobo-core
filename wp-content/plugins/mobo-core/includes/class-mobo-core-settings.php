@@ -21,7 +21,6 @@ class Mobo_Core_Settings {
 		return array(
 			'mobo_core_security_code'             => '',
 			'mobo_core_api_base_url'              => '',
-			'mobo_core_api_token'                 => '',
 			'mobo_core_only_in_stock'             => '0',
 
 			'global_product_auto_stock'           => '1',
@@ -51,6 +50,8 @@ class Mobo_Core_Settings {
 			'mobo_core_excluded_product_urls' => '',
 			'mobo_core_categories_last_sync_at'              => 0,
 			'mobo_core_categories_refresh_interval_hours'    => 12,
+			
+			'mobo_core_token'         => '',
 		);
 	}
 
@@ -116,7 +117,7 @@ class Mobo_Core_Settings {
 	public static function save_from_post( $post ) {
 		self::save_text( $post, 'mobo_core_security_code' );
 		self::save_url( $post, 'mobo_core_api_base_url' );
-		self::save_text( $post, 'mobo_core_api_token' );
+		self::save_text( $post, 'mobo_core_token' );
 
 		self::save_bool( $post, 'mobo_core_only_in_stock' );
 		self::save_bool( $post, 'global_product_auto_stock' );

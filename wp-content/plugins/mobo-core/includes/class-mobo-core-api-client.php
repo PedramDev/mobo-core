@@ -147,7 +147,7 @@ class Mobo_Core_API_Client {
 			'Accept' => 'application/json',
 		);
 
-		$token = (string) Mobo_Core_Settings::get( 'mobo_core_api_token', '' );
+		$token = (string) Mobo_Core_Settings::get( 'mobo_core_token', '' );
 
 		if ( '' !== trim( $token ) ) {
 			$headers['Token'] = trim( $token );

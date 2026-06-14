@@ -62,6 +62,7 @@ class Mobo_Core_Admin {
 
 		$allowed_tabs = array(
 			'dashboard',
+			'connection',
 			'product',
 			'categories',
 			'pricing',
@@ -96,6 +97,7 @@ class Mobo_Core_Admin {
 
 			<nav class="mobo-tabs" aria-label="Mobo settings tabs">
 				<?php $this->tab_link( 'dashboard', 'داشبورد', $active_tab ); ?>
+				<?php $this->tab_link( 'connection', 'اتصال', $active_tab ); ?>
 				<?php $this->tab_link( 'product', 'محصول', $active_tab ); ?>
 				<?php $this->tab_link( 'categories', 'دسته‌بندی', $active_tab ); ?>
 				<?php $this->tab_link( 'pricing', 'قیمت‌گذاری', $active_tab ); ?>
@@ -106,6 +108,8 @@ class Mobo_Core_Admin {
 			<div class="mobo-panel">
 				<?php if ( 'dashboard' === $active_tab ) : ?>
 					<?php $this->render_dashboard_tab( $status ); ?>
+				<?php elseif ( 'connection' === $active_tab ) : ?>
+					<?php $this->render_connection_tab(); ?>
 				<?php elseif ( 'product' === $active_tab ) : ?>
 					<?php $this->render_product_tab(); ?>
 				<?php elseif ( 'categories' === $active_tab ) : ?>
@@ -218,6 +222,66 @@ class Mobo_Core_Admin {
 				</div>
 			</div>
 		</div>
+		<?php
+	}
+
+	 /**
+	 * Render connection tab.
+	 *
+	 * @return void
+	 */
+	private function render_connection_tab() {
+		$has_token         = '' !== (string) get_option( 'mobo_core_token', '' );
+		$has_security_code = '' !== (string) get_option( 'mobo_core_security_code', '' );
+
+		?>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
+			<input type="hidden" name="action" value="mobo_core_save_settings">
+			<input type="hidden" name="mobo_active_tab" value="connection">
+			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
+
+			<div class="mobo-grid">
+				<div class="mobo-card">
+					<div class="mobo-card-head">
+						<h2>اتصال به API موبو</h2>
+						<p>توکن برای درخواست‌هایی استفاده می‌شود که وردپرس به سمت API موبو ارسال می‌کند.</p>
+					</div>
+
+					<?php
+					$this->secret_field(
+						'Token',
+						'mobo_core_token',
+						$has_token ? 'توکن قبلاً ثبت شده است. برای تغییر، مقدار جدید وارد کنید.' : 'توکن هنوز ثبت نشده است.'
+					);
+					?>
+
+					<div class="mobo-note">
+						این مقدار در دیتابیس با کلید <code>mobo_core_token</code> ذخیره می‌شود و در درخواست‌های API به عنوان Header با نام <code>Token</code> ارسال می‌شود.
+					</div>
+				</div>
+
+				<div class="mobo-card">
+					<div class="mobo-card-head">
+						<h2>کد امنیتی وب‌هوک</h2>
+						<p>این مقدار برای اعتبارسنجی درخواست‌هایی استفاده می‌شود که از سیستم مرکزی به وردپرس ارسال می‌شوند.</p>
+					</div>
+
+					<?php
+					$this->secret_field(
+						'Webhook Security Code',
+						'mobo_core_security_code',
+						$has_security_code ? 'کد امنیتی قبلاً ثبت شده است. برای تغییر، مقدار جدید وارد کنید.' : 'کد امنیتی هنوز ثبت نشده است.'
+					);
+					?>
+
+					<div class="mobo-note">
+						این مقدار در دیتابیس با کلید <code>mobo_core_security_code</code> ذخیره می‌شود و با Header <code>X-SEC</code> مقایسه می‌شود.
+					</div>
+				</div>
+			</div>
+
+			<?php $this->save_button(); ?>
+		</form>
 		<?php
 	}
 
@@ -719,6 +783,38 @@ class Mobo_Core_Admin {
 	}
 
 	/**
+	 * Secret field.
+	 *
+	 * Secret values are not rendered back into HTML.
+	 * Empty input keeps the previous saved value.
+	 *
+	 * @param string $label Label.
+	 * @param string $key Option key.
+	 * @param string $help Help text.
+	 * @return void
+	 */
+	private function secret_field( $label, $key, $help = '' ) {
+		?>
+		<div class="mobo-field">
+			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
+
+			<input
+				type="text"
+				id="<?php echo esc_attr( $key ); ?>"
+				name="<?php echo esc_attr( $key ); ?>"
+				value=""
+				placeholder="برای تغییر، مقدار جدید را وارد کنید"
+				dir="ltr"
+			>
+
+			<?php if ( '' !== $help ) : ?>
+				<div class="mobo-help"><?php echo esc_html( $help ); ?></div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
 	 * Status box.
 	 *
 	 * @param string $label Label.
@@ -819,6 +915,27 @@ class Mobo_Core_Admin {
 				sanitize_textarea_field( wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) ),
 				false
 			);
+		}
+
+		/*
+		* Connection secrets.
+		*
+		* Do not overwrite existing secret values with empty input.
+		*/
+		if ( isset( $_POST['mobo_core_token'] ) ) {
+			$token = sanitize_text_field( wp_unslash( $_POST['mobo_core_token'] ) );
+
+			if ( '' !== $token ) {
+				update_option( 'mobo_core_token', $token, false );
+			}
+		}
+
+		if ( isset( $_POST['mobo_core_security_code'] ) ) {
+			$security_code = sanitize_text_field( wp_unslash( $_POST['mobo_core_security_code'] ) );
+
+			if ( '' !== $security_code ) {
+				update_option( 'mobo_core_security_code', $security_code, false );
+			}
 		}
 
 		$this->save_dynamic_price_rules();

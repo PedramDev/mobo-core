@@ -107,6 +107,6 @@ if ( is_array( $transient_names ) ) {
  * - mobo_dynamic_price
  * - mobo_core_security_code
  * - mobo_core_api_base_url
- * - mobo_core_api_token
+ * - mobo_core_token
  * - mobo_core_only_in_stock
  */
