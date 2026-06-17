@@ -117,9 +117,32 @@ class Mobo_Core_Image_Sync {
 			return $existing_id;
 		}
 
-		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
+		/*
+		 * Some source image servers have an invalid or incomplete SSL chain.
+		 * WordPress media_sideload_image() uses download_url(), which verifies SSL by default.
+		 * Temporarily disable SSL verification only for this sideload request so the
+		 * product image can still be imported. The filter is removed immediately after
+		 * the download attempt to avoid affecting other WordPress HTTP requests.
+		 */
+		$disable_sslverify = static function ( $args, $request_url ) {
+			$args['sslverify'] = false;
+
+			return $args;
+		};
+
+		add_filter( 'http_request_args', $disable_sslverify, 10, 2 );
+
+		try {
+			$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
+		} finally {
+			remove_filter( 'http_request_args', $disable_sslverify, 10 );
+		}
 
 		if ( is_wp_error( $attachment_id ) ) {
+			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+				error_log( 'Mobo Core image sideload failed: ' . $attachment_id->get_error_message() );
+			}
+
 			return 0;
 		}
 

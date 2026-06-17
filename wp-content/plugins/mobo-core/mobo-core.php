@@ -3,9 +3,9 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/moboplugin.com
  * Description: همگام‌سازی مرحله‌ای محصولات، تنوع‌ها، دسته‌بندی‌ها، تصاویر و وب‌هوک‌ها برای ووکامرس.
- * Version: 10.0.0
+ * Version: 10.0.1
  * Author: Pedram Karimi
- * Author URI: https://customers.mobomobo.ir/
+ * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Text Domain: mobo-core
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.0.0' );
+define( 'MOBO_CORE_VERSION', '10.0.1' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -26,12 +26,12 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-files/' );
  *
  * You can define this in wp-config.php or in your custom environment loader:
  *
- * define( 'MOBO_API_BASE_URL', 'http://dev.mobomobo.ir/' );
+ * define( 'MOBO_API_BASE_URL', 'http://dev.mobo.codeya.ir/' );
  *
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
 if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', 'https://customers.mobomobo.ir/' );
+	define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 }
 
 /*
