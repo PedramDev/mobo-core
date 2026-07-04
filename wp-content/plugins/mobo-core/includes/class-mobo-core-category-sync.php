@@ -11,6 +11,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Category_Sync {
 
+	private $category_map;
+
+	public function __construct() {
+		$this->category_map = class_exists( 'Mobo_Core_Category_Map' ) ? new Mobo_Core_Category_Map() : null;
+	}
+
 	public function sync_categories_payload( $payload ) {
 		$categories = $payload;
 
@@ -83,6 +89,8 @@ class Mobo_Core_Category_Sync {
 		$product_id              = absint( $product_id );
 		$is_new_product          = (bool) $is_new_product;
 		$auto_categories_enabled = (bool) $auto_categories_enabled;
+		$mapping_enabled         = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_enabled', '1' );
+		$mapping_required        = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_required', '0' );
 
 		if ( $product_id <= 0 ) {
 			return array(
@@ -109,41 +117,86 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		/*
-		* Auto category update enabled:
-		* Try API categories first.
-		*/
-		$term_ids = array();
+		$term_ids       = array();
+		$sources        = array();
+		$missing_guids  = array();
+		$category_refs  = is_array( $categories ) ? $categories : array();
 
-		if ( is_array( $categories ) ) {
-			foreach ( $categories as $category_ref ) {
-				if ( ! is_array( $category_ref ) ) {
-					continue;
-				}
+		foreach ( $category_refs as $category_ref ) {
+			if ( ! is_array( $category_ref ) ) {
+				continue;
+			}
 
-				$category_guid = $this->get_category_guid( $category_ref );
+			$category_guid = $this->get_category_guid( $category_ref );
 
-				if ( '' === $category_guid ) {
-					continue;
-				}
+			if ( '' === $category_guid ) {
+				continue;
+			}
 
+			$term_id = 0;
+			$source  = 'missing';
+
+			if ( $mapping_enabled && $this->category_map instanceof Mobo_Core_Category_Map ) {
+				$resolved = $this->category_map->resolve_assignment_term( $category_guid );
+				$term_id  = absint( isset( $resolved['term_id'] ) ? $resolved['term_id'] : 0 );
+				$source   = sanitize_key( isset( $resolved['source'] ) ? $resolved['source'] : 'missing' );
+			}
+
+			if ( $term_id <= 0 ) {
 				$term_id = $this->find_term_id_by_guid( $category_guid );
 
 				if ( $term_id > 0 ) {
-					$term_ids[] = $term_id;
+					$source = 'legacy-synced';
 				}
 			}
+
+			if ( $term_id <= 0 && ! $mapping_required ) {
+				$created = $this->upsert_category( $category_ref );
+				$term_id = absint( isset( $created['term_id'] ) ? $created['term_id'] : 0 );
+
+				if ( $term_id > 0 ) {
+					$source = ! empty( $created['created'] ) ? 'auto-created' : 'auto-updated';
+				}
+			}
+
+			if ( $term_id > 0 ) {
+				$term_ids[] = $term_id;
+				$sources[]  = $source;
+				continue;
+			}
+
+			$missing_guids[] = $category_guid;
 		}
 
 		$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $term_ids ) ) ) );
+		$sources  = array_values( array_unique( array_filter( array_map( 'sanitize_key', $sources ) ) ) );
+
+		if ( ! empty( $missing_guids ) ) {
+			update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $missing_guids ) ) );
+		} else {
+			delete_post_meta( $product_id, 'mobo_category_missing_guids' );
+		}
 
 		if ( ! empty( $term_ids ) ) {
 			wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
+			update_post_meta( $product_id, 'mobo_category_assign_source', implode( ',', $sources ) );
 
 			return array(
-				'assigned' => count( $term_ids ),
-				'source'   => 'auto',
-				'changed'  => true,
+				'assigned'      => count( $term_ids ),
+				'source'        => ! empty( $sources ) ? implode( ',', $sources ) : 'mapped-or-synced',
+				'changed'       => true,
+				'missingGuids'  => array_values( array_unique( $missing_guids ) ),
+			);
+		}
+
+		if ( $mapping_required && ! empty( $missing_guids ) ) {
+			update_post_meta( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
+
+			return array(
+				'assigned'     => 0,
+				'source'       => 'mapping-required-missing',
+				'changed'      => false,
+				'missingGuids' => array_values( array_unique( $missing_guids ) ),
 			);
 		}
 
@@ -156,6 +209,7 @@ class Mobo_Core_Category_Sync {
 
 		if ( ! empty( $result['changed'] ) ) {
 			$result['source'] = 'auto-fallback-default';
+			update_post_meta( $product_id, 'mobo_category_assign_source', 'auto-fallback-default' );
 		}
 
 		return $result;
@@ -221,6 +275,7 @@ class Mobo_Core_Category_Sync {
 			}
 
 			$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
 			update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
 
 			return array(
@@ -264,6 +319,7 @@ class Mobo_Core_Category_Sync {
 		}
 
 		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+		$this->upsert_category_map( $category_guid, $term_id, $insert_name, $url, $parent_guid );
 		update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
 
 		return array(
@@ -277,6 +333,14 @@ class Mobo_Core_Category_Sync {
 
 		if ( '' === $category_guid ) {
 			return 0;
+		}
+
+		if ( $this->category_map instanceof Mobo_Core_Category_Map ) {
+			$term_id = $this->category_map->get_synced_term_id( $category_guid );
+
+			if ( $term_id > 0 ) {
+				return $term_id;
+			}
 		}
 
 		$terms = get_terms(
@@ -297,7 +361,13 @@ class Mobo_Core_Category_Sync {
 			return 0;
 		}
 
-		return absint( $terms[0]->term_id );
+		$term_id = absint( $terms[0]->term_id );
+
+		if ( $term_id > 0 ) {
+			$this->upsert_category_map( $category_guid, $term_id, '', '', '' );
+		}
+
+		return $term_id;
 	}
 
 	private function assign_default_category( $product_id ) {
@@ -347,6 +417,14 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return '';
+	}
+
+	private function upsert_category_map( $category_guid, $term_id, $name = '', $url = '', $parent_guid = '' ) {
+		if ( ! ( $this->category_map instanceof Mobo_Core_Category_Map ) ) {
+			return;
+		}
+
+		$this->category_map->upsert_synced_category( $category_guid, $term_id, $name, $url, $parent_guid );
 	}
 
 	private function save_category_meta( $term_id, $category_guid, $url, $parent_guid ) {

@@ -19,6 +19,7 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
  */
 delete_option( 'mobo_core_sync_state' );
 delete_option( 'mobo_core_db_version' );
+delete_option( 'mobo_core_schema_version' );
 
 /*
  * Remove runtime/chunking options introduced by v2.
@@ -32,6 +33,15 @@ delete_option( 'mobo_core_products_per_page' );
 delete_option( 'mobo_core_variants_per_page' );
 delete_option( 'mobo_core_images_per_run' );
 delete_option( 'mobo_core_missing_variants_behavior' );
+delete_option( 'mobo_core_cron_token' );
+delete_option( 'mobo_core_real_cron_last_hit_at' );
+delete_option( 'mobo_core_real_cron_last_success_at' );
+delete_option( 'mobo_core_real_cron_last_result' );
+delete_option( 'mobo_core_real_cron_time_budget_seconds' );
+delete_option( 'mobo_core_real_cron_max_sync_steps' );
+delete_option( 'mobo_core_real_cron_lock_ttl_seconds' );
+delete_option( 'mobo_core_real_cron_process_webhooks' );
+delete_option( 'mobo_core_process_webhook_on_receive' );
 
 /*
  * Remove old v2 beta option if it exists.
@@ -109,4 +119,7 @@ if ( is_array( $transient_names ) ) {
  * - mobo_core_api_base_url
  * - mobo_core_token
  * - mobo_core_only_in_stock
+ * - mobo_core_security_code
+ * - mobo_core_api_base_url
+ * - custom Mobo Core tables; resume/map data is preserved intentionally
  */

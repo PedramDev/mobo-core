@@ -38,6 +38,19 @@ class Mobo_Core_Webhook_Queue {
 
 		$sync_id = $this->get_value( $payload, 'syncId', '' );
 
+		/*
+		 * Prefer the table-backed queue for new events. The JSON file queue remains
+		 * as a safe fallback for old installs or write failures.
+		 */
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
+			$event_store = new Mobo_Core_Sync_Event_Store();
+			$event_id    = $event_store->enqueue( $payload );
+
+			if ( ! is_wp_error( $event_id ) && absint( $event_id ) > 0 ) {
+				return 'event:' . absint( $event_id );
+			}
+		}
+
 		$envelope = array(
 			'id'        => wp_generate_uuid4(),
 			'event'     => sanitize_text_field( (string) $event ),
@@ -65,6 +78,47 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		return $path;
+	}
+
+	/**
+	 * Return lightweight queue status.
+	 *
+	 * @return array
+	 */
+	public function get_status() {
+		$this->ensure_dirs();
+
+		$file_count = count( $this->get_queue_files() );
+		$table_pending = 0;
+		$table_due = 0;
+		$table_failed = 0;
+
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$store = new Mobo_Core_Sync_Event_Store();
+			$table_pending = $store->count_pending();
+			$table_due = method_exists( $store, 'count_due' ) ? $store->count_due() : $table_pending;
+			$table_failed = $store->count_failed();
+		}
+
+		return array(
+			'pendingFiles'       => $file_count,
+			'pendingTableEvents' => $table_pending,
+			'dueTableEvents'     => $table_due,
+			'failedTableEvents'  => $table_failed,
+			'hasPending'         => $file_count > 0 || $table_pending > 0,
+			'hasDue'             => $file_count > 0 || $table_due > 0,
+		);
+	}
+
+	/**
+	 * Whether there is due work that can run now.
+	 *
+	 * @return bool
+	 */
+	public function has_due_work() {
+		$status = $this->get_status();
+
+		return ! empty( $status['hasDue'] );
 	}
 
 	/**
@@ -110,10 +164,54 @@ class Mobo_Core_Webhook_Queue {
 		$processed = 0;
 		$failed    = 0;
 		$messages  = array();
+		$remaining_table     = false;
+		$remaining_due_table = false;
+		$used_table          = false;
+
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$table_result = $this->process_table_events( $started_at, $budget, $max_files );
+
+			$processed += isset( $table_result['processed'] ) ? absint( $table_result['processed'] ) : 0;
+			$failed    += isset( $table_result['failed'] ) ? absint( $table_result['failed'] ) : 0;
+			$remaining_table     = ! empty( $table_result['remainingTable'] );
+			$remaining_due_table = ! empty( $table_result['remainingDueTable'] );
+
+			if ( ! empty( $table_result['messages'] ) && is_array( $table_result['messages'] ) ) {
+				$messages = array_merge( $messages, $table_result['messages'] );
+			}
+
+			$used_table = $processed > 0 || $failed > 0 || $remaining_table;
+
+			if ( $processed >= $max_files || ( time() - $started_at ) >= $budget ) {
+				return array(
+					'success'        => true,
+					'status'         => 'processed',
+					'processed'      => $processed,
+					'failed'         => $failed,
+					'remainingFile'     => $remaining_table || ! empty( $this->get_queue_files() ),
+					'remainingTable'    => $remaining_table,
+					'remainingDueTable' => $remaining_due_table,
+					'messages'       => $messages,
+				);
+			}
+		}
 
 		$files = $this->get_queue_files();
 
 		if ( empty( $files ) ) {
+			if ( $used_table ) {
+				return array(
+					'success'        => true,
+					'status'         => $processed > 0 || $failed > 0 ? 'processed' : 'empty',
+					'processed'      => $processed,
+					'failed'         => $failed,
+					'remainingFile'     => $remaining_table,
+					'remainingTable'    => $remaining_table,
+					'remainingDueTable' => $remaining_due_table,
+					'messages'       => empty( $messages ) ? array( 'صف وب‌هوک خالی است.' ) : $messages,
+				);
+			}
+
 			return array(
 				'success'       => true,
 				'status'        => 'empty',
@@ -254,8 +352,144 @@ class Mobo_Core_Webhook_Queue {
 			'status'        => 'processed',
 			'processed'     => $processed,
 			'failed'        => $failed,
-			'remainingFile' => ! empty( $this->get_queue_files() ),
-			'messages'      => $messages,
+			'remainingFile'     => $remaining_table || ! empty( $this->get_queue_files() ),
+			'remainingTable'    => $remaining_table,
+			'remainingDueTable' => $remaining_due_table,
+			'messages'       => $messages,
+		);
+	}
+
+	/**
+	 * Process table-backed events.
+	 *
+	 * @param int $started_at Run start timestamp.
+	 * @param int $budget Time budget in seconds.
+	 * @param int $max_items Max events in this run.
+	 * @return array
+	 */
+	private function process_table_events( $started_at, $budget, $max_items ) {
+		$store = new Mobo_Core_Sync_Event_Store();
+		$rows  = $store->get_due_events( $max_items );
+
+		$processed = 0;
+		$failed    = 0;
+		$messages  = array();
+
+		if ( empty( $rows ) ) {
+			return array(
+				'processed'         => 0,
+				'failed'            => 0,
+				'remainingTable'    => $store->count_pending() > 0,
+				'remainingDueTable' => method_exists( $store, 'count_due' ) ? $store->count_due() > 0 : $store->count_pending() > 0,
+				'messages'          => array(),
+			);
+		}
+
+		foreach ( $rows as $row ) {
+			if ( $processed >= $max_items ) {
+				break;
+			}
+
+			if ( ( time() - $started_at ) >= $budget ) {
+				$messages[] = 'بودجه زمانی پردازش جدول وب‌هوک به پایان رسید.';
+				break;
+			}
+
+			$event_id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+
+			if ( $event_id <= 0 ) {
+				continue;
+			}
+
+			$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
+
+			if ( $expires_at > 0 && time() > $expires_at ) {
+				$store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true );
+				$failed++;
+				$messages[] = 'یک event وب‌هوک منقضی شد و failed شد.';
+				continue;
+			}
+
+			if ( ! $store->lock_event( $event_id, max( 60, $budget + 30 ) ) ) {
+				continue;
+			}
+
+			$item = $store->row_to_item( $row );
+
+			if ( is_wp_error( $item ) ) {
+				$store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true );
+				$failed++;
+				$messages[] = 'payload یک event وب‌هوک نامعتبر بود و failed شد.';
+				continue;
+			}
+
+			$result = $this->process_item( $item );
+
+			if ( ! is_array( $result ) ) {
+				$result = array(
+					'success' => false,
+					'message' => 'Invalid processor result.',
+					'data'    => array(),
+				);
+			}
+
+			if ( ! empty( $result['success'] ) ) {
+				$data        = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+				$delete_file = array_key_exists( 'deleteFile', $data ) ? (bool) $data['deleteFile'] : true;
+
+				if ( $delete_file ) {
+					$store->mark_done( $event_id );
+				} else {
+					$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
+					$store->mark_pending_progress( $event_id, $updated_payload, $data );
+				}
+
+				$processed++;
+				$messages[] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'event وب‌هوک پردازش شد.';
+
+				continue;
+			}
+
+			$try_count = absint( $row['try_count'] ) + 1;
+			$message   = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'Webhook event processing failed.';
+			$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 );
+			$data      = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+			$is_payload_pull_failure = ! empty( $data['payloadPullFailed'] );
+
+			if ( $is_payload_pull_failure ) {
+				update_option( 'mobo_core_last_payload_pull_error', $message, false );
+				update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
+
+				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+					error_log( 'Mobo Core payload pull failed: ' . $message );
+				}
+
+				if ( method_exists( $store, 'mark_retry_now' ) ) {
+					$store->mark_retry_now( $event_id, $message, $try_count, $try_count >= $max_try );
+				} else {
+					$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+				}
+			} else {
+				$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+			}
+
+			$failed++;
+
+			if ( $try_count >= $max_try ) {
+				$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
+			} else {
+				$messages[] = 'پردازش event وب‌هوک ناموفق بود و برای retry در صف ماند. پردازش در این اجرا متوقف شد.';
+			}
+
+			break;
+		}
+
+		return array(
+			'processed'         => $processed,
+			'failed'            => $failed,
+			'remainingTable'    => $store->count_pending() > 0,
+			'remainingDueTable' => method_exists( $store, 'count_due' ) ? $store->count_due() > 0 : $store->count_pending() > 0,
+			'messages'          => $messages,
 		);
 	}
 
@@ -268,6 +502,30 @@ class Mobo_Core_Webhook_Queue {
 	private function process_item( $item ) {
 		$event   = sanitize_text_field( (string) $item['event'] );
 		$payload = isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array();
+
+		$payload_result = $this->resolve_lightweight_payload( $event, $payload );
+
+		if ( is_wp_error( $payload_result ) ) {
+			$message = $payload_result->get_error_message();
+			update_option( 'mobo_core_last_payload_pull_error', $message, false );
+			update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
+
+			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+				error_log( 'Mobo Core payload pull failed: ' . $message );
+			}
+
+			return array(
+				'success' => false,
+				'message' => $message,
+				'data'    => array(
+					'payloadPullFailed' => true,
+				),
+			);
+		}
+
+		if ( is_array( $payload_result ) ) {
+			$payload = $payload_result;
+		}
 
 		$product_sync = new Mobo_Core_Product_Sync();
 
@@ -291,6 +549,225 @@ class Mobo_Core_Webhook_Queue {
 					'data'    => array(),
 				);
 		}
+	}
+
+
+	/**
+	 * Resolve lightweight webhook notifications into the real payload.
+	 *
+	 * Portal phase-3 notifications contain only EventId/Type/ChangesUrl. Old full
+	 * payload webhooks still bypass this method and are processed as before.
+	 *
+	 * @param string $event Expected event name.
+	 * @param array  $payload Current payload/notification.
+	 * @return array|WP_Error
+	 */
+	private function resolve_lightweight_payload( $event, $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return $payload;
+		}
+
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_pull_payload_enabled', '1' ) ) {
+			return $payload;
+		}
+
+		$payload_url = $this->first_non_empty(
+			array(
+				$this->get_value( $payload, 'changesUrl', '' ),
+				$this->get_value( $payload, 'payloadUrl', '' ),
+				$this->get_value( $payload, 'url', '' ),
+			)
+		);
+
+		if ( '' === $payload_url ) {
+			return $this->unwrap_event_model_payload( $event, $payload );
+		}
+
+		/*
+		 * If a payload already contains data and only happens to also contain a URL,
+		 * keep the local data. This protects custom/legacy payload shapes.
+		 */
+		$existing_data = $this->get_value( $payload, 'data', null );
+		if ( is_array( $existing_data ) && ! empty( $existing_data ) ) {
+			return $this->unwrap_event_model_payload( $event, $payload );
+		}
+
+		$api      = new Mobo_Core_API_Client();
+		$fetched  = $api->get_event_payload( $payload_url );
+
+		if ( is_wp_error( $fetched ) ) {
+			return $fetched;
+		}
+
+		$normalized = $this->unwrap_event_model_payload( $event, $fetched );
+
+		if ( ! is_array( $normalized ) ) {
+			return new WP_Error( 'mobo_core_invalid_pulled_payload', 'Pulled payload is invalid.' );
+		}
+
+		if ( ! isset( $normalized['syncId'] ) ) {
+			$sync_id = $this->get_value( $payload, 'syncId', '' );
+			if ( '' !== $sync_id ) {
+				$normalized['syncId'] = sanitize_text_field( (string) $sync_id );
+			}
+		}
+
+		$normalized['_moboPulledFrom'] = esc_url_raw( $payload_url );
+		$normalized['_moboPulledAt']   = time();
+
+		if ( 'UpdateVariant' === $event ) {
+			$normalized = $this->ensure_update_variant_product_context( $normalized, $payload_url, $payload );
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Unwrap Portal EventModel<T> payloads:
+	 * { event/type, data: {...} } or { Event/Type, Data: {...} }
+	 *
+	 * @param string $expected_event Expected event.
+	 * @param array  $payload Payload.
+	 * @return array
+	 */
+	private function unwrap_event_model_payload( $expected_event, $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return array();
+		}
+
+		$data = $this->get_value( $payload, 'data', null );
+
+		if ( ! is_array( $data ) ) {
+			return $payload;
+		}
+
+		$event = $this->detect_event( $payload );
+
+		if ( '' !== $event && '' !== $expected_event && $event !== $expected_event ) {
+			/*
+			 * Do not unwrap a mismatched EventModel. Let the processor fail clearly
+			 * rather than silently processing the wrong event type.
+			 */
+			return $payload;
+		}
+
+		/*
+		 * Important: Portal paged payloads are shaped like:
+		 * { productId: "...", data: [ variants/products ], pageNumber: ... }.
+		 * The list in data is not an EventModel wrapper; unwrapping it would drop
+		 * productId/page/cursor metadata and UpdateVariant would fail with
+		 * "productId is required". Only unwrap associative EventModel data.
+		 */
+		if ( $this->is_list_array( $data ) ) {
+			return $payload;
+		}
+
+		return $data;
+	}
+
+
+	private function ensure_update_variant_product_context( $normalized, $payload_url, $notification_payload ) {
+		if ( ! is_array( $normalized ) ) {
+			return $normalized;
+		}
+
+		$product_guid = $this->first_non_empty(
+			array(
+				$this->get_value( $normalized, 'productId', '' ),
+				$this->get_value( $normalized, 'productGuid', '' ),
+				$this->get_value( $normalized, 'parentProductId', '' ),
+				$this->get_value( $normalized, 'parentGuid', '' ),
+			)
+		);
+
+		$data = $this->get_value( $normalized, 'data', null );
+		if ( '' === $product_guid && is_array( $data ) && isset( $data[0] ) && is_array( $data[0] ) ) {
+			$product_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $data[0], 'productId', '' ),
+					$this->get_value( $data[0], 'productGuid', '' ),
+					$this->get_value( $data[0], 'parentProductId', '' ),
+					$this->get_value( $data[0], 'parentGuid', '' ),
+				)
+			);
+		}
+
+		if ( '' === $product_guid ) {
+			$product_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $notification_payload, 'productId', '' ),
+					$this->get_value( $notification_payload, 'productGuid', '' ),
+					$this->get_value( $notification_payload, 'entityGuid', '' ),
+					$this->get_value( $notification_payload, 'entityId', '' ),
+				)
+			);
+		}
+
+		if ( '' === $product_guid ) {
+			$product_guid = $this->extract_product_guid_from_variants_url( $payload_url );
+		}
+
+		if ( '' !== $product_guid ) {
+			$normalized['productId'] = sanitize_text_field( (string) $product_guid );
+
+			if ( is_array( $data ) ) {
+				foreach ( $data as $index => $variant_data ) {
+					if ( is_array( $variant_data ) ) {
+						$variant_product_guid = $this->first_non_empty(
+							array(
+								$this->get_value( $variant_data, 'productId', '' ),
+								$this->get_value( $variant_data, 'productGuid', '' ),
+								$this->get_value( $variant_data, 'parentProductId', '' ),
+								$this->get_value( $variant_data, 'parentGuid', '' ),
+							)
+						);
+
+						if ( '' === $variant_product_guid ) {
+							$data[ $index ]['productId'] = sanitize_text_field( (string) $product_guid );
+						}
+					}
+				}
+
+				$normalized['data'] = $data;
+			}
+		}
+
+		return $normalized;
+	}
+
+	private function extract_product_guid_from_variants_url( $url ) {
+		$url  = trim( (string) $url );
+		$path = '' === $url ? '' : wp_parse_url( $url, PHP_URL_PATH );
+
+		if ( ! is_string( $path ) || '' === $path ) {
+			return '';
+		}
+
+		$segments = array_values( array_filter( explode( '/', trim( $path, '/' ) ), 'strlen' ) );
+
+		foreach ( $segments as $index => $segment ) {
+			if ( 'get-variants' === strtolower( $segment ) && $index > 0 ) {
+				return sanitize_text_field( rawurldecode( (string) $segments[ $index - 1 ] ) );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * First non-empty scalar helper.
+	 *
+	 * @param array $values Values.
+	 * @return string
+	 */
+	private function first_non_empty( $values ) {
+		foreach ( (array) $values as $value ) {
+			if ( is_scalar( $value ) && '' !== trim( (string) $value ) ) {
+				return (string) $value;
+			}
+		}
+
+		return '';
 	}
 
 	/**
@@ -540,11 +1017,43 @@ class Mobo_Core_Webhook_Queue {
 	 */
 	private function map_numeric_event_type( $type ) {
 		$map = array(
+			0 => 'ProductUpdated',
 			1 => 'UpdateVariant',
 			2 => 'ProductUpdated',
+			4 => 'UpdateVariant',
 		);
 
 		return isset( $map[ $type ] ) ? $map[ $type ] : '';
+	}
+
+	/**
+	 * Check if array is a list-style array.
+	 *
+	 * Uses array_is_list on PHP 8.1+ and a compatible fallback for older PHP versions.
+	 *
+	 * @param mixed $array Value to inspect.
+	 * @return bool
+	 */
+	private function is_list_array( $array ) {
+		if ( ! is_array( $array ) ) {
+			return false;
+		}
+
+		if ( function_exists( 'array_is_list' ) ) {
+			return array_is_list( $array );
+		}
+
+		$expected = 0;
+
+		foreach ( array_keys( $array ) as $key ) {
+			if ( $key !== $expected ) {
+				return false;
+			}
+
+			++$expected;
+		}
+
+		return true;
 	}
 
 	/**

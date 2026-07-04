@@ -18,12 +18,14 @@ class Mobo_Core_Product_Sync {
 	private $price_calculator;
 	private $image_sync;
 	private $category_sync;
+	private $product_map;
 
 	public function __construct() {
 		$this->rules            = new Mobo_Core_Legacy_Rules();
 		$this->price_calculator = new Mobo_Core_Price_Calculator( $this->rules );
 		$this->image_sync       = new Mobo_Core_Image_Sync();
 		$this->category_sync    = new Mobo_Core_Category_Sync();
+		$this->product_map      = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
 	}
 
 	public function start_manual_sync( $sync_id = '', $source = 'admin' ) {
@@ -41,6 +43,9 @@ class Mobo_Core_Product_Sync {
 			'categorySynced'               => false,
 
 			'productPage'                  => 1,
+			'productCursor'                => 0,
+			'productCursorMode'            => Mobo_Core_Settings::enabled( 'mobo_core_product_cursor_sync_enabled', '1' ) ? 'cursor' : 'page',
+			'productCursorSupported'       => false,
 			'productQueue'                 => array(),
 
 			'currentProductGuid'           => '',
@@ -61,12 +66,17 @@ class Mobo_Core_Product_Sync {
 			'currentVariantTotalCount'     => 0,
 			'currentVariantTotalPages'     => 0,
 			'currentVariantProcessedPages' => 0,
+			'currentVariantCursor'          => 0,
 
 			'startedAt'                    => time(),
 			'completedAt'                  => 0,
 			'updatedAt'                    => time(),
 			'lastMessage'                  => 'همگام‌سازی محصولات شروع شد.',
 			'lastError'                    => '',
+			'transientRetryCount'           => 0,
+			'lastTransientError'            => '',
+			'waitingForPortalSince'         => 0,
+			'nextRetryAt'                  => 0,
 		);
 
 		update_option( self::STATE_OPTION, $state, false );
@@ -108,6 +118,9 @@ class Mobo_Core_Product_Sync {
 			'categorySynced'               => false,
 
 			'productPage'                  => 1,
+			'productCursor'                => 0,
+			'productCursorMode'            => 'cursor',
+			'productCursorSupported'       => false,
 			'productQueue'                 => array(),
 
 			'currentProductGuid'           => '',
@@ -128,12 +141,17 @@ class Mobo_Core_Product_Sync {
 			'currentVariantTotalCount'     => 0,
 			'currentVariantTotalPages'     => 0,
 			'currentVariantProcessedPages' => 0,
+			'currentVariantCursor'          => 0,
 
 			'startedAt'                    => 0,
 			'completedAt'                  => 0,
 			'updatedAt'                    => 0,
 			'lastMessage'                  => '',
 			'lastError'                    => '',
+			'transientRetryCount'           => 0,
+			'lastTransientError'            => '',
+			'waitingForPortalSince'         => 0,
+			'nextRetryAt'                  => 0,
 		);
 
 		$state = get_option( self::STATE_OPTION, array() );
@@ -155,7 +173,10 @@ class Mobo_Core_Product_Sync {
 
 		$last_error      = sanitize_text_field( (string) $state['lastError'] );
 		$current_status  = sanitize_key( (string) $state['status'] );
-		$should_continue = 'running' === $current_status && '' === $last_error;
+		$next_retry_at   = absint( $state['nextRetryAt'] ?? 0 );
+		$is_waiting      = 'waiting_for_portal' === $current_status;
+		$is_retry_due    = $is_waiting && ( 0 === $next_retry_at || $next_retry_at <= time() );
+		$should_continue = ( 'running' === $current_status && '' === $last_error ) || ( $is_retry_due && '' === $last_error );
 
 		return array(
 			'syncId'                       => sanitize_text_field( (string) $state['syncId'] ),
@@ -163,12 +184,18 @@ class Mobo_Core_Product_Sync {
 			'source'                       => sanitize_key( (string) $state['source'] ),
 
 			'isRunning'                    => 'running' === $current_status,
+			'isWaitingForPortal'            => $is_waiting,
+			'isRetryDue'                    => $is_retry_due,
+			'secondsUntilNextRetry'         => $is_waiting && $next_retry_at > time() ? max( 0, $next_retry_at - time() ) : 0,
 			'isDone'                       => 'done' === $current_status,
 			'isCancelled'                  => 'cancelled' === $current_status,
 
 			'categorySynced'               => (bool) $state['categorySynced'],
 
 			'productPage'                  => absint( $state['productPage'] ),
+			'productCursor'                => absint( $state['productCursor'] ),
+			'productCursorMode'            => sanitize_key( (string) $state['productCursorMode'] ),
+			'productCursorSupported'       => (bool) $state['productCursorSupported'],
 			'queuedProducts'               => is_array( $state['productQueue'] ) ? count( $state['productQueue'] ) : 0,
 
 			'currentProductGuid'           => sanitize_text_field( (string) $state['currentProductGuid'] ),
@@ -189,16 +216,21 @@ class Mobo_Core_Product_Sync {
 			'currentVariantTotalCount'     => absint( $state['currentVariantTotalCount'] ),
 			'currentVariantTotalPages'     => absint( $state['currentVariantTotalPages'] ),
 			'currentVariantProcessedPages' => absint( $state['currentVariantProcessedPages'] ),
+			'currentVariantCursor'          => absint( $state['currentVariantCursor'] ),
 
 			'startedAt'                    => absint( $state['startedAt'] ),
 			'completedAt'                  => absint( $state['completedAt'] ),
 			'updatedAt'                    => absint( $state['updatedAt'] ),
+			'waitingForPortalSince'         => absint( $state['waitingForPortalSince'] ?? 0 ),
+			'nextRetryAt'                  => $next_retry_at,
 
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
 			'lastError'                    => $last_error,
+			'transientRetryCount'           => absint( $state['transientRetryCount'] ?? 0 ),
+			'lastTransientError'            => sanitize_text_field( (string) ( $state['lastTransientError'] ?? '' ) ),
 
 			'shouldContinue'               => $should_continue,
-			'recommendedDelayMs'           => $should_continue ? 0 : 5000,
+			'recommendedDelayMs'           => $should_continue ? 0 : ( $is_waiting && $next_retry_at > time() ? max( 1000, ( $next_retry_at - time() ) * 1000 ) : 5000 ),
 		);
 	}
 
@@ -220,6 +252,24 @@ class Mobo_Core_Product_Sync {
 			return $this->result( true, 'همگام‌سازی قبلاً کامل شده است.', $this->get_manual_sync_status() );
 		}
 
+		if ( 'waiting_for_portal' === $state['status'] ) {
+			$next_retry_at = absint( $state['nextRetryAt'] ?? 0 );
+
+			if ( $next_retry_at > 0 && $next_retry_at > time() ) {
+				$state['updatedAt'] = time();
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, 'Portal هنوز آماده تلاش مجدد نیست. وضعیت sync حفظ شده است.', $this->get_manual_sync_status() );
+			}
+
+			$state['status']              = 'running';
+			$state['transientRetryCount'] = 0;
+			$state['lastError']           = '';
+			$state['lastMessage']         = 'اتصال به Portal دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
+			$state['updatedAt']           = time();
+			$this->save_manual_sync_state( $state );
+		}
+
 		/*
 		 * Step 1: Sync categories once before products.
 		 */
@@ -228,12 +278,10 @@ class Mobo_Core_Product_Sync {
 				$response = $api->get_categories( $state['syncId'] );
 
 				if ( is_wp_error( $response ) ) {
-					$state['lastError']   = $response->get_error_message();
-					$state['lastMessage'] = 'خطا در همگام‌سازی دسته‌بندی‌ها.';
-					$this->save_manual_sync_state( $state );
-
-					return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
+					return $this->handle_transient_request_error( $state, $response, 'خطا در همگام‌سازی دسته‌بندی‌ها.' );
 				}
+
+				$this->clear_transient_request_error( $state );
 
 				$category_result = $this->category_sync->sync_categories_payload( $response );
 				
@@ -265,19 +313,21 @@ class Mobo_Core_Product_Sync {
 		 * Step 2: Fetch product page when queue is empty and no current product exists.
 		 */
 		if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
+			$use_product_cursor = Mobo_Core_Settings::enabled( 'mobo_core_product_cursor_sync_enabled', '1' ) && 'page-fallback' !== (string) $state['productCursorMode'];
+
 			$response = $api->get_products_page(
 				absint( $state['productPage'] ),
 				$products_limit,
-				$state['syncId']
+				$state['syncId'],
+				absint( $state['productCursor'] ),
+				$use_product_cursor
 			);
 
 			if ( is_wp_error( $response ) ) {
-				$state['lastError']   = $response->get_error_message();
-				$state['lastMessage'] = 'خطا در دریافت صفحه محصولات.';
-				$this->save_manual_sync_state( $state );
-
-				return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
+				return $this->handle_transient_request_error( $state, $response, 'خطا در دریافت صفحه محصولات.' );
 			}
+
+			$this->clear_transient_request_error( $state );
 
 			$items       = $this->get_value( $response, 'data', array() );
 			$has_more    = $this->get_value( $response, 'hasMore', false );
@@ -294,6 +344,24 @@ class Mobo_Core_Product_Sync {
 
 			if ( ! is_array( $items ) ) {
 				$items = array();
+			}
+
+			$cursor_mode = sanitize_key( (string) $this->get_value( $response, 'cursorMode', '' ) );
+			if ( '' !== $cursor_mode ) {
+				$state['productCursorMode']      = $cursor_mode;
+				$state['productCursorSupported'] = true;
+
+				$next_cursor = $this->get_value( $response, 'nextCursor', null );
+				if ( null !== $next_cursor && '' !== $next_cursor ) {
+					$state['productCursor'] = absint( $next_cursor );
+				}
+			} elseif ( $use_product_cursor ) {
+				/*
+				 * Backward compatibility: older Portal builds ignore UseCursor/Cursor.
+				 * After the first legacy response, fall back to page-number mode.
+				 */
+				$state['productCursorMode']      = 'page-fallback';
+				$state['productCursorSupported'] = false;
 			}
 
 			foreach ( $items as $product_data ) {
@@ -377,6 +445,7 @@ class Mobo_Core_Product_Sync {
 			$state['currentVariantTotalCount']      = 0;
 			$state['currentVariantTotalPages']      = 0;
 			$state['currentVariantProcessedPages']  = 0;
+			$state['currentVariantCursor']          = 0;
 			$state['lastError']                     = '';
 			$state['lastMessage']                   = 'محصول اصلی همگام شد: ' . $product_guid;
 
@@ -451,20 +520,23 @@ class Mobo_Core_Product_Sync {
 		 */
 		$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
 
+		$use_variant_cursor = Mobo_Core_Settings::enabled( 'mobo_core_variant_cursor_sync_enabled', '1' );
+		$variant_cursor     = max( 0, absint( $state['currentVariantCursor'] ?? 0 ) );
+
 		$response = $api->get_variants_page(
 			$product_guid,
 			absint( $state['variantPage'] ),
 			$variants_limit,
-			$state['syncId']
+			$state['syncId'],
+			$variant_cursor,
+			$use_variant_cursor
 		);
 
 		if ( is_wp_error( $response ) ) {
-			$state['lastError']   = $response->get_error_message();
-			$state['lastMessage'] = 'خطا در دریافت تنوع‌های محصول.';
-			$this->save_manual_sync_state( $state );
-
-			return $this->result( false, $response->get_error_message(), $this->get_manual_sync_status() );
+			return $this->handle_transient_request_error( $state, $response, 'خطا در دریافت تنوع‌های محصول.' );
 		}
+
+		$this->clear_transient_request_error( $state );
 
 		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
 		$product_id          = absint( $state['currentProductId'] );
@@ -490,6 +562,12 @@ class Mobo_Core_Product_Sync {
 
 		$state['currentVariantTotalCount'] = $variant_total_count;
 		$state['currentVariantTotalPages'] = absint( $this->get_value( $response, 'totalPages', 0 ) );
+
+		$variant_cursor_mode = sanitize_key( (string) $this->get_value( $response, 'cursorMode', '' ) );
+		$variant_next_cursor = $this->get_value( $response, 'nextCursor', null );
+		if ( '' !== $variant_cursor_mode && null !== $variant_next_cursor && '' !== $variant_next_cursor ) {
+			$state['currentVariantCursor'] = absint( $variant_next_cursor );
+		}
 
 		$payload = array(
 			'event'         => 'UpdateVariant',
@@ -632,23 +710,107 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, 'Invalid UpdateVariant payload.' );
 		}
 
-		$product_guid = sanitize_text_field( (string) $this->get_value( $payload, 'productId', '' ) );
+		/*
+		 * Be tolerant of all known Portal shapes:
+		 * 1) VariantSyncPagedResult: { productId, data: [...] }
+		 * 2) EventModel wrapper: { event: UpdateVariant, data: { productId, data: [...] } }
+		 * 3) Legacy list wrapper: { data: [ { productId, ... } ] }
+		 * 4) Variant-specific metadata: { variantId/entityGuid } where parent can be found from product_map.
+		 */
+		$inner_data = $this->get_value( $payload, 'data', null );
+		if ( is_array( $inner_data ) && ! $this->is_list_array( $inner_data ) ) {
+			$inner_product_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $inner_data, 'productId', '' ),
+					$this->get_value( $inner_data, 'productGuid', '' ),
+					$this->get_value( $inner_data, 'parentProductId', '' ),
+					$this->get_value( $inner_data, 'parentGuid', '' ),
+				)
+			);
+
+			$inner_variants = $this->get_value( $inner_data, 'data', null );
+			if ( '' !== $inner_product_guid || is_array( $inner_variants ) ) {
+				$payload = array_merge( $payload, $inner_data );
+			}
+		}
+
+		$product_guid = sanitize_text_field(
+			(string) $this->first_non_empty(
+				array(
+					$this->get_value( $payload, 'productId', '' ),
+					$this->get_value( $payload, 'productGuid', '' ),
+					$this->get_value( $payload, 'parentProductId', '' ),
+					$this->get_value( $payload, 'parentGuid', '' ),
+				)
+			)
+		);
 		$sync_id      = sanitize_text_field( (string) $this->get_value( $payload, 'syncId', '' ) );
 		$page_number  = max( 1, absint( $this->get_value( $payload, 'pageNumber', 1 ) ) );
 		$has_more     = $this->get_value( $payload, 'hasMore', false );
 		$is_last_page = $this->get_value( $payload, 'isLastPage', null );
 		$variants     = $this->get_value( $payload, 'data', array() );
 
+		if ( is_array( $variants ) && ! $this->is_list_array( $variants ) ) {
+			$nested_variants = $this->get_value( $variants, 'data', null );
+			if ( is_array( $nested_variants ) ) {
+				$variants = $nested_variants;
+			}
+		}
+
 		if ( ! is_array( $variants ) ) {
 			$variants = array();
 		}
 
 		if ( '' === $product_guid && isset( $variants[0] ) && is_array( $variants[0] ) ) {
-			$product_guid = sanitize_text_field( (string) $this->get_value( $variants[0], 'productId', '' ) );
+			$product_guid = sanitize_text_field(
+				(string) $this->first_non_empty(
+					array(
+						$this->get_value( $variants[0], 'productId', '' ),
+						$this->get_value( $variants[0], 'productGuid', '' ),
+						$this->get_value( $variants[0], 'parentProductId', '' ),
+						$this->get_value( $variants[0], 'parentGuid', '' ),
+					)
+				)
+			);
 		}
 
 		if ( '' === $product_guid ) {
-			return $this->result( false, 'productId is required.' );
+			$product_guid = $this->extract_product_guid_from_url( (string) $this->get_value( $payload, '_moboPulledFrom', '' ) );
+		}
+
+		if ( '' === $product_guid ) {
+			$variant_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $payload, 'variantId', '' ),
+					$this->get_value( $payload, 'variantGuid', '' ),
+					$this->get_value( $payload, 'entityGuid', '' ),
+					$this->get_value( $payload, 'entityId', '' ),
+				)
+			);
+			if ( '' !== $variant_guid ) {
+				$product_guid = $this->find_parent_product_guid_by_variant_guid( $variant_guid );
+			}
+		}
+
+		if ( '' === $product_guid ) {
+			return $this->result( false, $this->build_missing_product_id_message( $payload, $variants ) );
+		}
+
+		foreach ( $variants as $variant_index => $variant_data ) {
+			if ( is_array( $variant_data ) ) {
+				$variant_product_guid = $this->first_non_empty(
+					array(
+						$this->get_value( $variant_data, 'productId', '' ),
+						$this->get_value( $variant_data, 'productGuid', '' ),
+						$this->get_value( $variant_data, 'parentProductId', '' ),
+						$this->get_value( $variant_data, 'parentGuid', '' ),
+					)
+				);
+
+				if ( '' === $variant_product_guid ) {
+					$variants[ $variant_index ]['productId'] = $product_guid;
+				}
+			}
 		}
 
 		if ( '' === $sync_id ) {
@@ -836,6 +998,7 @@ class Mobo_Core_Product_Sync {
 		$state['currentVariantTotalCount']       = 0;
 		$state['currentVariantTotalPages']       = 0;
 		$state['currentVariantProcessedPages']   = 0;
+		$state['currentVariantCursor']            = 0;
 		$state['lastError']                      = '';
 		$state['lastMessage']                    = sanitize_text_field( (string) $message );
 
@@ -885,6 +1048,10 @@ class Mobo_Core_Product_Sync {
 
 			$product_id = absint( $product->save() );
 
+			if ( $product_id > 0 ) {
+				$this->upsert_product_map( $product_guid, $product_id, true );
+			}
+
 			if ( $product_id <= 0 ) {
 				return 0;
 			}
@@ -897,7 +1064,8 @@ class Mobo_Core_Product_Sync {
 		} else {
 			$product->update_meta_data( 'product_guid', $product_guid );
 			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
-			$product->save();
+			$product_id = absint( $product->save() );
+			$this->upsert_product_map( $product_guid, $product_id, true );
 		}
 
 		if ( $is_new_product || $this->rules->should_update_title() ) {
@@ -941,6 +1109,10 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
 
 		$product_id = absint( $product->save() );
+
+		if ( $product_id > 0 ) {
+			$this->upsert_product_map( $product_guid, $product_id, false );
+		}
 
 		if ( $product_id <= 0 ) {
 			return 0;
@@ -1012,6 +1184,10 @@ class Mobo_Core_Product_Sync {
 
 			$variation_id = absint( $variation->save() );
 
+			if ( $variation_id > 0 ) {
+				$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true );
+			}
+
 			if ( $variation_id <= 0 ) {
 				return 0;
 			}
@@ -1031,7 +1207,8 @@ class Mobo_Core_Product_Sync {
 				$variation->update_meta_data( 'product_guid', $product_guid );
 			}
 
-			$variation->save();
+			$variation_id = absint( $variation->save() );
+			$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true );
 		}
 
 		if ( $is_new_variation || $this->rules->should_update_title() ) {
@@ -1064,7 +1241,13 @@ class Mobo_Core_Product_Sync {
 
 		$variation->update_meta_data( 'mobo_sync_incomplete', '0' );
 
-		return absint( $variation->save() );
+		$variation_id = absint( $variation->save() );
+
+		if ( $variation_id > 0 ) {
+			$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false );
+		}
+
+		return $variation_id;
 	}
 
 	private function product_has_variation_attributes( $data ) {
@@ -1261,19 +1444,90 @@ class Mobo_Core_Product_Sync {
 			return;
 		}
 
+		$raw_price         = $this->get_value( $data, 'price', null );
+		$raw_compare_price = $this->get_value( $data, 'comparePrice', null );
+
+		$product->update_meta_data( 'mobo_api_price', null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price ) );
+		$product->update_meta_data( 'mobo_api_compare_price', null === $raw_compare_price || '' === $raw_compare_price ? '' : wc_format_decimal( $raw_compare_price ) );
+		$product->update_meta_data( 'mobo_price_policy_type', (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ) );
+		$product->update_meta_data( 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+
 		$pair = $this->price_calculator->calculate_price_pair(
 			absint( $product->get_id() ),
-			$this->get_value( $data, 'price', null ),
-			$this->get_value( $data, 'comparePrice', null ),
+			$raw_price,
+			$raw_compare_price,
 			$context
 		);
 
 		if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ) {
 			$product->set_regular_price( $pair['regular_price'] );
+			$product->update_meta_data( 'mobo_calculated_regular_price', $pair['regular_price'] );
 		}
 
 		if ( isset( $pair['sale_price'] ) ) {
 			$product->set_sale_price( $pair['sale_price'] );
+			$product->update_meta_data( 'mobo_calculated_sale_price', $pair['sale_price'] );
+		}
+	}
+
+
+	/**
+	 * Treat temporary API/HTTP failures as retryable manual-sync errors.
+	 *
+	 * A single timeout must not poison the sync state with lastError, because
+	 * get_manual_sync_status() stops the self-runner when lastError is not empty.
+	 *
+	 * @param array    $state   Current manual sync state.
+	 * @param WP_Error $error   Request error.
+	 * @param string   $message Human message.
+	 * @return array
+	 */
+	private function handle_transient_request_error( &$state, $error, $message ) {
+		$try_count = absint( $state['transientRetryCount'] ?? 0 ) + 1;
+		$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_transient_retry_max_try', 10, 1, 50 );
+		$error_msg = is_wp_error( $error ) ? $error->get_error_message() : (string) $error;
+
+		$state['transientRetryCount'] = $try_count;
+		$state['lastTransientError']  = sanitize_text_field( $error_msg );
+		$state['updatedAt']           = time();
+
+		if ( $try_count >= $max_try ) {
+			$delay_seconds = Mobo_Core_Settings::get_int( 'mobo_core_waiting_for_portal_retry_delay_seconds', 60, 10, 3600 );
+
+			$state['status']                = 'waiting_for_portal';
+			$state['waitingForPortalSince'] = empty( $state['waitingForPortalSince'] ) ? time() : absint( $state['waitingForPortalSince'] );
+			$state['nextRetryAt']           = time() + $delay_seconds;
+			$state['lastError']             = '';
+			$state['lastMessage']           = sprintf( '%s اتصال به Portal پس از %d تلاش برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'] . ' ' . $error_msg, $this->get_manual_sync_status() );
+		}
+
+		/* Keep lastError empty so the self-runner keeps the sync resumable. */
+		$state['status']      = 'running';
+		$state['nextRetryAt'] = 0;
+		$state['lastError']   = '';
+		$state['lastMessage'] = sprintf( '%s خطای موقت؛ تلاش مجدد %d از %d. %s', $message, $try_count, $max_try, $error_msg );
+		$this->save_manual_sync_state( $state );
+
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+	}
+
+	/**
+	 * Clear transient request retry state after a successful API response.
+	 *
+	 * @param array $state Current state.
+	 * @return void
+	 */
+	private function clear_transient_request_error( &$state ) {
+		$state['transientRetryCount']   = 0;
+		$state['lastTransientError']    = '';
+		$state['lastError']             = '';
+		$state['waitingForPortalSince'] = 0;
+		$state['nextRetryAt']           = 0;
+		if ( 'waiting_for_portal' === sanitize_key( (string) ( $state['status'] ?? '' ) ) ) {
+			$state['status'] = 'running';
 		}
 	}
 
@@ -1452,11 +1706,85 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function find_product_id_by_guid( $guid ) {
-		return $this->find_post_id_by_meta( 'product', 'product_guid', $guid );
+		$guid = sanitize_text_field( (string) $guid );
+
+		if ( '' === $guid ) {
+			return 0;
+		}
+
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			$product_id = $this->product_map->get_product_id( $guid );
+
+			if ( $product_id > 0 ) {
+				return $product_id;
+			}
+		}
+
+		$product_id = $this->find_post_id_by_meta( 'product', 'product_guid', $guid );
+
+		if ( $product_id > 0 ) {
+			$this->upsert_product_map( $guid, $product_id, false );
+		}
+
+		return $product_id;
 	}
 
 	private function find_variation_id_by_guid( $guid ) {
-		return $this->find_post_id_by_meta( 'product_variation', 'variant_guid', $guid );
+		$guid = sanitize_text_field( (string) $guid );
+
+		if ( '' === $guid ) {
+			return 0;
+		}
+
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			$variation_id = $this->product_map->get_variation_id( $guid );
+
+			if ( $variation_id > 0 ) {
+				return $variation_id;
+			}
+		}
+
+		$variation_id = $this->find_post_id_by_meta( 'product_variation', 'variant_guid', $guid );
+
+		if ( $variation_id > 0 ) {
+			$parent_guid = sanitize_text_field( (string) get_post_meta( $variation_id, 'product_guid', true ) );
+			$this->upsert_variation_map( $guid, $variation_id, $parent_guid, false );
+		}
+
+		return $variation_id;
+	}
+
+	/**
+	 * Persist product GUID map if the table is available.
+	 *
+	 * @param string $product_guid Remote product GUID.
+	 * @param int    $product_id Product ID.
+	 * @param bool   $sync_incomplete Sync incomplete.
+	 * @return void
+	 */
+	private function upsert_product_map( $product_guid, $product_id, $sync_incomplete = false ) {
+		if ( ! ( $this->product_map instanceof Mobo_Core_Product_Map ) ) {
+			return;
+		}
+
+		$this->product_map->upsert_product( $product_guid, $product_id, '', $sync_incomplete );
+	}
+
+	/**
+	 * Persist variation GUID map if the table is available.
+	 *
+	 * @param string $variant_guid Remote variant GUID.
+	 * @param int    $variation_id Variation ID.
+	 * @param string $product_guid Parent remote product GUID.
+	 * @param bool   $sync_incomplete Sync incomplete.
+	 * @return void
+	 */
+	private function upsert_variation_map( $variant_guid, $variation_id, $product_guid = '', $sync_incomplete = false ) {
+		if ( ! ( $this->product_map instanceof Mobo_Core_Product_Map ) ) {
+			return;
+		}
+
+		$this->product_map->upsert_variation( $variant_guid, $variation_id, $product_guid, '', $sync_incomplete );
 	}
 
 	private function find_post_id_by_meta( $post_type, $meta_key, $meta_value ) {
@@ -1510,6 +1838,56 @@ class Mobo_Core_Product_Sync {
 		update_option( $option_name, $seen, false );
 	}
 
+
+	private function extract_product_guid_from_url( $url ) {
+		$url = trim( (string) $url );
+
+		if ( '' === $url ) {
+			return '';
+		}
+
+		$path = wp_parse_url( $url, PHP_URL_PATH );
+
+		if ( ! is_string( $path ) || '' === $path ) {
+			return '';
+		}
+
+		$segments = array_values( array_filter( explode( '/', trim( $path, '/' ) ), 'strlen' ) );
+
+		foreach ( $segments as $index => $segment ) {
+			if ( 'get-variants' === strtolower( $segment ) && $index > 0 ) {
+				return sanitize_text_field( rawurldecode( (string) $segments[ $index - 1 ] ) );
+			}
+		}
+
+		return '';
+	}
+
+	private function build_missing_product_id_message( $payload, $variants ) {
+		$payload_keys = is_array( $payload ) ? implode( ',', array_slice( array_keys( $payload ), 0, 20 ) ) : '';
+		$data_keys    = '';
+		$variant_keys = '';
+
+		$data = $this->get_value( $payload, 'data', null );
+		if ( is_array( $data ) ) {
+			$data_keys = implode( ',', array_slice( array_keys( $data ), 0, 20 ) );
+		}
+
+		if ( is_array( $variants ) && isset( $variants[0] ) && is_array( $variants[0] ) ) {
+			$variant_keys = implode( ',', array_slice( array_keys( $variants[0] ), 0, 20 ) );
+		}
+
+		$pulled_from = is_array( $payload ) ? (string) $this->get_value( $payload, '_moboPulledFrom', '' ) : '';
+
+		return sprintf(
+			'productId is required. PayloadKeys=%s DataKeys=%s FirstVariantKeys=%s PulledFrom=%s',
+			$payload_keys,
+			$data_keys,
+			$variant_keys,
+			$pulled_from
+		);
+	}
+
 	private function clear_seen_variants( $product_guid, $sync_id ) {
 		delete_option( $this->seen_option_name( $product_guid, $sync_id ) );
 	}
@@ -1534,6 +1912,71 @@ class Mobo_Core_Product_Sync {
 		}
 
 		return $default;
+	}
+
+
+	/**
+	 * Return the first non-empty scalar value.
+	 *
+	 * @param array $values Values.
+	 * @return string
+	 */
+	private function first_non_empty( $values ) {
+		foreach ( (array) $values as $value ) {
+			if ( is_scalar( $value ) && '' !== trim( (string) $value ) ) {
+				return (string) $value;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Determine whether an array is a zero-based list.
+	 *
+	 * @param array $array Array.
+	 * @return bool
+	 */
+	private function is_list_array( $array ) {
+		if ( ! is_array( $array ) ) {
+			return false;
+		}
+
+		$expected = 0;
+		foreach ( array_keys( $array ) as $key ) {
+			if ( $key !== $expected ) {
+				return false;
+			}
+			$expected++;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Resolve parent product GUID from a known remote variant GUID.
+	 *
+	 * @param string $variant_guid Remote variant GUID.
+	 * @return string
+	 */
+	private function find_parent_product_guid_by_variant_guid( $variant_guid ) {
+		global $wpdb;
+
+		$variant_guid = sanitize_text_field( (string) $variant_guid );
+		if ( '' === $variant_guid || ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
+			return '';
+		}
+
+		$table = Mobo_Core_Product_Map::table_name();
+		$parent_guid = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT parent_remote_guid FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+				$variant_guid,
+				Mobo_Core_Product_Map::TYPE_VARIATION
+			)
+		);
+
+		return sanitize_text_field( (string) $parent_guid );
 	}
 
 	private function to_bool( $value ) {

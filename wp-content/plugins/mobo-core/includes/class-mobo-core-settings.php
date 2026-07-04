@@ -30,6 +30,8 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug'            => '1',
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
+			'mobo_core_category_mapping_enabled'  => '1',
+			'mobo_core_category_mapping_required' => '0',
 
 			'mobo_default_category_id'            => '0',
 
@@ -42,9 +44,21 @@ class Mobo_Core_Settings {
 			'mobo_core_webhook_files_per_run'     => 1,
 			'mobo_core_webhook_max_try'           => 5,
 			'mobo_core_webhook_expire_days'       => 2,
+			'mobo_core_pull_payload_enabled'        => '1',
+			'mobo_core_payload_pull_timeout_seconds'=> 60,
+			'mobo_core_api_request_timeout_seconds'    => 60,
+			'mobo_core_transient_retry_max_try'        => 10,
+			'mobo_core_waiting_for_portal_retry_delay_seconds' => 60,
+			'mobo_core_reprice_batch_size'       => 20,
 			'mobo_core_products_per_page'         => 1,
+			'mobo_core_product_cursor_sync_enabled' => '1',
 			'mobo_core_variants_per_page'         => 5,
+			'mobo_core_variant_cursor_sync_enabled' => '1',
 			'mobo_core_images_per_run'            => 1,
+			'mobo_core_image_queue_enabled'       => '1',
+			'mobo_core_image_queue_blocking'      => '1',
+			'mobo_core_image_max_try'             => 5,
+			'mobo_core_image_retry_base_seconds'  => 120,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
 
 			'mobo_core_excluded_product_urls' => '',
@@ -52,6 +66,52 @@ class Mobo_Core_Settings {
 			'mobo_core_categories_refresh_interval_hours'    => 12,
 			
 			'mobo_core_token'         => '',
+
+			// Real cron is the primary execution path on customer hosts.
+			'mobo_core_cron_token'                    => '',
+			'mobo_core_real_cron_last_hit_at'          => 0,
+			'mobo_core_real_cron_last_success_at'      => 0,
+			'mobo_core_real_cron_last_result'          => array(),
+			'mobo_core_real_cron_time_budget_seconds'  => 25,
+			'mobo_core_real_cron_max_sync_steps'       => 3,
+			'mobo_core_real_cron_lock_ttl_seconds'     => 120,
+			'mobo_core_real_cron_process_webhooks'     => '1',
+			'mobo_core_process_webhook_on_receive'     => '0',
+
+			// Customer-side self runner. This replaces central runner/WP-Cron dependency.
+			'mobo_core_self_runner_enabled'           => '1',
+			'mobo_core_self_runner_continue_enabled'  => '1',
+			'mobo_core_self_runner_min_interval_seconds' => 3,
+			'mobo_core_self_runner_http_timeout_seconds' => 1,
+			'mobo_core_self_runner_last_kick_attempt_at' => 0,
+			'mobo_core_self_runner_last_kick_success_at' => 0,
+			'mobo_core_self_runner_last_kick_result'   => array(),
+			'mobo_core_self_runner_last_run_at'        => 0,
+			'mobo_core_self_runner_last_run_success_at'=> 0,
+			'mobo_core_self_runner_last_run_result'    => array(),
+
+			// Customer-side health reporting to Portal.
+			'mobo_core_health_report_enabled'          => '1',
+			'mobo_core_health_report_url'              => '',
+			'mobo_core_health_report_min_interval_seconds' => 300,
+			'mobo_core_health_report_timeout_seconds'  => 15,
+			'mobo_core_health_last_report_attempt_at'  => 0,
+			'mobo_core_health_last_report_success_at'  => 0,
+			'mobo_core_health_last_report_result'      => array(),
+
+			// Checkout / pre-purchase validation. Disabled by default for safe upgrades.
+			'mobo_core_checkout_validation_enabled'          => '0',
+			'mobo_core_checkout_validate_only_mobo_products' => '1',
+			'mobo_core_checkout_require_remote_guid'         => '1',
+			'mobo_core_checkout_block_incomplete_sync'       => '1',
+			'mobo_core_checkout_local_stock_check_enabled'   => '1',
+			'mobo_core_checkout_external_validation_enabled' => '0',
+			'mobo_core_checkout_external_validation_url'     => '',
+			'mobo_core_checkout_external_timeout_seconds'    => 3,
+			'mobo_core_checkout_external_error_behavior'     => 'allow',
+			'mobo_core_checkout_last_validation_attempt_at'  => 0,
+			'mobo_core_checkout_last_validation_success_at'  => 0,
+			'mobo_core_checkout_last_validation_result'      => array(),
 		);
 	}
 
@@ -118,6 +178,9 @@ class Mobo_Core_Settings {
 		self::save_text( $post, 'mobo_core_security_code' );
 		self::save_url( $post, 'mobo_core_api_base_url' );
 		self::save_text( $post, 'mobo_core_token' );
+		self::save_text( $post, 'mobo_core_cron_token' );
+		self::save_url( $post, 'mobo_core_health_report_url' );
+		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
 
 		self::save_bool( $post, 'mobo_core_only_in_stock' );
 		self::save_bool( $post, 'global_product_auto_stock' );
@@ -127,6 +190,8 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'global_product_auto_slug' );
 		self::save_bool( $post, 'global_update_categories' );
 		self::save_bool( $post, 'global_update_images' );
+		self::save_bool( $post, 'mobo_core_category_mapping_enabled' );
+		self::save_bool( $post, 'mobo_core_category_mapping_required' );
 
 		if ( isset( $_POST['mobo_core_excluded_product_urls'] ) ) {
 			update_option(
@@ -173,9 +238,51 @@ class Mobo_Core_Settings {
 		self::save_int( $post, 'mobo_core_webhook_files_per_run', 1, 1, 10 );
 		self::save_int( $post, 'mobo_core_webhook_max_try', 5, 1, 20 );
 		self::save_int( $post, 'mobo_core_webhook_expire_days', 2, 1, 30 );
+		self::save_bool_if_present( $post, 'mobo_core_pull_payload_enabled' );
+		self::save_int_if_present( $post, 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
+		self::save_int_if_present( $post, 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
+		self::save_int_if_present( $post, 'mobo_core_transient_retry_max_try', 10, 1, 50 );
+		self::save_int_if_present( $post, 'mobo_core_waiting_for_portal_retry_delay_seconds', 60, 10, 3600 );
+		self::save_int_if_present( $post, 'mobo_core_reprice_batch_size', 20, 1, 200 );
 		self::save_int( $post, 'mobo_core_products_per_page', 1, 1, 20 );
+		self::save_bool_if_present( $post, 'mobo_core_product_cursor_sync_enabled' );
 		self::save_int( $post, 'mobo_core_variants_per_page', 5, 1, 100 );
+		self::save_bool_if_present( $post, 'mobo_core_variant_cursor_sync_enabled' );
 		self::save_int( $post, 'mobo_core_images_per_run', 1, 0, 10 );
+		self::save_bool_if_present( $post, 'mobo_core_image_queue_enabled' );
+		self::save_bool_if_present( $post, 'mobo_core_image_queue_blocking' );
+		self::save_int_if_present( $post, 'mobo_core_image_max_try', 5, 1, 20 );
+		self::save_int_if_present( $post, 'mobo_core_image_retry_base_seconds', 120, 30, 900 );
+		self::save_int( $post, 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
+		self::save_int( $post, 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
+		self::save_int( $post, 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
+		self::save_bool( $post, 'mobo_core_real_cron_process_webhooks' );
+		self::save_bool( $post, 'mobo_core_process_webhook_on_receive' );
+		self::save_bool_if_present( $post, 'mobo_core_self_runner_enabled' );
+		self::save_bool_if_present( $post, 'mobo_core_self_runner_continue_enabled' );
+		self::save_int_if_present( $post, 'mobo_core_self_runner_min_interval_seconds', 3, 0, 60 );
+		self::save_int_if_present( $post, 'mobo_core_self_runner_http_timeout_seconds', 1, 1, 10 );
+		self::save_bool( $post, 'mobo_core_health_report_enabled' );
+		self::save_int( $post, 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
+		self::save_int( $post, 'mobo_core_health_report_timeout_seconds', 15, 5, 60 );
+
+		self::save_bool_if_present( $post, 'mobo_core_checkout_validation_enabled' );
+		self::save_bool_if_present( $post, 'mobo_core_checkout_validate_only_mobo_products' );
+		self::save_bool_if_present( $post, 'mobo_core_checkout_require_remote_guid' );
+		self::save_bool_if_present( $post, 'mobo_core_checkout_block_incomplete_sync' );
+		self::save_bool_if_present( $post, 'mobo_core_checkout_local_stock_check_enabled' );
+		self::save_bool_if_present( $post, 'mobo_core_checkout_external_validation_enabled' );
+		self::save_int_if_present( $post, 'mobo_core_checkout_external_timeout_seconds', 3, 1, 10 );
+
+		$checkout_error_behavior = isset( $post['mobo_core_checkout_external_error_behavior'] )
+			? sanitize_key( wp_unslash( $post['mobo_core_checkout_external_error_behavior'] ) )
+			: 'allow';
+
+		if ( ! in_array( $checkout_error_behavior, array( 'allow', 'block' ), true ) ) {
+			$checkout_error_behavior = 'allow';
+		}
+
+		update_option( 'mobo_core_checkout_external_error_behavior', $checkout_error_behavior, false );
 
 		$behavior = isset( $post['mobo_core_missing_variants_behavior'] )
 			? sanitize_key( wp_unslash( $post['mobo_core_missing_variants_behavior'] ) )
@@ -280,6 +387,40 @@ class Mobo_Core_Settings {
 			isset( $post[ $key ] ) ? esc_url_raw( wp_unslash( $post[ $key ] ) ) : '',
 			false
 		);
+	}
+
+
+	/**
+	 * Save integer option only when the field belongs to the submitted tab/form.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @param int    $default Default.
+	 * @param int    $min Minimum.
+	 * @param int    $max Maximum.
+	 * @return void
+	 */
+	private static function save_int_if_present( $post, $key, $default, $min, $max ) {
+		if ( ! isset( $post[ $key ] ) ) {
+			return;
+		}
+
+		self::save_int( $post, $key, $default, $min, $max );
+	}
+
+	/**
+	 * Save boolean-like option only when the field belongs to the submitted tab/form.
+	 *
+	 * @param array  $post Post.
+	 * @param string $key Option key.
+	 * @return void
+	 */
+	private static function save_bool_if_present( $post, $key ) {
+		if ( ! isset( $post[ $key ] ) ) {
+			return;
+		}
+
+		self::save_bool( $post, $key );
 	}
 
 	/**

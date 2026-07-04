@@ -48,6 +48,66 @@ class Mobo_Core_Rest_Controller {
 
 		register_rest_route(
 			'mobo-core/v1',
+			'/cron/run',
+			array(
+				'methods'             => array( 'GET', 'POST' ),
+				'callback'            => array( $this, 'run_real_cron' ),
+				'permission_callback' => array( $this, 'check_cron_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/cron/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_real_cron_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/worker/run',
+			array(
+				'methods'             => array( 'GET', 'POST' ),
+				'callback'            => array( $this, 'run_self_worker' ),
+				'permission_callback' => array( $this, 'check_cron_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/worker/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_self_worker_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/health',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_health' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/health/report-now',
+			array(
+				'methods'             => array( 'GET', 'POST' ),
+				'callback'            => array( $this, 'send_health_report_now' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
 			'/webhook',
 			array(
 				'methods'             => 'POST',
@@ -144,6 +204,48 @@ class Mobo_Core_Rest_Controller {
 		return true;
 	}
 
+
+	/**
+	 * Check real cron token.
+	 *
+	 * cPanel curl usually cannot send custom headers reliably for non-technical users,
+	 * so this endpoint accepts a query/body token and also supports X-SEC as fallback.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return bool|WP_Error
+	 */
+	public function check_cron_security( $request ) {
+		$expected = (string) get_option( 'mobo_core_cron_token', '' );
+
+		if ( '' === trim( $expected ) ) {
+			return new WP_Error(
+				'mobo_core_cron_token_missing',
+				'Cron token is not configured.',
+				array( 'status' => 403 )
+			);
+		}
+
+		$provided = (string) $request->get_param( 'token' );
+
+		if ( '' === $provided ) {
+			$provided = (string) $request->get_header( 'X-SEC' );
+		}
+
+		if ( '' === $provided ) {
+			$provided = (string) $request->get_header( 'x-sec' );
+		}
+
+		if ( '' === $provided || ! hash_equals( $expected, $provided ) ) {
+			return new WP_Error(
+				'mobo_core_cron_unauthorized',
+				'Unauthorized cron request.',
+				array( 'status' => 401 )
+			);
+		}
+
+		return true;
+	}
+
 	/**
 	 * Ensure categories are synced if due.
 	 *
@@ -189,21 +291,149 @@ class Mobo_Core_Rest_Controller {
 			return $file;
 		}
 
-		/*
-		 * Auto-process a small part of the queue.
-		 * This should not be relied on for long work; C# may still call /webhook/run.
-		 */
-		$process_result = $queue->process();
+		$process_result = array(
+			'processed'     => 0,
+			'failed'        => 0,
+			'remainingFile' => true,
+		);
+
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_process_webhook_on_receive', '0' ) ) {
+			$process_result = $queue->process();
+		}
+
+		$self_kick = array(
+			'success' => true,
+			'status'  => 'skipped',
+			'message' => 'Self runner is not available.',
+		);
+
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			$self_kick = Mobo_Core_Self_Runner::kick( 'webhook', false );
+		}
+
+		return rest_ensure_response(
+			array(
+				'success'  => true,
+				'status'   => 'accepted',
+				'queue'    => array(
+					'processed' => isset( $process_result['processed'] ) ? absint( $process_result['processed'] ) : 0,
+					'failed'    => isset( $process_result['failed'] ) ? absint( $process_result['failed'] ) : 0,
+					'remaining' => ! empty( $process_result['remainingFile'] ) || ! empty( $process_result['remainingTable'] ),
+				),
+				'selfKick' => $self_kick,
+			)
+		);
+	}
+
+
+	/**
+	 * Run one real-cron slice.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function run_real_cron( $request ) {
+		$runner = new Mobo_Core_Cron_Runner();
+
+		return rest_ensure_response( $runner->run( 'real-cron' ) );
+	}
+
+	/**
+	 * Return real-cron status.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_real_cron_status( $request ) {
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'ok',
+				'data'    => Mobo_Core_Cron_Runner::get_status(),
+			)
+		);
+	}
+
+	/**
+	 * Run one local self-worker slice.
+	 *
+	 * This is called by the plugin itself through a non-blocking loopback request.
+	 * It uses the same bounded runner as /cron/run, but records separate self-runner
+	 * status and optionally chains another local slice if real progress was made.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function run_self_worker( $request ) {
+		$source = sanitize_key( (string) $request->get_param( 'source' ) );
+
+		if ( '' === $source ) {
+			$source = 'self-worker';
+		}
+
+		$runner = new Mobo_Core_Cron_Runner();
+		$result = $runner->run( $source );
+
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::record_run_result( $result );
+
+			if ( Mobo_Core_Self_Runner::should_continue_after_result( $result ) ) {
+				$result['continuationKick'] = Mobo_Core_Self_Runner::kick( 'continue', true );
+			} else {
+				$result['continuationKick'] = array(
+					'success' => true,
+					'status'  => 'not-needed',
+				);
+			}
+		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Return local self-worker status.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_self_worker_status( $request ) {
+		$data = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
 
 		return rest_ensure_response(
 			array(
 				'success' => true,
-				'status'  => 'accepted',
-				'queue'   => array(
-					'processed' => isset( $process_result['processed'] ) ? absint( $process_result['processed'] ) : 0,
-					'failed'    => isset( $process_result['failed'] ) ? absint( $process_result['failed'] ) : 0,
-					'remaining' => ! empty( $process_result['remainingFile'] ),
-				),
+				'status'  => 'ok',
+				'data'    => $data,
+			)
+		);
+	}
+
+	/**
+	 * Return local site health for Portal probe.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_health( $request ) {
+		$reporter = new Mobo_Core_Health_Reporter();
+
+		return rest_ensure_response( $reporter->get_local_status() );
+	}
+
+	/**
+	 * Force-send health report to Portal.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function send_health_report_now( $request ) {
+		$reporter = new Mobo_Core_Health_Reporter();
+
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'ok',
+				'data'    => $reporter->send_report( 'manual', true ),
 			)
 		);
 	}
@@ -272,6 +502,10 @@ class Mobo_Core_Rest_Controller {
 			}
 		} finally {
 			Mobo_Core_Lock::release( 'manual_sync_start', $lock );
+		}
+
+		if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			$result['selfKick'] = Mobo_Core_Self_Runner::kick( 'sync-start', false );
 		}
 
 		return rest_ensure_response( $result );

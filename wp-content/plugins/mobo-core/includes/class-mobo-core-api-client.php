@@ -55,19 +55,23 @@ class Mobo_Core_API_Client {
 	 * @param string $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	public function get_products_page( $page_number, $record_per_page, $sync_id ) {
+	public function get_products_page( $page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false ) {
 		$only_in_stock = Mobo_Core_Settings::enabled( 'mobo_core_only_in_stock', '0' ) ? 'true' : 'false';
 
-		$path = add_query_arg(
-			array(
-				'OnlyInStock'   => $only_in_stock,
-				'RemVariants'   => 'true',
-				'SyncId'        => sanitize_text_field( (string) $sync_id ),
-				'PageNumber'    => max( 1, absint( $page_number ) ),
-				'RecordPerPage' => max( 1, absint( $record_per_page ) ),
-			),
-			'get-products'
+		$args = array(
+			'OnlyInStock'   => $only_in_stock,
+			'RemVariants'   => 'true',
+			'SyncId'        => sanitize_text_field( (string) $sync_id ),
+			'PageNumber'    => max( 1, absint( $page_number ) ),
+			'RecordPerPage' => max( 1, absint( $record_per_page ) ),
 		);
+
+		if ( $use_cursor ) {
+			$args['UseCursor'] = 'true';
+			$args['Cursor']    = max( 0, absint( $cursor ) );
+		}
+
+		$path = add_query_arg( $args, 'get-products' );
 
 		return $this->get_json( $path );
 	}
@@ -84,23 +88,54 @@ class Mobo_Core_API_Client {
 	 * @param string $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	public function get_variants_page( $product_guid, $page_number, $record_per_page, $sync_id ) {
+	public function get_variants_page( $product_guid, $page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false ) {
 		$product_guid = rawurlencode( sanitize_text_field( (string) $product_guid ) );
 
 		if ( '' === $product_guid ) {
 			return new WP_Error( 'mobo_core_missing_product_guid', 'Product GUID is missing.' );
 		}
 
-		$path = add_query_arg(
-			array(
-				'SyncId'        => sanitize_text_field( (string) $sync_id ),
-				'PageNumber'    => max( 1, absint( $page_number ) ),
-				'RecordPerPage' => max( 1, absint( $record_per_page ) ),
-			),
-			$product_guid . '/get-variants'
+		$args = array(
+			'SyncId'        => sanitize_text_field( (string) $sync_id ),
+			'PageNumber'    => max( 1, absint( $page_number ) ),
+			'RecordPerPage' => max( 1, absint( $record_per_page ) ),
 		);
 
+		if ( $use_cursor ) {
+			$args['UseCursor'] = 'true';
+			$args['Cursor']    = max( 0, absint( $cursor ) );
+		}
+
+		$path = add_query_arg( $args, $product_guid . '/get-variants' );
+
 		return $this->get_json( $path );
+	}
+
+
+	/**
+	 * Pull a lightweight webhook payload from Portal.
+	 *
+	 * The URL may be absolute, root-relative, or relative to the configured
+	 * API base URL. The customer site's X-SEC value is sent so Portal can
+	 * authorize the payload request.
+	 *
+	 * @param string $payload_url Payload URL from lightweight notification.
+	 * @return array|WP_Error
+	 */
+	public function get_event_payload( $payload_url ) {
+		$payload_url = trim( (string) $payload_url );
+
+		if ( '' === $payload_url ) {
+			return new WP_Error( 'mobo_core_missing_payload_url', 'Payload URL is missing.' );
+		}
+
+		$url = $this->normalize_payload_url( $payload_url );
+
+		if ( is_wp_error( $url ) ) {
+			return $url;
+		}
+
+		return $this->get_json_url( $url, Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 ) );
 	}
 
 	/**
@@ -128,6 +163,126 @@ class Mobo_Core_API_Client {
 		return '';
 	}
 
+
+	/**
+	 * Normalize a payload URL.
+	 *
+	 * @param string $payload_url Payload URL.
+	 * @return string|WP_Error
+	 */
+	private function normalize_payload_url( $payload_url ) {
+		$payload_url = trim( (string) $payload_url );
+
+		if ( preg_match( '#^https?://#i', $payload_url ) ) {
+			return esc_url_raw( $payload_url );
+		}
+
+		$base_url = $this->get_base_url();
+
+		if ( '' === $base_url ) {
+			return new WP_Error( 'mobo_core_missing_api_base_url', 'API base URL is missing for relative payload URL.' );
+		}
+
+		if ( 0 === strpos( $payload_url, '/' ) ) {
+			$parts = wp_parse_url( $base_url );
+
+			if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+				return new WP_Error( 'mobo_core_invalid_api_base_url', 'API base URL is invalid.' );
+			}
+
+			$port = isset( $parts['port'] ) ? ':' . absint( $parts['port'] ) : '';
+			return esc_url_raw( $parts['scheme'] . '://' . $parts['host'] . $port . $payload_url );
+		}
+
+		return esc_url_raw( trailingslashit( $base_url ) . ltrim( $payload_url, '/' ) );
+	}
+
+	/**
+	 * GET JSON from a full URL.
+	 *
+	 * @param string $url Full URL.
+	 * @param int    $timeout Timeout seconds.
+	 * @return array|WP_Error
+	 */
+	private function get_json_url( $url, $timeout = 20 ) {
+		$url = esc_url_raw( (string) $url );
+
+		if ( '' === $url ) {
+			return new WP_Error( 'mobo_core_invalid_payload_url', 'Payload URL is invalid.' );
+		}
+
+		$headers = array(
+			'Accept' => 'application/json',
+		);
+
+		$security_code = (string) Mobo_Core_Settings::get( 'mobo_core_security_code', '' );
+
+		if ( '' !== trim( $security_code ) ) {
+			$headers['X-SEC'] = trim( $security_code );
+		}
+
+		$token = (string) Mobo_Core_Settings::get( 'mobo_core_token', '' );
+
+		if ( '' !== trim( $token ) ) {
+			$headers['Token'] = trim( $token );
+		}
+
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout'     => max( 5, absint( $timeout ) ),
+				'redirection' => 3,
+				'sslverify'   => false,
+				'headers'     => $headers,
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			$error_message = sprintf(
+				'Payload request failed. URL=%s Error=%s',
+				$url,
+				$response->get_error_message()
+			);
+
+			return new WP_Error(
+				'mobo_core_payload_request_failed',
+				$error_message,
+				array(
+					'url'            => $url,
+					'original_error' => $response->get_error_code(),
+					'error_message'  => $response->get_error_message(),
+				)
+			);
+		}
+
+		$code = absint( wp_remote_retrieve_response_code( $response ) );
+
+		if ( $code < 200 || $code >= 300 ) {
+			return new WP_Error(
+				'mobo_core_payload_http_error',
+				sprintf( 'Payload HTTP error. URL=%s Status=%d', $url, $code ),
+				array(
+					'url'    => $url,
+					'status' => $code,
+				)
+			);
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+
+		if ( '' === trim( (string) $body ) ) {
+			return new WP_Error( 'mobo_core_empty_payload_response', 'Payload endpoint returned empty response.' );
+		}
+
+		$json = json_decode( $body, true );
+
+		if ( ! is_array( $json ) ) {
+			return new WP_Error( 'mobo_core_invalid_payload_json', 'Payload endpoint returned invalid JSON.' );
+		}
+
+		return $json;
+	}
+
 	/**
 	 * GET JSON from API.
 	 *
@@ -143,60 +298,6 @@ class Mobo_Core_API_Client {
 
 		$url = $base_url . ltrim( $path, '/' );
 
-		$headers = array(
-			'Accept' => 'application/json',
-		);
-
-		$token = (string) Mobo_Core_Settings::get( 'mobo_core_token', '' );
-
-		if ( '' !== trim( $token ) ) {
-			$headers['Token'] = trim( $token );
-		}
-
-		$response = wp_remote_get(
-			$url,
-			array(
-				'timeout'     => 20,
-				'redirection' => 3,
-				'sslverify'   => false,
-				'headers'     => $headers,
-			)
-		);
-
-		if ( is_wp_error( $response ) ) {
-			return new WP_Error(
-				'mobo_core_api_request_failed',
-				'API request failed.',
-				array(
-					'original_error' => $response->get_error_code(),
-				)
-			);
-		}
-
-		$code = absint( wp_remote_retrieve_response_code( $response ) );
-
-		if ( $code < 200 || $code >= 300 ) {
-			return new WP_Error(
-				'mobo_core_api_http_error',
-				'API HTTP error.',
-				array(
-					'status' => $code,
-				)
-			);
-		}
-
-		$body = wp_remote_retrieve_body( $response );
-
-		if ( '' === trim( (string) $body ) ) {
-			return new WP_Error( 'mobo_core_empty_api_response', 'API returned empty response.' );
-		}
-
-		$json = json_decode( $body, true );
-
-		if ( ! is_array( $json ) ) {
-			return new WP_Error( 'mobo_core_invalid_api_json', 'API returned invalid JSON.' );
-		}
-
-		return $json;
+		return $this->get_json_url( $url, Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 ) );
 	}
 }
