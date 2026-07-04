@@ -692,6 +692,23 @@ class Mobo_Core_Admin {
 	 */
 	private function render_categories_tab() {
 		?>
+		<div class="mobo-card">
+			<div class="mobo-card-head">
+				<h2>لود دسته‌بندی قبل از Sync محصول</h2>
+				<p>این عملیات فقط دسته‌بندی‌های موبو را دریافت می‌کند و جدول نگاشت را پر می‌کند؛ همگام‌سازی محصول را شروع نمی‌کند.</p>
+			</div>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-form">
+				<input type="hidden" name="action" value="mobo_core_sync_categories">
+				<?php wp_nonce_field( 'mobo_core_sync_categories', 'mobo_core_nonce' ); ?>
+				<div class="mobo-actions">
+					<button type="submit" class="mobo-btn mobo-btn-primary">همگام‌سازی دسته‌بندی‌ها</button>
+				</div>
+			</form>
+			<div class="mobo-note">
+				پس از اجرای موفق، همین صفحه را بررسی کنید و نگاشت دستی را ذخیره کنید. بعد از آن دکمه همگام‌سازی محصولات را بزنید.
+			</div>
+		</div>
+
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
 			<input type="hidden" name="mobo_active_tab" value="categories">
@@ -711,31 +728,14 @@ class Mobo_Core_Admin {
 				</div>
 
 				<div class="mobo-note">
-					ترتیب انتخاب دسته برای محصول: mapping دستی، دسته همگام‌شده با category_guid، ساخت خودکار در صورت مجاز بودن، سپس دسته پیشفرض.
-					اگر mapping اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند.
-				</div>
-			</div>
-
-			<div class="mobo-card">
-				<div class="mobo-card-head">
-					<h2>لود دسته‌بندی قبل از Sync محصول</h2>
-					<p>این عملیات فقط دسته‌بندی‌های موبو را دریافت می‌کند و جدول نگاشت را پر می‌کند؛ همگام‌سازی محصول را شروع نمی‌کند.</p>
-				</div>
-				<div class="mobo-actions">
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
-						<input type="hidden" name="action" value="mobo_core_sync_categories">
-						<?php wp_nonce_field( 'mobo_core_sync_categories', 'mobo_core_nonce' ); ?>
-						<button type="submit" class="mobo-btn mobo-btn-primary">همگام‌سازی دسته‌بندی‌ها</button>
-					</form>
-				</div>
-				<div class="mobo-note">
-					پس از اجرای موفق، همین صفحه را بررسی کنید و نگاشت دستی را ذخیره کنید. بعد از آن دکمه همگام‌سازی محصولات را بزنید.
+					ترتیب انتخاب دسته برای محصول: نگاشت دستی، دسته همگام‌شده با category_guid، ساخت خودکار در صورت مجاز بودن، سپس دسته پیشفرض.
+					اگر نگاشت اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند.
 				</div>
 			</div>
 
 			<?php $this->category_mapping_table(); ?>
 
-			<?php $this->save_button(); ?>
+			<?php $this->save_button( 'ذخیره تنظیمات و نگاشت دسته‌بندی' ); ?>
 		</form>
 		<?php
 	}
@@ -902,11 +902,11 @@ class Mobo_Core_Admin {
 	 *
 	 * @return void
 	 */
-	private function save_button() {
+	private function save_button( $label = 'ذخیره تنظیمات' ) {
 		?>
 		<div class="mobo-save-row">
 			<button type="submit" class="mobo-btn mobo-btn-primary">
-				ذخیره تنظیمات
+				<?php echo esc_html( $label ); ?>
 			</button>
 		</div>
 		<?php
