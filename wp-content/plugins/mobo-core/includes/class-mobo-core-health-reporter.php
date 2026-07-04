@@ -39,6 +39,7 @@ class Mobo_Core_Health_Reporter {
 
 		return array(
 			'siteUrl'               => home_url( '/' ),
+			'licenseToken'          => (string) get_option( 'mobo_core_token', '' ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,

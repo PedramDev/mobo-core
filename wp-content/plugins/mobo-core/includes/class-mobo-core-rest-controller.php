@@ -42,7 +42,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'ensure_categories_sync' ),
-				'permission_callback' => array( $this, 'permission_callback' ),
+				'permission_callback' => array( $this, 'check_security' ),
 			)
 		);
 

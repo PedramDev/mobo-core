@@ -1,1 +1,0 @@
-https://chatgpt.com/g/g-6989b5f4ed2c8191932b3896db1ac352-wordpress-plugin-generator-production-secure/c/6a083153-86d4-8391-a5a2-e3395b82c72b

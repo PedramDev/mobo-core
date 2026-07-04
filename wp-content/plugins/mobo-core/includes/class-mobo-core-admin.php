@@ -24,6 +24,7 @@ class Mobo_Core_Admin {
 
 		add_action( 'admin_post_mobo_core_save_settings', array( $this, 'handle_save_settings' ) );
 		add_action( 'admin_post_mobo_core_start_sync', array( $this, 'handle_start_sync' ) );
+		add_action( 'admin_post_mobo_core_sync_categories', array( $this, 'handle_sync_categories' ) );
 		add_action( 'admin_post_mobo_core_resume_sync', array( $this, 'handle_resume_sync' ) );
 		add_action( 'admin_post_mobo_core_cancel_sync', array( $this, 'handle_cancel_sync' ) );
 		add_action( 'admin_post_mobo_core_reset_sync', array( $this, 'handle_reset_sync' ) );
@@ -236,6 +237,16 @@ class Mobo_Core_Admin {
 				</div>
 
 				<div class="mobo-actions">
+					<?php if ( ! $is_running && ! $is_waiting ) : ?>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+							<input type="hidden" name="action" value="mobo_core_sync_categories">
+							<?php wp_nonce_field( 'mobo_core_sync_categories', 'mobo_core_nonce' ); ?>
+							<button type="submit" class="mobo-btn mobo-btn-light">
+								همگام‌سازی دسته‌بندی‌ها برای نگاشت
+							</button>
+						</form>
+					<?php endif; ?>
+
 					<?php if ( $is_waiting ) : ?>
 						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 							<input type="hidden" name="action" value="mobo_core_resume_sync">
@@ -491,20 +502,20 @@ class Mobo_Core_Admin {
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'ارسال Health Report', ! empty( $status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'ارسال گزارش سلامت', ! empty( $status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 						<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'نسخه پلاگین', defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '—' ); ?>
 					</div>
 
 					<div class="mobo-field mobo-field-full">
-						<label>Endpoint Probe داخلی پلاگین</label>
+						<label>آدرس بررسی داخلی پلاگین</label>
 						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $health_url ); ?>" onclick="this.select();">
 						<div class="mobo-help">Portal این endpoint را با header امنیتی <code>X-SEC</code> چک می‌کند.</div>
 					</div>
 
 					<div class="mobo-field mobo-field-full">
-						<label>Endpoint ارسال دستی گزارش</label>
+						<label>آدرس ارسال دستی گزارش</label>
 						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $manual_url ); ?>" onclick="this.select();">
 					</div>
 				</div>
@@ -516,12 +527,12 @@ class Mobo_Core_Admin {
 					</div>
 
 					<div class="mobo-fields-grid">
-						<?php $this->bool_field( 'ارسال Health Report به Portal', 'mobo_core_health_report_enabled' ); ?>
+						<?php $this->bool_field( 'ارسال گزارش سلامت به Portal', 'mobo_core_health_report_enabled' ); ?>
 						<?php $this->int_field( 'حداقل فاصله ارسال / ثانیه', 'mobo_core_health_report_min_interval_seconds', 60, 3600 ); ?>
 						<?php $this->int_field( 'Timeout ارسال / ثانیه', 'mobo_core_health_report_timeout_seconds', 5, 60 ); ?>
 					</div>
 
-					<?php $this->url_field( 'Health Report URL', 'mobo_core_health_report_url', 'اختیاری. مثال: https://portal.example.com/api/site-health/report' ); ?>
+					<?php $this->url_field( 'آدرس گزارش سلامت', 'mobo_core_health_report_url', 'اختیاری. مثال: https://portal.example.com/api/site-health/report' ); ?>
 				</div>
 
 				<div class="mobo-card mobo-card-wide">
@@ -531,22 +542,22 @@ class Mobo_Core_Admin {
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'WP DEBUG', ! empty( $local['wpDebug'] ) ? 'فعال' : 'غیرفعال' ); ?>
-						<?php $this->status_box( 'WP DEBUG DISPLAY', ! empty( $local['wpDebugDisplay'] ) ? 'فعال' : 'غیرفعال' ); ?>
-						<?php $this->status_box( 'PHP Memory Limit', isset( $local['phpMemoryLimit'] ) ? $local['phpMemoryLimit'] : '—' ); ?>
-						<?php $this->status_box( 'PHP Version', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
-						<?php $this->status_box( 'Disk Free', isset( $local['diskFreePercent'] ) && null !== $local['diskFreePercent'] ? $local['diskFreePercent'] . '%' : '—' ); ?>
-						<?php $this->status_box( 'Pending Webhooks', isset( $local['pendingWebhookJobs'] ) ? absint( $local['pendingWebhookJobs'] ) : 0 ); ?>
-						<?php $this->status_box( 'Failed Webhooks', isset( $local['failedWebhookJobs'] ) ? absint( $local['failedWebhookJobs'] ) : 0 ); ?>
+						<?php $this->status_box( 'دیباگ وردپرس', ! empty( $local['wpDebug'] ) ? 'فعال' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'دیباگ وردپرس DISPLAY', ! empty( $local['wpDebugDisplay'] ) ? 'فعال' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'محدودیت حافظه PHP', isset( $local['phpMemoryLimit'] ) ? $local['phpMemoryLimit'] : '—' ); ?>
+						<?php $this->status_box( 'نسخه PHP', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
+						<?php $this->status_box( 'فضای خالی دیسک', isset( $local['diskFreePercent'] ) && null !== $local['diskFreePercent'] ? $local['diskFreePercent'] . '%' : '—' ); ?>
+						<?php $this->status_box( 'وب‌هوک‌های در صف', isset( $local['pendingWebhookJobs'] ) ? absint( $local['pendingWebhookJobs'] ) : 0 ); ?>
+						<?php $this->status_box( 'وب‌هوک‌های ناموفق', isset( $local['failedWebhookJobs'] ) ? absint( $local['failedWebhookJobs'] ) : 0 ); ?>
 						<div class="mobo-status-box">
-							<div class="mobo-status-label">Retry Failed Webhooks</div>
+							<div class="mobo-status-label">Retry وب‌هوک‌های ناموفق</div>
 							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:8px;">
 								<input type="hidden" name="action" value="mobo_core_retry_failed_webhooks">
 								<?php wp_nonce_field( 'mobo_core_retry_failed_webhooks', 'mobo_core_nonce' ); ?>
 								<button type="submit" class="button button-secondary">برگرداندن failed ها به صف</button>
 							</form>
 						</div>
-						<?php $this->status_box( 'Cron Mode', isset( $local['cronMode'] ) ? $local['cronMode'] : '—' ); ?>
+						<?php $this->status_box( 'حالت اجرای کران', isset( $local['cronMode'] ) ? $local['cronMode'] : '—' ); ?>
 					</div>
 
 					<?php if ( ! empty( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) : ?>
@@ -568,11 +579,12 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_cron_tab() {
-		$status   = Mobo_Core_Cron_Runner::get_status();
-		$cron_url = isset( $status['cronUrl'] ) ? (string) $status['cronUrl'] : '';
-		$command  = '' !== $cron_url ? '*/5 * * * * curl -fsS "' . $cron_url . '" >/dev/null 2>&1' : '';
+		$status      = Mobo_Core_Cron_Runner::get_status();
+		$cron_url    = isset( $status['cronUrl'] ) ? (string) $status['cronUrl'] : '';
+		$script_path = MOBO_CORE_PLUGIN_DIR . 'mobo-cron.php';
+		$php_command = '/usr/local/bin/php -q ' . $script_path;
 		$self_status = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
-		$worker_url = isset( $self_status['workerUrl'] ) ? (string) $self_status['workerUrl'] : '';
+		$worker_url  = isset( $self_status['workerUrl'] ) ? (string) $self_status['workerUrl'] : '';
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
@@ -582,15 +594,15 @@ class Mobo_Core_Admin {
 			<div class="mobo-grid">
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
-						<h2>Self Runner / Real Cron</h2>
+						<h2>اجرای خودکار / کران واقعی</h2>
 						<p>مسیر اصلی اجرای sync، worker داخلی پلاگین است که بعد از دریافت webhook خودش را بیدار می‌کند. Cron واقعی فقط fallback اختیاری است.</p>
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'Self Runner', ! empty( $self_status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'اجرای داخلی', ! empty( $self_status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 						<?php $this->status_box( 'آخرین Kick', ! empty( $self_status['lastKickAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastKickAttemptAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'آخرین اجرای Worker', ! empty( $self_status['lastRunAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastRunAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'Cron fallback', ! empty( $status['isActive'] ) ? 'فعال' : 'تشخیص داده نشده' ); ?>
+						<?php $this->status_box( 'کران جایگزین', ! empty( $status['isActive'] ) ? 'فعال' : 'تشخیص داده نشده' ); ?>
 					</div>
 
 					<?php if ( '' !== $worker_url ) : ?>
@@ -601,13 +613,44 @@ class Mobo_Core_Admin {
 						</div>
 					<?php endif; ?>
 
-					<?php if ( '' !== $command ) : ?>
+					<div class="mobo-field mobo-field-full">
+						<label>مسیر فایل PHP برای cPanel Cron</label>
+						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $script_path ); ?>" onclick="this.select();">
+						<div class="mobo-help">اگر هاست شما فقط PHP Script قبول می‌کند، همین مسیر فایل را وارد کنید. این روش به wget، curl و عملگرهای shell نیاز ندارد.</div>
+					</div>
+
+					<div class="mobo-field mobo-field-full">
+						<label>دستور PHP Cron در صورت مجاز بودن Command کامل</label>
+						<textarea rows="3" readonly dir="ltr" onclick="this.select();"><?php echo esc_textarea( $php_command ); ?></textarea>
+						<div class="mobo-help">اگر cPanel شما Command کامل می‌پذیرد، این دستور را استفاده کنید. هیچ redirect یا chain operator داخل آن نیست.</div>
+					</div>
+
+					<?php if ( '' !== $cron_url ) : ?>
 						<div class="mobo-field mobo-field-full">
-							<label>دستور پیشنهادی cPanel Cron</label>
-							<textarea rows="3" readonly dir="ltr" onclick="this.select();"><?php echo esc_textarea( $command ); ?></textarea>
-							<div class="mobo-help">این دستور فقط fallback است. اگر loopback/self-kick روی هاست بسته بود، می‌توانید آن را فعال کنید.</div>
+							<label>Endpoint قدیمی HTTP Cron</label>
+							<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $cron_url ); ?>" onclick="this.select();">
+							<div class="mobo-help">این URL فقط برای هاست‌هایی است که HTTP cron با curl/wget را اجازه می‌دهند. برای هاست فعلی شما از فایل PHP بالا استفاده کنید.</div>
 						</div>
 					<?php endif; ?>
+				</div>
+
+				<div class="mobo-card mobo-card-wide">
+					<div class="mobo-card-head">
+						<h2>راهنمای تنظیم Cron در هاست‌ها</h2>
+						<p>اگر اجرای داخلی روی هاست مشتری کافی نبود، یک Cron واقعی هر ۵ دقیقه تنظیم کنید. روش اول، اجرای مستقیم فایل PHP است و برای هاست‌هایی که فقط PHP Script قبول می‌کنند مناسب‌تر است.</p>
+					</div>
+					<div class="mobo-note">
+						<strong>cPanel با محدودیت «Only PHP scripts»:</strong> در بخش Cron Jobs، حالت اجرای PHP Script را انتخاب کنید و فقط مسیر فایل <code dir="ltr"><?php echo esc_html( $script_path ); ?></code> را وارد کنید. از <code>wget</code>، <code>curl</code>، <code>&gt;/dev/null</code> و <code>2&gt;&amp;1</code> استفاده نکنید.
+					</div>
+					<div class="mobo-note">
+						<strong>cPanel با Command کامل:</strong> دستور <code dir="ltr"><?php echo esc_html( $php_command ); ?></code> را با زمان‌بندی هر ۵ دقیقه ثبت کنید. اگر مسیر PHP فرق داشت، فقط مسیر PHP را اصلاح کنید.
+					</div>
+					<div class="mobo-note">
+						<strong>DirectAdmin:</strong> از Advanced Features &gt; Cron Jobs یک job با دقیقه <code dir="ltr">*/5</code> بسازید. اگر Command کامل مجاز است دستور PHP بالا را وارد کنید؛ اگر فقط فایل PHP می‌خواهد، مسیر فایل را وارد کنید.
+					</div>
+					<div class="mobo-note">
+						<strong>Plesk یا هاست‌های عمومی:</strong> در Scheduled Tasks، نوع Task را PHP Script قرار دهید و فایل <code dir="ltr">mobo-cron.php</code> را از مسیر پلاگین انتخاب کنید. در صورت استفاده از URL task، فقط Endpoint HTTP Cron را وارد کنید و مطمئن شوید توکن کران تنظیم شده است.
+					</div>
 				</div>
 
 				<div class="mobo-card">
@@ -620,7 +663,7 @@ class Mobo_Core_Admin {
 						<?php $this->int_field( 'بودجه زمانی هر اجرا / ثانیه', 'mobo_core_real_cron_time_budget_seconds', 5, 55 ); ?>
 						<?php $this->int_field( 'حداکثر step محصول در هر اجرا', 'mobo_core_real_cron_max_sync_steps', 1, 20 ); ?>
 						<?php $this->int_field( 'TTL قفل Cron / ثانیه', 'mobo_core_real_cron_lock_ttl_seconds', 30, 600 ); ?>
-						<?php $this->bool_field( 'فعال بودن Self Runner', 'mobo_core_self_runner_enabled' ); ?>
+						<?php $this->bool_field( 'فعال بودن اجرای داخلی', 'mobo_core_self_runner_enabled' ); ?>
 						<?php $this->bool_field( 'ادامه خودکار تا خالی شدن صف', 'mobo_core_self_runner_continue_enabled' ); ?>
 						<?php $this->int_field( 'حداقل فاصله Kick / ثانیه', 'mobo_core_self_runner_min_interval_seconds', 0, 60 ); ?>
 						<?php $this->int_field( 'Timeout درخواست داخلی / ثانیه', 'mobo_core_self_runner_http_timeout_seconds', 1, 10 ); ?>
@@ -633,7 +676,7 @@ class Mobo_Core_Admin {
 						<?php $this->int_field( 'فاصله تلاش مجدد پس از انتظار Portal / ثانیه', 'mobo_core_waiting_for_portal_retry_delay_seconds', 10, 3600 ); ?>
 					</div>
 
-					<?php $this->secret_field( 'Cron Token', 'mobo_core_cron_token', 'خالی بگذارید تا مقدار قبلی حفظ شود. این token داخل URL کران استفاده می‌شود.' ); ?>
+					<?php $this->secret_field( 'توکن کران', 'mobo_core_cron_token', 'خالی بگذارید تا مقدار قبلی حفظ شود. این توکن داخل URL کران استفاده می‌شود.' ); ?>
 				</div>
 			</div>
 
@@ -657,19 +700,36 @@ class Mobo_Core_Admin {
 			<div class="mobo-card">
 				<div class="mobo-card-head">
 					<h2>دسته‌بندی محصولات</h2>
-					<p>دسته‌بندی اتوماتیک از API موبو دریافت می‌شود. mapping دستی فقط هنگام اختصاص دسته به محصول استفاده می‌شود و دسته‌های sync شده را overwrite نمی‌کند.</p>
+					<p>اول دسته‌بندی‌ها را از موبو دریافت کنید، بعد برای هر دسته‌ی موبو یک دسته‌ی محلی ووکامرس انتخاب کنید. این نگاشت قبل از همگام‌سازی محصول استفاده می‌شود.</p>
 				</div>
 
 				<div class="mobo-fields-grid">
 					<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
-					<?php $this->bool_field( 'فعال بودن Category Mapping', 'mobo_core_category_mapping_enabled' ); ?>
-					<?php $this->bool_field( 'اجباری بودن Mapping دستی', 'mobo_core_category_mapping_required' ); ?>
+					<?php $this->bool_field( 'فعال بودن نگاشت دسته‌بندی', 'mobo_core_category_mapping_enabled' ); ?>
+					<?php $this->bool_field( 'اجباری بودن نگاشت دستی', 'mobo_core_category_mapping_required' ); ?>
 					<?php $this->category_dropdown_field( 'دسته‌بندی پیشفرض / جایگزین', 'mobo_default_category_id' ); ?>
 				</div>
 
 				<div class="mobo-note">
-					ترتیب انتخاب دسته برای محصول: mapping دستی، دسته sync شده با category_guid، ساخت خودکار در صورت مجاز بودن، سپس دسته پیشفرض.
+					ترتیب انتخاب دسته برای محصول: mapping دستی، دسته همگام‌شده با category_guid، ساخت خودکار در صورت مجاز بودن، سپس دسته پیشفرض.
 					اگر mapping اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند.
+				</div>
+			</div>
+
+			<div class="mobo-card">
+				<div class="mobo-card-head">
+					<h2>لود دسته‌بندی قبل از Sync محصول</h2>
+					<p>این عملیات فقط دسته‌بندی‌های موبو را دریافت می‌کند و جدول نگاشت را پر می‌کند؛ همگام‌سازی محصول را شروع نمی‌کند.</p>
+				</div>
+				<div class="mobo-actions">
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<input type="hidden" name="action" value="mobo_core_sync_categories">
+						<?php wp_nonce_field( 'mobo_core_sync_categories', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="mobo-btn mobo-btn-primary">همگام‌سازی دسته‌بندی‌ها</button>
+					</form>
+				</div>
+				<div class="mobo-note">
+					پس از اجرای موفق، همین صفحه را بررسی کنید و نگاشت دستی را ذخیره کنید. بعد از آن دکمه همگام‌سازی محصولات را بزنید.
 				</div>
 			</div>
 
@@ -954,22 +1014,22 @@ class Mobo_Core_Admin {
 		?>
 		<div class="mobo-card">
 			<div class="mobo-card-head">
-				<h2>Mapping دسته‌بندی‌های Mobo به WooCommerce</h2>
-				<p>اگر دسته‌بندی‌های فروشگاه مشتری با دسته‌بندی‌های Portal فرق دارند، برای هر category_guid یک دسته محلی انتخاب کن. انتخاب نکردن یعنی fallback به دسته sync شده.</p>
+				<h2>نگاشت دسته‌بندی‌های موبو به ووکامرس</h2>
+				<p>اگر دسته‌بندی‌های فروشگاه مشتری با دسته‌بندی‌های موبو فرق دارد، برای هر شناسه دسته‌بندی موبو یک دسته محلی انتخاب کنید. انتخاب نکردن یعنی استفاده از دسته همگام‌شده.</p>
 			</div>
 
 			<?php if ( empty( $rows ) ) : ?>
 				<div class="mobo-note">
-					فعلاً دسته‌ای برای mapping وجود ندارد. بعد از اولین sync دسته‌بندی یا migration از term meta، این جدول پر می‌شود.
+					فعلاً دسته‌ای برای نگاشت وجود ندارد. دکمه «همگام‌سازی دسته‌بندی‌ها» را بزنید تا دسته‌ها قبل از Sync محصول لود شوند.
 				</div>
 			<?php else : ?>
 				<div class="mobo-table-wrap">
 					<table class="widefat striped">
 						<thead>
 							<tr>
-								<th>دسته Mobo</th>
-								<th>Remote GUID</th>
-								<th>دسته sync شده</th>
+								<th>دسته موبو</th>
+								<th>شناسه دسته موبو</th>
+								<th>دسته همگام‌شده</th>
 								<th>دسته محلی دستی</th>
 							</tr>
 						</thead>
@@ -980,7 +1040,7 @@ class Mobo_Core_Admin {
 								$manual_id   = absint( isset( $row['manual_term_id'] ) ? $row['manual_term_id'] : 0 );
 								$remote_name = sanitize_text_field( (string) ( isset( $row['remote_name'] ) ? $row['remote_name'] : '' ) );
 								if ( '' === $remote_name ) {
-									$remote_name = 'Mobo Category';
+									$remote_name = 'دسته موبو';
 								}
 								?>
 								<tr>
@@ -996,7 +1056,7 @@ class Mobo_Core_Admin {
 									</td>
 									<td>
 										<select class="mobo-category-select2" name="mobo_category_map[<?php echo esc_attr( $remote_guid ); ?>]" data-placeholder="جستجو و انتخاب دسته محلی">
-											<option value="0">بدون mapping دستی / fallback</option>
+											<option value="0">بدون نگاشت دستی / استفاده از fallback</option>
 											<?php foreach ( $terms as $term ) : ?>
 												<option value="<?php echo esc_attr( absint( $term->term_id ) ); ?>" <?php selected( $manual_id, absint( $term->term_id ) ); ?>>
 													<?php echo esc_html( $term->name ); ?>
@@ -1581,6 +1641,33 @@ class Mobo_Core_Admin {
 		$status['serverTime']           = wp_date( 'Y-m-d H:i:s' );
 
 		wp_send_json_success( $status );
+	}
+
+	/**
+	 * Sync categories before product sync so the customer can complete mapping.
+	 *
+	 * @return void
+	 */
+	public function handle_sync_categories() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_sync_categories', 'mobo_core_nonce' );
+
+		$product_sync = new Mobo_Core_Product_Sync();
+		$result       = $product_sync->ensure_categories_synced_if_due( '', true );
+
+		$type    = ! empty( $result['success'] ) ? 'success' : 'error';
+		$message = isset( $result['message'] ) ? $result['message'] : 'عملیات همگام‌سازی دسته‌بندی انجام شد.';
+
+		if ( ! empty( $result['data'] ) && is_array( $result['data'] ) && ! empty( $result['data']['synced'] ) ) {
+			$created = isset( $result['data']['created'] ) ? absint( $result['data']['created'] ) : 0;
+			$updated = isset( $result['data']['updated'] ) ? absint( $result['data']['updated'] ) : 0;
+			$message .= ' ایجادشده: ' . $created . '، بروزرسانی‌شده: ' . $updated . '.';
+		}
+
+		$this->redirect_with_message( $message, $type, 'categories' );
 	}
 
 	/**

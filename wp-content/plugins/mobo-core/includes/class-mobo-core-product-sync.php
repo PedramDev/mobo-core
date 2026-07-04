@@ -899,7 +899,7 @@ class Mobo_Core_Product_Sync {
 	 * @return array
 	 */
 	public function ensure_categories_synced_if_due( $sync_id = '', $force = false ) {
-		if ( ! $this->rules->should_update_categories() ) {
+		if ( ! $force && ! $this->rules->should_update_categories() ) {
 			return $this->result(
 				true,
 				'آپدیت اتوماتیک دسته‌بندی‌ها غیرفعال است.',
