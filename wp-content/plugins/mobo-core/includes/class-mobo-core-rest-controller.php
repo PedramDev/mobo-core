@@ -447,9 +447,27 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_webhook_queue( $request ) {
-		$queue = new Mobo_Core_Webhook_Queue();
+		try {
+			$queue = new Mobo_Core_Webhook_Queue();
+			return rest_ensure_response( $queue->process() );
+		} catch ( Throwable $e ) {
+			$result = array(
+				'success'        => false,
+				'status'         => 'webhook-queue-exception',
+				'processed'      => 0,
+				'failed'         => 1,
+				'remaining'      => true,
+				'message'        => $e->getMessage(),
+				'exceptionClass' => get_class( $e ),
+				'file'           => $e->getFile(),
+				'line'           => $e->getLine(),
+			);
 
-		return rest_ensure_response( $queue->process() );
+			update_option( 'mobo_core_webhook_queue_last_result', $result, false );
+			update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
+
+			return rest_ensure_response( $result );
+		}
 	}
 
 	/**

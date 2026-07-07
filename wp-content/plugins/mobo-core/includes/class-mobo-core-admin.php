@@ -31,8 +31,13 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_start_reprice', array( $this, 'handle_start_reprice' ) );
 		add_action( 'admin_post_mobo_core_cancel_reprice', array( $this, 'handle_cancel_reprice' ) );
 		add_action( 'admin_post_mobo_core_reset_reprice', array( $this, 'handle_reset_reprice' ) );
+		add_action( 'admin_post_mobo_core_start_recategorize', array( $this, 'handle_start_recategorize' ) );
+		add_action( 'admin_post_mobo_core_cancel_recategorize', array( $this, 'handle_cancel_recategorize' ) );
+		add_action( 'admin_post_mobo_core_reset_recategorize', array( $this, 'handle_reset_recategorize' ) );
 		add_action( 'admin_post_mobo_core_retry_failed_webhooks', array( $this, 'handle_retry_failed_webhooks' ) );
 		add_action( 'wp_ajax_mobo_core_get_sync_status', array( $this, 'handle_ajax_sync_status' ) );
+		add_action( 'wp_ajax_mobo_core_get_reprice_status', array( $this, 'handle_ajax_reprice_status' ) );
+		add_action( 'wp_ajax_mobo_core_get_recategorize_status', array( $this, 'handle_ajax_recategorize_status' ) );
 	}
 
 	/**
@@ -265,11 +270,11 @@ class Mobo_Core_Admin {
 					<?php endif; ?>
 
 					<?php if ( $is_running || $is_waiting ) : ?>
-						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" data-mobo-cancel-sync-form="1">
 							<input type="hidden" name="action" value="mobo_core_cancel_sync">
 							<?php wp_nonce_field( 'mobo_core_cancel_sync', 'mobo_core_nonce' ); ?>
 
-							<button type="submit" class="mobo-btn mobo-btn-danger">
+							<button type="submit" class="mobo-btn mobo-btn-danger" data-mobo-cancel-sync-button="1">
 								توقف همگام‌سازی
 							</button>
 						</form>
@@ -290,6 +295,7 @@ class Mobo_Core_Admin {
 				<div class="mobo-note">
 					اجرای مرحله‌ای روی خود همین وردپرس انجام می‌شود. اگر Portal موقتاً قطع شود، sync از آخرین cursor/page ذخیره‌شده ادامه پیدا می‌کند.
 				</div>
+
 			</div>
 		</div>
 		<?php
@@ -350,6 +356,27 @@ class Mobo_Core_Admin {
 				</div>
 			</div>
 
+			<?php
+			$this->guide_box(
+				'راهنمای اتصال و امنیت',
+				array(
+					array( 'title' => 'Token', 'text' => 'برای درخواست‌هایی است که وردپرس به Portal یا API موبو می‌فرستد. اگر خالی ذخیره شود، مقدار قبلی حذف نمی‌شود.' ),
+					array( 'title' => 'Webhook Security Code', 'text' => 'برای اعتبارسنجی درخواست‌های ورودی از Portal استفاده می‌شود و با header امنیتی X-SEC مقایسه می‌شود.' ),
+					array( 'title' => 'تعویض اطلاعات', 'text' => 'برای تغییر هر secret فقط مقدار جدید را وارد کنید. نمایش ندادن مقدار قبلی به معنی پاک شدن آن نیست.' ),
+				),
+				'این اطلاعات را در اختیار کاربر نهایی قرار ندهید. تغییر Token یا Security Code باید با تنظیمات Portal هماهنگ باشد.'
+			);
+			$this->recommendation_box(
+				'تنظیمات پیشنهادی اتصال',
+				array(
+					array( 'setting' => 'Token', 'value' => 'یک مقدار اختصاصی برای هر سایت', 'reason' => 'اگر چند سایت از یک Token مشترک استفاده کنند، ردیابی و محدودسازی خطا سخت می‌شود.' ),
+					array( 'setting' => 'Webhook Security Code', 'value' => 'یک مقدار قوی و هماهنگ با Portal', 'reason' => 'این مقدار جلوی پذیرش webhook جعلی را می‌گیرد و باید با تنظیمات Portal یکی باشد.' ),
+					array( 'setting' => 'تعویض secretها', 'value' => 'فقط هنگام جابه‌جایی لایسنس یا نشت اطلاعات', 'reason' => 'تغییر بی‌برنامه باعث reject شدن درخواست‌های Portal یا API می‌شود.' ),
+				),
+				'برای امنیت و پشتیبانی دقیق‌تر، Token و Security Code باید برای همین سایت اختصاصی باشند. از مقدار مشترک بین چند سایت استفاده نکنید.'
+			);
+			?>
+
 			<?php $this->save_button(); ?>
 		</form>
 		<?php
@@ -386,6 +413,33 @@ class Mobo_Core_Admin {
 				<div class="mobo-note">
 					فیلد محتوا / caption در این نسخه همگام‌سازی نمی‌شود، چون از API مقدار قابل استفاده‌ای برای آن دریافت نمی‌شود.
 				</div>
+
+				<?php
+				$this->guide_box(
+					'راهنمای بروزرسانی محصول',
+					array(
+						array( 'title' => 'محصول جدید', 'text' => 'محصول جدید با اطلاعات پایه دریافتی از Portal ساخته می‌شود و معمولاً status آن publish است.' ),
+						array( 'title' => 'محصول موجود', 'text' => 'گزینه‌های این بخش تعیین می‌کنند کدام فیلدهای محصول موجود دوباره نوشته شوند؛ اگر گزینه خاموش باشد، همان فیلد حفظ می‌شود.' ),
+						array( 'title' => 'تصاویر', 'text' => 'تصاویر در صف مستقل پردازش می‌شوند تا Sync محصول روی دانلود تصویر قفل نشود. خطای تصویر، خود محصول را متوقف نمی‌کند.' ),
+						array( 'title' => 'Trash', 'text' => 'محصول یا واریانت داخل سطل زباله آپدیت، restore یا publish نمی‌شود و duplicate جدید از همان GUID ساخته نمی‌شود.' ),
+					),
+					'برای جلوگیری از write اضافی، پلاگین برای واریانت‌ها hash نگه می‌دارد و اگر داده تغییر نکرده باشد، save سنگین ووکامرس اجرا نمی‌شود.'
+				);
+				?>
+				<?php
+				$this->recommendation_box(
+					'تنظیمات پیشنهادی بروزرسانی محصول',
+					array(
+						array( 'setting' => 'بروزرسانی موجودی', 'value' => 'روشن', 'reason' => 'موجودی یک فیلد عملیاتی است و باید با منبع اصلی هماهنگ بماند.' ),
+						array( 'setting' => 'بروزرسانی قیمت', 'value' => 'روشن', 'reason' => 'قیمت و سود وابسته به Portal هستند و باید در syncهای بعدی اصلاح شوند.' ),
+						array( 'setting' => 'بروزرسانی عنوان', 'value' => 'خاموش برای سایت‌های SEO شده، روشن فقط در راه‌اندازی اولیه', 'reason' => 'تغییر عنوان محصول می‌تواند محتوای دستی و ساختار سئوی فروشگاه را خراب کند.' ),
+						array( 'setting' => 'بروزرسانی آدرس محصول / slug', 'value' => 'خاموش بعد از انتشار سایت', 'reason' => 'تغییر slug باعث تغییر URL و نیاز به redirect می‌شود.' ),
+						array( 'setting' => 'فقط محصولات موجود', 'value' => 'خاموش در حالت عمومی، روشن برای فروشگاه‌هایی که کالای ناموجود نمی‌خواهند', 'reason' => 'اگر روشن باشد، محصول ناموجود از ابتدا وارد سایت نمی‌شود و پوشش کاتالوگ کمتر می‌شود.' ),
+						array( 'setting' => 'آپدیت عکس‌ها', 'value' => 'روشن همراه با صف مستقل تصویر', 'reason' => 'تصویرها باید sync شوند، اما نباید اجرای محصول را قفل کنند.' ),
+					),
+					'برای سایت فعال، Title و Slug را فقط وقتی روشن کنید که Portal مالک قطعی محتوای محصول باشد.'
+				);
+				?>
 			</div>
 
 			<?php $this->save_button(); ?>
@@ -404,7 +458,10 @@ class Mobo_Core_Admin {
 		$validator = class_exists( 'Mobo_Core_Checkout_Validator' ) ? new Mobo_Core_Checkout_Validator() : null;
 		$status    = $validator ? $validator->get_last_status() : array();
 		$last      = isset( $status['lastResult'] ) && is_array( $status['lastResult'] ) ? $status['lastResult'] : array();
-		$behavior  = sanitize_key( (string) Mobo_Core_Settings::get( 'mobo_core_checkout_external_error_behavior', 'allow' ) );
+		$debug_log = $validator && method_exists( $validator, 'get_mobo_debug_log' ) ? $validator->get_mobo_debug_log() : array();
+		$address_mapping = class_exists( 'Mobo_Core_Address_Mapping' ) ? new Mobo_Core_Address_Mapping() : null;
+		$address_status  = $address_mapping && method_exists( $address_mapping, 'get_status' ) ? $address_mapping->get_status() : array();
+
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
@@ -420,10 +477,11 @@ class Mobo_Core_Admin {
 
 					<div class="mobo-fields-grid">
 						<?php $this->bool_field( 'فعال بودن اعتبارسنجی خرید', 'mobo_core_checkout_validation_enabled' ); ?>
-						<?php $this->bool_field( 'فقط محصولات sync شده موبو بررسی شوند', 'mobo_core_checkout_validate_only_mobo_products' ); ?>
-						<?php $this->bool_field( 'نیاز به product_guid / variant_guid', 'mobo_core_checkout_require_remote_guid' ); ?>
-						<?php $this->bool_field( 'مسدود کردن محصول با sync ناقص', 'mobo_core_checkout_block_incomplete_sync' ); ?>
 						<?php $this->bool_field( 'بررسی محلی موجودی و قابل خرید بودن', 'mobo_core_checkout_local_stock_check_enabled' ); ?>
+					</div>
+
+					<div class="mobo-note">
+						این سه قانون همیشه فعال هستند و دیگر تنظیم انتخابی ندارند: فقط محصولات sync شده موبو بررسی می‌شوند، وجود <code>product_guid</code> و در صورت وجود تنوع <code>variant_guid</code> الزامی است، و محصول با sync ناقص مسدود می‌شود. وقتی بررسی سبد خرید موبو فعال باشد، API موبو منبع اصلی موجودی است و بررسی محلی موجودی وردپرس نادیده گرفته می‌شود.
 					</div>
 
 					<div class="mobo-note">
@@ -433,28 +491,94 @@ class Mobo_Core_Admin {
 
 				<div class="mobo-card">
 					<div class="mobo-card-head">
-						<h2>سرویس خارجی اعتبارسنجی</h2>
-						<p>مقصد API خارجی اختیاری است. اگر URL خالی باشد، سیستم فقط local validation انجام می‌دهد.</p>
+						<h2>اتصال به سبد خرید موبو</h2>
+						<p>پلاگین با این اطلاعات وارد سایت موبو می‌شود. چون در موبو فقط یک سبد خرید مشترک داریم، پلاگین روی add/update/delete ووکامرس به موبو درخواست نمی‌زند؛ فقط در checkout یک lock سراسری می‌گیرد، سبد موبو را پاک می‌کند و از روی سبد همان مشتری دوباره می‌سازد.</p>
 					</div>
 
 					<div class="mobo-fields-grid">
-						<?php $this->bool_field( 'فعال بودن اعتبارسنجی خارجی', 'mobo_core_checkout_external_validation_enabled' ); ?>
-						<?php $this->url_field( 'آدرس API اعتبارسنجی خارجی', 'mobo_core_checkout_external_validation_url', 'مثال: https://api.example.com/pre-purchase/check' ); ?>
-						<?php $this->int_field( 'Timeout سرویس خارجی / ثانیه', 'mobo_core_checkout_external_timeout_seconds', 1, 10 ); ?>
-						<div class="mobo-field">
-							<label for="mobo_core_checkout_external_error_behavior">رفتار هنگام خطای سرویس خارجی</label>
-							<select id="mobo_core_checkout_external_error_behavior" name="mobo_core_checkout_external_error_behavior">
-								<option value="allow" <?php selected( $behavior, 'allow' ); ?>>اجازه ادامه خرید</option>
-								<option value="block" <?php selected( $behavior, 'block' ); ?>>مسدود کردن خرید</option>
-							</select>
+						<?php $this->bool_field( 'فعال بودن بررسی سبد خرید موبو', 'mobo_core_checkout_mobo_cart_validation_enabled' ); ?>
+						<?php $this->bool_field( 'فعال بودن لاگ حرفه‌ای سبد موبو', 'mobo_core_checkout_mobo_debug_enabled' ); ?>
+						<?php $this->readonly_field( 'آدرس سایت موبو', 'https://mobomobo.ir' ); ?>
+						<?php $this->text_field( 'نام کاربری موبو', 'mobo_core_checkout_mobo_username', 'همان username برای endpoint signin.' ); ?>
+						<?php $this->secret_field( 'رمز عبور موبو', 'mobo_core_checkout_mobo_password', 'خالی بگذارید تا رمز قبلی حفظ شود.' ); ?>
+						<?php $this->int_field( 'Timeout API موبو / ثانیه', 'mobo_core_checkout_mobo_timeout_seconds', 2, 20 ); ?>
+						<?php $this->int_field( 'زمان انتظار lock سبد موبو / ثانیه', 'mobo_core_checkout_mobo_cart_lock_wait_seconds', 0, 45 ); ?>
+						<?php $this->int_field( 'مدت اعتبار lock سبد موبو / ثانیه', 'mobo_core_checkout_mobo_cart_lock_ttl_seconds', 15, 300 ); ?>
+						<?php $this->bool_field( 'فعال بودن ثبت سفارش خودکار در موبو', 'mobo_core_mobo_order_submission_enabled' ); ?>
+						<?php $this->bool_field( 'تکمیل خودکار سفارش بعد از ثبت موفق در موبو', 'mobo_core_mobo_order_auto_complete_enabled' ); ?>
+						<?php $this->text_field( 'نام فرستنده / فروشنده / فروشگاه', 'mobo_core_mobo_order_sender_name', 'در payload موبو به عنوان name ارسال می‌شود.' ); ?>
+						<?php $this->text_field( 'شماره موبایل فرستنده / فروشنده / فروشگاه', 'mobo_core_mobo_order_sender_mobile', 'در payload موبو به عنوان mobile ارسال می‌شود.' ); ?>
+						<?php $this->int_field( 'شناسه روش ارسال موبو', 'mobo_core_mobo_order_shipping_id', 1, 2147483647, 148395514 ); ?>
+						<div class="mobo-field mobo-field-full">
+							<div class="mobo-help">مقدار پیش‌فرض و نمونه پیشنهادی: <code>148395514</code>. این شناسه باید در پاسخ <code>/site/api/v1/cart/shippings</code> موبو وجود داشته باشد؛ در غیر این صورت ثبت سفارش متوقف می‌شود.</div>
 						</div>
 					</div>
 
+					<p style="margin-top:12px;">
+						<button type="submit" name="mobo_core_test_mobo_login" value="1" class="button button-secondary">تست ورود به موبو</button>
+							<button type="submit" name="mobo_core_clear_mobo_debug_log" value="1" class="button button-secondary" onclick="return confirm('لاگ دیباگ سبد موبو پاک شود؟');">پاک کردن لاگ دیباگ</button>
+					</p>
+
 					<div class="mobo-note">
-						درخواست خارجی با <code>POST JSON</code> ارسال می‌شود و اگر مقدارهای <code>X-SEC</code> و <code>Token</code> تنظیم شده باشند، به عنوان header ارسال می‌شوند.
+						اگر cookie ورود معتبر نباشد، پلاگین ابتدا <code>/site/api/v1/user/signin</code> را صدا می‌زند. در checkout، عملیات روی سبد مشترک موبو به صورت قفل‌شده انجام می‌شود. بعد از پرداخت موفق، وقتی سفارش از هر وضعیتی بجز تکمیل شده به <code>processing</code> رفت، فقط یک بار در موبو ثبت می‌شود و بعد از موفقیت، سفارش ووکامرس به تکمیل شده تغییر می‌کند.
 					</div>
 				</div>
+
+				<div class="mobo-card">
+					<div class="mobo-card-head">
+						<h2>کشور، استان و شهر موبو</h2>
+						<p>این داده‌ها از پرتال مرکزی خوانده می‌شوند و فیلدهای کشور، استان و شهر checkout را به select با شناسه موبو تبدیل می‌کنند.</p>
+					</div>
+
+					<div class="mobo-fields-grid">
+						<?php $this->bool_field( 'فعال بودن انتخاب کشور/استان/شهر موبو', 'mobo_core_address_mapping_enabled' ); ?>
+						<?php $this->int_field( 'بازه بروزرسانی از پرتال / روز', 'mobo_core_address_mapping_sync_interval_days', 1, 30 ); ?>
+					</div>
+
+					<p style="margin-top:12px;">
+						<button type="submit" name="mobo_core_sync_address_mapping" value="1" class="button button-secondary">بروزرسانی کشور/استان/شهر از پرتال</button>
+					</p>
+
+					<div class="mobo-status-grid">
+						<?php $counts = isset( $address_status['counts'] ) && is_array( $address_status['counts'] ) ? $address_status['counts'] : array(); ?>
+						<?php $this->status_box( 'کشورها', isset( $counts['countries'] ) ? absint( $counts['countries'] ) : 0 ); ?>
+						<?php $this->status_box( 'استان‌ها', isset( $counts['states'] ) ? absint( $counts['states'] ) : 0 ); ?>
+						<?php $this->status_box( 'شهرها', isset( $counts['cities'] ) ? absint( $counts['cities'] ) : 0 ); ?>
+						<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $address_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $address_status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین خطا', ! empty( $address_status['lastError'] ) ? $address_status['lastError'] : '—' ); ?>
+					</div>
+
+					<div class="mobo-note">
+						پرتال مرکزی هر ۲۴ ساعت mapping را از موبو می‌گیرد. سایت وردپرسی مشتری به صورت پیش‌فرض هر ۷ روز یکبار از پرتال می‌کشد. مقدار ذخیره‌شده در checkout همان شناسه عددی موبو است.
+					</div>
+				</div>
+
 			</div>
+
+			<?php
+			$this->guide_box(
+				'راهنمای اعتبارسنجی خرید و ثبت سفارش موبو',
+				array(
+					array( 'title' => 'اعتبارسنجی خرید', 'text' => 'این گزینه قبل از پرداخت سبد خرید را بررسی می‌کند. پیش‌فرض آن غیرفعال است تا checkout فروشگاه بعد از نصب افزونه بدون تست قبلی مسدود نشود.' ),
+					array( 'title' => 'بررسی سبد موبو', 'text' => 'اگر فعال شود، افزونه فقط هنگام submit checkout سبد مشترک موبو را lock، پاکسازی، بازسازی و با سبد ووکامرس مقایسه می‌کند. پیش‌فرض این گزینه نیز غیرفعال است.' ),
+					array( 'title' => 'لاگ حرفه‌ای سبد موبو', 'text' => 'برای عیب‌یابی درخواست‌های login، cart، snapshot و checkout استفاده می‌شود. چون حجم لاگ را بالا می‌برد، پیش‌فرض آن غیرفعال است.' ),
+					array( 'title' => 'ثبت سفارش خودکار', 'text' => 'ثبت سفارش در موبو فقط وقتی انجام می‌شود که سفارش واقعاً وارد وضعیت processing شود و همه line itemهای سفارش متعلق به موبو باشند.' ),
+					array( 'title' => 'سفارش ترکیبی یا غیرموبو', 'text' => 'اگر سفارش حتی یک محصول غیرموبو داشته باشد، وارد صف ارسال موبو نمی‌شود و روی سفارش پیام «این سفارش مربوط به موبو نیست» ثبت می‌شود.' ),
+				),
+				'قبل از فعال کردن اعتبارسنجی یا بررسی سبد موبو، username/password موبو، portal_variant_id و شناسه روش ارسال را روی یک سفارش تست بررسی کنید.'
+			);
+			$this->recommendation_box(
+				'تنظیمات پیشنهادی اعتبارسنجی خرید',
+				array(
+					array( 'setting' => 'فعال بودن اعتبارسنجی خرید', 'value' => 'غیرفعال به عنوان پیش‌فرض', 'reason' => 'تا وقتی sync کامل، GUIDها و checkout تست نشده‌اند، نباید خرید مشتری مسدود شود.' ),
+					array( 'setting' => 'بررسی محلی موجودی', 'value' => 'غیرفعال مگر برای تست کنترل‌شده', 'reason' => 'منبع عملیاتی موجودی باید مشخص باشد؛ همزمان کردن چند منبع می‌تواند خطای کاذب ایجاد کند.' ),
+					array( 'setting' => 'بررسی سبد موبو', 'value' => 'غیرفعال به عنوان پیش‌فرض', 'reason' => 'سبد موبو مشترک است و فقط بعد از اطمینان از lock و portal_variant_id باید فعال شود.' ),
+					array( 'setting' => 'لاگ حرفه‌ای سبد موبو', 'value' => 'غیرفعال به عنوان پیش‌فرض', 'reason' => 'برای debug روشن شود و بعد از رفع مشکل خاموش بماند تا حجم option/log بالا نرود.' ),
+					array( 'setting' => 'شناسه روش ارسال موبو', 'value' => '148395514', 'reason' => 'این شناسه هنگام مرحله shipping به موبو ارسال می‌شود و باید داخل لیست shippings موبو موجود باشد.' ),
+				),
+				'پیشنهاد عملی: اول با ثبت سفارش خودکار و یک سفارش کاملاً موبویی تست کنید؛ سپس در صورت نیاز اعتبارسنجی checkout و بررسی سبد موبو را جداگانه فعال کنید.'
+			);
+			?>
 
 			<div class="mobo-card">
 				<div class="mobo-card-head">
@@ -464,17 +588,250 @@ class Mobo_Core_Admin {
 
 				<div class="mobo-status-grid">
 					<?php $this->status_box( 'وضعیت local validator', ! empty( $status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
-					<?php $this->status_box( 'اعتبارسنجی خارجی', ! empty( $status['external'] ) ? 'فعال' : 'غیرفعال' ); ?>
+					<?php $this->status_box( 'بررسی سبد موبو', ! empty( $status['moboCartEnabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین موفقیت', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین ورود موفق موبو', ! empty( $status['lastMoboLoginAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastMoboLoginAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_at' ) ? wp_date( 'Y-m-d H:i:s', absint( get_option( 'mobo_core_checkout_mobo_login_test_at' ) ) ) : '—' ); ?>
+					<?php $this->status_box( 'نتیجه تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_result', '—' ) ); ?>
+					<?php $this->status_box( 'آخرین Cart موفق موبو', ! empty( $status['lastMoboCartAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastMoboCartAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'وضعیت lock سبد موبو', get_option( 'mobo_core_shared_mobo_cart_lock' ) ? 'فعال / در حال استفاده' : 'آزاد' ); ?>
+					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'آخرین نتیجه', isset( $last['success'] ) ? ( ! empty( $last['success'] ) ? 'موفق' : 'ناموفق' ) : '—' ); ?>
 					<?php $this->status_box( 'HTTP Status', isset( $last['status'] ) ? absint( $last['status'] ) : '—' ); ?>
 				</div>
 			</div>
 
+			<?php $this->render_mobo_cart_debug_log( $debug_log ); ?>
+
 			<?php $this->save_button(); ?>
 		</form>
 		<?php
+	}
+
+	/**
+	 * Render Mobo cart debug log in a session-oriented table.
+	 *
+	 * @param array $debug_log Debug log entries.
+	 * @return void
+	 */
+	private function render_mobo_cart_debug_log( $debug_log ) {
+		$debug_log = is_array( $debug_log ) ? $debug_log : array();
+		$sessions  = array();
+		$last_time = 0;
+		$last_err  = '—';
+
+		foreach ( $debug_log as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			$session = isset( $entry['session'] ) ? sanitize_text_field( (string) $entry['session'] ) : 'unknown';
+			$action  = isset( $entry['action'] ) ? sanitize_key( (string) $entry['action'] ) : 'unknown';
+			$time    = isset( $entry['time'] ) ? absint( $entry['time'] ) : 0;
+			$context = isset( $entry['context'] ) && is_array( $entry['context'] ) ? $entry['context'] : array();
+
+			if ( ! isset( $sessions[ $session ] ) ) {
+				$sessions[ $session ] = array(
+					'count'       => 0,
+					'first'       => $time,
+					'last'        => $time,
+					'actions'     => array(),
+					'variants'    => array(),
+					'cartItems'   => array(),
+					'cartCookie'  => '',
+					'userCookie'  => '',
+					'entries'     => array(),
+				);
+			}
+
+			$sessions[ $session ]['count']++;
+			$sessions[ $session ]['first'] = $sessions[ $session ]['first'] ? min( $sessions[ $session ]['first'], $time ) : $time;
+			$sessions[ $session ]['last']  = max( $sessions[ $session ]['last'], $time );
+			$sessions[ $session ]['actions'][ $action ] = isset( $sessions[ $session ]['actions'][ $action ] ) ? $sessions[ $session ]['actions'][ $action ] + 1 : 1;
+
+			$variant = $this->debug_context_value( $context, array( 'portalVariantId', 'variantid', 'variant_id' ) );
+			if ( '' !== $variant ) {
+				$sessions[ $session ]['variants'][ $variant ] = true;
+			}
+
+			$cart_item = $this->debug_context_value( $context, array( 'cartItemId', 'cartitemid', 'cart_item_id' ) );
+			if ( '' !== $cart_item ) {
+				$sessions[ $session ]['cartItems'][ $cart_item ] = true;
+			}
+
+			$cookie_summary = $this->debug_cookie_summary( $context );
+			if ( '' !== $cookie_summary['cart'] ) {
+				$sessions[ $session ]['cartCookie'] = $cookie_summary['cart'];
+			}
+			if ( '' !== $cookie_summary['userauth'] ) {
+				$sessions[ $session ]['userCookie'] = $cookie_summary['userauth'];
+			}
+
+			if ( $time > $last_time ) {
+				$last_time = $time;
+			}
+
+			$error = $this->debug_context_value( $context, array( 'error' ) );
+			if ( '' !== $error ) {
+				$last_err = $error;
+			}
+
+			$sessions[ $session ]['entries'][] = $entry;
+		}
+
+		uasort( $sessions, function( $a, $b ) {
+			return (int) $b['last'] <=> (int) $a['last'];
+		} );
+		?>
+		<div class="mobo-card mobo-card-wide">
+			<div class="mobo-card-head">
+				<h2>لاگ حرفه‌ای سبد موبو</h2>
+				<p>برای تست چند کاربر همزمان، هر WooCommerce session جدا نمایش داده می‌شود. cookie واقعی ذخیره نمی‌شود؛ فقط hash کوتاه آن نشان داده می‌شود.</p>
+			</div>
+
+			<div class="mobo-status-grid">
+				<?php $this->status_box( 'تعداد رخدادها', count( $debug_log ) ); ?>
+				<?php $this->status_box( 'تعداد Sessionها', count( $sessions ) ); ?>
+				<?php $this->status_box( 'آخرین رخداد', $last_time ? wp_date( 'Y-m-d H:i:s', $last_time ) : '—' ); ?>
+				<?php $this->status_box( 'آخرین خطا', $last_err ); ?>
+			</div>
+
+			<?php if ( empty( $debug_log ) ) : ?>
+				<div class="mobo-note">هنوز لاگی ثبت نشده است. لاگ را فعال کن، سپس با دو مرورگر یا incognito عملیات add/update/delete انجام بده.</div>
+			<?php else : ?>
+				<div class="mobo-note">در تست دو کاربر، باید حداقل دو مقدار متفاوت در ستون <code>Session</code> و ترجیحاً دو hash متفاوت برای cookie <code>cart</code> ببینی. اگر Session متفاوت است ولی cart hash یکی است، یعنی موبو سمت خودش cart را برای همان userauth مشترک نگه می‌دارد.</div>
+
+				<?php foreach ( array_slice( $sessions, 0, 20, true ) as $session_id => $session ) : ?>
+					<details class="mobo-note" open>
+						<summary>
+							<strong dir="ltr">Session <?php echo esc_html( $session_id ); ?></strong>
+							— رخداد: <?php echo esc_html( (string) $session['count'] ); ?>
+							— آخرین: <?php echo esc_html( $session['last'] ? wp_date( 'H:i:s', $session['last'] ) : '—' ); ?>
+							— cart cookie: <code dir="ltr"><?php echo esc_html( '' !== $session['cartCookie'] ? $session['cartCookie'] : '—' ); ?></code>
+						</summary>
+
+						<div style="margin:8px 0;">
+							<strong>Actionها:</strong> <code dir="ltr"><?php echo esc_html( wp_json_encode( $session['actions'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></code><br>
+							<strong>Variantها:</strong> <code dir="ltr"><?php echo esc_html( implode( ', ', array_keys( $session['variants'] ) ) ?: '—' ); ?></code><br>
+							<strong>Cart item idها:</strong> <code dir="ltr"><?php echo esc_html( implode( ', ', array_keys( $session['cartItems'] ) ) ?: '—' ); ?></code>
+						</div>
+
+						<div style="overflow:auto; max-height:520px; border:1px solid #e5e7eb; background:#fff;">
+							<table class="widefat striped" style="min-width:1350px;">
+								<thead>
+									<tr>
+										<th>زمان</th>
+										<th>Action</th>
+										<th>Variant</th>
+										<th>Qty</th>
+										<th>Cart item</th>
+										<th>HTTP</th>
+										<th>Method</th>
+										<th>Path</th>
+										<th>Cart cookie</th>
+										<th>Userauth</th>
+										<th>Map</th>
+										<th>خطا / توضیح</th>
+									</tr>
+								</thead>
+								<tbody>
+									<?php foreach ( array_slice( $session['entries'], 0, 80 ) as $entry ) : ?>
+										<?php
+										$context = isset( $entry['context'] ) && is_array( $entry['context'] ) ? $entry['context'] : array();
+										$cookies = $this->debug_cookie_summary( $context );
+										?>
+										<tr>
+											<td dir="ltr"><?php echo esc_html( ! empty( $entry['time'] ) ? wp_date( 'H:i:s', absint( $entry['time'] ) ) : '—' ); ?></td>
+											<td><code dir="ltr"><?php echo esc_html( isset( $entry['action'] ) ? (string) $entry['action'] : '—' ); ?></code></td>
+											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'portalVariantId', 'variantid', 'variant_id' ) ) ?: '—' ); ?></td>
+											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'quantity' ) ) ?: '—' ); ?></td>
+											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'cartItemId', 'cartitemid', 'cart_item_id' ) ) ?: '—' ); ?></td>
+											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'httpStatus', 'httpstatus', 'status' ) ) ?: '—' ); ?></td>
+											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'method' ) ) ?: '—' ); ?></td>
+											<td dir="ltr" style="max-width:260px; white-space:normal;"><?php echo esc_html( $this->debug_context_value( $context, array( 'path' ) ) ?: '—' ); ?></td>
+											<td dir="ltr"><code><?php echo esc_html( $cookies['cart'] ?: '—' ); ?></code></td>
+											<td dir="ltr"><code><?php echo esc_html( $cookies['userauth'] ?: '—' ); ?></code></td>
+											<td dir="ltr" style="max-width:220px; white-space:normal;"><code><?php echo esc_html( $this->debug_compact_value( isset( $context['map'] ) ? $context['map'] : '' ) ); ?></code></td>
+											<td style="max-width:300px; white-space:normal;"><?php echo esc_html( $this->debug_context_value( $context, array( 'error', 'message', 'note' ) ) ?: $this->debug_compact_value( $context ) ); ?></td>
+										</tr>
+									<?php endforeach; ?>
+								</tbody>
+							</table>
+						</div>
+					</details>
+				<?php endforeach; ?>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Return a scalar value from debug context by trying multiple possible keys.
+	 *
+	 * @param array $context Context.
+	 * @param array $keys Candidate keys.
+	 * @return string
+	 */
+	private function debug_context_value( $context, $keys ) {
+		if ( ! is_array( $context ) || ! is_array( $keys ) ) {
+			return '';
+		}
+
+		foreach ( $keys as $key ) {
+			if ( isset( $context[ $key ] ) && ! is_array( $context[ $key ] ) && null !== $context[ $key ] ) {
+				return sanitize_text_field( (string) $context[ $key ] );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Return masked Mobo cookie hashes from context.
+	 *
+	 * @param array $context Context.
+	 * @return array
+	 */
+	private function debug_cookie_summary( $context ) {
+		$result = array( 'cart' => '', 'userauth' => '' );
+
+		if ( ! is_array( $context ) || empty( $context['cookieJar'] ) || ! is_array( $context['cookieJar'] ) ) {
+			return $result;
+		}
+
+		foreach ( array( 'cart', 'userauth' ) as $name ) {
+			if ( isset( $context['cookieJar'][ $name ] ) && is_array( $context['cookieJar'][ $name ] ) && ! empty( $context['cookieJar'][ $name ]['hash'] ) ) {
+				$result[ $name ] = sanitize_text_field( (string) $context['cookieJar'][ $name ]['hash'] );
+			}
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Compact debug context for table display.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 */
+	private function debug_compact_value( $value ) {
+		if ( '' === $value || null === $value ) {
+			return '—';
+		}
+
+		if ( is_array( $value ) ) {
+			$json = wp_json_encode( $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			$value = false !== $json ? $json : '';
+		}
+
+		$value = sanitize_text_field( (string) $value );
+
+		if ( strlen( $value ) > 260 ) {
+			$value = substr( $value, 0, 260 ) . '...';
+		}
+
+		return $value;
 	}
 
 	/**
@@ -568,6 +925,31 @@ class Mobo_Core_Admin {
 				</div>
 			</div>
 
+			<?php
+			$this->guide_box(
+				'راهنمای سلامت سایت',
+				array(
+					array( 'title' => 'امتیازدهی Portal', 'text' => 'Portal از همین گزارش برای بررسی memory، debug، disk، cron و صف‌های pending/failed استفاده می‌کند.' ),
+					array( 'title' => 'گزارش دستی', 'text' => 'Endpoint ارسال دستی برای تست سریع است. در حالت عادی، گزارش با فاصله زمانی تنظیم‌شده ارسال می‌شود.' ),
+					array( 'title' => 'چند دامنه روی یک لایسنس', 'text' => 'اطلاعات licenseToken و دامنه در گزارش ارسال می‌شود تا استفاده غیرعادی از یک لایسنس در Portal قابل تشخیص باشد.' ),
+				),
+				'اگر failed webhook زیاد شد، ابتدا علت خطا را بررسی کنید؛ دکمه Retry فقط آن‌ها را به صف برمی‌گرداند و خطای اصلی را رفع نمی‌کند.'
+			);
+			?>
+
+			<?php
+			$this->recommendation_box(
+				'تنظیمات پیشنهادی سلامت سایت',
+				array(
+					array( 'setting' => 'ارسال گزارش سلامت', 'value' => 'روشن', 'reason' => 'برای تشخیص cron، صف‌ها، خطاها و مصرف منابع در Portal لازم است.' ),
+					array( 'setting' => 'حداقل فاصله ارسال', 'value' => '۹۰۰ ثانیه در حالت عادی؛ ۳۰۰ ثانیه فقط برای راه‌اندازی اولیه یا عیب‌یابی', 'reason' => 'فاصله کوتاه‌تر تعداد گزارش‌های بیشتری تولید می‌کند و می‌تواند روی منابع هاست و Portal فشار اضافه ایجاد کند.' ),
+					array( 'setting' => 'Timeout ارسال', 'value' => '۱۰ تا ۱۵ ثانیه', 'reason' => 'کمتر از این ممکن است روی هاست‌های کند خطای کاذب بدهد؛ بیشتر از این worker را بی‌دلیل نگه می‌دارد.' ),
+					array( 'setting' => 'آدرس گزارش سلامت', 'value' => 'خالی مگر Portal جداگانه باشد', 'reason' => 'اگر خالی باشد از API Base URL ساخته می‌شود و خطای تنظیم دستی کمتر است.' ),
+				),
+				'Health را روشن نگه دارید، اما فاصله ارسال را کمتر از ۵ دقیقه نگذارید مگر در زمان راه‌اندازی اولیه یا عیب‌یابی.'
+			);
+			?>
+
 			<?php $this->save_button(); ?>
 		</form>
 		<?php
@@ -579,12 +961,33 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_cron_tab() {
-		$status      = Mobo_Core_Cron_Runner::get_status();
-		$cron_url    = isset( $status['cronUrl'] ) ? (string) $status['cronUrl'] : '';
-		$script_path = MOBO_CORE_PLUGIN_DIR . 'mobo-cron.php';
-		$php_command = '/usr/local/bin/php -q ' . $script_path;
-		$self_status = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
-		$worker_url  = isset( $self_status['workerUrl'] ) ? (string) $self_status['workerUrl'] : '';
+		$status         = Mobo_Core_Cron_Runner::get_status();
+		$cron_url       = isset( $status['cronUrl'] ) ? (string) $status['cronUrl'] : '';
+		$script_path    = MOBO_CORE_PLUGIN_DIR . 'mobo-cron.php';
+		$php_command    = '/usr/local/bin/php -q ' . $script_path;
+		$self_status    = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
+		$worker_url     = isset( $self_status['workerUrl'] ) ? (string) $self_status['workerUrl'] : '';
+		$webhook_queue  = class_exists( 'Mobo_Core_Webhook_Queue' ) ? new Mobo_Core_Webhook_Queue() : null;
+		$webhook_status = $webhook_queue ? $webhook_queue->get_status() : array();
+		$table_timing   = isset( $webhook_status['tableTiming'] ) && is_array( $webhook_status['tableTiming'] ) ? $webhook_status['tableTiming'] : array();
+		$file_timing    = isset( $webhook_status['fileTiming'] ) && is_array( $webhook_status['fileTiming'] ) ? $webhook_status['fileTiming'] : array();
+		$next_cron_at   = isset( $status['nextEstimatedAt'] ) ? absint( $status['nextEstimatedAt'] ) : 0;
+		$next_deferred  = 0;
+
+		if ( ! empty( $table_timing['nextDeferredAt'] ) ) {
+			$next_deferred = absint( $table_timing['nextDeferredAt'] );
+		}
+
+		if ( ! empty( $file_timing['nextDeferredAt'] ) && ( 0 === $next_deferred || absint( $file_timing['nextDeferredAt'] ) < $next_deferred ) ) {
+			$next_deferred = absint( $file_timing['nextDeferredAt'] );
+		}
+
+		$next_webhook_at = 0;
+		if ( ! empty( $webhook_status['hasDue'] ) ) {
+			$next_webhook_at = $next_cron_at;
+		} elseif ( ! empty( $webhook_status['hasPending'] ) && $next_deferred > 0 ) {
+			$next_webhook_at = $next_cron_at > 0 ? max( $next_cron_at, $next_deferred ) : $next_deferred;
+		}
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
@@ -595,15 +998,47 @@ class Mobo_Core_Admin {
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>اجرای خودکار / کران واقعی</h2>
-						<p>مسیر اصلی اجرای sync، worker داخلی پلاگین است که بعد از دریافت webhook خودش را بیدار می‌کند. Cron واقعی فقط fallback اختیاری است.</p>
+						<p>مسیر اصلی و مطمئن برای اجرای صف‌ها، Cron واقعی با فایل PHP داخل پلاگین است. برای جلوگیری از pending ماندن webhookها، فقط یک Cron Job برای همین فایل تنظیم کنید.</p>
 					</div>
 
 					<div class="mobo-status-grid">
+						<?php $this->status_box( 'کران واقعی', ! empty( $status['isActive'] ) ? 'فعال' : 'تشخیص داده نشده' ); ?>
+						<?php $this->status_box( 'آخرین اجرای کران واقعی', ! empty( $status['lastHitAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastHitAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای موفق کران', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'اجرای بعدی Cron، تقریبی', ! empty( $status['lastHitAt'] ) && ! empty( $status['nextEstimatedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextEstimatedAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'فاصله مورد انتظار Cron', ! empty( $status['expectedIntervalSeconds'] ) ? absint( $status['expectedIntervalSeconds'] ) . ' ثانیه' : '—' ); ?>
+						<?php $this->status_box( 'وضعیت زمان‌بندی Cron', empty( $status['lastHitAt'] ) ? '—' : ( ! empty( $status['isOverdue'] ) ? 'عقب‌افتاده' : 'به‌موقع' ) ); ?>
+						<?php $this->status_box( 'آخرین اجرای Worker داخلی', ! empty( $self_status['lastRunAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastRunAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین Kick داخلی', ! empty( $self_status['lastKickAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastKickAttemptAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'اجرای داخلی', ! empty( $self_status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
-						<?php $this->status_box( 'آخرین Kick', ! empty( $self_status['lastKickAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastKickAttemptAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین اجرای Worker', ! empty( $self_status['lastRunAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastRunAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'کران جایگزین', ! empty( $status['isActive'] ) ? 'فعال' : 'تشخیص داده نشده' ); ?>
+						<?php $this->status_box( 'آخرین تلاش پردازش وب‌هوک', ! empty( $webhook_status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastAttemptAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای موفق صف وب‌هوک', ! empty( $webhook_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین فعالیت واقعی وب‌هوک', ! empty( $webhook_status['lastActivityAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastActivityAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'اجرای بعدی وب‌هوک، تقریبی', $next_webhook_at > 0 ? wp_date( 'Y-m-d H:i:s', $next_webhook_at ) : '—' ); ?>
+						<?php $this->status_box( 'وب‌هوک‌های pending / due / failed', absint( isset( $webhook_status['pendingTableEvents'] ) ? $webhook_status['pendingTableEvents'] : 0 ) . ' / ' . absint( isset( $webhook_status['dueTableEvents'] ) ? $webhook_status['dueTableEvents'] : 0 ) . ' / ' . absint( isset( $webhook_status['failedTableEvents'] ) ? $webhook_status['failedTableEvents'] : 0 ) ); ?>
+						<?php $this->status_box( 'فایل‌های pending قدیمی', absint( isset( $webhook_status['pendingFiles'] ) ? $webhook_status['pendingFiles'] : 0 ) ); ?>
 					</div>
+					<div class="mobo-note">
+						اگر Cron را با فایل <code dir="ltr">mobo-cron.php</code> تنظیم کرده‌اید، معیار اصلی «آخرین اجرای کران واقعی» است. «اجرای بعدی» فقط تخمین پلاگین بر اساس آخرین اجرا و فاصله مورد انتظار است؛ زمان دقیق بعدی در خود cPanel نگهداری می‌شود. اگر «آخرین اجرای کران واقعی» تغییر نمی‌کند، cron اصلاً فایل را اجرا نکرده یا قبل از لود وردپرس خطا می‌دهد.
+					</div>
+
+					<div class="mobo-actions">
+						<button type="submit" class="button button-secondary" name="mobo_core_run_cron_now" value="1">اجرای تست Cron و پردازش وب‌هوک‌ها</button>
+					</div>
+
+					<?php if ( ! empty( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) : ?>
+						<div class="mobo-note">
+							<strong>آخرین نتیجه Cron:</strong>
+							<pre dir="ltr"><?php echo esc_html( wp_json_encode( $status['lastResult'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre>
+						</div>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $webhook_status['lastResult'] ) && is_array( $webhook_status['lastResult'] ) ) : ?>
+						<div class="mobo-note">
+							<strong>آخرین نتیجه صف وب‌هوک:</strong>
+							<pre dir="ltr"><?php echo esc_html( wp_json_encode( $webhook_status['lastResult'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre>
+						</div>
+					<?php endif; ?>
 
 					<?php if ( '' !== $worker_url ) : ?>
 						<div class="mobo-field mobo-field-full">
@@ -614,22 +1049,22 @@ class Mobo_Core_Admin {
 					<?php endif; ?>
 
 					<div class="mobo-field mobo-field-full">
-						<label>مسیر فایل PHP برای cPanel Cron</label>
+						<label>مسیر فایل PHP برای Cron واقعی</label>
 						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $script_path ); ?>" onclick="this.select();">
-						<div class="mobo-help">اگر هاست شما فقط PHP Script قبول می‌کند، همین مسیر فایل را وارد کنید. این روش به wget، curl و عملگرهای shell نیاز ندارد.</div>
+						<div class="mobo-help">اگر هاست فقط PHP Script قبول می‌کند، همین مسیر فایل را وارد کنید. این روش مسیر اصلی پیشنهادی است و به wget، curl و عملگرهای shell نیاز ندارد.</div>
 					</div>
 
 					<div class="mobo-field mobo-field-full">
-						<label>دستور PHP Cron در صورت مجاز بودن Command کامل</label>
+						<label>دستور کامل Cron پیشنهادی</label>
 						<textarea rows="3" readonly dir="ltr" onclick="this.select();"><?php echo esc_textarea( $php_command ); ?></textarea>
-						<div class="mobo-help">اگر cPanel شما Command کامل می‌پذیرد، این دستور را استفاده کنید. هیچ redirect یا chain operator داخل آن نیست.</div>
+						<div class="mobo-help">اگر هاست Command کامل می‌پذیرد، همین دستور را هر ۱ دقیقه اجرا کنید. این دستور مستقیم فایل mobo-cron.php را اجرا می‌کند و به HTTP/loopback وابسته نیست.</div>
 					</div>
 
 					<?php if ( '' !== $cron_url ) : ?>
 						<div class="mobo-field mobo-field-full">
-							<label>Endpoint قدیمی HTTP Cron</label>
+							<label>Endpoint HTTP جایگزین، فقط در صورت نیاز</label>
 							<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $cron_url ); ?>" onclick="this.select();">
-							<div class="mobo-help">این URL فقط برای هاست‌هایی است که HTTP cron با curl/wget را اجازه می‌دهند. برای هاست فعلی شما از فایل PHP بالا استفاده کنید.</div>
+							<div class="mobo-help">این URL فقط fallback است. مسیر اصلی Cron واقعی، اجرای فایل PHP بالا با PHP CLI است.</div>
 						</div>
 					<?php endif; ?>
 				</div>
@@ -637,19 +1072,19 @@ class Mobo_Core_Admin {
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>راهنمای تنظیم Cron در هاست‌ها</h2>
-						<p>اگر اجرای داخلی روی هاست مشتری کافی نبود، یک Cron واقعی هر ۵ دقیقه تنظیم کنید. روش اول، اجرای مستقیم فایل PHP است و برای هاست‌هایی که فقط PHP Script قبول می‌کنند مناسب‌تر است.</p>
+						<p>برای این پلاگین معمولاً فقط یک Cron Job کافی است. پیشنهاد اصلی، اجرای فایل <code dir="ltr">mobo-cron.php</code> هر ۱ دقیقه است تا webhookهای pending سریع‌تر پردازش شوند.</p>
 					</div>
 					<div class="mobo-note">
-						<strong>cPanel با محدودیت «Only PHP scripts»:</strong> در بخش Cron Jobs، حالت اجرای PHP Script را انتخاب کنید و فقط مسیر فایل <code dir="ltr"><?php echo esc_html( $script_path ); ?></code> را وارد کنید. از <code>wget</code>، <code>curl</code>، <code>&gt;/dev/null</code> و <code>2&gt;&amp;1</code> استفاده نکنید.
+						<strong>cPanel با محدودیت «Only PHP scripts»:</strong> در بخش Cron Jobs حالت PHP Script را انتخاب کنید، زمان‌بندی را روی هر ۱ دقیقه قرار دهید و فقط مسیر فایل <code dir="ltr"><?php echo esc_html( $script_path ); ?></code> را وارد کنید. از <code>wget</code>، <code>curl</code>، <code>&gt;/dev/null</code> و <code>2&gt;&amp;1</code> استفاده نکنید.
 					</div>
 					<div class="mobo-note">
-						<strong>cPanel با Command کامل:</strong> دستور <code dir="ltr"><?php echo esc_html( $php_command ); ?></code> را با زمان‌بندی هر ۵ دقیقه ثبت کنید. اگر مسیر PHP فرق داشت، فقط مسیر PHP را اصلاح کنید.
+						<strong>cPanel با Command کامل:</strong> دستور <code dir="ltr"><?php echo esc_html( $php_command ); ?></code> را با زمان‌بندی هر ۱ دقیقه ثبت کنید. اگر مسیر PHP فرق داشت، فقط مسیر PHP را اصلاح کنید.
 					</div>
 					<div class="mobo-note">
-						<strong>DirectAdmin:</strong> از Advanced Features &gt; Cron Jobs یک job با دقیقه <code dir="ltr">*/5</code> بسازید. اگر Command کامل مجاز است دستور PHP بالا را وارد کنید؛ اگر فقط فایل PHP می‌خواهد، مسیر فایل را وارد کنید.
+						<strong>DirectAdmin:</strong> از Advanced Features &gt; Cron Jobs یک job با دقیقه <code dir="ltr">*</code> یا حالت هر ۱ دقیقه بسازید. اگر Command کامل مجاز است دستور PHP بالا را وارد کنید؛ اگر فقط فایل PHP می‌خواهد، مسیر فایل را وارد کنید.
 					</div>
 					<div class="mobo-note">
-						<strong>Plesk یا هاست‌های عمومی:</strong> در Scheduled Tasks، نوع Task را PHP Script قرار دهید و فایل <code dir="ltr">mobo-cron.php</code> را از مسیر پلاگین انتخاب کنید. در صورت استفاده از URL task، فقط Endpoint HTTP Cron را وارد کنید و مطمئن شوید توکن کران تنظیم شده است.
+						<strong>Plesk یا هاست‌های عمومی:</strong> در Scheduled Tasks، نوع Task را PHP Script قرار دهید، زمان‌بندی را هر ۱ دقیقه بگذارید و فایل <code dir="ltr">mobo-cron.php</code> را از مسیر پلاگین انتخاب کنید. URL task فقط fallback است.
 					</div>
 				</div>
 
@@ -663,6 +1098,7 @@ class Mobo_Core_Admin {
 						<?php $this->int_field( 'بودجه زمانی هر اجرا / ثانیه', 'mobo_core_real_cron_time_budget_seconds', 5, 55 ); ?>
 						<?php $this->int_field( 'حداکثر step محصول در هر اجرا', 'mobo_core_real_cron_max_sync_steps', 1, 20 ); ?>
 						<?php $this->int_field( 'TTL قفل Cron / ثانیه', 'mobo_core_real_cron_lock_ttl_seconds', 30, 600 ); ?>
+						<?php $this->int_field( 'فاصله مورد انتظار Cron / ثانیه', 'mobo_core_real_cron_expected_interval_seconds', 60, 3600 ); ?>
 						<?php $this->bool_field( 'فعال بودن اجرای داخلی', 'mobo_core_self_runner_enabled' ); ?>
 						<?php $this->bool_field( 'ادامه خودکار تا خالی شدن صف', 'mobo_core_self_runner_continue_enabled' ); ?>
 						<?php $this->int_field( 'حداقل فاصله Kick / ثانیه', 'mobo_core_self_runner_min_interval_seconds', 0, 60 ); ?>
@@ -676,7 +1112,32 @@ class Mobo_Core_Admin {
 						<?php $this->int_field( 'فاصله تلاش مجدد پس از انتظار Portal / ثانیه', 'mobo_core_waiting_for_portal_retry_delay_seconds', 10, 3600 ); ?>
 					</div>
 
-					<?php $this->secret_field( 'توکن کران', 'mobo_core_cron_token', 'خالی بگذارید تا مقدار قبلی حفظ شود. این توکن داخل URL کران استفاده می‌شود.' ); ?>
+					<?php $this->secret_field( 'توکن کران', 'mobo_core_cron_token', 'خالی بگذارید تا مقدار قبلی حفظ شود. این توکن فقط برای Endpoint HTTP لازم است؛ اجرای مستقیم فایل mobo-cron.php با PHP CLI به توکن نیاز ندارد.' ); ?>
+
+					<?php
+					$this->guide_box(
+						'راهنمای Runner و Cron',
+						array(
+							array( 'title' => 'اجرای داخلی', 'text' => 'بعد از webhook یا polling، پلاگین تلاش می‌کند worker داخلی را بیدار کند؛ اما روی بعضی هاست‌ها loopback قابل اعتماد نیست، بنابراین Cron واقعی باید فعال باشد.' ),
+							array( 'title' => 'Cron واقعی', 'text' => 'مسیر اصلی پیشنهادی، اجرای مستقیم فایل mobo-cron.php با PHP CLI است. یک Cron Job هر ۱ دقیقه کافی است.' ),
+							array( 'title' => 'بودجه زمانی', 'text' => 'زمان و تعداد step را کوچک نگه دارید تا هاست مشتری timeout یا فشار CPU نگیرد.' ),
+						),
+						'روی هاست اشتراکی معمولاً تعداد step محصول ۱ تا ۳ و تعداد تصویر ۳ مقدار امن‌تری است. روی VPS می‌توان تدریجی افزایش داد.'
+					);
+					$this->recommendation_box(
+						'تنظیمات پیشنهادی Runner و Cron',
+						array(
+							array( 'setting' => 'بودجه زمانی هر اجرا', 'value' => '۲۰ تا ۲۵ ثانیه روی هاست معمولی؛ ۳۰ تا ۴۵ ثانیه روی VPS', 'reason' => 'کمتر از این sync کند می‌شود؛ بیشتر از این احتمال timeout و مصرف CPU را بالا می‌برد.' ),
+							array( 'setting' => 'حداکثر step محصول', 'value' => '۲ یا ۳ روی هاست اشتراکی؛ ۵ روی VPS', 'reason' => 'هر step ممکن است product، variant و image queue را درگیر کند.' ),
+							array( 'setting' => 'TTL قفل Cron', 'value' => '۱۲۰ ثانیه', 'reason' => 'باید بزرگ‌تر از بودجه زمانی باشد تا اجرای همزمان ساخته نشود، ولی آنقدر زیاد نباشد که lock مرده طولانی بماند.' ),
+							array( 'setting' => 'Cron واقعی', 'value' => 'هر ۱ دقیقه، فقط یک job', 'reason' => 'اگر worker داخلی تکان نخورد، Cron واقعی صف webhook، محصول، واریانت و تصویر را جلو می‌برد.' ),
+							array( 'setting' => 'اجرای داخلی و ادامه خودکار', 'value' => 'روشن', 'reason' => 'بعد از webhook تلاش می‌کند صف را سریع‌تر جلو ببرد، اما جایگزین Cron واقعی نیست.' ),
+							array( 'setting' => 'پردازش فوری وب‌هوک هنگام دریافت', 'value' => 'خاموش', 'reason' => 'درخواست ورودی Portal نباید منتظر پردازش سنگین وردپرس بماند.' ),
+							array( 'setting' => 'Timeout API و payload', 'value' => '۶۰ ثانیه', 'reason' => 'برای payloadهای بزرگ و هاست کند معقول است؛ مقادیر خیلی بالا worker را قفل می‌کند.' ),
+						),
+						'برای جلوگیری از pending ماندن webhookها، فقط یک Cron واقعی با فایل PHP پلاگین و زمان‌بندی هر ۱ دقیقه تنظیم کنید. چند Cron موازی برای worker، cron URL و wp-cron لازم نیست. اگر هاست محدودیت سخت‌گیرانه دارد، بازه را به ۲ یا ۵ دقیقه افزایش دهید.'
+					);
+					?>
 				</div>
 			</div>
 
@@ -695,7 +1156,7 @@ class Mobo_Core_Admin {
 		<div class="mobo-card">
 			<div class="mobo-card-head">
 				<h2>لود دسته‌بندی قبل از Sync محصول</h2>
-				<p>این عملیات فقط دسته‌بندی‌های موبو را دریافت می‌کند و جدول نگاشت را پر می‌کند؛ همگام‌سازی محصول را شروع نمی‌کند.</p>
+				<p>این عملیات فقط دسته‌بندی‌های موبو را برای جدول نگاشت دریافت می‌کند؛ هیچ دسته‌ای در ووکامرس ساخته یا بروزرسانی نمی‌شود و Sync محصول هم شروع نمی‌شود.</p>
 			</div>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-form">
 				<input type="hidden" name="action" value="mobo_core_sync_categories">
@@ -705,7 +1166,7 @@ class Mobo_Core_Admin {
 				</div>
 			</form>
 			<div class="mobo-note">
-				پس از اجرای موفق، همین صفحه را بررسی کنید و نگاشت دستی را ذخیره کنید. بعد از آن دکمه همگام‌سازی محصولات را بزنید.
+				پس از اجرای موفق، همین صفحه را بررسی کنید و نگاشت دستی را ذخیره کنید. این دکمه مستقل از گزینه «آپدیت اتوماتیک دسته‌بندی‌های محصول» است و فقط Mapping را آماده می‌کند.
 			</div>
 		</div>
 
@@ -728,15 +1189,32 @@ class Mobo_Core_Admin {
 				</div>
 
 				<div class="mobo-note">
-					ترتیب انتخاب دسته برای محصول: نگاشت دستی، دسته همگام‌شده با category_guid، ساخت خودکار در صورت مجاز بودن، سپس دسته پیشفرض.
+					ترتیب انتخاب دسته برای محصول: نگاشت دستی، دسته همگام‌شده با category_guid، ساخت خودکار دسته جدید در صورت مجاز بودن، سپس دسته پیشفرض فقط برای محصول جدید. دسته‌های موجود ووکامرس به‌صورت پیش‌فرض بروزرسانی نمی‌شوند؛ پلاگین فقط دسته‌های جدید را می‌سازد و نام، slug، parent و متادیتای دسته‌های قبلی را تغییر نمی‌دهد.
 					اگر نگاشت اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند.
 				</div>
+
+				<?php $this->category_sync_guide_box(); ?>
+
+				<?php
+				$this->recommendation_box(
+					'تنظیمات پیشنهادی دسته‌بندی',
+					array(
+						array( 'setting' => 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'value' => 'خاموش اگر همه دسته‌ها دستی mapping می‌شوند؛ روشن اگر دسته‌های جدید باید خودکار ساخته شوند', 'reason' => 'در هر دو حالت دسته‌های موجود آپدیت نمی‌شوند؛ روشن بودن فقط اجازه ساخت دسته جدید را می‌دهد.' ),
+						array( 'setting' => 'فعال بودن نگاشت دسته‌بندی', 'value' => 'روشن', 'reason' => 'برای جلوگیری از رفتن محصولات روی default و کنترل ساختار فروشگاه لازم است.' ),
+						array( 'setting' => 'اجباری بودن نگاشت دستی', 'value' => 'روشن برای فروشگاه‌های حساس؛ خاموش در import اولیه', 'reason' => 'اگر روشن باشد محصول بدون mapping دسته‌اش را تغییر نمی‌دهد و خطای mapping قابل پیگیری می‌شود.' ),
+						array( 'setting' => 'دسته پیشفرض', 'value' => 'یک دسته مشخص مثل «نیازمند نگاشت»', 'reason' => 'Uncategorized عمومی پیدا کردن محصولات بدون mapping را سخت می‌کند.' ),
+					),
+					'پیشنهاد راه‌اندازی: اول دسته‌ها را لود کنید، mapping را ذخیره کنید، سپس Sync محصول را اجرا کنید. اگر mapping کامل است، required را روشن کنید.'
+				);
+				?>
 			</div>
 
 			<?php $this->category_mapping_table(); ?>
 
 			<?php $this->save_button( 'ذخیره تنظیمات و نگاشت دسته‌بندی' ); ?>
 		</form>
+
+		<?php $this->recategorize_queue_ui(); ?>
 		<?php
 	}
 
@@ -759,12 +1237,36 @@ class Mobo_Core_Admin {
 				</div>
 
 				<?php $this->pricing_rules_ui(); ?>
-			</div>
 
-			<?php $this->reprice_queue_ui(); ?>
+				<?php
+				$this->guide_box(
+					'راهنمای قیمت‌گذاری',
+					array(
+						array( 'title' => 'سود مستقیم واریانت', 'text' => 'اگر mobo_additional_price برای یک variation وجود داشته باشد، همان مقدار اولویت دارد و قانون عمومی روی آن اعمال نمی‌شود.' ),
+						array( 'title' => 'قوانین بازه‌ای', 'text' => 'در قیمت‌گذاری داینامیک، اولین قانونی که بازه قیمت خام با آن تطبیق داشته باشد اعمال می‌شود.' ),
+						array( 'title' => 'اعمال مجدد قیمت', 'text' => 'بعد از تغییر سیاست سود، لازم نیست محصول‌ها دوباره از سامانه دریافت شوند؛ ابزار اعمال مجدد قیمت از meta قیمت خام استفاده می‌کند.' ),
+					),
+					'قبل از اجرای reprice روی کل محصولات، یک نمونه محصول ساده و یک محصول متغیر را دستی بررسی کنید تا فرمول سود مطابق انتظار باشد.'
+				);
+				?>
+				<?php
+				$this->recommendation_box(
+					'تنظیمات پیشنهادی قیمت‌گذاری',
+					array(
+						array( 'setting' => 'نوع سود', 'value' => 'داینامیک برای کاتالوگ بزرگ؛ ثابت فقط برای فروشگاه ساده', 'reason' => 'محصول ارزان و گران نباید الزاماً یک سود عددی/درصدی یکسان داشته باشند.' ),
+						array( 'setting' => 'سود مستقیم واریانت', 'value' => 'فقط برای استثناها', 'reason' => 'اگر برای همه استفاده شود، کنترل مرکزی قوانین قیمت سخت می‌شود.' ),
+						array( 'setting' => 'بازه‌های داینامیک', 'value' => 'بدون همپوشانی و با high مشخص', 'reason' => 'اولین بازه match شده اعمال می‌شود؛ همپوشانی باعث نتیجه غیرمنتظره می‌شود.' ),
+						array( 'setting' => 'Reprice', 'value' => 'بعد از تغییر قوانین، مرحله‌ای اجرا شود', 'reason' => 'برای اعمال سود جدید لازم نیست همه محصولات دوباره از سامانه دریافت شوند.' ),
+					),
+					'قبل از reprice عمومی، حداقل یک محصول ساده و یک محصول متغیر را دستی بررسی کنید.'
+				);
+				?>
+			</div>
 
 			<?php $this->save_button(); ?>
 		</form>
+
+		<?php $this->reprice_queue_ui(); ?>
 		<?php
 	}
 
@@ -791,6 +1293,29 @@ class Mobo_Core_Admin {
 				<div class="mobo-note">
 					اگر URL محصول داخل این لیست باشد، محصول جدید ساخته نمی‌شود و محصول موجود هم بروزرسانی نمی‌شود.
 				</div>
+
+				<?php
+				$this->guide_box(
+					'راهنمای فیلتر محصولات',
+					array(
+						array( 'title' => 'فرمت ورودی', 'text' => 'هر خط یک URL یا مسیر محصول است. بهتر است همان فرمتی را وارد کنید که از Portal برای محصول دریافت می‌شود.' ),
+						array( 'title' => 'اثر روی محصول جدید', 'text' => 'اگر محصول هنوز در ووکامرس ساخته نشده باشد و URL آن در این لیست باشد، اصلاً ایجاد نمی‌شود.' ),
+						array( 'title' => 'اثر روی محصول موجود', 'text' => 'اگر محصول قبلاً sync شده باشد، با قرار گرفتن URL در این لیست، بروزرسانی بعدی آن متوقف می‌شود.' ),
+					),
+					'این بخش برای حذف محصول از ووکامرس نیست؛ فقط جلوی syncهای بعدی را می‌گیرد.'
+				);
+				?>
+				<?php
+				$this->recommendation_box(
+					'تنظیمات پیشنهادی فیلتر محصولات',
+					array(
+						array( 'setting' => 'فرمت URL', 'value' => 'همان URL یا path دریافتی از Portal، هر خط یک مورد', 'reason' => 'اگر فرمت متفاوت باشد، محصول match نمی‌شود و همچنان sync خواهد شد.' ),
+						array( 'setting' => 'زمان ثبت فیلتر', 'value' => 'قبل از اولین sync', 'reason' => 'اگر محصول قبلاً ساخته شده باشد، فیلتر فقط جلوی بروزرسانی بعدی را می‌گیرد و حذف انجام نمی‌دهد.' ),
+						array( 'setting' => 'کاربرد پیشنهادی', 'value' => 'محصولات تستی، ممنوع، ناقص یا خارج از سیاست فروشگاه', 'reason' => 'این بخش برای مدیریت استثناست، نه پاکسازی کاتالوگ.' ),
+					),
+					'بعد از اضافه کردن فیلتر، اگر محصول قبلاً ساخته شده، برای حذف یا trash کردن آن باید جداگانه در WooCommerce تصمیم بگیرید.'
+				);
+				?>
 			</div>
 
 			<?php $this->save_button(); ?>
@@ -838,13 +1363,46 @@ class Mobo_Core_Admin {
 					</div>
 
 					<div class="mobo-fields-grid">
-						<?php $this->int_field( 'تعداد فایل وب‌هوک در هر اجرا', 'mobo_core_webhook_files_per_run', 1, 10 ); ?>
+						<?php $this->int_field( 'تعداد فایل وب‌هوک در هر اجرا', 'mobo_core_webhook_files_per_run', 1, 10, 4 ); ?>
 						<?php $this->int_field( 'حداکثر تلاش برای هر وب‌هوک', 'mobo_core_webhook_max_try', 1, 20 ); ?>
 						<?php $this->int_field( 'انقضای وب‌هوک - روز', 'mobo_core_webhook_expire_days', 1, 30 ); ?>
+						<?php $this->int_field( 'مهلت انتظار محصول مادر برای تنوع - ثانیه', 'mobo_core_variant_parent_wait_timeout_seconds', 60, 86400, 600 ); ?>
 						<?php $this->missing_variants_field(); ?>
 					</div>
 				</div>
 			</div>
+
+			<?php
+			$this->guide_box(
+				'راهنمای صف و پردازش مرحله‌ای',
+				array(
+					array( 'title' => 'محصول و واریانت', 'text' => 'تعداد صفحه‌ها را کوچک نگه دارید تا WooCommerce در هر اجرا فقط چند write کنترل‌شده انجام دهد.' ),
+					array( 'title' => 'صف تصویر', 'text' => 'صف مستقل تصویر باعث می‌شود محصول روی دانلود عکس گیر نکند. اگر عکس‌ها دیر می‌آیند، وضعیت wp_mobo_image_queue را بررسی کنید.' ),
+					array( 'title' => 'صف وب‌هوک', 'text' => 'وب‌هوک‌ها ابتدا فایل می‌شوند و بعد مرحله‌ای پردازش می‌شوند تا درخواست ورودی Portal timeout نشود.' ),
+					array( 'title' => 'Missing variants', 'text' => 'رفتار واریانت‌هایی که دیگر از Portal نمی‌آیند اینجا تعیین می‌شود؛ معمولاً outofstock امن‌تر از حذف است.' ),
+					array( 'title' => 'مهلت انتظار محصول مادر', 'text' => 'اگر UpdateVariant زودتر از ProductUpdated برسد، افزونه فقط تا این مدت منتظر ساخته شدن محصول مادر می‌ماند. بعد از اتمام مهلت، event از صف خارج می‌شود تا صف روی چند تنوع گیر نکند.' ),
+				),
+				'برای هاست اشتراکی مقدارهای کوچک‌تر پایدارتر هستند؛ افزایش ناگهانی تعداد محصول، واریانت یا تصویر می‌تواند باعث timeout و lock شود.'
+			);
+
+			$this->recommendation_box(
+				'تنظیمات پیشنهادی صف و پردازش مرحله‌ای',
+				array(
+					array( 'setting' => 'بودجه زمانی Sync', 'value' => '۸ تا ۱۲ ثانیه روی هاست اشتراکی؛ ۱۵ تا ۲۰ ثانیه روی VPS', 'reason' => 'بودجه کوتاه‌تر از timeout جلوگیری می‌کند؛ بودجه خیلی بلند lock و CPU را زیاد می‌کند.' ),
+					array( 'setting' => 'تعداد محصول در هر صفحه', 'value' => '۱ تا ۳ روی هاست اشتراکی؛ ۵ روی VPS', 'reason' => 'هر محصول می‌تواند ده‌ها واریانت و تصویر داشته باشد.' ),
+					array( 'setting' => 'Cursor محصول و تنوع', 'value' => 'روشن', 'reason' => 'ادامه از آخرین نقطه پایدارتر از page ساده است و برای قطعی موقت امن‌تر است.' ),
+					array( 'setting' => 'تعداد تنوع در هر صفحه', 'value' => '۵ تا ۱۰ برای هاست معمولی؛ ۲۰ برای VPS', 'reason' => 'واریانت‌ها پرهزینه‌تر از محصول ساده هستند، مخصوصاً روی WooCommerce.' ),
+					array( 'setting' => 'تعداد تصویر در هر اجرا', 'value' => '۳ روی هاست معمولی؛ ۵ روی VPS', 'reason' => 'دانلود تصویر کند و وابسته به شبکه است؛ عدد بالا باعث timeout می‌شود.' ),
+					array( 'setting' => 'صف مستقل تصویر', 'value' => 'روشن', 'reason' => 'محصول نباید به خاطر چند تصویر کند یا خراب قفل شود.' ),
+					array( 'setting' => 'منتظر ماندن تا تکمیل تصاویر', 'value' => 'خاموش', 'reason' => 'این گزینه همان نقطه‌ای است که می‌تواند Sync محصول را روی تصاویر نگه دارد.' ),
+					array( 'setting' => 'حداکثر تلاش تصویر / retry base', 'value' => '۵ تلاش، ۱۲۰ ثانیه', 'reason' => 'برای خطای موقت کافی است و برای URL خراب بی‌نهایت retry نمی‌سازد.' ),
+					array( 'setting' => 'وب‌هوک در هر اجرا', 'value' => '۴', 'reason' => 'پیش‌فرض جدید ۴ فایل است؛ برای هاست ضعیف کمتر و برای VPS بعد از تست تدریجی بیشتر شود.' ),
+					array( 'setting' => 'مهلت انتظار محصول مادر برای تنوع', 'value' => '۶۰۰ ثانیه / ۱۰ دقیقه', 'reason' => 'اگر parent در این بازه نرسید، آن UpdateVariant دیگر نگه داشته نمی‌شود و runner سراغ باقی eventها می‌رود.' ),
+					array( 'setting' => 'Missing variants', 'value' => 'outofstock', 'reason' => 'از حذف ناخواسته واریانت‌ها جلوگیری می‌کند و همچنان فروش را متوقف می‌کند.' ),
+				),
+				'برای پایداری سایت، افزایش سرعت پردازش را تدریجی انجام دهید و مقدارها را متناسب با توان هاست نگه دارید.'
+			);
+			?>
 
 			<?php $this->save_button(); ?>
 		</form>
@@ -942,8 +1500,11 @@ class Mobo_Core_Admin {
 	 * @param int    $max Max.
 	 * @return void
 	 */
-	private function int_field( $label, $key, $min, $max ) {
-		$value = absint( Mobo_Core_Settings::get( $key, $min ) );
+	private function int_field( $label, $key, $min, $max, $default = null ) {
+		if ( null === $default ) {
+			$default = $min;
+		}
+		$value = absint( Mobo_Core_Settings::get( $key, $default ) );
 		?>
 		<div class="mobo-field">
 			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
@@ -990,6 +1551,157 @@ class Mobo_Core_Admin {
 	}
 
 	/**
+	 * Render a generic guide box.
+	 *
+	 * @param string $title Guide title.
+	 * @param array  $items Guide cards.
+	 * @param string $warning Optional warning.
+	 * @param array  $flow Optional ordered flow items.
+	 * @return void
+	 */
+	private function guide_box( $title, $items, $warning = '', $flow = array() ) {
+		?>
+		<div class="mobo-guide-box" aria-label="<?php echo esc_attr( $title ); ?>">
+			<div class="mobo-guide-title"><?php echo esc_html( $title ); ?></div>
+
+			<?php if ( ! empty( $items ) && is_array( $items ) ) : ?>
+				<div class="mobo-guide-summary">
+					<?php foreach ( $items as $item ) : ?>
+						<div>
+							<strong><?php echo esc_html( isset( $item['title'] ) ? (string) $item['title'] : '' ); ?></strong>
+							<span><?php echo esc_html( isset( $item['text'] ) ? (string) $item['text'] : '' ); ?></span>
+						</div>
+					<?php endforeach; ?>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( '' !== (string) $warning ) : ?>
+				<div class="mobo-guide-warning"><?php echo esc_html( $warning ); ?></div>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $flow ) && is_array( $flow ) ) : ?>
+				<div class="mobo-guide-flow">
+					<strong>ترتیب پیشنهادی کار</strong>
+					<?php foreach ( $flow as $step ) : ?>
+						<span><?php echo esc_html( (string) $step ); ?></span>
+					<?php endforeach; ?>
+				</div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+
+	/**
+	 * Render recommended settings table.
+	 *
+	 * @param string $title Box title.
+	 * @param array  $rows Recommendation rows.
+	 * @param string $note Optional note.
+	 * @return void
+	 */
+	private function recommendation_box( $title, $rows, $note = '' ) {
+		?>
+		<div class="mobo-guide-box mobo-recommendation-box" aria-label="<?php echo esc_attr( $title ); ?>">
+			<div class="mobo-guide-title"><?php echo esc_html( $title ); ?></div>
+
+			<div class="mobo-guide-table-wrap">
+				<table class="widefat mobo-guide-table">
+					<thead>
+						<tr>
+							<th>تنظیم</th>
+							<th>مقدار پیشنهادی</th>
+							<th>دلیل</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $rows as $row ) : ?>
+							<tr>
+								<td><strong><?php echo esc_html( isset( $row['setting'] ) ? (string) $row['setting'] : '' ); ?></strong></td>
+								<td><?php echo esc_html( isset( $row['value'] ) ? (string) $row['value'] : '' ); ?></td>
+								<td><?php echo esc_html( isset( $row['reason'] ) ? (string) $row['reason'] : '' ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			</div>
+
+			<?php if ( '' !== (string) $note ) : ?>
+				<div class="mobo-guide-warning"><?php echo esc_html( $note ); ?></div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render category sync guide.
+	 *
+	 * @return void
+	 */
+	private function category_sync_guide_box() {
+		?>
+		<div class="mobo-guide-box" aria-label="راهنمای تنظیمات دسته‌بندی">
+			<div class="mobo-guide-title">راهنمای رفتار تنظیمات دسته‌بندی</div>
+
+			<div class="mobo-guide-summary">
+				<div>
+					<strong>آپدیت اتوماتیک دسته‌بندی‌های محصول</strong>
+					<span>مشخص می‌کند پلاگین اجازه دارد دسته‌های جدید ووکامرس را از روی داده موبو بسازد یا نه. دسته‌های موجود به‌صورت پیش‌فرض بروزرسانی نمی‌شوند.</span>
+				</div>
+				<div>
+					<strong>نگاشت دسته‌بندی</strong>
+					<span>مستقل از ساخت خودکار دسته است. اگر «فعال بودن نگاشت دسته‌بندی» روشن باشد، پلاگین ابتدا دسته متناظر را از روی نگاشت‌های ذخیره‌شده پیدا می‌کند و محصول را روی همان دسته محلی ووکامرس قرار می‌دهد.</span>
+				</div>
+				<div>
+					<strong>دسته‌بندی پیشفرض / جایگزین</strong>
+					<span>اگر نگاشت دسته‌بندی فعال باشد اما برای دسته محصول، نگاشت معتبری پیدا نشود، پلاگین از دسته‌ای استفاده می‌کند که در گزینه «دسته‌بندی پیشفرض / جایگزین» انتخاب شده است. برای جلوگیری از این حالت، نگاشت همه دسته‌های موردنیاز را ذخیره کنید یا گزینه «اجباری بودن نگاشت دستی» را فعال کنید.</span>
+				</div>
+				<div>
+					<strong>حفاظت از دسته‌های قبلی</strong>
+					<span>اگر دسته‌ای قبلاً در ووکامرس وجود داشته باشد و با category_guid یا نگاشت شناسایی شود، پلاگین نام، slug، parent و metadata آن را تغییر نمی‌دهد؛ فقط ارتباط داخلی Mapping را حفظ می‌کند.</span>
+				</div>
+			</div>
+
+			<div class="mobo-guide-table-wrap">
+				<table class="widefat mobo-guide-table">
+					<thead>
+						<tr>
+							<th>آپدیت اتوماتیک دسته‌بندی</th>
+							<th>رفتار پلاگین</th>
+							<th>پیشنهاد استفاده</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<td><span class="mobo-pill mobo-pill-off">خاموش</span></td>
+							<td>دسته جدید ساخته نمی‌شود و دسته‌های قبلی تغییر نمی‌کنند. اگر نگاشت فعال باشد، ابتدا نگاشت دستی اعمال می‌شود؛ اگر نگاشت متناظر پیدا نشود، دسته پیشفرض / جایگزین استفاده می‌شود؛ مگر اینکه نگاشت دستی اجباری باشد.</td>
+							<td>مناسب وقتی دسته‌های سایت مشتری باید کاملاً دستی کنترل شوند.</td>
+						</tr>
+						<tr>
+							<td><span class="mobo-pill mobo-pill-on">روشن</span></td>
+							<td>اگر دسته موردنیاز در ووکامرس وجود نداشته باشد ساخته می‌شود. اگر دسته موجود باشد، بروزرسانی نمی‌شود و نام، slug، parent و متادیتای آن دست‌نخورده می‌ماند.</td>
+							<td>حالت پیشنهادی وقتی می‌خواهید دسته‌های جدید اضافه شوند ولی ساختار دسته‌های قبلی مشتری خراب نشود.</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+
+			<div class="mobo-guide-warning">
+				برای جلوگیری از رفتن محصولات روی دسته پیشفرض، اول دکمه «همگام‌سازی دسته‌بندی‌ها» را بزنید، بعد نگاشت‌ها را انتخاب و ذخیره کنید، سپس Sync محصول را اجرا کنید.
+			</div>
+
+			<div class="mobo-guide-flow">
+				<strong>ترتیب تصمیم‌گیری هنگام Sync محصول:</strong>
+				<span>۱) اگر نگاشت دستی برای دسته موبو وجود داشته باشد، همان استفاده می‌شود.</span>
+				<span>۲) اگر نگاشت نباشد و دسته sync شده معتبر باشد، همان استفاده می‌شود.</span>
+				<span>۳) اگر آپدیت اتوماتیک روشن باشد، فقط دسته جدید در صورت نیاز ساخته می‌شود.</span>
+				<span>۴) اگر نگاشت فعال باشد اما دسته متناظر پیدا نشود، دسته پیشفرض / جایگزین استفاده می‌شود؛ اگر نگاشت دستی اجباری باشد، دسته محصول تغییر نمی‌کند و GUID گمشده ثبت می‌شود.</span>
+			</div>
+		</div>
+		<?php
+	}
+
+	/**
 	 * Category mapping table.
 	 *
 	 * @return void
@@ -1015,7 +1727,7 @@ class Mobo_Core_Admin {
 		<div class="mobo-card">
 			<div class="mobo-card-head">
 				<h2>نگاشت دسته‌بندی‌های موبو به ووکامرس</h2>
-				<p>اگر دسته‌بندی‌های فروشگاه مشتری با دسته‌بندی‌های موبو فرق دارد، برای هر شناسه دسته‌بندی موبو یک دسته محلی انتخاب کنید. انتخاب نکردن یعنی استفاده از دسته همگام‌شده.</p>
+				<p>اگر دسته‌بندی‌های فروشگاه مشتری با دسته‌بندی‌های موبو فرق دارد، برای هر شناسه دسته‌بندی موبو یک دسته محلی انتخاب کنید. دکمه لود دسته‌بندی فقط این جدول را پر می‌کند و دسته جدید در ووکامرس نمی‌سازد.</p>
 			</div>
 
 			<?php if ( empty( $rows ) ) : ?>
@@ -1120,12 +1832,12 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function missing_variants_field() {
-		$value = (string) Mobo_Core_Settings::get( 'mobo_missing_variants_behavior', 'outofstock' );
+		$value = (string) Mobo_Core_Settings::get( 'mobo_core_missing_variants_behavior', 'outofstock' );
 		?>
 		<div class="mobo-field">
-			<label for="mobo_missing_variants_behavior">رفتار تنوع‌های حذف‌شده از API</label>
+			<label for="mobo_core_missing_variants_behavior">رفتار تنوع‌های حذف‌شده از API</label>
 
-			<select id="mobo_missing_variants_behavior" name="mobo_missing_variants_behavior">
+			<select id="mobo_core_missing_variants_behavior" name="mobo_core_missing_variants_behavior">
 				<option value="outofstock" <?php selected( $value, 'outofstock' ); ?>>ناموجود شود</option>
 				<option value="ignore" <?php selected( $value, 'ignore' ); ?>>تغییر نکند</option>
 			</select>
@@ -1271,36 +1983,41 @@ class Mobo_Core_Admin {
 		$percent = isset( $status['percent'] ) ? (float) $status['percent'] : 0;
 		$is_running = 'running' === $state;
 		?>
-		<div class="mobo-card">
+		<div class="mobo-card" id="mobo-reprice-status-card" data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( wp_create_nonce( 'mobo_core_reprice_status' ) ); ?>">
 			<div class="mobo-card-head">
 				<h2>اعمال مجدد سیاست قیمت‌گذاری</h2>
-				<p>قیمت خام دریافتی از .NET در meta محصولات نگهداری می‌شود. با این ابزار می‌توانید پس از تغییر سیاست سود، قیمت همه محصولات و تنوع‌های sync شده را بدون دریافت مجدد دیتا از Portal محاسبه و اعمال کنید.</p>
+				<p>قیمت خام دریافتی از سامانه در meta محصولات نگهداری می‌شود. با این ابزار می‌توانید پس از تغییر سیاست سود، قیمت همه محصولات و تنوع‌های همگام‌شده را بدون دریافت مجدد اطلاعات محصول محاسبه و اعمال کنید.</p>
 			</div>
 
 			<div class="mobo-progress-wrap">
 				<div class="mobo-progress-meta">
 					<span>پیشرفت اعمال قیمت</span>
-					<strong><?php echo esc_html( $this->format_percent( $percent ) ); ?>٪</strong>
+					<strong><span data-mobo-reprice-field="percent"><?php echo esc_html( $this->format_percent( $percent ) ); ?></span>٪</strong>
 				</div>
-				<div class="mobo-progress"><div style="width: <?php echo esc_attr( min( 100, max( 0, $percent ) ) ); ?>%;"></div></div>
+				<div class="mobo-progress"><div data-mobo-reprice-progress-bar="1" style="width: <?php echo esc_attr( min( 100, max( 0, $percent ) ) ); ?>%;"></div></div>
 			</div>
 
 			<div class="mobo-status-grid">
-				<?php $this->status_box( 'وضعیت', $this->reprice_status_label( $state ) ); ?>
-				<?php $this->status_box( 'قابل پردازش', isset( $status['total'] ) ? absint( $status['total'] ) : 0 ); ?>
-				<?php $this->status_box( 'پردازش‌شده', isset( $status['processed'] ) ? absint( $status['processed'] ) : 0 ); ?>
-				<?php $this->status_box( 'به‌روزرسانی‌شده', isset( $status['updated'] ) ? absint( $status['updated'] ) : 0 ); ?>
-				<?php $this->status_box( 'ناموفق', isset( $status['failed'] ) ? absint( $status['failed'] ) : 0 ); ?>
-				<?php $this->status_box( 'آخرین ID', isset( $status['lastPostId'] ) ? absint( $status['lastPostId'] ) : 0 ); ?>
+				<div class="mobo-status-box"><span>وضعیت</span><strong data-mobo-reprice-field="statusLabel"><?php echo esc_html( $this->reprice_status_label( $state ) ); ?></strong></div>
+				<div class="mobo-status-box"><span>قابل پردازش</span><strong data-mobo-reprice-field="total"><?php echo esc_html( isset( $status['total'] ) ? absint( $status['total'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>پردازش‌شده</span><strong data-mobo-reprice-field="processed"><?php echo esc_html( isset( $status['processed'] ) ? absint( $status['processed'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>به‌روزرسانی‌شده</span><strong data-mobo-reprice-field="updated"><?php echo esc_html( isset( $status['updated'] ) ? absint( $status['updated'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>ناموفق</span><strong data-mobo-reprice-field="failed"><?php echo esc_html( isset( $status['failed'] ) ? absint( $status['failed'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>آخرین ID</span><strong data-mobo-reprice-field="lastPostId"><?php echo esc_html( isset( $status['lastPostId'] ) ? absint( $status['lastPostId'] ) : 0 ); ?></strong></div>
 			</div>
 
-			<?php if ( ! empty( $status['lastMessage'] ) ) : ?>
-				<div class="mobo-message mobo-message-info"><?php echo esc_html( $status['lastMessage'] ); ?></div>
-			<?php endif; ?>
+			<div class="mobo-message mobo-message-info" data-mobo-reprice-message="lastMessage" style="<?php echo empty( $status['lastMessage'] ) ? 'display:none;' : ''; ?>">
+				<?php echo esc_html( isset( $status['lastMessage'] ) ? $status['lastMessage'] : '' ); ?>
+			</div>
 
-			<?php if ( ! empty( $status['lastError'] ) ) : ?>
-				<div class="mobo-message mobo-message-error"><?php echo esc_html( $status['lastError'] ); ?></div>
-			<?php endif; ?>
+			<div class="mobo-message mobo-message-error" data-mobo-reprice-message="lastError" style="<?php echo empty( $status['lastError'] ) ? 'display:none;' : ''; ?>">
+				<?php echo esc_html( isset( $status['lastError'] ) ? $status['lastError'] : '' ); ?>
+			</div>
+
+			<div class="mobo-auto-refresh">
+				<span data-mobo-reprice-refresh-state>به‌روزرسانی خودکار وضعیت قیمت‌گذاری فعال است.</span>
+				<span data-mobo-reprice-updated-at></span>
+			</div>
 
 			<div class="mobo-actions">
 				<?php if ( ! $is_running ) : ?>
@@ -1325,7 +2042,7 @@ class Mobo_Core_Admin {
 			</div>
 
 			<div class="mobo-note">
-				این عملیات محصول را از Portal دوباره دریافت نمی‌کند؛ فقط از metaهای <code>mobo_api_price</code> و <code>mobo_api_compare_price</code> استفاده می‌کند. پردازش مرحله‌ای است و توسط self-runner ادامه پیدا می‌کند.
+				این عملیات محصول را دوباره دریافت نمی‌کند؛ فقط از metaهای <code>mobo_api_price</code> و <code>mobo_api_compare_price</code> استفاده می‌کند. پردازش مرحله‌ای است و در پس‌زمینه ادامه پیدا می‌کند.
 			</div>
 		</div>
 		<?php
@@ -1348,6 +2065,149 @@ class Mobo_Core_Admin {
 			default:
 				return 'آماده';
 		}
+	}
+
+
+
+	/**
+	 * Recategorize queue UI.
+	 *
+	 * @return void
+	 */
+	private function recategorize_queue_ui() {
+		$queue      = class_exists( 'Mobo_Core_Recategorize_Queue' ) ? new Mobo_Core_Recategorize_Queue() : null;
+		$status     = $queue ? $queue->get_status() : array();
+		$state      = isset( $status['status'] ) ? (string) $status['status'] : 'idle';
+		$percent    = isset( $status['percent'] ) ? (float) $status['percent'] : 0;
+		$is_running = 'running' === $state;
+		?>
+		<div class="mobo-card" id="mobo-recategorize-status-card" data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( wp_create_nonce( 'mobo_core_recategorize_status' ) ); ?>">
+			<div class="mobo-card-head">
+				<h2>اعمال مجدد دسته‌بندی‌ها</h2>
+				<p>بعد از تغییر Mapping، با این ابزار می‌توانید دسته‌بندی محصولات منتشرشده و همگام‌شده را بر اساس نگاشت فعلی دوباره اعمال کنید؛ بدون اینکه کل محصول دوباره از سامانه دریافت شود.</p>
+			</div>
+
+			<div class="mobo-progress-wrap">
+				<div class="mobo-progress-meta">
+					<span>پیشرفت اعمال دسته‌بندی</span>
+					<strong><span data-mobo-recategorize-field="percent"><?php echo esc_html( $this->format_percent( $percent ) ); ?></span>٪</strong>
+				</div>
+				<div class="mobo-progress"><div data-mobo-recategorize-progress-bar="1" style="width: <?php echo esc_attr( min( 100, max( 0, $percent ) ) ); ?>%;"></div></div>
+			</div>
+
+			<div class="mobo-status-grid">
+				<div class="mobo-status-box"><span>وضعیت</span><strong data-mobo-recategorize-field="statusLabel"><?php echo esc_html( $this->recategorize_status_label( $state ) ); ?></strong></div>
+				<div class="mobo-status-box"><span>قابل پردازش</span><strong data-mobo-recategorize-field="total"><?php echo esc_html( isset( $status['total'] ) ? absint( $status['total'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>پردازش‌شده</span><strong data-mobo-recategorize-field="processed"><?php echo esc_html( isset( $status['processed'] ) ? absint( $status['processed'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>تغییرکرده</span><strong data-mobo-recategorize-field="updated"><?php echo esc_html( isset( $status['updated'] ) ? absint( $status['updated'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>ردشده/بدون تغییر</span><strong data-mobo-recategorize-field="skipped"><?php echo esc_html( isset( $status['skipped'] ) ? absint( $status['skipped'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>ناموفق</span><strong data-mobo-recategorize-field="failed"><?php echo esc_html( isset( $status['failed'] ) ? absint( $status['failed'] ) : 0 ); ?></strong></div>
+				<div class="mobo-status-box"><span>آخرین ID</span><strong data-mobo-recategorize-field="lastPostId"><?php echo esc_html( isset( $status['lastPostId'] ) ? absint( $status['lastPostId'] ) : 0 ); ?></strong></div>
+			</div>
+
+			<div class="mobo-message mobo-message-info" data-mobo-recategorize-message="lastMessage" style="<?php echo empty( $status['lastMessage'] ) ? 'display:none;' : ''; ?>">
+				<?php echo esc_html( isset( $status['lastMessage'] ) ? $status['lastMessage'] : '' ); ?>
+			</div>
+
+			<div class="mobo-message mobo-message-error" data-mobo-recategorize-message="lastError" style="<?php echo empty( $status['lastError'] ) ? 'display:none;' : ''; ?>">
+				<?php echo esc_html( isset( $status['lastError'] ) ? $status['lastError'] : '' ); ?>
+			</div>
+
+			<div class="mobo-auto-refresh">
+				<span data-mobo-recategorize-refresh-state>به‌روزرسانی خودکار وضعیت دسته‌بندی فعال است.</span>
+				<span data-mobo-recategorize-updated-at></span>
+			</div>
+
+			<div class="mobo-actions">
+				<?php if ( ! $is_running ) : ?>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<input type="hidden" name="action" value="mobo_core_start_recategorize">
+						<?php wp_nonce_field( 'mobo_core_start_recategorize', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="mobo-btn mobo-btn-primary">اعمال مجدد دسته‌بندی روی محصولات منتشرشده</button>
+					</form>
+				<?php else : ?>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<input type="hidden" name="action" value="mobo_core_cancel_recategorize">
+						<?php wp_nonce_field( 'mobo_core_cancel_recategorize', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="mobo-btn mobo-btn-danger">توقف اعمال دسته‌بندی</button>
+					</form>
+				<?php endif; ?>
+
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+					<input type="hidden" name="action" value="mobo_core_reset_recategorize">
+					<?php wp_nonce_field( 'mobo_core_reset_recategorize', 'mobo_core_nonce' ); ?>
+					<button type="submit" class="mobo-btn mobo-btn-light">پاک کردن وضعیت</button>
+				</form>
+			</div>
+
+			<div class="mobo-note">
+				این ابزار فقط روی محصولات اصلی <strong>publish</strong> که قبلاً همگام‌سازی شده‌اند کار می‌کند. واریانت‌ها جداگانه دسته‌بندی نمی‌شوند. اگر محصولی دسته‌های منبع ذخیره‌شده نداشته باشد، پلاگین تلاش می‌کند آن را از آخرین رویداد محصول بازیابی کند؛ در غیر این صورت آن محصول رد می‌شود.
+			</div>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Recategorize status label.
+	 *
+	 * @param string $status Status.
+	 * @return string
+	 */
+	private function recategorize_status_label( $status ) {
+		switch ( (string) $status ) {
+			case 'running':
+				return 'در حال اعمال دسته‌بندی';
+			case 'done':
+				return 'کامل شده';
+			case 'cancelled':
+				return 'متوقف شده';
+			default:
+				return 'آماده';
+		}
+	}
+
+
+	/**
+	 * Text field.
+	 *
+	 * @param string $label Label.
+	 * @param string $key Option key.
+	 * @param string $help Help text.
+	 * @return void
+	 */
+	private function text_field( $label, $key, $help = '' ) {
+		$value = (string) Mobo_Core_Settings::get( $key, '' );
+		?>
+		<div class="mobo-field">
+			<label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
+			<input
+				type="text"
+				id="<?php echo esc_attr( $key ); ?>"
+				name="<?php echo esc_attr( $key ); ?>"
+				value="<?php echo esc_attr( $value ); ?>"
+				dir="ltr"
+			>
+			<?php if ( '' !== $help ) : ?>
+				<div class="mobo-help"><?php echo esc_html( $help ); ?></div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Readonly text field.
+	 *
+	 * @param string $label Label.
+	 * @param string $value Value.
+	 * @return void
+	 */
+	private function readonly_field( $label, $value ) {
+		?>
+		<div class="mobo-field mobo-field-full">
+			<label><?php echo esc_html( $label ); ?></label>
+			<input type="text" readonly dir="ltr" value="<?php echo esc_attr( (string) $value ); ?>" onclick="this.select();">
+		</div>
+		<?php
 	}
 
 	/**
@@ -1464,7 +2324,12 @@ class Mobo_Core_Admin {
 			'mobo_core_checkout_require_remote_guid',
 			'mobo_core_checkout_block_incomplete_sync',
 			'mobo_core_checkout_local_stock_check_enabled',
+			'mobo_core_checkout_mobo_cart_validation_enabled',
+			'mobo_core_checkout_mobo_debug_enabled',
+			'mobo_core_mobo_order_submission_enabled',
+			'mobo_core_mobo_order_auto_complete_enabled',
 			'mobo_core_checkout_external_validation_enabled',
+			'mobo_core_address_mapping_enabled',
 		);
 
 		foreach ( $bool_options as $key ) {
@@ -1472,6 +2337,11 @@ class Mobo_Core_Admin {
 				update_option( $key, $this->sanitize_bool_value( wp_unslash( $_POST[ $key ] ) ), false );
 			}
 		}
+
+		/* Hard-forced checkout safety rules; these are no longer optional UI settings. */
+		update_option( 'mobo_core_checkout_validate_only_mobo_products', '1', false );
+		update_option( 'mobo_core_checkout_require_remote_guid', '1', false );
+		update_option( 'mobo_core_checkout_block_incomplete_sync', '1', false );
 
 		$int_options = array(
 			'mobo_default_category_id'        => array( 0, PHP_INT_MAX ),
@@ -1484,14 +2354,21 @@ class Mobo_Core_Admin {
 			'mobo_core_webhook_files_per_run'=> array( 1, 10 ),
 			'mobo_core_webhook_max_try'      => array( 1, 20 ),
 			'mobo_core_webhook_expire_days'  => array( 1, 30 ),
+			'mobo_core_variant_parent_wait_timeout_seconds' => array( 60, 86400 ),
 			'mobo_core_real_cron_time_budget_seconds' => array( 5, 55 ),
 			'mobo_core_real_cron_max_sync_steps' => array( 1, 20 ),
 			'mobo_core_real_cron_lock_ttl_seconds' => array( 30, 600 ),
+			'mobo_core_real_cron_expected_interval_seconds' => array( 60, 3600 ),
 			'mobo_core_self_runner_min_interval_seconds' => array( 0, 60 ),
 			'mobo_core_self_runner_http_timeout_seconds' => array( 1, 10 ),
 			'mobo_core_health_report_min_interval_seconds' => array( 60, 3600 ),
 			'mobo_core_health_report_timeout_seconds' => array( 5, 60 ),
+			'mobo_core_checkout_mobo_timeout_seconds' => array( 2, 20 ),
+			'mobo_core_checkout_mobo_cart_lock_wait_seconds' => array( 0, 45 ),
+			'mobo_core_checkout_mobo_cart_lock_ttl_seconds' => array( 15, 300 ),
+			'mobo_core_mobo_order_shipping_id' => array( 1, 2147483647 ),
 			'mobo_core_checkout_external_timeout_seconds' => array( 1, 10 ),
+			'mobo_core_address_mapping_sync_interval_days' => array( 1, 30 ),
 			'global_additional_price'        => array( 0, PHP_INT_MAX ),
 		);
 
@@ -1521,14 +2398,14 @@ class Mobo_Core_Admin {
 			update_option( 'mobo_price_type', $price_type, false );
 		}
 
-		if ( isset( $_POST['mobo_missing_variants_behavior'] ) ) {
-			$behavior = sanitize_key( wp_unslash( $_POST['mobo_missing_variants_behavior'] ) );
+		if ( isset( $_POST['mobo_core_missing_variants_behavior'] ) ) {
+			$behavior = sanitize_key( wp_unslash( $_POST['mobo_core_missing_variants_behavior'] ) );
 
 			if ( ! in_array( $behavior, array( 'outofstock', 'ignore' ), true ) ) {
 				$behavior = 'outofstock';
 			}
 
-			update_option( 'mobo_missing_variants_behavior', $behavior, false );
+			update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
 		}
 
 		if ( isset( $_POST['mobo_core_excluded_product_urls'] ) ) {
@@ -1576,6 +2453,41 @@ class Mobo_Core_Admin {
 			);
 		}
 
+		update_option( 'mobo_core_checkout_mobo_site_url', 'https://mobomobo.ir', false );
+
+		if ( isset( $_POST['mobo_core_checkout_mobo_username'] ) ) {
+			update_option(
+				'mobo_core_checkout_mobo_username',
+				sanitize_text_field( wp_unslash( $_POST['mobo_core_checkout_mobo_username'] ) ),
+				false
+			);
+		}
+
+		if ( isset( $_POST['mobo_core_checkout_mobo_password'] ) ) {
+			$mobo_password = (string) wp_unslash( $_POST['mobo_core_checkout_mobo_password'] );
+
+			if ( '' !== $mobo_password ) {
+				update_option( 'mobo_core_checkout_mobo_password', sanitize_text_field( $mobo_password ), false );
+				delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
+			}
+		}
+
+		if ( isset( $_POST['mobo_core_mobo_order_sender_name'] ) ) {
+			update_option(
+				'mobo_core_mobo_order_sender_name',
+				sanitize_text_field( wp_unslash( $_POST['mobo_core_mobo_order_sender_name'] ) ),
+				false
+			);
+		}
+
+		if ( isset( $_POST['mobo_core_mobo_order_sender_mobile'] ) ) {
+			update_option(
+				'mobo_core_mobo_order_sender_mobile',
+				sanitize_text_field( wp_unslash( $_POST['mobo_core_mobo_order_sender_mobile'] ) ),
+				false
+			);
+		}
+
 		if ( isset( $_POST['mobo_core_checkout_external_validation_url'] ) ) {
 			update_option(
 				'mobo_core_checkout_external_validation_url',
@@ -1613,6 +2525,73 @@ class Mobo_Core_Admin {
 
 		$this->save_dynamic_price_rules();
 
+		if ( isset( $_POST['mobo_core_clear_mobo_debug_log'] ) && 'checkout' === $tab ) {
+			if ( class_exists( 'Mobo_Core_Checkout_Validator' ) ) {
+				$validator = new Mobo_Core_Checkout_Validator();
+				if ( method_exists( $validator, 'clear_mobo_debug_log' ) ) {
+					$validator->clear_mobo_debug_log();
+				}
+			}
+
+			$this->redirect_with_message( 'لاگ دیباگ سبد موبو پاک شد.', 'success', 'checkout' );
+		}
+
+
+		if ( isset( $_POST['mobo_core_sync_address_mapping'] ) && 'checkout' === $tab ) {
+			if ( ! class_exists( 'Mobo_Core_Address_Mapping' ) ) {
+				$this->redirect_with_message( 'کلاس بروزرسانی آدرس‌ها در دسترس نیست.', 'error', 'checkout' );
+			}
+
+			$address_mapping = new Mobo_Core_Address_Mapping();
+			$result = $address_mapping->sync_now( 'manual', true );
+
+			if ( empty( $result['success'] ) ) {
+				$message = isset( $result['message'] ) ? $result['message'] : 'بروزرسانی آدرس‌ها ناموفق بود.';
+				$this->redirect_with_message( 'بروزرسانی آدرس‌ها ناموفق بود: ' . $message, 'error', 'checkout' );
+			}
+
+			$this->redirect_with_message( 'کشور، استان و شهرها از پرتال بروزرسانی شدند.', 'success', 'checkout' );
+		}
+
+		if ( isset( $_POST['mobo_core_test_mobo_login'] ) && 'checkout' === $tab ) {
+			if ( ! class_exists( 'Mobo_Core_Checkout_Validator' ) ) {
+				$this->redirect_with_message( 'کلاس اعتبارسنجی خرید در دسترس نیست.', 'error', 'checkout' );
+			}
+
+			$validator = new Mobo_Core_Checkout_Validator();
+			$result    = $validator->test_mobo_login();
+
+			if ( is_wp_error( $result ) ) {
+				$this->redirect_with_message( 'تست ورود ناموفق بود: ' . $result->get_error_message(), 'error', 'checkout' );
+			}
+
+			$this->redirect_with_message( 'تست ورود به موبو موفق بود.', 'success', 'checkout' );
+		}
+
+		if ( isset( $_POST['mobo_core_run_cron_now'] ) && 'cron' === $tab ) {
+			if ( ! class_exists( 'Mobo_Core_Cron_Runner' ) ) {
+				$this->redirect_with_message( 'کلاس Cron Runner در دسترس نیست.', 'error', 'cron' );
+			}
+
+			$runner = new Mobo_Core_Cron_Runner();
+			$result = $runner->run( 'admin-manual-cron-test' );
+			$webhook_processed = 0;
+			$webhook_failed    = 0;
+
+			if ( is_array( $result ) && isset( $result['webhookQueue'] ) && is_array( $result['webhookQueue'] ) ) {
+				$webhook_processed = isset( $result['webhookQueue']['processed'] ) ? absint( $result['webhookQueue']['processed'] ) : 0;
+				$webhook_failed    = isset( $result['webhookQueue']['failed'] ) ? absint( $result['webhookQueue']['failed'] ) : 0;
+			}
+
+			$message = sprintf(
+				'تست Cron اجرا شد. وب‌هوک پردازش‌شده: %d، خطا: %d. جزئیات در آخرین نتیجه Cron ثبت شد.',
+				$webhook_processed,
+				$webhook_failed
+			);
+
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'cron' );
+		}
+
 		$this->redirect_with_message( 'تنظیمات ذخیره شد.', 'success', $tab );
 	}
 
@@ -1635,10 +2614,128 @@ class Mobo_Core_Admin {
 			Mobo_Core_Self_Runner::kick( 'admin-waiting-for-portal-resume', true );
 		}
 
+		/*
+		 * The admin page polls this endpoint every few seconds. If the non-blocking
+		 * self-runner/loopback request is blocked by hosting, SSL, firewall, or REST
+		 * routing, the visible sync status can stay on the last successful message
+		 * such as "UpdateVariant processed." without showing an error.
+		 *
+		 * As a safe fallback, when a running sync has made no progress for a short
+		 * period, the authenticated admin poll advances exactly one manual-sync step.
+		 * This keeps the UI moving without creating parallel workers.
+		 */
+		if ( ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
+			$updated_at = isset( $status['updatedAt'] ) ? absint( $status['updatedAt'] ) : 0;
+			$is_stale   = $updated_at > 0 && ( time() - $updated_at ) >= 8;
+
+			if ( $is_stale && class_exists( 'Mobo_Core_Lock' ) ) {
+				$step_lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
+
+				if ( false !== $step_lock ) {
+					try {
+						$product_sync->run_manual_sync_step();
+					} finally {
+						Mobo_Core_Lock::release( 'manual_sync', $step_lock );
+					}
+
+					$status = $product_sync->get_manual_sync_status();
+				}
+			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-status-continue', false );
+			}
+		}
+
+		/*
+		 * Product sync no longer blocks on images, otherwise one slow/bad source image
+		 * can freeze the whole import. That means product rows may appear before their
+		 * images are attached. While the admin sync page is open, process a small,
+		 * bounded image-queue slice on every status poll so pending images continue
+		 * moving even on hosts where real cron/loopback is unreliable.
+		 */
+		if ( class_exists( 'Mobo_Core_Image_Sync' ) ) {
+			$image_sync          = new Mobo_Core_Image_Sync();
+			$image_queue_before  = $image_sync->get_queue_status();
+			$image_poll_limit    = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
+			$image_queue_result  = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped' );
+
+			if ( ! empty( $image_queue_before['due'] ) ) {
+				$image_queue_result = $image_sync->process_queue( $image_poll_limit );
+			}
+
+			$status['imageQueue'] = array(
+				'before'   => $image_queue_before,
+				'after'    => $image_sync->get_queue_status(),
+				'lastRun'  => $image_queue_result,
+				'pollLimit'=> $image_poll_limit,
+			);
+		}
+
 		$status['statusLabel']          = $this->status_label( $status['status'] );
 		$status['progressPercentLabel'] = $this->format_percent( $status['progressPercent'] );
 		$status['nextRetryAtLabel']     = ! empty( $status['nextRetryAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—';
 		$status['serverTime']           = wp_date( 'Y-m-d H:i:s' );
+
+		wp_send_json_success( $status );
+	}
+
+	/**
+	 * Return current repricing status for AJAX polling on the pricing tab.
+	 *
+	 * @return void
+	 */
+	public function handle_ajax_reprice_status() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => 'Forbidden.' ), 403 );
+		}
+
+		check_ajax_referer( 'mobo_core_reprice_status', 'nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			wp_send_json_error( array( 'message' => 'صف اعمال مجدد قیمت در دسترس نیست.' ), 500 );
+		}
+
+		$queue  = new Mobo_Core_Reprice_Queue();
+		$status = $queue->get_status();
+
+		if ( ! empty( $status['shouldContinue'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::kick( 'admin-reprice-status', false );
+		}
+
+		$status['statusLabel']  = $this->reprice_status_label( isset( $status['status'] ) ? $status['status'] : 'idle' );
+		$status['percentLabel'] = $this->format_percent( isset( $status['percent'] ) ? (float) $status['percent'] : 0 );
+		$status['serverTime']   = wp_date( 'Y-m-d H:i:s' );
+
+		wp_send_json_success( $status );
+	}
+
+
+
+	/**
+	 * Return current recategorize status for AJAX polling on the categories tab.
+	 *
+	 * @return void
+	 */
+	public function handle_ajax_recategorize_status() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => 'Forbidden.' ), 403 );
+		}
+
+		check_ajax_referer( 'mobo_core_recategorize_status', 'nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			wp_send_json_error( array( 'message' => 'صف اعمال مجدد دسته‌بندی در دسترس نیست.' ), 500 );
+		}
+
+		$queue  = new Mobo_Core_Recategorize_Queue();
+		$status = $queue->get_status();
+
+		if ( ! empty( $status['shouldContinue'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::kick( 'admin-recategorize-status', false );
+		}
+
+		$status['statusLabel']  = $this->recategorize_status_label( isset( $status['status'] ) ? $status['status'] : 'idle' );
+		$status['percentLabel'] = $this->format_percent( isset( $status['percent'] ) ? (float) $status['percent'] : 0 );
+		$status['serverTime']   = wp_date( 'Y-m-d H:i:s' );
 
 		wp_send_json_success( $status );
 	}
@@ -1656,15 +2753,15 @@ class Mobo_Core_Admin {
 		check_admin_referer( 'mobo_core_sync_categories', 'mobo_core_nonce' );
 
 		$product_sync = new Mobo_Core_Product_Sync();
-		$result       = $product_sync->ensure_categories_synced_if_due( '', true );
+		$result       = $product_sync->preload_categories_for_mapping( '' );
 
 		$type    = ! empty( $result['success'] ) ? 'success' : 'error';
-		$message = isset( $result['message'] ) ? $result['message'] : 'عملیات همگام‌سازی دسته‌بندی انجام شد.';
+		$message = isset( $result['message'] ) ? $result['message'] : 'دسته‌بندی‌ها برای نگاشت لود شدند.';
 
 		if ( ! empty( $result['data'] ) && is_array( $result['data'] ) && ! empty( $result['data']['synced'] ) ) {
 			$created = isset( $result['data']['created'] ) ? absint( $result['data']['created'] ) : 0;
 			$updated = isset( $result['data']['updated'] ) ? absint( $result['data']['updated'] ) : 0;
-			$message .= ' ایجادشده: ' . $created . '، بروزرسانی‌شده: ' . $updated . '.';
+			$message .= ' ردیف نگاشت جدید: ' . $created . '، ردیف بروزرسانی‌شده: ' . $updated . '.';
 		}
 
 		$this->redirect_with_message( $message, $type, 'categories' );
@@ -1764,6 +2861,189 @@ class Mobo_Core_Admin {
 		$product_sync->reset_manual_sync_state();
 
 		$this->redirect_with_message( 'وضعیت همگام‌سازی پاک شد.', 'success', 'dashboard' );
+	}
+
+	/**
+	 * Start repricing all synced WooCommerce products/variations.
+	 *
+	 * @return void
+	 */
+	public function handle_start_reprice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_start_reprice', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$queue  = new Mobo_Core_Reprice_Queue();
+			$result = $queue->start( 'admin' );
+
+			/*
+			 * Wake the bounded local worker. If loopback is disabled, the real cron
+			 * will continue the queue and the UI still shows the queued state instead
+			 * of throwing a fatal admin-post error.
+			 */
+			if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-reprice-start', true );
+			}
+
+			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد سیاست قیمت‌گذاری شروع شد.';
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core reprice start failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'شروع اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+	/**
+	 * Cancel current repricing run.
+	 *
+	 * @return void
+	 */
+	public function handle_cancel_reprice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_cancel_reprice', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$queue  = new Mobo_Core_Reprice_Queue();
+			$result = $queue->cancel();
+			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد قیمت متوقف شد.';
+
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core reprice cancel failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'توقف اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+	/**
+	 * Reset repricing status.
+	 *
+	 * @return void
+	 */
+	public function handle_reset_reprice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_reset_reprice', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$queue  = new Mobo_Core_Reprice_Queue();
+			$result = $queue->reset();
+			$message = isset( $result['message'] ) ? $result['message'] : 'وضعیت اعمال مجدد قیمت پاک شد.';
+
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core reprice reset failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'پاک کردن وضعیت اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+
+
+	/**
+	 * Start applying current category mapping to published synced products.
+	 *
+	 * @return void
+	 */
+	public function handle_start_recategorize() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_start_recategorize', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد دسته‌بندی در دسترس نیست.', 'error', 'categories' );
+		}
+
+		try {
+			$queue  = new Mobo_Core_Recategorize_Queue();
+			$result = $queue->start( 'admin' );
+
+			if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-recategorize-start', true );
+			}
+
+			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد دسته‌بندی‌ها شروع شد.';
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core recategorize start failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'شروع اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
+		}
+	}
+
+	/**
+	 * Cancel current category reapply run.
+	 *
+	 * @return void
+	 */
+	public function handle_cancel_recategorize() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_cancel_recategorize', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد دسته‌بندی در دسترس نیست.', 'error', 'categories' );
+		}
+
+		try {
+			$queue   = new Mobo_Core_Recategorize_Queue();
+			$result  = $queue->cancel();
+			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد دسته‌بندی متوقف شد.';
+
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core recategorize cancel failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'توقف اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
+		}
+	}
+
+	/**
+	 * Reset category reapply state.
+	 *
+	 * @return void
+	 */
+	public function handle_reset_recategorize() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_reset_recategorize', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد دسته‌بندی در دسترس نیست.', 'error', 'categories' );
+		}
+
+		try {
+			$queue   = new Mobo_Core_Recategorize_Queue();
+			$result  = $queue->reset();
+			$message = isset( $result['message'] ) ? $result['message'] : 'وضعیت اعمال مجدد دسته‌بندی پاک شد.';
+
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
+		} catch ( Throwable $e ) {
+			error_log( 'Mobo Core recategorize reset failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'پاک کردن وضعیت اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
+		}
 	}
 
 	/**
@@ -2059,6 +3339,13 @@ class Mobo_Core_Admin {
 					$(this).closest('.mobo-dynamic-row').remove();
 				});
 
+				$(document).on('submit', '[data-mobo-cancel-sync-form]', function() {
+					var $button = $(this).find('[data-mobo-cancel-sync-button]');
+					$button.prop('disabled', true).text('در حال توقف...');
+					$('[data-mobo-sync-refresh-state]').text('درخواست توقف ثبت شد...');
+				});
+
+
 				function initSyncStatusAutoRefresh() {
 					var $card = $('#mobo-sync-status-card');
 
@@ -2145,10 +3432,169 @@ class Mobo_Core_Admin {
 				}
 
 
+				function initRepriceStatusAutoRefresh() {
+					var $card = $('#mobo-reprice-status-card');
+
+					if (! $card.length) {
+						return;
+					}
+
+					var ajaxUrl = $card.data('ajax-url');
+					var nonce = $card.data('nonce');
+					var busy = false;
+
+					function setRepriceMessage(name, value) {
+						var $message = $('[data-mobo-reprice-message="' + name + '"]');
+						value = value || '';
+
+						if (! $message.length) {
+							return;
+						}
+
+						$message.text(value);
+						if (value === '') {
+							$message.hide();
+						} else {
+							$message.show();
+						}
+					}
+
+					function applyRepriceStatus(status) {
+						if (! status) {
+							return;
+						}
+
+						var percent = parseFloat(status.percent || 0);
+						percent = Math.max(0, Math.min(100, isNaN(percent) ? 0 : percent));
+
+						$('[data-mobo-reprice-field="percent"]').text(status.percentLabel || percent);
+						$('[data-mobo-reprice-progress-bar]').css('width', percent + '%');
+						$('[data-mobo-reprice-field="statusLabel"]').text(status.statusLabel || status.status || '—');
+						$('[data-mobo-reprice-field="total"]').text(status.total || 0);
+						$('[data-mobo-reprice-field="processed"]').text(status.processed || 0);
+						$('[data-mobo-reprice-field="updated"]').text(status.updated || 0);
+						$('[data-mobo-reprice-field="failed"]').text(status.failed || 0);
+						$('[data-mobo-reprice-field="lastPostId"]').text(status.lastPostId || 0);
+						setRepriceMessage('lastMessage', status.lastMessage || '');
+						setRepriceMessage('lastError', status.lastError || '');
+						$('[data-mobo-reprice-updated-at]').text(status.serverTime ? 'آخرین بررسی: ' + status.serverTime : '');
+					}
+
+					function refreshRepriceStatus() {
+						if (busy) {
+							return;
+						}
+
+						busy = true;
+						$('[data-mobo-reprice-refresh-state]').text('در حال دریافت وضعیت قیمت‌گذاری...');
+
+						$.post(ajaxUrl, {
+							action: 'mobo_core_get_reprice_status',
+							nonce: nonce
+						}).done(function(response) {
+							if (response && response.success) {
+								applyRepriceStatus(response.data);
+								$('[data-mobo-reprice-refresh-state]').text('به‌روزرسانی خودکار وضعیت قیمت‌گذاری فعال است.');
+							} else {
+								$('[data-mobo-reprice-refresh-state]').text('خطا در دریافت وضعیت قیمت‌گذاری.');
+							}
+						}).fail(function() {
+							$('[data-mobo-reprice-refresh-state]').text('خطا در دریافت وضعیت قیمت‌گذاری.');
+						}).always(function() {
+							busy = false;
+						});
+					}
+
+					refreshRepriceStatus();
+					window.setInterval(refreshRepriceStatus, 3000);
+				}
+
+
+				function initRecategorizeStatusAutoRefresh() {
+					var $card = $('#mobo-recategorize-status-card');
+
+					if (! $card.length) {
+						return;
+					}
+
+					var ajaxUrl = $card.data('ajax-url');
+					var nonce = $card.data('nonce');
+					var busy = false;
+
+					function setRecategorizeMessage(name, value) {
+						var $message = $('[data-mobo-recategorize-message="' + name + '"]');
+						value = value || '';
+
+						if (! $message.length) {
+							return;
+						}
+
+						$message.text(value);
+						if (value === '') {
+							$message.hide();
+						} else {
+							$message.show();
+						}
+					}
+
+					function applyRecategorizeStatus(status) {
+						if (! status) {
+							return;
+						}
+
+						var percent = parseFloat(status.percent || 0);
+						percent = Math.max(0, Math.min(100, isNaN(percent) ? 0 : percent));
+
+						$('[data-mobo-recategorize-field="percent"]').text(status.percentLabel || percent);
+						$('[data-mobo-recategorize-progress-bar]').css('width', percent + '%');
+						$('[data-mobo-recategorize-field="statusLabel"]').text(status.statusLabel || status.status || '—');
+						$('[data-mobo-recategorize-field="total"]').text(status.total || 0);
+						$('[data-mobo-recategorize-field="processed"]').text(status.processed || 0);
+						$('[data-mobo-recategorize-field="updated"]').text(status.updated || 0);
+						$('[data-mobo-recategorize-field="skipped"]').text(status.skipped || 0);
+						$('[data-mobo-recategorize-field="failed"]').text(status.failed || 0);
+						$('[data-mobo-recategorize-field="lastPostId"]').text(status.lastPostId || 0);
+						setRecategorizeMessage('lastMessage', status.lastMessage || '');
+						setRecategorizeMessage('lastError', status.lastError || '');
+						$('[data-mobo-recategorize-updated-at]').text(status.serverTime ? 'آخرین بررسی: ' + status.serverTime : '');
+					}
+
+					function refreshRecategorizeStatus() {
+						if (busy) {
+							return;
+						}
+
+						busy = true;
+						$('[data-mobo-recategorize-refresh-state]').text('در حال دریافت وضعیت دسته‌بندی...');
+
+						$.post(ajaxUrl, {
+							action: 'mobo_core_get_recategorize_status',
+							nonce: nonce
+						}).done(function(response) {
+							if (response && response.success) {
+								applyRecategorizeStatus(response.data);
+								$('[data-mobo-recategorize-refresh-state]').text('به‌روزرسانی خودکار وضعیت دسته‌بندی فعال است.');
+							} else {
+								$('[data-mobo-recategorize-refresh-state]').text('خطا در دریافت وضعیت دسته‌بندی.');
+							}
+						}).fail(function() {
+							$('[data-mobo-recategorize-refresh-state]').text('خطا در دریافت وضعیت دسته‌بندی.');
+						}).always(function() {
+							busy = false;
+						});
+					}
+
+					refreshRecategorizeStatus();
+					window.setInterval(refreshRecategorizeStatus, 3000);
+				}
+
+
 				initCategorySelect2();
 				switchPriceSection();
 				updateAllPricePreviews();
 				initSyncStatusAutoRefresh();
+				initRepriceStatusAutoRefresh();
+				initRecategorizeStatusAutoRefresh();
 			});
 		</script>
 		<?php
@@ -2388,6 +3834,113 @@ class Mobo_Core_Admin {
 				line-height: 1.9;
 			}
 
+			.mobo-guide-box {
+				margin-top: 16px;
+				border: 1px solid #bfdbfe;
+				background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+				border-radius: 18px;
+				padding: 16px;
+			}
+
+			.mobo-guide-title {
+				font-size: 15px;
+				font-weight: 900;
+				color: #1e3a8a;
+				margin-bottom: 12px;
+			}
+
+			.mobo-guide-summary {
+				display: grid;
+				grid-template-columns: repeat(3, minmax(0, 1fr));
+				gap: 10px;
+				margin-bottom: 14px;
+			}
+
+			.mobo-guide-summary div {
+				background: #fff;
+				border: 1px solid #dbeafe;
+				border-radius: 14px;
+				padding: 11px 12px;
+			}
+
+			.mobo-guide-summary strong {
+				display: block;
+				font-size: 13px;
+				font-weight: 900;
+				color: #0f172a;
+				margin-bottom: 5px;
+			}
+
+			.mobo-guide-summary span,
+			.mobo-guide-flow span {
+				display: block;
+				font-size: 12px;
+				line-height: 1.85;
+				color: #475569;
+			}
+
+			.mobo-guide-table-wrap {
+				overflow-x: auto;
+				margin-top: 12px;
+			}
+
+			.mobo-guide-table th {
+				font-weight: 900;
+				color: #0f172a;
+			}
+
+			.mobo-guide-table td {
+				vertical-align: top;
+				line-height: 1.9;
+				font-size: 12px;
+			}
+
+			.mobo-pill {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				border-radius: 999px;
+				padding: 3px 9px;
+				font-size: 11px;
+				font-weight: 900;
+			}
+
+			.mobo-pill-on {
+				background: #dcfce7;
+				color: #166534;
+			}
+
+			.mobo-pill-off {
+				background: #fee2e2;
+				color: #991b1b;
+			}
+
+			.mobo-guide-flow {
+				margin-top: 14px;
+				background: #fff;
+				border: 1px solid #e0f2fe;
+				border-radius: 14px;
+				padding: 12px 14px;
+			}
+
+			.mobo-guide-flow strong {
+				display: block;
+				margin-bottom: 6px;
+				color: #075985;
+			}
+
+			.mobo-guide-warning {
+				margin-top: 12px;
+				background: #fffbeb;
+				border: 1px solid #fde68a;
+				border-radius: 14px;
+				padding: 11px 12px;
+				color: #92400e;
+				font-size: 12px;
+				font-weight: 800;
+				line-height: 1.85;
+			}
+
 			.mobo-save-row {
 				margin-top: 16px;
 				display: flex;
@@ -2623,7 +4176,8 @@ class Mobo_Core_Admin {
 
 				.mobo-fields-grid,
 				.mobo-status-grid,
-				.mobo-price-types {
+				.mobo-price-types,
+				.mobo-guide-summary {
 					grid-template-columns: 1fr;
 				}
 

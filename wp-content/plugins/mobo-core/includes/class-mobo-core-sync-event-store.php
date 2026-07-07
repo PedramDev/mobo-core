@@ -108,6 +108,22 @@ class Mobo_Core_Sync_Event_Store {
 			return new WP_Error( 'mobo_core_event_type_missing', 'Webhook event is missing.' );
 		}
 
+		$entity_type = sanitize_key( (string) $normalized['entityType'] );
+		$entity_guid = sanitize_text_field( (string) $normalized['entityGuid'] );
+
+		if ( 'UpdateVariant' === $event_type ) {
+			$variant_guids        = $this->extract_update_variant_variant_guids( $payload );
+			$variant_product_guid = $this->extract_update_variant_product_guid( $payload );
+
+			if ( 1 === count( $variant_guids ) ) {
+				$entity_type = 'variant';
+				$entity_guid = $variant_guids[0];
+			} elseif ( '' !== $variant_product_guid ) {
+				$entity_type = 'product';
+				$entity_guid = $variant_product_guid;
+			}
+		}
+
 		$payload_json = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 
 		if ( false === $payload_json ) {
@@ -116,6 +132,23 @@ class Mobo_Core_Sync_Event_Store {
 
 		$remote_event_id = sanitize_text_field( (string) $normalized['remoteEventId'] );
 		$table           = self::table_name();
+
+		if ( 'UpdateVariant' === $event_type ) {
+			$variant_identity_key = $this->build_update_variant_identity_key( $payload );
+
+			if ( '' !== $remote_event_id && '' !== $variant_identity_key ) {
+				/*
+				 * Some senders reuse the same remote event id for multiple variant
+				 * changes of the same parent product. Keep idempotency for identical
+				 * retries, but do not collapse different variant GUIDs into one row.
+				 */
+				$remote_event_id = 'remote:updatevariant:' . md5( $remote_event_id . '|' . $variant_identity_key );
+			}
+		}
+
+		if ( '' === $remote_event_id ) {
+			$remote_event_id = $this->build_local_dedupe_id( $event_type, $payload, sanitize_text_field( (string) $normalized['syncId'] ), $entity_type, $entity_guid );
+		}
 
 		if ( '' !== $remote_event_id ) {
 			$existing = $wpdb->get_var(
@@ -139,8 +172,8 @@ class Mobo_Core_Sync_Event_Store {
 				'event_uuid'       => wp_generate_uuid4(),
 				'remote_event_id'  => $remote_event_id,
 				'event_type'       => $event_type,
-				'entity_type'      => sanitize_key( (string) $normalized['entityType'] ),
-				'entity_guid'      => sanitize_text_field( (string) $normalized['entityGuid'] ),
+				'entity_type'      => $entity_type,
+				'entity_guid'      => $entity_guid,
 				'sync_id'          => sanitize_text_field( (string) $normalized['syncId'] ),
 				'event_version'    => sanitize_text_field( (string) $normalized['version'] ),
 				'status'           => 'pending',
@@ -195,7 +228,7 @@ class Mobo_Core_Sync_Event_Store {
 					AND locked_until IS NOT NULL
 					AND locked_until < %s
 				)
-				ORDER BY id ASC
+				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
 				LIMIT %d",
 				$now,
 				$now,
@@ -291,6 +324,109 @@ class Mobo_Core_Sync_Event_Store {
 	}
 
 	/**
+	 * Mark event as completed while keeping diagnostic progress.
+	 *
+	 * @param int   $id Event ID.
+	 * @param array $payload Event payload.
+	 * @param array $progress Progress/diagnostic data.
+	 * @return void
+	 */
+	public function mark_done_with_progress( $id, $payload = array(), $progress = array() ) {
+		$fields = array(
+			'locked_until'  => null,
+			'next_retry_at' => null,
+			'last_error'    => null,
+		);
+
+		if ( is_array( $payload ) && ! empty( $payload ) ) {
+			$payload_json = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+			if ( false !== $payload_json ) {
+				$fields['payload_json'] = $payload_json;
+			}
+		}
+
+		if ( is_array( $progress ) && ! empty( $progress ) ) {
+			$progress_json = wp_json_encode( $progress, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+			if ( false !== $progress_json ) {
+				$fields['progress_json'] = $progress_json;
+			}
+		}
+
+		$this->update_status( $id, 'done', $fields );
+	}
+
+	/**
+	 * Retire UpdateVariant events that have been waiting for a missing parent too long.
+	 *
+	 * @param int $timeout_seconds Maximum wait age in seconds.
+	 * @param int $limit Maximum rows to retire.
+	 * @return int Number of retired events.
+	 */
+	public function retire_stale_parent_waiting_events( $timeout_seconds = 600, $limit = 200 ) {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+
+		$timeout_seconds = max( 60, absint( $timeout_seconds ) );
+		$limit           = max( 1, min( 1000, absint( $limit ) ) );
+		$cutoff          = gmdate( 'Y-m-d H:i:s', time() - $timeout_seconds );
+		$table           = self::table_name();
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, payload_json, progress_json, created_at FROM {$table}
+				WHERE status = 'pending'
+				AND event_type = 'UpdateVariant'
+				AND created_at <= %s
+				AND progress_json LIKE %s
+				ORDER BY id ASC
+				LIMIT %d",
+				$cutoff,
+				'%waitingForParent%',
+				$limit
+			),
+			ARRAY_A
+		);
+
+		if ( empty( $rows ) || ! is_array( $rows ) ) {
+			return 0;
+		}
+
+		$retired = 0;
+
+		foreach ( $rows as $row ) {
+			$progress = json_decode( isset( $row['progress_json'] ) ? (string) $row['progress_json'] : '', true );
+
+			if ( ! is_array( $progress ) || empty( $progress['waitingForParent'] ) ) {
+				continue;
+			}
+
+			$payload = json_decode( isset( $row['payload_json'] ) ? (string) $row['payload_json'] : '', true );
+			if ( ! is_array( $payload ) ) {
+				$payload = array();
+			}
+
+			$created_at = isset( $row['created_at'] ) ? strtotime( (string) $row['created_at'] . ' UTC' ) : 0;
+			$wait_age   = $created_at > 0 ? max( 0, time() - $created_at ) : $timeout_seconds;
+
+			$progress['deleteFile']               = true;
+			$progress['retiredBecause']           = 'parent_wait_timeout';
+			$progress['retiredAt']                = gmdate( 'Y-m-d H:i:s' );
+			$progress['parentWaitTimeoutSeconds'] = $timeout_seconds;
+			$progress['parentWaitAgeSeconds']     = $wait_age;
+
+			$this->mark_done_with_progress( absint( $row['id'] ), $payload, $progress );
+			$retired++;
+		}
+
+		return $retired;
+	}
+
+	/**
 	 * Keep partially processed event pending with updated payload/progress.
 	 *
 	 * @param int   $id Event ID.
@@ -299,8 +435,9 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return void
 	 */
 	public function mark_pending_progress( $id, $payload, $progress = array() ) {
-		$payload_json = wp_json_encode( is_array( $payload ) ? $payload : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		$payload_json  = wp_json_encode( is_array( $payload ) ? $payload : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		$progress_json = wp_json_encode( is_array( $progress ) ? $progress : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		$defer_seconds = is_array( $progress ) && isset( $progress['deferSeconds'] ) ? absint( $progress['deferSeconds'] ) : 0;
 
 		$this->update_status(
 			$id,
@@ -309,7 +446,7 @@ class Mobo_Core_Sync_Event_Store {
 				'payload_json'  => false === $payload_json ? '{}' : $payload_json,
 				'progress_json' => false === $progress_json ? '{}' : $progress_json,
 				'locked_until'  => null,
-				'next_retry_at' => null,
+				'next_retry_at' => $defer_seconds > 0 ? gmdate( 'Y-m-d H:i:s', time() + $defer_seconds ) : null,
 				'last_error'    => null,
 			)
 		);
@@ -524,6 +661,177 @@ class Mobo_Core_Sync_Event_Store {
 		$wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
 	}
 
+	private function build_local_dedupe_id( $event_type, $payload, $sync_id, $entity_type, $entity_guid ) {
+		$event_type = sanitize_text_field( (string) $event_type );
+		$sync_id    = sanitize_text_field( (string) $sync_id );
+
+		if ( 'UpdateVariant' === $event_type ) {
+			$identity_key = $this->build_update_variant_identity_key( $payload );
+
+			if ( '' !== $identity_key ) {
+				return 'local:updatevariant:' . md5( $sync_id . '|' . $identity_key );
+			}
+		}
+
+		return '';
+	}
+
+	private function build_update_variant_identity_key( $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return '';
+		}
+
+		$variant_guids = $this->extract_update_variant_variant_guids( $payload );
+
+		if ( ! empty( $variant_guids ) ) {
+			$variant_guids = array_values( array_unique( array_map( 'strval', $variant_guids ) ) );
+			sort( $variant_guids );
+
+			return 'variants:' . implode( ',', $variant_guids );
+		}
+
+		$product_guid = $this->extract_update_variant_product_guid( $payload );
+		$page_number  = absint( $this->get_value( $payload, 'pageNumber', 0 ) );
+		$payload_url  = $this->first_non_empty(
+			array(
+				$this->get_value( $payload, 'changesUrl', '' ),
+				$this->get_value( $payload, 'payloadUrl', '' ),
+				$this->get_value( $payload, 'url', '' ),
+				$this->get_value( $payload, '_moboPulledFrom', '' ),
+			)
+		);
+		$payload_json = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		$payload_hash = false === $payload_json ? '' : md5( $payload_json );
+
+		if ( '' !== $product_guid || '' !== $payload_hash ) {
+			return 'product:' . $product_guid . '|page:' . $page_number . '|url:' . $payload_url . '|payload:' . $payload_hash;
+		}
+
+		return '';
+	}
+
+	private function extract_update_variant_variant_guids( $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return array();
+		}
+
+		$guids = array();
+		$this->append_variant_guid_from_item( $payload, $guids );
+
+		$data = $this->get_value( $payload, 'data', null );
+
+		if ( is_array( $data ) && ! $this->is_list_array( $data ) ) {
+			$this->append_variant_guid_from_item( $data, $guids );
+
+			$nested_data = $this->get_value( $data, 'data', null );
+			if ( is_array( $nested_data ) ) {
+				$data = $nested_data;
+			}
+		}
+
+		if ( is_array( $data ) && $this->is_list_array( $data ) ) {
+			foreach ( $data as $item ) {
+				if ( is_array( $item ) ) {
+					$this->append_variant_guid_from_item( $item, $guids );
+				}
+			}
+		}
+
+		$variants = $this->get_value( $payload, 'variants', null );
+		if ( ! is_array( $variants ) ) {
+			$variants = $this->get_value( $payload, 'Variants', null );
+		}
+		if ( is_array( $variants ) ) {
+			foreach ( $variants as $variant ) {
+				if ( is_array( $variant ) ) {
+					$this->append_variant_guid_from_item( $variant, $guids );
+				}
+			}
+		}
+
+		$guids = array_filter( array_map( 'sanitize_text_field', array_map( 'strval', $guids ) ) );
+
+		return array_values( array_unique( $guids ) );
+	}
+
+	private function append_variant_guid_from_item( $item, &$guids ) {
+		if ( ! is_array( $item ) ) {
+			return;
+		}
+
+		$guid = $this->first_non_empty(
+			array(
+				$this->get_value( $item, 'variant_guid', '' ),
+				$this->get_value( $item, 'variantGuid', '' ),
+				$this->get_value( $item, 'variantId', '' ),
+				$this->get_value( $item, 'remote_guid', '' ),
+				$this->get_value( $item, 'remoteGuid', '' ),
+				$this->get_value( $item, 'entity_guid', '' ),
+				$this->get_value( $item, 'entityGuid', '' ),
+				$this->get_value( $item, 'entityId', '' ),
+				$this->get_value( $item, 'guid', '' ),
+			)
+		);
+
+		if ( '' !== $guid ) {
+			$guids[] = $guid;
+		}
+	}
+
+	private function extract_update_variant_product_guid( $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return '';
+		}
+
+		$product_guid = $this->first_non_empty(
+			array(
+				$this->get_value( $payload, 'product_guid', '' ),
+				$this->get_value( $payload, 'productGuid', '' ),
+				$this->get_value( $payload, 'productId', '' ),
+				$this->get_value( $payload, 'parentProductId', '' ),
+				$this->get_value( $payload, 'parentGuid', '' ),
+			)
+		);
+
+		if ( '' !== $product_guid ) {
+			return sanitize_text_field( (string) $product_guid );
+		}
+
+		$data = $this->get_value( $payload, 'data', null );
+
+		if ( is_array( $data ) && ! $this->is_list_array( $data ) ) {
+			$product_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $data, 'product_guid', '' ),
+					$this->get_value( $data, 'productGuid', '' ),
+					$this->get_value( $data, 'productId', '' ),
+					$this->get_value( $data, 'parentProductId', '' ),
+					$this->get_value( $data, 'parentGuid', '' ),
+				)
+			);
+
+			if ( '' !== $product_guid ) {
+				return sanitize_text_field( (string) $product_guid );
+			}
+
+			$data = $this->get_value( $data, 'data', null );
+		}
+
+		if ( is_array( $data ) && isset( $data[0] ) && is_array( $data[0] ) ) {
+			$product_guid = $this->first_non_empty(
+				array(
+					$this->get_value( $data[0], 'product_guid', '' ),
+					$this->get_value( $data[0], 'productGuid', '' ),
+					$this->get_value( $data[0], 'productId', '' ),
+					$this->get_value( $data[0], 'parentProductId', '' ),
+					$this->get_value( $data[0], 'parentGuid', '' ),
+				)
+			);
+		}
+
+		return sanitize_text_field( (string) $product_guid );
+	}
+
 	/**
 	 * Normalize wrapper and extract event metadata.
 	 *
@@ -551,7 +859,7 @@ class Mobo_Core_Sync_Event_Store {
 			if ( $this->is_list_array( $data ) ) {
 				$payload = array( 'data' => $data );
 
-				$product_id = $this->get_value( $raw, 'productId', '' );
+				$product_id = $this->get_value( $raw, 'product_guid', '' );
 				if ( '' !== $product_id ) {
 					$payload['productId'] = $product_id;
 				}
@@ -630,48 +938,26 @@ class Mobo_Core_Sync_Event_Store {
 		$type       = '';
 
 		if ( 'UpdateVariant' === $event_type ) {
-			$type = 'variant';
-			$guid = $this->first_non_empty(
-				array(
-					$this->get_value( $payload, 'variantId', '' ),
-					$this->get_value( $payload, 'variantGuid', '' ),
-					$this->get_value( $payload, 'entityGuid', '' ),
-					$this->get_value( $payload, 'entityId', '' ),
-				)
-			);
+			$variant_guids = $this->extract_update_variant_variant_guids( $payload );
 
-			if ( '' === $guid ) {
-				$product_guid = $this->first_non_empty(
-					array(
-						$this->get_value( $payload, 'productId', '' ),
-						$this->get_value( $payload, 'productGuid', '' ),
-						$this->get_value( $payload, 'parentProductId', '' ),
-						$this->get_value( $payload, 'parentGuid', '' ),
-					)
-				);
+			if ( 1 === count( $variant_guids ) ) {
+				$type = 'variant';
+				$guid = $variant_guids[0];
+			} else {
+				$product_guid = $this->extract_update_variant_product_guid( $payload );
+
 				if ( '' !== $product_guid ) {
 					$type = 'product';
 					$guid = $product_guid;
 				}
 			}
-
-			$items = $this->get_value( $payload, 'data', array() );
-			if ( '' === $guid && is_array( $items ) && isset( $items[0] ) && is_array( $items[0] ) ) {
-				$guid = $this->first_non_empty(
-					array(
-						$this->get_value( $items[0], 'variantId', '' ),
-						$this->get_value( $items[0], 'variantGuid', '' ),
-						$this->get_value( $items[0], 'productId', '' ),
-						$this->get_value( $items[0], 'productGuid', '' ),
-					)
-				);
-			}
 		} elseif ( 'ProductUpdated' === $event_type ) {
 			$type = 'product';
 			$guid = $this->first_non_empty(
 				array(
-					$this->get_value( $payload, 'productId', '' ),
+					$this->get_value( $payload, 'product_guid', '' ),
 					$this->get_value( $payload, 'productGuid', '' ),
+					$this->get_value( $payload, 'productId', '' ),
 					$this->get_value( $payload, 'entityGuid', '' ),
 				)
 			);
@@ -679,7 +965,13 @@ class Mobo_Core_Sync_Event_Store {
 			$items = $this->get_value( $payload, 'data', array() );
 
 			if ( '' === $guid && is_array( $items ) && isset( $items[0] ) && is_array( $items[0] ) ) {
-				$guid = $this->get_value( $items[0], 'productId', '' );
+				$guid = $this->first_non_empty( array(
+					$this->get_value( $items[0], 'product_guid', '' ),
+					$this->get_value( $items[0], 'productGuid', '' ),
+					$this->get_value( $items[0], 'productId', '' ),
+					$this->get_value( $items[0], 'guid', '' ),
+					$this->get_value( $items[0], 'id', '' ),
+				) );
 			}
 		}
 

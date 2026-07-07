@@ -17,6 +17,74 @@ class Mobo_Core_Category_Sync {
 		$this->category_map = class_exists( 'Mobo_Core_Category_Map' ) ? new Mobo_Core_Category_Map() : null;
 	}
 
+
+	/**
+	 * Load remote categories into the mapping table only.
+	 *
+	 * This method intentionally does not create or update WooCommerce terms.
+	 * It is used by the admin button "load categories before product sync".
+	 *
+	 * @param mixed $payload API payload.
+	 * @return array
+	 */
+	public function load_categories_for_mapping_payload( $payload ) {
+		$categories = $payload;
+
+		if ( is_array( $payload ) && isset( $payload['data'] ) && is_array( $payload['data'] ) ) {
+			$categories = $payload['data'];
+		}
+
+		if ( ! is_array( $categories ) || ! ( $this->category_map instanceof Mobo_Core_Category_Map ) ) {
+			return array(
+				'created' => 0,
+				'updated' => 0,
+				'skipped' => 0,
+			);
+		}
+
+		$created = 0;
+		$updated = 0;
+		$skipped = 0;
+
+		foreach ( $categories as $category_data ) {
+			if ( ! is_array( $category_data ) ) {
+				$skipped++;
+				continue;
+			}
+
+			$category_guid = $this->get_category_guid( $category_data );
+			$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
+			$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
+			$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
+
+			if ( '' === $category_guid ) {
+				$skipped++;
+				continue;
+			}
+
+			$result = $this->category_map->upsert_remote_category_for_mapping( $category_guid, $title, $url, $parent_guid );
+
+			if ( empty( $result['success'] ) ) {
+				$skipped++;
+				continue;
+			}
+
+			if ( ! empty( $result['created'] ) ) {
+				$created++;
+			} elseif ( ! empty( $result['skipped_update'] ) ) {
+				$skipped++;
+			} else {
+				$updated++;
+			}
+		}
+
+		return array(
+			'created' => $created,
+			'updated' => $updated,
+			'skipped' => $skipped,
+		);
+	}
+
 	public function sync_categories_payload( $payload ) {
 		$categories = $payload;
 
@@ -91,6 +159,7 @@ class Mobo_Core_Category_Sync {
 		$auto_categories_enabled = (bool) $auto_categories_enabled;
 		$mapping_enabled         = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_enabled', '1' );
 		$mapping_required        = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_required', '0' );
+		$category_refs           = is_array( $categories ) ? $categories : array();
 
 		if ( $product_id <= 0 ) {
 			return array(
@@ -101,13 +170,59 @@ class Mobo_Core_Category_Sync {
 		}
 
 		/*
-		* Auto category update disabled:
-		* - new product gets default category
-		* - existing product must remain unchanged
-		*/
+		 * Manual mapping is product assignment, not category creation.
+		 * It must work even when automatic WooCommerce category sync is disabled.
+		 */
+		$manual_result = $this->resolve_manual_mapped_terms( $category_refs, $mapping_enabled );
+
+		if ( ! empty( $manual_result['term_ids'] ) ) {
+			$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $manual_result['term_ids'] ) ) ) );
+
+			if ( ! empty( $term_ids ) ) {
+				wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
+				update_post_meta( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
+
+				if ( ! empty( $manual_result['missing_guids'] ) ) {
+					update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $manual_result['missing_guids'] ) ) );
+				} else {
+					delete_post_meta( $product_id, 'mobo_category_missing_guids' );
+				}
+
+				return array(
+					'assigned'     => count( $term_ids ),
+					'source'       => 'manual-mapping',
+					'changed'      => true,
+					'missingGuids' => array_values( array_unique( $manual_result['missing_guids'] ) ),
+				);
+			}
+		}
+
+		if ( $mapping_required && ! empty( $manual_result['missing_guids'] ) ) {
+			update_post_meta( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
+			update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $manual_result['missing_guids'] ) ) );
+
+			return array(
+				'assigned'     => 0,
+				'source'       => 'mapping-required-missing',
+				'changed'      => false,
+				'missingGuids' => array_values( array_unique( $manual_result['missing_guids'] ) ),
+			);
+		}
+
+		/*
+		 * Automatic category update disabled:
+		 * - Manual mapping above still applies.
+		 * - New product without mapping gets default category.
+		 * - Existing product without mapping remains untouched.
+		 */
 		if ( ! $auto_categories_enabled ) {
 			if ( $is_new_product ) {
-				return $this->assign_default_category( $product_id );
+				$result = $this->assign_default_category( $product_id );
+				if ( ! empty( $result['changed'] ) ) {
+					$result['source'] = 'auto-disabled-new-default';
+					update_post_meta( $product_id, 'mobo_category_assign_source', 'auto-disabled-new-default' );
+				}
+				return $result;
 			}
 
 			return array(
@@ -120,7 +235,6 @@ class Mobo_Core_Category_Sync {
 		$term_ids       = array();
 		$sources        = array();
 		$missing_guids  = array();
-		$category_refs  = is_array( $categories ) ? $categories : array();
 
 		foreach ( $category_refs as $category_ref ) {
 			if ( ! is_array( $category_ref ) ) {
@@ -137,7 +251,14 @@ class Mobo_Core_Category_Sync {
 			$source  = 'missing';
 
 			if ( $mapping_enabled && $this->category_map instanceof Mobo_Core_Category_Map ) {
-				$resolved = $this->category_map->resolve_assignment_term( $category_guid );
+				$identifiers = $this->get_category_identifiers( $category_ref );
+
+				if ( method_exists( $this->category_map, 'resolve_assignment_term_by_identifiers' ) ) {
+					$resolved = $this->category_map->resolve_assignment_term_by_identifiers( $identifiers );
+				} else {
+					$resolved = $this->category_map->resolve_assignment_term( $category_guid );
+				}
+
 				$term_id  = absint( isset( $resolved['term_id'] ) ? $resolved['term_id'] : 0 );
 				$source   = sanitize_key( isset( $resolved['source'] ) ? $resolved['source'] : 'missing' );
 			}
@@ -155,7 +276,7 @@ class Mobo_Core_Category_Sync {
 				$term_id = absint( isset( $created['term_id'] ) ? $created['term_id'] : 0 );
 
 				if ( $term_id > 0 ) {
-					$source = ! empty( $created['created'] ) ? 'auto-created' : 'auto-updated';
+					$source = ! empty( $created['created'] ) ? 'auto-created' : ( ! empty( $created['skipped_update'] ) ? 'existing-category-kept' : 'auto-updated' );
 				}
 			}
 
@@ -201,18 +322,190 @@ class Mobo_Core_Category_Sync {
 		}
 
 		/*
-		* Important fallback:
-		* Auto category is enabled, but API categories were missing/not found.
-		* Use default category in every case.
-		*/
-		$result = $this->assign_default_category( $product_id );
+		 * No resolved category. Do not overwrite categories on existing products.
+		 * New products can still receive the configured default category.
+		 */
+		if ( $is_new_product ) {
+			$result = $this->assign_default_category( $product_id );
 
-		if ( ! empty( $result['changed'] ) ) {
-			$result['source'] = 'auto-fallback-default';
-			update_post_meta( $product_id, 'mobo_category_assign_source', 'auto-fallback-default' );
+			if ( ! empty( $result['changed'] ) ) {
+				$result['source'] = 'new-product-default';
+				update_post_meta( $product_id, 'mobo_category_assign_source', 'new-product-default' );
+			}
+
+			return $result;
 		}
 
+		update_post_meta( $product_id, 'mobo_category_assign_source', 'existing-product-category-unchanged' );
+
+		return array(
+			'assigned'     => 0,
+			'source'       => 'existing-product-category-unchanged',
+			'changed'      => false,
+			'missingGuids' => array_values( array_unique( $missing_guids ) ),
+		);
+	}
+
+
+
+	/**
+	 * Resolve only manual mappings for product assignment.
+	 *
+	 * @param array $category_refs Remote product category refs.
+	 * @param bool  $mapping_enabled Mapping enabled.
+	 * @return array
+	 */
+	private function resolve_manual_mapped_terms( $category_refs, $mapping_enabled ) {
+		$result = array(
+			'term_ids'      => array(),
+			'missing_guids' => array(),
+		);
+
+		if ( ! $mapping_enabled || ! ( $this->category_map instanceof Mobo_Core_Category_Map ) || ! is_array( $category_refs ) ) {
+			return $result;
+		}
+
+		foreach ( $category_refs as $category_ref ) {
+			$identifiers = $this->get_category_identifiers( $category_ref );
+
+			if ( empty( $identifiers ) ) {
+				continue;
+			}
+
+			$term_id = 0;
+
+			if ( method_exists( $this->category_map, 'get_manual_term_id_by_identifiers' ) ) {
+				$term_id = $this->category_map->get_manual_term_id_by_identifiers( $identifiers );
+			}
+
+			if ( $term_id <= 0 ) {
+				foreach ( $identifiers as $identifier ) {
+					$term_id = $this->category_map->get_manual_term_id( $identifier );
+					if ( $term_id > 0 ) {
+						break;
+					}
+				}
+			}
+
+			if ( $term_id > 0 ) {
+				$result['term_ids'][] = $term_id;
+			} else {
+				$result['missing_guids'][] = $this->get_primary_category_identifier( $identifiers );
+			}
+		}
+
+		$result['term_ids']      = array_values( array_unique( array_filter( array_map( 'absint', $result['term_ids'] ) ) ) );
+		$result['missing_guids'] = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $result['missing_guids'] ) ) ) );
+
 		return $result;
+	}
+
+
+	/**
+	 * Return GUID identifiers from a category reference.
+	 *
+	 * Category assignment is GUID-only. URL/path/slug are ignored here because
+	 * they are not durable identity keys.
+	 *
+	 * @param mixed $category_ref Category ref.
+	 * @return array
+	 */
+	private function get_category_identifiers( $category_ref ) {
+		return $this->collect_category_guid_candidates( $category_ref );
+	}
+
+	/**
+	 * Collect all category GUID candidates from a product-category reference.
+	 *
+	 * Important: some payloads have a wrapper/relation GUID at top-level `id`,
+	 * while the actual category GUID is inside `category.id` or `category.guid`.
+	 * Mapping must match the actual category GUID, but collecting all valid GUIDs
+	 * lets older payload shapes still resolve correctly. URL/path/slug are never used.
+	 *
+	 * @param mixed $category_ref Category reference.
+	 * @return array
+	 */
+	private function collect_category_guid_candidates( $category_ref ) {
+		$identifiers = array();
+
+		if ( ! is_array( $category_ref ) ) {
+			$value = sanitize_text_field( (string) $category_ref );
+			return $this->is_remote_guid_value( $value ) ? array( $value ) : array();
+		}
+
+		/* Explicit category GUID fields first. */
+		$primary_keys = array(
+			'category_guid',
+			'categoryGuid',
+			'categoryId',
+			'categoryGUID',
+			'guid',
+			'remote_guid',
+			'remoteGuid',
+			'portal_category_id',
+			'portalCategoryId',
+			'category_portal_id',
+			'categoryPortalId',
+		);
+
+		foreach ( $primary_keys as $key ) {
+			$this->append_guid_candidate( $identifiers, $this->get_value( $category_ref, $key, '' ) );
+		}
+
+		/* Actual category object, when payload wraps the relation. */
+		$nested = $this->get_value( $category_ref, 'category', null );
+		if ( is_array( $nested ) ) {
+			foreach ( $this->collect_category_guid_candidates( $nested ) as $nested_guid ) {
+				$this->append_guid_candidate( $identifiers, $nested_guid );
+			}
+		} else {
+			$this->append_guid_candidate( $identifiers, $nested );
+		}
+
+		/* Last-resort compatibility only. These may be relation GUIDs in some payloads. */
+		$fallback_keys = array( 'product_category_id', 'productCategoryId', 'product_category_guid', 'productCategoryGuid', 'id' );
+		foreach ( $fallback_keys as $key ) {
+			$this->append_guid_candidate( $identifiers, $this->get_value( $category_ref, $key, '' ) );
+		}
+
+		return array_values( array_unique( array_filter( $identifiers ) ) );
+	}
+
+	/**
+	 * Append a GUID candidate if valid.
+	 *
+	 * @param array $identifiers Candidate list.
+	 * @param mixed $value Raw value.
+	 * @return void
+	 */
+	private function append_guid_candidate( &$identifiers, $value ) {
+		$value = sanitize_text_field( (string) $value );
+		$value = trim( $value );
+
+		if ( '' !== $value && $this->is_remote_guid_value( $value ) ) {
+			$identifiers[] = $value;
+		}
+	}
+
+	/**
+	 * Pick a readable primary identifier for diagnostics.
+	 *
+	 * @param array $identifiers Identifiers.
+	 * @return string
+	 */
+	private function get_primary_category_identifier( $identifiers ) {
+		if ( ! is_array( $identifiers ) || empty( $identifiers ) ) {
+			return '';
+		}
+
+		foreach ( $identifiers as $identifier ) {
+			$identifier = sanitize_text_field( (string) $identifier );
+			if ( '' !== $identifier && false === strpos( $identifier, '/' ) ) {
+				return $identifier;
+			}
+		}
+
+		return sanitize_text_field( (string) reset( $identifiers ) );
 	}
 
 	public function upsert_category( $category_data ) {
@@ -257,30 +550,14 @@ class Mobo_Core_Category_Sync {
 		}
 
 		if ( $term_id > 0 ) {
-			update_term_meta( $term_id, 'category_guid', $category_guid );
-			update_term_meta( $term_id, 'mobo_sync_incomplete', '1' );
-
-			$result = wp_update_term( $term_id, 'product_cat', $args );
-
-			if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
-				unset( $args['slug'] );
-				$result = wp_update_term( $term_id, 'product_cat', $args );
-			}
-
-			if ( is_wp_error( $result ) ) {
-				return array(
-					'term_id' => $term_id,
-					'created' => false,
-				);
-			}
-
-			$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+			// Existing WooCommerce categories are protected by default.
+			// Keep the local category name, slug, parent and metadata untouched; only refresh the internal mapping.
 			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
-			update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
 
 			return array(
-				'term_id' => $term_id,
-				'created' => false,
+				'term_id'        => $term_id,
+				'created'        => false,
+				'skipped_update' => true,
 			);
 		}
 
@@ -402,21 +679,29 @@ class Mobo_Core_Category_Sync {
 	}
 
 	private function get_category_guid( $category_data ) {
-		$keys = array(
-			'id',
-			'categoryId',
-			'categoryGuid',
-		);
+		$identifiers = $this->collect_category_guid_candidates( $category_data );
 
-		foreach ( $keys as $key ) {
-			$value = sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) );
+		return ! empty( $identifiers ) ? sanitize_text_field( (string) $identifiers[0] ) : '';
+	}
 
-			if ( '' !== $value ) {
-				return $value;
-			}
+	/**
+	 * Check whether a value is usable as a remote GUID.
+	 *
+	 * @param string $value Value.
+	 * @return bool
+	 */
+	private function is_remote_guid_value( $value ) {
+		$value = trim( sanitize_text_field( (string) $value ) );
+
+		if ( '' === $value ) {
+			return false;
 		}
 
-		return '';
+		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	private function upsert_category_map( $category_guid, $term_id, $name = '', $url = '', $parent_guid = '' ) {

@@ -77,6 +77,7 @@ class Mobo_Core_Product_Sync {
 			'lastTransientError'            => '',
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
+			'cancelRequestedAt'            => 0,
 		);
 
 		update_option( self::STATE_OPTION, $state, false );
@@ -90,13 +91,23 @@ class Mobo_Core_Product_Sync {
 
 	public function cancel_manual_sync() {
 		$state = $this->get_manual_sync_state();
+		$now   = time();
 
-		$state['status']      = 'cancelled';
-		$state['completedAt'] = time();
-		$state['updatedAt']   = time();
-		$state['lastMessage'] = 'همگام‌سازی محصولات متوقف شد.';
+		$state['status']            = 'cancelled';
+		$state['completedAt']       = $now;
+		$state['updatedAt']         = $now;
+		$state['cancelRequestedAt'] = $now;
+		$state['nextRetryAt']       = 0;
+		$state['lastError']         = '';
+		$state['lastTransientError'] = '';
+		$state['lastMessage']       = 'همگام‌سازی محصولات متوقف شد.';
 
 		$this->save_manual_sync_state( $state );
+
+		if ( class_exists( 'Mobo_Core_Lock' ) ) {
+			Mobo_Core_Lock::force_release( 'manual_sync_start' );
+			Mobo_Core_Lock::force_release( 'self_runner_kick' );
+		}
 
 		return $this->result(
 			true,
@@ -152,6 +163,7 @@ class Mobo_Core_Product_Sync {
 			'lastTransientError'            => '',
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
+			'cancelRequestedAt'            => 0,
 		);
 
 		$state = get_option( self::STATE_OPTION, array() );
@@ -223,6 +235,7 @@ class Mobo_Core_Product_Sync {
 			'updatedAt'                    => absint( $state['updatedAt'] ),
 			'waitingForPortalSince'         => absint( $state['waitingForPortalSince'] ?? 0 ),
 			'nextRetryAt'                  => $next_retry_at,
+			'cancelRequestedAt'            => absint( $state['cancelRequestedAt'] ?? 0 ),
 
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
 			'lastError'                    => $last_error,
@@ -417,7 +430,24 @@ class Mobo_Core_Product_Sync {
 				);
 			}
 
-			$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+			$product_guid = $this->extract_product_guid( $product_data );
+
+			if ( '' !== $product_guid && $this->is_remote_product_trashed( $product_guid ) ) {
+				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
+				$state['lastError']         = '';
+				$state['lastMessage']       = 'محصول به دلیل قرار داشتن در سطل زباله وردپرس رد شد: ' . $product_guid;
+
+				if ( absint( $state['productTotalCount'] ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+					$state['status']      = 'done';
+					$state['completedAt'] = time();
+					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+				}
+
+				$this->save_manual_sync_state( $state );
+
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+			}
+
 			$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
 
 			/*
@@ -470,13 +500,14 @@ class Mobo_Core_Product_Sync {
 				$image_result = $this->image_sync->process_images(
 					$product_id,
 					$images,
-					$image_offset
+					$image_offset,
+					false
 				);
 
 				if ( empty( $image_result['done'] ) ) {
 					$state['currentProductImageOffset'] = absint( $image_result['nextOffset'] );
 					$state['lastError']                 = '';
-					$state['lastMessage']               = 'تصاویر محصول در حال پردازش است.';
+					$state['lastMessage']               = sprintf( 'تصاویر محصول در حال پردازش است. پردازش‌شده: %d، باقی‌مانده صف: %d', isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0, isset( $image_result['pending'] ) ? absint( $image_result['pending'] ) : 0 );
 
 					$this->save_manual_sync_state( $state );
 
@@ -487,7 +518,7 @@ class Mobo_Core_Product_Sync {
 			$state['currentProductImagesDone']   = true;
 			$state['currentProductImageOffset']  = 0;
 			$state['lastError']                  = '';
-			$state['lastMessage']                = 'تصاویر محصول پردازش شد.';
+			$state['lastMessage']                = 'تصاویر محصول به صف امن منتقل شد و همگام‌سازی محصول ادامه پیدا می‌کند.';
 
 			$this->save_manual_sync_state( $state );
 
@@ -538,8 +569,20 @@ class Mobo_Core_Product_Sync {
 
 		$this->clear_transient_request_error( $state );
 
+		$variant_items       = $this->normalize_variant_items_from_response( $response );
+		$variant_items_count = count( $variant_items );
 		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
-		$product_id          = absint( $state['currentProductId'] );
+
+		/*
+		 * Some Portal/Swagger payloads may return totalCount=0 while data still contains variants.
+		 * Treat the actual data as authoritative for this page; never mark existing variations
+		 * as simple/out-of-stock just because totalCount is zero.
+		 */
+		if ( 0 === $variant_total_count && $variant_items_count > 0 ) {
+			$variant_total_count = $variant_items_count;
+		}
+
+		$product_id = absint( $state['currentProductId'] );
 
 		if ( $product_id <= 0 ) {
 			$product_id = $this->find_product_id_by_guid( $product_guid );
@@ -549,13 +592,13 @@ class Mobo_Core_Product_Sync {
 			$this->ensure_product_type_for_variants( $product_id, $variant_total_count );
 		}
 
-		if ( 0 === $variant_total_count ) {
-			if ( $product_id > 0 ) {
-				$this->force_product_simple_if_needed( $product_id );
-				wc_delete_product_transients( $product_id );
-			}
-
-			$this->finish_current_product_state( $state, 'محصول ساده پردازش شد.' );
+		if ( 0 === $variant_total_count && 0 === $variant_items_count ) {
+			/*
+			 * Safe behavior: do not force existing variations to stock=0 when the variant
+			 * endpoint returns an empty/inconclusive page. If the product is truly simple,
+			 * Step 5 handles it before reaching this point.
+			 */
+			$this->finish_current_product_state( $state, 'هیچ تنوعی از API دریافت نشد؛ تنوع‌های موجود تغییر نکردند.' );
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -570,15 +613,16 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$payload = array(
-			'event'         => 'UpdateVariant',
-			'syncId'        => $state['syncId'],
+			'event'                    => 'UpdateVariant',
+			'variantListAuthoritative' => true,
+			'syncId'                   => $state['syncId'],
 			'productId'     => $product_guid,
 			'totalCount'    => $this->get_value( $response, 'totalCount', 0 ),
 			'pageNumber'    => $this->get_value( $response, 'pageNumber', $state['variantPage'] ),
 			'recordPerPage' => $this->get_value( $response, 'recordPerPage', $variants_limit ),
 			'hasMore'       => $this->get_value( $response, 'hasMore', false ),
 			'isLastPage'    => $this->get_value( $response, 'isLastPage', null ),
-			'data'          => $this->get_value( $response, 'data', array() ),
+			'data'          => $variant_items,
 		);
 
 		$result = $this->process_update_variant_payload( $payload );
@@ -593,7 +637,24 @@ class Mobo_Core_Product_Sync {
 
 		$state['currentVariantProcessedPages'] = absint( $state['currentVariantProcessedPages'] ) + 1;
 
-		if ( $this->to_bool( $payload['hasMore'] ) ) {
+		$variant_items     = $this->get_value( $payload, 'data', array() );
+		$variant_has_more  = $this->to_bool( $payload['hasMore'] );
+		$payload_last_page = $this->get_value( $payload, 'isLastPage', null );
+		$total_pages       = absint( $state['currentVariantTotalPages'] );
+
+		if ( null !== $payload_last_page && $this->to_bool( $payload_last_page ) ) {
+			$variant_has_more = false;
+		}
+
+		if ( $total_pages > 0 && absint( $state['currentVariantProcessedPages'] ) >= $total_pages ) {
+			$variant_has_more = false;
+		}
+
+		if ( is_array( $variant_items ) && empty( $variant_items ) ) {
+			$variant_has_more = false;
+		}
+
+		if ( $variant_has_more ) {
 			$state['variantPage'] = absint( $state['variantPage'] ) + 1;
 			$state['lastError']   = '';
 			$state['lastMessage'] = $result['message'];
@@ -656,7 +717,36 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
-		$product_guid = sanitize_text_field( (string) $this->get_value( $product_data, 'productId', '' ) );
+		$product_guid = $this->extract_product_guid( $product_data );
+
+		if ( '' !== $product_guid && $this->is_remote_product_trashed( $product_guid ) ) {
+			$product_index++;
+			$payload['_moboProductIndex'] = $product_index;
+			$payload['_moboImageOffset']  = 0;
+
+			if ( $product_index < count( $items ) ) {
+				return $this->result(
+					true,
+					'ProductUpdated skipped trashed product; products remaining.',
+					array(
+						'deleteFile'  => false,
+						'productGuid' => $product_guid,
+					)
+				);
+			}
+
+			unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+
+			return $this->result(
+				true,
+				'ProductUpdated skipped trashed product.',
+				array(
+					'deleteFile'  => true,
+					'productGuid' => $product_guid,
+				)
+			);
+		}
+
 		$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
 
 		$product_id = $this->upsert_parent_product( $product_data, true );
@@ -673,7 +763,8 @@ class Mobo_Core_Product_Sync {
 			$image_result = $this->image_sync->process_images(
 				$product_id,
 				$this->get_product_images_from_payload( $product_data ),
-				$image_offset
+				$image_offset,
+				false
 			);
 
 			if ( empty( $image_result['done'] ) ) {
@@ -719,14 +810,7 @@ class Mobo_Core_Product_Sync {
 		 */
 		$inner_data = $this->get_value( $payload, 'data', null );
 		if ( is_array( $inner_data ) && ! $this->is_list_array( $inner_data ) ) {
-			$inner_product_guid = $this->first_non_empty(
-				array(
-					$this->get_value( $inner_data, 'productId', '' ),
-					$this->get_value( $inner_data, 'productGuid', '' ),
-					$this->get_value( $inner_data, 'parentProductId', '' ),
-					$this->get_value( $inner_data, 'parentGuid', '' ),
-				)
-			);
+			$inner_product_guid = $this->extract_product_guid( $inner_data );
 
 			$inner_variants = $this->get_value( $inner_data, 'data', null );
 			if ( '' !== $inner_product_guid || is_array( $inner_variants ) ) {
@@ -734,16 +818,7 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		$product_guid = sanitize_text_field(
-			(string) $this->first_non_empty(
-				array(
-					$this->get_value( $payload, 'productId', '' ),
-					$this->get_value( $payload, 'productGuid', '' ),
-					$this->get_value( $payload, 'parentProductId', '' ),
-					$this->get_value( $payload, 'parentGuid', '' ),
-				)
-			)
-		);
+		$product_guid = $this->extract_product_guid( $payload );
 		$sync_id      = sanitize_text_field( (string) $this->get_value( $payload, 'syncId', '' ) );
 		$page_number  = max( 1, absint( $this->get_value( $payload, 'pageNumber', 1 ) ) );
 		$has_more     = $this->get_value( $payload, 'hasMore', false );
@@ -762,31 +837,12 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( '' === $product_guid && isset( $variants[0] ) && is_array( $variants[0] ) ) {
-			$product_guid = sanitize_text_field(
-				(string) $this->first_non_empty(
-					array(
-						$this->get_value( $variants[0], 'productId', '' ),
-						$this->get_value( $variants[0], 'productGuid', '' ),
-						$this->get_value( $variants[0], 'parentProductId', '' ),
-						$this->get_value( $variants[0], 'parentGuid', '' ),
-					)
-				)
-			);
+			$product_guid = $this->extract_product_guid( $variants[0] );
 		}
 
-		if ( '' === $product_guid ) {
-			$product_guid = $this->extract_product_guid_from_url( (string) $this->get_value( $payload, '_moboPulledFrom', '' ) );
-		}
 
 		if ( '' === $product_guid ) {
-			$variant_guid = $this->first_non_empty(
-				array(
-					$this->get_value( $payload, 'variantId', '' ),
-					$this->get_value( $payload, 'variantGuid', '' ),
-					$this->get_value( $payload, 'entityGuid', '' ),
-					$this->get_value( $payload, 'entityId', '' ),
-				)
-			);
+			$variant_guid = $this->extract_variant_guid( $payload );
 			if ( '' !== $variant_guid ) {
 				$product_guid = $this->find_parent_product_guid_by_variant_guid( $variant_guid );
 			}
@@ -798,19 +854,24 @@ class Mobo_Core_Product_Sync {
 
 		foreach ( $variants as $variant_index => $variant_data ) {
 			if ( is_array( $variant_data ) ) {
-				$variant_product_guid = $this->first_non_empty(
-					array(
-						$this->get_value( $variant_data, 'productId', '' ),
-						$this->get_value( $variant_data, 'productGuid', '' ),
-						$this->get_value( $variant_data, 'parentProductId', '' ),
-						$this->get_value( $variant_data, 'parentGuid', '' ),
-					)
-				);
+				$variant_product_guid = $this->extract_product_guid( $variant_data );
 
 				if ( '' === $variant_product_guid ) {
 					$variants[ $variant_index ]['productId'] = $product_guid;
 				}
 			}
+		}
+
+		if ( $this->is_remote_product_trashed( $product_guid ) ) {
+			return $this->result(
+				true,
+				'محصول مادر در سطل زباله وردپرس است؛ تنوع‌های آن رد شدند.',
+				array(
+					'deleteFile'     => true,
+					'productGuid'    => $product_guid,
+					'skippedBecause' => 'parent_trashed',
+				)
+			);
 		}
 
 		if ( '' === $sync_id ) {
@@ -820,7 +881,16 @@ class Mobo_Core_Product_Sync {
 		$product_id = $this->find_product_id_by_guid( $product_guid );
 
 		if ( $product_id <= 0 ) {
-			return $this->result( false, 'Parent product not found.', array( 'productGuid' => $product_guid ) );
+			return $this->result(
+				true,
+				'محصول مادر هنوز ساخته نشده است؛ پردازش تنوع‌ها برای تلاش بعدی به تعویق افتاد.',
+				array(
+					'deleteFile'       => false,
+					'deferSeconds'     => 120,
+					'waitingForParent' => true,
+					'productGuid'      => $product_guid,
+				)
+			);
 		}
 
 		$product = wc_get_product( $product_id );
@@ -829,7 +899,9 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, 'Invalid parent product.' );
 		}
 
-		if ( 1 === $page_number ) {
+		$variant_list_authoritative = $this->is_authoritative_variant_list_payload( $payload, $variants );
+
+		if ( $variant_list_authoritative && 1 === $page_number ) {
 			$this->reset_seen_variants( $product_guid, $sync_id );
 		}
 
@@ -837,8 +909,9 @@ class Mobo_Core_Product_Sync {
 
 		$product = wc_get_product( $product_id );
 
-		$updated = 0;
-		$skipped = 0;
+		$updated   = 0;
+		$unchanged = 0;
+		$skipped   = 0;
 
 		foreach ( $variants as $variant_data ) {
 			if ( ! is_array( $variant_data ) ) {
@@ -846,16 +919,21 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
-			$variation_id = $this->upsert_variation( $product, $variant_data );
+			$variation_result = $this->upsert_variation( $product, $variant_data );
+			$variation_id     = is_array( $variation_result ) && isset( $variation_result['id'] ) ? absint( $variation_result['id'] ) : absint( $variation_result );
 
 			if ( $variation_id > 0 ) {
-				$variant_guid = sanitize_text_field( (string) $this->get_value( $variant_data, 'variantId', '' ) );
+				$variant_guid = $this->extract_variant_guid( $variant_data );
 
-				if ( '' !== $variant_guid ) {
+				if ( $variant_list_authoritative && '' !== $variant_guid ) {
 					$this->mark_variant_seen( $product_guid, $sync_id, $variant_guid );
 				}
 
-				$updated++;
+				if ( is_array( $variation_result ) && empty( $variation_result['changed'] ) ) {
+					$unchanged++;
+				} else {
+					$updated++;
+				}
 			} else {
 				$skipped++;
 			}
@@ -863,9 +941,24 @@ class Mobo_Core_Product_Sync {
 
 		$is_last_page = null === $is_last_page ? ! $this->to_bool( $has_more ) : $this->to_bool( $is_last_page );
 
-		if ( $is_last_page ) {
-			$this->finalize_missing_variants( $product, $product_guid, $sync_id );
+		if ( $is_last_page && $variant_list_authoritative ) {
+			$expected_variant_total = absint( $this->get_value( $payload, 'totalCount', 0 ) );
+			$seen_variant_count     = $this->count_seen_variants( $product_guid, $sync_id );
+
+			if ( $expected_variant_total > 0 && $seen_variant_count >= $expected_variant_total ) {
+				$this->finalize_missing_variants( $product, $product_guid, $sync_id );
+			} else {
+				update_post_meta( $product_id, '_mobo_missing_variants_finalize_skipped_at', gmdate( 'c' ) );
+				update_post_meta( $product_id, '_mobo_missing_variants_finalize_reason', 'variant_list_not_authoritative' );
+				update_post_meta( $product_id, '_mobo_missing_variants_seen_count', $seen_variant_count );
+				update_post_meta( $product_id, '_mobo_missing_variants_expected_count', $expected_variant_total );
+			}
+
 			$this->clear_seen_variants( $product_guid, $sync_id );
+		} elseif ( $is_last_page && ! $variant_list_authoritative ) {
+			update_post_meta( $product_id, '_mobo_missing_variants_finalize_skipped_at', gmdate( 'c' ) );
+			update_post_meta( $product_id, '_mobo_missing_variants_finalize_reason', 'variant_delta_webhook_not_authoritative' );
+			update_post_meta( $product_id, '_mobo_missing_variants_payload_event', sanitize_text_field( (string) $this->get_value( $payload, 'event', '' ) ) );
 		}
 
 		if ( is_callable( array( 'WC_Product_Variable', 'sync' ) ) ) {
@@ -874,16 +967,75 @@ class Mobo_Core_Product_Sync {
 
 		wc_delete_product_transients( $product_id );
 
+		$message = sprintf(
+			'تنوع‌های محصول پردازش شد. محصول: %s، صفحه: %d، بروزرسانی: %d، بدون تغییر: %d، رد شده: %d',
+			$product_guid,
+			$page_number,
+			$updated,
+			$unchanged,
+			$skipped
+		);
+
 		return $this->result(
 			true,
-			'UpdateVariant processed.',
+			$message,
 			array(
 				'deleteFile'  => true,
 				'productGuid' => $product_guid,
 				'pageNumber'  => $page_number,
 				'updated'     => $updated,
+				'unchanged'   => $unchanged,
 				'skipped'     => $skipped,
 				'isLastPage'  => $is_last_page,
+			)
+		);
+	}
+
+
+	/**
+	 * Fetch remote categories only for admin mapping.
+	 *
+	 * This method never creates or updates WooCommerce product_cat terms and
+	 * does not respect/change the automatic category update schedule.
+	 *
+	 * @param string $sync_id Optional sync ID.
+	 * @return array
+	 */
+	public function preload_categories_for_mapping( $sync_id = '' ) {
+		$sync_id = sanitize_text_field( (string) $sync_id );
+
+		if ( '' === $sync_id ) {
+			$sync_id = 'category-mapping-' . gmdate( 'YmdHis' );
+		}
+
+		$api      = new Mobo_Core_API_Client();
+		$response = $api->get_categories( $sync_id );
+
+		if ( is_wp_error( $response ) ) {
+			return $this->result(
+				false,
+				$response->get_error_message(),
+				array(
+					'skipped' => false,
+					'synced'  => false,
+				)
+			);
+		}
+
+		$category_result = $this->category_sync->load_categories_for_mapping_payload( $response );
+
+		update_option( 'mobo_core_categories_mapping_loaded_at', time(), false );
+
+		return $this->result(
+			true,
+			'دسته‌بندی‌ها فقط برای نگاشت لود شدند. هیچ دسته‌ای در ووکامرس ساخته یا بروزرسانی نشد.',
+			array(
+				'skipped'      => false,
+				'synced'       => true,
+				'mappingOnly'  => true,
+				'created'      => absint( $category_result['created'] ),
+				'updated'      => absint( $category_result['updated'] ),
+				'skippedItems' => absint( $category_result['skipped'] ),
 			)
 		);
 	}
@@ -981,8 +1133,34 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function save_manual_sync_state( $state ) {
+		if ( ! is_array( $state ) ) {
+			return false;
+		}
+
+		$incoming_status  = sanitize_key( (string) ( $state['status'] ?? '' ) );
+		$incoming_sync_id = sanitize_text_field( (string) ( $state['syncId'] ?? '' ) );
+		$current          = get_option( self::STATE_OPTION, array() );
+
+		/*
+		 * A running worker may have loaded the state before the admin clicked
+		 * cancel. Without this guard, that stale worker can save its old
+		 * "running" snapshot after the cancel request and make the UI look
+		 * alive again. Once a syncId is cancelled, only another explicit start or
+		 * resume action is allowed to move it out of cancelled state.
+		 */
+		if ( is_array( $current ) ) {
+			$current_status  = sanitize_key( (string) ( $current['status'] ?? '' ) );
+			$current_sync_id = sanitize_text_field( (string) ( $current['syncId'] ?? '' ) );
+
+			if ( 'cancelled' === $current_status && 'cancelled' !== $incoming_status && '' !== $incoming_sync_id && $incoming_sync_id === $current_sync_id ) {
+				return false;
+			}
+		}
+
 		$state['updatedAt'] = time();
 		update_option( self::STATE_OPTION, $state, false );
+
+		return true;
 	}
 
 	private function finish_current_product_state( &$state, $message ) {
@@ -1012,7 +1190,7 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function upsert_parent_product( $data, $skip_images ) {
-		$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
+		$product_guid = $this->extract_product_guid( $data );
 
 		if ( '' === $product_guid ) {
 			return 0;
@@ -1044,6 +1222,7 @@ class Mobo_Core_Product_Sync {
 			$product->set_name( $initial_title );
 			$product->set_status( 'publish' );
 			$product->update_meta_data( 'product_guid', $product_guid );
+			$this->store_portal_product_id_on_product_object( $product, $data );
 			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
 
 			$product_id = absint( $product->save() );
@@ -1063,6 +1242,7 @@ class Mobo_Core_Product_Sync {
 			}
 		} else {
 			$product->update_meta_data( 'product_guid', $product_guid );
+			$this->store_portal_product_id_on_product_object( $product, $data );
 			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
 			$product_id = absint( $product->save() );
 			$this->upsert_product_map( $product_guid, $product_id, true );
@@ -1081,7 +1261,16 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $is_new_product || $this->rules->should_update_stock() ) {
-			$this->apply_api_stock( $product, $this->get_value( $data, 'stock', null ) );
+			$stock_present = false;
+			$stock_value   = $this->get_stock_value_from_payload( $data, $stock_present );
+
+			if ( $stock_present ) {
+				$this->apply_api_stock( $product, $stock_value );
+			} elseif ( $is_new_product ) {
+				$this->apply_api_stock( $product, null );
+			} else {
+				$product->update_meta_data( '_mobo_stock_payload_missing', gmdate( 'c' ) );
+			}
 		}
 
 		if ( $is_new_product || $this->rules->should_update_slug() ) {
@@ -1097,6 +1286,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product->update_meta_data( 'product_guid', $product_guid );
+		$this->store_portal_product_id_on_product_object( $product, $data );
 
 		$attributes = $this->build_product_attributes( $this->get_value( $data, 'attributes', array() ) );
 
@@ -1120,9 +1310,12 @@ class Mobo_Core_Product_Sync {
 
 		$this->store_product_attribute_guids( $product_id, $this->get_value( $data, 'attributes', array() ) );
 
+		$product_category_refs = $this->get_product_category_refs_from_payload( $data );
+		$this->store_product_category_refs( $product_id, $product_category_refs );
+
 		$this->category_sync->assign_product_categories(
 			$product_id,
-			$this->get_value( $data, 'productCategories', array() ),
+			$product_category_refs,
 			$this->rules->should_update_categories(),
 			$is_new_product
 		);
@@ -1131,7 +1324,8 @@ class Mobo_Core_Product_Sync {
 			$this->image_sync->process_images(
 				$product_id,
 				$this->get_product_images_from_payload( $data ),
-				0
+				0,
+				false
 			);
 		}
 
@@ -1140,20 +1334,57 @@ class Mobo_Core_Product_Sync {
 
 	private function upsert_variation( $parent, $data ) {
 		if ( ! $parent instanceof WC_Product ) {
-			return 0;
+			return array(
+				'id'      => 0,
+				'changed' => false,
+			);
 		}
 
 		$parent_id    = absint( $parent->get_id() );
-		$variant_guid = sanitize_text_field( (string) $this->get_value( $data, 'variantId', '' ) );
+		$variant_guid = $this->extract_variant_guid( $data );
 
 		if ( $parent_id <= 0 || '' === $variant_guid ) {
-			return 0;
+			return array(
+				'id'      => 0,
+				'changed' => false,
+			);
 		}
 
-		$product_guid = sanitize_text_field( (string) $this->get_value( $data, 'productId', '' ) );
+		$product_guid  = $this->extract_product_guid( $data );
+		$incoming_hash = $this->build_variation_source_hash( $data, $product_guid );
+
+		if ( $this->is_remote_variation_trashed( $variant_guid ) ) {
+			return array(
+				'id'             => 0,
+				'changed'        => false,
+				'skipped_trash'  => true,
+			);
+		}
 
 		$variation_id     = $this->find_variation_id_by_guid( $variant_guid );
 		$is_new_variation = $variation_id <= 0;
+
+		if ( ! $is_new_variation && $variation_id > 0 ) {
+			$old_hash          = sanitize_text_field( (string) get_post_meta( $variation_id, '_mobo_variant_source_hash', true ) );
+			$old_incomplete    = sanitize_text_field( (string) get_post_meta( $variation_id, 'mobo_sync_incomplete', true ) );
+			$current_parent_id = absint( wp_get_post_parent_id( $variation_id ) );
+			$current_parent_ok = 0 === $current_parent_id || $current_parent_id === $parent_id;
+
+			if ( '' !== $incoming_hash && $old_hash === $incoming_hash && '1' !== $old_incomplete && $current_parent_ok ) {
+				if ( ! $this->variation_stock_matches_payload( $variation_id, $data ) ) {
+					update_post_meta( $variation_id, '_mobo_hash_skip_bypassed_reason', 'stock-mismatch' );
+					update_post_meta( $variation_id, '_mobo_hash_skip_bypassed_at', gmdate( 'c' ) );
+				} else {
+					$this->store_portal_ids_on_variation_post( $variation_id, $data, $product_guid, $parent_id );
+					$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false );
+
+					return array(
+						'id'      => $variation_id,
+						'changed' => false,
+					);
+				}
+			}
+		}
 
 		if ( $variation_id > 0 ) {
 			$variation = wc_get_product( $variation_id );
@@ -1176,6 +1407,8 @@ class Mobo_Core_Product_Sync {
 			$variation->set_status( 'publish' );
 			$variation->set_name( $initial_title );
 			$variation->update_meta_data( 'variant_guid', $variant_guid );
+			$this->store_portal_variant_id_on_product_object( $variation, $data );
+			$this->store_portal_product_id_on_product_object( $variation, $data, $parent_id );
 			$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
 
 			if ( '' !== $product_guid ) {
@@ -1189,26 +1422,22 @@ class Mobo_Core_Product_Sync {
 			}
 
 			if ( $variation_id <= 0 ) {
-				return 0;
+				return array(
+					'id'      => 0,
+					'changed' => false,
+				);
 			}
 
 			$variation = wc_get_product( $variation_id );
 
 			if ( ! $variation instanceof WC_Product_Variation ) {
-				return 0;
+				return array(
+					'id'      => 0,
+					'changed' => false,
+				);
 			}
 		} else {
 			$variation->set_parent_id( $parent_id );
-			$variation->set_status( 'publish' );
-			$variation->update_meta_data( 'variant_guid', $variant_guid );
-			$variation->update_meta_data( 'mobo_sync_incomplete', '1' );
-
-			if ( '' !== $product_guid ) {
-				$variation->update_meta_data( 'product_guid', $product_guid );
-			}
-
-			$variation_id = absint( $variation->save() );
-			$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true );
 		}
 
 		if ( $is_new_variation || $this->rules->should_update_title() ) {
@@ -1224,7 +1453,16 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $is_new_variation || $this->rules->should_update_stock() ) {
-			$this->apply_api_stock( $variation, $this->get_value( $data, 'stock', null ) );
+			$stock_present = false;
+			$stock_value   = $this->get_stock_value_from_payload( $data, $stock_present );
+
+			if ( $stock_present ) {
+				$this->apply_api_stock( $variation, $stock_value );
+			} elseif ( $is_new_variation ) {
+				$this->apply_api_stock( $variation, null );
+			} else {
+				$variation->update_meta_data( '_mobo_stock_payload_missing', gmdate( 'c' ) );
+			}
 		}
 
 		$attrs = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
@@ -1234,11 +1472,15 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$variation->update_meta_data( 'variant_guid', $variant_guid );
+		$this->store_portal_variant_id_on_product_object( $variation, $data );
+		$this->store_portal_product_id_on_product_object( $variation, $data, $parent_id );
 
 		if ( '' !== $product_guid ) {
 			$variation->update_meta_data( 'product_guid', $product_guid );
 		}
 
+		$variation->update_meta_data( '_mobo_variant_source_hash', $incoming_hash );
+		$variation->update_meta_data( '_mobo_variant_source_hash_updated_at', gmdate( 'c' ) );
 		$variation->update_meta_data( 'mobo_sync_incomplete', '0' );
 
 		$variation_id = absint( $variation->save() );
@@ -1247,7 +1489,146 @@ class Mobo_Core_Product_Sync {
 			$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false );
 		}
 
-		return $variation_id;
+		return array(
+			'id'      => $variation_id,
+			'changed' => $variation_id > 0,
+		);
+	}
+
+
+
+	private function store_portal_product_id_on_product_object( $product, $data, $fallback_product_id = 0 ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$portal_product_id = $this->extract_portal_product_id( $data );
+
+		if ( $portal_product_id <= 0 && $fallback_product_id > 0 ) {
+			$portal_product_id = absint( get_post_meta( absint( $fallback_product_id ), 'portal_product_id', true ) );
+		}
+
+		if ( $portal_product_id <= 0 ) {
+			return;
+		}
+
+		$product->update_meta_data( 'portal_product_id', $portal_product_id );
+		$product->update_meta_data( 'mobo_portal_product_id', $portal_product_id );
+		$product->update_meta_data( '_mobo_portal_product_id', $portal_product_id );
+	}
+
+	private function store_portal_variant_id_on_product_object( $product, $data ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$portal_variant_id = $this->extract_portal_variant_id( $data );
+
+		if ( $portal_variant_id <= 0 ) {
+			return;
+		}
+
+		$product->update_meta_data( 'portal_variant_id', $portal_variant_id );
+		$product->update_meta_data( 'mobo_portal_variant_id', $portal_variant_id );
+		$product->update_meta_data( '_mobo_portal_variant_id', $portal_variant_id );
+	}
+
+	private function store_portal_ids_on_variation_post( $variation_id, $data, $product_guid = '', $parent_id = 0 ) {
+		$variation_id = absint( $variation_id );
+
+		if ( $variation_id <= 0 ) {
+			return;
+		}
+
+		$portal_variant_id = $this->extract_portal_variant_id( $data );
+
+		if ( $portal_variant_id > 0 ) {
+			update_post_meta( $variation_id, 'portal_variant_id', $portal_variant_id );
+			update_post_meta( $variation_id, 'mobo_portal_variant_id', $portal_variant_id );
+			update_post_meta( $variation_id, '_mobo_portal_variant_id', $portal_variant_id );
+		}
+
+		$portal_product_id = $this->extract_portal_product_id( $data );
+
+		if ( $portal_product_id <= 0 && $parent_id > 0 ) {
+			$portal_product_id = absint( get_post_meta( absint( $parent_id ), 'portal_product_id', true ) );
+		}
+
+		if ( $portal_product_id > 0 ) {
+			update_post_meta( $variation_id, 'portal_product_id', $portal_product_id );
+			update_post_meta( $variation_id, 'mobo_portal_product_id', $portal_product_id );
+			update_post_meta( $variation_id, '_mobo_portal_product_id', $portal_product_id );
+		}
+
+		if ( '' !== $product_guid ) {
+			update_post_meta( $variation_id, 'product_guid', sanitize_text_field( (string) $product_guid ) );
+		}
+	}
+
+	private function build_variation_source_hash( $data, $product_guid = '' ) {
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+
+		$hash_data = array(
+			'variantId'       => $this->extract_variant_guid( $data ),
+			'productId'       => sanitize_text_field( (string) $product_guid ),
+			'attributes'      => $this->get_value( $data, 'attributes', array() ),
+			'updateTitle'     => $this->rules->should_update_title() ? 1 : 0,
+			'updatePrice'     => $this->rules->should_update_price() ? 1 : 0,
+			'updateCompare'   => $this->rules->should_update_compare_price() ? 1 : 0,
+			'updateStock'     => $this->rules->should_update_stock() ? 1 : 0,
+			'pricePolicyHash' => $this->build_price_policy_hash(),
+		);
+
+		if ( $this->rules->should_update_title() ) {
+			$hash_data['title'] = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+		}
+
+		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+			$hash_data['price']        = $this->get_value( $data, 'price', null );
+			$hash_data['comparePrice'] = $this->get_value( $data, 'comparePrice', null );
+		}
+
+		if ( $this->rules->should_update_stock() ) {
+			$stock_present      = false;
+			$hash_data['stock'] = $this->get_stock_value_from_payload( $data, $stock_present );
+			$hash_data['stockPresent'] = $stock_present ? 1 : 0;
+		}
+
+		$hash_data = $this->sort_array_for_hash( $hash_data );
+		$json      = wp_json_encode( $hash_data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+		return false === $json ? '' : md5( $json );
+	}
+
+	private function build_price_policy_hash() {
+		$policy = array(
+			'mobo_price_type'                   => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
+			'global_additional_price'           => (string) Mobo_Core_Settings::get( 'global_additional_price', 0 ),
+			'global_product_auto_compare_price' => (string) Mobo_Core_Settings::get( 'global_product_auto_compare_price', '0' ),
+			'mobo_dynamic_price'                => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
+		);
+
+		$json = wp_json_encode( $this->sort_array_for_hash( $policy ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+		return false === $json ? '' : md5( $json );
+	}
+
+	private function sort_array_for_hash( $value ) {
+		if ( ! is_array( $value ) ) {
+			return $value;
+		}
+
+		if ( ! $this->is_list_array( $value ) ) {
+			ksort( $value );
+		}
+
+		foreach ( $value as $key => $item ) {
+			$value[ $key ] = $this->sort_array_for_hash( $item );
+		}
+
+		return $value;
 	}
 
 	private function product_has_variation_attributes( $data ) {
@@ -1362,6 +1743,153 @@ class Mobo_Core_Product_Sync {
 		return wc_get_product( $product_id );
 	}
 
+	private function is_authoritative_variant_list_payload( $payload, $variants ) {
+		if ( ! is_array( $payload ) ) {
+			return false;
+		}
+
+		$explicit_keys = array(
+			'variantListAuthoritative',
+			'variant_list_authoritative',
+			'authoritativeVariantList',
+			'authoritative_variant_list',
+			'isFullVariantSnapshot',
+			'is_full_variant_snapshot',
+			'fullVariantSync',
+			'full_variant_sync',
+		);
+
+		foreach ( $explicit_keys as $key ) {
+			if ( array_key_exists( $key, $payload ) ) {
+				return $this->to_bool( $payload[ $key ] );
+			}
+		}
+
+		/*
+		 * Webhook UpdateVariant messages are deltas, not full snapshots. A payload like
+		 * { event: UpdateVariant, data: { totalCount: 1, data: [one variant] } }
+		 * must never mark the other product variations as missing/out-of-stock.
+		 */
+		$event = strtolower( sanitize_text_field( (string) $this->get_value( $payload, 'event', '' ) ) );
+
+		if ( 'updatevariant' === $event ) {
+			return false;
+		}
+
+		$entity_type = strtolower( sanitize_text_field( (string) $this->get_value( $payload, 'entityType', $this->get_value( $payload, 'entity_type', '' ) ) ) );
+
+		if ( 'variant' === $entity_type ) {
+			return false;
+		}
+
+		/*
+		 * Safety rule: UpdateVariant payloads are treated as delta/webhook updates unless
+		 * they explicitly opt in via variantListAuthoritative/isFullVariantSnapshot.
+		 * This prevents four single-variant webhooks from marking each other's variants
+		 * as missing/out-of-stock. Full manual/API syncs set the explicit flag above.
+		 */
+		return false;
+	}
+
+	private function normalize_variant_items_from_response( $response ) {
+		$items = $this->get_value( $response, 'data', array() );
+
+		if ( is_array( $items ) && ! $this->is_list_array( $items ) ) {
+			$nested_items = $this->get_value( $items, 'data', null );
+			if ( is_array( $nested_items ) ) {
+				$items = $nested_items;
+			}
+		}
+
+		return is_array( $items ) ? $items : array();
+	}
+
+	private function get_stock_value_from_payload( $data, &$present = false ) {
+		$present = false;
+
+		if ( ! is_array( $data ) ) {
+			return null;
+		}
+
+		$keys = array(
+			'stock',
+			'Stock',
+			'stock_quantity',
+			'stockQuantity',
+			'quantity',
+			'Quantity',
+			'inventory',
+			'inventoryQuantity',
+		);
+
+		foreach ( $keys as $key ) {
+			if ( array_key_exists( $key, $data ) ) {
+				$present = true;
+				return $data[ $key ];
+			}
+		}
+
+		return null;
+	}
+
+	private function variation_stock_matches_payload( $variation_id, $data ) {
+		if ( ! $this->rules->should_update_stock() ) {
+			return true;
+		}
+
+		$stock_present = false;
+		$stock_value   = $this->get_stock_value_from_payload( $data, $stock_present );
+
+		if ( ! $stock_present ) {
+			return true;
+		}
+
+		$normalized = $this->normalize_api_stock_quantity( $stock_value );
+
+		if ( null === $normalized ) {
+			return true;
+		}
+
+		$variation = wc_get_product( absint( $variation_id ) );
+
+		if ( ! $variation instanceof WC_Product_Variation ) {
+			return false;
+		}
+
+		$current_quantity = $variation->get_stock_quantity();
+		$current_status   = (string) $variation->get_stock_status();
+		$expected_status   = $normalized > 0 ? 'instock' : 'outofstock';
+
+		if ( ! $variation->get_manage_stock() ) {
+			return false;
+		}
+
+		if ( null === $current_quantity || (int) $current_quantity !== (int) $normalized ) {
+			return false;
+		}
+
+		if ( $current_status !== $expected_status ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	private function normalize_api_stock_quantity( $stock ) {
+		if ( null === $stock || '' === $stock || ! is_scalar( $stock ) ) {
+			return null;
+		}
+
+		$raw_stock        = trim( (string) $stock );
+		$normalized_stock = str_replace( ',', '.', $raw_stock );
+
+		if ( '' === $raw_stock || ! is_numeric( $normalized_stock ) ) {
+			return null;
+		}
+
+		return max( 0, (int) floor( (float) $normalized_stock ) );
+	}
+
 	private function apply_api_stock( $product, $stock ) {
 		if ( ! $product instanceof WC_Product ) {
 			return;
@@ -1371,14 +1899,28 @@ class Mobo_Core_Product_Sync {
 			$product->set_manage_stock( false );
 			$product->set_stock_quantity( null );
 			$product->set_stock_status( 'instock' );
+			$product->update_meta_data( '_mobo_last_api_stock_raw', '' );
+			$product->update_meta_data( '_mobo_stock_update_source', 'api-empty-stock' );
 			return;
 		}
 
-		$stock_quantity = max( 0, absint( $stock ) );
+		$raw_stock      = is_scalar( $stock ) ? trim( (string) $stock ) : '';
+		$stock_quantity = $this->normalize_api_stock_quantity( $stock );
+
+		if ( null === $stock_quantity ) {
+			$product->update_meta_data( '_mobo_last_api_stock_raw', sanitize_text_field( $raw_stock ) );
+			$product->update_meta_data( '_mobo_stock_update_source', 'api-invalid-stock-skipped' );
+			$product->update_meta_data( '_mobo_stock_update_skipped_at', gmdate( 'c' ) );
+			return;
+		}
 
 		$product->set_manage_stock( true );
 		$product->set_stock_quantity( $stock_quantity );
 		$product->set_stock_status( $stock_quantity > 0 ? 'instock' : 'outofstock' );
+		$product->update_meta_data( '_mobo_last_api_stock_raw', sanitize_text_field( $raw_stock ) );
+		$product->update_meta_data( '_mobo_last_api_stock_quantity', $stock_quantity );
+		$product->update_meta_data( '_mobo_last_api_stock_applied_at', gmdate( 'c' ) );
+		$product->update_meta_data( '_mobo_stock_update_source', 'api-stock' );
 	}
 
 	private function apply_product_slug( $product, $data ) {
@@ -1611,7 +2153,7 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
-			$guid = sanitize_text_field( (string) $this->get_value( $attribute_data, 'id', '' ) );
+			$guid = $this->extract_attribute_guid( $attribute_data );
 			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
 
 			if ( '' !== $guid && '' !== $name ) {
@@ -1623,6 +2165,31 @@ class Mobo_Core_Product_Sync {
 			update_post_meta( $product_id, 'attribute_guid', $map );
 			update_post_meta( $product_id, 'mobo_attribute_guid_map', $map );
 		}
+	}
+
+
+	/**
+	 * Extract attribute GUID from an attribute payload.
+	 *
+	 * @param array $attribute_data Attribute payload.
+	 * @return string
+	 */
+	private function extract_attribute_guid( $attribute_data ) {
+		if ( ! is_array( $attribute_data ) ) {
+			return '';
+		}
+
+		$keys = array( 'attribute_guid', 'attributeGuid', 'attributeId', 'guid', 'remote_guid', 'remoteGuid', 'id' );
+
+		foreach ( $keys as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $attribute_data, $key, '' ) );
+
+			if ( $this->is_remote_guid_value( $value ) ) {
+				return $value;
+			}
+		}
+
+		return '';
 	}
 
 	private function normalize_variation_attributes( $attributes ) {
@@ -1686,6 +2253,10 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
+			if ( in_array( get_post_status( $variation_id ), array( 'trash', 'auto-draft' ), true ) ) {
+				continue;
+			}
+
 			$variant_guid = sanitize_text_field( (string) get_post_meta( $variation_id, 'variant_guid', true ) );
 
 			if ( '' === $variant_guid || isset( $seen[ $variant_guid ] ) ) {
@@ -1703,6 +2274,66 @@ class Mobo_Core_Product_Sync {
 			$variation->set_stock_status( 'outofstock' );
 			$variation->save();
 		}
+	}
+
+	private function is_remote_product_trashed( $guid ) {
+		return $this->remote_post_has_blocked_status( $guid, 'product', 'product_guid', 'product' );
+	}
+
+	private function is_remote_variation_trashed( $guid ) {
+		return $this->remote_post_has_blocked_status( $guid, 'product_variation', 'variant_guid', 'variation' );
+	}
+
+	private function remote_post_has_blocked_status( $guid, $post_type, $meta_key, $object_type ) {
+		$guid = sanitize_text_field( (string) $guid );
+
+		if ( '' === $guid ) {
+			return false;
+		}
+
+		$status = '';
+
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			if ( 'product' === $object_type && method_exists( $this->product_map, 'get_product_post_status' ) ) {
+				$status = $this->product_map->get_product_post_status( $guid );
+			} elseif ( 'variation' === $object_type && method_exists( $this->product_map, 'get_variation_post_status' ) ) {
+				$status = $this->product_map->get_variation_post_status( $guid );
+			}
+		}
+
+		if ( in_array( $status, array( 'trash', 'auto-draft' ), true ) ) {
+			return true;
+		}
+
+		return $this->find_blocked_post_id_by_meta( $post_type, $meta_key, $guid ) > 0;
+	}
+
+	private function find_blocked_post_id_by_meta( $post_type, $meta_key, $meta_value ) {
+		$meta_value = sanitize_text_field( (string) $meta_value );
+
+		if ( '' === $meta_value ) {
+			return 0;
+		}
+
+		$query = new WP_Query(
+			array(
+				'post_type'              => sanitize_key( $post_type ),
+				'post_status'            => array( 'trash', 'auto-draft' ),
+				'fields'                 => 'ids',
+				'posts_per_page'         => 1,
+				'no_found_rows'          => true,
+				'update_post_meta_cache' => false,
+				'update_post_term_cache' => false,
+				'meta_query'             => array(
+					array(
+						'key'   => sanitize_key( $meta_key ),
+						'value' => $meta_value,
+					),
+				),
+			)
+		);
+
+		return ! empty( $query->posts[0] ) ? absint( $query->posts[0] ) : 0;
 	}
 
 	private function find_product_id_by_guid( $guid ) {
@@ -1838,28 +2469,20 @@ class Mobo_Core_Product_Sync {
 		update_option( $option_name, $seen, false );
 	}
 
+	private function count_seen_variants( $product_guid, $sync_id ) {
+		$seen = get_option( $this->seen_option_name( $product_guid, $sync_id ), array() );
 
+		return is_array( $seen ) ? count( $seen ) : 0;
+	}
+
+
+	/**
+	 * Deprecated: product identity is GUID-only and must be present in payload.
+	 *
+	 * @param string $url URL.
+	 * @return string
+	 */
 	private function extract_product_guid_from_url( $url ) {
-		$url = trim( (string) $url );
-
-		if ( '' === $url ) {
-			return '';
-		}
-
-		$path = wp_parse_url( $url, PHP_URL_PATH );
-
-		if ( ! is_string( $path ) || '' === $path ) {
-			return '';
-		}
-
-		$segments = array_values( array_filter( explode( '/', trim( $path, '/' ) ), 'strlen' ) );
-
-		foreach ( $segments as $index => $segment ) {
-			if ( 'get-variants' === strtolower( $segment ) && $index > 0 ) {
-				return sanitize_text_field( rawurldecode( (string) $segments[ $index - 1 ] ) );
-			}
-		}
-
 		return '';
 	}
 
@@ -1914,6 +2537,127 @@ class Mobo_Core_Product_Sync {
 		return $default;
 	}
 
+
+
+
+	private function extract_portal_product_id( $data ) {
+		return $this->extract_positive_int_from_payload(
+			$data,
+			array(
+				'portal_product_id',
+				'portalProductId',
+				'PortalProductId',
+				'portal_product_id_api',
+				'portalId',
+			)
+		);
+	}
+
+	private function extract_portal_variant_id( $data ) {
+		return $this->extract_positive_int_from_payload(
+			$data,
+			array(
+				'portal_variant_id',
+				'portalVariantId',
+				'PortalVariantId',
+				'portalVariantID',
+			)
+		);
+	}
+
+	private function extract_positive_int_from_payload( $data, $keys ) {
+		if ( ! is_array( $data ) || ! is_array( $keys ) ) {
+			return 0;
+		}
+
+		foreach ( $keys as $key ) {
+			$value = $this->get_value( $data, $key, null );
+
+			if ( null === $value || '' === $value || is_array( $value ) || is_object( $value ) ) {
+				continue;
+			}
+
+			$value = trim( (string) $value );
+
+			if ( '' === $value || ! preg_match( '/^\d+$/', $value ) ) {
+				continue;
+			}
+
+			$int_value = absint( $value );
+
+			if ( $int_value > 0 ) {
+				return $int_value;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Extract remote product GUID from a payload.
+	 *
+	 * @param array $data Payload.
+	 * @return string
+	 */
+	private function extract_product_guid( $data ) {
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+
+		$keys = array( 'product_guid', 'productGuid', 'productId', 'parent_product_guid', 'parentProductId', 'parentGuid', 'remote_guid', 'remoteGuid', 'entity_guid', 'entityGuid', 'entityId', 'id' );
+
+		foreach ( $keys as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $data, $key, '' ) );
+			if ( $this->is_remote_guid_value( $value ) ) {
+				return $value;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Extract remote variation GUID from a payload.
+	 *
+	 * @param array $data Payload.
+	 * @return string
+	 */
+	private function extract_variant_guid( $data ) {
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+
+		$keys = array( 'variant_guid', 'variantGuid', 'variantId', 'guid', 'remote_guid', 'remoteGuid', 'entity_guid', 'entityGuid', 'entity_id', 'entityId', 'id' );
+
+		foreach ( $keys as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $data, $key, '' ) );
+			if ( $this->is_remote_guid_value( $value ) ) {
+				return $value;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Check whether a value is usable as a remote GUID.
+	 *
+	 * @param string $value Value.
+	 * @return bool
+	 */
+	private function is_remote_guid_value( $value ) {
+		$value = trim( sanitize_text_field( (string) $value ) );
+
+		if ( '' === $value ) {
+			return false;
+		}
+
+		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
+			return false;
+		}
+
+		return true;
+	}
 
 	/**
 	 * Return the first non-empty scalar value.
@@ -2003,7 +2747,170 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
-	/**
+	
+
+/**
+ * Return product category refs from all supported payload field names.
+ *
+ * Identity must be based on category GUIDs, but the collection name can differ
+ * between .NET serializers or older payload versions.
+ *
+ * @param array $data Product payload.
+ * @return array
+ */
+private function get_product_category_refs_from_payload( $data ) {
+	if ( ! is_array( $data ) ) {
+		return array();
+	}
+
+	$keys = array(
+		'product_categories',
+		'productCategories',
+		'ProductCategories',
+		'category_refs',
+		'categoryRefs',
+		'categories',
+		'Categories',
+		'category_guids',
+		'categoryGuids',
+		'CategoryGuids',
+	);
+
+	foreach ( $keys as $key ) {
+		$value = $this->get_value( $data, $key, null );
+
+		if ( is_array( $value ) && ! empty( $value ) ) {
+			return $value;
+		}
+	}
+
+	return array();
+}
+
+
+/**
+ * Store product category refs for later category reapply runs.
+ *
+ * @param int   $product_id Product ID.
+ * @param mixed $category_refs Raw category refs.
+ * @return void
+ */
+private function store_product_category_refs( $product_id, $category_refs ) {
+	$product_id = absint( $product_id );
+
+	if ( $product_id <= 0 ) {
+		return;
+	}
+
+	if ( ! is_array( $category_refs ) ) {
+		delete_post_meta( $product_id, 'mobo_product_category_refs_json' );
+		delete_post_meta( $product_id, 'mobo_product_category_guids' );
+		return;
+	}
+
+	$normalized = array();
+	$guids      = array();
+
+	foreach ( $category_refs as $ref ) {
+		if ( ! is_array( $ref ) ) {
+			$guid = sanitize_text_field( (string) $ref );
+
+			if ( $this->is_remote_guid_value( $guid ) ) {
+				$normalized[] = array( 'id' => $guid );
+				$guids[]      = $guid;
+			}
+
+			continue;
+		}
+
+		$guid = $this->extract_category_guid_for_storage( $ref );
+
+		if ( '' === $guid ) {
+			continue;
+		}
+
+		$normalized[] = array(
+			'id'       => $guid,
+			'title'    => sanitize_text_field( (string) $this->get_value( $ref, 'title', '' ) ),
+			'url'      => sanitize_text_field( (string) $this->get_value( $ref, 'url', '' ) ),
+			'parentId' => sanitize_text_field( (string) $this->get_value( $ref, 'parentId', '' ) ),
+		);
+		$guids[] = $guid;
+	}
+
+	if ( empty( $normalized ) ) {
+		delete_post_meta( $product_id, 'mobo_product_category_refs_json' );
+		delete_post_meta( $product_id, 'mobo_product_category_guids' );
+		return;
+	}
+
+	update_post_meta( $product_id, 'mobo_product_category_refs_json', wp_json_encode( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+	update_post_meta( $product_id, 'mobo_product_category_guids', array_values( array_unique( array_filter( $guids ) ) ) );
+}
+
+/**
+ * Extract category GUID for storage.
+ *
+ * @param array $ref Category ref.
+ * @return string
+ */
+private function extract_category_guid_for_storage( $ref ) {
+	$guids = $this->collect_category_guid_candidates_for_storage( $ref );
+
+	return ! empty( $guids ) ? sanitize_text_field( (string) $guids[0] ) : '';
+}
+
+/**
+ * Collect category GUID candidates for storage, preferring actual category GUIDs over relation IDs.
+ *
+ * @param mixed $ref Category ref.
+ * @return array
+ */
+private function collect_category_guid_candidates_for_storage( $ref ) {
+	$guids = array();
+
+	if ( ! is_array( $ref ) ) {
+		$value = sanitize_text_field( (string) $ref );
+		return $this->is_remote_guid_value( $value ) ? array( $value ) : array();
+	}
+
+	$primary_keys = array( 'category_guid', 'categoryGuid', 'categoryId', 'categoryGUID', 'guid', 'remote_guid', 'remoteGuid', 'portal_category_id', 'portalCategoryId', 'category_portal_id', 'categoryPortalId' );
+	foreach ( $primary_keys as $key ) {
+		$this->append_category_guid_candidate_for_storage( $guids, $this->get_value( $ref, $key, '' ) );
+	}
+
+	$nested = $this->get_value( $ref, 'category', null );
+	if ( is_array( $nested ) ) {
+		foreach ( $this->collect_category_guid_candidates_for_storage( $nested ) as $nested_guid ) {
+			$this->append_category_guid_candidate_for_storage( $guids, $nested_guid );
+		}
+	} else {
+		$this->append_category_guid_candidate_for_storage( $guids, $nested );
+	}
+
+	$fallback_keys = array( 'product_category_id', 'productCategoryId', 'product_category_guid', 'productCategoryGuid', 'id' );
+	foreach ( $fallback_keys as $key ) {
+		$this->append_category_guid_candidate_for_storage( $guids, $this->get_value( $ref, $key, '' ) );
+	}
+
+	return array_values( array_unique( array_filter( $guids ) ) );
+}
+
+/**
+ * Append storage GUID candidate.
+ *
+ * @param array $guids GUID list.
+ * @param mixed $value Raw value.
+ * @return void
+ */
+private function append_category_guid_candidate_for_storage( &$guids, $value ) {
+	$value = trim( sanitize_text_field( (string) $value ) );
+	if ( '' !== $value && $this->is_remote_guid_value( $value ) ) {
+		$guids[] = $value;
+	}
+}
+
+/**
  * Check if product should be excluded by URL.
  *
  * @param array $product_data Product payload.

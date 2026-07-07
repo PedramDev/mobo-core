@@ -76,6 +76,44 @@ class Mobo_Core_API_Client {
 		return $this->get_json( $path );
 	}
 
+
+	/**
+	 * Get a single product payload by remote product GUID.
+	 *
+	 * Portal endpoint:
+	 * /get-products-by-guid?ProductId={productGuid}&SyncId=...
+	 *
+	 * This is used by category reapply to backfill category_guid metadata for
+	 * products that were synced by older plugin versions before category refs
+	 * were persisted on the WooCommerce product.
+	 *
+	 * @param string $product_guid Remote product GUID.
+	 * @param string $sync_id Sync ID.
+	 * @return array|WP_Error
+	 */
+	public function get_product_by_guid( $product_guid, $sync_id = '' ) {
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$sync_id      = sanitize_text_field( (string) $sync_id );
+
+		if ( '' === $product_guid ) {
+			return new WP_Error( 'mobo_core_missing_product_guid', 'Product GUID is missing.' );
+		}
+
+		if ( '' === $sync_id ) {
+			$sync_id = 'category-backfill-' . gmdate( 'YmdHis' );
+		}
+
+		$path = add_query_arg(
+			array(
+				'ProductId' => $product_guid,
+				'SyncId'    => $sync_id,
+			),
+			'get-products-by-guid'
+		);
+
+		return $this->get_json( $path );
+	}
+
 	/**
 	 * Get variants page.
 	 *
@@ -136,6 +174,30 @@ class Mobo_Core_API_Client {
 		}
 
 		return $this->get_json_url( $url, Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 ) );
+	}
+
+
+	/**
+	 * Get cached address mapping from Portal.
+	 *
+	 * Portal returns countries/states/cities with Mobo numeric IDs. Customer sites
+	 * cache this locally and use it for checkout address selects.
+	 *
+	 * Expected endpoint:
+	 * /get-address-mapping?force=true|false
+	 *
+	 * @param bool $force Ask Portal to refresh if needed.
+	 * @return array|WP_Error
+	 */
+	public function get_address_mapping( $force = false ) {
+		$path = add_query_arg(
+			array(
+				'force' => $force ? 'true' : 'false',
+			),
+			'get-address-mapping'
+		);
+
+		return $this->get_json( $path );
 	}
 
 	/**

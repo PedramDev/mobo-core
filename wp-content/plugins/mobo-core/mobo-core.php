@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/moboplugin.com
  * Description: همگام‌سازی مرحله‌ای محصولات، تنوع‌ها، دسته‌بندی‌ها، تصاویر و وب‌هوک‌ها برای ووکامرس.
- * Version: 10.25.2
+ * Version: 10.31.1
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.25.2' );
+define( 'MOBO_CORE_VERSION', '10.31.1' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -59,12 +59,15 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-map.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-recategorize-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-maintenance.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cron-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-self-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-health-reporter.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-checkout-validator.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-variation-fields.php';
@@ -160,6 +163,12 @@ add_action(
 		 */
 		$checkout_validator = new Mobo_Core_Checkout_Validator();
 		$checkout_validator->init();
+
+		/*
+		 * Mobo address mapping for checkout country/state/city selects.
+		 */
+		$address_mapping = new Mobo_Core_Address_Mapping();
+		$address_mapping->init();
 
 		/*
 		 * REST endpoints for C# runner and webhooks.

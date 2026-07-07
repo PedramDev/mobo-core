@@ -160,7 +160,7 @@ class Mobo_Core_Reprice_Queue {
 				if ( ! empty( $result['parentId'] ) ) {
 					$parents_to_sync[ absint( $result['parentId'] ) ] = true;
 				}
-			} catch ( Exception $e ) {
+			} catch ( Throwable $e ) {
 				$failed++;
 				$state['lastError'] = sanitize_text_field( $e->getMessage() );
 			}
@@ -182,9 +182,15 @@ class Mobo_Core_Reprice_Queue {
 		}
 
 		foreach ( array_keys( $parents_to_sync ) as $parent_id ) {
-			if ( function_exists( 'wc_get_product' ) ) {
-				WC_Product_Variable::sync( absint( $parent_id ) );
-				wc_delete_product_transients( absint( $parent_id ) );
+			if ( function_exists( 'wc_get_product' ) && class_exists( 'WC_Product_Variable' ) ) {
+				try {
+					WC_Product_Variable::sync( absint( $parent_id ) );
+					wc_delete_product_transients( absint( $parent_id ) );
+				} catch ( Throwable $e ) {
+					$failed++;
+					$state['lastError'] = 'خطا در sync محصول متغیر ' . absint( $parent_id ) . ': ' . sanitize_text_field( $e->getMessage() );
+					error_log( 'Mobo Core reprice parent sync failed for product ' . absint( $parent_id ) . ': ' . $e->getMessage() );
+				}
 			}
 		}
 
@@ -253,6 +259,12 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	private function reprice_object( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( ! $this->is_reprice_allowed_post( $post_id ) ) {
+			return array( 'updated' => false, 'skipped' => true );
+		}
+
 		$product = wc_get_product( $post_id );
 
 		if ( ! $product instanceof WC_Product ) {
@@ -305,6 +317,54 @@ class Mobo_Core_Reprice_Queue {
 	}
 
 	/**
+	 * Check whether a product/variation is allowed to be repriced.
+	 *
+	 * Reprice is intentionally limited to published synced objects. A variation
+	 * is only eligible when both the variation and its parent product are
+	 * published. Draft/private/pending/trash objects are left untouched.
+	 *
+	 * @param int $post_id Product or variation post ID.
+	 * @return bool
+	 */
+	private function is_reprice_allowed_post( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof WP_Post ) {
+			return false;
+		}
+
+		if ( 'publish' !== $post->post_status ) {
+			return false;
+		}
+
+		if ( 'product' === $post->post_type ) {
+			return true;
+		}
+
+		if ( 'product_variation' !== $post->post_type ) {
+			return false;
+		}
+
+		$parent_id = absint( $post->post_parent );
+
+		if ( $parent_id <= 0 ) {
+			return false;
+		}
+
+		$parent = get_post( $parent_id );
+
+		return $parent instanceof WP_Post
+			&& 'product' === $parent->post_type
+			&& 'publish' === $parent->post_status;
+	}
+
+	/**
 	 * Count repricable objects.
 	 *
 	 * @return int
@@ -316,8 +376,10 @@ class Mobo_Core_Reprice_Queue {
 			SELECT COUNT(DISTINCT p.ID)
 			FROM {$wpdb->posts} p
 			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+			LEFT JOIN {$wpdb->posts} parent ON parent.ID = p.post_parent
 			WHERE p.post_type IN ('product', 'product_variation')
-			AND p.post_status NOT IN ('trash', 'auto-draft')
+			AND p.post_status = 'publish'
+			AND (p.post_type = 'product' OR (p.post_type = 'product_variation' AND parent.post_type = 'product' AND parent.post_status = 'publish'))
 			AND pm.meta_key = 'mobo_api_price'
 			AND pm.meta_value <> ''
 		" ) );
@@ -341,8 +403,10 @@ class Mobo_Core_Reprice_Queue {
 			SELECT DISTINCT p.ID
 			FROM {$wpdb->posts} p
 			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+			LEFT JOIN {$wpdb->posts} parent ON parent.ID = p.post_parent
 			WHERE p.post_type IN ('product', 'product_variation')
-			AND p.post_status NOT IN ('trash', 'auto-draft')
+			AND p.post_status = 'publish'
+			AND (p.post_type = 'product' OR (p.post_type = 'product_variation' AND parent.post_type = 'product' AND parent.post_status = 'publish'))
 			AND pm.meta_key = 'mobo_api_price'
 			AND pm.meta_value <> ''
 			AND p.ID > %d

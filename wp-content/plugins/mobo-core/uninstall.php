@@ -40,8 +40,13 @@ delete_option( 'mobo_core_real_cron_last_result' );
 delete_option( 'mobo_core_real_cron_time_budget_seconds' );
 delete_option( 'mobo_core_real_cron_max_sync_steps' );
 delete_option( 'mobo_core_real_cron_lock_ttl_seconds' );
+delete_option( 'mobo_core_real_cron_expected_interval_seconds' );
 delete_option( 'mobo_core_real_cron_process_webhooks' );
 delete_option( 'mobo_core_process_webhook_on_receive' );
+delete_option( 'mobo_core_webhook_queue_last_attempt_at' );
+delete_option( 'mobo_core_webhook_queue_last_success_at' );
+delete_option( 'mobo_core_webhook_queue_last_activity_at' );
+delete_option( 'mobo_core_webhook_queue_last_result' );
 
 /*
  * Remove old v2 beta option if it exists.

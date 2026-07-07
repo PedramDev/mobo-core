@@ -99,6 +99,26 @@ class Mobo_Core_Product_Map {
 	}
 
 	/**
+	 * Get product post status by remote product GUID.
+	 *
+	 * @param string $guid Remote product GUID.
+	 * @return string
+	 */
+	public function get_product_post_status( $guid ) {
+		return $this->get_post_status( $guid, self::TYPE_PRODUCT, 'product' );
+	}
+
+	/**
+	 * Get variation post status by remote variant GUID.
+	 *
+	 * @param string $guid Remote variant GUID.
+	 * @return string
+	 */
+	public function get_variation_post_status( $guid ) {
+		return $this->get_post_status( $guid, self::TYPE_VARIATION, 'product_variation' );
+	}
+
+	/**
 	 * Upsert product mapping.
 	 *
 	 * @param string $guid Remote product GUID.
@@ -223,7 +243,54 @@ class Mobo_Core_Product_Map {
 			return 0;
 		}
 
+		$status = get_post_status( $post_id );
+
+		if ( in_array( $status, array( 'trash', 'auto-draft' ), true ) ) {
+			return 0;
+		}
+
 		return $post_id;
+	}
+
+	/**
+	 * Get post status from map and validate post type.
+	 *
+	 * @param string $guid Remote GUID.
+	 * @param string $object_type product|variation.
+	 * @param string $expected_post_type WP post type.
+	 * @return string
+	 */
+	private function get_post_status( $guid, $object_type, $expected_post_type ) {
+		global $wpdb;
+
+		$guid = sanitize_text_field( (string) $guid );
+
+		if ( '' === $guid || ! self::table_exists() ) {
+			return '';
+		}
+
+		$table = self::table_name();
+		$row   = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT id, wp_post_id FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+				$guid,
+				sanitize_key( (string) $object_type )
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $row ) || empty( $row['wp_post_id'] ) ) {
+			return '';
+		}
+
+		$post_id = absint( $row['wp_post_id'] );
+
+		if ( $post_id <= 0 || get_post_type( $post_id ) !== $expected_post_type ) {
+			$this->delete_row( absint( $row['id'] ) );
+			return '';
+		}
+
+		return sanitize_key( (string) get_post_status( $post_id ) );
 	}
 
 	/**
@@ -293,6 +360,7 @@ class Mobo_Core_Product_Map {
 				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
 				WHERE p.ID > %d
 				AND p.post_type = 'product'
+				AND p.post_status NOT IN ('trash', 'auto-draft')
 				AND pm.meta_value <> ''
 				ORDER BY p.ID ASC
 				LIMIT %d",
@@ -344,6 +412,7 @@ class Mobo_Core_Product_Map {
 				LEFT JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
 				WHERE p.ID > %d
 				AND p.post_type = 'product_variation'
+				AND p.post_status NOT IN ('trash', 'auto-draft')
 				AND vm.meta_value <> ''
 				ORDER BY p.ID ASC
 				LIMIT %d",

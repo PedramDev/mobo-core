@@ -84,6 +84,19 @@ class Mobo_Core_Category_Map {
 		return $this->get_term_id_by_column( $guid, 'manual_term_id', true );
 	}
 
+
+	/**
+	 * Get manually mapped local term ID using GUID identifiers only.
+	 *
+	 * URL/path/slug are stored for display and diagnostics, not identity.
+	 *
+	 * @param array $identifiers Candidate remote GUID identifiers.
+	 * @return int
+	 */
+	public function get_manual_term_id_by_identifiers( $identifiers ) {
+		return $this->get_term_id_by_identifiers( $identifiers, 'manual_term_id', true );
+	}
+
 	/**
 	 * Get synced local term ID.
 	 *
@@ -92,6 +105,17 @@ class Mobo_Core_Category_Map {
 	 */
 	public function get_synced_term_id( $guid ) {
 		return $this->get_term_id_by_column( $guid, 'synced_term_id', false );
+	}
+
+
+	/**
+	 * Get synced local term ID using GUID identifiers only.
+	 *
+	 * @param array $identifiers Candidate remote GUID identifiers.
+	 * @return int
+	 */
+	public function get_synced_term_id_by_identifiers( $identifiers ) {
+		return $this->get_term_id_by_identifiers( $identifiers, 'synced_term_id', false );
 	}
 
 	/**
@@ -122,6 +146,109 @@ class Mobo_Core_Category_Map {
 		return array(
 			'term_id' => 0,
 			'source'  => 'missing',
+		);
+	}
+
+
+	/**
+	 * Get best assignment term using GUID identifiers: manual first, synced fallback.
+	 *
+	 * @param array $identifiers Candidate remote GUID identifiers.
+	 * @return array
+	 */
+	public function resolve_assignment_term_by_identifiers( $identifiers ) {
+		$manual = $this->get_manual_term_id_by_identifiers( $identifiers );
+
+		if ( $manual > 0 ) {
+			return array(
+				'term_id' => $manual,
+				'source'  => 'mapped',
+			);
+		}
+
+		$synced = $this->get_synced_term_id_by_identifiers( $identifiers );
+
+		if ( $synced > 0 ) {
+			return array(
+				'term_id' => $synced,
+				'source'  => 'synced',
+			);
+		}
+
+		return array(
+			'term_id' => 0,
+			'source'  => 'missing',
+		);
+	}
+
+
+	/**
+	 * Upsert remote category metadata for mapping only.
+	 *
+	 * This must not create, update, or assign WooCommerce product_cat terms.
+	 * It only prepares rows in the mapping table so the admin can choose
+	 * local categories before product sync.
+	 *
+	 * @param string $guid Remote GUID.
+	 * @param string $name Remote name.
+	 * @param string $url Remote URL/path.
+	 * @param string $parent_guid Parent remote GUID.
+	 * @return array
+	 */
+	public function upsert_remote_category_for_mapping( $guid, $name = '', $url = '', $parent_guid = '' ) {
+		global $wpdb;
+
+		$guid = sanitize_text_field( (string) $guid );
+
+		if ( '' === $guid || ! self::table_exists() ) {
+			return array(
+				'success' => false,
+				'created' => false,
+			);
+		}
+
+		$now   = current_time( 'mysql', true );
+		$table = self::table_name();
+
+		$existing_id = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				$guid
+			)
+		);
+
+		$data = array(
+			'remote_guid'        => $guid,
+			'remote_name'        => sanitize_text_field( (string) $name ),
+			'remote_slug'        => sanitize_title( $this->slug_from_url( $url ) ),
+			'remote_url'         => sanitize_text_field( (string) $url ),
+			'parent_remote_guid' => sanitize_text_field( (string) $parent_guid ),
+			'updated_at'         => $now,
+		);
+
+		$formats = array( '%s', '%s', '%s', '%s', '%s', '%s' );
+
+		if ( $existing_id ) {
+			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing_id ) ), $formats, array( '%d' ) );
+
+			return array(
+				'success' => $success,
+				'created' => false,
+			);
+		}
+
+		$data['manual_term_id'] = 0;
+		$data['synced_term_id'] = 0;
+		$data['created_at']     = $now;
+		$formats[]              = '%d';
+		$formats[]              = '%d';
+		$formats[]              = '%s';
+
+		$success = false !== $wpdb->insert( $table, $data, $formats );
+
+		return array(
+			'success' => $success,
+			'created' => $success,
 		);
 	}
 
@@ -335,6 +462,137 @@ class Mobo_Core_Category_Map {
 		update_option( 'mobo_core_category_map_cursor', $last, false );
 
 		return array( 'categories' => $count );
+	}
+
+
+	/**
+	 * Get term ID by GUID identifiers and validate existence.
+	 *
+	 * GUID is the only valid remote identity. URL/path/slug are stored only for
+	 * display and diagnostics; they must never be used to match a category.
+	 *
+	 * @param array  $identifiers Candidate identifiers.
+	 * @param string $column manual_term_id or synced_term_id.
+	 * @param bool   $clear_stale Clear stale manual mapping.
+	 * @return int
+	 */
+	private function get_term_id_by_identifiers( $identifiers, $column, $clear_stale ) {
+		$column = sanitize_key( (string) $column );
+
+		if ( ! in_array( $column, array( 'manual_term_id', 'synced_term_id' ), true ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$normalized = $this->normalize_identifiers( $identifiers );
+
+		if ( empty( $normalized['values'] ) ) {
+			return 0;
+		}
+
+		foreach ( $normalized['values'] as $identifier ) {
+			$term_id = $this->get_term_id_by_column( $identifier, $column, $clear_stale );
+			if ( $term_id > 0 ) {
+				return $term_id;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Validate a map row term ID and optionally clear stale mappings.
+	 *
+	 * Kept for backward compatibility with older code paths, but GUID-only
+	 * matching above does not query URL/path/slug rows.
+	 *
+	 * @param mixed  $row Row.
+	 * @param string $column Column name.
+	 * @param bool   $clear_stale Clear stale values.
+	 * @return int
+	 */
+	private function validate_identifier_row( $row, $column, $clear_stale ) {
+		global $wpdb;
+
+		if ( ! is_array( $row ) || empty( $row['term_id'] ) ) {
+			return 0;
+		}
+
+		$term_id = absint( $row['term_id'] );
+
+		if ( $term_id <= 0 ) {
+			return 0;
+		}
+
+		if ( $this->term_exists( $term_id ) ) {
+			return $term_id;
+		}
+
+		if ( $clear_stale && ! empty( $row['id'] ) ) {
+			$wpdb->update(
+				self::table_name(),
+				array( $column => 0, 'updated_at' => current_time( 'mysql', true ) ),
+				array( 'id' => absint( $row['id'] ) ),
+				array( '%d', '%s' ),
+				array( '%d' )
+			);
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Normalize GUID identifiers.
+	 *
+	 * URL/path/slug are intentionally ignored here. They are presentation or
+	 * routing values, not durable identity keys.
+	 *
+	 * @param mixed $identifiers Identifiers.
+	 * @return array
+	 */
+	private function normalize_identifiers( $identifiers ) {
+		if ( ! is_array( $identifiers ) ) {
+			$identifiers = array( $identifiers );
+		}
+
+		$values = array();
+
+		foreach ( $identifiers as $identifier ) {
+			$identifier = sanitize_text_field( (string) $identifier );
+			$identifier = trim( $identifier );
+
+			if ( '' === $identifier || ! $this->is_remote_guid_value( $identifier ) ) {
+				continue;
+			}
+
+			$values[] = $identifier;
+		}
+
+		$values = array_values( array_unique( array_filter( $values ) ) );
+
+		return array(
+			'values' => $values,
+			'slugs'  => array(),
+		);
+	}
+
+	/**
+	 * Check whether a value is usable as a remote GUID.
+	 *
+	 * @param string $value Value.
+	 * @return bool
+	 */
+	private function is_remote_guid_value( $value ) {
+		$value = trim( sanitize_text_field( (string) $value ) );
+
+		if ( '' === $value ) {
+			return false;
+		}
+
+		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	/**

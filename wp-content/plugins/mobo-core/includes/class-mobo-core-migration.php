@@ -30,6 +30,7 @@ class Mobo_Core_Migration {
 	 */
 	public static function activate() {
 		self::ensure_defaults();
+		self::apply_10307_default_adjustments( '' );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::create_database_tables();
@@ -57,12 +58,14 @@ class Mobo_Core_Migration {
 		}
 
 		self::ensure_defaults();
+		self::apply_10307_default_adjustments( $current );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::create_database_tables();
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
 		self::migrate_legacy_webhook_queue();
+		self::clear_legacy_cron_hooks();
 
 		/*
 		 * Cleanup old beta option if it exists.
@@ -85,6 +88,44 @@ class Mobo_Core_Migration {
 			if ( false === get_option( $key, false ) ) {
 				add_option( $key, $value, '', false );
 			}
+		}
+	}
+
+	/**
+	 * Adjust defaults introduced in 10.30.7 without disturbing custom values.
+	 *
+	 * Existing values are changed only when they still match the old defaults.
+	 * This keeps customer overrides intact while moving untouched installs to the
+	 * safer requested defaults.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10307_default_adjustments( $previous_version ) {
+		if ( '' !== (string) $previous_version && version_compare( (string) $previous_version, '10.30.7', '>=' ) ) {
+			return;
+		}
+
+		self::update_option_if_current_value( 'mobo_core_webhook_files_per_run', 1, 4 );
+		self::update_option_if_current_value( 'mobo_core_missing_variants_behavior', 'ignore', 'outofstock' );
+		self::update_option_if_current_value( 'mobo_core_checkout_mobo_cart_validation_enabled', '1', '0' );
+		self::update_option_if_current_value( 'mobo_core_checkout_mobo_debug_enabled', '1', '0' );
+		self::update_option_if_current_value( 'mobo_core_checkout_validation_enabled', '0', '0' );
+	}
+
+	/**
+	 * Update an option only if it is absent or still equals a known old default.
+	 *
+	 * @param string $key Option key.
+	 * @param mixed  $old_value Old default value.
+	 * @param mixed  $new_value New default value.
+	 * @return void
+	 */
+	private static function update_option_if_current_value( $key, $old_value, $new_value ) {
+		$current = get_option( $key, false );
+
+		if ( false === $current || (string) $current === (string) $old_value ) {
+			update_option( $key, $new_value, false );
 		}
 	}
 
@@ -312,21 +353,27 @@ class Mobo_Core_Migration {
 	 * @return void
 	 */
 	private static function clear_legacy_cron_hooks() {
-		$hooks = array(
-			'mobo_core_cron',
-			'mobo_core_sync_cron',
-			'mobo_core_product_sync_cron',
-			'mobo_core_products_sync_cron',
-			'mobo_core_webhook_cron',
-			'mobo_core_webhook_queue_cron',
-			'mobo_core_process_webhook_queue',
-			'mobo_core_run_webhooks',
-			'mobo_core_update_products',
-			'mobo_core_update_variants',
-			'mobo_cron_hook',
-			'mobo_sync_cron_hook',
-			'mobo_webhook_cron_hook',
-		);
+		if ( class_exists( 'Mobo_Core_Maintenance' ) ) {
+			$hooks = Mobo_Core_Maintenance::mobo_cron_hooks();
+		} else {
+			$hooks = array(
+				'mobo_core_cron',
+				'mobo_core_sync_cron',
+				'mobo_core_product_sync_cron',
+				'mobo_core_products_sync_cron',
+				'mobo_core_webhook_cron',
+				'mobo_core_webhook_queue_cron',
+				'mobo_core_process_webhook_queue',
+				'mobo_core_run_webhooks',
+				'mobo_core_update_products',
+				'mobo_core_update_variants',
+				'mobo_core_process_queued_mobo_orders',
+				'mobo_core_queue_mobo_order_submission',
+				'mobo_cron_hook',
+				'mobo_sync_cron_hook',
+				'mobo_webhook_cron_hook',
+			);
+		}
 
 		/**
 		 * Allow old/custom installs to register extra legacy cron hooks for cleanup.

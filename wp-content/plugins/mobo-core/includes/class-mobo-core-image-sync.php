@@ -27,10 +27,11 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param array $images Images.
-	 * @param int   $offset Legacy offset kept for backward compatibility.
+	 * @param int       $offset Legacy offset kept for backward compatibility.
+	 * @param bool|null $blocking_override Optional blocking override for queue mode.
 	 * @return array
 	 */
-	public function process_images( $product_id, $images, $offset ) {
+	public function process_images( $product_id, $images, $offset, $blocking_override = null ) {
 		$product_id = absint( $product_id );
 		$offset     = max( 0, absint( $offset ) );
 		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
@@ -45,7 +46,7 @@ class Mobo_Core_Image_Sync {
 		}
 
 		if ( $this->should_use_queue() ) {
-			return $this->process_images_with_queue( $product_id, $images, $limit );
+			return $this->process_images_with_queue( $product_id, $images, $limit, $blocking_override );
 		}
 
 		return $this->process_images_direct( $product_id, $images, $offset, $limit );
@@ -115,7 +116,14 @@ class Mobo_Core_Image_Sync {
 	 * @param int   $limit Limit.
 	 * @return array
 	 */
-	private function process_images_with_queue( $product_id, $images, $limit ) {
+	private function process_images_with_queue( $product_id, $images, $limit, $blocking_override = null ) {
+		/*
+		 * Keep this variable local and explicit. Older cached copies of this file
+		 * could reference the override without a default; this guard also keeps the
+		 * method safe if custom integrations call it through reflection/tests.
+		 */
+		$queue_blocking_override = is_bool( $blocking_override ) ? $blocking_override : null;
+
 		$queue        = new Mobo_Core_Image_Queue();
 		$product_guid = $this->get_product_guid( $product_id );
 
@@ -125,16 +133,34 @@ class Mobo_Core_Image_Sync {
 
 		$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
 
-		$pending  = $queue->count_pending_by_product( $product_id, false );
-		$blocking = Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '1' );
+		$pending       = $queue->count_pending_by_product( $product_id, false );
+		$due_by_product = method_exists( $queue, 'count_due_by_product' ) ? $queue->count_due_by_product( $product_id ) : $pending;
+		$processed      = isset( $result['processed'] ) ? absint( $result['processed'] ) : 0;
+		$failed         = isset( $result['failed'] ) ? absint( $result['failed'] ) : 0;
+		$blocking       = is_bool( $queue_blocking_override ) ? $queue_blocking_override : Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '0' );
+
+		/*
+		 * Never keep product sync stuck on image rows that are waiting for a
+		 * future retry or an expired lock. The image queue is independent and cron
+		 * will continue processing it. Blocking is only useful while there are
+		 * immediately due rows for the same product.
+		 */
+		$done = true;
+
+		if ( $blocking && $pending > 0 && $due_by_product > 0 ) {
+			$done = false;
+		}
 
 		return array(
-			'done'       => $blocking ? 0 === $pending : true,
-			'nextOffset' => $blocking && $pending > 0 ? 1 : 0,
-			'processed'  => isset( $result['processed'] ) ? absint( $result['processed'] ) : 0,
+			'done'       => $done,
+			'nextOffset' => $done ? 0 : 1,
+			'processed'  => $processed,
+			'failed'     => $failed,
 			'skipped'    => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
 			'queued'     => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
 			'pending'    => $pending,
+			'due'        => $due_by_product,
+			'blocking'   => $blocking,
 		);
 	}
 
@@ -320,6 +346,8 @@ class Mobo_Core_Image_Sync {
 		} else {
 			$disable_sslverify = static function ( $args, $request_url ) {
 				$args['sslverify'] = false;
+				$args['timeout']   = min( 20, max( 8, isset( $args['timeout'] ) ? absint( $args['timeout'] ) : 15 ) );
+				$args['redirection'] = min( 3, isset( $args['redirection'] ) ? absint( $args['redirection'] ) : 3 );
 
 				return $args;
 			};
@@ -401,7 +429,7 @@ class Mobo_Core_Image_Sync {
 		$response = wp_remote_get(
 			$url,
 			array(
-				'timeout'            => 30,
+				'timeout'            => 15,
 				'redirection'        => 5,
 				'sslverify'          => false,
 				'reject_unsafe_urls' => false,
@@ -626,13 +654,7 @@ class Mobo_Core_Image_Sync {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$url        = esc_url_raw( (string) $url );
 
-		$id = $this->find_attachment_by_guid( $image_guid );
-
-		if ( $id <= 0 && '' !== $url ) {
-			$id = $this->find_attachment_by_meta( 'mobo_source_url', $url );
-		}
-
-		return $id;
+		return $this->find_attachment_by_guid( $image_guid );
 	}
 
 	private function find_attachment_by_guid( $guid ) {
@@ -722,16 +744,20 @@ class Mobo_Core_Image_Sync {
 
 	private function get_image_guid( $image ) {
 		$keys = array(
-			'id',
-			'imageId',
+			'image_guid',
+			'img_guid',
 			'imageGuid',
+			'imageId',
 			'guid',
+			'remote_guid',
+			'remoteGuid',
+			'id',
 		);
 
 		foreach ( $keys as $key ) {
 			$value = sanitize_text_field( (string) $this->get_value( $image, $key, '' ) );
 
-			if ( '' !== $value ) {
+			if ( $this->is_remote_guid_value( $value ) ) {
 				return $value;
 			}
 		}
@@ -754,6 +780,27 @@ class Mobo_Core_Image_Sync {
 		}
 
 		return '';
+	}
+
+
+	/**
+	 * Check whether a value is usable as a remote GUID.
+	 *
+	 * @param string $value Value.
+	 * @return bool
+	 */
+	private function is_remote_guid_value( $value ) {
+		$value = trim( sanitize_text_field( (string) $value ) );
+
+		if ( '' === $value ) {
+			return false;
+		}
+
+		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	private function get_value( $array, $key, $default = null ) {

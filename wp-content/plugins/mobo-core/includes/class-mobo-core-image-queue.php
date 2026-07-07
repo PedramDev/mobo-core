@@ -156,16 +156,24 @@ class Mobo_Core_Image_Queue {
 				'image_guid'     => $image_guid,
 				'source_url'     => $url,
 				'position_index' => absint( $position ),
-				'status'         => 'pending',
-				'next_retry_at'  => null,
-				'locked_until'   => null,
-				'last_error'     => null,
 				'updated_at'     => $now,
 			);
 
 			if ( is_array( $existing ) ) {
+				/*
+				 * Do not re-open the same pending/processing/failed image on every
+				 * product-sync step. Re-enqueueing used to reset next_retry_at and
+				 * locked_until, which could keep manual sync stuck forever on the same
+				 * three bad/slow images. Only reset the queue row when the source URL
+				 * actually changed.
+				 */
 				if ( $existing_url !== $url ) {
-					$data['try_count'] = 0;
+					$data['status']        = 'pending';
+					$data['try_count']     = 0;
+					$data['next_retry_at'] = null;
+					$data['locked_until']  = null;
+					$data['last_error']    = null;
+					$data['attachment_id'] = 0;
 				}
 
 				$wpdb->update(
@@ -178,6 +186,10 @@ class Mobo_Core_Image_Queue {
 			} else {
 				$data['attachment_id'] = 0;
 				$data['try_count']     = 0;
+				$data['status']        = 'pending';
+				$data['next_retry_at'] = null;
+				$data['locked_until']  = null;
+				$data['last_error']    = null;
 				$data['created_at']    = $now;
 
 				$wpdb->insert( $table, $data );
@@ -228,6 +240,41 @@ class Mobo_Core_Image_Queue {
 		);
 
 		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Count immediately due image rows for one product.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return int
+	 */
+	public function count_due_by_product( $product_id ) {
+		global $wpdb;
+
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+
+		return absint(
+			$wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table}
+					WHERE product_id = %d
+					AND (
+						(status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+					)",
+					$product_id,
+					$now,
+					$now
+				)
+			)
+		);
 	}
 
 	/**
@@ -551,12 +598,12 @@ class Mobo_Core_Image_Queue {
 	}
 
 	private function get_image_guid( $image ) {
-		$keys = array( 'id', 'imageId', 'imageGuid', 'guid' );
+		$keys = array( 'image_guid', 'img_guid', 'imageGuid', 'imageId', 'guid', 'remote_guid', 'remoteGuid', 'id' );
 
 		foreach ( $keys as $key ) {
 			$value = sanitize_text_field( (string) $this->get_value( $image, $key, '' ) );
 
-			if ( '' !== $value ) {
+			if ( $this->is_remote_guid_value( $value ) ) {
 				return $value;
 			}
 		}
@@ -576,6 +623,27 @@ class Mobo_Core_Image_Queue {
 		}
 
 		return '';
+	}
+
+
+	/**
+	 * Check whether a value is usable as a remote GUID.
+	 *
+	 * @param string $value Value.
+	 * @return bool
+	 */
+	private function is_remote_guid_value( $value ) {
+		$value = trim( sanitize_text_field( (string) $value ) );
+
+		if ( '' === $value ) {
+			return false;
+		}
+
+		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	private function get_value( $array, $key, $default = null ) {
