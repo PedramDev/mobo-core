@@ -200,6 +200,24 @@ class Mobo_Core_API_Client {
 		return $this->get_json( $path );
 	}
 
+
+	/**
+	 * Get license information from Portal/API.
+	 *
+	 * Legacy plugin versions used the LicenseInfo endpoint to show whether the
+	 * license is expired and how much validity remains. Keep the same endpoint
+	 * so existing Portal contracts continue to work after migration.
+	 *
+	 * Expected legacy payload includes at least:
+	 * - isExpired: bool
+	 * - message: string
+	 *
+	 * @return array|WP_Error
+	 */
+	public function get_license_info() {
+		return $this->get_json( 'LicenseInfo' );
+	}
+
 	/**
 	 * Get API base URL from plugin/legacy configuration.
 	 *

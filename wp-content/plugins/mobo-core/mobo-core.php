@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/moboplugin.com
  * Description: همگام‌سازی مرحله‌ای محصولات، تنوع‌ها، دسته‌بندی‌ها، تصاویر و وب‌هوک‌ها برای ووکامرس.
- * Version: 10.31.1
+ * Version: 10.31.3
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -17,7 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.1' );
+define( 'MOBO_CORE_VERSION', '10.31.3' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );

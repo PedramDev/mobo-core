@@ -5,7 +5,7 @@
  * Responsibilities:
  * - create missing defaults
  * - create/update local data directories
- * - move legacy webhook queue files from the plugin directory to uploads
+ * - discard legacy plugin-directory webhook queue files that are no longer needed
  * - create/update local sync database tables
  * - seed product/variation map from legacy meta in bounded batches
  * - clear old WP-Cron hooks from previous versions
@@ -23,8 +23,8 @@ class Mobo_Core_Migration {
 	 * Activation hook.
 	 *
 	 * Activation must be safe for existing customer installs. It must never delete
-	 * pending webhook JSON files, because plugin updates/re-activations can happen
-	 * while a queue is still being processed.
+	 * the active uploads-based webhook queue. Legacy plugin-directory JSON files
+	 * from 7.4 are intentionally discarded because they are no longer required.
 	 *
 	 * @return void
 	 */
@@ -36,7 +36,7 @@ class Mobo_Core_Migration {
 		self::create_database_tables();
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
-		self::migrate_legacy_webhook_queue();
+		self::discard_legacy_webhook_queue();
 		self::clear_legacy_cron_hooks();
 
 		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
@@ -46,7 +46,8 @@ class Mobo_Core_Migration {
 	 * Run lightweight migrations if version changed.
 	 *
 	 * Important:
-	 * This method never deletes queued webhook JSON files.
+	 * This method never deletes the active uploads-based webhook queue. It only
+	 * discards legacy plugin-directory JSON files from 7.4.
 	 *
 	 * @return void
 	 */
@@ -64,7 +65,7 @@ class Mobo_Core_Migration {
 		self::create_database_tables();
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
-		self::migrate_legacy_webhook_queue();
+		self::discard_legacy_webhook_queue();
 		self::clear_legacy_cron_hooks();
 
 		/*
@@ -221,23 +222,22 @@ class Mobo_Core_Migration {
 	}
 
 	/**
-	 * Migrate old file-based webhook queue from plugin directory to uploads.
+	 * Discard old file-based webhook queue from the plugin directory.
 	 *
 	 * Previous versions used:
 	 * wp-content/plugins/mobo-core/webhook-files/
 	 *
-	 * New versions use:
-	 * wp-content/uploads/mobo-core/webhook-files/
+	 * Current versions use uploads for the active queue. The legacy queued JSON
+	 * files are intentionally not migrated because stale webhook payloads from
+	 * 7.4 are not required and can replay outdated product/category changes.
 	 *
-	 * This migration is intentionally repeatable and lossless:
-	 * - JSON files are moved when possible.
-	 * - If rename() fails, copy + unlink is attempted.
-	 * - Existing destination files are not overwritten.
-	 * - Non-JSON protection files are left in place.
+	 * Only JSON payload files inside the legacy plugin-directory queue are removed.
+	 * Protection files such as index.php, .htaccess and .gitignore are left intact.
+	 * The current uploads-based queue is never touched here.
 	 *
 	 * @return void
 	 */
-	private static function migrate_legacy_webhook_queue() {
+	private static function discard_legacy_webhook_queue() {
 		if ( ! defined( 'MOBO_CORE_LEGACY_WEBHOOK_FILE_DIR' ) ) {
 			return;
 		}
@@ -249,18 +249,15 @@ class Mobo_Core_Migration {
 			return;
 		}
 
-		self::protect_dir( $new_dir );
-		self::protect_dir( $new_dir . 'failed/' );
+		$deleted = 0;
 
 		$iterator = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator(
 				$legacy_dir,
 				RecursiveDirectoryIterator::SKIP_DOTS
 			),
-			RecursiveIteratorIterator::SELF_FIRST
+			RecursiveIteratorIterator::CHILD_FIRST
 		);
-
-		$moved = 0;
 
 		foreach ( $iterator as $file ) {
 			if ( ! $file instanceof SplFileInfo || ! $file->isFile() ) {
@@ -273,52 +270,13 @@ class Mobo_Core_Migration {
 				continue;
 			}
 
-			$source = $file->getPathname();
-			$relative = ltrim( str_replace( $legacy_dir, '', $source ), '/\\' );
-			$target = $new_dir . $relative;
-			$target_dir = dirname( $target );
-
-			self::protect_dir( $target_dir );
-
-			if ( file_exists( $target ) ) {
-				$target = self::unique_file_path( $target );
-			}
-
-			if ( @rename( $source, $target ) ) {
-				$moved++;
-				continue;
-			}
-
-			if ( @copy( $source, $target ) ) {
-				@unlink( $source );
-				$moved++;
+			if ( @unlink( $file->getPathname() ) ) {
+				$deleted++;
 			}
 		}
 
-		update_option( 'mobo_core_legacy_webhook_queue_migrated_at', time(), false );
-		update_option( 'mobo_core_legacy_webhook_queue_migrated_count', $moved, false );
-	}
-
-	/**
-	 * Build a unique file path without overwriting the original destination.
-	 *
-	 * @param string $path Desired path.
-	 * @return string
-	 */
-	private static function unique_file_path( $path ) {
-		$dir = dirname( $path );
-		$name = pathinfo( $path, PATHINFO_FILENAME );
-		$ext = pathinfo( $path, PATHINFO_EXTENSION );
-
-		for ( $i = 1; $i < 1000; $i++ ) {
-			$candidate = trailingslashit( $dir ) . $name . '-' . $i . ( '' !== $ext ? '.' . $ext : '' );
-
-			if ( ! file_exists( $candidate ) ) {
-				return $candidate;
-			}
-		}
-
-		return trailingslashit( $dir ) . $name . '-' . wp_generate_password( 8, false, false ) . ( '' !== $ext ? '.' . $ext : '' );
+		update_option( 'mobo_core_legacy_webhook_queue_discarded_at', time(), false );
+		update_option( 'mobo_core_legacy_webhook_queue_discarded_count', $deleted, false );
 	}
 
 	/**
@@ -369,6 +327,10 @@ class Mobo_Core_Migration {
 				'mobo_core_update_variants',
 				'mobo_core_process_queued_mobo_orders',
 				'mobo_core_queue_mobo_order_submission',
+				'mobo_core_read_webhook_interval',
+				'mobo_core_sync_products_24_event',
+				'mobo_core_sync_products_event',
+				'mobo_core_sync_categories_event',
 				'mobo_cron_hook',
 				'mobo_sync_cron_hook',
 				'mobo_webhook_cron_hook',

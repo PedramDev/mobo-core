@@ -298,6 +298,8 @@ class Mobo_Core_Admin {
 
 			</div>
 		</div>
+
+		<?php $this->render_license_info_card(); ?>
 		<?php
 	}
 
@@ -356,6 +358,8 @@ class Mobo_Core_Admin {
 				</div>
 			</div>
 
+			<?php $this->render_license_info_card(); ?>
+
 			<?php
 			$this->guide_box(
 				'راهنمای اتصال و امنیت',
@@ -380,6 +384,172 @@ class Mobo_Core_Admin {
 			<?php $this->save_button(); ?>
 		</form>
 		<?php
+	}
+
+
+	/**
+	 * Render license information card.
+	 *
+	 * @return void
+	 */
+	private function render_license_info_card() {
+		$license_info = $this->get_license_info_for_display();
+		$is_error     = ! empty( $license_info['error'] );
+		$is_expired   = ! empty( $license_info['isExpired'] );
+		$status_text  = $is_error ? 'نامشخص' : ( $is_expired ? 'منقضی شده' : 'فعال' );
+		$message      = isset( $license_info['message'] ) ? (string) $license_info['message'] : '';
+		$raw          = isset( $license_info['raw'] ) && is_array( $license_info['raw'] ) ? $license_info['raw'] : array();
+		$details      = $this->license_info_display_details( $raw );
+
+		?>
+		<div class="mobo-card mobo-card-license" style="margin-top:16px;">
+			<div class="mobo-card-head">
+				<h2>اطلاعات لایسنس</h2>
+				<p>این بخش از endpoint قدیمی <code>LicenseInfo</code> خوانده می‌شود و وضعیت اعتبار لایسنس را نمایش می‌دهد.</p>
+			</div>
+
+			<div class="mobo-status-grid">
+				<?php $this->status_box( 'وضعیت لایسنس', $status_text ); ?>
+				<?php $this->status_box( 'روزهای باقی‌مانده', $this->first_license_value( $raw, array( 'remainingDays', 'remainDays', 'daysRemaining', 'leftDays', 'remainingDayCount', 'RemainingDays', 'DaysRemaining' ) ) ); ?>
+				<?php $this->status_box( 'تاریخ پایان', $this->first_license_value( $raw, array( 'expiresAt', 'expireAt', 'expirationDate', 'expiryDate', 'expireDate', 'validUntil', 'endDate', 'licenseEndAt', 'ExpiresAt', 'ExpireDate', 'ValidUntil' ) ) ); ?>
+			</div>
+
+			<?php if ( '' !== trim( $message ) ) : ?>
+				<div class="mobo-message <?php echo $is_error || $is_expired ? 'mobo-message-error' : 'mobo-message-info'; ?>">
+					<?php echo esc_html( $message ); ?>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $details ) ) : ?>
+				<div class="mobo-guide-table-wrap">
+					<table class="widefat striped mobo-guide-table">
+						<thead>
+							<tr>
+								<th>فیلد</th>
+								<th>مقدار</th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $details as $row ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $row['key'] ); ?></code></td>
+									<td><?php echo esc_html( $row['value'] ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+			<?php endif; ?>
+
+			<div class="mobo-note">
+				اگر این بخش خطای اتصال نشان دهد، معمولاً Token یا API Base URL مشکل دارد. این بخش sync را متوقف نمی‌کند، فقط وضعیت لایسنس را از Portal نمایش می‌دهد.
+			</div>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Fetch license info for admin display.
+	 *
+	 * @return array
+	 */
+	private function get_license_info_for_display() {
+		$api_client = new Mobo_Core_API_Client();
+		$response   = $api_client->get_license_info();
+
+		if ( is_wp_error( $response ) ) {
+			return array(
+				'error'     => true,
+				'isExpired' => false,
+				'message'   => 'اطلاعات لایسنس دریافت نشد: ' . $response->get_error_message(),
+				'raw'       => array(
+					'errorCode'    => $response->get_error_code(),
+					'errorMessage' => $response->get_error_message(),
+				),
+			);
+		}
+
+		if ( ! is_array( $response ) ) {
+			return array(
+				'error'     => true,
+				'isExpired' => false,
+				'message'   => 'پاسخ LicenseInfo معتبر نیست.',
+				'raw'       => array(),
+			);
+		}
+
+		return array(
+			'error'     => false,
+			'isExpired' => $this->license_bool_value( isset( $response['isExpired'] ) ? $response['isExpired'] : false ),
+			'message'   => isset( $response['message'] ) && is_scalar( $response['message'] ) ? (string) $response['message'] : '',
+			'raw'       => $response,
+		);
+	}
+
+	/**
+	 * Convert mixed API boolean value to bool.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return bool
+	 */
+	private function license_bool_value( $value ) {
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+
+		return in_array( strtolower( trim( (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+	}
+
+	/**
+	 * Read the first available license response field.
+	 *
+	 * @param array $info Raw license info.
+	 * @param array $keys Candidate keys.
+	 * @return string
+	 */
+	private function first_license_value( $info, $keys ) {
+		foreach ( $keys as $key ) {
+			if ( array_key_exists( $key, $info ) && is_scalar( $info[ $key ] ) && '' !== trim( (string) $info[ $key ] ) ) {
+				return (string) $info[ $key ];
+			}
+		}
+
+		return '—';
+	}
+
+	/**
+	 * Prepare scalar LicenseInfo fields for display.
+	 *
+	 * @param array $info Raw license info.
+	 * @return array
+	 */
+	private function license_info_display_details( $info ) {
+		$rows         = array();
+		$hidden_keys  = array( 'token', 'licenseToken', 'Token', 'LicenseToken' );
+		$primary_keys = array( 'isExpired', 'message' );
+
+		foreach ( $info as $key => $value ) {
+			$key = (string) $key;
+
+			if ( in_array( $key, $hidden_keys, true ) || in_array( $key, $primary_keys, true ) ) {
+				continue;
+			}
+
+			if ( is_bool( $value ) ) {
+				$value = $value ? 'true' : 'false';
+			} elseif ( is_array( $value ) || is_object( $value ) ) {
+				continue;
+			} elseif ( null === $value || '' === trim( (string) $value ) ) {
+				continue;
+			}
+
+			$rows[] = array(
+				'key'   => $key,
+				'value' => (string) $value,
+			);
+		}
+
+		return $rows;
 	}
 
 	/**

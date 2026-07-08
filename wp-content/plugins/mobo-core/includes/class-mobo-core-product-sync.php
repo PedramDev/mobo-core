@@ -178,13 +178,28 @@ class Mobo_Core_Product_Sync {
 	public function get_manual_sync_status() {
 		$state = $this->get_manual_sync_state();
 
-		$total     = absint( $state['productTotalCount'] );
-		$processed = absint( $state['processedProducts'] );
-		$remaining = $total > 0 ? max( 0, $total - $processed ) : 0;
-		$progress  = $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
-
+		$total           = absint( $state['productTotalCount'] );
+		$processed       = absint( $state['processedProducts'] );
 		$last_error      = sanitize_text_field( (string) $state['lastError'] );
 		$current_status  = sanitize_key( (string) $state['status'] );
+
+		/*
+		 * Portal totalCount can be a stale estimate while hasMore=false is the
+		 * authoritative terminal signal. When sync is already done, the UI must not
+		 * keep showing a phantom remaining product such as 529/530.
+		 */
+		if ( 'done' === $current_status ) {
+			if ( $total <= 0 || $processed < $total ) {
+				$total = $processed;
+			}
+
+			$remaining = 0;
+			$progress  = 100;
+		} else {
+			$remaining = $total > 0 ? max( 0, $total - $processed ) : 0;
+			$progress  = $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
+		}
+
 		$next_retry_at   = absint( $state['nextRetryAt'] ?? 0 );
 		$is_waiting      = 'waiting_for_portal' === $current_status;
 		$is_retry_due    = $is_waiting && ( 0 === $next_retry_at || $next_retry_at <= time() );
@@ -386,10 +401,16 @@ class Mobo_Core_Product_Sync {
 			$state['productPage'] = absint( $state['productPage'] ) + 1;
 
 			if ( empty( $state['productQueue'] ) && ! $this->to_bool( $has_more ) ) {
-				$state['status']      = 'done';
-				$state['completedAt'] = time();
-				$state['lastError']   = '';
-				$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+				/*
+				 * If Portal says there is no next page, sync is complete even when a
+				 * previously reported totalCount was one item higher. Persist the
+				 * effective total so the admin UI does not show a phantom remaining item.
+				 */
+				$state['productTotalCount'] = absint( $state['processedProducts'] );
+				$state['status']            = 'done';
+				$state['completedAt']       = time();
+				$state['lastError']         = '';
+				$state['lastMessage']       = 'همگام‌سازی محصولات کامل شد.';
 				$this->save_manual_sync_state( $state );
 
 				return $this->result( true, 'همگام‌سازی محصولات کامل شد.', $this->get_manual_sync_status() );
@@ -407,11 +428,19 @@ class Mobo_Core_Product_Sync {
 			$product_data = array_shift( $state['productQueue'] );
 
 			if ( ! is_array( $product_data ) ) {
-				$state['lastError']   = '';
-				$state['lastMessage'] = 'محصول نامعتبر رد شد.';
+				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
+				$state['lastError']         = '';
+				$state['lastMessage']       = 'محصول نامعتبر رد شد.';
+
+				if ( absint( $state['productTotalCount'] ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+					$state['status']      = 'done';
+					$state['completedAt'] = time();
+					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+				}
+
 				$this->save_manual_sync_state( $state );
 
-				return $this->result( true, 'محصول نامعتبر رد شد.', $this->get_manual_sync_status() );
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
 			if ( $this->should_skip_product_by_url( $product_data ) ) {
@@ -420,6 +449,12 @@ class Mobo_Core_Product_Sync {
 				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
 				$state['lastError']         = '';
 				$state['lastMessage']       = 'محصول به دلیل قرار داشتن آدرس در لیست عدم همگام‌سازی رد شد: ' . $skipped_url;
+
+				if ( absint( $state['productTotalCount'] ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+					$state['status']      = 'done';
+					$state['completedAt'] = time();
+					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+				}
 
 				$this->save_manual_sync_state( $state );
 
@@ -456,11 +491,19 @@ class Mobo_Core_Product_Sync {
 			$product_id = $this->upsert_parent_product( $product_data, true );
 
 			if ( $product_id <= 0 ) {
-				$state['lastError']   = '';
-				$state['lastMessage'] = 'محصول نامعتبر رد شد.';
+				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
+				$state['lastError']         = '';
+				$state['lastMessage']       = 'محصول نامعتبر رد شد.';
+
+				if ( absint( $state['productTotalCount'] ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+					$state['status']      = 'done';
+					$state['completedAt'] = time();
+					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
+				}
+
 				$this->save_manual_sync_state( $state );
 
-				return $this->result( true, 'محصول نامعتبر رد شد.', $this->get_manual_sync_status() );
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
 			$state['currentProductGuid']            = $product_guid;
