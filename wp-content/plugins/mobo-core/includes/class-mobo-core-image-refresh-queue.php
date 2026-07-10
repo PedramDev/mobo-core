@@ -378,7 +378,7 @@ class Mobo_Core_Image_Refresh_Queue {
 	 */
 	public function get_status() {
 		return array(
-			'enabled'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '1' ),
+			'enabled'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '0' ),
 			'pending'    => $this->count_by_statuses( array( 'pending', 'processing' ) ),
 			'due'        => $this->count_due(),
 			'done'       => $this->count_by_statuses( array( 'done' ) ),

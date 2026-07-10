@@ -234,7 +234,7 @@ class Mobo_Core_Image_Refresh_Service {
 			return $this->save_last_result( $this->locked_result() );
 		}
 
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '1' ) ) {
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '0' ) ) {
 			return $this->save_last_result(
 				array(
 					'success'   => true,

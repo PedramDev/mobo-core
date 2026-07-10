@@ -339,10 +339,14 @@ class Mobo_Core_Image_Sync {
 		}
 
 		if ( $this->is_local_or_private_image_url( $url ) ) {
+			if ( ! (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id ) ) {
+				return 0;
+			}
+
 			$attachment_id = $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid );
 		} else {
-			$disable_sslverify = static function ( $args, $request_url ) {
-				$args['sslverify'] = false;
+			$secure_image_request_args = static function ( $args, $request_url ) {
+				$args['sslverify'] = (bool) apply_filters( 'mobo_core_http_sslverify', true, 'image_sideload' );
 				$args['timeout']   = min( 20, max( 8, isset( $args['timeout'] ) ? absint( $args['timeout'] ) : 15 ) );
 				$args['redirection'] = min( 3, isset( $args['redirection'] ) ? absint( $args['redirection'] ) : 3 );
 
@@ -351,13 +355,13 @@ class Mobo_Core_Image_Sync {
 
 			$allow_local_image_host = $this->build_safe_local_image_host_filter( $url );
 
-			add_filter( 'http_request_args', $disable_sslverify, 10, 2 );
+			add_filter( 'http_request_args', $secure_image_request_args, 10, 2 );
 			add_filter( 'http_request_host_is_external', $allow_local_image_host, 10, 3 );
 
 			try {
 				$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 			} finally {
-				remove_filter( 'http_request_args', $disable_sslverify, 10 );
+				remove_filter( 'http_request_args', $secure_image_request_args, 10 );
 				remove_filter( 'http_request_host_is_external', $allow_local_image_host, 10 );
 			}
 
@@ -366,7 +370,9 @@ class Mobo_Core_Image_Sync {
 					error_log( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $attachment_id->get_error_message() );
 				}
 
-				$attachment_id = $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid );
+				$attachment_id = (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id )
+					? $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid )
+					: 0;
 			}
 		}
 
@@ -397,7 +403,9 @@ class Mobo_Core_Image_Sync {
 	/**
 	 * Download an image using wp_remote_get with reject_unsafe_urls disabled.
 	 *
-	 * This is only a fallback for local/dev environments where WordPress rejects
+	 * This fallback is disabled by default and only runs when a developer explicitly
+	 * enables the mobo_core_allow_unsafe_local_image_download filter for local/dev use.
+	 * It is only intended for environments where WordPress rejects
 	 * localhost/private IP URLs before media_sideload_image() can download them.
 	 * It still imports the file via media_handle_sideload(), so WordPress validates
 	 * the file type before creating the attachment.
@@ -428,8 +436,8 @@ class Mobo_Core_Image_Sync {
 			array(
 				'timeout'            => 15,
 				'redirection'        => 5,
-				'sslverify'          => false,
-				'reject_unsafe_urls' => false,
+				'sslverify'          => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'image_sync' ),
+				'reject_unsafe_urls' => ! (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id ),
 				'stream'             => true,
 				'filename'           => $tmp_file,
 				'headers'            => array(

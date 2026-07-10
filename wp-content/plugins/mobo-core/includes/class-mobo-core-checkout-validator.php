@@ -138,7 +138,7 @@ class Mobo_Core_Checkout_Validator {
 
 		$master_enabled = $this->is_enabled();
 		$mobo_cart_raw = $this->is_mobo_cart_validation_enabled();
-		$auto_order_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		$auto_order_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 		$local_stock_raw = Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' );
 		$external_raw    = Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' );
 
@@ -1198,7 +1198,7 @@ class Mobo_Core_Checkout_Validator {
 			array(
 				'timeout'     => $this->get_mobo_timeout(),
 				'redirection' => 3,
-				'sslverify'   => false,
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'checkout_validator' ),
 				'headers'     => array(
 					'Accept'     => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 					'User-Agent' => 'MoboCore-CheckoutValidator/' . ( defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '1.0' ),
@@ -1215,7 +1215,7 @@ class Mobo_Core_Checkout_Validator {
 			array(
 				'timeout'     => $this->get_mobo_timeout(),
 				'redirection' => 0,
-				'sslverify'   => false,
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'checkout_validator' ),
 				'headers'     => array(
 					'Accept'       => 'application/json, text/plain, */*',
 					'Content-Type' => 'application/json; charset=utf-8',
@@ -1286,7 +1286,7 @@ class Mobo_Core_Checkout_Validator {
 			'method'      => strtoupper( (string) $method ),
 			'timeout'     => $this->get_mobo_timeout(),
 			'redirection' => 0,
-			'sslverify'   => false,
+			'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'checkout_validator' ),
 			'headers'     => $headers,
 		);
 
@@ -1377,7 +1377,7 @@ class Mobo_Core_Checkout_Validator {
 			array(
 				'timeout'     => $timeout,
 				'redirection' => 0,
-				'sslverify'   => false,
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'checkout_validator' ),
 				'headers'     => $headers,
 				'body'        => $body,
 			)
@@ -2524,7 +2524,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function is_order_submission_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 	}
 
 	private function order_was_already_sent_to_mobo( $order ) {

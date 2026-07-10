@@ -398,6 +398,12 @@ class Mobo_Core_Admin {
 	private function render_purchase_tab() {
 		$purchase_url   = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'https://mobo.codeya.ir/';
 		$github_url     = defined( 'MOBO_CORE_GITHUB_URL' ) ? MOBO_CORE_GITHUB_URL : 'https://github.com/PedramDev/mobo-core';
+		$sales_phone   = defined( 'MOBO_CORE_SALES_PHONE' ) ? MOBO_CORE_SALES_PHONE : '+989124508218';
+		$sales_tel     = defined( 'MOBO_CORE_SALES_TEL_URL' ) ? MOBO_CORE_SALES_TEL_URL : 'tel:+989124508218';
+		$sales_tg      = defined( 'MOBO_CORE_SALES_TELEGRAM_URL' ) ? MOBO_CORE_SALES_TELEGRAM_URL : 'https://t.me/yazdan_ghadiri';
+		$sales_wa      = defined( 'MOBO_CORE_SALES_WHATSAPP_URL' ) ? MOBO_CORE_SALES_WHATSAPP_URL : 'https://wa.me/989124508218';
+		$tech_phone    = defined( 'MOBO_CORE_TECH_PHONE' ) ? MOBO_CORE_TECH_PHONE : '+989367362228';
+		$tech_tg       = defined( 'MOBO_CORE_TECH_TELEGRAM_URL' ) ? MOBO_CORE_TECH_TELEGRAM_URL : 'https://t.me/Codeya';
 		$connection_url = add_query_arg(
 			array(
 				'page' => 'mobo-core',
@@ -426,6 +432,32 @@ class Mobo_Core_Admin {
 					<a class="mobo-btn mobo-btn-primary" href="<?php echo esc_url( $purchase_url ); ?>" target="_blank" rel="noopener noreferrer">خرید یا ورود به MoboCore</a>
 					<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $connection_url ); ?>">رفتن به تنظیمات اتصال</a>
 					<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $github_url ); ?>" target="_blank" rel="noopener noreferrer">مشاهده سورس در GitHub</a>
+				</div>
+			</div>
+
+			<div class="mobo-card mobo-card-wide">
+				<div class="mobo-card-head">
+					<h2>تماس برای خرید و پشتیبانی</h2>
+					<p>برای خرید لایسنس، راه اندازی اولیه یا سوال فنی، از مسیر مناسب زیر استفاده کنید. بخش فروش برای خرید و فعال سازی است؛ بخش فنی برای نصب، اتصال، خطا و راه اندازی افزونه است.</p>
+				</div>
+				<div class="mobo-status-grid">
+					<div class="mobo-status-box">
+						<strong>بخش فروش</strong>
+						<span dir="ltr"><?php echo esc_html( $sales_phone ); ?></span>
+						<div class="mobo-actions" style="margin-top:10px;">
+							<a class="mobo-btn mobo-btn-primary" href="<?php echo esc_url( $sales_tel ); ?>">تماس تلفنی</a>
+							<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $sales_wa ); ?>" target="_blank" rel="noopener noreferrer">WhatsApp</a>
+							<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $sales_tg ); ?>" target="_blank" rel="noopener noreferrer">Telegram</a>
+						</div>
+					</div>
+					<div class="mobo-status-box">
+						<strong>بخش فنی</strong>
+						<span dir="ltr"><?php echo esc_html( $tech_phone ); ?></span>
+						<div class="mobo-actions" style="margin-top:10px;">
+							<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( 'tel:' . $tech_phone ); ?>">تماس تلفنی</a>
+							<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $tech_tg ); ?>" target="_blank" rel="noopener noreferrer">Telegram</a>
+						</div>
+					</div>
 				</div>
 			</div>
 
@@ -816,7 +848,7 @@ class Mobo_Core_Admin {
 		$persian_wc_plugins = $this->get_active_persian_woocommerce_plugins();
 		$persian_wc_status  = $this->get_persian_woocommerce_status();
 		$poina_allowlist_status = $this->get_poina_domain_allowlist_status();
-		$order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		$order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 		$address_mapping_enabled = $order_submission_enabled;
 		$address_checkout_active = ! empty( $address_status['checkoutActive'] );
 		$checkout_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
@@ -1115,7 +1147,7 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'آخرین Cart موفق موبو', ! empty( $status['lastMoboCartAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastMoboCartAt'] ) ) : '—' ); ?>
 					<?php $lock_disabled = empty( $status['moboCartEnabled'] ) && empty( $status['autoOrderEnabled'] ); ?>
 					<?php $this->status_box( 'وضعیت lock سبد موبو', $lock_disabled ? 'غیرفعال - بررسی سبد و ثبت سفارش خاموش است' : ( get_option( 'mobo_core_shared_mobo_cart_lock' ) ? 'فعال / در حال استفاده' : 'آزاد' ) ); ?>
-					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) ? 'فعال' : 'غیرفعال' ); ?>
+					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'آخرین نتیجه', isset( $last['success'] ) ? ( ! empty( $last['success'] ) ? 'موفق' : 'ناموفق' ) : '—' ); ?>
 					<?php $this->status_box( 'HTTP Status', isset( $last['status'] ) ? absint( $last['status'] ) : '—' ); ?>
 				</div>
@@ -4549,11 +4581,11 @@ type:{mobo_order_type_label}</textarea>
 			update_option( 'mobo_core_checkout_mobo_debug_enabled', '0', false );
 		}
 
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) ) {
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
 			update_option( 'mobo_core_mobo_order_auto_complete_enabled', '0', false );
 		}
 
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) ) {
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
 			/* Address mapping is mandatory for automatic Mobo order submission. */
 			update_option( 'mobo_core_address_mapping_enabled', '1', false );
 		}
@@ -4913,7 +4945,7 @@ type:{mobo_order_type_label}</textarea>
 			$tab = 'dashboard';
 		}
 
-		$was_order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		$was_order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 
 		$this->save_current_tab_settings( $tab );
 
@@ -5005,7 +5037,7 @@ type:{mobo_order_type_label}</textarea>
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'cron' );
 		}
 
-		if ( 'checkout' === $tab && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) ) {
+		if ( 'checkout' === $tab && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
 			if ( class_exists( 'Mobo_Core_Address_Mapping' ) ) {
 				$address_mapping = new Mobo_Core_Address_Mapping();
 				$address_status  = method_exists( $address_mapping, 'get_status' ) ? $address_mapping->get_status() : array();

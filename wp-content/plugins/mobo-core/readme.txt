@@ -6,15 +6,15 @@ Tested up to: 6.8
 Requires PHP: 7.4
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.43
+Stable tag: 10.31.45
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Mobo Core connects Iranian WooCommerce stores to MoboCore and the mobomobo.ir source for product sync, checkout validation, shipping mapping, and Mobo order automation.
+Mobo Core connects Iranian WooCommerce stores to MoboCore and a specific mobomobo.ir workflow for product sync, checkout validation, shipping mapping, and optional Mobo order automation.
 
 == Description ==
 
-Mobo Core is a WooCommerce integration plugin built for stores operating in Iran and using `mobomobo.ir` as the specific Mobo/Mobomobo product and order source.
+Mobo Core is a WooCommerce integration plugin built for stores operating in Iran and using the specific `mobomobo.ir` workflow as their Mobo/Mobomobo product and order source. This plugin is not presented as the official plugin of mobomobo.ir unless such authorization is explicitly stated by the service owner.
 
 The plugin connects WooCommerce to the MoboCore service for product synchronization, webhook processing, shipping method mapping, checkout validation, automatic order submission, and operational health checks.
 
@@ -24,15 +24,27 @@ Main features:
 * Queue-based webhook processing to avoid timeout in WordPress requests.
 * Shipping method mapping between WooCommerce shipping zones/methods and Mobo shipping methods.
 * Separate shipping mapping for Mobo-only orders and mixed Mobo/non-Mobo orders.
-* Automatic order submission for Mobo-only and mixed WooCommerce orders.
+* Optional automatic order submission for Mobo-only and mixed WooCommerce orders.
 * Address mapping for checkout country, state, and city values used in Iran.
 * Image refresh workflow for legacy images after a full Repair run.
-* Health reporting for cron, queue, memory, disk, and debug status.
+* Optional health reporting for cron, queue, memory, disk, and debug status.
 * Optional order SMS notifications through the Persian WooCommerce SMS plugin.
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
 
 https://mobo.codeya.ir/
+
+Sales and activation contact:
+
+* Phone: +989124508218
+* Telegram: https://t.me/yazdan_ghadiri
+* WhatsApp: https://wa.me/989124508218
+* Tel link: tel:+989124508218
+
+Technical support contact:
+
+* Phone: +989367362228
+* Telegram: https://t.me/Codeya
 
 == External services ==
 
@@ -56,7 +68,7 @@ The plugin may send or receive the following data depending on enabled settings:
 * WooCommerce order data needed for Mobo order submission, including customer name, phone, shipping address, selected shipping method, Mobo product/variation identifiers, and order item quantities.
 * Technical health data such as queue counts, cron state, PHP memory, disk space, and debug status.
 
-This communication happens only when the site administrator enters a Token, enables synchronization, runs Repair/sync, receives webhooks, enables checkout validation/order automation, or enables health reporting.
+This communication happens only after the site administrator enters a Token or explicitly uses/enables related features such as synchronization, Repair/sync, webhook processing, checkout validation/order automation, image refresh, or health reporting. Sensitive external workflows such as order submission, health reporting, address mapping, and legacy image refresh are disabled by default on fresh installations.
 
 Service website:
 
@@ -115,6 +127,15 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Changelog ==
 
+= 10.31.45 =
+* Added sales and technical contact information to the purchase/activation screen and documentation.
+* Kept GitHub links aligned with https://github.com/PedramDev/mobo-core.
+* Changed the default MoboCore API URL to HTTPS.
+* Enabled SSL verification by default for outbound HTTP requests.
+* Disabled sensitive external workflows by default on fresh installs: automatic order submission, health reporting, address mapping, and legacy image refresh.
+* Added a developer-only opt-in filter for unsafe local/private image downloads used in local test environments.
+* Clarified that this is an integration for a specific mobomobo.ir workflow and not presented as an official mobomobo.ir plugin unless separately authorized.
+
 = 10.31.43 =
 * Added ready-to-publish Terms and Privacy pages for mobo.codeya.ir.
 * Clarified that the plugin is intended for Iranian stores and the specific mobomobo.ir source.
@@ -128,5 +149,5 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
-= 10.31.43 =
-Clarifies external services and adds ready-to-use Terms and Privacy pages. Run Repair once when upgrading from legacy versions such as version 7.
+= 10.31.45 =
+Adds sales/technical contact information and keeps WordPress.org hardening: HTTPS defaults, SSL verification, and disabled sensitive external workflows on fresh installations. Run Repair once when upgrading from legacy versions such as version 7.

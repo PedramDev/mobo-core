@@ -60,7 +60,7 @@ class Mobo_Core_Settings {
 			'mobo_core_image_queue_blocking'      => '1',
 			'mobo_core_image_max_try'             => 5,
 			'mobo_core_image_retry_base_seconds'  => 120,
-			'mobo_core_image_refresh_enabled'     => '1',
+			'mobo_core_image_refresh_enabled'     => '0',
 			'mobo_core_image_refresh_delete_old'  => '1',
 			'mobo_core_image_refresh_per_run'     => 2,
 			'mobo_core_image_refresh_scan_limit'  => 500,
@@ -102,7 +102,7 @@ class Mobo_Core_Settings {
 			'mobo_core_self_runner_last_run_result'    => array(),
 
 			// Customer-side health reporting to MoboCore.
-			'mobo_core_health_report_enabled'          => '1',
+			'mobo_core_health_report_enabled'          => '0',
 			'mobo_core_health_report_url'              => '',
 			'mobo_core_health_report_min_interval_seconds' => 300,
 			'mobo_core_health_report_timeout_seconds'  => 15,
@@ -137,7 +137,7 @@ class Mobo_Core_Settings {
 			'mobo_core_checkout_last_validation_result'      => array(),
 
 			// Automatic Mobo order submission defaults.
-			'mobo_core_mobo_order_submission_enabled'       => '1',
+			'mobo_core_mobo_order_submission_enabled'       => '0',
 			'mobo_core_mobo_order_auto_complete_enabled'    => '1',
 			'mobo_core_mobo_order_sender_name'              => '',
 			'mobo_core_mobo_order_sender_mobile'            => '',
@@ -145,7 +145,7 @@ class Mobo_Core_Settings {
 			'mobo_core_remote_shipping_sync_interval_hours'   => 1,
 
 			// Mobo checkout address mapping defaults.
-			'mobo_core_address_mapping_enabled'             => '1',
+			'mobo_core_address_mapping_enabled'             => '0',
 			'mobo_core_address_mapping_sync_interval_days'  => 7,
 
 			// SMS notifications through Persian WooCommerce SMS.

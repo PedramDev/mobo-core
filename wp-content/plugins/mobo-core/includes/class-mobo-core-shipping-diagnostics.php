@@ -506,8 +506,8 @@ class Mobo_Core_Shipping_Diagnostics {
 	 */
 	private function get_mobo_checkout_settings() {
 		$master = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' ) : false;
-		$auto_order = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ) : false;
-		$address_mapping_raw = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::enabled( 'mobo_core_address_mapping_enabled', '1' ) : false;
+		$auto_order = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) : false;
+		$address_mapping_raw = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::enabled( 'mobo_core_address_mapping_enabled', '0' ) : false;
 
 		return array(
 			'checkoutValidationMasterEnabled' => $master,

@@ -102,7 +102,7 @@ class Mobo_Core_Self_Runner {
 				'timeout'     => $timeout,
 				'redirection' => 0,
 				'blocking'    => false,
-				'sslverify'   => (bool) apply_filters( 'mobo_core_self_runner_sslverify', false ),
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'self_runner' ),
 				'headers'     => array(
 					'Accept'             => 'application/json',
 					'X-Mobo-Self-Runner' => '1',

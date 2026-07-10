@@ -745,6 +745,6 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function is_order_submission_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 	}
 }

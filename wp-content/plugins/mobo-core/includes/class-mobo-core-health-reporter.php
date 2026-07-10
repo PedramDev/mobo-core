@@ -105,7 +105,7 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	public function send_report( $source = 'real-cron', $force = false ) {
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '1' ) ) {
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '0' ) ) {
 			return $this->save_result(
 				array(
 					'success' => true,
@@ -160,7 +160,7 @@ class Mobo_Core_Health_Reporter {
 			array(
 				'timeout'     => Mobo_Core_Settings::get_int( 'mobo_core_health_report_timeout_seconds', 15, 5, 60 ),
 				'redirection' => 2,
-				'sslverify'   => false,
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'health_reporter' ),
 				'headers'     => array(
 					'Accept'       => 'application/json',
 					'Content-Type' => 'application/json; charset=utf-8',
@@ -223,7 +223,7 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		return array(
-			'enabled'       => Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '1' ),
+			'enabled'       => Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '0' ),
 			'reportUrl'     => $this->get_report_url(),
 			'lastAttemptAt' => absint( get_option( 'mobo_core_health_last_report_attempt_at', 0 ) ),
 			'lastSuccessAt' => absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) ),

@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.43
+ * Version: 10.31.45
  * Author: Pedram Karimi
  * Author URI: https://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -19,12 +19,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.43' );
+define( 'MOBO_CORE_VERSION', '10.31.45' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'MOBO_CORE_PURCHASE_URL', 'https://mobo.codeya.ir/' );
 define( 'MOBO_CORE_GITHUB_URL', 'https://github.com/PedramDev/mobo-core' );
+define( 'MOBO_CORE_SALES_PHONE', '+989124508218' );
+define( 'MOBO_CORE_SALES_TEL_URL', 'tel:+989124508218' );
+define( 'MOBO_CORE_SALES_TELEGRAM_URL', 'https://t.me/yazdan_ghadiri' );
+define( 'MOBO_CORE_SALES_WHATSAPP_URL', 'https://wa.me/989124508218' );
+define( 'MOBO_CORE_TECH_PHONE', '+989367362228' );
+define( 'MOBO_CORE_TECH_TELEGRAM_URL', 'https://t.me/Codeya' );
 define( 'MOBO_CORE_LEGACY_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-files/' );
 
 $mobo_core_upload = function_exists( 'wp_upload_dir' ) ? wp_upload_dir( null, false ) : array();
@@ -40,12 +46,12 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_DATA_DIR . 'webhook-files/' );
  *
  * You can define this in wp-config.php or in your custom environment loader:
  *
- * define( 'MOBO_API_BASE_URL', 'http://dev.mobo.codeya.ir/' );
+ * define( 'MOBO_API_BASE_URL', 'https://dev.mobo.codeya.ir/' );
  *
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
 if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+	define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 }
 
 /*
@@ -192,7 +198,7 @@ add_action(
 		 * packages and shipping-rate calculation.
 		 */
 		$checkout_validation_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
-		$checkout_runtime_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' )
+		$checkout_runtime_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' )
 			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' ) )
 			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' ) )
 			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' ) );

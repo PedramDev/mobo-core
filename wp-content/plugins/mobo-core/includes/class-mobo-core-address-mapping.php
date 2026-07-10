@@ -496,7 +496,7 @@ class Mobo_Core_Address_Mapping {
 			'enabled'                => $this->is_enabled(),
 			'checkoutActive'         => $this->is_checkout_mapping_active(),
 			'checkoutMode'           => $this->is_enabled() ? 'manual-map' : 'disabled',
-			'orderSubmissionEnabled' => Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' ),
+			'orderSubmissionEnabled' => Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ),
 			'lastAttemptAt'          => absint( get_option( 'mobo_core_address_mapping_last_attempt_at', 0 ) ),
 			'lastSuccessAt'          => absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ),
 			'lastError'              => (string) get_option( 'mobo_core_address_mapping_last_error', '' ),
@@ -1038,7 +1038,7 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	private function is_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 	}
 
 	private function is_checkout_mapping_active() {

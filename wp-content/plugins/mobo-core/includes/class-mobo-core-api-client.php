@@ -332,7 +332,7 @@ class Mobo_Core_API_Client {
 			array(
 				'timeout'     => max( 5, absint( $timeout ) ),
 				'redirection' => 3,
-				'sslverify'   => false,
+				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'api_client' ),
 				'headers'     => $headers,
 			)
 		);
