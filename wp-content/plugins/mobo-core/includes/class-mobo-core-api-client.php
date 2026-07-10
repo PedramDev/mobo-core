@@ -80,7 +80,7 @@ class Mobo_Core_API_Client {
 	/**
 	 * Get a single product payload by remote product GUID.
 	 *
-	 * Portal endpoint:
+	 * MoboCore endpoint:
 	 * /get-products-by-guid?ProductId={productGuid}&SyncId=...
 	 *
 	 * This is used by category reapply to backfill category_guid metadata for
@@ -151,10 +151,10 @@ class Mobo_Core_API_Client {
 
 
 	/**
-	 * Pull a lightweight webhook payload from Portal.
+	 * Pull a lightweight webhook payload from MoboCore.
 	 *
 	 * The URL may be absolute, root-relative, or relative to the configured
-	 * API base URL. The customer site's X-SEC value is sent so Portal can
+	 * API base URL. The customer site's X-SEC value is sent so MoboCore can
 	 * authorize the payload request.
 	 *
 	 * @param string $payload_url Payload URL from lightweight notification.
@@ -178,15 +178,15 @@ class Mobo_Core_API_Client {
 
 
 	/**
-	 * Get cached address mapping from Portal.
+	 * Get cached address mapping from MoboCore.
 	 *
-	 * Portal returns countries/states/cities with Mobo numeric IDs. Customer sites
+	 * MoboCore returns countries/states/cities with Mobo numeric IDs. Customer sites
 	 * cache this locally and use it for checkout address selects.
 	 *
 	 * Expected endpoint:
 	 * /get-address-mapping?force=true|false
 	 *
-	 * @param bool $force Ask Portal to refresh if needed.
+	 * @param bool $force Ask MoboCore to refresh if needed.
 	 * @return array|WP_Error
 	 */
 	public function get_address_mapping( $force = false ) {
@@ -200,13 +200,33 @@ class Mobo_Core_API_Client {
 		return $this->get_json( $path );
 	}
 
+	/**
+	 * Get cached Mobo shipping methods from MoboCore.
+	 *
+	 * Expected endpoint:
+	 * /get-mobo-shipping-methods?force=true|false
+	 *
+	 * @param bool $force Ask MoboCore to refresh if supported.
+	 * @return array|WP_Error
+	 */
+	public function get_mobo_shipping_methods( $force = false ) {
+		$path = add_query_arg(
+			array(
+				'force' => $force ? 'true' : 'false',
+			),
+			'get-mobo-shipping-methods'
+		);
+
+		return $this->get_json( $path );
+	}
+
 
 	/**
-	 * Get license information from Portal/API.
+	 * Get license information from MoboCore/API.
 	 *
 	 * Legacy plugin versions used the LicenseInfo endpoint to show whether the
 	 * license is expired and how much validity remains. Keep the same endpoint
-	 * so existing Portal contracts continue to work after migration.
+	 * so existing MoboCore contracts continue to work after migration.
 	 *
 	 * Expected legacy payload includes at least:
 	 * - isExpired: bool

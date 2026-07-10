@@ -34,6 +34,7 @@ class Mobo_Core_Migration {
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::create_database_tables();
+		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
 		self::discard_legacy_webhook_queue();
@@ -63,6 +64,7 @@ class Mobo_Core_Migration {
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::create_database_tables();
+		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
 		self::discard_legacy_webhook_queue();
@@ -179,8 +181,87 @@ class Mobo_Core_Migration {
 			Mobo_Core_Image_Queue::create_table();
 		}
 
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ) {
+			Mobo_Core_Image_Refresh_Queue::create_table();
+		}
+
+		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
+			Mobo_Core_Orphan_Image_Cleanup::create_table();
+		}
+
 		update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
 	}
+
+	/**
+	 * Mark legacy installs as requiring one manual Repair pass.
+	 *
+	 * Version 7 installs can have products/images created before the new map,
+	 * image queue and hash-bypass repair flow existed. We do not run Repair during
+	 * upgrade because it can be heavy; we only persist a clear admin requirement.
+	 *
+	 * @param string $previous_version Previously stored DB version.
+	 * @return void
+	 */
+	private static function maybe_mark_legacy_repair_required( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+
+		if ( class_exists( 'Mobo_Core_Product_Sync' ) && Mobo_Core_Product_Sync::is_repair_completed() ) {
+			update_option( 'mobo_core_legacy_repair_required', '0', false );
+			return;
+		}
+
+		$looks_legacy = false;
+		if ( '' !== $previous_version ) {
+			$looks_legacy = version_compare( $previous_version, '10.0.0', '<' );
+		} else {
+			$looks_legacy = self::has_legacy_mobo_content();
+		}
+
+		if ( $looks_legacy ) {
+			update_option( 'mobo_core_legacy_repair_required', '1', false );
+		}
+	}
+
+	/**
+	 * Detect legacy Mobo products/attachments on installs that do not have a stored DB version.
+	 *
+	 * @return bool
+	 */
+	private static function has_legacy_mobo_content() {
+		global $wpdb;
+
+		$product_meta_count = absint(
+			$wpdb->get_var(
+				"SELECT COUNT(1)
+				FROM {$wpdb->postmeta} pm
+				INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				WHERE p.post_type IN ('product','product_variation')
+				AND p.post_status NOT IN ('trash','auto-draft')
+				AND pm.meta_key IN ('product_guid','variant_guid','portal_product_id','mobo_portal_product_id','_mobo_portal_product_id','PortalProductId','mobo_url')
+				AND pm.meta_value <> ''
+				LIMIT 1"
+			)
+		);
+
+		if ( $product_meta_count > 0 ) {
+			return true;
+		}
+
+		$attachment_meta_count = absint(
+			$wpdb->get_var(
+				"SELECT COUNT(1)
+				FROM {$wpdb->postmeta} pm
+				INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				WHERE p.post_type = 'attachment'
+				AND pm.meta_key IN ('image_guid','img_guid','mobo_source_url')
+				AND pm.meta_value <> ''
+				LIMIT 1"
+			)
+		);
+
+		return $attachment_meta_count > 0;
+	}
+
 
 	/**
 	 * Seed product/variation map from old post meta without blocking upgrades.

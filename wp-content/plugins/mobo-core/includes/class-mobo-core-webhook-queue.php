@@ -546,6 +546,49 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
+	 * Store remote Mobo shipping method changes for admin review.
+	 *
+	 * @param array $payload Payload.
+	 * @return array
+	 */
+	private function process_shipping_methods_changed_payload( $payload ) {
+		if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
+			$manager = new Mobo_Core_Remote_Shipping_Methods();
+			$result  = $manager->store_snapshot( $payload, 'webhook' );
+			if ( empty( $result['success'] ) ) {
+				return array(
+					'success' => false,
+					'message' => isset( $result['message'] ) ? $result['message'] : 'Mobo shipping methods payload was invalid.',
+				);
+			}
+		}
+
+		return array(
+			'success' => true,
+			'message' => 'Mobo shipping methods change was stored for admin review.',
+			'data'    => array( 'deleteFile' => true ),
+		);
+	}
+
+	/**
+	 * Store webhook delivery status notification for admin display.
+	 *
+	 * @param array $payload Payload.
+	 * @return array
+	 */
+	private function process_webhook_delivery_status_payload( $payload ) {
+		$data = isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : $payload;
+		update_option( 'mobo_core_portal_webhook_delivery_status', $data, false );
+		update_option( 'mobo_core_portal_webhook_delivery_status_at', time(), false );
+
+		return array(
+			'success' => true,
+			'message' => 'MoboCore webhook delivery status was stored.',
+			'data'    => array( 'deleteFile' => true ),
+		);
+	}
+
+	/**
 	 * Parent wait timeout for UpdateVariant events.
 	 *
 	 * @return int
@@ -822,6 +865,12 @@ class Mobo_Core_Webhook_Queue {
 			case 'UpdateVariant':
 				return $product_sync->process_update_variant_payload( $payload );
 
+			case 'ShippingMethodsChanged':
+				return $this->process_shipping_methods_changed_payload( $payload );
+
+			case 'WebhookDeliveryStatusChanged':
+				return $this->process_webhook_delivery_status_payload( $payload );
+
 			default:
 				return array(
 					'success' => false,
@@ -835,7 +884,7 @@ class Mobo_Core_Webhook_Queue {
 	/**
 	 * Resolve lightweight webhook notifications into the real payload.
 	 *
-	 * Portal phase-3 notifications contain only EventId/Type/ChangesUrl. Old full
+	 * MoboCore phase-3 notifications contain only EventId/Type/ChangesUrl. Old full
 	 * payload webhooks still bypass this method and are processed as before.
 	 *
 	 * @param string $event Expected event name.
@@ -903,7 +952,7 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
-	 * Unwrap Portal EventModel<T> payloads:
+	 * Unwrap MoboCore EventModel<T> payloads:
 	 * { event/type, data: {...} } or { Event/Type, Data: {...} }
 	 *
 	 * @param string $expected_event Expected event.
@@ -932,7 +981,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		/*
-		 * Important: Portal paged payloads are shaped like:
+		 * Important: MoboCore paged payloads are shaped like:
 		 * { productId: "...", data: [ variants/products ], pageNumber: ... }.
 		 * The list in data is not an EventModel wrapper; unwrapping it would drop
 		 * productId/page/cursor metadata and UpdateVariant would fail with
@@ -1305,6 +1354,8 @@ class Mobo_Core_Webhook_Queue {
 			1 => 'UpdateVariant',
 			2 => 'ProductUpdated',
 			4 => 'UpdateVariant',
+			20 => 'ShippingMethodsChanged',
+			21 => 'WebhookDeliveryStatusChanged',
 		);
 
 		return isset( $map[ $type ] ) ? $map[ $type ] : '';

@@ -951,6 +951,11 @@ class Mobo_Core_Sync_Event_Store {
 					$guid = $product_guid;
 				}
 			}
+		} elseif ( 'ShippingMethodsChanged' === $event_type || 'WebhookDeliveryStatusChanged' === $event_type ) {
+			return array(
+				'entityType' => 'system',
+				'entityGuid' => null,
+			);
 		} elseif ( 'ProductUpdated' === $event_type ) {
 			$type = 'product';
 			$guid = $this->first_non_empty(
@@ -1019,6 +1024,8 @@ class Mobo_Core_Sync_Event_Store {
 			1 => 'UpdateVariant',
 			2 => 'ProductUpdated',
 			4 => 'UpdateVariant',
+			20 => 'ShippingMethodsChanged',
+			21 => 'WebhookDeliveryStatusChanged',
 		);
 
 		return isset( $map[ $type ] ) ? $map[ $type ] : '';

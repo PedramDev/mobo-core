@@ -13,12 +13,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Product_Sync {
 
 	const STATE_OPTION = 'mobo_core_sync_state';
+	const REPAIR_COMPLETED_OPTION = 'mobo_core_repair_completed_at';
+	const REPAIR_LAST_SYNC_ID_OPTION = 'mobo_core_repair_last_sync_id';
 
 	private $rules;
 	private $price_calculator;
 	private $image_sync;
 	private $category_sync;
 	private $product_map;
+	private $repair_mode = false;
 
 	public function __construct() {
 		$this->rules            = new Mobo_Core_Legacy_Rules();
@@ -28,8 +31,13 @@ class Mobo_Core_Product_Sync {
 		$this->product_map      = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
 	}
 
-	public function start_manual_sync( $sync_id = '', $source = 'admin' ) {
-		$sync_id = sanitize_text_field( (string) $sync_id );
+	public function start_manual_sync( $sync_id = '', $source = 'admin', $repair_mode = false ) {
+		$sync_id     = sanitize_text_field( (string) $sync_id );
+		$repair_mode = (bool) $repair_mode;
+
+		if ( $repair_mode ) {
+			delete_option( self::REPAIR_COMPLETED_OPTION );
+		}
 
 		if ( '' === $sync_id ) {
 			$sync_id = wp_generate_uuid4();
@@ -39,6 +47,8 @@ class Mobo_Core_Product_Sync {
 			'syncId'                       => $sync_id,
 			'status'                       => 'running',
 			'source'                       => sanitize_key( (string) $source ),
+			'repairMode'                   => $repair_mode,
+			'hashCheckBypassed'            => $repair_mode,
 
 			'categorySynced'               => false,
 
@@ -71,7 +81,7 @@ class Mobo_Core_Product_Sync {
 			'startedAt'                    => time(),
 			'completedAt'                  => 0,
 			'updatedAt'                    => time(),
-			'lastMessage'                  => 'همگام‌سازی محصولات شروع شد.',
+			'lastMessage'                  => $repair_mode ? 'Repair محصولات شروع شد. Hash check در این اجرا bypass می‌شود.' : 'همگام‌سازی محصولات شروع شد.',
 			'lastError'                    => '',
 			'transientRetryCount'           => 0,
 			'lastTransientError'            => '',
@@ -84,7 +94,7 @@ class Mobo_Core_Product_Sync {
 
 		return $this->result(
 			true,
-			'همگام‌سازی محصولات شروع شد.',
+			$repair_mode ? 'Repair محصولات شروع شد.' : 'همگام‌سازی محصولات شروع شد.',
 			$this->get_manual_sync_status()
 		);
 	}
@@ -125,6 +135,8 @@ class Mobo_Core_Product_Sync {
 			'syncId'                       => '',
 			'status'                       => 'idle',
 			'source'                       => '',
+			'repairMode'                   => false,
+			'hashCheckBypassed'            => false,
 
 			'categorySynced'               => false,
 
@@ -184,7 +196,7 @@ class Mobo_Core_Product_Sync {
 		$current_status  = sanitize_key( (string) $state['status'] );
 
 		/*
-		 * Portal totalCount can be a stale estimate while hasMore=false is the
+		 * MoboCore totalCount can be a stale estimate while hasMore=false is the
 		 * authoritative terminal signal. When sync is already done, the UI must not
 		 * keep showing a phantom remaining product such as 529/530.
 		 */
@@ -209,6 +221,10 @@ class Mobo_Core_Product_Sync {
 			'syncId'                       => sanitize_text_field( (string) $state['syncId'] ),
 			'status'                       => $current_status,
 			'source'                       => sanitize_key( (string) $state['source'] ),
+			'repairMode'                   => ! empty( $state['repairMode'] ),
+			'hashCheckBypassed'            => ! empty( $state['hashCheckBypassed'] ),
+			'repairCompletedAt'            => self::get_repair_completed_at(),
+			'isRepairCompleted'            => self::is_repair_completed(),
 
 			'isRunning'                    => 'running' === $current_status,
 			'isWaitingForPortal'            => $is_waiting,
@@ -265,6 +281,7 @@ class Mobo_Core_Product_Sync {
 	public function run_manual_sync_step() {
 		$api            = new Mobo_Core_API_Client();
 		$state          = $this->get_manual_sync_state();
+		$this->repair_mode = ! empty( $state['repairMode'] );
 		$products_limit = Mobo_Core_Settings::get_int( 'mobo_core_products_per_page', 1, 1, 20 );
 		$variants_limit = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
 
@@ -287,13 +304,13 @@ class Mobo_Core_Product_Sync {
 				$state['updatedAt'] = time();
 				$this->save_manual_sync_state( $state );
 
-				return $this->result( true, 'Portal هنوز آماده تلاش مجدد نیست. وضعیت sync حفظ شده است.', $this->get_manual_sync_status() );
+				return $this->result( true, 'MoboCore هنوز آماده تلاش مجدد نیست. وضعیت sync حفظ شده است.', $this->get_manual_sync_status() );
 			}
 
 			$state['status']              = 'running';
 			$state['transientRetryCount'] = 0;
 			$state['lastError']           = '';
-			$state['lastMessage']         = 'اتصال به Portal دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
+			$state['lastMessage']         = 'اتصال به MoboCore دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
 			$state['updatedAt']           = time();
 			$this->save_manual_sync_state( $state );
 		}
@@ -385,7 +402,7 @@ class Mobo_Core_Product_Sync {
 				}
 			} elseif ( $use_product_cursor ) {
 				/*
-				 * Backward compatibility: older Portal builds ignore UseCursor/Cursor.
+				 * Backward compatibility: older MoboCore builds ignore UseCursor/Cursor.
 				 * After the first legacy response, fall back to page-number mode.
 				 */
 				$state['productCursorMode']      = 'page-fallback';
@@ -402,7 +419,7 @@ class Mobo_Core_Product_Sync {
 
 			if ( empty( $state['productQueue'] ) && ! $this->to_bool( $has_more ) ) {
 				/*
-				 * If Portal says there is no next page, sync is complete even when a
+				 * If MoboCore says there is no next page, sync is complete even when a
 				 * previously reported totalCount was one item higher. Persist the
 				 * effective total so the admin UI does not show a phantom remaining item.
 				 */
@@ -483,12 +500,34 @@ class Mobo_Core_Product_Sync {
 				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
-			$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
+			$product_lock = false;
 
-			/*
-			 * In manual sync, images are processed as separate chunks after parent save.
-			 */
-			$product_id = $this->upsert_parent_product( $product_data, true );
+			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+				$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 5, 180 );
+
+				if ( false === $product_lock ) {
+					array_unshift( $state['productQueue'], $product_data );
+					$state['lastError']   = '';
+					$state['lastMessage'] = 'این محصول در مسیر دیگری در حال پردازش است؛ sync در مرحله بعدی دوباره تلاش می‌کند: ' . $product_guid;
+					$state['updatedAt']   = time();
+					$this->save_manual_sync_state( $state );
+
+					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+				}
+			}
+
+			try {
+				$was_existing = '' !== $product_guid && $this->find_product_id_by_guid( $product_guid ) > 0;
+
+				/*
+				 * In manual sync, images are processed as separate chunks after parent save.
+				 */
+				$product_id = $this->upsert_parent_product( $product_data, true );
+			} finally {
+				if ( false !== $product_lock && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+					Mobo_Core_Product_Concurrency::release_product_lock( $product_lock );
+				}
+			}
 
 			if ( $product_id <= 0 ) {
 				$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
@@ -617,7 +656,7 @@ class Mobo_Core_Product_Sync {
 		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
 
 		/*
-		 * Some Portal/Swagger payloads may return totalCount=0 while data still contains variants.
+		 * Some MoboCore/Swagger payloads may return totalCount=0 while data still contains variants.
 		 * Treat the actual data as authoritative for this page; never mark existing variations
 		 * as simple/out-of-stock just because totalCount is zero.
 		 */
@@ -668,7 +707,7 @@ class Mobo_Core_Product_Sync {
 			'data'          => $variant_items,
 		);
 
-		$result = $this->process_update_variant_payload( $payload );
+		$result = $this->process_update_variant_payload( $payload, true );
 
 		if ( empty( $result['success'] ) ) {
 			$state['lastError']   = isset( $result['message'] ) ? $result['message'] : 'خطا در پردازش تنوع محصول.';
@@ -712,7 +751,135 @@ class Mobo_Core_Product_Sync {
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
 
+
+
+	/**
+	 * Extract the product GUID currently being processed from a ProductUpdated payload.
+	 *
+	 * @param array $payload Payload by reference.
+	 * @return string
+	 */
+	private function extract_current_product_guid_from_product_updated_payload( &$payload ) {
+		if ( ! is_array( $payload ) ) {
+			return '';
+		}
+
+		$items = $this->get_value( $payload, 'data', array() );
+
+		if ( ! is_array( $items ) ) {
+			return '';
+		}
+
+		$product_index = max( 0, absint( $this->get_value( $payload, '_moboProductIndex', 0 ) ) );
+
+		if ( ! isset( $items[ $product_index ] ) || ! is_array( $items[ $product_index ] ) ) {
+			return '';
+		}
+
+		return $this->extract_product_guid( $items[ $product_index ] );
+	}
+
+	/**
+	 * Extract parent product GUID from all known UpdateVariant payload shapes.
+	 *
+	 * @param array $payload Payload.
+	 * @return string
+	 */
+	private function extract_product_guid_from_update_variant_payload( $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return '';
+		}
+
+		$inner_data = $this->get_value( $payload, 'data', null );
+		if ( is_array( $inner_data ) && ! $this->is_list_array( $inner_data ) ) {
+			$inner_product_guid = $this->extract_product_guid( $inner_data );
+			$inner_variants     = $this->get_value( $inner_data, 'data', null );
+
+			if ( '' !== $inner_product_guid || is_array( $inner_variants ) ) {
+				$payload = array_merge( $payload, $inner_data );
+			}
+		}
+
+		$product_guid = $this->extract_product_guid( $payload );
+		$variants     = $this->get_value( $payload, 'data', array() );
+
+		if ( is_array( $variants ) && ! $this->is_list_array( $variants ) ) {
+			$nested_variants = $this->get_value( $variants, 'data', null );
+			if ( is_array( $nested_variants ) ) {
+				$variants = $nested_variants;
+			}
+		}
+
+		if ( '' === $product_guid && is_array( $variants ) && isset( $variants[0] ) && is_array( $variants[0] ) ) {
+			$product_guid = $this->extract_product_guid( $variants[0] );
+		}
+
+		if ( '' === $product_guid ) {
+			$variant_guid = $this->extract_variant_guid( $payload );
+			if ( '' !== $variant_guid ) {
+				$product_guid = $this->find_parent_product_guid_by_variant_guid( $variant_guid );
+			}
+		}
+
+		return sanitize_text_field( (string) $product_guid );
+	}
+
+	/**
+	 * Whether the current manual sync run is a repair pass.
+	 *
+	 * Repair mode deliberately changes only one behavior: it bypasses the
+	 * source-hash short-circuit. All field update decisions still follow the
+	 * normal Mobo settings and legacy rules.
+	 *
+	 * @return bool
+	 */
+	private function is_repair_mode() {
+		return (bool) $this->repair_mode;
+	}
+
+	/**
+	 * Get repair completion timestamp.
+	 *
+	 * @return int
+	 */
+	public static function get_repair_completed_at() {
+		return absint( get_option( self::REPAIR_COMPLETED_OPTION, 0 ) );
+	}
+
+	/**
+	 * Whether the required repair pass has completed.
+	 *
+	 * @return bool
+	 */
+	public static function is_repair_completed() {
+		return self::get_repair_completed_at() > 0;
+	}
+
 	public function process_product_updated_payload( &$payload ) {
+		$product_guid = $this->extract_current_product_guid_from_product_updated_payload( $payload );
+
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $product_guid, 'manual_sync_active', 45 );
+			}
+
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 5, 180 );
+
+			if ( false === $lock ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $product_guid, 'product_lock_busy', 30 );
+			}
+
+			try {
+				return $this->process_product_updated_payload_unlocked( $payload );
+			} finally {
+				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+			}
+		}
+
+		return $this->process_product_updated_payload_unlocked( $payload );
+	}
+
+	private function process_product_updated_payload_unlocked( &$payload ) {
 		if ( ! is_array( $payload ) ) {
 			return $this->result( false, 'Invalid ProductUpdated payload.' );
 		}
@@ -839,13 +1006,37 @@ class Mobo_Core_Product_Sync {
 		return $this->result( true, 'ProductUpdated processed.', array( 'deleteFile' => true ) );
 	}
 
-	public function process_update_variant_payload( $payload ) {
+	public function process_update_variant_payload( $payload, $from_manual_sync = false ) {
+		$product_guid = $this->extract_product_guid_from_update_variant_payload( $payload );
+
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( ! $from_manual_sync && Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $product_guid, 'manual_sync_active', 45 );
+			}
+
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 5, 180 );
+
+			if ( false === $lock ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $product_guid, 'product_lock_busy', 30 );
+			}
+
+			try {
+				return $this->process_update_variant_payload_unlocked( $payload );
+			} finally {
+				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+			}
+		}
+
+		return $this->process_update_variant_payload_unlocked( $payload );
+	}
+
+	private function process_update_variant_payload_unlocked( $payload ) {
 		if ( ! is_array( $payload ) ) {
 			return $this->result( false, 'Invalid UpdateVariant payload.' );
 		}
 
 		/*
-		 * Be tolerant of all known Portal shapes:
+		 * Be tolerant of all known MoboCore shapes:
 		 * 1) VariantSyncPagedResult: { productId, data: [...] }
 		 * 2) EventModel wrapper: { event: UpdateVariant, data: { productId, data: [...] } }
 		 * 3) Legacy list wrapper: { data: [ { productId, ... } ] }
@@ -1201,6 +1392,14 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$state['updatedAt'] = time();
+
+		if ( ! empty( $state['repairMode'] ) && 'done' === sanitize_key( (string) $state['status'] ) ) {
+			$completed_at = ! empty( $state['completedAt'] ) ? absint( $state['completedAt'] ) : time();
+			update_option( self::REPAIR_COMPLETED_OPTION, $completed_at, false );
+			update_option( self::REPAIR_LAST_SYNC_ID_OPTION, sanitize_text_field( (string) ( $state['syncId'] ?? '' ) ), false );
+			update_option( 'mobo_core_legacy_repair_required', '0', false );
+		}
+
 		update_option( self::STATE_OPTION, $state, false );
 
 		return true;
@@ -1413,7 +1612,7 @@ class Mobo_Core_Product_Sync {
 			$current_parent_id = absint( wp_get_post_parent_id( $variation_id ) );
 			$current_parent_ok = 0 === $current_parent_id || $current_parent_id === $parent_id;
 
-			if ( '' !== $incoming_hash && $old_hash === $incoming_hash && '1' !== $old_incomplete && $current_parent_ok ) {
+			if ( ! $this->is_repair_mode() && '' !== $incoming_hash && $old_hash === $incoming_hash && '1' !== $old_incomplete && $current_parent_ok ) {
 				if ( ! $this->variation_stock_matches_payload( $variation_id, $data ) ) {
 					update_post_meta( $variation_id, '_mobo_hash_skip_bypassed_reason', 'stock-mismatch' );
 					update_post_meta( $variation_id, '_mobo_hash_skip_bypassed_at', gmdate( 'c' ) );
@@ -1649,6 +1848,7 @@ class Mobo_Core_Product_Sync {
 		$policy = array(
 			'mobo_price_type'                   => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
 			'global_additional_price'           => (string) Mobo_Core_Settings::get( 'global_additional_price', 0 ),
+			'global_additional_percentage'      => (string) Mobo_Core_Settings::get( 'global_additional_percentage', 0 ),
 			'global_product_auto_compare_price' => (string) Mobo_Core_Settings::get( 'global_product_auto_compare_price', '0' ),
 			'mobo_dynamic_price'                => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
 		);
@@ -2083,7 +2283,7 @@ class Mobo_Core_Product_Sync {
 			$state['waitingForPortalSince'] = empty( $state['waitingForPortalSince'] ) ? time() : absint( $state['waitingForPortalSince'] );
 			$state['nextRetryAt']           = time() + $delay_seconds;
 			$state['lastError']             = '';
-			$state['lastMessage']           = sprintf( '%s اتصال به Portal پس از %d تلاش برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
+			$state['lastMessage']           = sprintf( '%s اتصال به MoboCore پس از %d تلاش برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
 			$this->save_manual_sync_state( $state );
 
 			return $this->result( true, $state['lastMessage'] . ' ' . $error_msg, $this->get_manual_sync_status() );
@@ -2364,6 +2564,8 @@ class Mobo_Core_Product_Sync {
 				'post_status'            => array( 'trash', 'auto-draft' ),
 				'fields'                 => 'ids',
 				'posts_per_page'         => 1,
+				'orderby'                => 'ID',
+				'order'                  => 'ASC',
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
@@ -2386,12 +2588,23 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
-			$product_id = $this->product_map->get_product_id( $guid );
+		$mapped_product_id = 0;
 
-			if ( $product_id > 0 ) {
-				return $product_id;
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			$mapped_product_id = $this->product_map->get_product_id( $guid );
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			$canonical_id = Mobo_Core_Product_Concurrency::get_canonical_product_id( $guid, $mapped_product_id );
+
+			if ( $canonical_id > 0 ) {
+				$this->upsert_product_map( $guid, $canonical_id, false );
+				return $canonical_id;
 			}
+		}
+
+		if ( $mapped_product_id > 0 ) {
+			return $mapped_product_id;
 		}
 
 		$product_id = $this->find_post_id_by_meta( 'product', 'product_guid', $guid );
@@ -2474,6 +2687,8 @@ class Mobo_Core_Product_Sync {
 				'post_status'            => array( 'publish', 'draft', 'private', 'pending', 'inherit' ),
 				'fields'                 => 'ids',
 				'posts_per_page'         => 1,
+				'orderby'                => 'ID',
+				'order'                  => 'ASC',
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,

@@ -55,7 +55,22 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function validate_cart_notices() {
-		if ( ! $this->is_enabled() ) {
+		if ( ! $this->has_active_checkout_validation_checks() ) {
+			return;
+		}
+
+		/*
+		 * Keep Mobo cart notices out of checkout rendering and checkout Ajax.
+		 * WooCommerce persists notices in the customer session; an error notice
+		 * created on the initial checkout page load can still be present when
+		 * update_order_review calculates shipping rates. Some shipping methods then
+		 * return no rates even though their zone and method are configured correctly.
+		 *
+		 * Therefore, cart-page notices are allowed only on the cart page. Checkout
+		 * blocking remains in woocommerce_after_checkout_validation when the customer
+		 * actually submits the order.
+		 */
+		if ( ! ( function_exists( 'is_cart' ) && is_cart() ) || $this->is_checkout_order_review_ajax_request() ) {
 			return;
 		}
 
@@ -88,7 +103,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function validate_checkout_errors( $data, $errors ) {
-		if ( ! $this->is_enabled() || ! ( $errors instanceof WP_Error ) ) {
+		if ( ! $this->has_active_checkout_validation_checks() || ! ( $errors instanceof WP_Error ) ) {
 			return;
 		}
 
@@ -121,10 +136,31 @@ class Mobo_Core_Checkout_Validator {
 			$result = array();
 		}
 
+		$master_enabled = $this->is_enabled();
+		$mobo_cart_raw = $this->is_mobo_cart_validation_enabled();
+		$auto_order_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '1' );
+		$local_stock_raw = Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' );
+		$external_raw    = Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' );
+
+		$mobo_cart_enabled   = $master_enabled && $mobo_cart_raw;
+		$local_stock_enabled = $master_enabled && $local_stock_raw;
+		$external_enabled    = $master_enabled && $external_raw;
+		$runtime_enabled     = $auto_order_enabled || $mobo_cart_enabled || $local_stock_enabled || $external_enabled;
+
+		if ( ! $mobo_cart_enabled && ! $auto_order_enabled ) {
+			delete_option( 'mobo_core_shared_mobo_cart_lock' );
+		}
+
 		return array(
-			'enabled'          => $this->is_enabled(),
-			'moboCartEnabled'  => $this->is_mobo_cart_validation_enabled(),
-			'external'         => Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' ),
+			'enabled'           => $master_enabled,
+			'runtimeEnabled'    => $runtime_enabled,
+			'localStockEnabled' => $local_stock_enabled,
+			'moboCartEnabled'   => $mobo_cart_enabled,
+			'autoOrderEnabled'  => $auto_order_enabled,
+			'external'          => $external_enabled,
+			'rawLocalStockEnabled' => $local_stock_raw,
+			'rawMoboCartEnabled'   => $mobo_cart_raw,
+			'rawExternalEnabled'   => $external_raw,
 			'lastAttemptAt'    => absint( get_option( 'mobo_core_checkout_last_validation_attempt_at', 0 ) ),
 			'lastSuccessAt'    => absint( get_option( 'mobo_core_checkout_last_validation_success_at', 0 ) ),
 			'lastMoboLoginAt'  => absint( get_option( 'mobo_core_checkout_mobo_login_success_at', 0 ) ),
@@ -172,7 +208,7 @@ class Mobo_Core_Checkout_Validator {
 			return $this->result( true, array(), array( 'items' => array() ) );
 		}
 
-		if ( $include_external && $this->is_mobo_cart_validation_enabled() ) {
+		if ( $include_external && $this->is_mobo_cart_validation_effective() ) {
 			$mobo_errors = $this->validate_mobo_cart_api( $items );
 
 			if ( ! empty( $mobo_errors ) ) {
@@ -180,7 +216,7 @@ class Mobo_Core_Checkout_Validator {
 			}
 		}
 
-		$external_errors = $include_external ? $this->validate_external( $items ) : array();
+		$external_errors = ( $include_external && $this->is_external_validation_effective() ) ? $this->validate_external( $items ) : array();
 
 		if ( ! empty( $external_errors ) ) {
 			$errors = array_merge( $errors, $external_errors );
@@ -213,6 +249,31 @@ class Mobo_Core_Checkout_Validator {
 		 * customer actually submits checkout.
 		 */
 		return false;
+	}
+
+	/**
+	 * Detect WooCommerce Ajax order-review refresh.
+	 *
+	 * This request recalculates totals and shipping methods while the customer is
+	 * editing checkout fields. Mobo validation must not add cart error notices in
+	 * this pass; otherwise shipping plugins may return no rates even though their
+	 * zone and method are configured correctly.
+	 *
+	 * @return bool
+	 */
+	private function is_checkout_order_review_ajax_request() {
+		$is_ajax = ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) || ( defined( 'DOING_AJAX' ) && DOING_AJAX );
+
+		$wc_ajax = '';
+		if ( isset( $_GET['wc-ajax'] ) ) {
+			$wc_ajax = sanitize_key( wp_unslash( $_GET['wc-ajax'] ) );
+		} elseif ( isset( $_POST['wc-ajax'] ) ) {
+			$wc_ajax = sanitize_key( wp_unslash( $_POST['wc-ajax'] ) );
+		}
+
+		$action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
+
+		return ( $is_ajax && 'update_order_review' === $wc_ajax ) || 'woocommerce_update_order_review' === $action;
 	}
 
 	/**
@@ -257,6 +318,47 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
+	 * Master switch aware local stock flag.
+	 *
+	 * @return bool
+	 */
+	private function is_local_stock_check_effective() {
+		return $this->is_enabled() && Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' );
+	}
+
+	/**
+	 * Master switch aware Mobo cart validation flag.
+	 *
+	 * @return bool
+	 */
+	private function is_mobo_cart_validation_effective() {
+		return $this->is_enabled() && $this->is_mobo_cart_validation_enabled();
+	}
+
+	/**
+	 * Master switch aware external validation flag.
+	 *
+	 * @return bool
+	 */
+	private function is_external_validation_effective() {
+		return $this->is_enabled() && Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' );
+	}
+
+	/**
+	 * Whether any pre-purchase validation should run on cart/checkout.
+	 *
+	 * The master switch alone must not change checkout behavior. At least one
+	 * concrete validation mode must also be enabled.
+	 *
+	 * @return bool
+	 */
+	private function has_active_checkout_validation_checks() {
+		return $this->is_local_stock_check_effective()
+			|| $this->is_mobo_cart_validation_effective()
+			|| $this->is_external_validation_effective();
+	}
+
+	/**
 	 * Build sanitized cart item payload and local validation errors.
 	 *
 	 * @param array $errors Output errors.
@@ -282,7 +384,7 @@ class Mobo_Core_Checkout_Validator {
 		$only_mobo_products = true;
 		$block_incomplete   = true;
 		$require_guid       = true;
-		$check_stock        = Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' ) && ! $this->is_mobo_cart_validation_enabled();
+		$check_stock        = $this->is_local_stock_check_effective() && ! $this->is_mobo_cart_validation_effective();
 
 		$items = array();
 
@@ -510,7 +612,7 @@ class Mobo_Core_Checkout_Validator {
 		/* Single shared Mobo cart mode: live WooCommerce removals must not touch Mobo. */
 		return;
 
-		if ( ! $this->is_enabled() || ! $this->is_mobo_cart_validation_enabled() ) {
+		if ( ! $this->is_mobo_cart_validation_effective() ) {
 			return;
 		}
 
@@ -575,9 +677,9 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Delete a Mobo cart row for a Portal variant ID.
+	 * Delete a Mobo cart row for a MoboCore variant ID.
 	 *
-	 * @param int $portal_variant_id Portal variant ID.
+	 * @param int $portal_variant_id MoboCore variant ID.
 	 * @return true|WP_Error
 	 */
 	private function delete_mobo_cart_item_for_variant( $portal_variant_id ) {
@@ -797,9 +899,9 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Add one Portal variant to the shared Mobo cart.
+	 * Add one MoboCore variant to the shared Mobo cart.
 	 *
-	 * @param int   $portal_variant_id Portal variant ID.
+	 * @param int   $portal_variant_id MoboCore variant ID.
 	 * @param float $quantity Quantity.
 	 * @return array|WP_Error
 	 */
@@ -976,7 +1078,7 @@ class Mobo_Core_Checkout_Validator {
 	 * The cart item ID is discovered by matching:
 	 * cart.items[].product.variant.id == portal_variant_id.
 	 *
-	 * @param int   $portal_variant_id Portal variant ID.
+	 * @param int   $portal_variant_id MoboCore variant ID.
 	 * @param float $quantity Quantity.
 	 * @param bool  $prefer_put Prefer PUT when a cart item ID can be resolved.
 	 * @return array|WP_Error
@@ -1223,7 +1325,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array Errors.
 	 */
 	private function validate_external( $items ) {
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' ) ) {
+		if ( ! $this->is_external_validation_effective() ) {
 			return array();
 		}
 
@@ -1385,7 +1487,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Get saved Portal product ID.
+	 * Get saved MoboCore product ID.
 	 *
 	 * @param int $parent_id Parent product ID.
 	 * @param int $product_id Actual product ID.
@@ -1413,7 +1515,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Get saved Portal variant ID.
+	 * Get saved MoboCore variant ID.
 	 *
 	 * @param int $variation_id Variation ID.
 	 * @param int $product_id Product ID.
@@ -1714,7 +1816,7 @@ class Mobo_Core_Checkout_Validator {
 	 * Fetch the authoritative Mobo cart snapshot and rebuild the variant => cart line map.
 	 *
 	 * This must run after every successful POST/PUT because Mobo's quantity update
-	 * endpoint needs cart.items[].id, not the Portal variant ID.
+	 * endpoint needs cart.items[].id, not the MoboCore variant ID.
 	 *
 	 * @return array|WP_Error
 	 */
@@ -1793,9 +1895,9 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Get cart item ID for a Portal variant ID from current WooCommerce session.
+	 * Get cart item ID for a MoboCore variant ID from current WooCommerce session.
 	 *
-	 * @param int $portal_variant_id Portal variant ID.
+	 * @param int $portal_variant_id MoboCore variant ID.
 	 * @return int
 	 */
 	private function get_mobo_cart_item_id_for_variant( $portal_variant_id ) {
@@ -1816,9 +1918,9 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Remove stale cart item ID mapping for a Portal variant.
+	 * Remove stale cart item ID mapping for a MoboCore variant.
 	 *
-	 * @param int $portal_variant_id Portal variant ID.
+	 * @param int $portal_variant_id MoboCore variant ID.
 	 * @return void
 	 */
 	private function remove_mobo_cart_item_id_for_variant( $portal_variant_id ) {
@@ -2142,7 +2244,7 @@ class Mobo_Core_Checkout_Validator {
 		$order_object = $order instanceof WC_Order ? $order : ( function_exists( 'wc_get_order' ) ? wc_get_order( absint( $order_id ) ) : null );
 		$scope        = $this->get_order_mobo_item_scope( $order_object );
 
-		if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->add_non_mobo_order_note( absint( $order_id ), $scope, 'status_processing' );
 			return;
 		}
@@ -2261,7 +2363,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$scope = $this->get_order_mobo_item_scope( $order );
-		if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->mark_order_as_not_mobo( $order, $scope, 'queue_request' );
 			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش مربوط به موبو نیست.' );
 		}
@@ -2388,7 +2490,7 @@ class Mobo_Core_Checkout_Validator {
 			}
 
 			$scope = $this->get_order_mobo_item_scope( $order );
-			if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+			if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 				$result['skipped']++;
 				$this->mark_order_as_not_mobo( $order, $scope, 'queue_processor' );
 				if ( null !== $queue_item['queueKey'] ) {
@@ -2438,10 +2540,10 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Inspect order line items and decide whether the whole order belongs to Mobo.
+	 * Inspect order line items and decide how much of the order belongs to Mobo.
 	 *
-	 * Mobo order submission is all-or-nothing. If even one line item is not mapped
-	 * to Mobo, the order must not enter the Mobo submission queue.
+	 * Orders with at least one Mobo item can enter the Mobo submission queue.
+	 * In mixed orders, non-Mobo items stay only inside WooCommerce and are not sent to Mobo.
 	 *
 	 * @param WC_Order|null $order Order object.
 	 * @return array
@@ -2530,13 +2632,16 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * True only when every line item is a Mobo item.
+	 * True when the order contains at least one Mobo item.
+	 *
+	 * Mixed orders are allowed; only their Mobo line items are sent to Mobo.
+	 * Orders with no Mobo item must stay completely outside the Mobo submission flow.
 	 *
 	 * @param array $scope Scope from get_order_mobo_item_scope().
 	 * @return bool
 	 */
-	private function order_scope_is_mobo_only( $scope ) {
-		return is_array( $scope ) && isset( $scope['status'] ) && 'all_mobo' === (string) $scope['status'];
+	private function order_scope_has_mobo_items( $scope ) {
+		return is_array( $scope ) && isset( $scope['mobo'] ) && absint( $scope['mobo'] ) > 0;
 	}
 
 	/**
@@ -2648,9 +2753,9 @@ class Mobo_Core_Checkout_Validator {
 		$order_id = $order->get_id();
 		$scope    = $this->get_order_mobo_item_scope( $order );
 
-		if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->mark_order_as_not_mobo( $order, $scope, 'submit_guard' );
-			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش مربوط به موبو نیست.' );
+			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش محصول موبو ندارد.' );
 		}
 
 		$order->update_meta_data( '_mobo_order_submit_attempted', 'yes' );
@@ -2838,7 +2943,7 @@ class Mobo_Core_Checkout_Validator {
 			$name              = wp_strip_all_tags( $line_item->get_name() );
 
 			if ( ! $is_mobo_item ) {
-				$errors[] = sprintf( 'سفارش شامل محصول غیرموبو است: «%s». در این حالت هیچ سفارشی سمت موبو ثبت نمی‌شود.', $name );
+				/* Mixed orders are valid. Non-Mobo items stay in WooCommerce only. */
 				continue;
 			}
 
@@ -2927,8 +3032,20 @@ class Mobo_Core_Checkout_Validator {
 		$state_id   = absint( $order->get_meta( '_mobo_' . $group . '_state_id', true ) );
 		$city_id    = absint( $order->get_meta( '_mobo_' . $group . '_city_id', true ) );
 
+		if ( ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
+			$address_mapping = new Mobo_Core_Address_Mapping();
+			if ( method_exists( $address_mapping, 'resolve_order_group' ) ) {
+				$resolved = $address_mapping->resolve_order_group( $order, $group );
+				if ( ! is_wp_error( $resolved ) ) {
+					$country_id = absint( isset( $resolved['countryId'] ) ? $resolved['countryId'] : 0 );
+					$state_id   = absint( isset( $resolved['stateId'] ) ? $resolved['stateId'] : 0 );
+					$city_id    = absint( isset( $resolved['cityId'] ) ? $resolved['cityId'] : 0 );
+				}
+			}
+		}
+
 		if ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) {
-			return new WP_Error( 'mobo_core_location_ids_missing', 'شناسه کشور، استان یا شهر موبو روی سفارش کامل نیست.' );
+			return new WP_Error( 'mobo_core_location_ids_missing', 'شناسه کشور، استان یا شهر موبو روی سفارش کامل نیست. نگاشت دستی آدرس را در تنظیمات موبو تکمیل کنید.' );
 		}
 
 		$address_1 = 'shipping' === $group ? $order->get_shipping_address_1() : $order->get_billing_address_1();
@@ -2952,10 +3069,19 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function get_order_address_group_for_mobo( $order ) {
-		$ship_city = absint( $order->get_meta( '_mobo_shipping_city_id', true ) );
-		if ( $ship_city > 0 && ( $order->get_shipping_address_1() || $order->get_shipping_postcode() ) ) {
+		if ( ! $order instanceof WC_Order ) {
+			return 'billing';
+		}
+
+		$shipping_country = method_exists( $order, 'get_shipping_country' ) ? trim( (string) $order->get_shipping_country() ) : '';
+		$shipping_state   = method_exists( $order, 'get_shipping_state' ) ? trim( (string) $order->get_shipping_state() ) : '';
+		$shipping_city    = method_exists( $order, 'get_shipping_city' ) ? trim( (string) $order->get_shipping_city() ) : '';
+		$shipping_address = method_exists( $order, 'get_shipping_address_1' ) ? trim( (string) $order->get_shipping_address_1() ) : '';
+
+		if ( '' !== $shipping_country || '' !== $shipping_state || '' !== $shipping_city || '' !== $shipping_address ) {
 			return 'shipping';
 		}
+
 		return 'billing';
 	}
 
@@ -2995,9 +3121,18 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function resolve_mobo_shipping_id( $order, $shippings_json ) {
-		$shipping_id = Mobo_Core_Settings::get_int( 'mobo_core_mobo_order_shipping_id', 148395514, 1, PHP_INT_MAX );
-
 		$shippings = isset( $shippings_json['shippings'] ) && is_array( $shippings_json['shippings'] ) ? $shippings_json['shippings'] : array();
+
+		if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
+			$manager = new Mobo_Core_Remote_Shipping_Methods();
+			$result  = $manager->resolve_shipping_id_for_order( $order, $shippings );
+			if ( ! is_wp_error( $result ) ) {
+				return absint( $result );
+			}
+			return $result;
+		}
+
+		$shipping_id = Mobo_Core_Settings::get_int( 'mobo_core_mobo_order_shipping_id', 148395514, 1, PHP_INT_MAX );
 		if ( empty( $shippings ) ) {
 			return $shipping_id;
 		}
@@ -3195,7 +3330,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$scope = $this->get_order_mobo_item_scope( $order );
-		if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->mark_order_as_not_mobo( $order, $scope, 'admin_manual_retry' );
 			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
 			exit;
@@ -3375,7 +3510,7 @@ class Mobo_Core_Checkout_Validator {
 			return 'مربوط به موبو نیست';
 		}
 		$scope = $this->get_order_mobo_item_scope( $order );
-		if ( ! $this->order_scope_is_mobo_only( $scope ) ) {
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			return 'مربوط به موبو نیست';
 		}
 		if ( 'failed' === $status ) {

@@ -155,6 +155,13 @@ class Mobo_Core_Cron_Runner {
 			$image_result = $image_sync->process_queue( $image_limit );
 		}
 
+		$image_refresh_result = array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false );
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) && ( time() - $started_at ) < $budget ) {
+			$image_refresh_service = new Mobo_Core_Image_Refresh_Service();
+			$image_refresh_limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
+			$image_refresh_result  = $image_refresh_service->process_queue( $image_refresh_limit );
+		}
+
 		$product_sync = new Mobo_Core_Product_Sync();
 		$status       = $product_sync->get_manual_sync_status();
 		$steps        = 0;
@@ -182,6 +189,12 @@ class Mobo_Core_Cron_Runner {
 		if ( class_exists( 'Mobo_Core_Address_Mapping' ) && ( time() - $started_at ) < $budget ) {
 			$address_mapping = new Mobo_Core_Address_Mapping();
 			$address_mapping_result = $address_mapping->maybe_sync_if_due( $source, false );
+		}
+
+		$remote_shipping_result = array( 'status' => 'skipped' );
+		if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) && ( time() - $started_at ) < $budget ) {
+			$remote_shipping = new Mobo_Core_Remote_Shipping_Methods();
+			$remote_shipping_result = $remote_shipping->maybe_sync_if_due( $source, false );
 		}
 
 		$order_submission_result = array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'remaining' => false );
@@ -214,6 +227,8 @@ class Mobo_Core_Cron_Runner {
 		$remaining_webhooks = ! empty( $webhook_result['remainingFile'] ) || ! empty( $webhook_result['remainingTable'] ) || ! empty( $webhook_result['remainingDueTable'] );
 		$processed_images   = isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0;
 		$remaining_images   = ! empty( $image_result['remaining'] );
+		$processed_image_refresh = isset( $image_refresh_result['processed'] ) ? absint( $image_refresh_result['processed'] ) : 0;
+		$remaining_image_refresh = ! empty( $image_refresh_result['remaining'] );
 		$processed_reprice  = isset( $reprice_result['processed'] ) ? absint( $reprice_result['processed'] ) : 0;
 		$remaining_reprice  = ! empty( $reprice_result['remaining'] );
 		$processed_recategorize = isset( $recategorize_result['processed'] ) ? absint( $recategorize_result['processed'] ) : 0;
@@ -226,6 +241,10 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		if ( $processed_images > 0 && $remaining_images ) {
+			$needs_continuation = true;
+		}
+
+		if ( $processed_image_refresh > 0 && $remaining_image_refresh ) {
 			$needs_continuation = true;
 		}
 
@@ -252,9 +271,11 @@ class Mobo_Core_Cron_Runner {
 			'executedAt'        => time(),
 			'webhookQueue'      => $webhook_result,
 			'imageQueue'        => $image_result,
+			'imageRefreshQueue' => $image_refresh_result,
 			'repriceQueue'      => $reprice_result,
 			'recategorizeQueue' => $recategorize_result,
 			'addressMapping'     => $address_mapping_result,
+			'remoteShipping'     => isset( $remote_shipping_result ) ? $remote_shipping_result : array( 'status' => 'skipped' ),
 			'orderSubmissions'  => $order_submission_result,
 			'maintenance'       => $maintenance_result,
 			'productSteps'      => $steps,

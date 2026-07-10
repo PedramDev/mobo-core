@@ -60,6 +60,15 @@ class Mobo_Core_Settings {
 			'mobo_core_image_queue_blocking'      => '1',
 			'mobo_core_image_max_try'             => 5,
 			'mobo_core_image_retry_base_seconds'  => 120,
+			'mobo_core_image_refresh_enabled'     => '1',
+			'mobo_core_image_refresh_delete_old'  => '1',
+			'mobo_core_image_refresh_per_run'     => 2,
+			'mobo_core_image_refresh_scan_limit'  => 500,
+			'mobo_core_image_refresh_max_try'     => 5,
+			'mobo_core_image_refresh_retry_base_seconds' => 120,
+			'mobo_core_orphan_image_cleanup_enabled' => '1',
+			'mobo_core_orphan_image_scan_limit' => 500,
+			'mobo_core_orphan_image_delete_per_run' => 20,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
 
 			'mobo_core_excluded_product_urls' => '',
@@ -92,7 +101,7 @@ class Mobo_Core_Settings {
 			'mobo_core_self_runner_last_run_success_at'=> 0,
 			'mobo_core_self_runner_last_run_result'    => array(),
 
-			// Customer-side health reporting to Portal.
+			// Customer-side health reporting to MoboCore.
 			'mobo_core_health_report_enabled'          => '1',
 			'mobo_core_health_report_url'              => '',
 			'mobo_core_health_report_min_interval_seconds' => 300,
@@ -109,6 +118,7 @@ class Mobo_Core_Settings {
 			'mobo_core_checkout_local_stock_check_enabled'   => '0',
 			'mobo_core_checkout_mobo_cart_validation_enabled' => '0',
 			'mobo_core_checkout_mobo_debug_enabled'           => '0',
+			'mobo_core_shipping_diagnostics_enabled'              => '0',
 			'mobo_core_checkout_mobo_site_url'                => 'https://mobomobo.ir',
 			'mobo_core_checkout_mobo_username'                => '',
 			'mobo_core_checkout_mobo_password'                => '',
@@ -132,10 +142,23 @@ class Mobo_Core_Settings {
 			'mobo_core_mobo_order_sender_name'              => '',
 			'mobo_core_mobo_order_sender_mobile'            => '',
 			'mobo_core_mobo_order_shipping_id'              => 148395514,
+			'mobo_core_remote_shipping_sync_interval_hours'   => 1,
 
 			// Mobo checkout address mapping defaults.
 			'mobo_core_address_mapping_enabled'             => '1',
 			'mobo_core_address_mapping_sync_interval_days'  => 7,
+
+			// SMS notifications through Persian WooCommerce SMS.
+			'mobo_core_sms_notifications_enabled'           => '0',
+			'mobo_core_sms_non_mobo_enabled'                => '0',
+			'mobo_core_sms_non_mobo_recipients'             => '',
+			'mobo_core_sms_non_mobo_template'               => '',
+			'mobo_core_sms_mobo_only_enabled'               => '0',
+			'mobo_core_sms_mobo_only_recipients'            => '',
+			'mobo_core_sms_mobo_only_template'              => '',
+			'mobo_core_sms_mixed_enabled'                   => '0',
+			'mobo_core_sms_mixed_recipients'                => '',
+			'mobo_core_sms_mixed_template'                  => '',
 		);
 	}
 
@@ -205,7 +228,7 @@ class Mobo_Core_Settings {
 		self::save_text( $post, 'mobo_core_cron_token' );
 		self::save_url( $post, 'mobo_core_health_report_url' );
 		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
-		update_option( 'mobo_core_checkout_mobo_site_url', 'https://mobomobo.ir', false );
+		self::save_url( $post, 'mobo_core_checkout_mobo_site_url' );
 		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
 		if ( isset( $post['mobo_core_checkout_mobo_password'] ) ) {
 			$password = sanitize_text_field( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
@@ -243,7 +266,11 @@ class Mobo_Core_Settings {
 
 		$price_type = isset( $post['mobo_price_type'] )
 			? sanitize_key( wp_unslash( $post['mobo_price_type'] ) )
-			: 'static-price';
+			: null;
+
+		if ( null === $price_type ) {
+			$price_type = (string) self::get( 'mobo_price_type', 'static-price' );
+		}
 
 		if ( ! in_array( $price_type, array( 'static-price', 'static-percentage', 'dynamic-price' ), true ) ) {
 			$price_type = 'static-price';
@@ -306,12 +333,17 @@ class Mobo_Core_Settings {
 		update_option( 'mobo_core_checkout_validate_only_mobo_products', '1', false );
 		update_option( 'mobo_core_checkout_require_remote_guid', '1', false );
 		update_option( 'mobo_core_checkout_block_incomplete_sync', '1', false );
+		if ( ! self::enabled( 'mobo_core_checkout_validation_enabled', '0' ) ) {
+			delete_option( 'mobo_core_shared_mobo_cart_lock' );
+		}
 		self::save_bool_if_present( $post, 'mobo_core_checkout_local_stock_check_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_checkout_mobo_cart_validation_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_checkout_mobo_debug_enabled' );
+		self::save_bool_if_present( $post, 'mobo_core_shipping_diagnostics_enabled' );
 		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
 		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_cart_lock_wait_seconds', 15, 0, 45 );
 		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_cart_lock_ttl_seconds', 60, 15, 300 );
+		self::save_int_if_present( $post, 'mobo_core_remote_shipping_sync_interval_hours', 1, 1, 168 );
 		self::save_bool_if_present( $post, 'mobo_core_checkout_external_validation_enabled' );
 		self::save_int_if_present( $post, 'mobo_core_checkout_external_timeout_seconds', 3, 1, 10 );
 

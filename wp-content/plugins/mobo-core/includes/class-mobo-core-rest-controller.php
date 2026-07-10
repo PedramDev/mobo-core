@@ -409,7 +409,7 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
-	 * Return local site health for Portal probe.
+	 * Return local site health for MoboCore probe.
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response
@@ -421,7 +421,7 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
-	 * Force-send health report to Portal.
+	 * Force-send health report to MoboCore.
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response

@@ -260,6 +260,38 @@ class Mobo_Core_Reprice_Queue {
 	 */
 	private function reprice_object( $post_id ) {
 		$post_id = absint( $post_id );
+		$product_guid = $this->get_product_guid_for_lock( $post_id );
+		$parent_id = $this->get_parent_product_id_for_lock( $post_id );
+
+		if ( $parent_id > 0 && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_non_canonical_product( $parent_id ) ) {
+				return array( 'updated' => false, 'skipped' => true, 'reason' => 'duplicate-non-canonical' );
+			}
+		}
+
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				return array( 'updated' => false, 'skipped' => true, 'reason' => 'product-sync-active' );
+			}
+
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 120 );
+
+			if ( false === $lock ) {
+				return array( 'updated' => false, 'skipped' => true, 'reason' => 'product-lock-busy' );
+			}
+
+			try {
+				return $this->reprice_object_locked( $post_id );
+			} finally {
+				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+			}
+		}
+
+		return $this->reprice_object_locked( $post_id );
+	}
+
+	private function reprice_object_locked( $post_id ) {
+		$post_id = absint( $post_id );
 
 		if ( ! $this->is_reprice_allowed_post( $post_id ) ) {
 			return array( 'updated' => false, 'skipped' => true );
@@ -316,6 +348,48 @@ class Mobo_Core_Reprice_Queue {
 		);
 	}
 
+
+	/**
+	 * Return parent product ID used for product-level concurrency checks.
+	 *
+	 * @param int $post_id Product or variation ID.
+	 * @return int
+	 */
+	private function get_parent_product_id_for_lock( $post_id ) {
+		$post_id = absint( $post_id );
+		$post    = get_post( $post_id );
+
+		if ( ! $post instanceof WP_Post ) {
+			return 0;
+		}
+
+		if ( 'product' === $post->post_type ) {
+			return $post_id;
+		}
+
+		if ( 'product_variation' === $post->post_type ) {
+			return absint( $post->post_parent );
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Return product_guid for product-level lock.
+	 *
+	 * @param int $post_id Product or variation ID.
+	 * @return string
+	 */
+	private function get_product_guid_for_lock( $post_id ) {
+		$parent_id = $this->get_parent_product_id_for_lock( $post_id );
+
+		if ( $parent_id <= 0 ) {
+			return '';
+		}
+
+		return sanitize_text_field( (string) get_post_meta( $parent_id, 'product_guid', true ) );
+	}
+
 	/**
 	 * Check whether a product/variation is allowed to be repriced.
 	 *
@@ -344,6 +418,10 @@ class Mobo_Core_Reprice_Queue {
 		}
 
 		if ( 'product' === $post->post_type ) {
+			if ( class_exists( 'Mobo_Core_Product_Concurrency' ) && Mobo_Core_Product_Concurrency::is_non_canonical_product( $post_id ) ) {
+				return false;
+			}
+
 			return true;
 		}
 
@@ -359,9 +437,15 @@ class Mobo_Core_Reprice_Queue {
 
 		$parent = get_post( $parent_id );
 
-		return $parent instanceof WP_Post
-			&& 'product' === $parent->post_type
-			&& 'publish' === $parent->post_status;
+		if ( ! ( $parent instanceof WP_Post ) || 'product' !== $parent->post_type || 'publish' !== $parent->post_status ) {
+			return false;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Concurrency' ) && Mobo_Core_Product_Concurrency::is_non_canonical_product( $parent_id ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	/**

@@ -127,11 +127,12 @@ class Mobo_Core_Image_Queue {
 				ARRAY_A
 			);
 
-			$attachment_id = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
-			$existing_url  = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
-			$status        = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
+			$attachment_id        = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
+			$existing_url         = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
+			$status               = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
+			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_source( $attachment_id, $url );
 
-			if ( 'done' === $status && $attachment_id > 0 && $this->attachment_exists( $attachment_id ) && $existing_url === $url ) {
+			if ( 'done' === $status && $attachment_compatible && $existing_url === $url ) {
 				$wpdb->update(
 					$table,
 					array(
@@ -167,7 +168,7 @@ class Mobo_Core_Image_Queue {
 				 * three bad/slow images. Only reset the queue row when the source URL
 				 * actually changed.
 				 */
-				if ( $existing_url !== $url ) {
+				if ( $existing_url !== $url || ! $attachment_compatible ) {
 					$data['status']        = 'pending';
 					$data['try_count']     = 0;
 					$data['next_retry_at'] = null;
@@ -452,6 +453,41 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Get all image queue rows for one product ordered by source position.
+	 *
+	 * This is used to keep the WooCommerce featured image tied to the first
+	 * image from the Mobo payload. It is important for products migrated from
+	 * the old plugin because the old plugin could set the last image as the
+	 * featured image.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	public function get_ordered_rows_for_product( $product_id ) {
+		global $wpdb;
+
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 || ! self::table_exists() ) {
+			return array();
+		}
+
+		$table = self::table_name();
+		$rows  = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, image_guid, source_url, position_index, attachment_id, status
+				FROM {$table}
+				WHERE product_id = %d
+				ORDER BY position_index ASC, id ASC",
+				$product_id
+			),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
 	 * Count due image rows.
 	 *
 	 * @return int
@@ -595,6 +631,58 @@ class Mobo_Core_Image_Queue {
 		$attachment_id = absint( $attachment_id );
 
 		return $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
+	}
+
+	/**
+	 * Check whether an existing attachment is still compatible with source URL.
+	 *
+	 * A done row pointing to an old jpg/png must not block a new WebP source from
+	 * being downloaded.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $url Source URL.
+	 * @return bool
+	 */
+	private function attachment_matches_source( $attachment_id, $url ) {
+		$attachment_id = absint( $attachment_id );
+		$url           = esc_url_raw( (string) $url );
+
+		if ( ! $this->attachment_exists( $attachment_id ) ) {
+			return false;
+		}
+
+		if ( $this->is_webp_url( $url ) ) {
+			return $this->is_attachment_webp( $attachment_id );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Detect WebP source URL.
+	 *
+	 * @param string $url URL.
+	 * @return bool
+	 */
+	private function is_webp_url( $url ) {
+		$path = (string) wp_parse_url( (string) $url, PHP_URL_PATH );
+
+		return 'webp' === strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
+	}
+
+	/**
+	 * Detect WebP attachment.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function is_attachment_webp( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		$mime          = strtolower( (string) get_post_mime_type( $attachment_id ) );
+		$file          = (string) get_attached_file( $attachment_id );
+		$ext           = strtolower( pathinfo( $file, PATHINFO_EXTENSION ) );
+
+		return 'image/webp' === $mime || 'webp' === $ext;
 	}
 
 	private function get_image_guid( $image ) {

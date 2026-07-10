@@ -244,6 +244,27 @@ class Mobo_Core_Recategorize_Queue {
 	 */
 	private function recategorize_product( $post_id ) {
 		$post_id = absint( $post_id );
+		$product_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
+
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 120 );
+
+			if ( false === $lock ) {
+				return array( 'changed' => false, 'skipped' => true, 'reason' => 'product-lock-busy' );
+			}
+
+			try {
+				return $this->recategorize_product_locked( $post_id );
+			} finally {
+				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+			}
+		}
+
+		return $this->recategorize_product_locked( $post_id );
+	}
+
+	private function recategorize_product_locked( $post_id ) {
+		$post_id = absint( $post_id );
 
 		if ( ! $this->is_allowed_product( $post_id ) ) {
 			return array( 'changed' => false, 'skipped' => true, 'reason' => 'not-allowed' );
@@ -299,9 +320,23 @@ class Mobo_Core_Recategorize_Queue {
 
 		$post = get_post( $post_id );
 
-		return $post instanceof WP_Post
-			&& 'product' === $post->post_type
-			&& 'publish' === $post->post_status;
+		if ( ! ( $post instanceof WP_Post ) || 'product' !== $post->post_type || 'publish' !== $post->post_status ) {
+			return false;
+		}
+
+		$product_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
+
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_non_canonical_product( $post_id ) ) {
+				return false;
+			}
+
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -338,7 +373,7 @@ class Mobo_Core_Recategorize_Queue {
 		/*
 		 * Older installs may have synced the product before category GUID meta
 		 * existed and may also have no complete ProductUpdated payload left in the
-		 * local event table. In that case, backfill directly from Portal by the
+		 * local event table. In that case, backfill directly from MoboCore by the
 		 * product_guid and then apply the current mapping. This avoids forcing a
 		 * full product sync just to refresh categories.
 		 */
@@ -360,7 +395,7 @@ class Mobo_Core_Recategorize_Queue {
 
 
 	/**
-	 * Recover category refs directly from Portal by product GUID.
+	 * Recover category refs directly from MoboCore by product GUID.
 	 *
 	 * This is the fallback that makes recategorize work for products synced by
 	 * older plugin versions: the product already exists in WooCommerce, mapping

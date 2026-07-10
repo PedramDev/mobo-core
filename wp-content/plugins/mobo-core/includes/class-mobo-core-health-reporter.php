@@ -2,7 +2,7 @@
 /**
  * Customer-side WordPress health reporter.
  *
- * Builds a compact site-health snapshot and optionally posts it to Portal:
+ * Builds a compact site-health snapshot and optionally posts it to MoboCore:
  * POST /api/site-health/report
  * X-SEC: <mobo_core_security_code>
  *
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Health_Reporter {
 
 	/**
-	 * Build a health report compatible with Portal WordPressSiteHealthReportDto.
+	 * Build a health report compatible with MoboCore WordPressSiteHealthReportDto.
 	 *
 	 * @return array
 	 */
@@ -98,7 +98,7 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
-	 * Send report to Portal.
+	 * Send report to MoboCore.
 	 *
 	 * @param string $source Source label.
 	 * @param bool   $force Ignore minimum interval.
@@ -187,7 +187,7 @@ class Mobo_Core_Health_Reporter {
 			'success'    => $code >= 200 && $code < 300,
 			'status'     => $code >= 200 && $code < 300 ? 'sent' : 'http-error',
 			'httpStatus' => $code,
-			'message'    => $code >= 200 && $code < 300 ? 'Health report sent.' : 'Portal returned HTTP ' . $code,
+			'message'    => $code >= 200 && $code < 300 ? 'Health report sent.' : 'MoboCore returned HTTP ' . $code,
 			'body'       => $this->trim_string( $body, 1000 ),
 		);
 
@@ -249,7 +249,7 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
-	 * Resolve Portal health report URL.
+	 * Resolve MoboCore health report URL.
 	 *
 	 * @return string
 	 */

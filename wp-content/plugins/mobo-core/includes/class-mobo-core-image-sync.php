@@ -176,11 +176,10 @@ class Mobo_Core_Image_Sync {
 	private function process_images_direct( $product_id, $images, $offset, $limit ) {
 		$this->load_media_dependencies();
 
-		$total       = count( $images );
-		$processed   = 0;
-		$skipped     = 0;
-		$index       = $offset;
-		$gallery_ids = $this->get_existing_gallery_ids( $product_id );
+		$total     = count( $images );
+		$processed = 0;
+		$skipped   = 0;
+		$index     = $offset;
 
 		while ( $index < $total && $processed < $limit ) {
 			$image = isset( $images[ $index ] ) && is_array( $images[ $index ] ) ? $images[ $index ] : array();
@@ -203,14 +202,6 @@ class Mobo_Core_Image_Sync {
 
 			if ( $attachment_id > 0 ) {
 				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
-
-				if ( 0 === $index ) {
-					set_post_thumbnail( $product_id, $attachment_id );
-				}
-
-				if ( ! in_array( $attachment_id, $gallery_ids, true ) ) {
-					$gallery_ids[] = $attachment_id;
-				}
 			} else {
 				$skipped++;
 			}
@@ -219,7 +210,13 @@ class Mobo_Core_Image_Sync {
 			$index++;
 		}
 
-		$this->sync_woocommerce_product_image_objects( $product_id, $gallery_ids );
+		/*
+		 * Rebuild the WooCommerce image order from the full Mobo payload, not from
+		 * the current chunk. This prevents later chunks from making the second/third
+		 * image the product's featured image. It also fixes products created by the
+		 * old plugin where the featured image could be the last image.
+		 */
+		$this->sync_woocommerce_product_image_objects_from_payload_order( $product_id, $images );
 
 		return array(
 			'done'       => $index >= $total,
@@ -590,6 +587,29 @@ class Mobo_Core_Image_Sync {
 		};
 	}
 
+	/**
+	 * Import a replacement image for the legacy-image refresh queue.
+	 *
+	 * @param string $url New image URL.
+	 * @param int    $product_id Product ID.
+	 * @param string $image_guid Remote image GUID.
+	 * @param int    $old_attachment_id Old attachment being replaced.
+	 * @return int Attachment ID or 0.
+	 */
+	public function import_image_for_refresh( $url, $product_id, $image_guid, $old_attachment_id = 0 ) {
+		$this->load_media_dependencies();
+
+		$attachment_id = $this->download_image( $url, $product_id, $image_guid );
+		$attachment_id = absint( $attachment_id );
+
+		if ( $attachment_id > 0 ) {
+			update_post_meta( $attachment_id, 'mobo_replaces_attachment_id', absint( $old_attachment_id ) );
+			update_post_meta( $attachment_id, 'mobo_image_format', $this->is_attachment_webp( $attachment_id ) ? 'webp' : 'image' );
+		}
+
+		return $attachment_id;
+	}
+
 	private function mark_attachment_synced( $attachment_id, $image_guid, $url ) {
 		$attachment_id = absint( $attachment_id );
 		$image_guid    = sanitize_text_field( (string) $image_guid );
@@ -612,13 +632,160 @@ class Mobo_Core_Image_Sync {
 	}
 
 	private function sync_woocommerce_product_image_objects_from_queue( $product_id, Mobo_Core_Image_Queue $queue ) {
-		$ids = $queue->get_done_attachment_ids_for_product( $product_id );
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		$rows = method_exists( $queue, 'get_ordered_rows_for_product' ) ? $queue->get_ordered_rows_for_product( $product_id ) : array();
+
+		if ( empty( $rows ) ) {
+			$ids = $queue->get_done_attachment_ids_for_product( $product_id );
+
+			if ( empty( $ids ) ) {
+				return;
+			}
+
+			$this->sync_woocommerce_product_image_objects( $product_id, $ids );
+			return;
+		}
+
+		$ids            = array();
+		$first_done_id  = 0;
+		$first_position = null;
+
+		foreach ( $rows as $row ) {
+			$position      = isset( $row['position_index'] ) ? absint( $row['position_index'] ) : 0;
+			$attachment_id = isset( $row['attachment_id'] ) ? absint( $row['attachment_id'] ) : 0;
+			$status        = isset( $row['status'] ) ? sanitize_key( (string) $row['status'] ) : '';
+
+			if ( null === $first_position ) {
+				$first_position = $position;
+			}
+
+			if ( 'done' !== $status || $attachment_id <= 0 ) {
+				continue;
+			}
+
+			if ( $position === $first_position ) {
+				$first_done_id = $attachment_id;
+			}
+
+			$ids[] = $attachment_id;
+		}
+
+		$ids = array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) );
 
 		if ( empty( $ids ) ) {
 			return;
 		}
 
-		$this->sync_woocommerce_product_image_objects( $product_id, $ids );
+		if ( $first_done_id > 0 ) {
+			$this->sync_woocommerce_product_image_objects( $product_id, $ids );
+			return;
+		}
+
+		/*
+		 * If the first Mobo image is not downloaded yet, do not promote a later
+		 * image to featured image. Updating only the gallery is safer and avoids a
+		 * visible first-image flip on old/new products.
+		 */
+		$this->sync_woocommerce_product_gallery_only( $product_id, $ids );
+	}
+
+	/**
+	 * Sync product images by the exact order received from the Mobo product payload.
+	 *
+	 * The old plugin stored only img_guid and sometimes made the last uploaded image
+	 * the featured image. This method intentionally resolves attachments by
+	 * image_guid/img_guid/mobo_source_url and sets the WooCommerce featured image to
+	 * the first Mobo image only when that first image is available.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $images Mobo image payload.
+	 * @return void
+	 */
+	private function sync_woocommerce_product_image_objects_from_payload_order( $product_id, $images ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 || ! is_array( $images ) || empty( $images ) ) {
+			return;
+		}
+
+		$ordered_ids     = array();
+		$first_remote_id = 0;
+		$first_seen      = false;
+
+		foreach ( array_values( $images ) as $image ) {
+			if ( ! is_array( $image ) ) {
+				continue;
+			}
+
+			$image_guid = $this->get_image_guid( $image );
+			$url        = $this->get_image_url( $image );
+
+			if ( '' === $image_guid || '' === $url ) {
+				continue;
+			}
+
+			$attachment_id = $this->find_existing_attachment( $image_guid, $url );
+
+			if ( ! $first_seen ) {
+				$first_seen      = true;
+				$first_remote_id = $attachment_id;
+			}
+
+			if ( $attachment_id > 0 ) {
+				$ordered_ids[] = $attachment_id;
+			}
+		}
+
+		$ordered_ids = array_values( array_unique( array_filter( array_map( 'absint', $ordered_ids ) ) ) );
+
+		if ( empty( $ordered_ids ) ) {
+			return;
+		}
+
+		if ( $first_remote_id > 0 ) {
+			$this->sync_woocommerce_product_image_objects( $product_id, $ordered_ids );
+			return;
+		}
+
+		$this->sync_woocommerce_product_gallery_only( $product_id, $ordered_ids );
+	}
+
+	/**
+	 * Update gallery without changing the featured image.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $gallery_ids Attachment IDs.
+	 * @return void
+	 */
+	private function sync_woocommerce_product_gallery_only( $product_id, $gallery_ids ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		$product = wc_get_product( $product_id );
+
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+
+		if ( empty( $gallery_ids ) ) {
+			return;
+		}
+
+		$product->set_gallery_image_ids( $gallery_ids );
+		$product->save();
+
+		wc_delete_product_transients( $product_id );
+		clean_post_cache( $product_id );
 	}
 
 	private function sync_woocommerce_product_image_objects( $product_id, $gallery_ids ) {
@@ -654,31 +821,60 @@ class Mobo_Core_Image_Sync {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$url        = esc_url_raw( (string) $url );
 
-		return $this->find_attachment_by_guid( $image_guid );
+		$candidates = array();
+
+		if ( '' !== $image_guid ) {
+			$candidates = array_merge( $candidates, $this->find_attachments_by_meta( 'image_guid', $image_guid, 10 ) );
+			$candidates = array_merge( $candidates, $this->find_attachments_by_meta( 'img_guid', $image_guid, 10 ) );
+		}
+
+		if ( '' !== $url ) {
+			$candidates = array_merge( $candidates, $this->find_attachments_by_meta( 'mobo_source_url', $url, 10 ) );
+		}
+
+		$candidates = array_values( array_unique( array_filter( array_map( 'absint', $candidates ) ) ) );
+
+		foreach ( $candidates as $attachment_id ) {
+			if ( $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
+				return $attachment_id;
+			}
+		}
+
+		return 0;
 	}
 
 	private function find_attachment_by_guid( $guid ) {
+		$ids = $this->find_attachments_by_guid( $guid, 1 );
+
+		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
+	}
+
+	private function find_attachments_by_guid( $guid, $limit = 10 ) {
 		$guid = sanitize_text_field( (string) $guid );
 
 		if ( '' === $guid ) {
-			return 0;
+			return array();
 		}
 
-		$id = $this->find_attachment_by_meta( 'image_guid', $guid );
+		$ids = $this->find_attachments_by_meta( 'image_guid', $guid, $limit );
+		$ids = array_merge( $ids, $this->find_attachments_by_meta( 'img_guid', $guid, $limit ) );
 
-		if ( $id <= 0 ) {
-			$id = $this->find_attachment_by_meta( 'img_guid', $guid );
-		}
-
-		return $id;
+		return array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) );
 	}
 
 	private function find_attachment_by_meta( $meta_key, $meta_value ) {
+		$ids = $this->find_attachments_by_meta( $meta_key, $meta_value, 1 );
+
+		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
+	}
+
+	private function find_attachments_by_meta( $meta_key, $meta_value, $limit = 10 ) {
 		$meta_key   = sanitize_key( $meta_key );
 		$meta_value = sanitize_text_field( (string) $meta_value );
+		$limit      = max( 1, min( 50, absint( $limit ) ) );
 
 		if ( '' === $meta_key || '' === $meta_value ) {
-			return 0;
+			return array();
 		}
 
 		$query = new WP_Query(
@@ -686,7 +882,9 @@ class Mobo_Core_Image_Sync {
 				'post_type'              => 'attachment',
 				'post_status'            => array( 'inherit', 'private' ),
 				'fields'                 => 'ids',
-				'posts_per_page'         => 1,
+				'posts_per_page'         => $limit,
+				'orderby'                => 'ID',
+				'order'                  => 'DESC',
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
@@ -699,7 +897,43 @@ class Mobo_Core_Image_Sync {
 			)
 		);
 
-		return ! empty( $query->posts[0] ) ? absint( $query->posts[0] ) : 0;
+		return array_values( array_filter( array_map( 'absint', is_array( $query->posts ) ? $query->posts : array() ) ) );
+	}
+
+	private function is_attachment_reusable_for_source( $attachment_id, $url ) {
+		$attachment_id = absint( $attachment_id );
+		$url           = esc_url_raw( (string) $url );
+
+		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+			return false;
+		}
+
+		/*
+		 * If the new source is WebP, do not reuse an older jpg/png attachment with
+		 * the same image_guid. This is the critical migration behavior: it allows the
+		 * normal image queue to download the new WebP instead of silently keeping the
+		 * heavy legacy file.
+		 */
+		if ( $this->is_webp_url( $url ) ) {
+			return $this->is_attachment_webp( $attachment_id );
+		}
+
+		return true;
+	}
+
+	private function is_webp_url( $url ) {
+		$path = (string) wp_parse_url( (string) $url, PHP_URL_PATH );
+
+		return 'webp' === strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
+	}
+
+	private function is_attachment_webp( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		$mime          = strtolower( (string) get_post_mime_type( $attachment_id ) );
+		$file          = (string) get_attached_file( $attachment_id );
+		$ext           = strtolower( pathinfo( $file, PATHINFO_EXTENSION ) );
+
+		return 'image/webp' === $mime || 'webp' === $ext;
 	}
 
 	private function get_existing_gallery_ids( $product_id ) {

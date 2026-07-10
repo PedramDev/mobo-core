@@ -201,6 +201,18 @@ class Mobo_Core_Self_Runner {
 			return true;
 		}
 
+		$image_queue = isset( $result['imageQueue'] ) && is_array( $result['imageQueue'] ) ? $result['imageQueue'] : array();
+		$processed_images = isset( $image_queue['processed'] ) ? absint( $image_queue['processed'] ) : 0;
+		if ( $processed_images > 0 && ! empty( $image_queue['remaining'] ) ) {
+			return true;
+		}
+
+		$image_refresh = isset( $result['imageRefreshQueue'] ) && is_array( $result['imageRefreshQueue'] ) ? $result['imageRefreshQueue'] : array();
+		$processed_image_refresh = isset( $image_refresh['processed'] ) ? absint( $image_refresh['processed'] ) : 0;
+		if ( $processed_image_refresh > 0 && ! empty( $image_refresh['remaining'] ) ) {
+			return true;
+		}
+
 		$reprice = isset( $result['repriceQueue'] ) && is_array( $result['repriceQueue'] ) ? $result['repriceQueue'] : array();
 		$processed_reprice = isset( $reprice['processed'] ) ? absint( $reprice['processed'] ) : 0;
 		if ( $processed_reprice > 0 && ! empty( $reprice['remaining'] ) ) {

@@ -291,7 +291,11 @@ class Mobo_Core_Price_Calculator {
 				continue;
 			}
 
-			if ( $api_price < $low || $api_price > $high ) {
+			/*
+			 * A high value of 0 means "no upper limit".
+			 * Dynamic rows are inclusive, so the next row should start from previous high + 1.
+			 */
+			if ( $api_price < $low || ( $high > 0 && $api_price > $high ) ) {
 				continue;
 			}
 
