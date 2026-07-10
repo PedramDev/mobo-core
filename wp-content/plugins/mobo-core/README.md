@@ -65,7 +65,7 @@ The plugin uses external services and must disclose them in `readme.txt`:
 
 GPLv2 or later.
 
-## WordPress.org hardening in 10.31.45
+## WordPress.org hardening in 10.31.47
 
 - Default MoboCore API URL uses HTTPS.
 - SSL verification is enabled by default for outbound HTTP calls.

@@ -367,7 +367,7 @@ class Mobo_Core_Image_Sync {
 
 			if ( is_wp_error( $attachment_id ) ) {
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $attachment_id->get_error_message() );
+					Mobo_Core_Logger::error( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $attachment_id->get_error_message() );
 				}
 
 				$attachment_id = (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id )
@@ -447,10 +447,10 @@ class Mobo_Core_Image_Sync {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			@unlink( $tmp_file );
+			wp_delete_file( $tmp_file );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				error_log( 'Mobo Core image fallback download failed: ' . $response->get_error_message() );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed: ' . $response->get_error_message() );
 			}
 
 			return 0;
@@ -459,10 +459,10 @@ class Mobo_Core_Image_Sync {
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
 
 		if ( $code < 200 || $code >= 300 || ! file_exists( $tmp_file ) || filesize( $tmp_file ) <= 0 ) {
-			@unlink( $tmp_file );
+			wp_delete_file( $tmp_file );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				error_log( 'Mobo Core image fallback download failed with HTTP ' . $code . ': ' . $url );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed with HTTP ' . $code . ': ' . $url );
 			}
 
 			return 0;
@@ -487,10 +487,10 @@ class Mobo_Core_Image_Sync {
 		}
 
 		if ( is_wp_error( $attachment_id ) ) {
-			@unlink( $tmp_file );
+			wp_delete_file( $tmp_file );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				error_log( 'Mobo Core image fallback sideload failed: ' . $attachment_id->get_error_message() );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback sideload failed: ' . $attachment_id->get_error_message() );
 			}
 
 			return 0;
@@ -896,6 +896,7 @@ class Mobo_Core_Image_Sync {
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
+				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded maintenance/synchronization lookup on indexed post IDs.
 				'meta_query'             => array(
 					array(
 						'key'   => $meta_key,

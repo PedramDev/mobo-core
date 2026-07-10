@@ -13,6 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Product_Concurrency {
 
 	/**
@@ -256,19 +263,21 @@ class Mobo_Core_Product_Concurrency {
 	public static function count_duplicate_product_groups() {
 		global $wpdb;
 
-		$sql = "SELECT COUNT(*) FROM (
-			SELECT pm.meta_value
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-			WHERE p.post_type = 'product'
-			AND p.post_status IN ('publish','draft','private','pending')
-			AND pm.meta_key = 'product_guid'
-			AND pm.meta_value <> ''
-			GROUP BY pm.meta_value
-			HAVING COUNT(DISTINCT p.ID) > 1
-		) x";
-
-		return absint( $wpdb->get_var( $sql ) );
+		return absint(
+			$wpdb->get_var(
+				"SELECT COUNT(*) FROM (
+					SELECT pm.meta_value
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					WHERE p.post_type = 'product'
+					AND p.post_status IN ('publish','draft','private','pending')
+					AND pm.meta_key = 'product_guid'
+					AND pm.meta_value <> ''
+					GROUP BY pm.meta_value
+					HAVING COUNT(DISTINCT p.ID) > 1
+				) x"
+			)
+		);
 	}
 
 	/**

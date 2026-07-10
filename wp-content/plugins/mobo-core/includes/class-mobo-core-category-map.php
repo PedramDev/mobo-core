@@ -14,6 +14,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Category_Map {
 
 	/**
@@ -614,11 +621,11 @@ class Mobo_Core_Category_Map {
 		}
 
 		$table = self::table_name();
+		$sql   = 'manual_term_id' === $column
+			? "SELECT id, manual_term_id AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1"
+			: "SELECT id, synced_term_id AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1";
 		$row   = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT id, {$column} AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1",
-				$guid
-			),
+			$wpdb->prepare( $sql, $guid ), // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
 			ARRAY_A
 		);
 

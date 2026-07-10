@@ -250,10 +250,10 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'mobo_core_category_mapping_enabled' );
 		self::save_bool( $post, 'mobo_core_category_mapping_required' );
 
-		if ( isset( $_POST['mobo_core_excluded_product_urls'] ) ) {
+		if ( isset( $post['mobo_core_excluded_product_urls'] ) ) {
 			update_option(
 				'mobo_core_excluded_product_urls',
-				sanitize_textarea_field( wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) ),
+				sanitize_textarea_field( wp_unslash( $post['mobo_core_excluded_product_urls'] ) ),
 				false
 			);
 		}

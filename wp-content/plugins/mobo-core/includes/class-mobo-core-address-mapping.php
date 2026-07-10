@@ -826,8 +826,8 @@ class Mobo_Core_Address_Mapping {
 			$key = $group . '_' . $type;
 			if ( isset( $data[ $key ] ) && '' !== trim( (string) $data[ $key ] ) ) {
 				$values[ $type ] = sanitize_text_field( (string) $data[ $key ] );
-			} elseif ( isset( $_POST[ $key ] ) ) {
-				$values[ $type ] = sanitize_text_field( (string) wp_unslash( $_POST[ $key ] ) );
+			} elseif ( isset( $_POST[ $key ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing -- WooCommerce checkout request lifecycle verifies the request.
+				$values[ $type ] = sanitize_text_field( (string) wp_unslash( $_POST[ $key ] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
 			}
 		}
 

@@ -81,6 +81,10 @@ class Mobo_Core_Variation_Fields {
 			return;
 		}
 
+		if ( ! isset( $_POST['woocommerce_meta_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['woocommerce_meta_nonce'] ) ), 'woocommerce_save_data' ) ) {
+			return;
+		}
+
 		if ( ! isset( $_POST['variable_post_id'] ) || ! is_array( $_POST['variable_post_id'] ) ) {
 			return;
 		}
@@ -91,16 +95,12 @@ class Mobo_Core_Variation_Fields {
 			return;
 		}
 
-		$raw_values = isset( $_POST['mobo_additional_price'] ) && is_array( $_POST['mobo_additional_price'] )
-			? wp_unslash( $_POST['mobo_additional_price'] )
-			: array();
-
-		if ( ! array_key_exists( $loop, $raw_values ) ) {
+		if ( ! isset( $_POST['mobo_additional_price'] ) || ! is_array( $_POST['mobo_additional_price'] ) || ! isset( $_POST['mobo_additional_price'][ $loop ] ) ) {
 			delete_post_meta( $variation_id, 'mobo_additional_price' );
 			return;
 		}
 
-		$value = trim( (string) $raw_values[ $loop ] );
+		$value = sanitize_text_field( wp_unslash( $_POST['mobo_additional_price'][ $loop ] ) );
 
 		if ( '' === $value ) {
 			delete_post_meta( $variation_id, 'mobo_additional_price' );

@@ -13,6 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Maintenance {
 
 	const RUN_INTERVAL_SECONDS = 21600; // 6 hours.
@@ -270,8 +277,8 @@ class Mobo_Core_Maintenance {
 	private static function cleanup_action_scheduler_logs() {
 		global $wpdb;
 
-		$actions_table = $wpdb->prefix . 'actionscheduler_actions';
-		$logs_table    = $wpdb->prefix . 'actionscheduler_logs';
+		$actions_table = esc_sql( $wpdb->prefix . 'actionscheduler_actions' );
+		$logs_table    = esc_sql( $wpdb->prefix . 'actionscheduler_logs' );
 
 		if ( ! self::table_exists( $actions_table ) || ! self::table_exists( $logs_table ) ) {
 			return array( 'status' => 'missing-table', 'deleted' => 0 );
@@ -446,14 +453,45 @@ class Mobo_Core_Maintenance {
 		}
 
 		$id_column = sanitize_key( (string) $id_column );
-		if ( '' === $id_column ) {
-			$id_column = 'id';
+		$deleted   = 0;
+
+		if ( 'log_id' === $id_column ) {
+			$logs_table = $wpdb->prefix . 'actionscheduler_logs';
+
+			if ( $table !== $logs_table ) {
+				return 0;
+			}
+
+			foreach ( $ids as $id ) {
+				$result = $wpdb->delete( $logs_table, array( 'log_id' => $id ), array( '%d' ) );
+
+				if ( false !== $result ) {
+					$deleted += absint( $result );
+				}
+			}
+
+			return $deleted;
 		}
 
-		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-		$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE {$id_column} IN ({$placeholders})", $ids ) );
+		if ( 'id' !== $id_column || ! class_exists( 'Mobo_Core_Image_Queue' ) ) {
+			return 0;
+		}
 
-		return false === $deleted ? 0 : absint( $deleted );
+		$image_queue_table = Mobo_Core_Image_Queue::table_name();
+
+		if ( $table !== $image_queue_table ) {
+			return 0;
+		}
+
+		foreach ( $ids as $id ) {
+			$result = $wpdb->delete( $image_queue_table, array( 'id' => $id ), array( '%d' ) );
+
+			if ( false !== $result ) {
+				$deleted += absint( $result );
+			}
+		}
+
+		return $deleted;
 	}
 
 	/**

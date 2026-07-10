@@ -14,6 +14,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Image_Refresh_Queue {
 
 	/**
@@ -467,16 +474,27 @@ class Mobo_Core_Image_Refresh_Queue {
 			return 0;
 		}
 
-		$statuses = array_values( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) );
+		$statuses = array_values( array_unique( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) ) );
 
 		if ( empty( $statuses ) ) {
 			return 0;
 		}
 
-		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
-		$table        = self::table_name();
+		$table = self::table_name();
+		$total = 0;
 
-		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})", $statuses ) ) );
+		foreach ( $statuses as $status ) {
+			$total += absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM {$table} WHERE status = %s",
+						$status
+					)
+				)
+			);
+		}
+
+		return $total;
 	}
 
 	/**

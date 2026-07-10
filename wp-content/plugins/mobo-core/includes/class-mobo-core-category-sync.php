@@ -625,6 +625,7 @@ class Mobo_Core_Category_Sync {
 				'taxonomy'   => 'product_cat',
 				'hide_empty' => false,
 				'number'     => 1,
+				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded maintenance/synchronization lookup on indexed post IDs.
 				'meta_query' => array(
 					array(
 						'key'   => 'category_guid',

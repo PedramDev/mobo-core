@@ -10,6 +10,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Product_Sync {
 
 	const STATE_OPTION = 'mobo_core_sync_state';
@@ -2569,6 +2576,7 @@ class Mobo_Core_Product_Sync {
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
+				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded maintenance/synchronization lookup on indexed post IDs.
 				'meta_query'             => array(
 					array(
 						'key'   => sanitize_key( $meta_key ),
@@ -2692,6 +2700,7 @@ class Mobo_Core_Product_Sync {
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
+				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded maintenance/synchronization lookup on indexed post IDs.
 				'meta_query'             => array(
 					array(
 						'key'   => sanitize_key( $meta_key ),

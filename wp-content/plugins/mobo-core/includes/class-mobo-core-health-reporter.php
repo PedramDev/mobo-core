@@ -623,7 +623,7 @@ class Mobo_Core_Health_Reporter {
 			$actions = as_get_scheduled_actions( $args, 'ids' );
 		} catch ( Exception $exception ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				error_log( 'Mobo Core health Action Scheduler count failed: ' . $exception->getMessage() );
+				Mobo_Core_Logger::error( 'Mobo Core health Action Scheduler count failed: ' . $exception->getMessage() );
 			}
 
 			return null;

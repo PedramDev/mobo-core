@@ -265,6 +265,8 @@ class Mobo_Core_Checkout_Validator {
 		$is_ajax = ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) || ( defined( 'DOING_AJAX' ) && DOING_AJAX );
 
 		$wc_ajax = '';
+		// Read-only request routing inspection; WooCommerce validates action-specific nonces.
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended, WordPress.Security.NonceVerification.Missing
 		if ( isset( $_GET['wc-ajax'] ) ) {
 			$wc_ajax = sanitize_key( wp_unslash( $_GET['wc-ajax'] ) );
 		} elseif ( isset( $_POST['wc-ajax'] ) ) {
@@ -273,6 +275,7 @@ class Mobo_Core_Checkout_Validator {
 
 		$action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
 
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended, WordPress.Security.NonceVerification.Missing
 		return ( $is_ajax && 'update_order_review' === $wc_ajax ) || 'woocommerce_update_order_review' === $action;
 	}
 
@@ -290,8 +293,9 @@ class Mobo_Core_Checkout_Validator {
 
 		$keys = array( 'update_cart', 'woocommerce-cart-nonce', '_wpnonce' );
 
+		// Presence check only; no request value is trusted or persisted here.
 		foreach ( $keys as $key ) {
-			if ( isset( $_POST[ $key ] ) ) {
+			if ( isset( $_POST[ $key ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
 				return true;
 			}
 		}
@@ -2440,8 +2444,8 @@ class Mobo_Core_Checkout_Validator {
 				array(
 					'limit'      => $limit + 1,
 					'status'     => array( 'processing' ),
-					'meta_key'   => '_mobo_order_submit_status',
-					'meta_value' => 'queued',
+					'meta_key'   => '_mobo_order_submit_status', // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- Legacy bounded fallback queue lookup.
+					'meta_value' => 'queued', // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Legacy bounded fallback queue lookup.
 					'orderby'    => 'date',
 					'order'      => 'ASC',
 					'return'     => 'ids',
@@ -3479,11 +3483,12 @@ class Mobo_Core_Checkout_Validator {
 		if ( is_numeric( $object ) ) {
 			return wc_get_order( absint( $object ) );
 		}
-		if ( isset( $_GET['id'] ) ) {
-			return wc_get_order( absint( wp_unslash( $_GET['id'] ) ) );
+		// Read-only order-screen lookup; authorization is enforced by the surrounding admin screen.
+		if ( isset( $_GET['id'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return wc_get_order( absint( wp_unslash( $_GET['id'] ) ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		}
-		if ( isset( $_GET['post'] ) ) {
-			return wc_get_order( absint( wp_unslash( $_GET['post'] ) ) );
+		if ( isset( $_GET['post'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return wc_get_order( absint( wp_unslash( $_GET['post'] ) ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		}
 		return null;
 	}

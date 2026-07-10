@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.45
+ * Version: 10.31.47
  * Author: Pedram Karimi
  * Author URI: https://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.45' );
+define( 'MOBO_CORE_VERSION', '10.31.47' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -71,6 +71,7 @@ add_action( 'admin_init', function() {
 /*
  * Core classes.
  */
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';

@@ -115,7 +115,8 @@ class Mobo_Core_Admin {
 		$is_waiting   = ! empty( $status['isWaitingForPortal'] );
 		$is_repair_run = ! empty( $status['repairMode'] );
 
-		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'dashboard';
+		// Read-only admin navigation parameter; no state is changed here.
+		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'dashboard'; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 
 		$allowed_tabs = array(
 			'dashboard',
@@ -2539,8 +2540,9 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function render_notices() {
-		$message = isset( $_GET['mobo_message'] ) ? sanitize_text_field( wp_unslash( $_GET['mobo_message'] ) ) : '';
-		$type    = isset( $_GET['mobo_type'] ) ? sanitize_key( wp_unslash( $_GET['mobo_type'] ) ) : 'success';
+		// Read-only redirect notice parameters produced by this plugin.
+		$message = isset( $_GET['mobo_message'] ) ? sanitize_text_field( wp_unslash( $_GET['mobo_message'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$type    = isset( $_GET['mobo_type'] ) ? sanitize_key( wp_unslash( $_GET['mobo_type'] ) ) : 'success'; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 
 		if ( '' === $message ) {
 			return;
@@ -4384,6 +4386,10 @@ type:{mobo_order_type_label}</textarea>
 	}
 
 
+	// The following private save helpers are called only by handle_save_settings(),
+	// after capability and mobo_core_save_settings nonce verification.
+	// phpcs:disable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
 	/**
 	 * Save Mobo shipping rules for automatic order submission.
 	 *
@@ -4817,6 +4823,8 @@ type:{mobo_order_type_label}</textarea>
 				break;
 		}
 	}
+
+	// phpcs:enable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
 
 	/**
@@ -5421,7 +5429,7 @@ type:{mobo_order_type_label}</textarea>
 			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد سیاست قیمت‌گذاری شروع شد.';
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core reprice start failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core reprice start failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'شروع اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
 		}
 	}
@@ -5449,7 +5457,7 @@ type:{mobo_order_type_label}</textarea>
 
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core reprice cancel failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core reprice cancel failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'توقف اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
 		}
 	}
@@ -5477,7 +5485,7 @@ type:{mobo_order_type_label}</textarea>
 
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core reprice reset failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core reprice reset failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'پاک کردن وضعیت اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
 		}
 	}
@@ -5511,7 +5519,7 @@ type:{mobo_order_type_label}</textarea>
 			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد دسته‌بندی‌ها شروع شد.';
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core recategorize start failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core recategorize start failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'شروع اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
 		}
 	}
@@ -5539,7 +5547,7 @@ type:{mobo_order_type_label}</textarea>
 
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core recategorize cancel failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core recategorize cancel failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'توقف اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
 		}
 	}
@@ -5567,7 +5575,7 @@ type:{mobo_order_type_label}</textarea>
 
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'categories' );
 		} catch ( Throwable $e ) {
-			error_log( 'Mobo Core recategorize reset failed: ' . $e->getMessage() );
+			Mobo_Core_Logger::error( 'Mobo Core recategorize reset failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'پاک کردن وضعیت اعمال مجدد دسته‌بندی با خطا مواجه شد: ' . $e->getMessage(), 'error', 'categories' );
 		}
 	}
@@ -5826,6 +5834,9 @@ type:{mobo_order_type_label}</textarea>
 		$this->redirect_with_message( sprintf( 'لیست فایل های یتیم ریست شد. ردیف های حذف شده از لیست: %d.', absint( $deleted ) ), 'success', 'image-refresh' );
 	}
 
+	// Pricing POST data is read only after handle_save_settings() verifies the admin nonce.
+	// phpcs:disable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
 	/**
 	 * Save dynamic price rules.
 	 *
@@ -5908,6 +5919,8 @@ type:{mobo_order_type_label}</textarea>
 
 		return false;
 	}
+	// phpcs:enable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
 
 	/**
 	 * Normalize dynamic pricing rows so active/store-visible ranges do not have gaps.

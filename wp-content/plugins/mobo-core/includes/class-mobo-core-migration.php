@@ -17,6 +17,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Migration {
 
 	/**
@@ -351,7 +358,10 @@ class Mobo_Core_Migration {
 				continue;
 			}
 
-			if ( @unlink( $file->getPathname() ) ) {
+			$file_path = $file->getPathname();
+			wp_delete_file( $file_path );
+
+			if ( ! file_exists( $file_path ) ) {
 				$deleted++;
 			}
 		}

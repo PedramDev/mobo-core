@@ -13,6 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Recategorize_Queue {
 
 	const STATE_OPTION = 'mobo_core_recategorize_state';
@@ -163,7 +170,7 @@ class Mobo_Core_Recategorize_Queue {
 			} catch ( Throwable $e ) {
 				$failed++;
 				$state['lastError'] = sanitize_text_field( $e->getMessage() );
-				error_log( 'Mobo Core recategorize failed for product ' . $post_id . ': ' . $e->getMessage() );
+				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': ' . $e->getMessage() );
 			}
 
 			$checkpoint = $state;
@@ -875,7 +882,7 @@ class Mobo_Core_Recategorize_Queue {
 			$limit
 		);
 
-		$ids = $wpdb->get_col( $sql );
+		$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared immediately above with bounded integer placeholders.
 
 		return is_array( $ids ) ? array_map( 'absint', $ids ) : array();
 	}

@@ -2,15 +2,15 @@
 Contributors: pedramdev
 Tags: woocommerce, iran, product sync, mobomobo, order automation
 Requires at least: 5.8
-Tested up to: 6.8
+Tested up to: 7.0
 Requires PHP: 7.4
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.45
+Stable tag: 10.31.47
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Mobo Core connects Iranian WooCommerce stores to MoboCore and a specific mobomobo.ir workflow for product sync, checkout validation, shipping mapping, and optional Mobo order automation.
+Connect WooCommerce to MoboCore for product sync, webhook queues, shipping mapping, checkout validation, and optional order automation.
 
 == Description ==
 
@@ -127,6 +127,20 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Changelog ==
 
+= 10.31.47 =
+* Removed the final dynamic placeholder patterns reported by Plugin Check.
+* Replaced dynamic-column batch deletion with allowlisted WordPress database deletion calls.
+* Sanitized the selected variation price input before use.
+
+= 10.31.46 =
+* Hardened SQL identifier handling and documented intentional direct access to internal queue/map tables.
+* Added explicit nonce verification for variation saves and documented verified admin/checkout request boundaries.
+* Replaced direct file deletion and rename calls with WordPress filesystem APIs.
+* Reworked the local PHP cron runner with token authentication, scoped execution, JSON-only output, and direct-access protection.
+* Replaced direct PHP error logging with structured WooCommerce logging.
+* Removed hidden development files and non-distribution notes from the release package.
+* Updated WordPress compatibility metadata and plugin documentation.
+
 = 10.31.45 =
 * Added sales and technical contact information to the purchase/activation screen and documentation.
 * Kept GitHub links aligned with https://github.com/PedramDev/mobo-core.
@@ -149,5 +163,8 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
-= 10.31.45 =
-Adds sales/technical contact information and keeps WordPress.org hardening: HTTPS defaults, SSL verification, and disabled sensitive external workflows on fresh installations. Run Repair once when upgrading from legacy versions such as version 7.
+= 10.31.47 =
+Final Plugin Check cleanup for queue counters, maintenance deletion, and variation input sanitization.
+
+= 10.31.46 =
+Security and distribution hardening for SQL, nonce validation, cron execution, filesystem operations, logging, and WordPress.org packaging. Existing synchronization data is preserved.

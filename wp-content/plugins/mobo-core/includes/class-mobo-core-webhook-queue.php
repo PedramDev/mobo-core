@@ -15,6 +15,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Webhook_Queue {
 
 	/**
@@ -458,7 +465,7 @@ class Mobo_Core_Webhook_Queue {
 				}
 
 				if ( $delete_file ) {
-					@unlink( $file );
+					wp_delete_file( $file );
 				} else {
 					$item['try']       = absint( $item['try'] );
 					$item['updatedAt'] = time();
@@ -784,7 +791,7 @@ class Mobo_Core_Webhook_Queue {
 				update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
 
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					error_log( 'Mobo Core payload pull failed: ' . $message );
+					Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
 				}
 
 				if ( method_exists( $store, 'mark_retry_now' ) ) {
@@ -834,7 +841,7 @@ class Mobo_Core_Webhook_Queue {
 			update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				error_log( 'Mobo Core payload pull failed: ' . $message );
+				Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
 			}
 
 			return array(
@@ -1270,7 +1277,32 @@ class Mobo_Core_Webhook_Queue {
 		$failed_dir = trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/';
 		$target     = trailingslashit( $failed_dir ) . gmdate( 'Ymd-His' ) . '-' . sanitize_file_name( $reason ) . '-' . basename( $file );
 
-		@rename( $file, $target );
+		$this->move_file( $file, $target );
+	}
+
+	/**
+	 * Move a queue file using the WordPress filesystem abstraction.
+	 *
+	 * @param string $source Source path.
+	 * @param string $target Target path.
+	 * @return bool
+	 */
+	private function move_file( $source, $target ) {
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+
+		global $wp_filesystem;
+
+		if ( ! WP_Filesystem() || ! $wp_filesystem ) {
+			Mobo_Core_Logger::error( 'Mobo Core could not initialize WP_Filesystem for a webhook queue move.' );
+			return false;
+		}
+
+		$moved = $wp_filesystem->move( $source, $target, true );
+		if ( ! $moved ) {
+			Mobo_Core_Logger::error( 'Mobo Core could not move a webhook queue file to the failed directory.' );
+		}
+
+		return (bool) $moved;
 	}
 
 	/**
@@ -1364,7 +1396,7 @@ class Mobo_Core_Webhook_Queue {
 	/**
 	 * Check if array is a list-style array.
 	 *
-	 * Uses array_is_list on PHP 8.1+ and a compatible fallback for older PHP versions.
+	 * Uses a PHP 7.4-compatible sequential-key check.
 	 *
 	 * @param mixed $array Value to inspect.
 	 * @return bool
@@ -1372,10 +1404,6 @@ class Mobo_Core_Webhook_Queue {
 	private function is_list_array( $array ) {
 		if ( ! is_array( $array ) ) {
 			return false;
-		}
-
-		if ( function_exists( 'array_is_list' ) ) {
-			return array_is_list( $array );
 		}
 
 		$expected = 0;

@@ -17,6 +17,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Orphan_Image_Cleanup {
 
 	/**
@@ -232,14 +239,16 @@ class Mobo_Core_Orphan_Image_Cleanup {
 
 			$size = is_file( $path ) ? absint( filesize( $path ) ) : 0;
 
-			if ( @unlink( $path ) ) {
+			wp_delete_file( $path );
+
+			if ( ! file_exists( $path ) ) {
 				$this->update_row_status( $id, 'deleted', 'Deleted safely.', true, $size );
 				$result['deleted']++;
 				$result['bytes'] += $size;
 				continue;
 			}
 
-			$this->update_row_status( $id, 'failed', 'unlink() failed.' );
+			$this->update_row_status( $id, 'failed', 'wp_delete_file() failed.' );
 			$result['failed']++;
 		}
 
@@ -335,6 +344,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
 				'update_post_term_cache' => false,
+				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded maintenance/synchronization lookup on indexed post IDs.
 				'meta_query'             => array(
 					'relation' => 'OR',
 					array(
@@ -553,14 +563,27 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return 0;
 		}
 
-		$statuses = array_values( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) );
+		$statuses = array_values( array_unique( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) ) );
+
 		if ( empty( $statuses ) ) {
 			return 0;
 		}
 
-		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
+		$table = self::table_name();
+		$total = 0;
 
-		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM " . self::table_name() . " WHERE status IN ({$placeholders})", $statuses ) ) );
+		foreach ( $statuses as $status ) {
+			$total += absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM {$table} WHERE status = %s",
+						$status
+					)
+				)
+			);
+		}
+
+		return $total;
 	}
 
 	/**

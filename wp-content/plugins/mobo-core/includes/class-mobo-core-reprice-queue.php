@@ -13,6 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
+/*
+ * This component operates on Mobo Core's internal queue/map tables. Direct
+ * database access is required for atomic batching and cursor updates; table
+ * identifiers are generated internally and all external values are prepared.
+ */
+// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Reprice_Queue {
 
 	const STATE_OPTION = 'mobo_core_reprice_state';
@@ -189,7 +196,7 @@ class Mobo_Core_Reprice_Queue {
 				} catch ( Throwable $e ) {
 					$failed++;
 					$state['lastError'] = 'خطا در sync محصول متغیر ' . absint( $parent_id ) . ': ' . sanitize_text_field( $e->getMessage() );
-					error_log( 'Mobo Core reprice parent sync failed for product ' . absint( $parent_id ) . ': ' . $e->getMessage() );
+					Mobo_Core_Logger::error( 'Mobo Core reprice parent sync failed for product ' . absint( $parent_id ) . ': ' . $e->getMessage() );
 				}
 			}
 		}
@@ -501,7 +508,7 @@ class Mobo_Core_Reprice_Queue {
 			$limit
 		);
 
-		$ids = $wpdb->get_col( $sql );
+		$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared immediately above with bounded integer placeholders.
 
 		return is_array( $ids ) ? array_map( 'absint', $ids ) : array();
 	}
