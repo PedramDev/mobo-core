@@ -40,6 +40,7 @@ class Mobo_Core_Migration {
 		self::apply_10307_default_adjustments( '' );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
+		self::cleanup_legacy_private_city_assets();
 		self::create_database_tables();
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
@@ -70,6 +71,7 @@ class Mobo_Core_Migration {
 		self::apply_10307_default_adjustments( $current );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
+		self::cleanup_legacy_private_city_assets();
 		self::create_database_tables();
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
@@ -165,6 +167,26 @@ class Mobo_Core_Migration {
 		self::protect_dir( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/' );
 	}
 
+
+
+	/**
+	 * Remove generated city JS from the private data tree used before 10.31.56.
+	 *
+	 * The parent directory intentionally remains denied from the web because it
+	 * also stores webhook fallback data. Public city assets are regenerated in
+	 * uploads/mobo-core-public/assets by Mobo_Core_City_Assets.
+	 *
+	 * @return void
+	 */
+	private static function cleanup_legacy_private_city_assets() {
+		$legacy_dir = trailingslashit( MOBO_CORE_DATA_DIR ) . 'assets/';
+		foreach ( array( 'iran_cities.js', 'iran_cities.min.js' ) as $filename ) {
+			$path = $legacy_dir . $filename;
+			if ( is_file( $path ) ) {
+				wp_delete_file( $path );
+			}
+		}
+	}
 
 	/**
 	 * Create/update custom sync tables.

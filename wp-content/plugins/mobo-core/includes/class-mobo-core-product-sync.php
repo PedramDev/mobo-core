@@ -616,6 +616,13 @@ class Mobo_Core_Product_Sync {
 
 		/*
 		 * Step 5: Product without variation attributes is simple.
+		 *
+		 * A Mobo storefront "simple" product still has one purchasable Variant row.
+		 * WooCommerce does not create a WC_Product_Variation for that row, therefore
+		 * the storefront portal_variant_id and remote variant GUID must be persisted
+		 * on the WC_Product_Simple itself. Older builds stopped here without calling
+		 * get-variants, leaving the product visible in WooCommerce but impossible to
+		 * add to the Mobo cart during checkout/order submission.
 		 */
 		if ( empty( $state['currentProductCanHaveVariants'] ) ) {
 			$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
@@ -627,10 +634,28 @@ class Mobo_Core_Product_Sync {
 
 			if ( $product_id > 0 ) {
 				$this->force_product_simple_if_needed( $product_id );
+
+				$simple_variant = $this->sync_simple_product_variant_from_api(
+					$api,
+					$product_guid,
+					$product_id,
+					$state['syncId']
+				);
+
+				if ( is_wp_error( $simple_variant ) ) {
+					return $this->handle_transient_request_error( $state, $simple_variant, 'خطا در دریافت شناسه قابل خرید محصول ساده.' );
+				}
+
+				$message = ! empty( $simple_variant['success'] )
+					? 'محصول ساده و شناسه قابل خرید آن با موفقیت همگام شد.'
+					: ( isset( $simple_variant['message'] ) ? $simple_variant['message'] : 'شناسه قابل خرید محصول ساده پیدا نشد؛ محصول برای خرید مسدود شد.' );
+
 				wc_delete_product_transients( $product_id );
+			} else {
+				$message = 'محصول ساده محلی پیدا نشد و پردازش آن رد شد.';
 			}
 
-			$this->finish_current_product_state( $state, 'محصول بدون ویژگی متغیر است؛ به عنوان محصول ساده پردازش شد.' );
+			$this->finish_current_product_state( $state, $message );
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -1000,6 +1025,25 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
+		/* ProductUpdated must leave a simple product immediately purchasable. */
+		if ( ! $this->product_has_variation_attributes( $product_data ) && $this->get_stored_portal_variant_id( $product_id ) <= 0 ) {
+			$api            = new Mobo_Core_API_Client();
+			$simple_variant = $this->sync_simple_product_variant_from_api( $api, $product_guid, $product_id, 'product-updated-' . gmdate( 'YmdHis' ) );
+
+			if ( is_wp_error( $simple_variant ) ) {
+				return $this->result(
+					true,
+					'ProductUpdated منتظر دریافت شناسه قابل خرید محصول ساده است.',
+					array(
+						'deleteFile'   => false,
+						'deferSeconds' => 60,
+						'productId'    => $product_id,
+						'error'        => $simple_variant->get_error_message(),
+					)
+				);
+			}
+		}
+
 		$product_index++;
 		$payload['_moboProductIndex'] = $product_index;
 		$payload['_moboImageOffset']  = 0;
@@ -1070,10 +1114,12 @@ class Mobo_Core_Product_Sync {
 			$nested_variants = $this->get_value( $variants, 'data', null );
 			if ( is_array( $nested_variants ) ) {
 				$variants = $nested_variants;
+			} elseif ( $this->looks_like_variant_payload( $variants ) ) {
+				$variants = array( $variants );
 			}
 		}
 
-		if ( ! is_array( $variants ) ) {
+		if ( ! is_array( $variants ) || ! $this->is_list_array( $variants ) ) {
 			$variants = array();
 		}
 
@@ -1141,12 +1187,37 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$variant_list_authoritative = $this->is_authoritative_variant_list_payload( $payload, $variants );
+		$variant_total              = max( count( $variants ), absint( $this->get_value( $payload, 'totalCount', count( $variants ) ) ) );
+
+		/*
+		 * A simple WooCommerce product maps its one Mobo storefront Variant onto
+		 * the parent product itself. Never convert it to variable merely because
+		 * UpdateVariant reports totalCount=1.
+		 */
+		if ( 1 === count( $variants ) && $variant_total <= 1 && ! $this->variant_has_selection_attributes( $variants[0] ) && ( $product instanceof WC_Product_Simple || '1' === (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true ) ) ) {
+			$simple_result = $this->apply_simple_variant_to_product( $product_id, $variants[0], $product_guid );
+
+			if ( is_wp_error( $simple_result ) ) {
+				return $this->result( false, $simple_result->get_error_message(), array( 'deleteFile' => false, 'productGuid' => $product_guid ) );
+			}
+
+			return $this->result(
+				true,
+				'شناسه قابل خرید محصول ساده بروزرسانی شد.',
+				array(
+					'deleteFile'       => true,
+					'productGuid'      => $product_guid,
+					'simpleProduct'    => true,
+					'portalVariantId'  => isset( $simple_result['portalVariantId'] ) ? absint( $simple_result['portalVariantId'] ) : 0,
+				)
+			);
+		}
 
 		if ( $variant_list_authoritative && 1 === $page_number ) {
 			$this->reset_seen_variants( $product_guid, $sync_id );
 		}
 
-		$this->ensure_product_type_for_variants( $product_id, absint( $this->get_value( $payload, 'totalCount', count( $variants ) ) ) );
+		$this->ensure_product_type_for_variants( $product_id, $variant_total );
 
 		$product = wc_get_product( $product_id );
 
@@ -1578,6 +1649,21 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
+		/*
+		 * Some product payloads already contain the only storefront variant. Persist
+		 * it immediately so ProductUpdated webhooks can produce a purchasable simple
+		 * product even before a separate UpdateVariant event/manual variants page is
+		 * processed. The dedicated variants endpoint still remains authoritative and
+		 * refreshes this mapping during manual sync.
+		 */
+		if ( ! $this->product_has_variation_attributes( $data ) ) {
+			$embedded_variant = $this->extract_embedded_simple_variant_data( $data );
+
+			if ( ! empty( $embedded_variant ) ) {
+				$this->apply_simple_variant_to_product( $product_id, $embedded_variant, $product_guid );
+			}
+		}
+
 		return $product_id;
 	}
 
@@ -1921,6 +2007,247 @@ class Mobo_Core_Product_Sync {
 		return false;
 	}
 
+
+	/**
+	 * Resolve and persist the one purchasable Mobo variant of a simple product.
+	 *
+	 * @param Mobo_Core_API_Client $api API client.
+	 * @param string               $product_guid Remote product GUID.
+	 * @param int                  $product_id WooCommerce product ID.
+	 * @param string               $sync_id Sync ID.
+	 * @return array|WP_Error
+	 */
+	private function sync_simple_product_variant_from_api( $api, $product_guid, $product_id, $sync_id ) {
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$product_id   = absint( $product_id );
+		$sync_id      = sanitize_text_field( (string) $sync_id );
+
+		if ( ! is_object( $api ) || ! is_callable( array( $api, 'get_variants_page' ) ) || '' === $product_guid || $product_id <= 0 ) {
+			return new WP_Error( 'mobo_core_simple_variant_invalid_context', 'Simple product variant sync context is invalid.' );
+		}
+
+		$response = $api->get_variants_page( $product_guid, 1, 2, $sync_id, 0, false );
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$variants   = $this->normalize_variant_items_from_response( $response );
+		$total      = absint( $this->get_value( $response, 'totalCount', count( $variants ) ) );
+		$total      = max( $total, count( $variants ) );
+		$valid_rows = array_values( array_filter( $variants, array( $this, 'looks_like_variant_payload' ) ) );
+
+		if ( 1 === count( $valid_rows ) && $total <= 1 ) {
+			$result = $this->apply_simple_variant_to_product( $product_id, $valid_rows[0], $product_guid );
+
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+
+			return array(
+				'success'          => true,
+				'productId'        => $product_id,
+				'portalVariantId'  => isset( $result['portalVariantId'] ) ? absint( $result['portalVariantId'] ) : 0,
+				'variantGuid'      => isset( $result['variantGuid'] ) ? sanitize_text_field( (string) $result['variantGuid'] ) : '',
+				'message'          => 'شناسه قابل خرید محصول ساده همگام شد.',
+			);
+		}
+
+		if ( 0 === count( $valid_rows ) ) {
+			$message = 'محصول ساده در موبو هیچ Variant قابل خریدی ندارد؛ برای جلوگیری از سفارش نامعتبر، ناموجود شد.';
+			$this->mark_simple_product_variant_unresolved( $product_id, 'missing', $message );
+
+			return array( 'success' => false, 'message' => $message );
+		}
+
+		$message = sprintf( 'برای محصول ساده بیش از یک Variant موبو پیدا شد (%d مورد). انتخاب خودکار ناامن است؛ محصول برای خرید مسدود شد.', max( count( $valid_rows ), $total ) );
+		$this->mark_simple_product_variant_unresolved( $product_id, 'ambiguous', $message );
+
+		return array( 'success' => false, 'message' => $message );
+	}
+
+	/**
+	 * Persist a Mobo storefront variant on WC_Product_Simple.
+	 *
+	 * @param int    $product_id WooCommerce product ID.
+	 * @param array  $variant_data Variant payload.
+	 * @param string $product_guid Product GUID.
+	 * @return array|WP_Error
+	 */
+	private function apply_simple_variant_to_product( $product_id, $variant_data, $product_guid = '' ) {
+		$product_id   = absint( $product_id );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+
+		if ( $product_id <= 0 || ! is_array( $variant_data ) ) {
+			return new WP_Error( 'mobo_core_simple_variant_invalid_payload', 'Simple product variant payload is invalid.' );
+		}
+
+		$portal_variant_id = $this->extract_portal_variant_id( $variant_data );
+		$variant_guid      = $this->extract_simple_variant_guid( $variant_data );
+
+		if ( $portal_variant_id <= 0 ) {
+			$this->mark_simple_product_variant_unresolved( $product_id, 'portal_variant_id_missing', 'شناسه قابل خرید موبو برای محصول ساده در پاسخ API موجود نیست.' );
+			return new WP_Error( 'mobo_core_simple_portal_variant_id_missing', 'Simple Mobo product portal_variant_id is missing.' );
+		}
+
+		if ( $this->variant_has_selection_attributes( $variant_data ) ) {
+			return new WP_Error( 'mobo_core_simple_variant_has_attributes', 'A simple product variant unexpectedly contains selection attributes.' );
+		}
+
+		$this->force_product_simple_if_needed( $product_id );
+		$product = new WC_Product_Simple( $product_id );
+
+		$was_mapped = '1' === sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true ) );
+		$product->update_meta_data( 'portal_variant_id', $portal_variant_id );
+		$product->update_meta_data( 'mobo_portal_variant_id', $portal_variant_id );
+		$product->update_meta_data( '_mobo_portal_variant_id', $portal_variant_id );
+
+		if ( '' !== $variant_guid ) {
+			$product->update_meta_data( 'variant_guid', $variant_guid );
+			$product->update_meta_data( 'mobo_variant_guid', $variant_guid );
+			$product->update_meta_data( '_mobo_variant_guid', $variant_guid );
+		}
+
+		if ( '' !== $product_guid ) {
+			$product->update_meta_data( 'product_guid', $product_guid );
+		}
+
+		$this->store_portal_product_id_on_product_object( $product, $variant_data, $product_id );
+		$this->apply_price_to_product( $product, $variant_data, 'product', ! $was_mapped );
+
+		if ( ! $was_mapped || $this->rules->should_update_stock() ) {
+			$stock_present = false;
+			$stock_value   = $this->get_stock_value_from_payload( $variant_data, $stock_present );
+
+			if ( $stock_present ) {
+				$this->apply_api_stock( $product, $stock_value );
+			} elseif ( ! $was_mapped ) {
+				$this->apply_api_stock( $product, null );
+			}
+		}
+
+		$product->update_meta_data( '_mobo_simple_variant_mapped', '1' );
+		$product->update_meta_data( '_mobo_simple_variant_mapped_at', gmdate( 'c' ) );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_status', 'mapped' );
+		$product->update_meta_data( '_mobo_simple_variant_source_hash', $this->build_variation_source_hash( $variant_data, $product_guid ) );
+		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
+		$product->delete_meta_data( '_mobo_simple_variant_resolution_message' );
+		$product->save();
+
+		wc_delete_product_transients( $product_id );
+
+		return array(
+			'productId'       => $product_id,
+			'portalVariantId' => $portal_variant_id,
+			'variantGuid'     => $variant_guid,
+		);
+	}
+
+	private function mark_simple_product_variant_unresolved( $product_id, $reason, $message ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		$this->force_product_simple_if_needed( $product_id );
+		$product = new WC_Product_Simple( $product_id );
+
+		foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid' ) as $meta_key ) {
+			$product->delete_meta_data( $meta_key );
+		}
+
+		$product->set_manage_stock( true );
+		$product->set_stock_quantity( 0 );
+		$product->set_stock_status( 'outofstock' );
+		$product->update_meta_data( '_mobo_simple_variant_mapped', '0' );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_status', sanitize_key( (string) $reason ) );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_message', sanitize_text_field( (string) $message ) );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_at', gmdate( 'c' ) );
+		$product->update_meta_data( 'mobo_sync_incomplete', '1' );
+		$product->save();
+
+		wc_delete_product_transients( $product_id );
+	}
+
+	private function extract_embedded_simple_variant_data( $data ) {
+		if ( ! is_array( $data ) ) {
+			return array();
+		}
+
+		foreach ( array( 'variant', 'defaultVariant', 'default_variant', 'singleVariant', 'single_variant', 'productVariant', 'product_variant' ) as $key ) {
+			$candidate = $this->get_value( $data, $key, null );
+			if ( is_array( $candidate ) && $this->looks_like_variant_payload( $candidate ) ) {
+				return $candidate;
+			}
+		}
+
+		foreach ( array( 'variants', 'variantItems', 'variant_items' ) as $key ) {
+			$candidates = $this->get_value( $data, $key, null );
+			if ( is_array( $candidates ) && $this->is_list_array( $candidates ) && 1 === count( $candidates ) && is_array( $candidates[0] ) ) {
+				return $candidates[0];
+			}
+		}
+
+		return $this->looks_like_variant_payload( $data ) ? $data : array();
+	}
+
+	private function looks_like_variant_payload( $data ) {
+		if ( ! is_array( $data ) || empty( $data ) ) {
+			return false;
+		}
+
+		foreach ( array( 'portal_variant_id', 'portalVariantId', 'PortalVariantId', 'variant_guid', 'variantGuid', 'variantId', 'variant_id' ) as $key ) {
+			if ( null !== $this->get_value( $data, $key, null ) ) {
+				return true;
+			}
+		}
+
+		/* Storefront cart/API variant objects have id plus variant-specific fields. */
+		$id = $this->extract_positive_int_from_payload( $data, array( 'id' ) );
+		return $id > 0 && ( array_key_exists( 'status', $data ) || array_key_exists( 'min', $data ) || array_key_exists( 'max', $data ) || array_key_exists( 'price', $data ) || array_key_exists( 'type', $data ) || array_key_exists( 'attributes', $data ) );
+	}
+
+	private function extract_simple_variant_guid( $data ) {
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+
+		foreach ( array( 'variant_guid', 'variantGuid', 'variantId', 'guid', 'remote_guid', 'remoteGuid', 'entity_guid', 'entityGuid', 'entity_id', 'entityId' ) as $key ) {
+			$value = sanitize_text_field( (string) $this->get_value( $data, $key, '' ) );
+			if ( $this->is_remote_guid_value( $value ) ) {
+				return $value;
+			}
+		}
+
+		return '';
+	}
+
+	private function variant_has_selection_attributes( $variant_data ) {
+		if ( ! is_array( $variant_data ) ) {
+			return false;
+		}
+
+		return ! empty( $this->normalize_variation_attributes( $this->get_value( $variant_data, 'attributes', array() ) ) );
+	}
+
+	private function get_stored_portal_variant_id( $product_id ) {
+		$product_id = absint( $product_id );
+
+		if ( $product_id <= 0 ) {
+			return 0;
+		}
+
+		foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $meta_key ) {
+			$value = absint( get_post_meta( $product_id, $meta_key, true ) );
+			if ( $value > 0 ) {
+				return $value;
+			}
+		}
+
+		return 0;
+	}
+
 	private function force_product_simple_if_needed( $product_id ) {
 		$product_id = absint( $product_id );
 
@@ -2046,12 +2373,16 @@ class Mobo_Core_Product_Sync {
 
 		if ( is_array( $items ) && ! $this->is_list_array( $items ) ) {
 			$nested_items = $this->get_value( $items, 'data', null );
+
 			if ( is_array( $nested_items ) ) {
 				$items = $nested_items;
+			} elseif ( $this->looks_like_variant_payload( $items ) ) {
+				/* A single variant may be returned as data:{...}, not data:[{...}]. */
+				$items = array( $items );
 			}
 		}
 
-		return is_array( $items ) ? $items : array();
+		return is_array( $items ) && $this->is_list_array( $items ) ? $items : array();
 	}
 
 	private function get_stock_value_from_payload( $data, &$present = false ) {
@@ -2821,15 +3152,41 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function extract_portal_variant_id( $data ) {
-		return $this->extract_positive_int_from_payload(
+		$portal_variant_id = $this->extract_positive_int_from_payload(
 			$data,
 			array(
 				'portal_variant_id',
 				'portalVariantId',
 				'PortalVariantId',
 				'portalVariantID',
+				'variant_portal_id',
+				'variantPortalId',
 			)
 		);
+
+		if ( $portal_variant_id > 0 ) {
+			return $portal_variant_id;
+		}
+
+		/*
+		 * Storefront simple products expose the purchasable ID as variant.id.
+		 * A bare numeric id is accepted only when the array itself is clearly a
+		 * variant payload, so the Mobo product ID cannot be mistaken for a variant.
+		 */
+		if ( $this->looks_like_variant_payload( $data ) ) {
+			return $this->extract_positive_int_from_payload(
+				$data,
+				array( 'id', 'variant_id', 'variantIdNumeric', 'portalId' )
+			);
+		}
+
+		$embedded = $this->extract_embedded_simple_variant_data( $data );
+
+		if ( ! empty( $embedded ) && $embedded !== $data ) {
+			return $this->extract_portal_variant_id( $embedded );
+		}
+
+		return 0;
 	}
 
 	private function extract_positive_int_from_payload( $data, $keys ) {
@@ -2974,20 +3331,36 @@ class Mobo_Core_Product_Sync {
 		global $wpdb;
 
 		$variant_guid = sanitize_text_field( (string) $variant_guid );
-		if ( '' === $variant_guid || ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
+		if ( '' === $variant_guid ) {
 			return '';
 		}
 
-		$table = Mobo_Core_Product_Map::table_name();
-		$parent_guid = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT parent_remote_guid FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
-				$variant_guid,
-				Mobo_Core_Product_Map::TYPE_VARIATION
-			)
-		);
+		$parent_guid = '';
 
-		return sanitize_text_field( (string) $parent_guid );
+		if ( class_exists( 'Mobo_Core_Product_Map' ) && Mobo_Core_Product_Map::table_exists() ) {
+			$table = Mobo_Core_Product_Map::table_name();
+			$parent_guid = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT parent_remote_guid FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$variant_guid,
+					Mobo_Core_Product_Map::TYPE_VARIATION
+				)
+			);
+		}
+
+		if ( '' !== sanitize_text_field( (string) $parent_guid ) ) {
+			return sanitize_text_field( (string) $parent_guid );
+		}
+
+		/* Simple products keep the remote variant GUID on the product post. */
+		$product_id = absint( $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID WHERE p.post_type = 'product' AND pm.meta_key IN ('variant_guid','mobo_variant_guid','_mobo_variant_guid') AND pm.meta_value = %s LIMIT 1",
+				$variant_guid
+			)
+		) );
+
+		return $product_id > 0 ? sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) ) : '';
 	}
 
 	private function to_bool( $value ) {

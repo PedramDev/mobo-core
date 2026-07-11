@@ -127,6 +127,11 @@ class Mobo_Core_Cron_Runner {
 		$budget     = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
 		$max_steps  = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
 
+		$persian_woo_options_result = array( 'status' => 'unavailable' );
+		if ( class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
+			$persian_woo_options_result = Mobo_Core_Persian_Woo_Options::ensure_required_options( $source . '-pw-options', false );
+		}
+
 		$webhook_result = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped' );
 		if ( Mobo_Core_Settings::enabled( 'mobo_core_real_cron_process_webhooks', '1' ) ) {
 			try {
@@ -274,6 +279,7 @@ class Mobo_Core_Cron_Runner {
 			'imageRefreshQueue' => $image_refresh_result,
 			'repriceQueue'      => $reprice_result,
 			'recategorizeQueue' => $recategorize_result,
+			'persianWooOptions' => $persian_woo_options_result,
 			'addressMapping'     => $address_mapping_result,
 			'remoteShipping'     => isset( $remote_shipping_result ) ? $remote_shipping_result : array( 'status' => 'skipped' ),
 			'orderSubmissions'  => $order_submission_result,

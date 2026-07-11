@@ -3,13 +3,14 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.48
+ * Version: 10.31.58
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * WC requires at least: 8.2
  * WC tested up to: 10.9
+ * Requires Plugins: woocommerce, persian-woocommerce
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: mobo-core
@@ -19,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.48' );
+define( 'MOBO_CORE_VERSION', '10.31.58' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -71,8 +72,10 @@ add_action( 'admin_init', function() {
 /*
  * Core classes.
  */
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-dependencies.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-persian-woo-options.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
@@ -90,6 +93,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-orphan-image-clean
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-recategorize-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-settings-guard.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-maintenance.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cron-runner.php';
@@ -97,6 +101,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-self-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-health-reporter.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-checkout-validator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-city-assets.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shipping-diagnostics.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-shipping-methods.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sms-notifications.php';
@@ -155,7 +160,13 @@ add_filter(
  * Creates defaults, protects webhook directories,
  * creates/updates local tables, and migrates legacy webhook JSON files safely.
  */
-register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) );
+function mobo_core_activate() {
+	Mobo_Core_Dependencies::enforce_activation_requirements();
+	Mobo_Core_Migration::activate();
+	Mobo_Core_Persian_Woo_Options::ensure_required_options( 'activation', true );
+}
+
+register_activation_hook( __FILE__, 'mobo_core_activate' );
 
 /**
  * Bootstrap plugin.
@@ -163,24 +174,29 @@ register_activation_hook( __FILE__, array( 'Mobo_Core_Migration', 'activate' ) )
 add_action(
 	'plugins_loaded',
 	function () {
-		Mobo_Core_Migration::maybe_run();
-
-		if ( ! class_exists( 'WooCommerce' ) ) {
-			add_action(
-				'admin_notices',
-				function () {
-					if ( ! current_user_can( 'manage_options' ) ) {
-						return;
-					}
-
-					echo '<div class="notice notice-error"><p>';
-					echo esc_html__( 'برای استفاده از Mobo Core باید افزونه WooCommerce فعال باشد.', 'mobo-core' );
-					echo '</p></div>';
-				}
-			);
-
+		$missing_dependencies = Mobo_Core_Dependencies::get_missing_dependencies();
+		if ( ! empty( $missing_dependencies ) ) {
+			Mobo_Core_Dependencies::register_admin_notices( $missing_dependencies );
 			return;
 		}
+
+		Mobo_Core_Migration::maybe_run();
+
+		/*
+		 * Queue/pagination settings must remain immutable while a resumable
+		 * Sync or Repair run is active. The guard protects direct option writes
+		 * in addition to the disabled admin form.
+		 */
+		$sync_settings_guard = new Mobo_Core_Sync_Settings_Guard();
+		$sync_settings_guard->init();
+
+		/*
+		 * Persian WooCommerce options required by automatic Mobo checkout.
+		 * The enforcer protects PW_Options from being disabled while auto order
+		 * submission is enabled and performs an immediate bootstrap check.
+		 */
+		$persian_woo_options = new Mobo_Core_Persian_Woo_Options();
+		$persian_woo_options->init();
 
 		/*
 		 * Variation custom field:
@@ -217,6 +233,13 @@ add_action(
 		 */
 		$address_mapping = new Mobo_Core_Address_Mapping();
 		$address_mapping->init();
+
+		/*
+		 * Persian WooCommerce-compatible city asset generated from Mobo IDs.
+		 * This replaces pw-iran-cities only when a complete generated asset exists.
+		 */
+		$city_assets = new Mobo_Core_City_Assets();
+		$city_assets->init();
 
 
 		/*

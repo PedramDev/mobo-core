@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Mobo Core `10.31.48` · Portal `v25 / .NET 10`**
+**Mobo Core `10.31.58` · Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@
 ```mermaid
 flowchart LR
     P["MoboCore Portal v25<br/>.NET 10 + PostgreSQL"]
-    W["Mobo Core 10.31.48<br/>WordPress Plugin"]
+    W["Mobo Core 10.31.58<br/>WordPress Plugin"]
     WC["WooCommerce<br/>Products / Variations / Orders"]
     M["mobomobo.ir<br/>Cart & Order Workflow"]
     C["Server Cron / cPanel"]
@@ -168,7 +168,24 @@ stateDiagram-v2
     Done --> [*]
 ```
 
-## 8. Checkout و ثبت خودکار سفارش
+## 8. تولید فایل شهرهای موبو برای Checkout
+
+```mermaid
+flowchart TD
+    API["MoboCore get-address-mapping"] --> CACHE["Cache countries / states / cities"]
+    MAP["WooCommerce country/state mapping"] --> GEN["Mobo_Core_City_Assets"]
+    CACHE --> GEN
+    ALIAS["Province aliases: THR / TE / ..."] --> GEN
+    GEN --> JS["uploads/mobo-core-public/assets/iran_cities.js"]
+    GEN --> MIN["uploads/mobo-core-public/assets/iran_cities.min.js"]
+    JS --> HANDLE["Replace pw-iran-cities"]
+    MIN --> HANDLE
+    HANDLE --> CHECKOUT["Persian_Woo_iranCities() in Checkout"]
+    CHECKOUT --> VALUE["City field value = Mobo city_id"]
+    VALUE --> ORDER["Validate city belongs to resolved Mobo state"]
+```
+
+## 9. Checkout و ثبت خودکار سفارش
 
 ```mermaid
 sequenceDiagram
@@ -203,7 +220,7 @@ sequenceDiagram
     end
 ```
 
-## 9. نگاشت روش ارسال
+## 10. نگاشت روش ارسال
 
 ```mermaid
 flowchart TD
@@ -217,7 +234,7 @@ flowchart TD
     RESOLVE --> ORDER["Mobo checkout payload"]
 ```
 
-## 10. Health دوطرفه
+## 11. Health دوطرفه
 
 ```mermaid
 sequenceDiagram

@@ -107,6 +107,17 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
+			$pw_options = Mobo_Core_Persian_Woo_Options::ensure_required_options( 'checkout-validation', true );
+			if ( empty( $pw_options['success'] ) || empty( $pw_options['compliant'] ) ) {
+				$errors->add(
+					'mobo_core_persian_woocommerce_options',
+					'برای ثبت خودکار سفارش، گزینه‌های شهرهای ایران و جابجایی استان/شهر در ووکامرس فارسی باید فعال باشند. لطفا با مدیریت سایت تماس بگیرید.'
+				);
+				return;
+			}
+		}
+
 		$result = $this->validate_current_cart( true );
 
 		if ( ! empty( $result['success'] ) ) {
@@ -142,7 +153,7 @@ class Mobo_Core_Checkout_Validator {
 		$local_stock_raw = Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' );
 		$external_raw    = Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' );
 
-		$mobo_cart_enabled   = $master_enabled && $mobo_cart_raw;
+		$mobo_cart_enabled   = $auto_order_enabled || ( $master_enabled && $mobo_cart_raw );
 		$local_stock_enabled = $master_enabled && $local_stock_raw;
 		$external_enabled    = $master_enabled && $external_raw;
 		$runtime_enabled     = $auto_order_enabled || $mobo_cart_enabled || $local_stock_enabled || $external_enabled;
@@ -156,6 +167,7 @@ class Mobo_Core_Checkout_Validator {
 			'runtimeEnabled'    => $runtime_enabled,
 			'localStockEnabled' => $local_stock_enabled,
 			'moboCartEnabled'   => $mobo_cart_enabled,
+			'moboCartForcedByAutoOrder' => $auto_order_enabled,
 			'autoOrderEnabled'  => $auto_order_enabled,
 			'external'          => $external_enabled,
 			'rawLocalStockEnabled' => $local_stock_raw,
@@ -336,7 +348,13 @@ class Mobo_Core_Checkout_Validator {
 	 * @return bool
 	 */
 	private function is_mobo_cart_validation_effective() {
-		return $this->is_enabled() && $this->is_mobo_cart_validation_enabled();
+		/*
+		 * Automatic order submission may only run after the exact portal_variant_id
+		 * can be added to the authenticated Mobo cart. This preflight is therefore
+		 * mandatory while auto-order is enabled, even when the optional checkout
+		 * validation master/toggle is off.
+		 */
+		return $this->is_order_submission_enabled() || ( $this->is_enabled() && $this->is_mobo_cart_validation_enabled() );
 	}
 
 	/**
@@ -430,7 +448,9 @@ class Mobo_Core_Checkout_Validator {
 			}
 
 			if ( $portal_variant_id <= 0 ) {
-				$errors[] = sprintf( 'تنوع انتخاب‌شده برای محصول «%s» شناسه portal_variant_id معتبر ندارد.', $name );
+				$errors[] = $variation_id > 0
+					? sprintf( 'تنوع انتخاب‌شده برای محصول «%s» شناسه portal_variant_id معتبر ندارد.', $name )
+					: sprintf( 'محصول ساده «%s» شناسه قابل خرید موبو (portal_variant_id) ندارد؛ محصول را دوباره همگام‌سازی کنید.', $name );
 			}
 
 			if ( $block_incomplete && $this->is_sync_incomplete( $parent_id, $variation_id ) ) {
@@ -551,28 +571,30 @@ class Mobo_Core_Checkout_Validator {
 					$response = $this->add_mobo_cart_item_by_variant( $portal_variant_id, $quantity );
 				}
 
-				$code = is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) );
+				$code      = is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) );
+				$add_check = $this->validate_mobo_cart_add_response( $response, $portal_variant_id, $name );
 				$results[] = array(
 					'portalVariantId' => $portal_variant_id,
 					'quantity'        => $quantity,
 					'status'          => $code,
-					'error'           => is_wp_error( $response ) ? $response->get_error_message() : '',
+					'error'           => is_wp_error( $add_check ) ? $add_check->get_error_message() : '',
 				);
 
 				$this->debug_log( 'shared_cart_add_item_result', array(
 					'portalVariantId' => $portal_variant_id,
 					'quantity'        => $quantity,
 					'httpStatus'      => $code,
-					'error'           => is_wp_error( $response ) ? $response->get_error_message() : '',
+					'error'           => is_wp_error( $add_check ) ? $add_check->get_error_message() : '',
 				) );
 
-				if ( is_wp_error( $response ) || 200 !== $code ) {
-					$errors[] = sprintf( 'امکان ثبت سفارش برای محصول «%s» وجود ندارد. وضعیت بررسی موبو: %s', $name, $code > 0 ? (string) $code : 'خطای ارتباطی' );
+				if ( is_wp_error( $add_check ) ) {
+					$errors[] = sprintf( 'امکان ثبت سفارش برای محصول «%s» وجود ندارد: %s', $name, $add_check->get_error_message() );
 				}
 			}
 
 			if ( empty( $errors ) ) {
-				$snapshot = $this->get_mobo_cart_snapshot_json();
+				/* update=true is the authoritative storefront refresh used before checkout. */
+				$snapshot = $this->get_mobo_cart_snapshot_json( true );
 
 				if ( is_wp_error( $snapshot ) ) {
 					$this->debug_log( 'shared_cart_snapshot_failed', array( 'error' => $snapshot->get_error_message() ) );
@@ -932,8 +954,76 @@ class Mobo_Core_Checkout_Validator {
 	 *
 	 * @return array|WP_Error
 	 */
-	private function get_mobo_cart_snapshot_json() {
-		$response = $this->refresh_mobo_cart_snapshot();
+
+	/**
+	 * Validate the semantic result of POST /cart, not only HTTP 200.
+	 *
+	 * @param array|WP_Error $response HTTP response.
+	 * @param int            $portal_variant_id Requested variant.
+	 * @param string         $name Product name.
+	 * @return true|WP_Error
+	 */
+	private function validate_mobo_cart_add_response( $response, $portal_variant_id, $name = '' ) {
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$code = absint( wp_remote_retrieve_response_code( $response ) );
+		$name = sanitize_text_field( (string) $name );
+
+		if ( 200 !== $code ) {
+			return new WP_Error(
+				'mobo_core_mobo_cart_add_http_failed',
+				sprintf( 'آیتم «%s» در سبد موبو ثبت نشد. HTTP %d', '' !== $name ? $name : (string) absint( $portal_variant_id ), $code )
+			);
+		}
+
+		$raw = trim( (string) wp_remote_retrieve_body( $response ) );
+
+		if ( '' === $raw ) {
+			return true;
+		}
+
+		$json = json_decode( $raw, true );
+
+		if ( ! is_array( $json ) ) {
+			return new WP_Error( 'mobo_core_mobo_cart_add_invalid_json', 'پاسخ افزودن محصول به سبد موبو JSON معتبر نبود.' );
+		}
+
+		if ( array_key_exists( 'success', $json ) && ! $this->to_bool( $json['success'] ) ) {
+			$message = $this->first_non_empty_scalar(
+				array(
+					isset( $json['description'] ) ? $json['description'] : '',
+					isset( $json['message'] ) ? $json['message'] : '',
+					'موبو افزودن محصول به سبد را رد کرد.',
+				)
+			);
+			return new WP_Error( 'mobo_core_mobo_cart_add_rejected', sanitize_text_field( $message ) );
+		}
+
+		$returned_variant_id = 0;
+		if ( isset( $json['product']['variant']['id'] ) ) {
+			$returned_variant_id = absint( $json['product']['variant']['id'] );
+		}
+
+		if ( $returned_variant_id > 0 && $returned_variant_id !== absint( $portal_variant_id ) ) {
+			return new WP_Error( 'mobo_core_mobo_cart_add_variant_mismatch', 'شناسه Variant برگشتی موبو با محصول درخواستی برابر نیست.' );
+		}
+
+		return true;
+	}
+
+	private function first_non_empty_scalar( $values ) {
+		foreach ( (array) $values as $value ) {
+			if ( is_scalar( $value ) && '' !== trim( (string) $value ) ) {
+				return (string) $value;
+			}
+		}
+		return '';
+	}
+
+	private function get_mobo_cart_snapshot_json( $update = false ) {
+		$response = $this->refresh_mobo_cart_snapshot( $update );
 
 		if ( is_wp_error( $response ) ) {
 			return $response;
@@ -1064,6 +1154,17 @@ class Mobo_Core_Checkout_Validator {
 			if ( ! empty( $status ) && ! in_array( 'approved', $status, true ) ) {
 				$errors[] = sprintf( 'محصول «%s» در موبو وضعیت قابل تایید ندارد.', $name );
 			}
+
+			$minimum = isset( $remote[ $key ]['min'] ) && null !== $remote[ $key ]['min'] ? (float) $remote[ $key ]['min'] : null;
+			$maximum = isset( $remote[ $key ]['max'] ) && null !== $remote[ $key ]['max'] ? (float) $remote[ $key ]['max'] : null;
+
+			if ( null !== $minimum && $minimum > 0 && $expected_qty < $minimum ) {
+				$errors[] = sprintf( 'حداقل تعداد قابل خرید محصول «%s» در موبو %s است.', $name, wc_format_decimal( $minimum ) );
+			}
+
+			if ( null !== $maximum && $maximum > 0 && $expected_qty > $maximum ) {
+				$errors[] = sprintf( 'حداکثر تعداد قابل خرید محصول «%s» در موبو %s است.', $name, wc_format_decimal( $maximum ) );
+			}
 		}
 
 		$this->debug_log( 'shared_cart_snapshot_compared', array( 'expected' => $expected, 'remoteCount' => count( $remote ), 'errorCount' => count( $errors ) ) );
@@ -1076,7 +1177,7 @@ class Mobo_Core_Checkout_Validator {
 	 *
 	 * Flow used by mobomobo.ir:
 	 * 1) POST /site/api/v1/cart creates/adds a variant with variant_id = portal_variant_id.
-	 * 2) GET /site/api/v1/cart?update=false returns cart.items[].id.
+	 * 2) GET /site/api/v1/cart?update=false returns cart.items[].id; update=true refreshes checkout data.
 	 * 3) Later quantity changes must use PUT /site/api/v1/cart/{cart_item_id}.
 	 *
 	 * The cart item ID is discovered by matching:
@@ -1824,9 +1925,10 @@ class Mobo_Core_Checkout_Validator {
 	 *
 	 * @return array|WP_Error
 	 */
-	private function refresh_mobo_cart_snapshot() {
-		$this->debug_log( 'snapshot_request', array() );
-		$response = $this->mobo_request( 'GET', '/site/api/v1/cart?update=false', null );
+	private function refresh_mobo_cart_snapshot( $update = false ) {
+		$update = (bool) $update;
+		$this->debug_log( 'snapshot_request', array( 'update' => $update ) );
+		$response = $this->mobo_request( 'GET', '/site/api/v1/cart?update=' . ( $update ? 'true' : 'false' ), null );
 
 		if ( is_wp_error( $response ) ) {
 			return $response;
@@ -1857,7 +1959,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
-	 * Store variant => cart item ID map from GET /cart?update=false response.
+	 * Store variant => cart item ID map from GET /cart response.
 	 *
 	 * @param array $json Decoded snapshot.
 	 * @return void
@@ -2762,6 +2864,17 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش محصول موبو ندارد.' );
 		}
 
+		if ( class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
+			$pw_options = Mobo_Core_Persian_Woo_Options::ensure_required_options( 'order-submission', true );
+			if ( empty( $pw_options['success'] ) || empty( $pw_options['compliant'] ) ) {
+				return $this->fail_mobo_order_submission(
+					$order,
+					'persian_woocommerce_options_invalid',
+					'گزینه‌های شهرهای ایران و جابجایی استان/شهر در ووکامرس فارسی باید فعال باشند. Mobo Core نتوانست آن‌ها را به‌صورت خودکار فعال کند.'
+				);
+			}
+		}
+
 		$order->update_meta_data( '_mobo_order_submit_attempted', 'yes' );
 		$order->update_meta_data( '_mobo_order_submit_attempted_at', time() );
 		$order->update_meta_data( '_mobo_order_submit_status', 'running' );
@@ -2787,6 +2900,20 @@ class Mobo_Core_Checkout_Validator {
 			}
 
 			return $this->fail_mobo_order_submission( $order, $error_code, implode( ' | ', $errors ) );
+		}
+
+		/*
+		 * Resolve and validate the checkout contact before touching the shared Mobo
+		 * session/cart. Local mapping errors must fail without remote side effects.
+		 */
+		$contact_preflight = $this->build_mobo_order_contact_payload( $order );
+		if ( is_wp_error( $contact_preflight ) ) {
+			$this->append_order_log( $order, 'order_submission_address_preflight_failed', array(
+				'code'    => $contact_preflight->get_error_code(),
+				'message' => $contact_preflight->get_error_message(),
+				'data'    => $contact_preflight->get_error_data(),
+			) );
+			return $this->fail_mobo_order_submission( $order, 'checkout_payload_failed', $contact_preflight->get_error_message() );
 		}
 
 		$lock = $this->acquire_mobo_cart_lock( 'order_submission_' . $order_id );
@@ -2818,18 +2945,16 @@ class Mobo_Core_Checkout_Validator {
 				$quantity          = isset( $item['quantity'] ) ? (float) $item['quantity'] : 0;
 				$name              = isset( $item['name'] ) ? sanitize_text_field( (string) $item['name'] ) : 'محصول';
 
-				$response = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart', array( 'quantity' => $quantity, 'variant_id' => $portal_variant_id ), 'cart_add_item' );
-				if ( is_wp_error( $response ) ) {
-					return $this->fail_mobo_order_submission( $order, 'cart_add_failed', $response->get_error_message() );
-				}
+				$response  = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart', array( 'quantity' => $quantity, 'variant_id' => $portal_variant_id ), 'cart_add_item' );
+				$add_check = $this->validate_mobo_cart_add_response( $response, $portal_variant_id, $name );
 
-				$code = absint( wp_remote_retrieve_response_code( $response ) );
-				if ( 200 !== $code ) {
-					return $this->fail_mobo_order_submission( $order, 'cart_add_http_failed', sprintf( 'آیتم «%s» در سبد موبو ثبت نشد. HTTP %s', $name, $code ) );
+				if ( is_wp_error( $add_check ) ) {
+					return $this->fail_mobo_order_submission( $order, 'cart_add_failed', $add_check->get_error_message() );
 				}
 			}
 
-			$snapshot = $this->get_mobo_cart_snapshot_json();
+			/* Match mobomobo.ir checkout flow: refresh cart with update=true. */
+			$snapshot = $this->get_mobo_cart_snapshot_json( true );
 			if ( is_wp_error( $snapshot ) ) {
 				return $this->fail_mobo_order_submission( $order, 'cart_snapshot_failed', $snapshot->get_error_message() );
 			}
@@ -2958,7 +3083,9 @@ class Mobo_Core_Checkout_Validator {
 				$errors[] = sprintf( 'تنوع انتخاب‌شده برای محصول «%s» شناسه variant_guid معتبر ندارد.', $name );
 			}
 			if ( $portal_variant_id <= 0 ) {
-				$errors[] = sprintf( 'تنوع انتخاب‌شده برای محصول «%s» شناسه portal_variant_id معتبر ندارد.', $name );
+				$errors[] = $variation_id > 0
+					? sprintf( 'تنوع انتخاب‌شده برای محصول «%s» شناسه portal_variant_id معتبر ندارد.', $name )
+					: sprintf( 'محصول ساده «%s» شناسه قابل خرید موبو (portal_variant_id) ندارد؛ محصول را دوباره همگام‌سازی کنید.', $name );
 			}
 			if ( $this->is_sync_incomplete( $parent_id, $variation_id ) ) {
 				$errors[] = sprintf( 'همگام‌سازی محصول «%s» هنوز کامل نشده است.', $name );
@@ -3040,16 +3167,21 @@ class Mobo_Core_Checkout_Validator {
 			$address_mapping = new Mobo_Core_Address_Mapping();
 			if ( method_exists( $address_mapping, 'resolve_order_group' ) ) {
 				$resolved = $address_mapping->resolve_order_group( $order, $group );
-				if ( ! is_wp_error( $resolved ) ) {
-					$country_id = absint( isset( $resolved['countryId'] ) ? $resolved['countryId'] : 0 );
-					$state_id   = absint( isset( $resolved['stateId'] ) ? $resolved['stateId'] : 0 );
-					$city_id    = absint( isset( $resolved['cityId'] ) ? $resolved['cityId'] : 0 );
+				if ( is_wp_error( $resolved ) ) {
+					return $resolved;
+				}
+
+				$country_id = absint( isset( $resolved['countryId'] ) ? $resolved['countryId'] : 0 );
+				$state_id   = absint( isset( $resolved['stateId'] ) ? $resolved['stateId'] : 0 );
+				$city_id    = absint( isset( $resolved['cityId'] ) ? $resolved['cityId'] : 0 );
+				if ( method_exists( $address_mapping, 'write_order_group_location_meta' ) ) {
+					$address_mapping->write_order_group_location_meta( $order, $group, $resolved );
 				}
 			}
 		}
 
 		if ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) {
-			return new WP_Error( 'mobo_core_location_ids_missing', 'شناسه کشور، استان یا شهر موبو روی سفارش کامل نیست. نگاشت دستی آدرس را در تنظیمات موبو تکمیل کنید.' );
+			return new WP_Error( 'mobo_core_location_ids_missing', 'شناسه کشور، استان یا شهر موبو روی سفارش کامل نیست. نگاشت کشور و استان و وضعیت فایل شهرهای موبو را در تب اعتبارسنجی خرید بررسی کنید.' );
 		}
 
 		$address_1 = 'shipping' === $group ? $order->get_shipping_address_1() : $order->get_billing_address_1();
@@ -3082,7 +3214,13 @@ class Mobo_Core_Checkout_Validator {
 		$shipping_city    = method_exists( $order, 'get_shipping_city' ) ? trim( (string) $order->get_shipping_city() ) : '';
 		$shipping_address = method_exists( $order, 'get_shipping_address_1' ) ? trim( (string) $order->get_shipping_address_1() ) : '';
 
-		if ( '' !== $shipping_country || '' !== $shipping_state || '' !== $shipping_city || '' !== $shipping_address ) {
+		/*
+		 * WooCommerce may keep only a default shipping country/state even when the
+		 * customer did not enable a separate shipping address. Selecting shipping
+		 * merely because one field is populated makes a complete billing address
+		 * unusable. Use shipping only when its required address fields are complete.
+		 */
+		if ( '' !== $shipping_country && '' !== $shipping_state && '' !== $shipping_city && '' !== $shipping_address ) {
 			return 'shipping';
 		}
 

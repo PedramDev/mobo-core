@@ -60,6 +60,37 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_webhook_queue_last_success_at' );
 	delete_option( 'mobo_core_webhook_queue_last_activity_at' );
 	delete_option( 'mobo_core_webhook_queue_last_result' );
+	delete_option( 'mobo_core_city_assets_status' );
+	delete_option( 'mobo_core_pw_options_last_check_at' );
+	delete_option( 'mobo_core_pw_options_last_enforced' );
+	delete_transient( 'mobo_core_pw_options_enforced_notice' );
+
+	/*
+	 * Generated checkout city files are runtime assets, not business data.
+	 */
+	$upload = wp_upload_dir( null, false );
+	if ( empty( $upload['error'] ) && ! empty( $upload['basedir'] ) ) {
+		$base_dir = trailingslashit( (string) $upload['basedir'] );
+		$asset_dirs = array(
+			$base_dir . 'mobo-core-public/assets/',
+			$base_dir . 'mobo-core/assets/', // Legacy private location used before 10.31.56.
+		);
+		foreach ( $asset_dirs as $asset_dir ) {
+			foreach ( array( 'iran_cities.js', 'iran_cities.min.js', 'index.html', '.htaccess' ) as $asset_name ) {
+				$asset_path = $asset_dir . $asset_name;
+				if ( is_file( $asset_path ) ) {
+					wp_delete_file( $asset_path );
+				}
+			}
+			if ( is_dir( $asset_dir ) ) {
+				@rmdir( $asset_dir );
+			}
+		}
+		$public_root = $base_dir . 'mobo-core-public/';
+		if ( is_dir( $public_root ) ) {
+			@rmdir( $public_root );
+		}
+	}
 
 	/*
 	 * Remove old v2 beta option if it exists.

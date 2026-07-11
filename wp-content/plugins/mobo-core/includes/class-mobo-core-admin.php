@@ -850,10 +850,11 @@ class Mobo_Core_Admin {
 		$persian_wc_status  = $this->get_persian_woocommerce_status();
 		$poina_allowlist_status = $this->get_poina_domain_allowlist_status();
 		$order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$persian_woo_required_options_status = class_exists( 'Mobo_Core_Persian_Woo_Options' ) ? Mobo_Core_Persian_Woo_Options::get_status() : array();
 		$address_mapping_enabled = $order_submission_enabled;
 		$address_checkout_active = ! empty( $address_status['checkoutActive'] );
 		$checkout_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
-		$mobo_cart_validation_enabled = $checkout_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' );
+		$mobo_cart_validation_enabled = $order_submission_enabled || ( $checkout_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' ) );
 
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
@@ -875,7 +876,13 @@ class Mobo_Core_Admin {
 
 			<?php if ( ! empty( $persian_wc_plugins ) ) : ?>
 				<div class="mobo-alert mobo-alert-warning">
-					افزونه فارسی‌ساز/پرشین ووکامرس روی سایت فعال است: <?php echo esc_html( implode( '، ', $persian_wc_plugins ) ); ?>. برای ثبت سفارش خودکار موبو، کافی است نگاشت کشور، استان و شهر را در همین صفحه کامل کنید. افزونه مقدار انتخاب‌شده در checkout را به شناسه‌های موبو تبدیل می‌کند و لازم نیست مدیر سایت با تنظیمات داخلی افزونه‌های دیگر درگیر شود.
+					افزونه فارسی‌ساز/پرشین ووکامرس روی سایت فعال است: <?php echo esc_html( implode( '، ', $persian_wc_plugins ) ); ?>. Mobo Core فایل شهرهای تولیدشده از داده موبو را با همان handle ووکامرس فارسی در Checkout بارگذاری می‌کند. فقط کشور و استان نیاز به نگاشت دارند و مقدار شهر مستقیما شناسه شهر موبو خواهد بود.
+				</div>
+			<?php endif; ?>
+
+			<?php if ( $order_submission_enabled ) : ?>
+				<div class="mobo-alert <?php echo ! empty( $persian_woo_required_options_status['compliant'] ) ? 'mobo-alert-success' : 'mobo-alert-error'; ?>">
+					برای ثبت خودکار سفارش، گزینه‌های <code>PW_Options[enable_iran_cities]</code> و <code>PW_Options[flip_state_city]</code> در ووکامرس فارسی اجباری هستند. Mobo Core این دو گزینه را خودکار فعال نگه می‌دارد و در صورت برداشتن دستی تیک، اجازه ذخیره حالت غیرفعال را نمی‌دهد.
 				</div>
 			<?php endif; ?>
 
@@ -932,7 +939,7 @@ class Mobo_Core_Admin {
 				<div class="mobo-card">
 					<div class="mobo-card-head">
 						<h2>اعتبارسنجی قبل از خرید</h2>
-						<p>این بخش قبل از پرداخت، آیتم‌های سبد خرید را بررسی می‌کند. پیش‌فرض غیرفعال است تا آپدیت مشتری‌های فعلی رفتار checkout را تغییر ندهد.</p>
+						<p>این بخش قبل از پرداخت، آیتم‌های سبد خرید را بررسی می‌کند. در حالت عادی اختیاری است؛ اما با فعال شدن ثبت خودکار سفارش، تست واقعی افزودن کالا به سبد موبو الزامی و خودکار می‌شود.</p>
 					</div>
 
 					<div class="mobo-fields-grid">
@@ -940,11 +947,11 @@ class Mobo_Core_Admin {
 						<div data-mobo-ui-group="master-checkout">
 							<?php $this->bool_field( 'بررسی موجودی ثبت شده در همین سایت', 'mobo_core_checkout_local_stock_check_enabled' ); ?>
 						</div>
-						<div class="mobo-field mobo-field-full" data-mobo-ui-message="master-off"><div class="mobo-help">کنترل‌های قبل از پرداخت خاموش است؛ بنابراین این افزونه در checkout بررسی اضافه‌ای انجام نمی‌دهد.</div></div>
+						<div class="mobo-field mobo-field-full" data-mobo-ui-message="master-off"><div class="mobo-help">کنترل‌های اختیاری قبل از پرداخت خاموش است. اگر ثبت خودکار سفارش فعال باشد، تست اجباری افزودن کالا به سبد موبو همچنان اجرا می‌شود.</div></div>
 					</div>
 
 					<div class="mobo-note">
-						این گزینه کل کنترل‌های خرید را روشن یا خاموش می‌کند. اگر فقط می‌خواهید سایت مثل ووکامرس عادی کار کند، آن را خاموش بگذارید. برای بررسی موجودی لحظه‌ای موبو باید گزینه «بررسی موجودی لحظه‌ای در موبو» را هم فعال کنید.
+						این گزینه کنترل‌های اختیاری خرید را روشن یا خاموش می‌کند. بررسی واقعی قابل خرید بودن در موبو با فعال بودن ثبت سفارش خودکار قابل خاموش کردن نیست؛ زیرا همان portal_variant_id باید قبل از پرداخت با POST /cart تایید شود.
 					</div>
 				</div>
 
@@ -953,13 +960,13 @@ class Mobo_Core_Admin {
 				<div class="mobo-card">
 					<div class="mobo-card-head">
 						<h2>بررسی سبد خرید موبو</h2>
-						<p>اگر بررسی لحظه‌ای موجودی را فعال کنید، افزونه هنگام checkout سبد موبو را با سبد مشتری مقایسه می‌کند. این بخش فقط وقتی لازم است که می‌خواهید قبل از پرداخت، موجودی و قابل خرید بودن محصولات موبو دوباره بررسی شود.</p>
+						<p>افزونه هنگام checkout کالاها را با portal_variant_id به سبد موبو اضافه می‌کند و snapshot نهایی را با update=true می‌خواند. این کنترل برای ثبت سفارش خودکار اجباری است و در حالت عادی با گزینه زیر فعال می‌شود.</p>
 					</div>
 
 					<div class="mobo-fields-grid">
 						<div data-mobo-ui-group="master-checkout">
 							<?php $this->bool_field( 'بررسی موجودی لحظه‌ای در موبو', 'mobo_core_checkout_mobo_cart_validation_enabled' ); ?>
-							<div class="mobo-field mobo-field-full"><div class="mobo-help">اگر فعال باشد، قبل از ثبت سفارش، همین سبد خرید در موبو هم بررسی می‌شود تا مشخص شود کالاها در همان لحظه قابل خرید هستند یا نه.</div></div>
+							<div class="mobo-field mobo-field-full"><div class="mobo-help">اگر ثبت سفارش خودکار خاموش باشد، این گزینه کنترل را به صورت اختیاری فعال می‌کند. با روشن بودن ثبت سفارش خودکار، کنترل بدون توجه به این گزینه اجباری است.</div></div>
 						</div>
 
 						<div data-mobo-ui-group="mobo-cart-debug">
@@ -985,7 +992,7 @@ class Mobo_Core_Admin {
 
 
 					<div class="mobo-note">
-						اگر «بررسی موجودی لحظه‌ای در موبو» یا «ثبت خودکار سفارش در موبو» روشن باشد، پلاگین برای همین کار از اطلاعات ورود موبو استفاده می‌کند. ثبت سفارش در موبو فقط بعد از نهایی شدن سفارش ووکامرس انجام می‌شود.
+						اگر «بررسی موجودی لحظه‌ای در موبو» یا «ثبت خودکار سفارش در موبو» روشن باشد، پلاگین از اطلاعات ورود موبو استفاده می‌کند. در حالت ثبت خودکار، ابتدا قابل افزودن بودن تمام آیتم‌ها به سبد موبو در checkout تایید می‌شود و سپس سفارش نهایی ووکامرس برای خرید خودکار در موبو وارد صف می‌شود.
 					</div>
 				</div>
 
@@ -994,7 +1001,7 @@ class Mobo_Core_Admin {
 			<div class="mobo-card mobo-card-wide" data-mobo-ui-card="auto-order">
 				<div class="mobo-card-head">
 					<h2>نگاشت آدرس برای ثبت سفارش در موبو</h2>
-					<p>برای ثبت سفارش خودکار، افزونه باید بداند کشور، استان و شهر انتخاب شده در checkout معادل کدام مورد در موبو است. پیشنهاد خودکار فقط کمک می‌کند؛ تصمیم نهایی با مدیر سایت است.</p>
+					<p>برای ثبت سفارش خودکار، کشور و استان WooCommerce به موبو متصل می‌شوند. شهرها مستقیما از موبو دریافت و به صورت فایل سازگار با ووکامرس فارسی در Checkout بارگذاری می‌شوند.</p>
 				</div>
 
 				<div class="mobo-fields-grid">
@@ -1011,13 +1018,13 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'مالکیت فیلدهای checkout', 'WooCommerce / ووکامرس فارسی' ); ?>
 					<?php $this->status_box( 'کشورهای نگاشت‌شده', ( isset( $address_manual_status['countriesMapped'] ) ? absint( $address_manual_status['countriesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['countriesTotal'] ) ? absint( $address_manual_status['countriesTotal'] ) : 0 ) ); ?>
 					<?php $this->status_box( 'استان‌های نگاشت‌شده', ( isset( $address_manual_status['statesMapped'] ) ? absint( $address_manual_status['statesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['statesTotal'] ) ? absint( $address_manual_status['statesTotal'] ) : 0 ) ); ?>
-					<?php $this->status_box( 'شهرهای نگاشت‌شده', ( isset( $address_manual_status['citiesMapped'] ) ? absint( $address_manual_status['citiesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['citiesTotal'] ) ? absint( $address_manual_status['citiesTotal'] ) : 0 ) ); ?>
+					<?php $this->status_box( 'شهرهای فایل Checkout', ( isset( $address_manual_status['citiesMapped'] ) ? absint( $address_manual_status['citiesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['citiesTotal'] ) ? absint( $address_manual_status['citiesTotal'] ) : 0 ) ); ?>
 					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $address_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $address_status['lastSuccessAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین خطا', ! empty( $address_status['lastError'] ) ? $address_status['lastError'] : '—' ); ?>
 				</div>
 
 				<div class="mobo-note">
-					اگر ثبت سفارش خودکار را فعال کنید، پلاگین ابتدا دیتای خام کشور/استان/شهر موبو را از MoboCore دریافت می‌کند. اما تبدیل مقدارهای checkout به city_id/state_id/country_id موبو فقط از نگاشت دستی تایید شده انجام می‌شود. دکمه auto-map فقط پیشنهاد می‌دهد و تا زمانی که مدیر ذخیره نکند اعمال نمی‌شود.
+					اگر ثبت سفارش خودکار را فعال کنید، داده کشور/استان/شهر از MoboCore دریافت می‌شود. کشور و استان از نگاشت تاییدشده استفاده می‌کنند؛ مقدار شهر در Checkout مستقیما city_id موبو است و دیگر نگاشت دستی شهر وجود ندارد.
 				</div>
 
 				<?php if ( $address_mapping && method_exists( $address_mapping, 'get_cached_mapping' ) ) : ?>
@@ -1072,10 +1079,10 @@ class Mobo_Core_Admin {
 				'راهنمای سازگاری افزونه‌های جانبی',
 				array(
 					array( 'title' => 'poina-domain-allowlist', 'text' => 'اگر این افزونه روی سایت نصب است و خروجی‌های HTTP را محدود می‌کند، دامنه‌های mobo.codeya.ir و mobomobo.ir باید به allowlist اضافه شوند. در غیر این صورت ارتباط با MoboCore، ورود به موبو، بررسی سبد موبو یا ثبت سفارش خودکار ممکن است fail شود.' ),
-					array( 'title' => 'ووکامرس فارسی و شهرهای ایران', 'text' => 'اگر ووکامرس فارسی شهر و استان را کشویی می‌کند، مشکلی نیست؛ فقط نگاشت دستی همین صفحه باید کامل باشد تا مقدار انتخاب‌شده به شناسه شهر و استان موبو تبدیل شود.' ),
+					array( 'title' => 'ووکامرس فارسی و شهرهای ایران', 'text' => 'Mobo Core اسکریپت pw-iran-cities را فقط وقتی فایل تولیدشده معتبر باشد با فایل شهرهای موبو جایگزین می‌کند. کشور و استان نگاشت می‌شوند، اما مقدار شهر مستقیما city_id موبو است و نگاشت دستی شهر وجود ندارد.' ),
 					array( 'title' => 'مالکیت فیلدهای آدرس', 'text' => 'وقتی ثبت سفارش خودکار موبو خاموش است، فیلدهای آدرس باید دست WooCommerce و افزونه‌های حمل و نقل بماند. وقتی ثبت سفارش خودکار روشن است، mapping موبو باید منبع اصلی country/state/city باشد تا payload سفارش موبو معتبر بماند.' ),
 				),
-				'اگر افزونه دیگری فیلدهای checkout را تغییر می‌دهد، بعد از ذخیره نگاشت آدرس یک سفارش تست با استان و شهر واقعی بگیرید.'
+				'اگر افزونه دیگری فیلدهای checkout را تغییر می‌دهد، بعد از بروزرسانی داده آدرس و تولید فایل شهرها یک سفارش تست با استان و شهر واقعی بگیرید.'
 			);
 
 			$this->guide_box(
@@ -1185,8 +1192,8 @@ class Mobo_Core_Admin {
 
 				function refreshMoboCheckoutUi() {
 					var master = valueOf('mobo_core_checkout_validation_enabled') === '1';
-					var moboCart = master && valueOf('mobo_core_checkout_mobo_cart_validation_enabled') === '1';
 					var autoOrder = valueOf('mobo_core_mobo_order_submission_enabled') === '1';
+					var moboCart = autoOrder || (master && valueOf('mobo_core_checkout_mobo_cart_validation_enabled') === '1');
 					var needsMoboLogin = moboCart || autoOrder;
 
 					setVisible('[data-mobo-ui-group="master-checkout"]', master);
@@ -1502,7 +1509,7 @@ class Mobo_Core_Admin {
 					<div class="mobo-help">این دکمه‌ها تنظیمات فرم را ذخیره نمی‌کنند. اگر تغییری در تنظیمات داده‌اید، ابتدا دکمه «ذخیره تنظیمات» همین تب را بزنید.</div>
 					<div class="mobo-support-tools-actions">
 						<span data-mobo-ui-group="mobo-login"><?php $this->admin_tool_button( 'mobo_core_tool_test_mobo_login', 'تست اتصال به موبو' ); ?></span>
-						<?php $this->admin_tool_button( 'mobo_core_tool_sync_address_mapping', 'بروزرسانی کشور، استان و شهر از MoboCore' ); ?>
+						<?php $this->admin_tool_button( 'mobo_core_tool_sync_address_mapping', 'بروزرسانی آدرس موبو و ساخت فایل شهرهای Checkout' ); ?>
 						<?php $this->admin_tool_button( 'mobo_core_tool_sync_remote_shipping_methods', 'بروزرسانی روش‌های ارسال از MoboCore' ); ?>
 						<span data-mobo-ui-group="mobo-cart-debug"><?php $this->admin_tool_button( 'mobo_core_tool_clear_mobo_debug_log', 'پاک کردن گزارش سبد موبو', 'button button-secondary', 'گزارش‌های بررسی سبد موبو پاک شود؟' ); ?></span>
 						<?php $this->admin_tool_button( 'mobo_core_tool_clear_shipping_diagnostics', 'پاک کردن گزارش ارسال', 'button button-secondary', 'گزارش مشکل ارسال پاک شود؟' ); ?>
@@ -2188,13 +2195,27 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function render_queue_tab() {
+		$queue_settings_lock = class_exists( 'Mobo_Core_Sync_Settings_Guard' )
+			? Mobo_Core_Sync_Settings_Guard::get_lock_state()
+			: array( 'locked' => false, 'operationLabel' => 'همگام سازی محصولات' );
+		$queue_settings_locked = ! empty( $queue_settings_lock['locked'] );
+		$queue_operation_label = isset( $queue_settings_lock['operationLabel'] )
+			? sanitize_text_field( (string) $queue_settings_lock['operationLabel'] )
+			: 'همگام سازی محصولات';
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
 			<input type="hidden" name="mobo_active_tab" value="queue">
 			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
 
+			<?php if ( $queue_settings_locked ) : ?>
+				<div class="mobo-message mobo-message-warning mobo-queue-settings-lock-message" role="status">
+					<strong>تنظیمات صف و پردازش موقتا قفل است.</strong><br>
+					در حال اجرای <?php echo esc_html( $queue_operation_label ); ?> هستید. تغییر این مقادیر می تواند مرز صفحه، cursor، counter و index ادامه پردازش را جابه جا کند. پس از پایان عملیات، صفحه را دوباره باز کنید و سپس تنظیمات را تغییر دهید.
+				</div>
+			<?php endif; ?>
 
+			<fieldset class="mobo-queue-settings-fieldset" <?php disabled( $queue_settings_locked, true ); ?> aria-disabled="<?php echo $queue_settings_locked ? 'true' : 'false'; ?>">
 			<div class="mobo-card mobo-queue-preset-card" data-mobo-queue-preset-card>
 				<div class="mobo-card-head">
 					<h2>تنظیم سریع بر اساس توان هاست</h2>
@@ -2283,7 +2304,8 @@ type:{mobo_order_type_label}</textarea>
 			);
 			?>
 
-			<?php $this->save_button(); ?>
+			<?php $this->save_button( $queue_settings_locked ? 'پس از پایان Sync/Repair قابل ذخیره است' : 'ذخیره تنظیمات' ); ?>
+			</fieldset>
 		</form>
 		<?php
 	}
@@ -2605,20 +2627,19 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function render_address_manual_mapping_ui( $address_mapping ) {
-		$local = method_exists( $address_mapping, 'get_local_location_candidates' ) ? $address_mapping->get_local_location_candidates() : array();
-		$mobo  = method_exists( $address_mapping, 'get_cached_mapping' ) ? $address_mapping->get_cached_mapping() : array();
+		$local  = method_exists( $address_mapping, 'get_local_location_candidates' ) ? $address_mapping->get_local_location_candidates() : array();
+		$mobo   = method_exists( $address_mapping, 'get_cached_mapping' ) ? $address_mapping->get_cached_mapping() : array();
 		$manual = method_exists( $address_mapping, 'get_manual_mapping' ) ? $address_mapping->get_manual_mapping() : array();
 
-		$countries = isset( $local['countries'] ) && is_array( $local['countries'] ) ? $local['countries'] : array();
-		$states    = isset( $local['states'] ) && is_array( $local['states'] ) ? $local['states'] : array();
-		$cities    = isset( $local['cities'] ) && is_array( $local['cities'] ) ? $local['cities'] : array();
+		$countries      = isset( $local['countries'] ) && is_array( $local['countries'] ) ? $local['countries'] : array();
+		$states         = isset( $local['states'] ) && is_array( $local['states'] ) ? $local['states'] : array();
 		$mobo_countries = isset( $mobo['countries'] ) && is_array( $mobo['countries'] ) ? $mobo['countries'] : array();
 		$mobo_states    = isset( $mobo['states'] ) && is_array( $mobo['states'] ) ? $mobo['states'] : array();
-		$mobo_cities    = isset( $mobo['cities'] ) && is_array( $mobo['cities'] ) ? $mobo['cities'] : array();
 
 		$manual_countries = isset( $manual['countries'] ) && is_array( $manual['countries'] ) ? $manual['countries'] : array();
 		$manual_states    = isset( $manual['states'] ) && is_array( $manual['states'] ) ? $manual['states'] : array();
-		$manual_cities    = isset( $manual['cities'] ) && is_array( $manual['cities'] ) ? $manual['cities'] : array();
+		$city_status      = class_exists( 'Mobo_Core_City_Assets' ) ? ( new Mobo_Core_City_Assets() )->get_status() : array();
+
 		$show_all_countries = Mobo_Core_Settings::enabled( 'mobo_core_address_mapping_show_all_countries', '0' );
 		$country_scope_is_limited = false;
 		foreach ( $countries as $country_row ) {
@@ -2628,39 +2649,21 @@ type:{mobo_order_type_label}</textarea>
 			}
 		}
 
-		$mobo_city_lookup = array();
-		$cities_by_state  = array();
-		foreach ( $mobo_cities as $city ) {
-			$id = isset( $city['id'] ) ? absint( $city['id'] ) : 0;
-			$state_id = isset( $city['stateId'] ) ? absint( $city['stateId'] ) : 0;
-			$name = isset( $city['name'] ) ? sanitize_text_field( (string) $city['name'] ) : '';
-			if ( $id <= 0 || $state_id <= 0 || '' === $name ) {
-				continue;
-			}
-			$mobo_city_lookup[ $id ] = $name;
-			if ( ! isset( $cities_by_state[ $state_id ] ) ) {
-				$cities_by_state[ $state_id ] = array();
-			}
-			$cities_by_state[ $state_id ][] = array( 'id' => $id, 'name' => $name );
-		}
-
 		$js_payload = array(
 			'countries' => $mobo_countries,
 			'states'    => $mobo_states,
-			'citiesByState' => $cities_by_state,
 		);
 		?>
 		<div class="mobo-address-manual-map" data-mobo-address-map-root>
 			<div class="mobo-card" style="background:#f8fafc;margin-top:16px;">
 				<div class="mobo-card-head">
-					<h3>نگاشت دستی آدرس WooCommerce به موبو</h3>
-					<p>داده خام موبو از MoboCore دریافت می‌شود، اما نگاشت نهایی باید توسط مدیر تایید شود. دکمه پیشنهاد خودکار فقط فیلدهای مشابه را در UI انتخاب می‌کند؛ تا زمانی که تنظیمات را ذخیره نکنید اعمال نمی‌شود.</p>
+					<h3>اتصال کشور و استان WooCommerce به موبو</h3>
+					<p>فقط کشور و استان نیاز به نگاشت دارند. شهرها مستقیما از داده موبو دریافت می‌شوند و شناسه واقعی شهر موبو داخل فیلد Checkout ذخیره می‌شود.</p>
 				</div>
 
 				<p>
-					<button type="button" class="button button-secondary" data-mobo-address-auto-map>پیشنهاد خودکار نگاشت</button>
+					<button type="button" class="button button-secondary" data-mobo-address-auto-map>پیشنهاد خودکار کشور و استان</button>
 				</p>
-
 				<div class="mobo-address-map-result" data-mobo-address-map-result style="display:none;"></div>
 
 				<label class="mobo-inline-check" style="display:flex;align-items:center;gap:8px;margin:12px 0;">
@@ -2670,18 +2673,18 @@ type:{mobo_order_type_label}</textarea>
 
 				<?php if ( $country_scope_is_limited ) : ?>
 					<div class="mobo-alert mobo-alert-warning">
-						در ووکامرس ارسال به همه کشورها فعال است. برای ساده تر شدن کار، فعلا فقط کشور اصلی فروشگاه/ایران نمایش داده می شود. اگر واقعا به کشورهای دیگر سفارش می فرستید، گزینه «نمایش همه کشورها برای نگاشت» را روشن و ذخیره کنید.
+						در WooCommerce ارسال به همه کشورها فعال است. برای ساده شدن تنظیمات، فعلا فقط کشور اصلی فروشگاه و ایران نمایش داده می‌شود.
 					</div>
 				<?php endif; ?>
 
 				<div class="mobo-note">
-					برای خرید اتوماتیک، checkout می‌تواند همچنان توسط WooCommerce یا ووکامرس فارسی کنترل شود. پلاگین در زمان ساخت سفارش، کشور/استان/شهر انتخاب شده را فقط از همین نگاشت دستی به شناسه‌های موبو تبدیل می‌کند.
+					فایل‌های <code>iran_cities.js</code> و <code>iran_cities.min.js</code> از فهرست کشور، استان و شهر موبو ساخته می‌شوند. Mobo Core با فیلتر <code>persian_woo_iran_cities</code> و جایگزینی handle <code>pw-iran-cities</code> این فایل را به جای فایل شهرهای ووکامرس فارسی بارگذاری می‌کند.
 				</div>
 
 				<h4>کشورها</h4>
 				<div style="max-height:280px;overflow:auto;border:1px solid #e5e7eb;background:#fff;border-radius:10px;">
 					<table class="widefat striped" style="margin:0;">
-						<thead><tr><th>کشور WooCommerce</th><th>شناسه کشور موبو</th></tr></thead>
+						<thead><tr><th>کشور WooCommerce</th><th>کشور موبو</th></tr></thead>
 						<tbody>
 						<?php if ( empty( $countries ) ) : ?>
 							<tr><td colspan="2">کشوری از WooCommerce قابل تشخیص نیست.</td></tr>
@@ -2700,7 +2703,7 @@ type:{mobo_order_type_label}</textarea>
 											<?php foreach ( $mobo_countries as $mobo_country ) : ?>
 												<?php $id = isset( $mobo_country['id'] ) ? absint( $mobo_country['id'] ) : 0; ?>
 												<?php if ( $id <= 0 ) { continue; } ?>
-												<option value="<?php echo esc_attr( $id ); ?>" <?php selected( $selected, $id ); ?> data-iso="<?php echo esc_attr( isset( $mobo_country['isoCode'] ) ? strtoupper( sanitize_text_field( (string) $mobo_country['isoCode'] ) ) : '' ); ?>"><?php echo esc_html( isset( $mobo_country['name'] ) ? $mobo_country['name'] : ( '#' . $id ) ); ?><?php echo ! empty( $mobo_country['isoCode'] ) ? ' — ' . esc_html( strtoupper( sanitize_text_field( (string) $mobo_country['isoCode'] ) ) ) : ''; ?> — <?php echo esc_html( $id ); ?></option>
+												<option value="<?php echo esc_attr( $id ); ?>" <?php selected( $selected, $id ); ?> data-iso="<?php echo esc_attr( isset( $mobo_country['isoCode'] ) ? strtoupper( sanitize_text_field( (string) $mobo_country['isoCode'] ) ) : '' ); ?>"><?php echo esc_html( isset( $mobo_country['name'] ) ? $mobo_country['name'] : ( '#' . $id ) ); ?> — <?php echo esc_html( $id ); ?></option>
 											<?php endforeach; ?>
 										</select>
 									</td>
@@ -2712,9 +2715,9 @@ type:{mobo_order_type_label}</textarea>
 				</div>
 
 				<h4 style="margin-top:18px;">استان‌ها</h4>
-				<div style="max-height:360px;overflow:auto;border:1px solid #e5e7eb;background:#fff;border-radius:10px;">
+				<div style="max-height:420px;overflow:auto;border:1px solid #e5e7eb;background:#fff;border-radius:10px;">
 					<table class="widefat striped" style="margin:0;">
-						<thead><tr><th>استان WooCommerce</th><th>شناسه استان موبو</th></tr></thead>
+						<thead><tr><th>استان WooCommerce</th><th>استان موبو</th></tr></thead>
 						<tbody>
 						<?php if ( empty( $states ) ) : ?>
 							<tr><td colspan="2">استانی از WooCommerce قابل تشخیص نیست.</td></tr>
@@ -2746,47 +2749,24 @@ type:{mobo_order_type_label}</textarea>
 					</table>
 				</div>
 
-				<h4 style="margin-top:18px;">شهرها</h4>
-				<?php if ( empty( $cities ) ) : ?>
-					<div class="mobo-alert mobo-alert-warning">لیست شهرهای محلی از WooCommerce/ووکامرس فارسی قابل تشخیص نیست. اگر ووکامرس فارسی شهرها را dropdown می‌کند اما این جدول خالی است، باید منبع شهرهای آن افزونه را به فیلتر <code>mobo_core_local_city_candidates</code> وصل کنیم.</div>
+				<h4 style="margin-top:18px;">فایل شهرهای موبو برای Checkout</h4>
+				<?php if ( ! empty( $city_status['ready'] ) ) : ?>
+					<div class="mobo-alert mobo-alert-success">
+						فایل شهرها آماده است: <?php echo esc_html( isset( $city_status['cities'] ) ? absint( $city_status['cities'] ) : 0 ); ?> شهر در <?php echo esc_html( isset( $city_status['states'] ) ? absint( $city_status['states'] ) : 0 ); ?> استان. مقدار هر گزینه شهر، شناسه واقعی شهر موبو است.
+					</div>
 				<?php else : ?>
-					<div style="max-height:520px;overflow:auto;border:1px solid #e5e7eb;background:#fff;border-radius:10px;">
-						<table class="widefat striped" style="margin:0;">
-							<thead><tr><th>شهر محلی</th><th>شناسه شهر موبو</th></tr></thead>
-							<tbody>
-							<?php foreach ( $cities as $city ) : ?>
-								<?php
-								$country = isset( $city['country'] ) ? strtoupper( sanitize_text_field( (string) $city['country'] ) ) : 'IR';
-								$state = isset( $city['state'] ) ? sanitize_text_field( (string) $city['state'] ) : '';
-								$name = isset( $city['name'] ) ? sanitize_text_field( (string) $city['name'] ) : '';
-								$row_key = md5( $country . '|' . $state . '|' . $name );
-								$manual_key = $country . '|' . $state . '|' . $this->normalize_admin_persian_label( $name );
-								$selected = 0;
-								if ( isset( $manual_cities[ $manual_key ] ) ) {
-									$entry = $manual_cities[ $manual_key ];
-									$selected = is_array( $entry ) && isset( $entry['id'] ) ? absint( $entry['id'] ) : absint( $entry );
-								}
-								$selected_label = $selected > 0 && isset( $mobo_city_lookup[ $selected ] ) ? $mobo_city_lookup[ $selected ] : '';
-								?>
-								<tr>
-									<td><strong><?php echo esc_html( $name ); ?></strong> <code dir="ltr"><?php echo esc_html( $country . ':' . $state ); ?></code></td>
-									<td>
-										<input type="hidden" name="mobo_address_map_city_country[<?php echo esc_attr( $row_key ); ?>]" value="<?php echo esc_attr( $country ); ?>">
-										<input type="hidden" name="mobo_address_map_city_state[<?php echo esc_attr( $row_key ); ?>]" value="<?php echo esc_attr( $state ); ?>">
-										<input type="hidden" name="mobo_address_map_city_name[<?php echo esc_attr( $row_key ); ?>]" value="<?php echo esc_attr( $name ); ?>">
-										<select name="mobo_address_map_city_id[<?php echo esc_attr( $row_key ); ?>]" class="mobo-address-map-city mobo-address-select2" data-placeholder="جستجو و انتخاب شهر موبو" data-local-label="<?php echo esc_attr( $name ); ?>" data-state-key="<?php echo esc_attr( $country . '|' . $state ); ?>" data-current="<?php echo esc_attr( $selected ); ?>">
-											<option value="">— انتخاب نشده —</option>
-											<?php if ( $selected > 0 ) : ?>
-												<option value="<?php echo esc_attr( $selected ); ?>" selected><?php echo esc_html( '' !== $selected_label ? $selected_label : ( '#' . $selected ) ); ?> — <?php echo esc_html( $selected ); ?></option>
-											<?php endif; ?>
-										</select>
-									</td>
-								</tr>
-							<?php endforeach; ?>
-							</tbody>
-						</table>
+					<div class="mobo-alert mobo-alert-warning">
+						فایل شهرهای موبو هنوز آماده نیست. ابتدا داده آدرس موبو را بروزرسانی کنید و نگاشت استان‌ها را ذخیره کنید. <?php echo ! empty( $city_status['lastError'] ) ? esc_html( $city_status['lastError'] ) : ''; ?>
 					</div>
 				<?php endif; ?>
+				<table class="widefat striped" style="margin-top:10px;">
+					<tbody>
+						<tr><th style="width:220px;">نسخه توسعه</th><td><code dir="ltr"><?php echo esc_html( isset( $city_status['jsPath'] ) ? (string) $city_status['jsPath'] : '—' ); ?></code></td></tr>
+						<tr><th>نسخه Minified</th><td><code dir="ltr"><?php echo esc_html( isset( $city_status['minPath'] ) ? (string) $city_status['minPath'] : '—' ); ?></code></td></tr>
+						<tr><th>آخرین تولید</th><td><?php echo ! empty( $city_status['generatedAt'] ) ? esc_html( wp_date( 'Y-m-d H:i:s', absint( $city_status['generatedAt'] ) ) ) : '—'; ?></td></tr>
+						<tr><th>استان‌های بدون اتصال</th><td><?php echo isset( $city_status['unmappedStates'] ) && is_array( $city_status['unmappedStates'] ) ? esc_html( count( $city_status['unmappedStates'] ) ) : '—'; ?></td></tr>
+					</tbody>
+				</table>
 			</div>
 			<script>
 			(function(){
@@ -2797,189 +2777,52 @@ type:{mobo_order_type_label}</textarea>
 				var resultBox = root.querySelector('[data-mobo-address-map-result]');
 
 				function norm(value) {
-					return String(value || '')
-						.toLowerCase()
-						.replace(/[\u064b-\u065f\u0670]/g, '')
-						.replace(/ي/g, 'ی')
-						.replace(/ك/g, 'ک')
-						.replace(/ة|ۀ/g, 'ه')
-						.replace(/ـ/g, '')
-						.replace(/[،,]/g, ' ')
-						.replace(/\s+/g, ' ')
-						.trim();
+					return String(value || '').toLowerCase().replace(/[\u064b-\u065f\u0670]/g, '').replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/ة|ۀ/g, 'ه').replace(/ـ/g, '').replace(/^(استان|شهر|شهرستان)\s+/g, '').replace(/\s+(استان|شهر|شهرستان)$/g, '').replace(/\s+/g, ' ').trim();
 				}
-				function cleanAdministrativeWords(value) {
-					return norm(value).replace(/^(استان|شهر|شهرستان)\s+/g, '').replace(/\s+(استان|شهر|شهرستان)$/g, '').trim();
-				}
-				function variants(value) {
-					var raw = String(value || '');
-					var items = [norm(raw), cleanAdministrativeWords(raw)];
-					var match;
-					var re = /\(([^)]+)\)|\uFF08([^\uFF09]+)\uFF09/g;
-					while ((match = re.exec(raw)) !== null) {
-						items.push(norm(match[1] || match[2] || ''));
-						items.push(cleanAdministrativeWords(match[1] || match[2] || ''));
-					}
-					items.push(norm(raw.replace(/\([^)]*\)/g, ' ')));
-					items.push(cleanAdministrativeWords(raw.replace(/\([^)]*\)/g, ' ')));
-					var out = [];
-					items.forEach(function(item){
-						if (item && out.indexOf(item) === -1) out.push(item);
+				function uniqueMatch(rows, label, parentKey, parentValue) {
+					var target = norm(label);
+					var found = (rows || []).filter(function(row){
+						if (!row || norm(row.name || '') !== target) return false;
+						return !parentKey || String(row[parentKey] || '') === String(parentValue || '');
 					});
-					return out;
+					return found.length === 1 ? found[0] : null;
 				}
-				function uniqueById(rows) {
-					var seen = {};
-					return (rows || []).filter(function(row){
-						var id = String(row && row.id || '');
-						if (!id || seen[id]) return false;
-						seen[id] = true;
-						return true;
-					});
+				function setValue(select, value) {
+					if (!select || !value) return false;
+					var exists = Array.prototype.some.call(select.options || [], function(option){ return String(option.value) === String(value); });
+					if (!exists) return false;
+					select.value = String(value);
+					if (window.jQuery) window.jQuery(select).trigger('change.select2');
+					return true;
 				}
-				function rowIso(row) {
-					return String((row && (row.isoCode || row.iso_code || row.iso || row.code || row.countryCode || row.country_code)) || '').toUpperCase().trim();
-				}
-				function matchRows(rows, label, parentKey, parentValue) {
-					var names = variants(label);
-					var pool = (rows || []).filter(function(row){
-						if (!row) return false;
-						if (parentKey && String(row[parentKey] || '') !== String(parentValue || '')) return false;
-						return true;
-					});
-					for (var i = 0; i < names.length; i++) {
-						var matched = uniqueById(pool.filter(function(row){ return variants(row.name || '').indexOf(names[i]) !== -1; }));
-						if (matched.length === 1) return {status:'matched', row: matched[0]};
-						if (matched.length > 1) return {status:'ambiguous'};
-					}
-					return {status:'missing'};
-				}
-				function matchCountry(select) {
-					var code = String(select.getAttribute('data-country-code') || '').toUpperCase();
-					var isoMatches = uniqueById((data.countries || []).filter(function(row){ return rowIso(row) === code; }));
-					if (isoMatches.length === 1) return {status:'matched', row: isoMatches[0]};
-					if (isoMatches.length > 1) return {status:'ambiguous'};
-					return matchRows(data.countries || [], select.getAttribute('data-local-label') || '');
-				}
-				function selectSet(select, value) {
-					if (!select) return false;
-					value = String(value || '0');
-					select.value = value;
-					select.setAttribute('data-current', value);
-					if (window.jQuery) window.jQuery(select).trigger('change');
-					return value !== '0' && value !== '';
-				}
-				function setRowState(select, state) {
-					var row = select ? select.closest('tr') : null;
-					if (!row) return;
-					row.classList.remove('mobo-map-row-matched', 'mobo-map-row-missing', 'mobo-map-row-ambiguous');
-					if (state) row.classList.add('mobo-map-row-' + state);
-				}
-				function findSelectByData(className, attr, value) {
-					var found = null;
-					root.querySelectorAll('.' + className).forEach(function(select){
-						if (found) return;
-						if (String(select.getAttribute(attr) || '') === String(value || '')) found = select;
-					});
-					return found;
-				}
-				function getCountryMoboId(code) {
-					var select = findSelectByData('mobo-address-map-country', 'data-country-code', code);
-					return select ? select.value : '';
-				}
-				function getStateMoboId(stateKey) {
-					var select = findSelectByData('mobo-address-map-state', 'data-state-key', stateKey);
-					return select ? select.value : '';
-				}
-				function rebuildCitySelect(select) {
-					if (!select) return;
-					var stateId = getStateMoboId(select.getAttribute('data-state-key') || '');
-					var current = select.value && select.value !== '0' ? select.value : (select.getAttribute('data-current') || '0');
-					var currentText = '';
-					if (select.selectedIndex >= 0 && select.options[select.selectedIndex]) {
-						currentText = select.options[select.selectedIndex].textContent || '';
-					}
-					var rows = stateId ? (data.citiesByState[String(stateId)] || []) : [];
-					var hadCurrent = false;
-					if (window.jQuery) {
-						var $select = window.jQuery(select);
-						try {
-							if ($select.data('selectWoo')) { $select.selectWoo('destroy'); }
-							else if ($select.data('select2')) { $select.select2('destroy'); }
-						} catch(e) {}
-					}
-					select.innerHTML = '<option value="">— انتخاب نشده —</option>';
-					rows.forEach(function(row){
-						var option = document.createElement('option');
-						option.value = String(row.id || 0);
-						option.textContent = String(row.name || ('#' + row.id)) + ' — ' + String(row.id || '');
-						if (String(row.id || '') === String(current || '')) { option.selected = true; hadCurrent = true; }
-						select.appendChild(option);
-					});
-					if (current && current !== '0' && !hadCurrent) {
-						var preserved = document.createElement('option');
-						preserved.value = String(current);
-						preserved.textContent = currentText || ('#' + current);
-						preserved.selected = true;
-						select.appendChild(preserved);
-					}
-					select.setAttribute('data-current', current || '0');
-					if (window.jQuery) {
-						window.jQuery(select).trigger('change');
-						if (window.MoboCoreInitSelect2) window.MoboCoreInitSelect2(select.parentNode || root);
-					}
-				}
-
-				function rebuildCitiesForState(stateKey) {
-					root.querySelectorAll('.mobo-address-map-city').forEach(function(select){
-						if (String(select.getAttribute('data-state-key') || '') === String(stateKey || '')) rebuildCitySelect(select);
-					});
-				}
-				function showResult(message, type) {
+				function show(message, type) {
 					if (!resultBox) return;
 					resultBox.style.display = 'block';
-					resultBox.className = 'mobo-address-map-result mobo-alert ' + (type === 'warning' ? 'mobo-alert-warning' : 'mobo-alert-success');
+					resultBox.className = 'mobo-address-map-result mobo-alert ' + (type === 'success' ? 'mobo-alert-success' : 'mobo-alert-warning');
 					resultBox.textContent = message;
 				}
-
-				root.querySelectorAll('.mobo-address-map-state').forEach(function(select){
-					select.addEventListener('change', function(){ rebuildCitiesForState(select.getAttribute('data-state-key') || ''); });
-				});
-				root.querySelectorAll('.mobo-address-map-city').forEach(rebuildCitySelect);
-
 				var button = root.querySelector('[data-mobo-address-auto-map]');
-				if (button) {
-					button.addEventListener('click', function(){
-						var matched = {countries:0, states:0, cities:0};
-						var ambiguous = 0;
-						var missing = 0;
-						root.querySelectorAll('.mobo-address-map-country').forEach(function(select){
-							if (select.value && select.value !== '0') return;
-							var result = matchCountry(select);
-							if (result.status === 'matched' && selectSet(select, result.row.id)) { matched.countries++; setRowState(select, 'matched'); }
-							else { result.status === 'ambiguous' ? ambiguous++ : missing++; setRowState(select, result.status === 'ambiguous' ? 'ambiguous' : 'missing'); }
-						});
-						root.querySelectorAll('.mobo-address-map-state').forEach(function(select){
-							if (select.value && select.value !== '0') return;
-							var countryId = getCountryMoboId(select.getAttribute('data-country-code') || 'IR');
-							var result = countryId ? matchRows(data.states || [], select.getAttribute('data-local-label') || '', 'countryId', countryId) : {status:'missing'};
-							if (result.status === 'matched' && selectSet(select, result.row.id)) { matched.states++; setRowState(select, 'matched'); rebuildCitiesForState(select.getAttribute('data-state-key') || ''); }
-							else { result.status === 'ambiguous' ? ambiguous++ : missing++; setRowState(select, result.status === 'ambiguous' ? 'ambiguous' : 'missing'); }
-						});
-						root.querySelectorAll('.mobo-address-map-city').forEach(function(select){
-							if (select.value && select.value !== '0') return;
-							var stateId = getStateMoboId(select.getAttribute('data-state-key') || '');
-							var rows = stateId ? (data.citiesByState[String(stateId)] || []) : [];
-							var result = matchRows(rows, select.getAttribute('data-local-label') || '');
-							if (result.status === 'matched' && selectSet(select, result.row.id)) { matched.cities++; setRowState(select, 'matched'); }
-							else { result.status === 'ambiguous' ? ambiguous++ : missing++; setRowState(select, result.status === 'ambiguous' ? 'ambiguous' : 'missing'); }
-						});
-						showResult('پیشنهاد خودکار انجام شد. کشور: ' + matched.countries + '، استان: ' + matched.states + '، شهر: ' + matched.cities + '. موارد مبهم: ' + ambiguous + '، بدون پیشنهاد: ' + missing + '. قبل از ذخیره، انتخاب ها را بررسی کنید.', ambiguous || missing ? 'warning' : 'success');
+				if (button) button.addEventListener('click', function(){
+					var countries = 0, states = 0, missing = 0;
+					root.querySelectorAll('.mobo-address-map-country').forEach(function(select){
+						if (select.value) return;
+						var code = String(select.getAttribute('data-country-code') || '').toUpperCase();
+						var row = (data.countries || []).filter(function(item){ return String(item.isoCode || '').toUpperCase() === code; });
+						var match = row.length === 1 ? row[0] : uniqueMatch(data.countries || [], select.getAttribute('data-local-label') || '');
+						if (match && setValue(select, match.id)) countries++; else missing++;
 					});
-				}
+					root.querySelectorAll('.mobo-address-map-state').forEach(function(select){
+						if (select.value) return;
+						var countryCode = String(select.getAttribute('data-country-code') || '').toUpperCase();
+						var countrySelect = root.querySelector('.mobo-address-map-country[data-country-code="' + countryCode + '"]');
+						var countryId = countrySelect ? countrySelect.value : '';
+						var match = uniqueMatch(data.states || [], select.getAttribute('data-local-label') || '', 'countryId', countryId);
+						if (match && setValue(select, match.id)) states++; else missing++;
+					});
+					show('پیشنهاد انجام شد. کشور: ' + countries + '، استان: ' + states + '، بدون پیشنهاد: ' + missing + '. تنظیمات را ذخیره کنید تا فایل شهرها دوباره ساخته شود.', missing ? 'warning' : 'success');
+				});
 			})();
 			</script>
-
 		</div>
 		<?php
 	}
@@ -3323,9 +3166,30 @@ type:{mobo_order_type_label}</textarea>
 	 * @return true|WP_Error
 	 */
 	private function validate_mobo_order_submission_required_config() {
+		if ( ! class_exists( 'Mobo_Core_Dependencies' ) || ! Mobo_Core_Dependencies::is_persian_woocommerce_active() ) {
+			return new WP_Error(
+				'mobo_required_persian_woocommerce_missing',
+				'برای ثبت سفارش خودکار در موبو، افزونه «ووکامرس فارسی» باید نصب و فعال باشد.'
+			);
+		}
+
 		$mapped_states = $this->get_mobo_shipping_mapped_states_for_admin();
+		if ( ! class_exists( 'Mobo_Core_Address_Mapping' ) ) {
+			return new WP_Error( 'mobo_required_address_mapping_module_missing', 'ماژول نگاشت آدرس موبو در دسترس نیست.' );
+		}
+
+		$address_mapping = new Mobo_Core_Address_Mapping();
+		$manual_mapping  = method_exists( $address_mapping, 'get_manual_mapping' ) ? $address_mapping->get_manual_mapping() : array();
+		$manual_countries = isset( $manual_mapping['countries'] ) && is_array( $manual_mapping['countries'] ) ? $manual_mapping['countries'] : array();
+
+		if ( empty( $manual_countries ) ) {
+			return new WP_Error( 'mobo_required_country_mapping_missing', 'برای ثبت سفارش خودکار در موبو، نگاشت کشور اجباری است. بخش «اتصال کشور و استان WooCommerce به موبو» را تکمیل و ذخیره کنید.' );
+		}
 		if ( empty( $mapped_states ) ) {
-			return new WP_Error( 'mobo_required_state_mapping_missing', 'برای ثبت سفارش خودکار در موبو، نگاشت استان اجباری است. اول بخش «نگاشت دستی آدرس WooCommerce به موبو» را کامل و ذخیره کنید.' );
+			return new WP_Error( 'mobo_required_state_mapping_missing', 'برای ثبت سفارش خودکار در موبو، نگاشت استان اجباری است. بخش «اتصال کشور و استان WooCommerce به موبو» را تکمیل و ذخیره کنید.' );
+		}
+		if ( ! class_exists( 'Mobo_Core_City_Assets' ) || ! ( new Mobo_Core_City_Assets() )->is_ready() ) {
+			return new WP_Error( 'mobo_required_city_assets_missing', 'فایل شهرهای موبو برای Checkout آماده نیست. داده آدرس را از MoboCore بروزرسانی کنید و پس از ذخیره نگاشت استان‌ها دوباره تلاش کنید.' );
 		}
 
 		if ( ! class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
@@ -4592,8 +4456,11 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
-			/* Address mapping is mandatory for automatic Mobo order submission. */
+			/* Address mapping and Persian WooCommerce city/state options are mandatory. */
 			update_option( 'mobo_core_address_mapping_enabled', '1', false );
+			if ( class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
+				Mobo_Core_Persian_Woo_Options::ensure_required_options( 'checkout-settings-save', true );
+			}
 		}
 	}
 
@@ -4876,7 +4743,7 @@ type:{mobo_order_type_label}</textarea>
 					$this->redirect_with_message( 'بروزرسانی آدرس‌ها ناموفق بود: ' . $message, 'error', 'checkout' );
 				}
 
-				$this->redirect_with_message( 'کشور، استان و شهرها از MoboCore بروزرسانی شدند.', 'success', 'checkout' );
+				$this->redirect_with_message( 'کشور، استان و شهرها از MoboCore بروزرسانی و فایل‌های شهر Checkout ساخته شدند.', 'success', 'checkout' );
 				break;
 
 			case 'mobo_core_tool_sync_remote_shipping_methods':
@@ -4953,6 +4820,21 @@ type:{mobo_order_type_label}</textarea>
 			$tab = 'dashboard';
 		}
 
+		if ( 'queue' === $tab && class_exists( 'Mobo_Core_Sync_Settings_Guard' ) ) {
+			$queue_settings_lock = Mobo_Core_Sync_Settings_Guard::get_lock_state();
+			if ( ! empty( $queue_settings_lock['locked'] ) ) {
+				$operation_label = isset( $queue_settings_lock['operationLabel'] )
+					? sanitize_text_field( (string) $queue_settings_lock['operationLabel'] )
+					: 'همگام سازی محصولات';
+
+				$this->redirect_with_message(
+					'تنظیمات صف و پردازش در زمان اجرای ' . $operation_label . ' قفل است و هیچ تغییری ذخیره نشد. پس از پایان عملیات دوباره تلاش کنید.',
+					'warning',
+					'queue'
+				);
+			}
+		}
+
 		$was_order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
 
 		$this->save_current_tab_settings( $tab );
@@ -4992,7 +4874,7 @@ type:{mobo_order_type_label}</textarea>
 				$this->redirect_with_message( 'بروزرسانی آدرس‌ها ناموفق بود: ' . $message, 'error', 'checkout' );
 			}
 
-			$this->redirect_with_message( 'کشور، استان و شهرها از MoboCore بروزرسانی شدند.', 'success', 'checkout' );
+			$this->redirect_with_message( 'کشور، استان و شهرها از MoboCore بروزرسانی و فایل‌های شهر Checkout ساخته شدند.', 'success', 'checkout' );
 		}
 
 		if ( isset( $_POST['mobo_core_sync_remote_shipping_methods'] ) && 'checkout' === $tab ) {
@@ -8023,6 +7905,28 @@ type:{mobo_order_type_label}</textarea>
 					display: none;
 				}
 			}
+
+			.mobo-queue-settings-fieldset {
+				border: 0;
+				margin: 0;
+				padding: 0;
+				min-width: 0;
+			}
+
+			.mobo-queue-settings-fieldset[disabled] {
+				opacity: .62;
+			}
+
+			.mobo-queue-settings-fieldset[disabled] .mobo-card,
+			.mobo-queue-settings-fieldset[disabled] .mobo-guide-box {
+				box-shadow: none;
+			}
+
+			.mobo-queue-settings-lock-message {
+				margin-bottom: 18px;
+				line-height: 1.9;
+			}
+
 		</style>
 		<?php
 	}

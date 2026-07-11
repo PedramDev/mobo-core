@@ -4,9 +4,10 @@ Tags: woocommerce, iran, product sync, mobomobo, order automation
 Requires at least: 5.8
 Tested up to: 7.0
 Requires PHP: 7.4
+Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.47
+Stable tag: 10.31.58
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -17,6 +18,8 @@ Connect WooCommerce to MoboCore for product sync, webhook queues, shipping mappi
 Mobo Core is a WooCommerce integration plugin built for stores operating in Iran and using the specific `mobomobo.ir` workflow as their Mobo/Mobomobo product and order source. This plugin is not presented as the official plugin of mobomobo.ir unless such authorization is explicitly stated by the service owner.
 
 The plugin connects WooCommerce to the MoboCore service for product synchronization, webhook processing, shipping method mapping, checkout validation, automatic order submission, and operational health checks.
+
+Required plugins: WooCommerce and Persian WooCommerce (`persian-woocommerce`). Mobo Core cannot be activated or bootstrapped without both dependencies.
 
 Main features:
 
@@ -85,17 +88,22 @@ http://mobo.codeya.ir/privacy
 == Installation ==
 
 1. Upload the `mobo-core` folder to `/wp-content/plugins/`, or install the plugin through the WordPress plugins screen.
-2. Activate the plugin through the Plugins screen in WordPress.
-3. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
-4. Go to **Mobo > اتصال** and enter the Token and Webhook Security Code from MoboCore.
-5. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
-6. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
+2. Install and activate both WooCommerce and Persian WooCommerce (`persian-woocommerce`).
+3. Activate Mobo Core through the Plugins screen in WordPress.
+4. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
+5. Go to **Mobo > اتصال** and enter the Token and Webhook Security Code from MoboCore.
+6. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
+7. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
 
 == Frequently Asked Questions ==
 
 = Is this plugin for all countries? =
 
 No. This plugin is intended for WooCommerce stores operating in Iran and using the specific `mobomobo.ir` source/workflow.
+
+= Why does Mobo Core refuse to activate? =
+
+Mobo Core requires both WooCommerce and Persian WooCommerce (`persian-woocommerce`). Install and activate both plugins first. On older WordPress versions, Mobo Core shows an activation error; on newer versions, WordPress enforces the `Requires Plugins` header.
 
 = Does this plugin work without MoboCore? =
 
@@ -126,6 +134,69 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 5. Queue, cron, and image refresh settings.
 
 == Changelog ==
+
+= 10.31.58 =
+* Locked the complete Queue and Processing settings tab while a manual product Sync or Repair run is active or waiting for MoboCore.
+* Prevented server-side saves even when the form was opened before the run started or a stale browser tab submits changes.
+* Protected direct `update_option()` writes for pagination, cursor, image, webhook retry, and missing-variant behavior settings during active runs.
+* Added a clear Persian warning explaining that changing page size or cursor strategy can move counters/indexes and cause skipped or duplicate processing.
+
+= 10.31.57 =
+* Enforced Persian WooCommerce `PW_Options[enable_iran_cities]` and `PW_Options[flip_state_city]` whenever automatic Mobo order submission is enabled.
+* Prevented administrators or other plugins from saving either required option as disabled while automatic submission is active.
+* Restored the complete `PW_Options` array if it is deleted and added a clear WordPress admin notice after manual disable attempts.
+* Added mandatory checks during plugin bootstrap, checkout-settings save, checkout validation, automatic order submission, and real cron execution.
+* Added a throttled 15-minute cron verification while keeping checkout and order-submission checks unthrottled.
+
+= 10.31.56 =
+* Moved generated checkout city JavaScript from the private `wp-content/uploads/mobo-core/` tree to the public sibling path `wp-content/uploads/mobo-core-public/assets/`.
+* Kept `wp-content/uploads/mobo-core/` and all webhook fallback JSON files protected by the existing deny-all rule.
+* Added a dedicated public-assets `.htaccess` that disables directory listing and executable script extensions without blocking JavaScript delivery.
+* Increased the generated city asset schema to version 3 so existing installations automatically regenerate the files at the new public URL.
+* Removed stale `iran_cities.js` and `iran_cities.min.js` files from the old private path during migration.
+
+= 10.31.54 =
+* Removed manual city-to-city mapping from the automatic-order workflow.
+* Added generation of `iran_cities.js` and `iran_cities.min.js` from the authoritative Mobo country/state/city cache.
+* Replaced Persian WooCommerce's `pw-iran-cities` asset on checkout and Edit Address pages when the generated Mobo asset is valid.
+* Stored the real Mobo `city_id` as the WooCommerce city field value and validated that the selected city belongs to the resolved Mobo state.
+* Retained manual country/state mapping and added automatic province-name matching plus old/new province aliases.
+* Added a safe fallback to the original Persian WooCommerce city script when generated files are unavailable, while blocking automatic submission with a precise error.
+* Added legacy resolution for old Persian WooCommerce numeric city codes and fixed plural lookup of the `cities` mapping bucket.
+
+= 10.31.53 =
+* Bundled an independent Iranian city dataset generated from `iran_cities.js` with 31 provinces and more than 2,700 city records.
+* Removed the runtime dependency on Persian WooCommerce city tables, options, globals, and frontend JavaScript for address mapping.
+* Added old/new Persian WooCommerce province-code alias resolution such as `TE` to `THR`.
+* Changed the city-mapping UI to load and save one province at a time, preventing `max_input_vars` truncation.
+* Preserved mappings for all other provinces when saving the currently selected province.
+* Kept Persian WooCommerce city providers as compatibility fallbacks and retained the public city-candidate filter.
+
+= 10.31.52 =
+* Read Persian WooCommerce city candidates from its actual city provider and `Woo_Iran_Cities_By_HANNANStd` table.
+* Populated the manual city-mapping table when Persian WooCommerce city dropdowns are active.
+* Added canonical fallback matching for existing city mappings saved with province labels or legacy state keys.
+* Avoided loading the complete city list during normal order resolution when WooCommerce already stores the visible city name.
+
+= 10.31.51 =
+* Fixed simple-product synchronization by resolving the single purchasable Mobo Variant and storing portal_variant_id on WC_Product_Simple.
+* Preserved simple product type for one no-attribute UpdateVariant payload instead of converting the product to variable.
+* Marked simple products unavailable and sync-incomplete when their Mobo Variant is missing or ambiguous.
+* Made authenticated Mobo cart addability validation mandatory before checkout whenever automatic order submission is enabled.
+* Validated POST /cart response semantics, refreshed the authoritative cart with update=true, and enforced remote min/max quantities.
+
+= 10.31.50 =
+* Added hard plugin dependencies for WooCommerce and Persian WooCommerce through the WordPress `Requires Plugins` header.
+* Added an activation guard for WordPress versions that do not enforce plugin dependencies.
+* Added a persistent administrator error when a required dependency is removed or inactive.
+* Prevented Mobo Core bootstrap and automatic order workflows while Persian WooCommerce is unavailable.
+
+= 10.31.49 =
+* Fixed automatic Mobo order submission when WooCommerce had only partial shipping fields and a complete billing address.
+* Added Checkout Block / Store API address-mapping persistence hooks.
+* Added address preflight validation before login, remote cart clearing, and cart item insertion.
+* Improved country/state/city alias resolution, including numeric local city values from Persian WooCommerce city sources.
+* Added precise missing-address diagnostics and required country/state/city mapping checks before enabling automatic submission.
 
 = 10.31.47 =
 * Removed the final dynamic placeholder patterns reported by Plugin Check.
@@ -162,6 +233,30 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 * Updated plugin metadata, license headers, and GitHub URL.
 
 == Upgrade Notice ==
+
+= 10.31.58 =
+Queue and processing settings cannot be changed while Sync or Repair is active. Finish or cancel the run, reload the Queue tab, and then save new values.
+
+= 10.31.57 =
+When automatic Mobo order submission is enabled, Persian WooCommerce city support and state/city field order are now mandatory and are automatically kept enabled.
+
+= 10.31.56 =
+Generated city assets now use `wp-content/uploads/mobo-core-public/assets/`. Clear page, CDN, and optimization caches once if rendered checkout HTML still references the old denied `wp-content/uploads/mobo-core/assets/` URL.
+
+= 10.31.54 =
+Open Purchase Validation, refresh Mobo address data, verify country/state mapping, and save once. Mobo Core will generate both city scripts under `wp-content/uploads/mobo-core-public/assets/`; manual city mapping is no longer required.
+
+= 10.31.53 =
+Reload the purchase-validation settings page, select the required province, and save its city mappings. The bundled city source does not require Persian WooCommerce city Repair, and mappings for other provinces are preserved.
+
+= 10.31.51 =
+Run a product synchronization after upgrading so existing simple products receive their Mobo portal_variant_id. Automatic order submission now forces a real Mobo cart preflight during checkout.
+
+= 10.31.50 =
+Requires WooCommerce and Persian WooCommerce to be installed and active before Mobo Core can run.
+
+= 10.31.49 =
+Fixes checkout address mapping for classic and block checkout and prevents remote cart side effects when local address configuration is incomplete.
 
 = 10.31.47 =
 Final Plugin Check cleanup for queue counters, maintenance deletion, and variation input sanitization.

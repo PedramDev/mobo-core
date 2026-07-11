@@ -5,7 +5,7 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.48-1f6feb)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.58-1f6feb)
 ![Portal](https://img.shields.io/badge/Portal-v25%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
@@ -35,8 +35,9 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 - نگاشت GUIDهای راه دور به محصولات، تنوع ها و دسته بندی های ووکامرس
 - صف کنترل شده تصاویر، نوسازی WebP و پاک سازی امن فایل های قدیمی
 - قیمت گذاری، افزایش قیمت تنوع و اجرای Reprice به صورت batch
-- نگاشت آدرس کشور، استان و شهر و نگاشت روش ارسال ووکامرس به موبو
-- اعتبارسنجی سبد و ثبت خودکار سفارش موبو به صورت اختیاری
+- نگاشت کشور و استان به موبو، تولید خودکار فایل شهرهای موبو برای Checkout و نگاشت روش ارسال ووکامرس به موبو
+- نگاشت Variant قابل خرید موبو روی محصول ساده و جلوگیری از تبدیل اشتباه آن به محصول متغیر
+- اعتبارسنجی واقعی افزودن به سبد موبو؛ اجباری هنگام ثبت خودکار سفارش
 - پیامک بر اساس نوع سفارش از طریق افزونه «پیامک حرفه ای ووکامرس»
 - Real Cron، Self Runner، گزارش سلامت و ابزارهای عیب یابی
 - اعلام سازگاری با WooCommerce HPOS
@@ -48,26 +49,27 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
 | WooCommerce | `8.2+` |
+| ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.48` |
+| Mobo Core | `10.31.58` |
 | Portal سازگار | `v25 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
 ### نصب سریع
 
 1. پوشه `mobo-core` را در مسیر `/wp-content/plugins/` قرار دهید یا ZIP را از بخش افزونه های وردپرس نصب کنید.
-2. WooCommerce را فعال نگه دارید و سپس Mobo Core را فعال کنید.
+2. WooCommerce و افزونه «ووکامرس فارسی» با slug برابر `persian-woocommerce` را نصب و فعال کنید. سپس Mobo Core را فعال کنید.
 3. از مسیر **موبو > خرید و فعال سازی** وضعیت حساب و لایسنس را بررسی کنید.
 4. در **موبو > اتصال**، مقدار API Base URL، Token و Webhook Security Code را وارد کنید.
 5. در **موبو > کران واقعی**، Cron Token را تنظیم و Cron سرور را فعال کنید.
-6. قبل از فعال کردن ثبت خودکار سفارش، نگاشت آدرس و روش ارسال را کامل و تست کنید.
+6. قبل از فعال کردن ثبت خودکار سفارش، نگاشت کشور/استان را ذخیره کنید، فایل شهرهای موبو را بسازید و نگاشت روش ارسال را تست کنید.
 7. در سایت هایی که از نسخه های قدیمی مانند نسخه 7 ارتقا یافته اند، یک Repair کامل اجرا کنید.
 
 ### اتصال پایه
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.31.48:
+// مقدار فعلی پیش فرض افزونه در نسخه 10.31.58:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -135,7 +137,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 - Remote GUID mapping for WooCommerce products, variations, and categories
 - Bounded image queue, controlled WebP refresh, and safe orphan cleanup
 - Pricing rules, per-variation additional price, and batch repricing
-- Mobo country/state/city mapping and WooCommerce-to-Mobo shipping mapping
+- Mobo country/state mapping, generated Mobo city assets for checkout, and WooCommerce-to-Mobo shipping mapping
 - Optional cart validation and asynchronous Mobo order submission
 - Order-type SMS notifications through Persian WooCommerce SMS
 - Real cron, loopback self-runner, health reporting, and diagnostics
@@ -148,26 +150,27 @@ This repository contains the WordPress plugin. The current compatible backend is
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
 | WooCommerce | `8.2+` |
+| Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.48` |
+| Mobo Core | `10.31.58` |
 | Compatible Portal | `v25 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 
 ### Quick installation
 
 1. Place the `mobo-core` directory in `/wp-content/plugins/`, or upload the ZIP through WordPress.
-2. Keep WooCommerce active, then activate Mobo Core.
+2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`), then activate Mobo Core.
 3. Open **Mobo > Purchase & Activation** to verify the account and license.
 4. Open **Mobo > Connection** and enter the API base URL, Token, and Webhook Security Code.
 5. Configure a Cron Token in **Mobo > Real Cron**, then add the server cron request.
-6. Complete and test address and shipping mapping before enabling automatic order submission.
+6. Save country/state mapping, generate the Mobo city assets, and test shipping mapping before enabling automatic order submission.
 7. Run one full Repair after upgrading a legacy installation such as version 7.
 
 ### Basic connection
 
 ```php
 // wp-config.php
-// Current built-in default in version 10.31.48:
+// Current built-in default in version 10.31.58:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 

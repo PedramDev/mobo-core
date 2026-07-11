@@ -536,7 +536,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$city_id    = absint( isset( $resolved['cityId'] ) ? $resolved['cityId'] : 0 );
 
 		if ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) {
-			return new WP_Error( 'mobo_core_address_mapping_incomplete', 'نگاشت کشور، استان یا شهر این سفارش کامل نیست. ثبت سفارش در موبو متوقف شد.' );
+			return new WP_Error( 'mobo_core_address_mapping_incomplete', 'شناسه کشور، استان یا شهر موبو برای این سفارش کامل نیست. نگاشت کشور و استان و وضعیت فایل شهرهای موبو را بررسی کنید. ثبت سفارش در موبو متوقف شد.' );
 		}
 
 		return array(

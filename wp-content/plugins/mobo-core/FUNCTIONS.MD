@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.31.48` and Portal `v25 / .NET 10`**
+**Generated against Mobo Core `10.31.58` and Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,13 +14,13 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.48` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.58` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.31.48` |
+| `MOBO_CORE_VERSION` | `10.31.58` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
@@ -156,6 +156,7 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 - `woocommerce_save_product_variation`
 - `woocommerce_shop_order_list_table_custom_column`
 - `woocommerce_store_api_checkout_order_processed`
+- `woocommerce_store_api_checkout_update_order_from_request`
 - `woocommerce_variation_options_pricing`
 - `wp_ajax_mobo_core_get_recategorize_status`
 - `wp_ajax_mobo_core_get_reprice_status`
@@ -307,8 +308,8 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 ### `Mobo_Core_Address_Mapping`
 
 Source: [`includes/class-mobo-core-address-mapping.php`](includes/class-mobo-core-address-mapping.php)  
-نگاشت و cache آدرس موبو برای Checkout ووکامرس. / Caches Mobo country/state/city mapping and integrates it with WooCommerce checkout.  
-Public methods: **19** · Internal non-public methods: **38**
+نگاشت کشور/استان و resolve مستقیم شناسه شهر موبو برای Checkout ووکامرس. / Maps country/state values and resolves authoritative Mobo city IDs for WooCommerce checkout.  
+Public methods: **22** · Internal non-public methods: **49**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -321,6 +322,8 @@ Public methods: **19** · Internal non-public methods: **38**
 | `public function normalize_checkout_review_destination($post_data)` | نرمال سازی checkout review destination در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Legacy compatibility hook. |
 | `public function normalize_cart_shipping_packages($packages)` | نرمال سازی cart shipping packages در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Legacy compatibility hook. |
 | `public function save_order_location_meta($order, $data)` | ذخیره order location meta در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Save selected Mobo address IDs and labels on the WooCommerce order. |
+| `public function save_store_api_order_location_meta($order, $request)` | ذخیره نگاشت آدرس سفارش در Checkout Block و Store API. | Persist Mobo location metadata for Checkout Block / Store API orders. |
+| `public function save_store_api_processed_order_location_meta($order)` | اجرای fallback نهایی نگاشت آدرس پس از پردازش سفارش Store API. | Final Store API fallback after WooCommerce persists the order address. |
 | `public function get_status()` | دریافت status در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Get status for admin UI. |
 | `public function get_cached_mapping()` | دریافت cached mapping در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Public access to the cached Mobo location payload. |
 | `public function get_manual_mapping()` | دریافت manual mapping در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Get admin-approved manual mapping from local WooCommerce values to Mobo IDs. |
@@ -330,7 +333,26 @@ Public methods: **19** · Internal non-public methods: **38**
 | `public function resolve_order_group($order, $group = 'billing')` | حل و تعیین order group در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Resolve a WC order group to Mobo IDs without relying on checkout field ownership. |
 | `public function resolve_state_to_mobo_id($country, $state)` | حل و تعیین state to mobo id در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Resolve local country/state values to a Mobo state ID using the approved manual mapping. |
 | `public function is_mobo_state_tehran($mobo_state_id)` | بررسی وضعیت mobo state tehran در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Check whether a resolved Mobo state ID is Tehran using the cached Mobo mapping data. |
-| `public function resolve_values_to_mobo_location($country, $state, $city)` | حل و تعیین values to mobo location در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Resolve local country/state/city values to Mobo IDs using the manual map. |
+| `public function resolve_values_to_mobo_location($country, $state, $city)` | حل و تعیین values to mobo location در بخش نگاشت و cache آدرس موبو برای Checkout ووکامرس. | Resolve country/state through the approved map and accept or match the authoritative Mobo city ID. |
+| `public function write_order_group_location_meta($order, $group, $resolved)` | ذخیره شناسه های آدرس resolve شده روی سفارش برای retry و preflight. | Persist a resolved location on an existing order during retry/preflight. |
+
+### `Mobo_Core_City_Assets`
+
+Source: [`includes/class-mobo-core-city-assets.php`](includes/class-mobo-core-city-assets.php)  
+تولید و جایگزینی فایل شهرهای سازگار با ووکامرس فارسی از داده واقعی موبو. / Generates and serves Persian WooCommerce-compatible city assets from authoritative Mobo data.  
+Public methods: **9** · Internal non-public methods: **21**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public function init()` | ثبت filter و hookهای جایگزینی فایل شهرهای ووکامرس فارسی. | Register city-asset generation and replacement hooks. |
+| `public function maybe_generate_from_cache()` | در صورت تغییر cache یا حذف فایل، ساخت مجدد از داده ذخیره‌شده موبو. | Regenerate when the cache changes or generated files are missing. |
+| `public function generate($mapping, $manual = array(), $source = 'manual')` | ساخت اتمیک `iran_cities.js` و `iran_cities.min.js` با `city_id` واقعی موبو. | Atomically generate readable and minified city scripts with real Mobo city IDs. |
+| `public function get_status()` | دریافت وضعیت فایل‌ها، تعداد شهرها، hash و آخرین خطا. | Return generated asset status and diagnostics. |
+| `public function is_ready()` | بررسی آماده بودن فایل معتبر برای Checkout. | Check whether a valid generated city asset is ready. |
+| `public function filter_persian_woo_iran_cities_url($url)` | جایگزینی URL از طریق filter رسمی ووکامرس فارسی. | Replace the city source through Persian WooCommerce's filter. |
+| `public function replace_persian_woocommerce_city_script()` | تغییر URL و نسخه handle موجود بدون حذف metadata و ترتیب اجرای ووکامرس فارسی. | Mutate the existing handle source/version without destroying metadata or execution order. |
+| `public function force_synchronous_city_script($tag, $handle, $src = '')` | حذف async/defer از فایل provider شهر برای جلوگیری از race در Checkout. | Keep the city provider synchronous to prevent checkout race conditions. |
+| `public function render_admin_notice()` | نمایش هشدار دفاعی در صورت فعال بودن خرید خودکار و آماده نبودن فایل شهرها. | Show an admin warning when automatic submission is enabled without valid city assets. |
 
 ### `Mobo_Core_Admin`
 
@@ -431,7 +453,7 @@ Public methods: **6** · Internal non-public methods: **12**
 
 Source: [`includes/class-mobo-core-checkout-validator.php`](includes/class-mobo-core-checkout-validator.php)  
 اعتبارسنجی سبد، اتصال موبو و صف ثبت سفارش. / Validates carts, communicates with Mobo, and queues order submission.  
-Public methods: **21** · Internal non-public methods: **89**
+Public methods: **21** · Internal non-public methods: **91**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -591,6 +613,21 @@ Public methods: **3** · Internal non-public methods: **1**
 | `public static function release($name, $token)` | اجرای عملیات `release` در بخش قفل runtime مبتنی بر transient. | Release a named lock. |
 | `public static function force_release($name)` | اجرای عملیات `force_release` در بخش قفل runtime مبتنی بر transient. | Force delete a lock. |
 
+### `Mobo_Core_Dependencies`
+
+Source: [`includes/class-mobo-core-dependencies.php`](includes/class-mobo-core-dependencies.php)  
+کنترل پیش نیازهای اجباری افزونه و توقف امن activation/bootstrap. / Enforces required plugin dependencies and safely blocks activation/bootstrap.  
+Public methods: **6** · Internal non-public methods: **5**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function get_missing_dependencies()` | دریافت فهرست WooCommerce یا ووکامرس فارسی نصب نشده/غیرفعال. | Return missing required plugin dependencies. |
+| `public static function requirements_met()` | بررسی کامل بودن همه پیش نیازهای افزونه. | Whether all required dependencies are active. |
+| `public static function is_woocommerce_active()` | بررسی فعال بودن WooCommerce. | Whether WooCommerce is active. |
+| `public static function is_persian_woocommerce_active()` | بررسی فعال بودن افزونه رسمی `persian-woocommerce`. | Whether Persian WooCommerce is active. |
+| `public static function enforce_activation_requirements()` | توقف activation و نمایش خطای واضح در وردپرس های قدیمی. | Block activation when a dependency is missing. |
+| `public static function register_admin_notices($missing = null)` | ثبت اعلان مدیریتی پایدار بعد از غیرفعال شدن dependency. | Register persistent missing-dependency notices. |
+
 ### `Mobo_Core_Logger`
 
 Source: [`includes/class-mobo-core-logger.php`](includes/class-mobo-core-logger.php)  
@@ -691,11 +728,26 @@ Public methods: **11** · Internal non-public methods: **5**
 | `public function upsert($guid, $post_id, $object_type, $parent_guid = '', $last_hash = '', $sync_incomplete = false)` | اجرای عملیات `upsert` در بخش نگاشت سریع GUID محصول و variation به post ID. | Upsert a map row. |
 | `public function seed_from_legacy_meta($limit = 500)` | اجرای عملیات `seed_from_legacy_meta` در بخش نگاشت سریع GUID محصول و variation به post ID. | Incrementally seed product/variation map from legacy post meta. |
 
+### `Mobo_Core_Sync_Settings_Guard`
+
+Source: [`includes/class-mobo-core-sync-settings-guard.php`](includes/class-mobo-core-sync-settings-guard.php)  
+قفل تنظیمات صف و pagination در زمان Sync و Repair. / Locks queue and pagination settings during active Sync and Repair runs.  
+Public methods: **6** · Internal non-public methods: **1**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public function init()` | ثبت فیلترهای محافظ و اعلان مدیریتی. | Register option guards and the fallback admin notice. |
+| `public static function protected_options()` | دریافت فهرست تنظیمات قفل شونده. | Return queue/processing option names protected during a run. |
+| `public static function get_lock_state()` | دریافت وضعیت و نوع عملیات فعال. | Return active Sync/Repair lock details. |
+| `public static function is_locked()` | بررسی فعال بودن قفل تنظیمات. | Check whether queue settings are locked. |
+| `public function guard_option_update($new_value, $old_value, $option_name)` | جلوگیری از تغییر option در اجرای فعال. | Preserve the old value during active runs. |
+| `public function render_admin_notice()` | نمایش هشدار برای تلاش تغییر مستقیم. | Render a warning after blocked direct updates. |
+
 ### `Mobo_Core_Product_Sync`
 
 Source: [`includes/class-mobo-core-product-sync.php`](includes/class-mobo-core-product-sync.php)  
 هسته Sync کامل، Repair و پردازش payload تغییرات. / Core full sync, Repair, and incremental payload processor.  
-Public methods: **13** · Internal non-public methods: **71**
+Public methods: **13** · Internal non-public methods: **79**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -914,7 +966,7 @@ Public methods: **4** · Internal non-public methods: **31**
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.31.48`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.31.58`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 

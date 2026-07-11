@@ -16,6 +16,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Address_Mapping {
 
 	/**
+	 * Request-local cache for WooCommerce/Persian WooCommerce city candidates.
+	 *
+	 * @var array|null
+	 */
+	private $local_city_candidates_cache = null;
+
+	/**
+	 * Request-local cache for the bundled Iranian city dataset.
+	 *
+	 * @var array|null
+	 */
+	private $bundled_iran_city_groups_cache = null;
+
+	/**
 	 * Bootstrap hooks.
 	 *
 	 * @return void
@@ -34,6 +48,8 @@ class Mobo_Core_Address_Mapping {
 		$this->ensure_mapping_for_auto_order();
 
 		add_action( 'woocommerce_checkout_create_order', array( $this, 'save_order_location_meta' ), 20, 2 );
+		add_action( 'woocommerce_store_api_checkout_update_order_from_request', array( $this, 'save_store_api_order_location_meta' ), 20, 2 );
+		add_action( 'woocommerce_store_api_checkout_order_processed', array( $this, 'save_store_api_processed_order_location_meta' ), 5, 1 );
 	}
 
 	/**
@@ -127,11 +143,18 @@ class Mobo_Core_Address_Mapping {
 		update_option( 'mobo_core_address_mapping_last_success_at', time(), false );
 		delete_option( 'mobo_core_address_mapping_last_error' );
 
+		$city_assets = null;
+		if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
+			$generator = new Mobo_Core_City_Assets();
+			$city_assets = $generator->generate( $normalized, $this->get_manual_mapping(), $source );
+		}
+
 		return array(
-			'success' => true,
-			'status'  => 'ok',
-			'counts'  => $this->get_counts_from_mapping( $normalized ),
-			'message' => 'Address mapping synced from MoboCore.',
+			'success'    => ! is_wp_error( $city_assets ),
+			'status'     => is_wp_error( $city_assets ) ? 'mapping-ok-city-assets-failed' : 'ok',
+			'counts'     => $this->get_counts_from_mapping( $normalized ),
+			'cityAssets' => is_wp_error( $city_assets ) ? array( 'success' => false, 'message' => $city_assets->get_error_message() ) : $city_assets,
+			'message'    => is_wp_error( $city_assets ) ? 'Address mapping synced, but Mobo city assets could not be generated: ' . $city_assets->get_error_message() : 'Address mapping and Mobo city assets synced from MoboCore.',
 		);
 	}
 
@@ -485,6 +508,59 @@ class Mobo_Core_Address_Mapping {
 		}
 	}
 
+
+	/**
+	 * Persist Mobo location metadata for Checkout Block / Store API orders.
+	 *
+	 * @param WC_Order        $order Order object.
+	 * @param WP_REST_Request $request Store API request.
+	 * @return void
+	 */
+	public function save_store_api_order_location_meta( $order, $request ) {
+		$data = array();
+		if ( is_object( $request ) && method_exists( $request, 'get_json_params' ) ) {
+			$params = $request->get_json_params();
+			if ( is_array( $params ) ) {
+				$data = $this->flatten_store_api_address_data( $params );
+			}
+		}
+
+		$this->save_order_location_meta( $order, $data );
+	}
+
+	/**
+	 * Final Store API fallback after WooCommerce has persisted the order address.
+	 *
+	 * @param WC_Order $order Order object.
+	 * @return void
+	 */
+	public function save_store_api_processed_order_location_meta( $order ) {
+		$this->save_order_location_meta( $order, array() );
+		if ( is_object( $order ) && method_exists( $order, 'save' ) ) {
+			$order->save();
+		}
+	}
+
+	/**
+	 * Convert Store API billing_address/shipping_address arrays to classic keys.
+	 *
+	 * @param array $params Request parameters.
+	 * @return array
+	 */
+	private function flatten_store_api_address_data( $params ) {
+		$out = array();
+		foreach ( array( 'billing', 'shipping' ) as $group ) {
+			$source_key = $group . '_address';
+			$address = isset( $params[ $source_key ] ) && is_array( $params[ $source_key ] ) ? $params[ $source_key ] : array();
+			foreach ( array( 'country', 'state', 'city' ) as $field ) {
+				if ( isset( $address[ $field ] ) && '' !== trim( (string) $address[ $field ] ) ) {
+					$out[ $group . '_' . $field ] = sanitize_text_field( (string) $address[ $field ] );
+				}
+			}
+		}
+		return $out;
+	}
+
 	/**
 	 * Get status for admin UI.
 	 *
@@ -495,13 +571,14 @@ class Mobo_Core_Address_Mapping {
 		return array(
 			'enabled'                => $this->is_enabled(),
 			'checkoutActive'         => $this->is_checkout_mapping_active(),
-			'checkoutMode'           => $this->is_enabled() ? 'manual-map' : 'disabled',
+			'checkoutMode'           => $this->is_enabled() ? 'mobo-city-assets' : 'disabled',
 			'orderSubmissionEnabled' => Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ),
 			'lastAttemptAt'          => absint( get_option( 'mobo_core_address_mapping_last_attempt_at', 0 ) ),
 			'lastSuccessAt'          => absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ),
 			'lastError'              => (string) get_option( 'mobo_core_address_mapping_last_error', '' ),
 			'counts'                 => $this->get_counts_from_mapping( $mapping ),
 			'manualMapping'          => $this->get_manual_mapping_status(),
+			'cityAssets'             => class_exists( 'Mobo_Core_City_Assets' ) ? ( new Mobo_Core_City_Assets() )->get_status() : array(),
 		);
 	}
 
@@ -546,7 +623,8 @@ class Mobo_Core_Address_Mapping {
 		$out = array(
 			'countries' => array(),
 			'states'    => array(),
-			'cities'    => array(),
+			/* City rows are submitted one province at a time in the admin UI. */
+			'cities'    => isset( $current['cities'] ) && is_array( $current['cities'] ) ? $current['cities'] : array(),
 			'updatedAt' => time(),
 		);
 
@@ -575,12 +653,27 @@ class Mobo_Core_Address_Mapping {
 			$raw_countries = isset( $post['mobo_address_map_city_country'] ) && is_array( $post['mobo_address_map_city_country'] ) ? wp_unslash( $post['mobo_address_map_city_country'] ) : array();
 			$raw_states    = isset( $post['mobo_address_map_city_state'] ) && is_array( $post['mobo_address_map_city_state'] ) ? wp_unslash( $post['mobo_address_map_city_state'] ) : array();
 			$raw_names     = isset( $post['mobo_address_map_city_name'] ) && is_array( $post['mobo_address_map_city_name'] ) ? wp_unslash( $post['mobo_address_map_city_name'] ) : array();
+			$scope_country = isset( $post['mobo_address_map_city_scope_country'] ) ? strtoupper( sanitize_text_field( (string) wp_unslash( $post['mobo_address_map_city_scope_country'] ) ) ) : '';
+			$scope_state   = isset( $post['mobo_address_map_city_scope_state'] ) ? sanitize_text_field( (string) wp_unslash( $post['mobo_address_map_city_scope_state'] ) ) : '';
+
+			/* Remove only the currently displayed province before applying its submitted rows. */
+			if ( '' !== $scope_country && '' !== $scope_state ) {
+				foreach ( $out['cities'] as $stored_key => $entry ) {
+					$parts = explode( '|', (string) $stored_key, 3 );
+					$entry_country = is_array( $entry ) && isset( $entry['country'] ) ? strtoupper( sanitize_text_field( (string) $entry['country'] ) ) : ( isset( $parts[0] ) ? strtoupper( sanitize_text_field( (string) $parts[0] ) ) : '' );
+					$entry_state   = is_array( $entry ) && isset( $entry['state'] ) ? sanitize_text_field( (string) $entry['state'] ) : ( isset( $parts[1] ) ? sanitize_text_field( (string) $parts[1] ) : '' );
+					if ( $entry_country === $scope_country && $this->resolve_local_state_code( $scope_country, $entry_state ) === $this->resolve_local_state_code( $scope_country, $scope_state ) ) {
+						unset( $out['cities'][ $stored_key ] );
+					}
+				}
+			}
 
 			foreach ( $raw_ids as $row_key => $mobo_id ) {
 				$mobo_id = absint( $mobo_id );
-				$country = isset( $raw_countries[ $row_key ] ) ? strtoupper( sanitize_text_field( (string) $raw_countries[ $row_key ] ) ) : '';
-				$state   = isset( $raw_states[ $row_key ] ) ? sanitize_text_field( (string) $raw_states[ $row_key ] ) : '';
-				$name    = isset( $raw_names[ $row_key ] ) ? sanitize_text_field( (string) $raw_names[ $row_key ] ) : '';
+				$decoded = $this->decode_manual_city_row_key( $row_key );
+				$country = isset( $raw_countries[ $row_key ] ) ? strtoupper( sanitize_text_field( (string) $raw_countries[ $row_key ] ) ) : $decoded['country'];
+				$state   = isset( $raw_states[ $row_key ] ) ? sanitize_text_field( (string) $raw_states[ $row_key ] ) : $decoded['state'];
+				$name    = isset( $raw_names[ $row_key ] ) ? sanitize_text_field( (string) $raw_names[ $row_key ] ) : $decoded['name'];
 				$key     = $this->build_manual_city_key( $country, $state, $name );
 
 				if ( '' !== $key && $mobo_id > 0 ) {
@@ -594,12 +687,12 @@ class Mobo_Core_Address_Mapping {
 			}
 		}
 
-		/* Preserve manually entered city mappings when the city list source is not available. */
-		if ( empty( $out['cities'] ) && ! empty( $current['cities'] ) ) {
-			$out['cities'] = $current['cities'];
-		}
-
 		update_option( 'mobo_core_address_manual_mapping', $out, false );
+
+		if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
+			$generator = new Mobo_Core_City_Assets();
+			$generator->generate( $this->get_mapping(), $out, 'manual-state-map-save' );
+		}
 
 		return $out;
 	}
@@ -632,12 +725,11 @@ class Mobo_Core_Address_Mapping {
 			}
 		}
 
-		$cities = $this->get_local_city_candidates();
-
 		return array(
 			'countries' => $countries,
 			'states'    => $states,
-			'cities'    => $cities,
+			/* Manual city mapping was retired in 10.31.54. */
+			'cities'    => array(),
 		);
 	}
 
@@ -650,13 +742,17 @@ class Mobo_Core_Address_Mapping {
 		$manual = $this->get_manual_mapping();
 		$local  = $this->get_local_location_candidates();
 
+		$city_status = class_exists( 'Mobo_Core_City_Assets' ) ? ( new Mobo_Core_City_Assets() )->get_status() : array();
+		$cached = $this->get_mapping();
+
 		return array(
 			'countriesTotal'  => count( $local['countries'] ),
 			'countriesMapped' => count( $manual['countries'] ),
 			'statesTotal'     => count( $local['states'] ),
 			'statesMapped'    => count( $manual['states'] ),
-			'citiesTotal'     => count( $local['cities'] ),
-			'citiesMapped'    => count( $manual['cities'] ),
+			'citiesTotal'     => isset( $cached['cities'] ) && is_array( $cached['cities'] ) ? count( $cached['cities'] ) : 0,
+			'citiesMapped'    => isset( $city_status['cities'] ) ? absint( $city_status['cities'] ) : 0,
+			'cityAssetsReady' => ! empty( $city_status['ready'] ),
 			'updatedAt'       => isset( $manual['updatedAt'] ) ? absint( $manual['updatedAt'] ) : 0,
 		);
 	}
@@ -737,70 +833,248 @@ class Mobo_Core_Address_Mapping {
 		$mapping = $this->get_mapping();
 		$manual  = $this->get_manual_mapping();
 
-		$country_id = 0;
-		$state_id   = 0;
-		$city_id    = 0;
+		$country_id   = 0;
+		$state_id     = 0;
+		$city_id      = 0;
+		$country_code = $this->resolve_local_country_code( $country );
+		$state_code   = $this->resolve_local_state_code( $country_code, $state );
+		$city_name    = sanitize_text_field( (string) $city );
 
 		if ( is_numeric( $country ) && $this->find_location_row( $mapping, 'country', absint( $country ) ) ) {
 			$country_id = absint( $country );
-		} else {
-			$country_code = strtoupper( sanitize_text_field( (string) $country ) );
 			if ( '' === $country_code ) {
-				$country_code = 'IR';
+				$country_code = $this->find_local_country_code_by_mobo_id( $country_id );
 			}
+		} elseif ( '' !== $country_code ) {
 			$country_id = isset( $manual['countries'][ $country_code ] ) ? absint( $manual['countries'][ $country_code ] ) : 0;
+		}
+
+		if ( '' === $country_code ) {
+			$country_code = 'IR';
 		}
 
 		if ( is_numeric( $state ) && $this->find_location_row( $mapping, 'state', absint( $state ) ) ) {
 			$state_id = absint( $state );
 		} else {
-			$country_code = strtoupper( sanitize_text_field( (string) $country ) );
-			if ( '' === $country_code || is_numeric( $country ) ) {
-				$country_code = $this->find_local_country_code_by_mobo_id( $country_id );
-			}
-			if ( '' === $country_code ) {
-				$country_code = 'IR';
-			}
-			$state_key = $this->build_manual_state_key( $country_code, (string) $state );
-			$state_id = isset( $manual['states'][ $state_key ] ) ? absint( $manual['states'][ $state_key ] ) : 0;
+			$state_key = $this->build_manual_state_key( $country_code, $state_code );
+			$state_id  = isset( $manual['states'][ $state_key ] ) ? absint( $manual['states'][ $state_key ] ) : 0;
 		}
 
-		if ( is_numeric( $city ) && $this->find_location_row( $mapping, 'city', absint( $city ) ) ) {
-			$city_id = absint( $city );
-		} else {
-			$country_code = strtoupper( sanitize_text_field( (string) $country ) );
-			if ( '' === $country_code || is_numeric( $country ) ) {
-				$country_code = $this->find_local_country_code_by_mobo_id( $country_id );
+		if ( is_numeric( $city ) ) {
+			$numeric_city = absint( $city );
+			$city_row = $this->find_location_row( $mapping, 'city', $numeric_city );
+			if ( $city_row && $state_id > 0 && isset( $city_row['stateId'] ) && absint( $city_row['stateId'] ) === $state_id ) {
+				$city_id = $numeric_city;
+			} elseif ( $state_id > 0 ) {
+				/* Legacy Persian WooCommerce numeric city code from old orders. */
+				$legacy_city_name = $this->resolve_local_city_name( $country_code, $state_code, $city );
+				$city_id = $this->find_mobo_city_id_by_name( $mapping, $state_id, $legacy_city_name );
+				if ( $city_id > 0 ) {
+					$city_name = $legacy_city_name;
+				}
 			}
-			if ( '' === $country_code ) {
-				$country_code = 'IR';
-			}
-			$city_key = $this->build_manual_city_key( $country_code, (string) $state, (string) $city );
-			if ( isset( $manual['cities'][ $city_key ] ) ) {
-				$city_entry = $manual['cities'][ $city_key ];
-				$city_id = is_array( $city_entry ) && isset( $city_entry['id'] ) ? absint( $city_entry['id'] ) : absint( $city_entry );
-			}
+		} elseif ( $state_id > 0 ) {
+			$city_id = $this->find_mobo_city_id_by_name( $mapping, $state_id, $city_name );
 		}
 
-		if ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) {
+		$missing = array();
+		if ( $country_id <= 0 ) {
+			$missing[] = 'کشور «' . ( '' !== trim( (string) $country ) ? sanitize_text_field( (string) $country ) : 'خالی' ) . '»';
+		}
+		if ( $state_id <= 0 ) {
+			$missing[] = 'استان «' . ( '' !== trim( (string) $state ) ? sanitize_text_field( (string) $state ) : 'خالی' ) . '»';
+		}
+		if ( $city_id <= 0 ) {
+			$missing[] = 'شهر «' . ( '' !== trim( (string) $city ) ? sanitize_text_field( (string) $city ) : 'خالی' ) . '»';
+		}
+
+		if ( ! empty( $missing ) ) {
+			$city_assets_ready = class_exists( 'Mobo_Core_City_Assets' ) && ( new Mobo_Core_City_Assets() )->is_ready();
 			return new WP_Error(
-				'mobo_core_manual_location_mapping_missing',
-				'نگاشت دستی کشور/استان/شهر به شناسه‌های موبو کامل نیست. ابتدا از تب اعتبارسنجی خرید، نگاشت آدرس را تکمیل و ذخیره کنید.'
+				'mobo_core_location_resolution_failed',
+				'آدرس سفارش به شناسه‌های موبو تبدیل نشد. موارد نامعتبر: ' . implode( '، ', $missing ) . '. ' . ( $city_assets_ready ? 'نگاشت کشور و استان را بررسی کنید؛ شهر باید مستقیما با شناسه موبو از Checkout ارسال شود.' : 'فایل شهرهای موبو آماده نیست؛ داده آدرس را از MoboCore بروزرسانی و فایل شهرها را دوباره تولید کنید.' ),
+				array(
+					'country'    => sanitize_text_field( (string) $country ),
+					'state'      => sanitize_text_field( (string) $state ),
+					'city'       => sanitize_text_field( (string) $city ),
+					'countryKey' => $country_code,
+					'stateKey'   => $state_code,
+					'cityKey'    => $city_name,
+					'cityAssetsReady' => $city_assets_ready,
+				)
 			);
 		}
 
 		$city_row = $this->find_location_row( $mapping, 'city', $city_id );
 
 		return array(
-			'countryId' => $country_id,
-			'stateId'   => $state_id,
-			'cityId'    => $city_id,
+			'countryId'   => $country_id,
+			'stateId'     => $state_id,
+			'cityId'      => $city_id,
 			'countryName' => $this->find_location_name( $mapping, 'country', $country_id ),
 			'stateName'   => $this->find_location_name( $mapping, 'state', $state_id ),
 			'cityName'    => $this->find_location_name( $mapping, 'city', $city_id ),
 			'latitude'    => isset( $city_row['latitude'] ) ? $city_row['latitude'] : null,
 			'longitude'   => isset( $city_row['longitude'] ) ? $city_row['longitude'] : null,
 		);
+	}
+
+
+	/**
+	 * Match a legacy/text city value directly against Mobo cities in the
+	 * resolved state. New checkout submissions normally send the numeric Mobo ID.
+	 *
+	 * @param array  $mapping Cached Mobo mapping.
+	 * @param int    $state_id Resolved Mobo state ID.
+	 * @param string $city_name City label.
+	 * @return int
+	 */
+	private function find_mobo_city_id_by_name( $mapping, $state_id, $city_name ) {
+		$state_id = absint( $state_id );
+		$target = $this->normalize_address_token( $city_name );
+		if ( $state_id <= 0 || '' === $target ) {
+			return 0;
+		}
+
+		$exact = array();
+		foreach ( isset( $mapping['cities'] ) && is_array( $mapping['cities'] ) ? $mapping['cities'] : array() as $row ) {
+			$id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+			$row_state = isset( $row['stateId'] ) ? absint( $row['stateId'] ) : 0;
+			$name = isset( $row['name'] ) ? (string) $row['name'] : '';
+			if ( $id <= 0 || $row_state !== $state_id ) {
+				continue;
+			}
+			if ( $this->normalize_address_token( $name ) === $target ) {
+				$exact[] = $id;
+			}
+		}
+
+		return 1 === count( $exact ) ? absint( reset( $exact ) ) : 0;
+	}
+
+	/**
+	 * Resolve a WooCommerce country value to its canonical local code.
+	 *
+	 * @param mixed $country Country value.
+	 * @return string
+	 */
+	private function resolve_local_country_code( $country ) {
+		if ( is_numeric( $country ) ) {
+			return $this->find_local_country_code_by_mobo_id( absint( $country ) );
+		}
+
+		$value = trim( (string) $country );
+		if ( '' === $value ) {
+			return 'IR';
+		}
+
+		$upper = strtoupper( $value );
+		$countries = $this->get_woocommerce_countries();
+		if ( isset( $countries[ $upper ] ) ) {
+			return $upper;
+		}
+
+		$matched = $this->find_woocommerce_country_code_by_name( $value );
+		return '' !== $matched ? strtoupper( $matched ) : $upper;
+	}
+
+	/**
+	 * Resolve WooCommerce state codes and labels to the canonical local code.
+	 *
+	 * @param string $country_code Country code.
+	 * @param mixed  $state State code or label.
+	 * @return string
+	 */
+	private function resolve_local_state_code( $country_code, $state ) {
+		$value = trim( (string) $state );
+		if ( '' === $value ) {
+			return '';
+		}
+
+		$states = $this->get_woocommerce_states( $country_code );
+		if ( isset( $states[ $value ] ) ) {
+			return (string) $value;
+		}
+
+		$upper = strtoupper( $value );
+		if ( isset( $states[ $upper ] ) ) {
+			return $upper;
+		}
+
+		$target = $this->normalize_address_token( $value );
+		foreach ( $states as $code => $name ) {
+			if ( $this->normalize_address_token( $name ) === $target ) {
+				return (string) $code;
+			}
+		}
+
+		if ( 'IR' === strtoupper( (string) $country_code ) ) {
+			$alias_code = $this->resolve_bundled_iran_state_alias( $upper, $states );
+			if ( '' !== $alias_code ) {
+				return $alias_code;
+			}
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Resolve a local city ID/code/label to the city label used by manual mapping.
+	 *
+	 * @param string $country_code Country code.
+	 * @param string $state_code State code.
+	 * @param mixed  $city City value.
+	 * @return string
+	 */
+	private function resolve_local_city_name( $country_code, $state_code, $city ) {
+		$value = sanitize_text_field( (string) $city );
+		if ( '' === trim( $value ) ) {
+			return '';
+		}
+
+		/* Persian WooCommerce stores the visible Persian city label as the field value. */
+		if ( ! is_numeric( $value ) && preg_match( '/[\x{0600}-\x{06FF}]/u', $value ) ) {
+			return $value;
+		}
+
+		$target = $this->normalize_address_token( $value );
+		foreach ( $this->get_local_city_candidates() as $candidate ) {
+			if ( ! is_array( $candidate ) ) {
+				continue;
+			}
+			$candidate_country = isset( $candidate['country'] ) ? strtoupper( (string) $candidate['country'] ) : 'IR';
+			$candidate_state   = isset( $candidate['state'] ) ? (string) $candidate['state'] : '';
+			$candidate_name    = isset( $candidate['name'] ) ? (string) $candidate['name'] : '';
+			$candidate_value   = isset( $candidate['value'] ) ? (string) $candidate['value'] : '';
+			if ( $candidate_country !== strtoupper( $country_code ) || $this->resolve_local_state_code( $country_code, $candidate_state ) !== $state_code ) {
+				continue;
+			}
+			if ( $this->normalize_address_token( $candidate_name ) === $target || ( '' !== $candidate_value && $this->normalize_address_token( $candidate_value ) === $target ) ) {
+				return $candidate_name;
+			}
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Persist a resolved location on an existing order during retry/preflight.
+	 *
+	 * @param WC_Order $order Order object.
+	 * @param string   $group billing|shipping.
+	 * @param array    $resolved Resolved location.
+	 * @return void
+	 */
+	public function write_order_group_location_meta( $order, $group, $resolved ) {
+		$group = 'shipping' === $group ? 'shipping' : 'billing';
+		if ( ! is_object( $order ) || ! is_array( $resolved ) ) {
+			return;
+		}
+		$this->write_resolved_location_meta( $order, $group, $resolved );
+		$order->delete_meta_data( '_mobo_' . $group . '_location_mapping_error' );
+		if ( method_exists( $order, 'save' ) ) {
+			$order->save();
+		}
 	}
 
 	private function write_resolved_location_meta( $order, $group, $resolved ) {
@@ -895,6 +1169,10 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	private function get_local_city_candidates() {
+		if ( is_array( $this->local_city_candidates_cache ) ) {
+			return $this->local_city_candidates_cache;
+		}
+
 		$cities = array();
 		$states = $this->get_woocommerce_states( 'IR' );
 		$state_lookup = array();
@@ -903,17 +1181,33 @@ class Mobo_Core_Address_Mapping {
 			$state_lookup[ $this->normalize_persian_label( (string) $name ) ] = (string) $code;
 		}
 
-		$option_names = array( 'PW_Cities', 'PW_Iran_Cities', 'persian_woocommerce_cities', 'woocommerce_iran_cities', 'pwoo_cities', 'iran_cities' );
-		foreach ( $option_names as $option_name ) {
-			$value = get_option( $option_name, null );
-			if ( is_array( $value ) && ! empty( $value ) ) {
-				$this->extract_city_candidates_from_value( $value, '', $state_lookup, $cities );
-			}
-		}
+		/*
+		 * Legacy compatibility source only. Current checkout city options are
+		 * generated from authoritative Mobo city IDs by Mobo_Core_City_Assets.
+		 * This bundled dataset is retained to resolve old Persian WooCommerce
+		 * numeric city codes already stored on historical orders.
+		 */
+		$this->append_bundled_iran_city_candidates( $states, $cities );
 
-		foreach ( array( 'iran_cities', 'persian_woocommerce_cities', 'pwoo_cities' ) as $global_name ) {
-			if ( isset( $GLOBALS[ $global_name ] ) && is_array( $GLOBALS[ $global_name ] ) ) {
-				$this->extract_city_candidates_from_value( $GLOBALS[ $global_name ], '', $state_lookup, $cities );
+		/* Keep legacy providers only as a compatibility fallback. */
+		if ( empty( $cities ) ) {
+			$this->append_persian_woocommerce_table_city_candidates( $states, $cities );
+			if ( empty( $cities ) ) {
+				$this->append_persian_woocommerce_function_city_candidates( $states, $cities );
+			}
+
+			$option_names = array( 'PW_Cities', 'PW_Iran_Cities', 'persian_woocommerce_cities', 'woocommerce_iran_cities', 'pwoo_cities', 'iran_cities' );
+			foreach ( $option_names as $option_name ) {
+				$value = get_option( $option_name, null );
+				if ( is_array( $value ) && ! empty( $value ) ) {
+					$this->extract_city_candidates_from_value( $value, '', $state_lookup, $cities );
+				}
+			}
+
+			foreach ( array( 'iran_cities', 'persian_woocommerce_cities', 'pwoo_cities' ) as $global_name ) {
+				if ( isset( $GLOBALS[ $global_name ] ) && is_array( $GLOBALS[ $global_name ] ) ) {
+					$this->extract_city_candidates_from_value( $GLOBALS[ $global_name ], '', $state_lookup, $cities );
+				}
 			}
 		}
 
@@ -933,12 +1227,255 @@ class Mobo_Core_Address_Mapping {
 			if ( '' === $state || '' === $name ) {
 				continue;
 			}
+			$value = isset( $city['value'] ) ? sanitize_text_field( (string) $city['value'] ) : '';
 			$key = $this->build_manual_city_key( $country, $state, $name );
-			$unique[ $key ] = array( 'country' => $country, 'state' => $state, 'name' => $name );
+			$unique[ $key ] = array( 'country' => $country, 'state' => $state, 'name' => $name, 'value' => $value );
 		}
 
 		uasort( $unique, array( $this, 'sort_city_candidates' ) );
-		return array_values( $unique );
+		$this->local_city_candidates_cache = array_values( $unique );
+		return $this->local_city_candidates_cache;
+	}
+
+	/**
+	 * Load the bundled city dataset once per request.
+	 *
+	 * @return array
+	 */
+	private function get_bundled_iran_city_groups() {
+		if ( is_array( $this->bundled_iran_city_groups_cache ) ) {
+			return $this->bundled_iran_city_groups_cache;
+		}
+
+		$file = defined( 'MOBO_CORE_PLUGIN_DIR' ) ? MOBO_CORE_PLUGIN_DIR . 'includes/data/iran-cities.php' : '';
+		if ( '' === $file || ! is_readable( $file ) ) {
+			$this->bundled_iran_city_groups_cache = array();
+			return $this->bundled_iran_city_groups_cache;
+		}
+
+		$groups = include $file;
+		$this->bundled_iran_city_groups_cache = is_array( $groups ) ? $groups : array();
+		return $this->bundled_iran_city_groups_cache;
+	}
+
+	/**
+	 * Convert old/new Persian WooCommerce province aliases to the active code.
+	 *
+	 * @param string $value State code.
+	 * @param array  $states Active WooCommerce states.
+	 * @return string
+	 */
+	private function resolve_bundled_iran_state_alias( $value, $states ) {
+		$value = strtoupper( sanitize_text_field( (string) $value ) );
+		if ( '' === $value ) {
+			return '';
+		}
+
+		foreach ( $this->get_bundled_iran_city_groups() as $group ) {
+			$aliases = is_array( $group ) && isset( $group['aliases'] ) && is_array( $group['aliases'] ) ? $group['aliases'] : array();
+			$normalized_aliases = array();
+			foreach ( $aliases as $alias ) {
+				$alias = strtoupper( sanitize_text_field( (string) $alias ) );
+				if ( '' !== $alias ) {
+					$normalized_aliases[] = $alias;
+				}
+			}
+			if ( ! in_array( $value, $normalized_aliases, true ) ) {
+				continue;
+			}
+
+			foreach ( $normalized_aliases as $alias ) {
+				if ( isset( $states[ $alias ] ) ) {
+					return $alias;
+				}
+			}
+
+			return ! empty( $normalized_aliases ) ? (string) reset( $normalized_aliases ) : '';
+		}
+
+		return '';
+	}
+
+	/**
+	 * Append cities from the plugin-bundled Iranian city dataset.
+	 *
+	 * @param array $states WooCommerce IR states.
+	 * @param array $out Output candidates.
+	 * @return void
+	 */
+	private function append_bundled_iran_city_candidates( $states, &$out ) {
+		$groups = $this->get_bundled_iran_city_groups();
+		if ( empty( $groups ) ) {
+			return;
+		}
+
+		$state_codes = array();
+		foreach ( is_array( $states ) ? $states : array() as $state_code => $state_name ) {
+			$state_codes[ strtoupper( sanitize_text_field( (string) $state_code ) ) ] = true;
+		}
+
+		foreach ( $groups as $group ) {
+			if ( ! is_array( $group ) ) {
+				continue;
+			}
+
+			$aliases = isset( $group['aliases'] ) && is_array( $group['aliases'] ) ? $group['aliases'] : array();
+			$state_code = '';
+			foreach ( $aliases as $alias ) {
+				$alias = strtoupper( sanitize_text_field( (string) $alias ) );
+				if ( '' !== $alias && isset( $state_codes[ $alias ] ) ) {
+					$state_code = $alias;
+					break;
+				}
+			}
+
+			if ( '' === $state_code && ! empty( $aliases ) ) {
+				$state_code = strtoupper( sanitize_text_field( (string) reset( $aliases ) ) );
+			}
+			if ( '' === $state_code ) {
+				continue;
+			}
+
+			$rows = isset( $group['cities'] ) && is_array( $group['cities'] ) ? $group['cities'] : array();
+			foreach ( $rows as $row ) {
+				if ( ! is_array( $row ) ) {
+					continue;
+				}
+				$name  = isset( $row['name'] ) ? sanitize_text_field( (string) $row['name'] ) : '';
+				$value = isset( $row['value'] ) ? sanitize_text_field( (string) $row['value'] ) : '';
+				if ( '' === trim( $name ) ) {
+					continue;
+				}
+
+				$out[] = array(
+					'country' => 'IR',
+					'state'   => $state_code,
+					'name'    => $name,
+					'value'   => $value,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Append cities exposed by Persian WooCommerce's public city provider.
+	 *
+	 * @param array $states WooCommerce IR states.
+	 * @param array $out Output candidates.
+	 * @return void
+	 */
+	private function append_persian_woocommerce_function_city_candidates( $states, &$out ) {
+		if ( ! function_exists( 'get_cities_by_hannanstd' ) || ! is_array( $states ) ) {
+			return;
+		}
+
+		foreach ( $states as $state_code => $state_name ) {
+			$state_code = sanitize_text_field( (string) $state_code );
+			if ( '' === $state_code ) {
+				continue;
+			}
+
+			try {
+				$rows = get_cities_by_hannanstd( $state_code );
+			} catch ( Throwable $exception ) {
+				continue;
+			}
+
+			if ( ! is_array( $rows ) ) {
+				continue;
+			}
+
+			foreach ( $rows as $city_value => $city_label ) {
+				if ( is_array( $city_label ) ) {
+					$city_name = isset( $city_label['name'] ) ? $city_label['name'] : ( isset( $city_label['city'] ) ? $city_label['city'] : ( isset( $city_label['title'] ) ? $city_label['title'] : '' ) );
+				} else {
+					$city_name = is_scalar( $city_label ) ? $city_label : '';
+				}
+
+				$city_name = sanitize_text_field( (string) $city_name );
+				if ( '' === trim( $city_name ) ) {
+					continue;
+				}
+
+				$out[] = array(
+					'country' => 'IR',
+					'state'   => $state_code,
+					'name'    => $city_name,
+					'value'   => is_scalar( $city_value ) ? sanitize_text_field( (string) $city_value ) : $city_name,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Read Persian WooCommerce's city table as a fallback.
+	 *
+	 * @param array $states WooCommerce IR states.
+	 * @param array $out Output candidates.
+	 * @return void
+	 */
+	private function append_persian_woocommerce_table_city_candidates( $states, &$out ) {
+		global $wpdb;
+
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! is_array( $states ) || empty( $states ) || ! method_exists( $wpdb, 'get_var' ) || ! method_exists( $wpdb, 'get_results' ) ) {
+			return;
+		}
+
+		$table = isset( $wpdb->prefix ) ? (string) $wpdb->prefix . 'Woo_Iran_Cities_By_HANNANStd' : '';
+		if ( '' === $table || ! method_exists( $wpdb, 'prepare' ) ) {
+			return;
+		}
+
+		$like = method_exists( $wpdb, 'esc_like' ) ? $wpdb->esc_like( $table ) : $table;
+		$found_table = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $like ) );
+		if ( ! is_string( $found_table ) || '' === $found_table ) {
+			return;
+		}
+
+		/* The identifier comes from SHOW TABLES and is reduced to safe table-name characters. */
+		$safe_table = preg_replace( '/[^A-Za-z0-9_$-]/', '', $found_table );
+		if ( ! is_string( $safe_table ) || '' === $safe_table ) {
+			return;
+		}
+
+		$rows = $wpdb->get_results( "SELECT `state`, `city` FROM `{$safe_table}`", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- trusted table returned by SHOW TABLES.
+		if ( ! is_array( $rows ) ) {
+			return;
+		}
+
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+
+			$city_name = isset( $row['city'] ) ? sanitize_text_field( (string) $row['city'] ) : '';
+			$state_raw = isset( $row['state'] ) ? sanitize_text_field( (string) $row['state'] ) : '';
+			if ( '' === $city_name || '' === $state_raw ) {
+				continue;
+			}
+
+			foreach ( $states as $state_code => $state_name ) {
+				$state_code = sanitize_text_field( (string) $state_code );
+				if ( '' === $state_code ) {
+					continue;
+				}
+
+				$wrapped_code = '_' . $state_code . '_';
+				$matches = false !== strpos( $state_raw, $wrapped_code )
+					|| $this->normalize_address_token( $state_raw ) === $this->normalize_address_token( $state_code )
+					|| $this->normalize_address_token( $state_raw ) === $this->normalize_address_token( (string) $state_name );
+				if ( ! $matches ) {
+					continue;
+				}
+
+				$out[] = array(
+					'country' => 'IR',
+					'state'   => $state_code,
+					'name'    => $city_name,
+					'value'   => $city_name,
+				);
+			}
+		}
 	}
 
 	private function extract_city_candidates_from_value( $value, $parent_key, $state_lookup, &$out ) {
@@ -962,7 +1499,8 @@ class Mobo_Core_Address_Mapping {
 					$state_raw = isset( $item['state'] ) ? $item['state'] : ( isset( $item['province'] ) ? $item['province'] : $state_code );
 					$state_final = isset( $state_lookup[ $this->normalize_persian_label( (string) $state_raw ) ] ) ? $state_lookup[ $this->normalize_persian_label( (string) $state_raw ) ] : $state_code;
 					if ( '' !== $state_final && '' !== trim( (string) $name ) ) {
-						$out[] = array( 'country' => 'IR', 'state' => $state_final, 'name' => sanitize_text_field( (string) $name ) );
+						$city_value = isset( $item['id'] ) ? $item['id'] : ( isset( $item['code'] ) ? $item['code'] : ( isset( $item['value'] ) ? $item['value'] : $key_string ) );
+						$out[] = array( 'country' => 'IR', 'state' => $state_final, 'name' => sanitize_text_field( (string) $name ), 'value' => sanitize_text_field( (string) $city_value ) );
 					}
 				} else {
 					$this->extract_city_candidates_from_value( $item, '' !== $state_code ? $state_code : $key_string, $state_lookup, $out );
@@ -970,10 +1508,45 @@ class Mobo_Core_Address_Mapping {
 			} elseif ( is_scalar( $item ) ) {
 				$name = sanitize_text_field( (string) $item );
 				if ( '' !== $state_code && '' !== $name ) {
-					$out[] = array( 'country' => 'IR', 'state' => $state_code, 'name' => $name );
+					$out[] = array( 'country' => 'IR', 'state' => $state_code, 'name' => $name, 'value' => sanitize_text_field( $key_string ) );
 				}
 			}
 		}
+	}
+
+	/**
+	 * Decode the compact URL-safe city row key used by the admin form.
+	 *
+	 * @param mixed $row_key Encoded country|state|city tuple.
+	 * @return array
+	 */
+	private function decode_manual_city_row_key( $row_key ) {
+		$out = array( 'country' => '', 'state' => '', 'name' => '' );
+		$encoded = sanitize_text_field( (string) $row_key );
+		if ( '' === $encoded ) {
+			return $out;
+		}
+
+		$base64 = strtr( $encoded, '-_', '+/' );
+		$padding = strlen( $base64 ) % 4;
+		if ( $padding > 0 ) {
+			$base64 .= str_repeat( '=', 4 - $padding );
+		}
+
+		$decoded = base64_decode( $base64, true );
+		if ( ! is_string( $decoded ) || '' === $decoded ) {
+			return $out;
+		}
+
+		$parts = explode( '|', $decoded, 3 );
+		if ( count( $parts ) !== 3 ) {
+			return $out;
+		}
+
+		$out['country'] = strtoupper( sanitize_text_field( (string) $parts[0] ) );
+		$out['state']   = sanitize_text_field( (string) $parts[1] );
+		$out['name']    = sanitize_text_field( (string) $parts[2] );
+		return $out;
 	}
 
 	private function build_manual_state_key( $country, $state ) {
@@ -1001,6 +1574,56 @@ class Mobo_Core_Address_Mapping {
 			return '';
 		}
 		return $country . '|' . $state . '|' . $city;
+	}
+
+	/**
+	 * Resolve a city from current or legacy manual-map keys.
+	 *
+	 * Older versions could save city rows with the province label or another
+	 * local state representation. Exact lookup remains first, then canonical
+	 * country/state/city matching keeps those approved mappings usable.
+	 *
+	 * @param array  $cities Manual city mapping bucket.
+	 * @param string $country Country code.
+	 * @param string $state State code or label.
+	 * @param string $city City label.
+	 * @return int
+	 */
+	private function find_manual_city_id( $cities, $country, $state, $city ) {
+		if ( ! is_array( $cities ) || empty( $cities ) ) {
+			return 0;
+		}
+
+		$country = strtoupper( sanitize_text_field( (string) $country ) );
+		$state   = $this->resolve_local_state_code( $country, $state );
+		$city    = $this->normalize_address_token( $city );
+		$exact_key = $this->build_manual_city_key( $country, $state, $city );
+
+		if ( '' !== $exact_key && isset( $cities[ $exact_key ] ) ) {
+			$entry = $cities[ $exact_key ];
+			return is_array( $entry ) && isset( $entry['id'] ) ? absint( $entry['id'] ) : absint( $entry );
+		}
+
+		foreach ( $cities as $stored_key => $entry ) {
+			$parts = explode( '|', (string) $stored_key, 3 );
+			$entry_country = is_array( $entry ) && isset( $entry['country'] ) ? (string) $entry['country'] : ( isset( $parts[0] ) ? $parts[0] : '' );
+			$entry_state   = is_array( $entry ) && isset( $entry['state'] ) ? (string) $entry['state'] : ( isset( $parts[1] ) ? $parts[1] : '' );
+			$entry_city    = is_array( $entry ) && isset( $entry['name'] ) ? (string) $entry['name'] : ( isset( $parts[2] ) ? $parts[2] : '' );
+			$entry_id      = is_array( $entry ) && isset( $entry['id'] ) ? absint( $entry['id'] ) : absint( $entry );
+
+			if ( $entry_id <= 0 || strtoupper( sanitize_text_field( $entry_country ) ) !== $country ) {
+				continue;
+			}
+
+			$entry_state = $this->resolve_local_state_code( $country, $entry_state );
+			if ( $entry_state !== $state || $this->normalize_address_token( $entry_city ) !== $city ) {
+				continue;
+			}
+
+			return $entry_id;
+		}
+
+		return 0;
 	}
 
 	private function find_local_country_code_by_mobo_id( $mobo_id ) {
@@ -1216,6 +1839,7 @@ class Mobo_Core_Address_Mapping {
 		$value = strtolower( trim( (string) $value ) );
 		$value = str_replace( array( 'ي', 'ك', 'ة', 'ۀ', 'ـ' ), array( 'ی', 'ک', 'ه', 'ه', '' ), $value );
 		$value = preg_replace( '/[\x{064B}-\x{065F}\x{0670}]/u', '', $value );
+		$value = preg_replace( '/[\x{200C}\x{200D}\x{00A0}]/u', ' ', $value );
 		$value = preg_replace( '/\s+/u', ' ', $value );
 		return null === $value ? '' : trim( $value );
 	}
@@ -1364,10 +1988,7 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	private function find_location_row( $mapping, $type, $id ) {
-		$list_key = $type . 's';
-		if ( 'country' === $type ) {
-			$list_key = 'countries';
-		}
+		$list_key = 'country' === $type ? 'countries' : ( 'city' === $type ? 'cities' : 'states' );
 		foreach ( isset( $mapping[ $list_key ] ) && is_array( $mapping[ $list_key ] ) ? $mapping[ $list_key ] : array() as $row ) {
 			if ( isset( $row['id'] ) && absint( $row['id'] ) === absint( $id ) ) {
 				return is_array( $row ) ? $row : array();
