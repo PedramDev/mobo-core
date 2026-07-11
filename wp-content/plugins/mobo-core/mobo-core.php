@@ -46,7 +46,7 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_DATA_DIR . 'webhook-files/' );
  *
  * You can define this in wp-config.php or in your custom environment loader:
  *
- * define( 'MOBO_API_BASE_URL', 'https://dev.mobo.codeya.ir/' );
+ * define( 'MOBO_API_BASE_URL', 'http://dev.mobo.codeya.ir/' );
  *
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
