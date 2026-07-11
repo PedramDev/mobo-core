@@ -14,7 +14,7 @@ This plugin is not a generic marketplace connector and is not presented as the o
 
 Mobo Core requires an active MoboCore account and token for synchronization and order automation.
 
-- Service: https://mobo.codeya.ir/
+- Service: http://mobo.codeya.ir/
 - Source workflow: https://mobomobo.ir/
 - WordPress admin path: **Mobo > خرید و فعال سازی**
 - Connection settings: **Mobo > اتصال**
@@ -30,8 +30,8 @@ Ready-to-publish page drafts are included in this repository:
 
 Recommended live URLs:
 
-- https://mobo.codeya.ir/terms
-- https://mobo.codeya.ir/privacy
+- http://mobo.codeya.ir/terms
+- http://mobo.codeya.ir/privacy
 
 ## Recommended repository name
 

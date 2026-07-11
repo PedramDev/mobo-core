@@ -32,7 +32,7 @@ Main features:
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
 
-https://mobo.codeya.ir/
+http://mobo.codeya.ir/
 
 Sales and activation contact:
 
@@ -72,15 +72,15 @@ This communication happens only after the site administrator enters a Token or e
 
 Service website:
 
-https://mobo.codeya.ir/
+http://mobo.codeya.ir/
 
 Terms of Service:
 
-https://mobo.codeya.ir/terms
+http://mobo.codeya.ir/terms
 
 Privacy Policy:
 
-https://mobo.codeya.ir/privacy
+http://mobo.codeya.ir/privacy
 
 == Installation ==
 

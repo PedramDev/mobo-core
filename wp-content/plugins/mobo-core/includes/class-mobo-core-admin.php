@@ -397,7 +397,7 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_purchase_tab() {
-		$purchase_url   = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'https://mobo.codeya.ir/';
+		$purchase_url   = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'http://mobo.codeya.ir/';
 		$github_url     = defined( 'MOBO_CORE_GITHUB_URL' ) ? MOBO_CORE_GITHUB_URL : 'https://github.com/PedramDev/mobo-core';
 		$sales_phone   = defined( 'MOBO_CORE_SALES_PHONE' ) ? MOBO_CORE_SALES_PHONE : '+989124508218';
 		$sales_tel     = defined( 'MOBO_CORE_SALES_TEL_URL' ) ? MOBO_CORE_SALES_TEL_URL : 'tel:+989124508218';

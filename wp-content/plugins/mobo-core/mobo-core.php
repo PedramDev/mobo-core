@@ -3,9 +3,9 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.47
+ * Version: 10.31.48
  * Author: Pedram Karimi
- * Author URI: https://mobo.codeya.ir/
+ * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * WC requires at least: 8.2
@@ -23,7 +23,7 @@ define( 'MOBO_CORE_VERSION', '10.31.47' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
-define( 'MOBO_CORE_PURCHASE_URL', 'https://mobo.codeya.ir/' );
+define( 'MOBO_CORE_PURCHASE_URL', 'http://mobo.codeya.ir/' );
 define( 'MOBO_CORE_GITHUB_URL', 'https://github.com/PedramDev/mobo-core' );
 define( 'MOBO_CORE_SALES_PHONE', '+989124508218' );
 define( 'MOBO_CORE_SALES_TEL_URL', 'tel:+989124508218' );
@@ -51,7 +51,7 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_DATA_DIR . 'webhook-files/' );
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
 if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
+	define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 }
 
 /*
