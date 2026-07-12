@@ -1189,12 +1189,9 @@ class Mobo_Core_Address_Mapping {
 		 */
 		$this->append_bundled_iran_city_candidates( $states, $cities );
 
-		/* Keep legacy providers only as a compatibility fallback. */
+		/* Keep non-database legacy providers only as a compatibility fallback. */
 		if ( empty( $cities ) ) {
-			$this->append_persian_woocommerce_table_city_candidates( $states, $cities );
-			if ( empty( $cities ) ) {
-				$this->append_persian_woocommerce_function_city_candidates( $states, $cities );
-			}
+			$this->append_persian_woocommerce_function_city_candidates( $states, $cities );
 
 			$option_names = array( 'PW_Cities', 'PW_Iran_Cities', 'persian_woocommerce_cities', 'woocommerce_iran_cities', 'pwoo_cities', 'iran_cities' );
 			foreach ( $option_names as $option_name ) {
@@ -1402,77 +1399,6 @@ class Mobo_Core_Address_Mapping {
 					'state'   => $state_code,
 					'name'    => $city_name,
 					'value'   => is_scalar( $city_value ) ? sanitize_text_field( (string) $city_value ) : $city_name,
-				);
-			}
-		}
-	}
-
-	/**
-	 * Read Persian WooCommerce's city table as a fallback.
-	 *
-	 * @param array $states WooCommerce IR states.
-	 * @param array $out Output candidates.
-	 * @return void
-	 */
-	private function append_persian_woocommerce_table_city_candidates( $states, &$out ) {
-		global $wpdb;
-
-		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! is_array( $states ) || empty( $states ) || ! method_exists( $wpdb, 'get_var' ) || ! method_exists( $wpdb, 'get_results' ) ) {
-			return;
-		}
-
-		$table = isset( $wpdb->prefix ) ? (string) $wpdb->prefix . 'Woo_Iran_Cities_By_HANNANStd' : '';
-		if ( '' === $table || ! method_exists( $wpdb, 'prepare' ) ) {
-			return;
-		}
-
-		$like = method_exists( $wpdb, 'esc_like' ) ? $wpdb->esc_like( $table ) : $table;
-		$found_table = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $like ) );
-		if ( ! is_string( $found_table ) || '' === $found_table ) {
-			return;
-		}
-
-		/* The identifier comes from SHOW TABLES and is reduced to safe table-name characters. */
-		$safe_table = preg_replace( '/[^A-Za-z0-9_$-]/', '', $found_table );
-		if ( ! is_string( $safe_table ) || '' === $safe_table ) {
-			return;
-		}
-
-		$rows = $wpdb->get_results( "SELECT `state`, `city` FROM `{$safe_table}`", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- trusted table returned by SHOW TABLES.
-		if ( ! is_array( $rows ) ) {
-			return;
-		}
-
-		foreach ( $rows as $row ) {
-			if ( ! is_array( $row ) ) {
-				continue;
-			}
-
-			$city_name = isset( $row['city'] ) ? sanitize_text_field( (string) $row['city'] ) : '';
-			$state_raw = isset( $row['state'] ) ? sanitize_text_field( (string) $row['state'] ) : '';
-			if ( '' === $city_name || '' === $state_raw ) {
-				continue;
-			}
-
-			foreach ( $states as $state_code => $state_name ) {
-				$state_code = sanitize_text_field( (string) $state_code );
-				if ( '' === $state_code ) {
-					continue;
-				}
-
-				$wrapped_code = '_' . $state_code . '_';
-				$matches = false !== strpos( $state_raw, $wrapped_code )
-					|| $this->normalize_address_token( $state_raw ) === $this->normalize_address_token( $state_code )
-					|| $this->normalize_address_token( $state_raw ) === $this->normalize_address_token( (string) $state_name );
-				if ( ! $matches ) {
-					continue;
-				}
-
-				$out[] = array(
-					'country' => 'IR',
-					'state'   => $state_code,
-					'name'    => $city_name,
-					'value'   => $city_name,
 				);
 			}
 		}

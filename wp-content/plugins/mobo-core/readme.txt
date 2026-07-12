@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.62
+Stable tag: 10.31.63
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -135,12 +135,18 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Changelog ==
 
+= 10.31.63 =
+* Replaced generated city-asset file operations with the WordPress filesystem abstraction.
+* Replaced uninstall directory cleanup with WP_Filesystem methods.
+* Removed the obsolete direct database fallback that read Persian WooCommerce city tables; current city assets remain sourced from Mobo data and the bundled legacy code map.
+* Resolved the Plugin Check filesystem errors and direct-database warnings reported against 10.31.62.
+
 = 10.31.62 =
 * Prevented mixed WooCommerce orders from being auto-completed after their Mobo line items are submitted successfully.
 * Kept mixed orders in processing and added an order note/log explaining that non-Mobo items still require fulfilment.
 * Limited the auto-complete option to orders whose line items are all Mobo products.
 
-= 10.31.62 =
+= 10.31.61 =
 * Removed “جابجایی فیلد استان و شهر” from the Persian WooCommerce requirements notice because it is not mandatory.
 * Kept only “فعالسازی شهرهای ایران” as the required Persian WooCommerce setting for automatic order submission.
 
@@ -245,7 +251,10 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
-= 10.31.62 =
+= 10.31.63 =
+Plugin Check filesystem findings were resolved with WP_Filesystem, and the obsolete Persian WooCommerce city-table database fallback was removed. No Sync or Repair is required.
+
+= 10.31.61 =
 Only “فعالسازی شهرهای ایران” needs to be enabled in Persian WooCommerce for automatic Mobo order submission; “جابجایی فیلد استان و شهر” is no longer listed as mandatory.
 
 = 10.31.60 =

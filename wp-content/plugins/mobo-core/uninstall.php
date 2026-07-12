@@ -21,6 +21,25 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 	exit;
 }
 
+
+/**
+ * Return the WordPress filesystem implementation used by uninstall cleanup.
+ *
+ * @return WP_Filesystem_Base|null
+ */
+function mobo_core_uninstall_filesystem() {
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	global $wp_filesystem;
+
+	if ( function_exists( 'WP_Filesystem' ) && WP_Filesystem() && is_object( $wp_filesystem ) ) {
+		return $wp_filesystem;
+	}
+
+	require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-base.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-direct.php';
+	return new WP_Filesystem_Direct( false );
+}
+
 /**
  * Remove Mobo Core runtime state while preserving business data.
  *
@@ -69,7 +88,8 @@ function mobo_core_uninstall_runtime_state() {
 	 * Generated checkout city files are runtime assets, not business data.
 	 */
 	$upload = wp_upload_dir( null, false );
-	if ( empty( $upload['error'] ) && ! empty( $upload['basedir'] ) ) {
+	$filesystem = mobo_core_uninstall_filesystem();
+	if ( $filesystem && empty( $upload['error'] ) && ! empty( $upload['basedir'] ) ) {
 		$base_dir = trailingslashit( (string) $upload['basedir'] );
 		$asset_dirs = array(
 			$base_dir . 'mobo-core-public/assets/',
@@ -78,17 +98,17 @@ function mobo_core_uninstall_runtime_state() {
 		foreach ( $asset_dirs as $asset_dir ) {
 			foreach ( array( 'iran_cities.js', 'iran_cities.min.js', 'index.html', '.htaccess' ) as $asset_name ) {
 				$asset_path = $asset_dir . $asset_name;
-				if ( is_file( $asset_path ) ) {
-					wp_delete_file( $asset_path );
+				if ( $filesystem->exists( $asset_path ) ) {
+					$filesystem->delete( $asset_path, false, 'f' );
 				}
 			}
-			if ( is_dir( $asset_dir ) ) {
-				@rmdir( $asset_dir );
+			if ( $filesystem->is_dir( $asset_dir ) ) {
+				$filesystem->rmdir( untrailingslashit( $asset_dir ), false );
 			}
 		}
 		$public_root = $base_dir . 'mobo-core-public/';
-		if ( is_dir( $public_root ) ) {
-			@rmdir( $public_root );
+		if ( $filesystem->is_dir( $public_root ) ) {
+			$filesystem->rmdir( untrailingslashit( $public_root ), false );
 		}
 	}
 

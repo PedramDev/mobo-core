@@ -23,6 +23,13 @@ class Mobo_Core_City_Assets {
 	const PUBLIC_UPLOAD_DIRNAME = 'mobo-core-public';
 
 	/**
+	 * WordPress filesystem instance used for generated public assets.
+	 *
+	 * @var WP_Filesystem_Base|null
+	 */
+	private $filesystem = null;
+
+	/**
 	 * Register runtime hooks.
 	 *
 	 * @return void
@@ -503,18 +510,18 @@ class Mobo_Core_City_Assets {
 		$lines[] = 'var Mobo_Core_Iran_City_Aliases = ' . $alias_json . ';';
 		$lines[] = '';
 		$lines[] = 'function Persian_Woo_iranCities(province) {';
-		$lines[] = "\tvar requested = String(province || '').toUpperCase();";
-		$lines[] = "\tvar canonical = Mobo_Core_Iran_City_Aliases[requested] || requested;";
-		$lines[] = "\tvar source = Mobo_Core_Iran_Cities[canonical] || [];";
-		$lines[] = "\tvar cities = [];";
-		$lines[] = "\tvar index;";
-		$lines[] = "\tfor (index = 0; index < source.length; index += 1) {";
-		$lines[] = "\t\tcities[index + 1] = [source[index][0], String(source[index][1])];";
-		$lines[] = "\t}";
-		$lines[] = "\tif (!source.length) {";
-		$lines[] = "\t\tcities[1] = ['لطفا استان خود را انتخاب کنید', '0'];";
-		$lines[] = "\t}";
-		$lines[] = "\treturn cities;";
+		$lines[] = "	var requested = String(province || '').toUpperCase();";
+		$lines[] = "	var canonical = Mobo_Core_Iran_City_Aliases[requested] || requested;";
+		$lines[] = "	var source = Mobo_Core_Iran_Cities[canonical] || [];";
+		$lines[] = "	var cities = [];";
+		$lines[] = "	var index;";
+		$lines[] = "	for (index = 0; index < source.length; index += 1) {";
+		$lines[] = "		cities[index + 1] = [source[index][0], String(source[index][1])];";
+		$lines[] = "	}";
+		$lines[] = "	if (!source.length) {";
+		$lines[] = "		cities[1] = ['لطفا استان خود را انتخاب کنید', '0'];";
+		$lines[] = "	}";
+		$lines[] = "	return cities;";
 		$lines[] = '}';
 		$lines[] = '';
 		$lines[] = 'window.Persian_Woo_iranCities = Persian_Woo_iranCities;';
@@ -624,8 +631,13 @@ class Mobo_Core_City_Assets {
 			return false;
 		}
 
+		$filesystem = $this->get_filesystem();
+		if ( ! $filesystem ) {
+			return false;
+		}
+
 		$index = $dir . 'index.html';
-		if ( ! file_exists( $index ) && false === @file_put_contents( $index, '' ) ) {
+		if ( ! $filesystem->exists( $index ) && ! $filesystem->put_contents( $index, '', FS_CHMOD_FILE ) ) {
 			return false;
 		}
 
@@ -638,7 +650,7 @@ class Mobo_Core_City_Assets {
 			. "<IfModule mod_headers.c>\n"
 			. "    Header set X-Content-Type-Options \"nosniff\"\n"
 			. "</IfModule>\n"
-			. "<FilesMatch \"\.(?:php|phtml|phar|cgi|pl|py|sh|bash)$\">\n"
+			. "<FilesMatch \"\\.(?:php|phtml|phar|cgi|pl|py|sh|bash)$\">\n"
 			. "    <IfModule mod_authz_core.c>\n"
 			. "        Require all denied\n"
 			. "    </IfModule>\n"
@@ -649,9 +661,9 @@ class Mobo_Core_City_Assets {
 			. "</FilesMatch>\n"
 			. "# END Mobo Core public assets\n";
 
-		$current = file_exists( $htaccess ) ? @file_get_contents( $htaccess ) : false;
+		$current = $filesystem->exists( $htaccess ) ? $filesystem->get_contents( $htaccess ) : false;
 		if ( ! is_string( $current ) || $current !== $rules ) {
-			if ( false === @file_put_contents( $htaccess, $rules, LOCK_EX ) ) {
+			if ( ! $filesystem->put_contents( $htaccess, $rules, FS_CHMOD_FILE ) ) {
 				return false;
 			}
 		}
@@ -661,27 +673,40 @@ class Mobo_Core_City_Assets {
 
 	private function files_are_readable() {
 		$assets = $this->get_asset_locations();
-		if ( is_wp_error( $assets ) || ! is_readable( $assets['jsPath'] ) || ! is_readable( $assets['minPath'] ) || filesize( $assets['jsPath'] ) <= 100 || filesize( $assets['minPath'] ) <= 100 ) {
+		if ( is_wp_error( $assets ) ) {
 			return false;
 		}
+
+		$filesystem = $this->get_filesystem();
+		if ( ! $filesystem ) {
+			return false;
+		}
+
+		if ( ! $filesystem->exists( $assets['jsPath'] ) || ! $filesystem->exists( $assets['minPath'] ) ) {
+			return false;
+		}
+		if ( $filesystem->size( $assets['jsPath'] ) <= 100 || $filesystem->size( $assets['minPath'] ) <= 100 ) {
+			return false;
+		}
+
 		$readable_tail = $this->read_file_tail( $assets['jsPath'], 8192 );
 		$minified_tail = $this->read_file_tail( $assets['minPath'], 8192 );
 		return $this->javascript_contains_public_contract( $readable_tail ) && $this->javascript_contains_public_contract( $minified_tail );
 	}
 
 	private function read_file_tail( $path, $bytes ) {
-		$handle = @fopen( $path, 'rb' );
-		if ( false === $handle ) {
+		$filesystem = $this->get_filesystem();
+		if ( ! $filesystem || ! $filesystem->exists( $path ) ) {
 			return '';
 		}
-		$size = @filesize( $path );
-		$offset = is_int( $size ) && $size > $bytes ? $size - $bytes : 0;
-		if ( $offset > 0 ) {
-			@fseek( $handle, $offset );
+
+		$contents = $filesystem->get_contents( $path );
+		if ( ! is_string( $contents ) ) {
+			return '';
 		}
-		$contents = stream_get_contents( $handle );
-		@fclose( $handle );
-		return is_string( $contents ) ? $contents : '';
+
+		$bytes = max( 1, absint( $bytes ) );
+		return strlen( $contents ) > $bytes ? substr( $contents, -$bytes ) : $contents;
 	}
 
 	private function javascript_contains_public_contract( $javascript ) {
@@ -696,25 +721,57 @@ class Mobo_Core_City_Assets {
 	}
 
 	private function atomic_write( $path, $contents ) {
+		$filesystem = $this->get_filesystem();
+		if ( ! $filesystem ) {
+			return false;
+		}
+
 		$dir = dirname( $path );
-		$tmp = tempnam( $dir, 'mobo-city-' );
-		if ( false === $tmp ) {
+		$tmp = trailingslashit( $dir ) . '.mobo-city-' . wp_generate_uuid4() . '.tmp';
+		if ( ! $filesystem->put_contents( $tmp, $contents, FS_CHMOD_FILE ) ) {
 			return false;
 		}
-		$written = file_put_contents( $tmp, $contents, LOCK_EX );
-		if ( false === $written || $written !== strlen( $contents ) ) {
-			@unlink( $tmp );
+
+		if ( $filesystem->size( $tmp ) !== strlen( $contents ) ) {
+			$filesystem->delete( $tmp, false, 'f' );
 			return false;
 		}
-		@chmod( $tmp, 0644 );
-		if ( ! @rename( $tmp, $path ) ) {
-			@unlink( $path );
-			if ( ! @rename( $tmp, $path ) ) {
-				@unlink( $tmp );
-				return false;
-			}
+
+		if ( ! $filesystem->move( $tmp, $path, true ) ) {
+			$filesystem->delete( $tmp, false, 'f' );
+			return false;
 		}
+
+		$filesystem->chmod( $path, FS_CHMOD_FILE );
 		return true;
+	}
+
+	/**
+	 * Return a filesystem implementation without requiring an admin credential form.
+	 *
+	 * Generated assets are written only inside the writable uploads directory. The
+	 * direct adapter is therefore a safe fallback when the global abstraction was
+	 * not initialized in the current frontend/cron request.
+	 *
+	 * @return WP_Filesystem_Base|null
+	 */
+	private function get_filesystem() {
+		if ( is_object( $this->filesystem ) ) {
+			return $this->filesystem;
+		}
+
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		global $wp_filesystem;
+
+		if ( function_exists( 'WP_Filesystem' ) && WP_Filesystem() && is_object( $wp_filesystem ) ) {
+			$this->filesystem = $wp_filesystem;
+			return $this->filesystem;
+		}
+
+		require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-base.php';
+		require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-direct.php';
+		$this->filesystem = new WP_Filesystem_Direct( false );
+		return $this->filesystem;
 	}
 
 	private function build_source_hash( $mapping, $manual ) {

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.62` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.31.63` · Compatible with Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 اجزای اصلی:
 
 1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.62**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+2. **Mobo Core 10.31.63**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.62` |
+| Mobo Core | `10.31.63` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -439,7 +439,7 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 Primary components:
 
 1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.62**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+2. **Mobo Core 10.31.63**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -449,7 +449,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.62` |
+| Mobo Core | `10.31.63` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
