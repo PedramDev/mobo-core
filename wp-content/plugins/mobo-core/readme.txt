@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.58
+Stable tag: 10.31.62
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -135,18 +135,29 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Changelog ==
 
+= 10.31.62 =
+* Prevented mixed WooCommerce orders from being auto-completed after their Mobo line items are submitted successfully.
+* Kept mixed orders in processing and added an order note/log explaining that non-Mobo items still require fulfilment.
+* Limited the auto-complete option to orders whose line items are all Mobo products.
+
+= 10.31.62 =
+* Removed “جابجایی فیلد استان و شهر” from the Persian WooCommerce requirements notice because it is not mandatory.
+* Kept only “فعالسازی شهرهای ایران” as the required Persian WooCommerce setting for automatic order submission.
+
+= 10.31.60 =
+* Replaced the technical Mobo cart HTTP 400 message with a customer-facing unavailable-product message.
+* Reworded the Persian WooCommerce city requirements as one concise user-facing sentence.
+
+= 10.31.59 =
+* Replaced the technical option-enforcement notice with a user-facing reminder for “فعالسازی شهرهای ایران”.
+* Removed all automatic reads, writes, save interception, restoration, checkout blocking, order-submission blocking, admin enforcement notices, and cron verification for these Persian WooCommerce settings.
+* Kept Persian WooCommerce as a required plugin and retained the generated Mobo city-script integration.
+
 = 10.31.58 =
 * Locked the complete Queue and Processing settings tab while a manual product Sync or Repair run is active or waiting for MoboCore.
 * Prevented server-side saves even when the form was opened before the run started or a stale browser tab submits changes.
 * Protected direct `update_option()` writes for pagination, cursor, image, webhook retry, and missing-variant behavior settings during active runs.
 * Added a clear Persian warning explaining that changing page size or cursor strategy can move counters/indexes and cause skipped or duplicate processing.
-
-= 10.31.57 =
-* Enforced Persian WooCommerce `PW_Options[enable_iran_cities]` and `PW_Options[flip_state_city]` whenever automatic Mobo order submission is enabled.
-* Prevented administrators or other plugins from saving either required option as disabled while automatic submission is active.
-* Restored the complete `PW_Options` array if it is deleted and added a clear WordPress admin notice after manual disable attempts.
-* Added mandatory checks during plugin bootstrap, checkout-settings save, checkout validation, automatic order submission, and real cron execution.
-* Added a throttled 15-minute cron verification while keeping checkout and order-submission checks unthrottled.
 
 = 10.31.56 =
 * Moved generated checkout city JavaScript from the private `wp-content/uploads/mobo-core/` tree to the public sibling path `wp-content/uploads/mobo-core-public/assets/`.
@@ -234,11 +245,17 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
+= 10.31.62 =
+Only “فعالسازی شهرهای ایران” needs to be enabled in Persian WooCommerce for automatic Mobo order submission; “جابجایی فیلد استان و شهر” is no longer listed as mandatory.
+
+= 10.31.60 =
+HTTP 400 returned while adding a product to the Mobo cart is now shown to the customer as an unavailable-product message.
+
+= 10.31.59 =
+Mobo Core no longer changes or checks these Persian WooCommerce settings. Enable “فعالسازی شهرهای ایران” manually in Persian WooCommerce when automatic Mobo order submission is used.
+
 = 10.31.58 =
 Queue and processing settings cannot be changed while Sync or Repair is active. Finish or cancel the run, reload the Queue tab, and then save new values.
-
-= 10.31.57 =
-When automatic Mobo order submission is enabled, Persian WooCommerce city support and state/city field order are now mandatory and are automatically kept enabled.
 
 = 10.31.56 =
 Generated city assets now use `wp-content/uploads/mobo-core-public/assets/`. Clear page, CDN, and optimization caches once if rendered checkout HTML still references the old denied `wp-content/uploads/mobo-core/assets/` URL.

@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.58
+ * Version: 10.31.62
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.58' );
+define( 'MOBO_CORE_VERSION', '10.31.62' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -75,7 +75,6 @@ add_action( 'admin_init', function() {
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-dependencies.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-persian-woo-options.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
@@ -163,7 +162,6 @@ add_filter(
 function mobo_core_activate() {
 	Mobo_Core_Dependencies::enforce_activation_requirements();
 	Mobo_Core_Migration::activate();
-	Mobo_Core_Persian_Woo_Options::ensure_required_options( 'activation', true );
 }
 
 register_activation_hook( __FILE__, 'mobo_core_activate' );
@@ -189,14 +187,6 @@ add_action(
 		 */
 		$sync_settings_guard = new Mobo_Core_Sync_Settings_Guard();
 		$sync_settings_guard->init();
-
-		/*
-		 * Persian WooCommerce options required by automatic Mobo checkout.
-		 * The enforcer protects PW_Options from being disabled while auto order
-		 * submission is enabled and performs an immediate bootstrap check.
-		 */
-		$persian_woo_options = new Mobo_Core_Persian_Woo_Options();
-		$persian_woo_options->init();
 
 		/*
 		 * Variation custom field:

@@ -41,6 +41,7 @@ class Mobo_Core_Migration {
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
+		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
@@ -72,6 +73,7 @@ class Mobo_Core_Migration {
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
+		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
@@ -186,6 +188,21 @@ class Mobo_Core_Migration {
 				wp_delete_file( $path );
 			}
 		}
+	}
+
+
+	/**
+	 * Remove runtime state from the retired Persian WooCommerce option-enforcement feature.
+	 *
+	 * Mobo Core now shows guidance only and does not read, write, block, or
+	 * periodically inspect Persian WooCommerce option values.
+	 *
+	 * @return void
+	 */
+	private static function cleanup_deprecated_pw_option_enforcement_state() {
+		delete_option( 'mobo_core_pw_options_last_check_at' );
+		delete_option( 'mobo_core_pw_options_last_enforced' );
+		delete_transient( 'mobo_core_pw_options_enforced_notice' );
 	}
 
 	/**

@@ -107,16 +107,6 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
-			$pw_options = Mobo_Core_Persian_Woo_Options::ensure_required_options( 'checkout-validation', true );
-			if ( empty( $pw_options['success'] ) || empty( $pw_options['compliant'] ) ) {
-				$errors->add(
-					'mobo_core_persian_woocommerce_options',
-					'برای ثبت خودکار سفارش، گزینه‌های شهرهای ایران و جابجایی استان/شهر در ووکامرس فارسی باید فعال باشند. لطفا با مدیریت سایت تماس بگیرید.'
-				);
-				return;
-			}
-		}
 
 		$result = $this->validate_current_cart( true );
 
@@ -970,6 +960,13 @@ class Mobo_Core_Checkout_Validator {
 
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
 		$name = sanitize_text_field( (string) $name );
+
+		if ( 400 === $code ) {
+			return new WP_Error(
+				'mobo_core_mobo_cart_item_unavailable',
+				sprintf( 'آیتم «%s» در سایت ناموجود است.', '' !== $name ? $name : (string) absint( $portal_variant_id ) )
+			);
+		}
 
 		if ( 200 !== $code ) {
 			return new WP_Error(
@@ -2617,8 +2614,40 @@ class Mobo_Core_Checkout_Validator {
 			if ( true === $submit ) {
 				$result['success']++;
 				$completed_order = wc_get_order( $order_id );
-				if ( $completed_order instanceof WC_Order && 'completed' !== $completed_order->get_status() && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_auto_complete_enabled', '1' ) ) {
-					$completed_order->update_status( 'completed', 'سفارش با موفقیت در موبو ثبت شد و وضعیت به تکمیل شده تغییر کرد.', true );
+
+				/*
+				 * A mixed WooCommerce order still has local/non-Mobo fulfilment work.
+				 * Successfully purchasing only its Mobo lines must never complete the
+				 * parent WooCommerce order. Keep it in processing even when the global
+				 * Mobo auto-complete option is enabled.
+				 */
+				if ( $completed_order instanceof WC_Order && 'mixed' === (string) $scope['status'] ) {
+					$note = 'اقلام موبو با موفقیت در موبو ثبت شدند. این سفارش ترکیبی است و برای پردازش اقلام غیرموبو در وضعیت در حال انجام باقی می‌ماند.';
+					$completed_order->update_meta_data( '_mobo_order_scope_status', 'mixed' );
+					$completed_order->update_meta_data( '_mobo_order_kept_processing', 'yes' );
+
+					if ( 'processing' !== $completed_order->get_status() ) {
+						$completed_order->update_status( 'processing', $note, true );
+					} else {
+						$completed_order->save();
+						$completed_order->add_order_note( $note );
+					}
+
+					$this->append_order_log(
+						$completed_order,
+						'order_submission_mixed_kept_processing',
+						array(
+							'moboItems'    => isset( $scope['mobo'] ) ? absint( $scope['mobo'] ) : 0,
+							'nonMoboItems' => isset( $scope['nonMobo'] ) ? absint( $scope['nonMobo'] ) : 0,
+						)
+					);
+				} elseif (
+					$completed_order instanceof WC_Order
+					&& 'all_mobo' === (string) $scope['status']
+					&& 'completed' !== $completed_order->get_status()
+					&& Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_auto_complete_enabled', '1' )
+				) {
+					$completed_order->update_status( 'completed', 'تمام اقلام سفارش موبو بودند؛ سفارش با موفقیت در موبو ثبت شد و وضعیت به تکمیل شده تغییر کرد.', true );
 				}
 			} else {
 				$result['failed']++;
@@ -2864,16 +2893,6 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش محصول موبو ندارد.' );
 		}
 
-		if ( class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
-			$pw_options = Mobo_Core_Persian_Woo_Options::ensure_required_options( 'order-submission', true );
-			if ( empty( $pw_options['success'] ) || empty( $pw_options['compliant'] ) ) {
-				return $this->fail_mobo_order_submission(
-					$order,
-					'persian_woocommerce_options_invalid',
-					'گزینه‌های شهرهای ایران و جابجایی استان/شهر در ووکامرس فارسی باید فعال باشند. Mobo Core نتوانست آن‌ها را به‌صورت خودکار فعال کند.'
-				);
-			}
-		}
 
 		$order->update_meta_data( '_mobo_order_submit_attempted', 'yes' );
 		$order->update_meta_data( '_mobo_order_submit_attempted_at', time() );
@@ -3360,7 +3379,7 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_paid', ! empty( $payment_json['paid'] ) && $this->to_bool( $payment_json['paid'] ) ? 'yes' : 'no' );
 		$order->delete_meta_data( '_mobo_order_last_error' );
 		$order->save();
-		$order->add_order_note( sprintf( 'سفارش با موفقیت در موبو ثبت شد. Mobo Order ID: %s', absint( $mobo_order_id ) ) );
+		$order->add_order_note( sprintf( 'اقلام موبو سفارش با موفقیت در موبو ثبت شدند. Mobo Order ID: %s', absint( $mobo_order_id ) ) );
 		$this->append_order_log( $order, 'order_submission_success', array( 'moboOrderId' => absint( $mobo_order_id ), 'token' => $token, 'shippingId' => absint( $shipping_id ) ) );
 	}
 

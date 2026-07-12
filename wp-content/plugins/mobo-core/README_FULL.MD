@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.58` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.31.62` · Compatible with Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 اجزای اصلی:
 
 1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.58**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+2. **Mobo Core 10.31.62**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.58` |
+| Mobo Core | `10.31.62` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -240,16 +240,16 @@ Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync 
 - انتخاب روش ارسال موبو بر اساس rate ووکامرس، استان و بازه زمانی
 - ثبت خودکار سفارش موبو
 
-ثبت سفارش خودکار زمانی queue می شود که سفارش واجد محصول موبو وارد وضعیت `processing` شود. سفارش های غیرموبو از این جریان خارج می مانند. پس از ثبت موفق، اگر گزینه مربوطه فعال باشد، سفارش WooCommerce به `completed` تغییر می کند.
+ثبت سفارش خودکار زمانی queue می شود که سفارش واجد محصول موبو وارد وضعیت `processing` شود. سفارش های غیرموبو از این جریان خارج می مانند. در سفارش ترکیبی فقط اقلام موبو به موبو ارسال می شوند و سفارش WooCommerce برای انجام اقلام غیرموبو در وضعیت `processing` باقی می ماند. گزینه تکمیل خودکار فقط برای سفارش هایی اعمال می شود که تمام اقلام آنها موبو باشند.
 
 
 ### قفل تنظیمات صف هنگام Sync و Repair
 
 در زمان اجرای Sync کامل یا Repair، تنظیمات تب «صف و پردازش» قفل می شوند. تغییر `products_per_page` یا `variants_per_page` در اجرای page-based می تواند مرز صفحه را جابه جا کند و باعث رد شدن یا پردازش دوباره رکوردها شود؛ تغییر cursor mode نیز strategy ادامه را عوض می کند. قفل هم در UI و هم در مسیر ذخیره سمت سرور اعمال می شود و direct `update_option()` نیز تا پایان یا لغو عملیات مقدار قبلی را حفظ می کند. وضعیت `waiting_for_portal` هم بخشی از اجرای فعال محسوب می شود.
 
-### تنظیمات اجباری ووکامرس فارسی برای ثبت خودکار
+### تنظیمات ووکامرس فارسی برای ثبت خودکار
 
-وقتی `mobo_core_mobo_order_submission_enabled` فعال باشد، Mobo Core دو گزینه `PW_Options[enable_iran_cities]` و `PW_Options[flip_state_city]` را اجباری می‌کند. افزونه هنگام Bootstrap، ذخیره تنظیمات Checkout، اعتبارسنجی خرید، ثبت سفارش و Cron واقعی آن‌ها را بررسی می‌کند. اگر کاربر یا افزونه دیگری این گزینه‌ها را خاموش یا کل Option را حذف کند، Mobo Core آن‌ها را دوباره فعال می‌کند و در مدیریت وردپرس هشدار می‌دهد. بررسی دوره‌ای Cron هر ۱۵ دقیقه throttled می‌شود، اما Checkout و ثبت سفارش همیشه بررسی اجباری و بدون throttle دارند.
+برای عملکرد صحیح ثبت سفارش خودکار، گزینه «فعالسازی شهرهای ایران» باید در تنظیمات افزونه ووکامرس فارسی فعال باشد. Mobo Core فقط این الزام را در پنل یادآوری می‌کند و این تنظیم را نمی‌خواند یا تغییر نمی‌دهد.
 
 در نسخه `10.31.56` نگاشت دستی شهر حذف شده است. افزونه ابتدا کشورها، استان ها و شهرهای موبو را از MoboCore دریافت می کند، سپس در مسیر uploads دو فایل `iran_cities.js` و `iran_cities.min.js` می سازد. این فایل ها همان تابع سازگار `Persian_Woo_iranCities()` را ارائه می کنند، اما مقدار هر گزینه شهر شناسه واقعی `city_id` موبو است. Mobo Core از فیلتر `persian_woo_iran_cities` استفاده می کند و در مرحله نهایی فقط URL و version همان handle موجود `pw-iran-cities` را تغییر می دهد؛ handle حذف و دوباره ثبت نمی شود تا dependency، inline data و ترتیب اجرای ووکامرس فارسی حفظ شود. نگاشت کشور و استان همچنان باقی می ماند، چون WooCommerce استان را با کد محلی مانند `THR` نگه می دارد و موبو از `state_id` استفاده می کند. فایل قدیمی شهرها فقط برای تشخیص alias استان و سازگاری سفارش های قبلی استفاده می شود و منبع شهرهای Checkout نیست.
 
@@ -439,7 +439,7 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 Primary components:
 
 1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.58**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+2. **Mobo Core 10.31.62**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -449,7 +449,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.58` |
+| Mobo Core | `10.31.62` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
@@ -606,9 +606,9 @@ Optional features include local stock checks, remote cart validation, external v
 
 While a full Sync or Repair run is active, the Queue and Processing tab is immutable. Changing `products_per_page` or `variants_per_page` during page-based pagination can move page boundaries and skip or duplicate records; changing cursor mode changes the continuation strategy. The guard applies in the UI, in the server-side save handler, and to direct `update_option()` writes. `waiting_for_portal` is treated as an active resumable run until it is completed or cancelled.
 
-### Required Persian WooCommerce options for automatic submission
+### Persian WooCommerce settings for automatic submission
 
-When `mobo_core_mobo_order_submission_enabled` is enabled, Mobo Core enforces `PW_Options[enable_iran_cities]` and `PW_Options[flip_state_city]`. The plugin checks them during bootstrap, checkout-settings save, checkout validation, order submission, and real cron execution. If a user or another plugin disables either option or deletes the whole option array, Mobo Core restores the required values and displays an admin notice. Cron checks are throttled to every 15 minutes, while checkout and order submission always perform an unthrottled mandatory check.
+When automatic Mobo order submission is enabled, the Persian WooCommerce options “Enable Iran cities” and “Swap state and city fields” must be enabled. Mobo Core now displays guidance only: it does not read, modify, block, or periodically inspect these settings, and it does not stop checkout or order submission based on their values.
 
 Version `10.31.56` removes manual city-to-city mapping. The plugin first downloads countries, states, and cities from MoboCore, then generates `iran_cities.js` and `iran_cities.min.js` under the WordPress uploads directory. Both files expose the Persian WooCommerce-compatible `Persian_Woo_iranCities()` function, while every city option value is the authoritative Mobo `city_id`. Mobo Core replaces the source through the `persian_woo_iran_cities` filter and, as a final safeguard, mutates only the existing `pw-iran-cities` source/version without deregistering the handle, preserving dependencies, inline data, and execution order. Country and state mapping remain because WooCommerce stores province codes such as `THR`, while Mobo uses numeric `state_id` values. The legacy bundled city source is retained only for province aliases and old-order compatibility, not as the current checkout city source.
 

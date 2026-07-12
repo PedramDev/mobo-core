@@ -148,10 +148,6 @@ class Mobo_Core_Settings {
 			'mobo_core_address_mapping_enabled'             => '0',
 			'mobo_core_address_mapping_sync_interval_days'  => 7,
 
-			// Persian WooCommerce required-option enforcement state.
-			'mobo_core_pw_options_last_check_at'            => 0,
-			'mobo_core_pw_options_last_enforced'            => array(),
-
 			// SMS notifications through Persian WooCommerce SMS.
 			'mobo_core_sms_notifications_enabled'           => '0',
 			'mobo_core_sms_non_mobo_enabled'                => '0',

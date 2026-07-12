@@ -847,10 +847,8 @@ class Mobo_Core_Admin {
 		$shipping_diagnostics = class_exists( 'Mobo_Core_Shipping_Diagnostics' ) ? new Mobo_Core_Shipping_Diagnostics() : null;
 		$shipping_report = $shipping_diagnostics && method_exists( $shipping_diagnostics, 'get_last_report' ) ? $shipping_diagnostics->get_last_report() : array();
 		$persian_wc_plugins = $this->get_active_persian_woocommerce_plugins();
-		$persian_wc_status  = $this->get_persian_woocommerce_status();
 		$poina_allowlist_status = $this->get_poina_domain_allowlist_status();
 		$order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
-		$persian_woo_required_options_status = class_exists( 'Mobo_Core_Persian_Woo_Options' ) ? Mobo_Core_Persian_Woo_Options::get_status() : array();
 		$address_mapping_enabled = $order_submission_enabled;
 		$address_checkout_active = ! empty( $address_status['checkoutActive'] );
 		$checkout_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
@@ -881,8 +879,8 @@ class Mobo_Core_Admin {
 			<?php endif; ?>
 
 			<?php if ( $order_submission_enabled ) : ?>
-				<div class="mobo-alert <?php echo ! empty( $persian_woo_required_options_status['compliant'] ) ? 'mobo-alert-success' : 'mobo-alert-error'; ?>">
-					برای ثبت خودکار سفارش، گزینه‌های <code>PW_Options[enable_iran_cities]</code> و <code>PW_Options[flip_state_city]</code> در ووکامرس فارسی اجباری هستند. Mobo Core این دو گزینه را خودکار فعال نگه می‌دارد و در صورت برداشتن دستی تیک، اجازه ذخیره حالت غیرفعال را نمی‌دهد.
+				<div class="mobo-alert mobo-alert-warning">
+					برای عملکرد صحیح ثبت سفارش خودکار، گزینه «فعالسازی شهرهای ایران» باید در تنظیمات افزونه ووکامرس فارسی فعال باشد.
 				</div>
 			<?php endif; ?>
 
@@ -980,7 +978,7 @@ class Mobo_Core_Admin {
 
 
 						<div data-mobo-ui-group="auto-order">
-							<?php $this->bool_field( 'تکمیل خودکار سفارش در سایت بعد از ثبت موفق در موبو', 'mobo_core_mobo_order_auto_complete_enabled' ); ?>
+							<?php $this->bool_field( 'تکمیل خودکار سفارش‌های تماما موبو بعد از ثبت موفق', 'mobo_core_mobo_order_auto_complete_enabled' ); ?>
 							<?php $this->text_field( 'نام فروشگاه یا فرستنده', 'mobo_core_mobo_order_sender_name', 'نامی که در اطلاعات سفارش موبو به عنوان فرستنده ثبت می‌شود.' ); ?>
 							<?php $this->text_field( 'شماره موبایل فروشگاه یا فرستنده', 'mobo_core_mobo_order_sender_mobile', 'شماره موبایلی که در اطلاعات سفارش موبو ثبت می‌شود.' ); ?>
 							<div class="mobo-field mobo-field-full"><div class="mobo-help">روش ارسال قابل مشاهده برای مشتری فقط با WooCommerce است. روش ارسال موبو در بخش پایین، بر اساس استان نگاشت‌شده و ساعت وردپرس برای ثبت سفارش اتوماتیک انتخاب می‌شود.</div></div>
@@ -4456,11 +4454,8 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
-			/* Address mapping and Persian WooCommerce city/state options are mandatory. */
+			/* Address mapping is mandatory for automatic Mobo order submission. */
 			update_option( 'mobo_core_address_mapping_enabled', '1', false );
-			if ( class_exists( 'Mobo_Core_Persian_Woo_Options' ) ) {
-				Mobo_Core_Persian_Woo_Options::ensure_required_options( 'checkout-settings-save', true );
-			}
 		}
 	}
 
@@ -6867,25 +6862,6 @@ type:{mobo_order_type_label}</textarea>
 		return $status;
 	}
 
-	/**
-	 * Return Persian WooCommerce city dropdown status.
-	 *
-	 * @return array
-	 */
-	private function get_persian_woocommerce_status() {
-		$options = get_option( 'PW_Options', array() );
-		$raw = '';
-		if ( is_array( $options ) && array_key_exists( 'enable_iran_cities', $options ) ) {
-			$raw = $options['enable_iran_cities'];
-		}
-
-		return array(
-			'activePlugins'      => $this->get_active_persian_woocommerce_plugins(),
-			'pwOptionsExists'    => is_array( $options ) && ! empty( $options ),
-			'iranCitiesRaw'      => is_scalar( $raw ) ? (string) $raw : '',
-			'iranCitiesEnabled'  => $this->truthy_option_value( $raw ),
-		);
-	}
 
 	/**
 	 * Get installed plugins safely.
@@ -6928,24 +6904,6 @@ type:{mobo_order_type_label}</textarea>
 		return (bool) $active;
 	}
 
-	/**
-	 * Interpret option values saved by third-party plugins.
-	 *
-	 * @param mixed $value Raw value.
-	 * @return bool
-	 */
-	private function truthy_option_value( $value ) {
-		if ( true === $value || 1 === $value ) {
-			return true;
-		}
-
-		if ( is_string( $value ) ) {
-			$value = strtolower( trim( $value ) );
-			return in_array( $value, array( '1', 'yes', 'on', 'true', 'enabled', 'enable' ), true );
-		}
-
-		return false;
-	}
 
 	/**
 	 * Detect active Persian WooCommerce compatibility plugins.
