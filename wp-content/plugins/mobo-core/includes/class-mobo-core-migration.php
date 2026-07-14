@@ -43,6 +43,11 @@ class Mobo_Core_Migration {
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_103164_image_family_migration( '' );
+		self::apply_103165_image_refresh_safety( '' );
+		self::apply_103166_admin_health_defaults( '' );
+		self::apply_103167_image_workflow_safety( '' );
+		self::apply_103168_image_automation_safety( '' );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -75,6 +80,11 @@ class Mobo_Core_Migration {
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_103164_image_family_migration( $current );
+		self::apply_103165_image_refresh_safety( $current );
+		self::apply_103166_admin_health_defaults( $current );
+		self::apply_103167_image_workflow_safety( $current );
+		self::apply_103168_image_automation_safety( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -236,6 +246,132 @@ class Mobo_Core_Migration {
 		}
 
 		update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
+	}
+
+
+	/**
+	 * Convert orphan-image cleanup from noisy per-file rows to one row per image
+	 * family and reset bounded scan cursors introduced in 10.31.64.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103164_image_family_migration( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' === $installed_version ) {
+			$installed_version = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+		}
+
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.64', '>=' ) ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) && method_exists( 'Mobo_Core_Orphan_Image_Cleanup', 'migrate_to_family_rows' ) ) {
+			Mobo_Core_Orphan_Image_Cleanup::migrate_to_family_rows();
+		}
+
+		delete_option( 'mobo_core_image_refresh_scan_cursor' );
+		delete_option( 'mobo_core_image_refresh_enqueue_cursor' );
+		delete_option( 'mobo_core_image_refresh_last_scan' );
+		delete_option( 'mobo_core_image_refresh_last_enqueue' );
+	}
+
+
+	/**
+	 * Apply the conservative image-maintenance defaults introduced in 10.31.65.
+	 *
+	 * Old releases defaulted destructive image cleanup options to enabled. On the
+	 * first 10.31.65 run they are switched off so the administrator must complete
+	 * the new health scan and explicitly opt in again. Non-destructive refresh
+	 * processing may continue, but old attachments and orphan families are kept.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103165_image_refresh_safety( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' === $installed_version ) {
+			$installed_version = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+		}
+
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.65', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+		delete_option( 'mobo_core_image_subsize_scan_cursor' );
+		delete_option( 'mobo_core_image_subsize_repair_cursor' );
+		delete_option( 'mobo_core_image_replaced_scan_cursor' );
+		delete_option( 'mobo_core_image_replaced_delete_cursor' );
+		delete_option( 'mobo_core_image_refresh_last_subsize_scan' );
+		delete_option( 'mobo_core_image_refresh_last_subsize_repair' );
+		delete_option( 'mobo_core_image_refresh_last_replaced_scan' );
+		delete_option( 'mobo_core_image_refresh_last_replaced_delete' );
+	}
+
+
+	/**
+	 * Enforce non-editable Mobo endpoints and always-on health reporting.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103166_admin_health_defaults( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.66', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_health_report_enabled', '1', false );
+		delete_option( 'mobo_core_health_report_url' );
+		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
+	}
+
+
+	/**
+	 * Start the strict image workflow with destructive switches disabled.
+	 *
+	 * Existing scan and queue progress is kept. Refresh execution and both
+	 * destructive opt-ins are turned off so the new state machine can unlock each
+	 * one at the correct stage.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103167_image_workflow_safety( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.67', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_image_refresh_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+	}
+
+
+	/**
+	 * Introduce image-refresh automation with every destructive approval off.
+	 *
+	 * Existing scan/queue progress is preserved. The coordinator starts only after
+	 * an administrator explicitly presses the safe automation button.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103168_image_automation_safety( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.68', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_image_refresh_automation_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_auto_delete_old_approved', '0', false );
+		update_option( 'mobo_core_image_refresh_auto_delete_orphan_approved', '0', false );
+		update_option( 'mobo_core_image_refresh_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 	}
 
 	/**

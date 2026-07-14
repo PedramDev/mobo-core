@@ -156,8 +156,15 @@ class Mobo_Core_Cron_Runner {
 			$image_result = $image_sync->process_queue( $image_limit );
 		}
 
-		$image_refresh_result = array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false );
-		if ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) && ( time() - $started_at ) < $budget ) {
+		$image_refresh_result     = array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false );
+		$image_refresh_automation = array( 'success' => true, 'status' => 'disabled', 'needsContinuation' => false, 'progressed' => false );
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_automation_enabled', '0' ) && ( time() - $started_at ) < $budget ) {
+			$automation               = new Mobo_Core_Image_Refresh_Automation();
+			$image_refresh_automation = $automation->run_tick( $source );
+			if ( isset( $image_refresh_automation['operation'] ) && is_array( $image_refresh_automation['operation'] ) && 'process-queue' === ( isset( $image_refresh_automation['status'] ) ? $image_refresh_automation['status'] : '' ) ) {
+				$image_refresh_result = $image_refresh_automation['operation'];
+			}
+		} elseif ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) && ( time() - $started_at ) < $budget ) {
 			$image_refresh_service = new Mobo_Core_Image_Refresh_Service();
 			$image_refresh_limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
 			$image_refresh_result  = $image_refresh_service->process_queue( $image_refresh_limit );
@@ -230,6 +237,8 @@ class Mobo_Core_Cron_Runner {
 		$remaining_images   = ! empty( $image_result['remaining'] );
 		$processed_image_refresh = isset( $image_refresh_result['processed'] ) ? absint( $image_refresh_result['processed'] ) : 0;
 		$remaining_image_refresh = ! empty( $image_refresh_result['remaining'] );
+		$automation_progressed = ! empty( $image_refresh_automation['progressed'] );
+		$automation_continue   = ! empty( $image_refresh_automation['needsContinuation'] );
 		$processed_reprice  = isset( $reprice_result['processed'] ) ? absint( $reprice_result['processed'] ) : 0;
 		$remaining_reprice  = ! empty( $reprice_result['remaining'] );
 		$processed_recategorize = isset( $recategorize_result['processed'] ) ? absint( $recategorize_result['processed'] ) : 0;
@@ -246,6 +255,10 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		if ( $processed_image_refresh > 0 && $remaining_image_refresh ) {
+			$needs_continuation = true;
+		}
+
+		if ( $automation_progressed && $automation_continue ) {
 			$needs_continuation = true;
 		}
 
@@ -273,6 +286,7 @@ class Mobo_Core_Cron_Runner {
 			'webhookQueue'      => $webhook_result,
 			'imageQueue'        => $image_result,
 			'imageRefreshQueue' => $image_refresh_result,
+			'imageRefreshAutomation' => $image_refresh_automation,
 			'repriceQueue'      => $reprice_result,
 			'recategorizeQueue' => $recategorize_result,
 			'addressMapping'     => $address_mapping_result,

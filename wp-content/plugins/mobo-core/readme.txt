@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.63
+Stable tag: 10.31.70
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -30,7 +30,7 @@ Main features:
 * Optional automatic order submission for Mobo-only and mixed WooCommerce orders.
 * Address mapping for checkout country, state, and city values used in Iran.
 * Image refresh workflow for legacy images after a full Repair run.
-* Optional health reporting for cron, queue, memory, disk, and debug status.
+* Always-on operational health reporting for cron, queue, PHP/image capabilities, memory, disk, and debug status.
 * Optional order SMS notifications through the Persian WooCommerce SMS plugin.
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
@@ -71,7 +71,7 @@ The plugin may send or receive the following data depending on enabled settings:
 * WooCommerce order data needed for Mobo order submission, including customer name, phone, shipping address, selected shipping method, Mobo product/variation identifiers, and order item quantities.
 * Technical health data such as queue counts, cron state, PHP memory, disk space, and debug status.
 
-This communication happens only after the site administrator enters a Token or explicitly uses/enables related features such as synchronization, Repair/sync, webhook processing, checkout validation/order automation, image refresh, or health reporting. Sensitive external workflows such as order submission, health reporting, address mapping, and legacy image refresh are disabled by default on fresh installations.
+After the site administrator enters a Token, Mobo Core can communicate with the central service for licensing, synchronization, webhook processing, and always-on operational health reporting. Optional customer-facing workflows such as checkout validation, order submission, address mapping, and legacy image refresh remain controlled separately and are disabled by default on fresh installations.
 
 Service website:
 
@@ -134,6 +134,64 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 5. Queue, cron, and image refresh settings.
 
 == Changelog ==
+
+= 10.31.70 =
+* Added one authoritative image-refresh command center at the top of the tab instead of relying on scattered status boxes.
+* Clearly distinguishes an actively running batch, an enabled workflow waiting for the next runner, a stalled workflow, a paused workflow, approval gates, terminal errors, and a completed cycle.
+* Added current-stage progress, estimated whole-cycle progress, a nine-stage timeline, last real worker activity, Cron/Self Runner heartbeat, and the last batch summary.
+* Added tick start/finish diagnostics and runtime-lock visibility so timeout or abandoned batch conditions are visible to the administrator.
+* Clarified that the live AJAX timestamp is only the time the page display was refreshed, not proof that the background worker ran.
+
+= 10.31.69 =
+* Added automatic live status refresh to the image-refresh tab without reloading the WordPress admin page.
+* Refreshes automation stage, progress counters, queues, errors, button locks, deletion approvals, and the recommended next step.
+* Uses adaptive polling: every four seconds while automation is active and every twelve seconds while idle.
+* Pauses polling when the tab is hidden or the administrator has unsaved form changes, preventing lost settings and unnecessary server load.
+* Added capability and nonce protected AJAX status rendering with retry backoff and non-blocking Self Runner wake-up.
+
+= 10.31.68 =
+* Added safe one-click automation for the complete legacy-image refresh workflow using bounded Cron/Self Runner batches.
+* Automated legacy scanning, queue construction, image replacement, WebP subsize audit/repair, and all verification rescans without repeated administrator clicks.
+* Kept destructive work behind two explicit one-time approvals: replaced old attachments and orphan raster families.
+* Automation now pauses safely on terminal queue failures, missing WebP support, unwritable uploads, incomplete subsize repair, or deletion errors.
+* Added start/resume, pause, run-one-batch, current-stage, last-run, and approval controls to the Persian image-refresh dashboard.
+* Locked manual workflow, reset, retry, and destructive switches while automation is active, with matching server-side guards.
+* Added automation state to operational Health Check reporting for Portal diagnostics.
+
+= 10.31.67 =
+* Rebuilt the image-refresh tab around one strict server-side workflow state machine shared by buttons, recommendations, settings, cron processing, and direct-request guards.
+* Legacy-image scanning must finish before queue construction; queue construction now shows an estimated remaining run count and must reach 100 percent before processing can start.
+* Added scan-cycle identifiers so a completed queue can only be processed when it belongs to the currently completed legacy-image scan.
+* Locked every image-maintenance action until its prerequisites are complete and added clearer Persian next-step instructions for stages 1 through 9.
+* Corrected retry and reset behavior: retries affect failed rows only, queue reset preserves stage 1, full reset restarts from stage 1, and all destructive switches are disabled after reset or upgrade.
+* Invalidated downstream WebP health and deletion audits whenever queue output changes, preventing an old audit from certifying newly processed media.
+* Corrected orphan-family deletion so stage 9 remains available until all current candidates are handled, then unlocks the final verification scan.
+
+= 10.31.66 =
+* Added a Mobo product marker beside WooCommerce products that contain `product_guid` metadata.
+* Added complete Mobo submenu navigation, a WordPress admin-toolbar Mobo menu, and plugin-screen shortcuts for settings and required plugins.
+* Added runtime, plugin-header, database, and packaged-file integrity checks with a dashboard warning when the installed files do not match the release manifest.
+* Made operational health reporting centrally configured and always active; added protected administrator-only phpinfo, PHP/image capability diagnostics, and bounded log containers.
+* Added separate cPanel and DirectAdmin commands for both `mobo-cron.php` and `wp-cron.php`, plus a visible `DISABLE_WP_CRON` configuration check.
+* Added automatic JavaScript-assisted matching for similar Mobo and WooCommerce categories without overwriting existing manual mappings.
+* Locked the Mobo checkout source URL, improved checkout-validation explanations, and added Webhook Security Code format warnings.
+* Added server image-engine readiness checks and clearer estimated progress/completion indicators for all image-maintenance scans.
+
+= 10.31.65 =
+* Added a dedicated read-only WebP subsize health scan and a separate controlled repair action with independent bounded cursors.
+* Subsize verification now checks attachment metadata, all currently required WordPress sizes, physical files, WebP output format, and GD/Imagick editor capability.
+* Regeneration is verified after execution; incomplete replacements are not assigned to products and legacy attachments are not deleted.
+* Added cumulative full-cycle scan reports, Persian status/error labels, manager-facing guidance, numbered operation order, conservative deletion defaults, and explicit fallback instructions.
+* Added detection and repair of stale metadata entries, missing physical cuts, incomplete metadata, and non-WebP derivative formats.
+* Added a separate full-cycle scan and safe deletion path for registered legacy attachments retained during a deletion-disabled dry run.
+
+= 10.31.64 =
+* Rebuilt legacy image cleanup around complete image families instead of one row per WordPress crop.
+* Registered Media Library originals and derivatives are now skipped before persistence, so normal 150x150, 768x1024, scaled, rotated, and edited files no longer flood the cleanup table.
+* Added bounded cursor traversal for legacy-image scans, queue construction, and orphan-family scans so repeated runs eventually cover the full library.
+* Added controlled generation/repair of WordPress WebP subsizes and safe cleanup of unregistered legacy derivatives after replacement.
+* Added revalidation of attachment, product, content, metadata, taxonomy, option, and physical-file references before destructive cleanup.
+* Building the refresh queue no longer starts immediate processing; execution remains explicit or cron-driven.
 
 = 10.31.63 =
 * Replaced generated city-asset file operations with the WordPress filesystem abstraction.
@@ -250,6 +308,27 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 * Updated plugin metadata, license headers, and GitHub URL.
 
 == Upgrade Notice ==
+
+= 10.31.70 =
+The image-refresh tab now starts with a single command center that states whether work is actually running, merely enabled, stalled, paused, waiting for approval, failed, or completed. Review this panel first after upgrade.
+
+= 10.31.69 =
+The image-refresh dashboard now updates itself while it remains open. Unsaved settings are protected: automatic refresh pauses as soon as a field is edited and resumes after the normal page reload following save.
+
+= 10.31.68 =
+Image refresh can now run automatically in bounded batches. Start it once, keep real Cron or Self Runner healthy, and intervene only for errors or the two explicit deletion approvals. All destructive approvals remain off after upgrade.
+
+= 10.31.67 =
+Image refresh is now a strict ordered workflow. Complete each scan until 100 percent, repeat queue construction until its cycle is complete, and use the enabled next-step button only. Refresh and destructive cleanup switches are disabled until their required audit stage is complete.
+
+= 10.31.66 =
+The dashboard now verifies the running version and packaged file hashes. Configure both recommended server cron jobs, verify that `DISABLE_WP_CRON` is true, and review the image-engine status before running image maintenance.
+
+= 10.31.65 =
+The image refresh screen now includes a numbered safe workflow plus dedicated WebP cut health scanning and verified repair. Old-attachment and orphan deletion are switched off on upgrade. Complete a full scan cycle before enabling them again.
+
+= 10.31.64 =
+Legacy image cleanup now treats the original and all WordPress derivatives as one family. Existing per-file cleanup rows are removed automatically and the new family list is rebuilt from a bounded scan.
 
 = 10.31.63 =
 Plugin Check filesystem findings were resolved with WP_Filesystem, and the obsolete Persian WooCommerce city-table database fallback was removed. No Sync or Repair is required.

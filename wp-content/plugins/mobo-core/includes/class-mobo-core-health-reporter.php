@@ -2,7 +2,7 @@
 /**
  * Customer-side WordPress health reporter.
  *
- * Builds a compact site-health snapshot and optionally posts it to MoboCore:
+ * Builds a compact site-health snapshot and posts it to MoboCore on the configured interval:
  * POST /api/site-health/report
  * X-SEC: <mobo_core_security_code>
  *
@@ -93,6 +93,11 @@ class Mobo_Core_Health_Reporter {
 			'actionSchedulerPastDue'=> $this->get_action_scheduler_past_due_count(),
 			'actionSchedulerFailed' => $this->get_action_scheduler_failed_count(),
 
+			'disableWpCronDefined'   => defined( 'DISABLE_WP_CRON' ),
+			'wpCronDisabled'         => defined( 'DISABLE_WP_CRON' ) && true === DISABLE_WP_CRON,
+			'imageProcessing'        => $this->get_image_processing_stats(),
+			'phpInfoSummary'         => $this->get_php_info_summary(),
+
 			'lastError'             => $last_error,
 		);
 	}
@@ -105,16 +110,6 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	public function send_report( $source = 'real-cron', $force = false ) {
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '0' ) ) {
-			return $this->save_result(
-				array(
-					'success' => true,
-					'status'  => 'disabled',
-					'message' => 'Health reporting is disabled.',
-				)
-			);
-		}
-
 		$min_interval = Mobo_Core_Settings::get_int( 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
 		$last_success = absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) );
 
@@ -122,7 +117,7 @@ class Mobo_Core_Health_Reporter {
 			return array(
 				'success' => true,
 				'status'  => 'throttled',
-				'message' => 'Health report was skipped because minimum interval has not passed.',
+				'message' => 'به دلیل نگذشتن حداقل فاصله زمانی، ارسال گزارش سلامت در این اجرا انجام نشد.',
 			);
 		}
 
@@ -133,7 +128,7 @@ class Mobo_Core_Health_Reporter {
 				array(
 					'success' => false,
 					'status'  => 'missing-url',
-					'message' => 'Health report URL is missing.',
+					'message' => 'آدرس مرکزی گزارش سلامت از API Base URL قابل محاسبه نیست.',
 				)
 			);
 		}
@@ -145,7 +140,7 @@ class Mobo_Core_Health_Reporter {
 				array(
 					'success' => false,
 					'status'  => 'missing-security-code',
-					'message' => 'Security code is missing.',
+					'message' => 'کد امنیتی وب هوک ثبت نشده است.',
 				)
 			);
 		}
@@ -175,7 +170,7 @@ class Mobo_Core_Health_Reporter {
 				array(
 					'success' => false,
 					'status'  => 'request-failed',
-					'message' => $response->get_error_message(),
+					'message' => 'ارسال گزارش سلامت ناموفق بود. جزئیات فنی: ' . $response->get_error_message(),
 				)
 			);
 		}
@@ -187,7 +182,7 @@ class Mobo_Core_Health_Reporter {
 			'success'    => $code >= 200 && $code < 300,
 			'status'     => $code >= 200 && $code < 300 ? 'sent' : 'http-error',
 			'httpStatus' => $code,
-			'message'    => $code >= 200 && $code < 300 ? 'Health report sent.' : 'MoboCore returned HTTP ' . $code,
+			'message'    => $code >= 200 && $code < 300 ? 'گزارش سلامت با موفقیت ارسال شد.' : 'MoboCore پاسخ HTTP ' . $code . ' برگرداند.',
 			'body'       => $this->trim_string( $body, 1000 ),
 		);
 
@@ -223,7 +218,7 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		return array(
-			'enabled'       => Mobo_Core_Settings::enabled( 'mobo_core_health_report_enabled', '0' ),
+			'enabled'       => true,
 			'reportUrl'     => $this->get_report_url(),
 			'lastAttemptAt' => absint( get_option( 'mobo_core_health_last_report_attempt_at', 0 ) ),
 			'lastSuccessAt' => absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) ),
@@ -254,12 +249,6 @@ class Mobo_Core_Health_Reporter {
 	 * @return string
 	 */
 	private function get_report_url() {
-		$explicit = (string) Mobo_Core_Settings::get( 'mobo_core_health_report_url', '' );
-
-		if ( '' !== trim( $explicit ) ) {
-			return esc_url_raw( trim( $explicit ) );
-		}
-
 		$base_url = apply_filters( 'mobo_core_api_base_url', '' );
 
 		if ( '' === trim( (string) $base_url ) ) {
@@ -271,6 +260,71 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		return trailingslashit( esc_url_raw( $base_url ) ) . 'api/site-health/report';
+	}
+
+
+	/**
+	 * Return a compact, non-secret PHP/runtime summary suitable for health reports.
+	 * Raw phpinfo output is intentionally never sent.
+	 *
+	 * @return array
+	 */
+	private function get_php_info_summary() {
+		$extensions = get_loaded_extensions();
+		sort( $extensions, SORT_NATURAL | SORT_FLAG_CASE );
+
+		return array(
+			'sapi'               => PHP_SAPI,
+			'os'                 => PHP_OS_FAMILY,
+			'iniFile'            => (string) php_ini_loaded_file(),
+			'memoryLimit'        => (string) ini_get( 'memory_limit' ),
+			'maxExecutionTime'   => (string) ini_get( 'max_execution_time' ),
+			'maxInputVars'       => (string) ini_get( 'max_input_vars' ),
+			'postMaxSize'        => (string) ini_get( 'post_max_size' ),
+			'uploadMaxFilesize'  => (string) ini_get( 'upload_max_filesize' ),
+			'extensions'         => array_values( $extensions ),
+		);
+	}
+
+	/**
+	 * Detect the active WordPress image stack and WebP support.
+	 *
+	 * @return array
+	 */
+	private function get_image_processing_stats() {
+		$gd_loaded       = extension_loaded( 'gd' );
+		$gd_webp         = $gd_loaded && function_exists( 'imagewebp' );
+		$imagick_loaded  = extension_loaded( 'imagick' ) && class_exists( 'Imagick' );
+		$imagick_webp    = false;
+
+		if ( $imagick_loaded ) {
+			try {
+				$formats = Imagick::queryFormats( 'WEBP' );
+				$imagick_webp = ! empty( $formats );
+			} catch ( Throwable $error ) {
+				$imagick_webp = false;
+			}
+		}
+
+		$wp_webp = function_exists( 'wp_image_editor_supports' ) ? wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) ) : ( $gd_webp || $imagick_webp );
+		$uploads = wp_upload_dir();
+		$automation = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
+
+		return array(
+			'gdLoaded'          => $gd_loaded,
+			'gdWebp'            => $gd_webp,
+			'imagickLoaded'     => $imagick_loaded,
+			'imagickWebp'       => $imagick_webp,
+			'wordpressWebp'     => (bool) $wp_webp,
+			'uploadsWritable'   => empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && is_writable( $uploads['basedir'] ),
+			'uploadsError'      => ! empty( $uploads['error'] ) ? (string) $uploads['error'] : '',
+			'refreshAutomationEnabled'         => ! empty( $automation['enabled'] ),
+			'refreshAutomationStep'            => absint( isset( $automation['currentStep'] ) ? $automation['currentStep'] : 0 ),
+			'refreshAutomationStatus'          => isset( $automation['status'] ) ? sanitize_key( (string) $automation['status'] ) : 'idle',
+			'refreshAutomationWaitingApproval' => isset( $automation['waitingApproval'] ) ? sanitize_key( (string) $automation['waitingApproval'] ) : '',
+			'refreshAutomationLastRunAt'        => absint( isset( $automation['lastRunAt'] ) ? $automation['lastRunAt'] : 0 ),
+			'refreshAutomationMessage'          => isset( $automation['message'] ) ? sanitize_text_field( (string) $automation['message'] ) : '',
+		);
 	}
 
 	/**

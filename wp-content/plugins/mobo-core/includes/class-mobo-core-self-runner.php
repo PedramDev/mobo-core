@@ -213,6 +213,11 @@ class Mobo_Core_Self_Runner {
 			return true;
 		}
 
+		$image_refresh_automation = isset( $result['imageRefreshAutomation'] ) && is_array( $result['imageRefreshAutomation'] ) ? $result['imageRefreshAutomation'] : array();
+		if ( ! empty( $image_refresh_automation['progressed'] ) && ! empty( $image_refresh_automation['needsContinuation'] ) ) {
+			return true;
+		}
+
 		$reprice = isset( $result['repriceQueue'] ) && is_array( $result['repriceQueue'] ) ? $result['repriceQueue'] : array();
 		$processed_reprice = isset( $reprice['processed'] ) ? absint( $reprice['processed'] ) : 0;
 		if ( $processed_reprice > 0 && ! empty( $reprice['remaining'] ) ) {

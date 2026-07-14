@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.31.63` and Portal `v25 / .NET 10`**
+**Generated against Mobo Core `10.31.70` and Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,13 +14,13 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.63` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.70` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.31.63` |
+| `MOBO_CORE_VERSION` | `10.31.70` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
@@ -218,12 +218,14 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_image_max_try` | `5` |
 | `mobo_core_image_retry_base_seconds` | `120` |
 | `mobo_core_image_refresh_enabled` | `'0'` |
-| `mobo_core_image_refresh_delete_old` | `'1'` |
+| `mobo_core_image_refresh_delete_old` | `'0'` |
+| `mobo_core_image_refresh_generate_subsizes` | `'1'` |
+| `mobo_core_image_refresh_cleanup_leftover_subsizes` | `'1'` |
 | `mobo_core_image_refresh_per_run` | `2` |
 | `mobo_core_image_refresh_scan_limit` | `500` |
 | `mobo_core_image_refresh_max_try` | `5` |
 | `mobo_core_image_refresh_retry_base_seconds` | `120` |
-| `mobo_core_orphan_image_cleanup_enabled` | `'1'` |
+| `mobo_core_orphan_image_cleanup_enabled` | `'0'` |
 | `mobo_core_orphan_image_scan_limit` | `500` |
 | `mobo_core_orphan_image_delete_per_run` | `20` |
 | `mobo_core_missing_variants_behavior` | `'outofstock'` |
@@ -251,8 +253,8 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_self_runner_last_run_at` | `0` |
 | `mobo_core_self_runner_last_run_success_at` | `0` |
 | `mobo_core_self_runner_last_run_result` | `array()` |
-| `mobo_core_health_report_enabled` | `'0'` |
-| `mobo_core_health_report_url` | `''` |
+| `mobo_core_health_report_enabled` | `'1'` (همیشه فعال / always on) |
+| `mobo_core_health_report_url` | حذف شده؛ مقصد از API مرکزی ساخته می شود / removed; derived from central API |
 | `mobo_core_health_report_min_interval_seconds` | `300` |
 | `mobo_core_health_report_timeout_seconds` | `15` |
 | `mobo_core_health_last_report_attempt_at` | `0` |
@@ -358,12 +360,15 @@ Public methods: **9** · Internal non-public methods: **23**
 
 Source: [`includes/class-mobo-core-admin.php`](includes/class-mobo-core-admin.php)  
 پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. / Persian administration UI and all plugin admin actions.  
-Public methods: **31** · Internal non-public methods: **94**
+Public methods: **45** · Internal non-public methods: **105**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public function init()` | ثبت hookها و راه اندازی پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Bootstrap admin hooks. |
 | `public function register_menu()` | اجرای عملیات `register_menu` در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Register admin menu. |
+| `public function register_admin_bar_menu($wp_admin_bar)` | افزودن منوی موبو و لینک تب ها به نوار بالای مدیریت وردپرس. | Add Mobo navigation to the WordPress admin toolbar. |
+| `public function add_mobo_product_post_state($post_states, $post)` | افزودن نشان موبویی کنار نام محصول دارای `product_guid`. | Add a Mobo marker beside WooCommerce products containing `product_guid`. |
+| `public function render_product_list_badge_styles()` | بارگذاری استایل محدودشده نشان موبویی در فهرست محصولات. | Render product-list-only styles for the Mobo badge. |
 | `public function enqueue_admin_assets($hook)` | اجرای عملیات `enqueue_admin_assets` در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Enqueue admin assets for the Mobo settings page. |
 | `public function render()` | اجرای عملیات `render` در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Render admin page. |
 | `public function handle_admin_tool_action()` | مدیریت رویداد یا درخواست admin tool action در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Handle separated admin/support tool actions without saving tab settings. |
@@ -371,6 +376,7 @@ Public methods: **31** · Internal non-public methods: **94**
 | `public function handle_ajax_sync_status()` | مدیریت رویداد یا درخواست ajax sync status در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Return current sync status for admin auto-refresh. |
 | `public function handle_ajax_reprice_status()` | مدیریت رویداد یا درخواست ajax reprice status در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Return current repricing status for AJAX polling on the pricing tab. |
 | `public function handle_ajax_recategorize_status()` | مدیریت رویداد یا درخواست ajax recategorize status در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Return current recategorize status for AJAX polling on the categories tab. |
+| `public function handle_ajax_image_refresh_live_status()` | دریافت امن HTML تازه تب نوسازی تصاویر برای بروزرسانی خودکار بدون reload صفحه. | Return the image-refresh tab fragment for protected live AJAX polling. |
 | `public function handle_sync_categories()` | مدیریت رویداد یا درخواست sync categories در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Sync categories before product sync so the customer can complete mapping. |
 | `public function handle_start_sync()` | مدیریت رویداد یا درخواست start sync در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Handle start sync. |
 | `public function handle_quarantine_duplicate_products()` | مدیریت رویداد یا درخواست quarantine duplicate products در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Move duplicate products to draft without deleting data. |
@@ -388,6 +394,10 @@ Public methods: **31** · Internal non-public methods: **94**
 | `public function handle_scan_legacy_images()` | مدیریت رویداد یا درخواست scan legacy images در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Scan old Mobo images. |
 | `public function handle_enqueue_image_refresh()` | مدیریت رویداد یا درخواست enqueue image refresh در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Enqueue legacy image refresh jobs. |
 | `public function handle_process_image_refresh()` | مدیریت رویداد یا درخواست process image refresh در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Process image refresh queue. |
+| `public function handle_scan_webp_subsizes()` | اسکن خواندنی سلامت برش های تصاویر WebP از پنل مدیریت. | Scan WebP subsize health without changing files. |
+| `public function handle_repair_webp_subsizes()` | بازسازی کنترل شده برش های ناقص WebP و نمایش نتیجه تایید نهایی. | Repair missing WebP subsizes and report verified results. |
+| `public function handle_scan_replaced_images()` | اسکن پیوست های قدیمی ثبت شده که قبلا با WebP جایگزین شده اند. | Scan registered legacy attachments already replaced by WebP. |
+| `public function handle_delete_replaced_images()` | حذف مرحله ای و دوباره اعتبارسنجی شده پیوست های قدیمی جایگزین شده. | Safely delete already-replaced legacy attachments. |
 | `public function handle_retry_image_refresh()` | مدیریت رویداد یا درخواست retry image refresh در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Retry failed image refresh rows. |
 | `public function handle_reset_image_refresh()` | مدیریت رویداد یا درخواست reset image refresh در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Reset image refresh queue. |
 | `public function handle_scan_orphan_images()` | مدیریت رویداد یا درخواست scan orphan images در بخش پنل مدیریت فارسی و تمام actionهای مدیریتی افزونه. | Scan orphan old raster files that match final Mobo WebP filenames. |
@@ -534,30 +544,33 @@ Public methods: **17** · Internal non-public methods: **11**
 
 Source: [`includes/class-mobo-core-image-refresh-queue.php`](includes/class-mobo-core-image-refresh-queue.php)  
 صف جداگانه نوسازی امن تصاویر قدیمی به WebP. / Separate queue for safe legacy-to-WebP refresh jobs.  
-Public methods: **14** · Internal non-public methods: **3**
+Public methods: **17** · Internal non-public methods: **3**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function table_name()` | برگرداندن نام جدول با prefix وردپرس. | Return table name. |
 | `public static function create_table()` | ایجاد یا بروزرسانی schema جدول داخلی. | Create/update table schema. |
 | `public static function table_exists()` | بررسی وجود جدول داخلی در دیتابیس. | Check whether table exists. |
-| `public function enqueue($job)` | اجرای عملیات `enqueue` در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Add/update one refresh job. |
+| `public function enqueue($job)` | افزودن یا بروزرسانی سازگار یک کار نوسازی. | Add/update one refresh job. |
+| `public function enqueue_with_result($job)` | افزودن کار همراه با نتیجه دقیق inserted/requeued/already queued/already done. | Add/update a refresh job and return its exact queue action. |
 | `public function get_due_jobs($limit)` | دریافت due jobs در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Get due jobs. |
 | `public function lock($id, $ttl = 120)` | اجرای عملیات `lock` در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Lock a job. |
 | `public function mark_done($id, $new_attachment_id, $note = '')` | ثبت وضعیت done در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Mark done. |
 | `public function mark_skipped($id, $message)` | ثبت وضعیت skipped در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Mark skipped. |
 | `public function mark_failure($id, $message, $try_count, $final_failed = false)` | ثبت وضعیت failure در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Mark retry/failure. |
-| `public function retry_failed()` | تلاش مجدد برای failed در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Reset failed/skipped rows back to pending. |
+| `public function retry_failed()` | تلاش مجدد فقط برای ردیف های failed در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Reset failed rows back to pending. |
 | `public function reset($only_done = false)` | اجرای عملیات `reset` در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Clear queue rows. |
 | `public function count_due()` | شمارش due در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Count due jobs. |
 | `public function get_status()` | دریافت status در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Get status counters. |
+| `public function count_active_processing()` | شمارش ردیف هایی که قفل پردازش معتبر دارند. | Count rows owned by a live processor. |
+| `public function count_waiting_retry()` | شمارش ردیف هایی که زمان retry آن ها هنوز نرسیده است. | Count rows waiting for their retry time. |
 | `public function get_recent_rows($limit = 20)` | دریافت recent rows در بخش صف جداگانه نوسازی امن تصاویر قدیمی به WebP. | Get recent rows for admin diagnostics. |
 
 ### `Mobo_Core_Image_Refresh_Service`
 
 Source: [`includes/class-mobo-core-image-refresh-service.php`](includes/class-mobo-core-image-refresh-service.php)  
 اسکن و پردازش نوسازی تصاویر قدیمی. / Scans and processes legacy image refresh work.  
-Public methods: **4** · Internal non-public methods: **21**
+Public methods: **9** · Internal non-public methods: **37**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -565,6 +578,26 @@ Public methods: **4** · Internal non-public methods: **21**
 | `public function scan_legacy_images($limit = 500)` | اجرای عملیات `scan_legacy_images` در بخش اسکن و پردازش نوسازی تصاویر قدیمی. | Scan legacy Mobo attachments without changing data. |
 | `public function enqueue_legacy_images($limit = 500)` | اجرای عملیات `enqueue_legacy_images` در بخش اسکن و پردازش نوسازی تصاویر قدیمی. | Build refresh queue from legacy Mobo attachments. |
 | `public function process_queue($limit = 0)` | پردازش queue در بخش اسکن و پردازش نوسازی تصاویر قدیمی. | Process bounded refresh jobs. |
+| `public function audit_webp_subsizes($limit = 500, $repair = false)` | اسکن خواندنی یا بازسازی کنترل شده برش های ناقص WebP همراه با تایید نهایی فایل و متادیتا. | Audit or repair WebP attachment subsizes and verify the result. |
+| `public function audit_replaced_legacy_attachments($limit = 500, $delete = false)` | اسکن یا حذف امن پیوست های قدیمی ثبت شده که در اجرای آزمایشی پس از جایگزینی نگه داشته شده اند. | Audit or safely delete registered legacy attachments retained after replacement. |
+| `public function reset_cursors()` | ریست cursor مستقل اسکن و ساخت صف و گزارش های آخر. | Reset independent scan/enqueue cursors and their last reports. |
+| `public function reset_workflow_state($keep_legacy_scan = true)` | ریست ساخت صف و مراحل وابسته، با امکان حفظ نتیجه مرحله ۱. | Reset queue construction and dependent workflow stages. |
+| `public function invalidate_post_queue_verification_state()` | بی اعتبار کردن اسکن های سلامت و حذف پس از تغییر خروجی صف. | Invalidate downstream verification after queue output changes. |
+
+### `Mobo_Core_Image_Refresh_Automation`
+
+Source: [`includes/class-mobo-core-image-refresh-automation.php`](includes/class-mobo-core-image-refresh-automation.php)  
+هماهنگ کننده اجرای خودکار امن نوسازی تصاویر. / Coordinates safe automated legacy-image refresh work.  
+Public methods: **6** · Internal non-public methods: **10**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function get_status()` | وضعیت اجرا، مرحله، زمان شروع و پایان tick، قفل فعال و تاییدهای در انتظار را برمی گرداند. | Return automation state, tick diagnostics, active-lock state, stage, timestamps, and pending approvals. |
+| `public function start()` | چرخه را بدون از بین بردن پیشرفت امن شروع یا ادامه می دهد. | Start or resume the safe workflow. |
+| `public function pause($reason = ..., $status = 'paused')` | اجرا و تمام کلیدهای حذفی را خاموش می کند و پیشرفت را نگه می دارد. | Pause safely while preserving progress. |
+| `public function approve_delete_old()` | تایید یک باره مرحله حذف پیوست های قدیمی جایگزین شده را ثبت می کند. | Approve replaced-old-attachment deletion for the current gate. |
+| `public function approve_delete_orphans()` | تایید یک باره پاکسازی خانواده های بدون پیوست را ثبت می کند. | Approve orphan-family deletion for the current gate. |
+| `public function run_tick($source = 'real-cron')` | فقط یک عملیات batch محدود را اجرا و نتیجه ادامه یا توقف را ثبت می کند. | Execute one bounded Cron/Self Runner automation slice. |
 
 ### `Mobo_Core_Image_Sync`
 
@@ -605,12 +638,13 @@ Public methods: **13** · Internal non-public methods: **2**
 
 Source: [`includes/class-mobo-core-lock.php`](includes/class-mobo-core-lock.php)  
 قفل runtime مبتنی بر transient. / Transient-based runtime lock helper.  
-Public methods: **3** · Internal non-public methods: **1**
+Public methods: **4** · Internal non-public methods: **1**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function acquire($name, $ttl = 30)` | اجرای عملیات `acquire` در بخش قفل runtime مبتنی بر transient. | Acquire a named lock. |
 | `public static function release($name, $token)` | اجرای عملیات `release` در بخش قفل runtime مبتنی بر transient. | Release a named lock. |
+| `public static function is_locked($name)` | بررسی فقط خواندنی فعال بودن قفل برای نمایش وضعیت و تشخیص batch در حال اجرا. | Check whether a named runtime lock currently exists. |
 | `public static function force_release($name)` | اجرای عملیات `force_release` در بخش قفل runtime مبتنی بر transient. | Force delete a lock. |
 
 ### `Mobo_Core_Dependencies`
@@ -654,7 +688,7 @@ Public methods: **2** · Internal non-public methods: **7**
 
 Source: [`includes/class-mobo-core-migration.php`](includes/class-mobo-core-migration.php)  
 Migration گزینه ها، جدول ها و داده های legacy. / Migrates options, tables, and legacy data.  
-Public methods: **2** · Internal non-public methods: **13**
+Public methods: **2** · Internal non-public methods: **17**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -665,15 +699,16 @@ Public methods: **2** · Internal non-public methods: **13**
 
 Source: [`includes/class-mobo-core-orphan-image-cleanup.php`](includes/class-mobo-core-orphan-image-cleanup.php)  
 شناسایی و حذف محافظه کارانه فایل های تصویر orphan. / Conservatively identifies and removes orphan image files.  
-Public methods: **8** · Internal non-public methods: **15**
+Public methods: **9** · Internal non-public methods: **22**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function table_name()` | برگرداندن نام جدول با prefix وردپرس. | Return table name. |
-| `public static function create_table()` | ایجاد یا بروزرسانی schema جدول داخلی. | Create/update table schema. |
+| `public static function create_table()` | ایجاد یا بروزرسانی schema جدول خانواده های تصویر. | Create/update the image-family table schema. |
+| `public static function migrate_to_family_rows()` | حذف ردیف های قدیمی per-file و ریست cursor برای مهاجرت به مدل خانواده. | Remove old per-file actionable rows and reset the family scan cursor. |
 | `public static function table_exists()` | بررسی وجود جدول داخلی در دیتابیس. | Check whether table exists. |
-| `public function scan($limit = 500)` | اجرای عملیات `scan` در بخش شناسایی و حذف محافظه کارانه فایل های تصویر orphan. | Scan uploads for old raster files matching final Mobo WebP filenames. |
-| `public function delete_candidates($limit = 20)` | حذف candidates در بخش شناسایی و حذف محافظه کارانه فایل های تصویر orphan. | Delete bounded candidate rows after re-validating them. |
+| `public function scan($limit = 500)` | اسکن مرحله ای خانواده های raster متناظر با WebP و ذخیره فقط خانواده های واقعا یتیم. | Scan bounded WebP references and persist only fully orphaned raster families. |
+| `public function delete_candidates($limit = 20)` | حذف یک خانواده کامل بعد از revalidation تمام فایل ها و referenceها. | Delete bounded image families after full revalidation. |
 | `public function reset($only_rescanable = false)` | اجرای عملیات `reset` در بخش شناسایی و حذف محافظه کارانه فایل های تصویر orphan. | Reset table rows. |
 | `public function get_status()` | دریافت status در بخش شناسایی و حذف محافظه کارانه فایل های تصویر orphan. | Get summary status. |
 | `public function get_recent_rows($limit = 20)` | دریافت recent rows در بخش شناسایی و حذف محافظه کارانه فایل های تصویر orphan. | Get recent rows. |
@@ -966,7 +1001,7 @@ Public methods: **4** · Internal non-public methods: **31**
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.31.63`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.31.70`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 

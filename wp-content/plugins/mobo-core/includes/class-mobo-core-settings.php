@@ -61,12 +61,24 @@ class Mobo_Core_Settings {
 			'mobo_core_image_max_try'             => 5,
 			'mobo_core_image_retry_base_seconds'  => 120,
 			'mobo_core_image_refresh_enabled'     => '0',
-			'mobo_core_image_refresh_delete_old'  => '1',
+			'mobo_core_image_refresh_delete_old'  => '0',
+			'mobo_core_image_refresh_generate_subsizes' => '1',
+			'mobo_core_image_refresh_cleanup_leftover_subsizes' => '1',
 			'mobo_core_image_refresh_per_run'     => 2,
 			'mobo_core_image_refresh_scan_limit'  => 500,
 			'mobo_core_image_refresh_max_try'     => 5,
 			'mobo_core_image_refresh_retry_base_seconds' => 120,
-			'mobo_core_orphan_image_cleanup_enabled' => '1',
+			'mobo_core_image_refresh_automation_enabled' => '0',
+			'mobo_core_image_refresh_auto_delete_old_approved' => '0',
+			'mobo_core_image_refresh_auto_delete_orphan_approved' => '0',
+			'mobo_core_image_refresh_automation_started_at' => 0,
+			'mobo_core_image_refresh_automation_completed_at' => 0,
+			'mobo_core_image_refresh_automation_last_run_at' => 0,
+			'mobo_core_image_refresh_automation_last_tick_started_at' => 0,
+			'mobo_core_image_refresh_automation_last_tick_finished_at' => 0,
+			'mobo_core_image_refresh_automation_last_tick_source' => '',
+			'mobo_core_image_refresh_automation_last_result' => array(),
+			'mobo_core_orphan_image_cleanup_enabled' => '0',
 			'mobo_core_orphan_image_scan_limit' => 500,
 			'mobo_core_orphan_image_delete_per_run' => 20,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
@@ -102,8 +114,7 @@ class Mobo_Core_Settings {
 			'mobo_core_self_runner_last_run_result'    => array(),
 
 			// Customer-side health reporting to MoboCore.
-			'mobo_core_health_report_enabled'          => '0',
-			'mobo_core_health_report_url'              => '',
+			'mobo_core_health_report_enabled'          => '1',
 			'mobo_core_health_report_min_interval_seconds' => 300,
 			'mobo_core_health_report_timeout_seconds'  => 15,
 			'mobo_core_health_last_report_attempt_at'  => 0,
@@ -226,9 +237,10 @@ class Mobo_Core_Settings {
 		self::save_url( $post, 'mobo_core_api_base_url' );
 		self::save_text( $post, 'mobo_core_token' );
 		self::save_text( $post, 'mobo_core_cron_token' );
-		self::save_url( $post, 'mobo_core_health_report_url' );
+		delete_option( 'mobo_core_health_report_url' );
+		update_option( 'mobo_core_health_report_enabled', '1', false );
 		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
-		self::save_url( $post, 'mobo_core_checkout_mobo_site_url' );
+		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
 		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
 		if ( isset( $post['mobo_core_checkout_mobo_password'] ) ) {
 			$password = sanitize_text_field( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
@@ -325,7 +337,7 @@ class Mobo_Core_Settings {
 		self::save_bool_if_present( $post, 'mobo_core_self_runner_continue_enabled' );
 		self::save_int_if_present( $post, 'mobo_core_self_runner_min_interval_seconds', 3, 0, 60 );
 		self::save_int_if_present( $post, 'mobo_core_self_runner_http_timeout_seconds', 1, 1, 10 );
-		self::save_bool( $post, 'mobo_core_health_report_enabled' );
+		update_option( 'mobo_core_health_report_enabled', '1', false );
 		self::save_int( $post, 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
 		self::save_int( $post, 'mobo_core_health_report_timeout_seconds', 15, 5, 60 );
 

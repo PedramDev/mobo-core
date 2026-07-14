@@ -99,10 +99,23 @@ class Mobo_Core_Image_Refresh_Queue {
 	 * @return bool
 	 */
 	public function enqueue( $job ) {
+		$result = $this->enqueue_with_result( $job );
+
+		return ! empty( $result['success'] );
+	}
+
+	/**
+	 * Add/update one refresh job and report whether it was newly queued,
+	 * re-queued, already pending, or already completed.
+	 *
+	 * @param array $job Job data.
+	 * @return array
+	 */
+	public function enqueue_with_result( $job ) {
 		global $wpdb;
 
 		if ( ! self::table_exists() || ! is_array( $job ) ) {
-			return false;
+			return array( 'success' => false, 'action' => 'invalid' );
 		}
 
 		$product_id        = absint( isset( $job['product_id'] ) ? $job['product_id'] : 0 );
@@ -111,14 +124,13 @@ class Mobo_Core_Image_Refresh_Queue {
 		$new_source_url    = esc_url_raw( (string) ( isset( $job['new_source_url'] ) ? $job['new_source_url'] : '' ) );
 
 		if ( $product_id <= 0 || '' === $image_guid || $old_attachment_id <= 0 || '' === $new_source_url ) {
-			return false;
+			return array( 'success' => false, 'action' => 'invalid' );
 		}
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$key   = $this->queue_key( $product_id, $image_guid, $old_attachment_id );
-
-		$data = array(
+		$data  = array(
 			'queue_key'         => $key,
 			'product_id'        => $product_id,
 			'product_guid'      => sanitize_text_field( (string) ( isset( $job['product_guid'] ) ? $job['product_guid'] : '' ) ),
@@ -137,16 +149,32 @@ class Mobo_Core_Image_Refresh_Queue {
 		);
 
 		if ( is_array( $existing ) ) {
+			$id     = absint( $existing['id'] );
 			$status = sanitize_key( (string) $existing['status'] );
 
-			if ( 'done' !== $status ) {
-				$data['status']        = 'pending';
-				$data['next_retry_at'] = null;
-				$data['locked_until']  = null;
-				$data['last_error']    = null;
+			if ( 'done' === $status ) {
+				$wpdb->update( $table, $data, array( 'id' => $id ) );
+				return array( 'success' => true, 'action' => 'already_done', 'id' => $id );
 			}
 
-			return false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ) );
+			if ( in_array( $status, array( 'pending', 'processing' ), true ) ) {
+				/* Do not unlock/reset a row that another runner may currently own. */
+				$wpdb->update( $table, $data, array( 'id' => $id ) );
+				return array( 'success' => true, 'action' => 'already_queued', 'id' => $id );
+			}
+
+			$data['status']        = 'pending';
+			$data['try_count']     = 0;
+			$data['next_retry_at'] = null;
+			$data['locked_until']  = null;
+			$data['last_error']    = null;
+			$updated               = $wpdb->update( $table, $data, array( 'id' => $id ) );
+
+			return array(
+				'success' => false !== $updated,
+				'action'  => false !== $updated ? 'requeued' : 'failed',
+				'id'      => $id,
+			);
 		}
 
 		$data['new_attachment_id'] = 0;
@@ -156,8 +184,13 @@ class Mobo_Core_Image_Refresh_Queue {
 		$data['locked_until']      = null;
 		$data['last_error']        = null;
 		$data['created_at']        = $now;
+		$inserted                  = $wpdb->insert( $table, $data );
 
-		return false !== $wpdb->insert( $table, $data );
+		return array(
+			'success' => false !== $inserted,
+			'action'  => false !== $inserted ? 'inserted' : 'failed',
+			'id'      => false !== $inserted ? absint( $wpdb->insert_id ) : 0,
+		);
 	}
 
 	/**
@@ -302,7 +335,7 @@ class Mobo_Core_Image_Refresh_Queue {
 	}
 
 	/**
-	 * Reset failed/skipped rows back to pending.
+	 * Reset failed rows back to pending.
 	 *
 	 * @return int
 	 */
@@ -321,7 +354,7 @@ class Mobo_Core_Image_Refresh_Queue {
 				$wpdb->prepare(
 					"UPDATE {$table}
 					SET status = 'pending', next_retry_at = NULL, locked_until = NULL, updated_at = %s
-					WHERE status IN ('failed', 'skipped')",
+					WHERE status = 'failed'",
 					$now
 				)
 			)
@@ -384,15 +417,81 @@ class Mobo_Core_Image_Refresh_Queue {
 	 * @return array
 	 */
 	public function get_status() {
+		$pending_count    = $this->count_by_statuses( array( 'pending' ) );
+		$processing_count = $this->count_by_statuses( array( 'processing' ) );
+
 		return array(
-			'enabled'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '0' ),
-			'pending'    => $this->count_by_statuses( array( 'pending', 'processing' ) ),
-			'due'        => $this->count_due(),
-			'done'       => $this->count_by_statuses( array( 'done' ) ),
-			'skipped'    => $this->count_by_statuses( array( 'skipped' ) ),
-			'failed'     => $this->count_by_statuses( array( 'failed' ) ),
-			'lastResult' => get_option( 'mobo_core_image_refresh_last_result', array() ),
-			'lastScan'   => get_option( 'mobo_core_image_refresh_last_scan', array() ),
+			'enabled'          => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '0' ),
+			'pending'          => $pending_count + $processing_count,
+			'pendingRows'      => $pending_count,
+			'processing'       => $processing_count,
+			'activeProcessing' => $this->count_active_processing(),
+			'waitingRetry'     => $this->count_waiting_retry(),
+			'due'              => $this->count_due(),
+			'done'             => $this->count_by_statuses( array( 'done' ) ),
+			'skipped'          => $this->count_by_statuses( array( 'skipped' ) ),
+			'failed'           => $this->count_by_statuses( array( 'failed' ) ),
+			'scanCursor'       => absint( get_option( 'mobo_core_image_refresh_scan_cursor', 0 ) ),
+			'enqueueCursor'    => absint( get_option( 'mobo_core_image_refresh_enqueue_cursor', 0 ) ),
+			'lastResult'       => get_option( 'mobo_core_image_refresh_last_result', array() ),
+			'lastScan'         => get_option( 'mobo_core_image_refresh_last_scan', array() ),
+			'lastEnqueue'      => get_option( 'mobo_core_image_refresh_last_enqueue', array() ),
+		);
+	}
+
+	/**
+	 * Count rows that are currently owned by a live processor.
+	 *
+	 * @return int
+	 */
+	public function count_active_processing() {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+
+		return absint(
+			$wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table}
+					WHERE status = 'processing'
+					AND locked_until IS NOT NULL
+					AND locked_until >= %s",
+					$now
+				)
+			)
+		);
+	}
+
+	/**
+	 * Count pending rows whose retry time has not arrived yet.
+	 *
+	 * @return int
+	 */
+	public function count_waiting_retry() {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+
+		return absint(
+			$wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table}
+					WHERE status = 'pending'
+					AND next_retry_at IS NOT NULL
+					AND next_retry_at > %s",
+					$now
+				)
+			)
 		);
 	}
 

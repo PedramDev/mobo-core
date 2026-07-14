@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.63
+ * Version: 10.31.70
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,11 +20,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.63' );
+define( 'MOBO_CORE_VERSION', '10.31.70' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'MOBO_CORE_PURCHASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_CORE_CHECKOUT_SITE_URL', 'https://mobomobo.ir' );
 define( 'MOBO_CORE_GITHUB_URL', 'https://github.com/PedramDev/mobo-core' );
 define( 'MOBO_CORE_SALES_PHONE', '+989124508218' );
 define( 'MOBO_CORE_SALES_TEL_URL', 'tel:+989124508218' );
@@ -33,6 +34,24 @@ define( 'MOBO_CORE_SALES_WHATSAPP_URL', 'https://wa.me/989124508218' );
 define( 'MOBO_CORE_TECH_PHONE', '+989367362228' );
 define( 'MOBO_CORE_TECH_TELEGRAM_URL', 'https://t.me/Codeya' );
 define( 'MOBO_CORE_LEGACY_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-files/' );
+
+
+/**
+ * Keep settings and dependency links available on the Plugins screen even when
+ * a required plugin was deactivated after Mobo Core had already been enabled.
+ */
+add_filter(
+	'plugin_action_links_' . plugin_basename( __FILE__ ),
+	function ( $links ) {
+		$settings    = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core' ) ) . '">تنظیمات موبو</a>';
+		$health      = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core&tab=health' ) ) . '">سلامت</a>';
+		$woocommerce = '<a href="' . esc_url( admin_url( 'plugin-install.php?s=woocommerce&tab=search&type=term' ) ) . '">پیش نیاز WooCommerce</a>';
+		$persian_wc  = '<a href="' . esc_url( admin_url( 'plugin-install.php?s=persian-woocommerce&tab=search&type=term' ) ) . '">پیش نیاز ووکامرس فارسی</a>';
+
+		array_unshift( $links, $settings, $health, $woocommerce, $persian_wc );
+		return $links;
+	}
+);
 
 $mobo_core_upload = function_exists( 'wp_upload_dir' ) ? wp_upload_dir( null, false ) : array();
 $mobo_core_basedir = isset( $mobo_core_upload['basedir'] ) && is_string( $mobo_core_upload['basedir'] ) && '' !== trim( $mobo_core_upload['basedir'] )
@@ -89,6 +108,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-queu
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-service.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-orphan-image-cleanup.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-automation.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-recategorize-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';

@@ -81,6 +81,25 @@ class Mobo_Core_Lock {
 	}
 
 	/**
+	 * Check whether a named lock currently exists.
+	 *
+	 * This is read-only and is intended for admin diagnostics/status screens.
+	 *
+	 * @param string $name Lock name.
+	 * @return bool
+	 */
+	public static function is_locked( $name ) {
+		$name = sanitize_key( (string) $name );
+
+		if ( '' === $name ) {
+			return false;
+		}
+
+		$current = get_transient( self::key( $name ) );
+		return false !== $current && '' !== $current;
+	}
+
+	/**
 	 * Force delete a lock.
 	 *
 	 * Use only for admin/debug cleanup.

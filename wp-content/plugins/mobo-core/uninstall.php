@@ -82,6 +82,16 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_city_assets_status' );
 	delete_option( 'mobo_core_pw_options_last_check_at' );
 	delete_option( 'mobo_core_pw_options_last_enforced' );
+	delete_option( 'mobo_core_image_refresh_automation_enabled' );
+	delete_option( 'mobo_core_image_refresh_auto_delete_old_approved' );
+	delete_option( 'mobo_core_image_refresh_auto_delete_orphan_approved' );
+	delete_option( 'mobo_core_image_refresh_automation_started_at' );
+	delete_option( 'mobo_core_image_refresh_automation_completed_at' );
+	delete_option( 'mobo_core_image_refresh_automation_last_result' );
+	delete_option( 'mobo_core_image_refresh_automation_last_run_at' );
+	delete_option( 'mobo_core_image_refresh_automation_last_tick_started_at' );
+	delete_option( 'mobo_core_image_refresh_automation_last_tick_finished_at' );
+	delete_option( 'mobo_core_image_refresh_automation_last_tick_source' );
 	delete_transient( 'mobo_core_pw_options_enforced_notice' );
 
 	/*

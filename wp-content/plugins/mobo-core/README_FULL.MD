@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.63` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.31.70` · Compatible with Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 اجزای اصلی:
 
 1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.63**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+2. **Mobo Core 10.31.70**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.63` |
+| Mobo Core | `10.31.70` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -208,23 +208,44 @@ Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync 
 
 ## 11. تصاویر
 
-### صف Sync معمولی
+### صف همگام سازی معمولی
 
-جدول `wp_mobo_image_queue` وضعیت import تصاویر هر محصول را نگه می دارد. تعداد پردازش در هر run محدود است و retry با backoff انجام می شود.
+جدول `wp_mobo_image_queue` وضعیت دریافت تصاویر هر محصول را نگه می دارد. تعداد پردازش هر اجرا محدود است و تلاش دوباره با فاصله افزایشی انجام می شود. اگر یک تصویر WebP قبلا با همان `image_guid` یا نشانی منبع ثبت شده باشد، همان پیوست معتبر دوباره استفاده می شود و پیوست تکراری ساخته نمی شود.
 
-### نوسازی WebP
+### روند امن نوسازی WebP
 
-فرآیند Refresh جدا از صف معمولی است:
+بخش «نوسازی تصاویر» در پنل مدیر یک راهنمای مرحله ای فارسی، دکمه های شماره گذاری شده و کادر «پیشنهاد مرحله بعد» دارد. این کادر بر اساس وضعیت واقعی صف، پیمایش ها، خطاها و گزینه های ایمنی، اقدام بعدی را به مدیر اعلام می کند. ترتیب توصیه شده:
 
-1. تصویر raster قدیمی شناسایی می شود.
-2. job در `wp_mobo_image_refresh_queue` ساخته می شود.
-3. WebP جدید import می شود.
-4. محصول به attachment جدید وصل می شود.
-5. فقط پس از اثبات عدم استفاده، فایل/attachment قدیمی حذف می شود.
+1. از دیتابیس و `wp-content/uploads` پشتیبان کامل بگیرید.
+2. ترمیم محصولات را یک بار کامل کنید؛ تا قبل از آن این بخش قفل است.
+3. در اولین ارتقا از نسخه های قدیمی به 10.31.65 یا جدیدتر، گزینه حذف پیوست قدیمی و پاک سازی فایل های بدون پیوست خودکار خاموش می شوند. در اجرای آزمایشی اول آن ها را خاموش نگه دارید و ساخت برش های WebP را روشن کنید.
+4. «۱) بررسی تصاویر قدیمی» و «۲) ساخت صف نوسازی» را تا پایان یک دوره کامل اجرا کنید.
+5. «۳) پردازش مرحله ای صف» را تا صفر شدن ردیف های در انتظار، آماده پردازش و ناموفق ادامه دهید.
+6. «۴) اسکن سلامت برش های WebP» را تا پایان یک دوره کامل اجرا کنید.
+7. در صورت وجود نقص، «۵) بازسازی برش های ناقص WebP» را تا پایان دوره اجرا و دوباره مرحله ۴ را تکرار کنید.
+8. پس از سلامت صف و برش ها، ابتدا مرحله ۶ را با حذف خاموش تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، حذف پیوست قدیمی را فعال کنید و مرحله ۷ همان پیوست های جایگزین شده را با کنترل دوباره حذف می کند.
+9. در پایان، مرحله ۸ را با پاک سازی خاموش تا پایان اسکن خانواده های فیزیکی اجرا کنید. اگر خانواده آماده حذف وجود داشت، پاک سازی فایل های بدون پیوست را فعال کنید و مرحله ۹ را محدود و مرحله ای انجام دهید.
 
-### پاک سازی orphan
+ساخت صف، پردازش را همان لحظه شروع نمی کند. پردازش فقط با مرحله ۳ یا اجرای زمان بندی شده انجام می شود. اگر اجرای آزمایشی با حذف خاموش انجام شود، پیوست های قدیمی ثبت شده گم نمی شوند؛ متادیتای جایگزینی روی آن ها ذخیره می شود و مرحله های ۶ و ۷ دقیقا برای اسکن و حذف امن همین پیوست ها هستند.
 
-پاک سازی فقط بعد از یک Repair موفق unlock می شود. فایل باید داخل uploads باشد، Media Library آن را نشناسد، در content/meta/options مرجع نداشته باشد و WebP متناظر معتبر باشد.
+### کنترل و بازسازی برش ها
+
+برای هر پیوست WebP، ابزار داخلی موارد زیر را بررسی می کند:
+
+- وجود و غیرخالی بودن فایل اصلی؛
+- کامل بودن متادیتای تصویر؛
+- سایزهای لازم بر اساس اندازه های ثبت شده فعلی وردپرس و قالب؛
+- وجود فیزیکی تمام فایل های ثبت شده در `uploads`؛
+- WebP بودن فرمت برش های ثبت شده؛
+- توانایی GD یا Imagick در باز کردن و ساخت WebP.
+
+بازسازی با توابع استاندارد رسانه وردپرس انجام می شود. پس از بازسازی، همان کنترل ها دوباره اجرا می شوند. اگر حتی یک سایز، فایل یا فرمت همچنان ناقص باشد، عملیات ناموفق ثبت می شود، دلیل در جدول فارسی نمایش داده می شود، محصول به تصویر ناقص منتقل نمی شود و تصویر قدیمی حذف نمی شود. گزارش های اسکن و بازسازی در طول هر دوره تجمعی هستند و با cursor کل کتابخانه رسانه را پوشش می دهند.
+
+اگر بازسازی داخلی ناموفق بود، ابتدا فضای دیسک، مجوز نوشتن `uploads`، حافظه PHP و پشتیبانی WebP در GD یا Imagick را اصلاح کنید. سپس بازسازی داخلی و اسکن نهایی را دوباره اجرا کنید. برای بازسازی عمومی کتابخانه رسانه می توان از افزونه `Regenerate Thumbnails` استفاده کرد. `Force Regenerate Thumbnails` تهاجمی تر است و فقط پس از پشتیبان کامل مناسب است. این افزونه ها مشکل نبود پشتیبانی WebP در سرور را برطرف نمی کنند.
+
+### پاک سازی خانواده های قدیمی
+
+فایل اصلی و مشتقات `150x150`، `768x1024`، `scaled`، `rotated` و نسخه های ویرایش شده یک خانواده محسوب می شوند. خانواده های ثبت شده در کتابخانه رسانه اصلا داخل جدول حذف ذخیره نمی شوند. هر خانواده آماده حذف پیش از پاک شدن دوباره از نظر attachment، محصول، محتوای نوشته، post meta، term meta، user meta، options و فایل فیزیکی کنترل می شود. پاک سازی فقط پس از یک ترمیم موفق باز می شود و حذف به صورت محدود و مرحله ای انجام می شود.
 
 ## 12. Checkout و ثبت سفارش
 
@@ -439,7 +460,7 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 Primary components:
 
 1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.63**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+2. **Mobo Core 10.31.70**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -449,7 +470,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.63` |
+| Mobo Core | `10.31.70` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
@@ -593,7 +614,13 @@ Pricing can include API price/compare price, legacy rules, global adjustments, t
 
 ## 11. Images
 
-Normal imports use `wp_mobo_image_queue`. WebP refresh uses the separate `wp_mobo_image_refresh_queue` and deletes an old attachment only after the new attachment is imported, assigned, and the old file is proven unused. Orphan cleanup stays locked until a successful Repair has completed.
+Normal imports use `wp_mobo_image_queue`. Repeated work reuses an existing valid WebP attachment matched by image GUID or source URL instead of creating a duplicate.
+
+The administrator-facing refresh workflow is numbered and intentionally conservative: back up the database and uploads, complete one product Repair, scan legacy images through a full cursor cycle, build the queue without immediate execution, process it, run the dedicated WebP-subsize health scan, repair missing cuts, and only then enable destructive cleanup. On the first 10.31.65-or-newer image-maintenance upgrade run, old-attachment deletion and orphan deletion are switched off and require an explicit administrator opt-in after verification.
+
+Subsize health checks the original file, attachment metadata, currently registered WordPress sizes, physical files, WebP output format, and GD/Imagick editor capability. Repair uses WordPress media APIs and then verifies the result again. A replacement is not assigned and the legacy attachment is not deleted when any required size, physical file, metadata field, or WebP format remains incomplete. Scan and repair results accumulate across the current cursor cycle.
+
+The original raster and all WordPress derivatives such as `150x150`, `scaled`, `rotated`, and edited copies are treated as one image family. Registered Media Library families are not persisted as orphan candidates. A separate replaced-attachment scanner handles dry runs where the product was moved to WebP while the old registered Media Library attachment was intentionally kept. It follows durable replacement metadata, verifies the replacement and all cuts, and only then offers bounded safe deletion. Every destructive deletion is revalidated against attachment, product, content, metadata, taxonomy, options, and physical files. Orphan cleanup remains locked until a successful Repair has completed.
 
 ## 12. Checkout and order submission
 
