@@ -292,7 +292,17 @@ class Mobo_Core_Image_Sync {
 			$try_count = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
 			$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_image_max_try', 5, 1, 20 );
 
-			$queue->mark_failure( $id, 'Image download failed.', $try_count, $try_count >= $max_try );
+			$error_message = 'Image download failed.';
+			if ( class_exists( 'Mobo_Core_Shared_Media' ) ) {
+				$shared_error = Mobo_Core_Shared_Media::get_last_error();
+				if ( '' !== $shared_error ) {
+					$error_message = $shared_error;
+				} elseif ( ! Mobo_Core_Shared_Media::downloads_enabled() ) {
+					$error_message = 'Image download is disabled by wp-config and the shared image is not available yet.';
+				}
+			}
+
+			$queue->mark_failure( $id, $error_message, $try_count, $try_count >= $max_try );
 			$failed++;
 		}
 
@@ -336,6 +346,19 @@ class Mobo_Core_Image_Sync {
 
 		if ( $existing_id > 0 ) {
 			return $existing_id;
+		}
+
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::enabled() ) {
+			$shared_attachment_id = Mobo_Core_Shared_Media::import_attachment( $image_guid, $url, $product_id );
+			if ( $shared_attachment_id > 0 ) {
+				return absint( $shared_attachment_id );
+			}
+
+			if ( ! Mobo_Core_Shared_Media::downloads_enabled() ) {
+				return 0;
+			}
+		} elseif ( class_exists( 'Mobo_Core_Shared_Media' ) && ! Mobo_Core_Shared_Media::downloads_enabled() ) {
+			return 0;
 		}
 
 		if ( $this->is_local_or_private_image_url( $url ) ) {
@@ -789,8 +812,17 @@ class Mobo_Core_Image_Sync {
 			return;
 		}
 
+		$current_gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids( 'edit' ) ) ) ) );
+		if ( $current_gallery_ids === $gallery_ids ) {
+			return;
+		}
+
 		$product->set_gallery_image_ids( $gallery_ids );
 		$product->save();
+
+		if ( class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			Mobo_Core_Product_Activity::mark( $product_id, 'image_sync' );
+		}
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
@@ -810,9 +842,16 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+		$target_image_id = ! empty( $gallery_ids ) ? absint( $gallery_ids[0] ) : 0;
+		$current_image_id = absint( $product->get_image_id( 'edit' ) );
+		$current_gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids( 'edit' ) ) ) ) );
+
+		if ( $current_image_id === $target_image_id && $current_gallery_ids === $gallery_ids ) {
+			return;
+		}
 
 		if ( ! empty( $gallery_ids ) ) {
-			$product->set_image_id( absint( $gallery_ids[0] ) );
+			$product->set_image_id( $target_image_id );
 			$product->set_gallery_image_ids( $gallery_ids );
 		} else {
 			$product->set_image_id( 0 );
@@ -820,6 +859,10 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$product->save();
+
+		if ( class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			Mobo_Core_Product_Activity::mark( $product_id, 'image_sync' );
+		}
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
@@ -842,7 +885,22 @@ class Mobo_Core_Image_Sync {
 
 		$candidates = array_values( array_unique( array_filter( array_map( 'absint', $candidates ) ) ) );
 
+		$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::enabled();
+
 		foreach ( $candidates as $attachment_id ) {
+			if ( $shared_mode ) {
+				if ( ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+					// A local legacy copy must not block migration to the shared repository.
+					continue;
+				}
+
+				$refreshed = Mobo_Core_Shared_Media::refresh_attachment( $attachment_id, $image_guid, $url );
+				if ( $refreshed > 0 ) {
+					return $refreshed;
+				}
+				continue;
+			}
+
 			if ( $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
 				return $attachment_id;
 			}

@@ -5,8 +5,8 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.70-1f6feb)
-![Portal](https://img.shields.io/badge/Portal-v25%20%2F%20.NET%2010-512bd4)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.33.2-1f6feb)
+![Portal](https://img.shields.io/badge/Portal-v32%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
 ![WooCommerce](https://img.shields.io/badge/WooCommerce-8.2%2B-96588a?logo=woocommerce&logoColor=white)
@@ -39,7 +39,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 - نگاشت Variant قابل خرید موبو روی محصول ساده و جلوگیری از تبدیل اشتباه آن به محصول متغیر
 - اعتبارسنجی واقعی افزودن به سبد موبو؛ اجباری هنگام ثبت خودکار سفارش
 - پیامک بر اساس نوع سفارش از طریق افزونه «پیامک حرفه ای ووکامرس»
-- Real Cron، Self Runner، گزارش سلامت و ابزارهای عیب یابی
+- Worker اختصاصی CLI برای cPanel، گزارش سلامت و ابزارهای عیب‌یابی
 - اعلام سازگاری با WooCommerce HPOS
 
 ### نیازمندی ها
@@ -51,8 +51,8 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WooCommerce | `8.2+` |
 | ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.70` |
-| Portal سازگار | `v25 / .NET 10` |
+| Mobo Core | `10.33.2` |
+| Portal سازگار | `v32 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
 ### نصب سریع
@@ -61,7 +61,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 2. WooCommerce و افزونه «ووکامرس فارسی» با slug برابر `persian-woocommerce` را نصب و فعال کنید. سپس Mobo Core را فعال کنید.
 3. از مسیر **موبو > خرید و فعال سازی** وضعیت حساب و لایسنس را بررسی کنید.
 4. در **موبو > اتصال**، مقدار API Base URL، Token و Webhook Security Code را وارد کنید.
-5. در **موبو > کران واقعی**، Cron Token را تنظیم و Cron سرور را فعال کنید.
+5. Constantهای Worker را در `wp-config.php` تعریف و Cron دقیقه‌ای cPanel را برای `mobo-cron.php` فعال کنید.
 6. قبل از فعال کردن ثبت خودکار سفارش، نگاشت کشور/استان را ذخیره کنید، فایل شهرهای موبو را بسازید و نگاشت روش ارسال را تست کنید.
 7. در سایت هایی که از نسخه های قدیمی مانند نسخه 7 ارتقا یافته اند، یک Repair کامل اجرا کنید.
 
@@ -69,7 +69,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.31.70:
+// مقدار فعلی پیش فرض افزونه در نسخه 10.33.2:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -86,13 +86,40 @@ X-SEC: <webhook-security-code>
 https://example.com/wp-json/mobo-core/v1/webhook
 ```
 
-مسیر کران واقعی:
+Worker اختصاصی cPanel:
 
-```text
-https://example.com/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+```php
+define( 'MOBO_QUEUE_WORKER_ENABLED', true );
+define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
+define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
+define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
 ```
 
+```cron
+* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
+```
+
+جزئیات: [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md)
+
 > Token، Security Code، رمز حساب موبو و Cron Token را داخل مخزن Git ثبت نکنید. اطلاعات حساب موبو در WordPress options ذخیره می شود؛ دسترسی مدیر، دیتابیس و فایل های backup باید محدود باشد.
+
+
+### تنظیمات مرکزی امضاشده
+
+از نسخه `10.33.0`، تنظیمات مدیریتی Mobo Core فقط در Portal ذخیره می‌شوند. افزونه یک JSON امضاشده با `RS256` دریافت می‌کند، آن را به Installation و Domain متصل می‌سنجد و فقط Cache معتبر `current/previous` را اجرا می‌کند. پس از اولین Bind، تغییر مستقیم `wp_options` روی تنظیمات، Token، Security Code، Cron Token و API URL اثری ندارد.
+
+برای Production ترجیحاً Bootstrap و Cache را خارج از دیتابیس/Web Root قرار دهید:
+
+```php
+define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_TOKEN', '...' );
+define( 'MOBO_SECURITY_CODE', '...' );
+define( 'MOBO_CRON_TOKEN', '...' );
+define( 'MOBO_CONFIG_KEY_ID', 'mobo-config-v1' );
+define( 'MOBO_CONFIG_CACHE_DIR', '/var/lib/mobo/config' );
+```
+
+جزئیات کامل: [`docs/CENTRAL-CONFIGURATION.md`](docs/CENTRAL-CONFIGURATION.md)
 
 ### مستندات
 
@@ -124,7 +151,7 @@ GPLv2 or later. فایل [`LICENSE`](LICENSE) را ببینید.
 
 ### مرکز وضعیت نوسازی تصاویر
 
-در نسخه 10.31.70 بالای تب نوسازی تصاویر یک مرکز وضعیت واحد نمایش داده می شود. این بخش به شکل مستقیم اعلام می کند عملیات در حال اجرای batch است، منتظر اجرای بعدی Cron/Self Runner مانده، متوقف شده، خطا دارد، منتظر تایید حذف است یا کامل شده است. مرحله جاری، درصد همان مرحله، پیشرفت تقریبی کل چرخه، آخرین فعالیت واقعی، سلامت موتور اجرا، نتیجه آخرین batch و مسیر ۹ مرحله ای نیز در همان کادر دیده می شوند.
+در نسخه 10.33.0 بالای تب نوسازی تصاویر یک مرکز وضعیت واحد نمایش داده می شود. این بخش به شکل مستقیم اعلام می کند عملیات در حال اجرای batch است، منتظر اجرای بعدی Cron/Self Runner مانده، متوقف شده، خطا دارد، منتظر تایید حذف است یا کامل شده است. مرحله جاری، درصد همان مرحله، پیشرفت تقریبی کل چرخه، آخرین فعالیت واقعی، سلامت موتور اجرا، نتیجه آخرین batch و مسیر ۹ مرحله ای نیز در همان کادر دیده می شوند.
 
 ### اجرای خودکار امن نوسازی تصاویر
 
@@ -138,7 +165,7 @@ GPLv2 or later. فایل [`LICENSE`](LICENSE) را ببینید.
 
 Mobo Core is a specialized WooCommerce integration for Iranian stores. It imports products, variations, categories, images, prices, and stock from MoboCore, then applies incremental changes delivered through webhooks. When explicitly enabled, it can also validate checkout data, map Mobo addresses and shipping methods, and submit eligible WooCommerce orders through the dedicated `mobomobo.ir` workflow.
 
-This repository contains the WordPress plugin. The current compatible backend is Portal v25 on `.NET 10`; no customer-facing documentation or code is added to the .NET project. All publishable customer documentation is maintained inside `mobo-core`.
+This repository contains the WordPress plugin. The current compatible backend is Portal v32 on `.NET 10`; no customer-facing documentation or code is added to the .NET project. All publishable customer documentation is maintained inside `mobo-core`.
 
 ### Main capabilities
 
@@ -152,7 +179,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 - Mobo country/state mapping, generated Mobo city assets for checkout, and WooCommerce-to-Mobo shipping mapping
 - Optional cart validation and asynchronous Mobo order submission
 - Order-type SMS notifications through Persian WooCommerce SMS
-- Real cron, loopback self-runner, health reporting, and diagnostics
+- Dedicated cPanel CLI queue worker, health reporting, and diagnostics
 - WooCommerce HPOS compatibility declaration
 
 ### Requirements
@@ -164,7 +191,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 | WooCommerce | `8.2+` |
 | Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.70` |
+| Mobo Core | `10.33.2` |
 | Compatible Portal | `v25 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 
@@ -174,7 +201,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`), then activate Mobo Core.
 3. Open **Mobo > Purchase & Activation** to verify the account and license.
 4. Open **Mobo > Connection** and enter the API base URL, Token, and Webhook Security Code.
-5. Configure a Cron Token in **Mobo > Real Cron**, then add the server cron request.
+5. Define the CLI worker constants in `wp-config.php`, then add the once-per-minute cPanel cron entry.
 6. Save country/state mapping, generate the Mobo city assets, and test shipping mapping before enabling automatic order submission.
 7. Run one full Repair after upgrading a legacy installation such as version 7.
 
@@ -182,7 +209,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 
 ```php
 // wp-config.php
-// Current built-in default in version 10.31.70:
+// Current built-in default in version 10.33.2:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -199,11 +226,20 @@ WordPress webhook endpoint:
 https://example.com/wp-json/mobo-core/v1/webhook
 ```
 
-Real-cron endpoint:
+Dedicated cPanel worker:
 
-```text
-https://example.com/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+```php
+define( 'MOBO_QUEUE_WORKER_ENABLED', true );
+define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
+define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
+define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
 ```
+
+```cron
+* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
+```
+
+See [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md).
 
 > Never commit the license Token, Security Code, Mobo account password, or Cron Token. Mobo account credentials are stored in WordPress options, so administrator access, database access, and backups must be protected.
 
@@ -238,3 +274,12 @@ GPLv2 or later. See [`LICENSE`](LICENSE).
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+
+## Private Shared Media
+
+Mobo Core 10.33.0 supports a hidden `wp-config.php`-only mode for a central,
+read-only image repository. A separate worker downloads originals, converts
+them to WebP and prepares the exact registered WordPress/WooCommerce cuts.
+Each WordPress site creates only local attachment records and never copies,
+resizes or deletes shared files. See `docs/SHARED-MEDIA.md`.

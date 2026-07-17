@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.70
+ * Version: 10.33.2
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.70' );
+define( 'MOBO_CORE_VERSION', '10.33.2' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -66,12 +66,18 @@ define( 'MOBO_CORE_WEBHOOK_FILE_DIR', MOBO_CORE_DATA_DIR . 'webhook-files/' );
  *
  * You can define this in wp-config.php or in your custom environment loader:
  *
- * define( 'MOBO_API_BASE_URL', 'http://dev.mobo.codeya.ir/' );
+ * define( 'MOBO_API_BASE_URL', 'https://dev.mobo.codeya.ir/' );
  *
  * If this is empty, API client may still fallback to mobo_core_api_base_url option.
  */
 if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
-	define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+	$mobo_api_base_url_env = getenv( 'MOBO_API_BASE_URL' );
+	define(
+		'MOBO_API_BASE_URL',
+		false !== $mobo_api_base_url_env && '' !== trim( (string) $mobo_api_base_url_env )
+			? (string) $mobo_api_base_url_env
+			: 'http://mobo.codeya.ir/'
+	);
 }
 
 /*
@@ -96,14 +102,18 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-activity.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-lock.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-queue-worker-lock.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-config.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-concurrency.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-api-client.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-map.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-event-store.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-map.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-queue.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shared-media.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-service.php';
@@ -199,6 +209,15 @@ add_action(
 		}
 
 		Mobo_Core_Migration::maybe_run();
+
+		/*
+		 * The .NET Portal is the source of truth for managed settings. Load the
+		 * last-known-good signed cache before any runtime component reads settings.
+		 */
+		Mobo_Core_Remote_Config::instance()->init();
+
+		/* Private wp-config-only shared image repository. */
+		Mobo_Core_Shared_Media::init();
 
 		/*
 		 * Queue/pagination settings must remain immutable while a resumable

@@ -22,6 +22,10 @@ class Mobo_Core_Self_Runner {
 	 * @return string
 	 */
 	public static function build_worker_url( $source = 'self-kick' ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return '';
+		}
+
 		$token = (string) get_option( 'mobo_core_cron_token', '' );
 
 		if ( '' === trim( $token ) ) {
@@ -45,6 +49,16 @@ class Mobo_Core_Self_Runner {
 	 * @return array
 	 */
 	public static function kick( $reason = 'webhook', $force = false ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return self::save_kick_result(
+				array(
+					'success' => true,
+					'status'  => 'managed-by-cli-worker',
+					'message' => 'The dedicated CLI queue worker will process this work.',
+				)
+			);
+		}
+
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ) ) {
 			return self::save_kick_result(
 				array(
@@ -172,6 +186,10 @@ class Mobo_Core_Self_Runner {
 	 * @return bool
 	 */
 	public static function should_continue_after_result( $result ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return false;
+		}
+
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_self_runner_continue_enabled', '1' ) ) {
 			return false;
 		}
@@ -241,7 +259,8 @@ class Mobo_Core_Self_Runner {
 		}
 
 		return array(
-			'enabled'            => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ),
+			'managedByCliWorker' => class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled(),
+			'enabled'            => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ) && ! ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ),
 			'continueEnabled'    => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_continue_enabled', '1' ),
 			'workerUrl'          => self::build_worker_url( 'manual' ),
 			'lastKickAttemptAt'  => absint( get_option( 'mobo_core_self_runner_last_kick_attempt_at', 0 ) ),

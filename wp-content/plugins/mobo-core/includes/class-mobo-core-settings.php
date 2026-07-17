@@ -187,6 +187,33 @@ class Mobo_Core_Settings {
 			$fallback = $defaults[ $key ];
 		}
 
+		if ( class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			$found = false;
+			$value = Mobo_Core_Remote_Config::instance()->get_value( $key, $found );
+			if ( $found ) {
+				return $value;
+			}
+		}
+
+		return get_option( $key, $fallback );
+	}
+
+	/**
+	 * Read a dynamically-named managed setting such as shipping mappings.
+	 *
+	 * @param string $key Option/configuration key.
+	 * @param mixed  $fallback Fallback.
+	 * @return mixed
+	 */
+	public static function get_dynamic( $key, $fallback = null ) {
+		if ( class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			$found = false;
+			$value = Mobo_Core_Remote_Config::instance()->get_value( $key, $found );
+			if ( $found ) {
+				return $value;
+			}
+		}
+
 		return get_option( $key, $fallback );
 	}
 
@@ -200,7 +227,7 @@ class Mobo_Core_Settings {
 	 * @return int
 	 */
 	public static function get_int( $key, $default, $min, $max ) {
-		$value = absint( get_option( $key, $default ) );
+		$value = absint( self::get( $key, $default ) );
 
 		if ( $value < $min ) {
 			return $min;
@@ -221,7 +248,7 @@ class Mobo_Core_Settings {
 	 * @return bool
 	 */
 	public static function enabled( $key, $default = '0' ) {
-		$value = get_option( $key, $default );
+		$value = self::get( $key, $default );
 
 		return in_array( strtolower( (string) $value ), array( '1', 'yes', 'true', 'on' ), true );
 	}

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.70` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.33.2` · Compatible with Portal `v33 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -20,8 +20,8 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 اجزای اصلی:
 
-1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.70**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+1. **MoboCore Portal v32**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
+2. **Mobo Core 10.33.2**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.70` |
+| Mobo Core | `10.33.2` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -164,23 +164,22 @@ Content-Type: application/json
 
 صف جدید ابتدا از جدول `wp_mobo_sync_events` استفاده می کند. اگر جدول در دسترس نباشد یا enqueue شکست بخورد، فایل JSON در `wp-content/uploads/mobo-core/webhook-files/` ذخیره می شود. مسیر fallback با `index.php` و `.htaccess` محافظت می شود.
 
-## 8. Cron واقعی و Self Runner
+## 8. Worker اختصاصی CLI برای cPanel
 
-Mobo Core برای عملیات حیاتی به WP-Cron وابسته نیست. Endpoint کران واقعی:
+در هاست‌هایی که Cron فقط هر یک دقیقه اجرا می‌شود، `mobo-cron.php` یک Process CLI محدود ایجاد می‌کند که تا حدود ۵۰ ثانیه زنده می‌ماند. Queueها در Roundهای چرخشی پردازش می‌شوند؛ در صورت انجام کار، Round بعدی فوری است و در صورت خالی بودن Queueها، Worker ده ثانیه صبر می‌کند.
 
-```text
-/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+```php
+define( 'MOBO_QUEUE_WORKER_ENABLED', true );
+define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
+define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
+define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
 ```
-
-نمونه cPanel/cron:
 
 ```cron
-* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
+* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
 ```
 
-در هر slice، Runner با بودجه زمانی محدود می تواند وب هوک، Sync، تصویر، Reprice، Recategorize، سفارش های queued، Health و maintenance را پردازش کند. lock داخلی مانع اجرای همزمان sliceهای تکراری می شود.
-
-Self Runner با loopback request غیرمسدودکننده، بعد از دریافت وب هوک یا شروع Sync یک اجرای محلی را kick می کند. Cron واقعی همچنان مسیر قابل اتکاتر برای production است.
+قفل اصلی `flock()` و Non-blocking است. Self Runner، اجرای Queue از REST، پردازش Queue سفارش توسط WP-Cron و پردازش Queue از Poll پنل، هنگام فعال بودن Worker اختصاصی غیرفعال می‌شوند. جزئیات کامل در [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md) است.
 
 ## 9. دسته بندی و Mapping
 
@@ -459,8 +458,8 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 
 Primary components:
 
-1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.70**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+1. **MoboCore Portal v32**: API, licensing, product data, event payloads, health, and central mappings.
+2. **Mobo Core 10.33.2**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -470,7 +469,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.70` |
+| Mobo Core | `10.33.2` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
@@ -588,21 +587,22 @@ Content-Type: application/json
 
 In lightweight mode, Portal sends metadata and a `changesUrl`. The plugin retrieves the real payload with `X-SEC` and `Token`. The primary queue is `wp_mobo_sync_events`; protected JSON files under `wp-content/uploads/mobo-core/webhook-files/` are used only as a fallback.
 
-## 8. Real cron and self-runner
+## 8. Dedicated cPanel CLI worker
 
-Production endpoint:
+`mobo-cron.php` is started once per minute and keeps the same CLI process alive for a bounded window. Ready queues continue immediately; idle queues are checked again after the configured sleep interval.
 
-```text
-/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+```php
+define( 'MOBO_QUEUE_WORKER_ENABLED', true );
+define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
+define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
+define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
 ```
-
-Example:
 
 ```cron
-* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
+* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
 ```
 
-Each bounded slice may process webhooks, sync, images, repricing, recategorization, queued orders, health, and maintenance. The self-runner uses non-blocking loopback requests to accelerate progress after a webhook or sync start, but real cron remains the recommended production scheduler.
+The worker uses a non-blocking OS `flock`, rotates queue order to avoid starvation, and disables loopback/REST/WP-Cron queue execution while dedicated mode is enabled. See [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md).
 
 ## 9. Category mapping
 
@@ -732,3 +732,12 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+
+## Private Shared Media
+
+Mobo Core 10.33.0 supports a hidden `wp-config.php`-only mode for a central,
+read-only image repository. A separate worker downloads originals, converts
+them to WebP and prepares the exact registered WordPress/WooCommerce cuts.
+Each WordPress site creates only local attachment records and never copies,
+resizes or deletes shared files. See `docs/SHARED-MEDIA.md`.

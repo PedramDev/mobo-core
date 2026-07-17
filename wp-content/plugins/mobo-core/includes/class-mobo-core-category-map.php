@@ -88,6 +88,14 @@ class Mobo_Core_Category_Map {
 	 * @return int
 	 */
 	public function get_manual_term_id( $guid ) {
+		if ( class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			$remote_config = Mobo_Core_Remote_Config::instance();
+			if ( $remote_config->is_enforced() ) {
+				$term_id = $remote_config->get_category_term_id( $guid );
+				return $term_id > 0 && $this->term_exists( $term_id ) ? $term_id : 0;
+			}
+		}
+
 		return $this->get_term_id_by_column( $guid, 'manual_term_id', true );
 	}
 
@@ -101,6 +109,19 @@ class Mobo_Core_Category_Map {
 	 * @return int
 	 */
 	public function get_manual_term_id_by_identifiers( $identifiers ) {
+		if ( is_array( $identifiers ) && class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			$remote_config = Mobo_Core_Remote_Config::instance();
+			if ( $remote_config->is_enforced() ) {
+				foreach ( $identifiers as $identifier ) {
+					$term_id = $remote_config->get_category_term_id( $identifier );
+					if ( $term_id > 0 && $this->term_exists( $term_id ) ) {
+						return $term_id;
+					}
+				}
+				return 0;
+			}
+		}
+
 		return $this->get_term_id_by_identifiers( $identifiers, 'manual_term_id', true );
 	}
 
@@ -321,6 +342,10 @@ class Mobo_Core_Category_Map {
 	 * @return bool
 	 */
 	public function update_manual_mapping( $guid, $term_id ) {
+		if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
+			return false;
+		}
+
 		global $wpdb;
 
 		$guid    = sanitize_text_field( (string) $guid );
@@ -401,6 +426,11 @@ class Mobo_Core_Category_Map {
 
 		foreach ( $rows as $index => $row ) {
 			$manual_id = absint( isset( $row['manual_term_id'] ) ? $row['manual_term_id'] : 0 );
+			if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
+				$remote_guid = isset( $row['remote_guid'] ) ? (string) $row['remote_guid'] : '';
+				$manual_id = Mobo_Core_Remote_Config::instance()->get_category_term_id( $remote_guid );
+				$rows[ $index ]['manual_term_id'] = $manual_id;
+			}
 			$synced_id = absint( isset( $row['synced_term_id'] ) ? $row['synced_term_id'] : 0 );
 
 			$rows[ $index ]['manual_term_name'] = $manual_id > 0 ? $this->get_term_name( $manual_id ) : '';

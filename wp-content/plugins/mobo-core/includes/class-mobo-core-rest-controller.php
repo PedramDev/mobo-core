@@ -284,6 +284,42 @@ class Mobo_Core_Rest_Controller {
 			);
 		}
 
+		$event = '';
+		foreach ( array( 'event', 'Event', 'type', 'Type' ) as $event_key ) {
+			if ( isset( $payload[ $event_key ] ) ) {
+				$event = (string) $payload[ $event_key ];
+				break;
+			}
+		}
+		if ( '22' === $event ) {
+			$event = 'ConfigurationChanged';
+		}
+		if ( 'ConfigurationChanged' === $event ) {
+			$result = class_exists( 'Mobo_Core_Remote_Config' )
+				? Mobo_Core_Remote_Config::instance()->refresh( true, 'webhook-notification' )
+				: array( 'success' => false, 'status' => 'remote-config-unavailable' );
+
+			if ( ! empty( $result['success'] ) || ( isset( $result['status'] ) && 'locked' === $result['status'] ) ) {
+				return rest_ensure_response(
+					array(
+						'success'       => true,
+						'status'        => 'configuration-notification-accepted',
+						'configuration' => $result,
+					)
+				);
+			}
+
+			$message = isset( $result['message'] ) ? (string) $result['message'] : 'Signed configuration refresh failed.';
+			return new WP_Error(
+				'mobo_core_configuration_refresh_failed',
+				$message,
+				array(
+					'status'        => 503,
+					'configuration' => $result,
+				)
+			);
+		}
+
 		$queue = new Mobo_Core_Webhook_Queue();
 		$file  = $queue->store( $payload );
 
@@ -297,7 +333,9 @@ class Mobo_Core_Rest_Controller {
 			'remainingFile' => true,
 		);
 
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_process_webhook_on_receive', '0' ) ) {
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_process_webhook_on_receive', '0' )
+			&& ! ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() )
+		) {
 			$process_result = $queue->process();
 		}
 
@@ -333,6 +371,10 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_real_cron( $request ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return $this->cli_worker_managed_response();
+		}
+
 		$runner = new Mobo_Core_Cron_Runner();
 
 		return rest_ensure_response( $runner->run( 'real-cron' ) );
@@ -365,6 +407,10 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_self_worker( $request ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return $this->cli_worker_managed_response();
+		}
+
 		$source = sanitize_key( (string) $request->get_param( 'source' ) );
 
 		if ( '' === $source ) {
@@ -447,6 +493,10 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_webhook_queue( $request ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return $this->cli_worker_managed_response();
+		}
+
 		try {
 			$queue = new Mobo_Core_Webhook_Queue();
 			return rest_ensure_response( $queue->process() );
@@ -538,6 +588,10 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_product_sync( $request ) {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return $this->cli_worker_managed_response();
+		}
+
 		$lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
 
 		if ( false === $lock ) {
@@ -608,4 +662,22 @@ class Mobo_Core_Rest_Controller {
 
 		return ! empty( $value );
 	}
+
+	/**
+	 * Return a consistent response when the dedicated cPanel CLI worker owns
+	 * queue execution.
+	 *
+	 * @return WP_REST_Response
+	 */
+	private function cli_worker_managed_response() {
+		return new WP_REST_Response(
+			array(
+				'success' => true,
+				'status'  => 'managed-by-cli-worker',
+				'message' => 'Queue execution is managed by the dedicated CLI worker.',
+			),
+			202
+		);
+	}
+
 }

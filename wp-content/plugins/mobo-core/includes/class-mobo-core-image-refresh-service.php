@@ -71,12 +71,45 @@ class Mobo_Core_Image_Refresh_Service {
 	}
 
 	/**
+	 * Shared-media mode delegates download, conversion and every registered cut
+	 * to the central mirror worker. WordPress must remain read-only.
+	 *
+	 * @param array $extra Extra data.
+	 * @return array
+	 */
+	private function shared_media_result( $extra = array() ) {
+		return array_merge(
+			array(
+				'success'   => true,
+				'status'    => 'managed_by_shared_media',
+				'message'   => 'تولید، نوسازی و برش تصاویر توسط مخزن اشتراکی مرکزی انجام می‌شود و WordPress در این حالت فقط خواندنی است.',
+				'processed' => 0,
+				'failed'    => 0,
+				'skipped'   => 0,
+				'remaining' => false,
+			),
+			is_array( $extra ) ? $extra : array()
+		);
+	}
+
+	private function is_shared_media_mode() {
+		return class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::enabled();
+	}
+
+	/**
 	 * Scan legacy Mobo attachments without changing data.
 	 *
 	 * @param int $limit Limit.
 	 * @return array
 	 */
 	public function scan_legacy_images( $limit = 500 ) {
+		if ( $this->is_shared_media_mode() ) {
+			$result = $this->shared_media_result(
+				array( 'checkedAt' => time(), 'scanned' => 0, 'legacyRaster' => 0, 'queueable' => 0, 'totalLegacyBytes' => 0, 'cycleComplete' => true )
+			);
+			update_option( 'mobo_core_image_refresh_last_scan', $result, false );
+			return $result;
+		}
 		if ( ! $this->is_unlocked() ) {
 			$result = $this->locked_result(
 				array(
@@ -180,6 +213,13 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function enqueue_legacy_images( $limit = 500 ) {
+		if ( $this->is_shared_media_mode() ) {
+			$result = $this->shared_media_result(
+				array( 'checkedAt' => time(), 'scanned' => 0, 'enqueued' => 0, 'cycleComplete' => true, 'processingStarted' => false )
+			);
+			update_option( 'mobo_core_image_refresh_last_enqueue', $result, false );
+			return $result;
+		}
 		if ( ! $this->is_unlocked() ) {
 			$result = $this->locked_result(
 				array(
@@ -323,6 +363,9 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function process_queue( $limit = 0 ) {
+		if ( $this->is_shared_media_mode() ) {
+			return $this->save_last_result( $this->shared_media_result() );
+		}
 		if ( ! $this->is_unlocked() ) {
 			return $this->save_last_result( $this->locked_result() );
 		}
@@ -573,6 +616,10 @@ class Mobo_Core_Image_Refresh_Service {
 		update_post_meta( $new_attachment_id, 'mobo_refreshed_from_attachment_id', absint( $old_attachment_id ) );
 		update_post_meta( $new_attachment_id, 'mobo_image_refresh_source_url', esc_url_raw( (string) $new_source_url ) );
 		update_post_meta( $new_attachment_id, 'mobo_image_refresh_product_id', absint( $product_id ) );
+
+		if ( class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			Mobo_Core_Product_Activity::mark( $product_id, 'image_refresh', $now );
+		}
 
 		if ( $old_attachment_id > 0 && 'attachment' === get_post_type( $old_attachment_id ) ) {
 			update_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_at', $now );
@@ -877,6 +924,9 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function audit_webp_subsizes( $limit = 500, $repair = false ) {
+		if ( $this->is_shared_media_mode() ) {
+			return $this->shared_media_result( array( 'checkedAt' => time(), 'scanned' => 0, 'healthy' => 0, 'unhealthy' => 0, 'repaired' => 0, 'cycleComplete' => true ) );
+		}
 		$repair        = (bool) $repair;
 		$cursor_option = $repair ? self::SUBSIZE_REPAIR_CURSOR_OPTION : self::SUBSIZE_SCAN_CURSOR_OPTION;
 		$option_name   = $repair ? 'mobo_core_image_refresh_last_subsize_repair' : 'mobo_core_image_refresh_last_subsize_scan';
@@ -1017,6 +1067,9 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function audit_replaced_legacy_attachments( $limit = 500, $delete = false ) {
+		if ( $this->is_shared_media_mode() ) {
+			return $this->shared_media_result( array( 'checkedAt' => time(), 'scanned' => 0, 'safeToDelete' => 0, 'deleted' => 0, 'cycleComplete' => true ) );
+		}
 		$delete        = (bool) $delete;
 		$cursor_option = $delete ? self::REPLACED_DELETE_CURSOR_OPTION : self::REPLACED_SCAN_CURSOR_OPTION;
 		$option_name   = $delete ? 'mobo_core_image_refresh_last_replaced_delete' : 'mobo_core_image_refresh_last_replaced_scan';

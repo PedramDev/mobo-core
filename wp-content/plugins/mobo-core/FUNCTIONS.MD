@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.31.70` and Portal `v25 / .NET 10`**
+**Generated against Mobo Core `10.33.2` and Portal `v32 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,13 +14,13 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.70` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.33.2` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.31.70` |
+| `MOBO_CORE_VERSION` | `10.33.2` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
@@ -29,6 +29,10 @@
 | `MOBO_API_BASE_URL` | آدرس API پیش فرض/قابل override |
 | `MOBO_CORE_DATA_DIR` | `wp-content/uploads/mobo-core/` |
 | `MOBO_CORE_WEBHOOK_FILE_DIR` | مسیر fallback فایل های وب هوک |
+| `MOBO_QUEUE_WORKER_ENABLED` | فعال‌سازی Worker اختصاصی CLI از `wp-config.php` |
+| `MOBO_QUEUE_WORKER_MAX_RUNTIME` | حداکثر زمان Process، پیش‌فرض ۵۰ ثانیه |
+| `MOBO_QUEUE_WORKER_IDLE_SLEEP` | فاصله بررسی Queue خالی، پیش‌فرض ۱۰ ثانیه |
+| `MOBO_QUEUE_WORKER_LOCK_PATH` | مسیر اختیاری فایل `flock` |
 
 ## 2. REST routeهای وردپرس
 
@@ -497,7 +501,7 @@ Public methods: **3** · Internal non-public methods: **3**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
-| `public function run($source = 'real-cron')` | اجرای عملیات `run` در بخش اجرای محدود عملیات افزونه مستقل از WP-Cron. | Run one bounded cron slice. |
+| `public function run($source = 'real-cron', $options = array())` | اجرای یک Slice معمولی یا یک Round منصفانه Worker CLI. | Run one bounded slice or fair CLI-worker round. |
 | `public static function build_cron_url()` | ساخت cron url در بخش اجرای محدود عملیات افزونه مستقل از WP-Cron. | Build a secure cron URL for the current site. |
 | `public static function get_status()` | دریافت status در بخش اجرای محدود عملیات افزونه مستقل از WP-Cron. | Get cron status for admin UI and central health checks. |
 
@@ -633,6 +637,22 @@ Public methods: **13** · Internal non-public methods: **2**
 | `public function price_type()` | اجرای عملیات `price_type` در بخش دسترسی متمرکز به قواعد سازگاری قدیمی. | Get price type. |
 | `public function default_category_id()` | اجرای عملیات `default_category_id` در بخش دسترسی متمرکز به قواعد سازگاری قدیمی. | Get default category ID. |
 | `public function missing_variants_behavior()` | اجرای عملیات `missing_variants_behavior` در بخش دسترسی متمرکز به قواعد سازگاری قدیمی. | Missing variants behavior. |
+
+
+### `Mobo_Core_Queue_Worker_Lock`
+
+Source: [`includes/class-mobo-core-queue-worker-lock.php`](includes/class-mobo-core-queue-worker-lock.php)  
+قفل سیستم‌عامل و تنظیمات Runtime Worker اختصاصی CLI. / OS process lock and runtime constants for the dedicated CLI worker.  
+Public methods: **6**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function is_cli_worker_enabled()` | بررسی Constant فعال‌سازی Worker. | Whether dedicated CLI mode is enabled. |
+| `public static function max_runtime()` | دریافت Runtime محدودشده. | Resolve bounded runtime. |
+| `public static function idle_sleep()` | دریافت فاصله Idle. | Resolve idle sleep. |
+| `public static function path()` | ساخت مسیر Lock اختصاصی سایت. | Resolve the site-specific lock path. |
+| `public static function acquire()` | گرفتن `flock` انحصاری و Non-blocking. | Acquire a non-blocking exclusive OS lock. |
+| `public static function release($lock)` | آزادسازی Handle و Lock. | Release the OS lock. |
 
 ### `Mobo_Core_Lock`
 
@@ -1001,7 +1021,7 @@ Public methods: **4** · Internal non-public methods: **31**
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.31.70`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.33.2`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 
@@ -1048,3 +1068,22 @@ The detailed class tables intentionally combine Persian and English descriptions
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+
+### `Mobo_Core_Shared_Media`
+
+Hidden `wp-config.php`-only shared media bridge. Public surface:
+
+- `init()`
+- `enabled()`
+- `downloads_enabled()`
+- `import_attachment( $image_guid, $source_url, $product_id )`
+- `refresh_attachment( $attachment_id, $image_guid, $source_url = '' )`
+- `get_last_error()`
+- `filter_attachment_url( $url, $attachment_id )`
+- `filter_attached_file( $file, $attachment_id )`
+- `filter_intermediate_sizes( $sizes, $image_meta, $attachment_id )`
+- `filter_big_image_threshold( $threshold, $imagesize, $file, $attachment_id )`
+- `protect_attachment_metadata( $data, $attachment_id )`
+- `protect_shared_file_from_delete( $file )`
+- `is_shared_attachment( $attachment_id )`

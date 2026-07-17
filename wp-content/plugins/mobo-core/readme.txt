@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.70
+Stable tag: 10.33.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -23,6 +23,7 @@ Required plugins: WooCommerce and Persian WooCommerce (`persian-woocommerce`). M
 
 Main features:
 
+* Centrally managed, RSA-signed configuration with immutable revisions and a Last Known Good cache that ignores direct database edits after binding.
 * Step-based product, variation, category, price, and image synchronization.
 * Queue-based webhook processing to avoid timeout in WordPress requests.
 * Shipping method mapping between WooCommerce shipping zones/methods and Mobo shipping methods.
@@ -91,9 +92,11 @@ http://mobo.codeya.ir/privacy
 2. Install and activate both WooCommerce and Persian WooCommerce (`persian-woocommerce`).
 3. Activate Mobo Core through the Plugins screen in WordPress.
 4. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
-5. Go to **Mobo > اتصال** and enter the Token and Webhook Security Code from MoboCore.
-6. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
-7. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
+5. Configure API URL, Token, Webhook Security Code, Cron Token, and preferably `MOBO_CONFIG_CACHE_DIR` through `wp-config.php` or environment variables.
+6. Open **Mobo > تنظیمات مرکزی** and refresh once. Existing local settings are imported to Portal only on the first bind.
+7. Make future business-setting changes only in the .NET Portal; the WordPress forms become read-only.
+8. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
+9. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
 
 == Frequently Asked Questions ==
 
@@ -135,12 +138,30 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Changelog ==
 
-= 10.31.70 =
-* Added one authoritative image-refresh command center at the top of the tab instead of relying on scattered status boxes.
-* Clearly distinguishes an actively running batch, an enabled workflow waiting for the next runner, a stalled workflow, a paused workflow, approval gates, terminal errors, and a completed cycle.
-* Added current-stage progress, estimated whole-cycle progress, a nine-stage timeline, last real worker activity, Cron/Self Runner heartbeat, and the last batch summary.
-* Added tick start/finish diagnostics and runtime-lock visibility so timeout or abandoned batch conditions are visible to the administrator.
-* Clarified that the live AJAX timestamp is only the time the page display was refreshed, not proof that the background worker ran.
+= 10.33.2 =
+* Added an "آخرین تغییر موبو" column to the WooCommerce products table.
+* Records exact Mobo-originated product changes from product, variant, price, category, image sync, and image refresh processes.
+* Shows a clearly marked approximate fallback date for legacy Mobo products until their next exact Mobo update.
+
+= 10.33.2 =
+* Added a CLI-only cPanel queue worker that stays alive for a bounded 50-second window and rechecks idle queues every 10 seconds.
+* Added a non-blocking flock process lock, fair rotating queue order, microtime deadline checks, and structured CLI logging.
+* Disabled loopback Self Runner, REST queue execution, synchronous webhook processing, and WP-Cron order queue processing when the dedicated CLI worker is enabled.
+
+= 10.33.0 =
+* Fixed GUID-only WooCommerce categories named `Mobo Category <GUID>`.
+* Product webhooks now carry category title, URL and parent identity.
+* GUID-only category references no longer create customer-facing placeholders.
+* Existing exact Mobo placeholders are repaired on the next full category synchronization without renaming customer-managed categories.
+
+= 10.32.0 =
+* Moved managed Mobo settings to immutable revisions in the .NET Portal.
+* Added RSA-SHA256 signed configuration envelopes bound to installation and domain.
+* Added atomic current/previous Last Known Good caches and fail-closed behavior after binding.
+* Moved bootstrap connection credentials out of `wp_options` into a private mode-0600 file after first bind.
+* Added immediate ConfigurationChanged pull with webhook retry on refresh failure and periodic recovery polling.
+* Converted WordPress settings to read-only diagnostics after remote enforcement.
+* Kept runtime queues, locks, cursors, timestamps, and logs local.
 
 = 10.31.69 =
 * Added automatic live status refresh to the image-refresh tab without reloading the WordPress admin page.
@@ -309,8 +330,8 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
-= 10.31.70 =
-The image-refresh tab now starts with a single command center that states whether work is actually running, merely enabled, stalled, paused, waiting for approval, failed, or completed. Review this panel first after upgrade.
+= 10.32.0 =
+Deploy the matching Portal release and signing key first. Then update the plugin, open Mobo > Central Settings, and confirm a valid signed revision before changing operational features.
 
 = 10.31.69 =
 The image-refresh dashboard now updates itself while it remains open. Unsaved settings are protected: automatic refresh pauses as soon as a field is edited and resumes after the normal page reload following save.

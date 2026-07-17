@@ -2385,6 +2385,10 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function handle_scheduled_queued_order_submissions() {
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			return;
+		}
+
 		$this->process_queued_mobo_order_submissions( 1, 'wp-cron' );
 	}
 

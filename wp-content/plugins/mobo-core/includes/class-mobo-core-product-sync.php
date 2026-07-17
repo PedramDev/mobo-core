@@ -1277,6 +1277,10 @@ class Mobo_Core_Product_Sync {
 			WC_Product_Variable::sync( $product_id );
 		}
 
+		if ( $updated > 0 && class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			Mobo_Core_Product_Activity::mark( $product_id, 'variant_sync' );
+		}
+
 		wc_delete_product_transients( $product_id );
 
 		$message = sprintf(
@@ -1622,6 +1626,10 @@ class Mobo_Core_Product_Sync {
 
 		if ( $product_id > 0 ) {
 			$this->upsert_product_map( $product_guid, $product_id, false );
+
+			if ( class_exists( 'Mobo_Core_Product_Activity' ) ) {
+				Mobo_Core_Product_Activity::mark( $product_id, 'product_sync' );
+			}
 		}
 
 		if ( $product_id <= 0 ) {
@@ -2133,6 +2141,10 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
 		$product->delete_meta_data( '_mobo_simple_variant_resolution_message' );
 		$product->save();
+
+		if ( class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			Mobo_Core_Product_Activity::mark( $product_id, 'variant_sync' );
+		}
 
 		wc_delete_product_transients( $product_id );
 

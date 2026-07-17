@@ -24,6 +24,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
 		add_action( 'admin_head-edit.php', array( $this, 'render_product_list_badge_styles' ) );
 		add_filter( 'display_post_states', array( $this, 'add_mobo_product_post_state' ), 10, 2 );
+		add_filter( 'manage_edit-product_columns', array( $this, 'add_mobo_last_change_column' ), 30 );
+		add_action( 'manage_product_posts_custom_column', array( $this, 'render_mobo_last_change_column' ), 10, 2 );
 
 		add_action( 'admin_post_mobo_core_save_settings', array( $this, 'handle_save_settings' ) );
 		add_action( 'admin_post_mobo_core_tool_test_mobo_login', array( $this, 'handle_admin_tool_action' ) );
@@ -182,6 +184,81 @@ class Mobo_Core_Admin {
 	}
 
 	/**
+	 * Add the latest exact Mobo change timestamp to the WooCommerce products table.
+	 *
+	 * @param array<string,string> $columns Existing columns.
+	 * @return array<string,string>
+	 */
+	public function add_mobo_last_change_column( $columns ) {
+		$result   = array();
+		$inserted = false;
+
+		foreach ( (array) $columns as $key => $label ) {
+			$result[ $key ] = $label;
+
+			if ( 'name' === $key || 'title' === $key ) {
+				$result['mobo_last_change'] = 'آخرین تغییر موبو';
+				$inserted                   = true;
+			}
+		}
+
+		if ( ! $inserted ) {
+			$result['mobo_last_change'] = 'آخرین تغییر موبو';
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Render latest Mobo-originated change information for a product.
+	 *
+	 * @param string $column Column key.
+	 * @param int    $post_id Product ID.
+	 * @return void
+	 */
+	public function render_mobo_last_change_column( $column, $post_id ) {
+		if ( 'mobo_last_change' !== $column ) {
+			return;
+		}
+
+		$post_id      = absint( $post_id );
+		$product_guid = trim( (string) get_post_meta( $post_id, 'product_guid', true ) );
+
+		if ( '' === $product_guid || ! class_exists( 'Mobo_Core_Product_Activity' ) ) {
+			echo '<span class="mobo-last-change-empty">—</span>';
+			return;
+		}
+
+		$activity  = Mobo_Core_Product_Activity::get( $post_id );
+		$timestamp = isset( $activity['timestamp'] ) ? absint( $activity['timestamp'] ) : 0;
+
+		if ( $timestamp <= 0 ) {
+			echo '<span class="mobo-last-change-empty">ثبت نشده</span>';
+			return;
+		}
+
+		$source     = isset( $activity['source'] ) ? sanitize_key( (string) $activity['source'] ) : '';
+		$exact      = ! empty( $activity['exact'] );
+		$date_value = wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $timestamp );
+		$utc_value  = gmdate( 'Y-m-d H:i:s', $timestamp ) . ' UTC';
+		$relative   = $timestamp <= time() ? human_time_diff( $timestamp, time() ) . ' پیش' : '';
+
+		echo '<div class="mobo-last-change" title="' . esc_attr( $utc_value ) . '">';
+		echo '<strong>' . esc_html( $date_value ) . '</strong>';
+		echo '<span>' . esc_html( Mobo_Core_Product_Activity::source_label( $source ) ) . '</span>';
+
+		if ( '' !== $relative ) {
+			echo '<small>' . esc_html( $relative ) . '</small>';
+		}
+
+		if ( ! $exact ) {
+			echo '<em title="این محصول قبل از اضافه‌شدن ثبت دقیق تاریخ پردازش شده است. پس از اولین تغییر جدید موبو، تاریخ دقیق جایگزین می‌شود.">تقریبی</em>';
+		}
+
+		echo '</div>';
+	}
+
+	/**
 	 * Product-list styles are kept scoped to edit.php?post_type=product.
 	 *
 	 * @return void
@@ -213,6 +290,37 @@ class Mobo_Core_Admin {
 			width:14px;
 			height:14px;
 			line-height:14px;
+		}
+		.column-mobo_last_change {
+			width:165px;
+		}
+		.mobo-last-change {
+			display:flex;
+			flex-direction:column;
+			align-items:flex-start;
+			gap:2px;
+			line-height:1.35;
+		}
+		.mobo-last-change strong {
+			font-size:12px;
+			color:#1d2327;
+		}
+		.mobo-last-change span,
+		.mobo-last-change small {
+			font-size:11px;
+			color:#646970;
+		}
+		.mobo-last-change em {
+			display:inline-block;
+			padding:1px 5px;
+			border-radius:10px;
+			background:#fff7ed;
+			color:#9a3412;
+			font-size:10px;
+			font-style:normal;
+		}
+		.mobo-last-change-empty {
+			color:#8c8f94;
 		}
 		</style>
 		<?php
@@ -5995,6 +6103,14 @@ type:{mobo_order_type_label}</textarea>
 
 		check_admin_referer( 'mobo_core_save_settings', 'mobo_core_nonce' );
 
+		if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
+			$this->redirect_with_message(
+				'تنظیمات Mobo Core از Portal .NET مدیریت می‌شوند و امکان ذخیره محلی وجود ندارد.',
+				'warning',
+				'dashboard'
+			);
+		}
+
 		$tab = isset( $_POST['mobo_active_tab'] ) ? sanitize_key( wp_unslash( $_POST['mobo_active_tab'] ) ) : 'dashboard';
 		$allowed_tabs = array( 'connection', 'product', 'categories', 'pricing', 'filters', 'queue', 'image-refresh', 'cron', 'checkout', 'sms', 'health' );
 		if ( ! in_array( $tab, $allowed_tabs, true ) ) {
@@ -6147,8 +6263,9 @@ type:{mobo_order_type_label}</textarea>
 
 		check_ajax_referer( 'mobo_core_sync_status', 'nonce' );
 
-		$product_sync = new Mobo_Core_Product_Sync();
-		$status       = $product_sync->get_manual_sync_status();
+		$product_sync       = new Mobo_Core_Product_Sync();
+		$status             = $product_sync->get_manual_sync_status();
+		$cli_worker_enabled = class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled();
 
 		if ( ! empty( $status['isWaitingForPortal'] ) && ! empty( $status['isRetryDue'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::kick( 'admin-waiting-for-portal-resume', true );
@@ -6164,7 +6281,7 @@ type:{mobo_order_type_label}</textarea>
 		 * period, the authenticated admin poll advances exactly one manual-sync step.
 		 * This keeps the UI moving without creating parallel workers.
 		 */
-		if ( ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
+		if ( ! $cli_worker_enabled && ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
 			$updated_at = isset( $status['updatedAt'] ) ? absint( $status['updatedAt'] ) : 0;
 			$is_stale   = $updated_at > 0 && ( time() - $updated_at ) >= 8;
 
@@ -6198,7 +6315,13 @@ type:{mobo_order_type_label}</textarea>
 			$image_poll_limit    = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
 			$image_queue_result  = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped' );
 
-			if ( ! empty( $image_queue_before['due'] ) ) {
+			if ( $cli_worker_enabled ) {
+				$image_queue_result = array(
+					'processed' => 0,
+					'failed'    => 0,
+					'status'    => 'managed-by-cli-worker',
+				);
+			} elseif ( ! empty( $image_queue_before['due'] ) ) {
 				$image_queue_result = $image_sync->process_queue( $image_poll_limit );
 			}
 
@@ -7271,6 +7394,10 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		check_admin_referer( 'mobo_core_process_image_refresh', 'mobo_core_nonce' );
+
+		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
+			$this->redirect_with_message( 'پردازش این صف توسط Worker اختصاصی CLI انجام می‌شود و اجرای مستقیم از پنل غیرفعال است.', 'warning', 'image-refresh' );
+		}
 
 		if ( $this->redirect_if_image_refresh_locked() ) {
 			return;

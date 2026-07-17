@@ -523,8 +523,20 @@ class Mobo_Core_Category_Sync {
 
 		$term_id = $this->find_term_id_by_guid( $category_guid );
 
+		/*
+		 * A product webhook may reference a category before the full category
+		 * catalogue has reached WordPress. A GUID by itself is not enough to
+		 * create a customer-facing WooCommerce term. Creating a fallback such as
+		 * "Mobo Category <GUID>" causes a permanent placeholder because normal
+		 * synced categories are intentionally protected from later renames.
+		 */
 		if ( $term_id <= 0 && '' === $title ) {
-			$title = 'Mobo Category ' . $category_guid;
+			return array(
+				'term_id'   => 0,
+				'created'   => false,
+				'incomplete' => true,
+				'guid'      => $category_guid,
+			);
 		}
 
 		$args = array();
@@ -550,8 +562,39 @@ class Mobo_Core_Category_Sync {
 		}
 
 		if ( $term_id > 0 ) {
-			// Existing WooCommerce categories are protected by default.
-			// Keep the local category name, slug, parent and metadata untouched; only refresh the internal mapping.
+			/*
+			 * Existing customer-managed WooCommerce categories remain protected.
+			 * The only safe automatic rename is an exact placeholder created by an
+			 * older Mobo Core version for this same GUID.
+			 */
+			if ( '' !== $title && $this->is_generated_placeholder_term( $term_id, $category_guid ) ) {
+				$repair_args = $args;
+
+				if ( ! isset( $repair_args['slug'] ) || '' === $repair_args['slug'] ) {
+					$repair_args['slug'] = sanitize_title( $title );
+				}
+
+				$repair_result = wp_update_term( $term_id, 'product_cat', $repair_args );
+
+				if ( is_wp_error( $repair_result ) && isset( $repair_args['slug'] ) ) {
+					unset( $repair_args['slug'] );
+					$repair_result = wp_update_term( $term_id, 'product_cat', $repair_args );
+				}
+
+				if ( ! is_wp_error( $repair_result ) ) {
+					delete_term_meta( $term_id, 'mobo_generated_placeholder' );
+					delete_term_meta( $term_id, 'mobo_sync_incomplete' );
+					$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
+					$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
+
+					return array(
+						'term_id'             => $term_id,
+						'created'             => false,
+						'repaired_placeholder' => true,
+					);
+				}
+			}
+
 			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
 
 			return array(
@@ -561,7 +604,7 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		$insert_name = '' !== $title ? $title : 'Mobo Category ' . $category_guid;
+		$insert_name = $title;
 
 		$insert_args = array();
 
@@ -603,6 +646,38 @@ class Mobo_Core_Category_Sync {
 			'term_id' => $term_id,
 			'created' => true,
 		);
+	}
+
+	/**
+	 * Detect an exact placeholder created by older plugin versions.
+	 *
+	 * @param int    $term_id Term ID.
+	 * @param string $category_guid Remote category GUID.
+	 * @return bool
+	 */
+	private function is_generated_placeholder_term( $term_id, $category_guid ) {
+		$term_id       = absint( $term_id );
+		$category_guid = sanitize_text_field( (string) $category_guid );
+
+		if ( $term_id <= 0 || '' === $category_guid ) {
+			return false;
+		}
+
+		if ( '1' === (string) get_term_meta( $term_id, 'mobo_generated_placeholder', true ) ) {
+			return true;
+		}
+
+		$term = get_term( $term_id, 'product_cat' );
+
+		if ( ! $term || is_wp_error( $term ) ) {
+			return false;
+		}
+
+		$placeholder_name = 'Mobo Category ' . $category_guid;
+		$placeholder_slug = sanitize_title( $placeholder_name );
+
+		return (string) $term->name === $placeholder_name
+			|| (string) $term->slug === $placeholder_slug;
 	}
 
 	public function find_term_id_by_guid( $category_guid ) {
