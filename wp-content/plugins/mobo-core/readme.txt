@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.2
+Stable tag: 10.33.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -36,7 +36,7 @@ Main features:
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
 
-http://mobo.codeya.ir/
+https://mobo.codeya.ir/
 
 Sales and activation contact:
 
@@ -76,27 +76,26 @@ After the site administrator enters a Token, Mobo Core can communicate with the 
 
 Service website:
 
-http://mobo.codeya.ir/
+https://mobo.codeya.ir/
 
 Terms of Service:
 
-http://mobo.codeya.ir/terms
+https://mobo.codeya.ir/terms
 
 Privacy Policy:
 
-http://mobo.codeya.ir/privacy
+https://mobo.codeya.ir/privacy
 
 == Installation ==
 
 1. Upload the `mobo-core` folder to `/wp-content/plugins/`, or install the plugin through the WordPress plugins screen.
 2. Install and activate both WooCommerce and Persian WooCommerce (`persian-woocommerce`).
 3. Activate Mobo Core through the Plugins screen in WordPress.
-4. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
-5. Configure API URL, Token, Webhook Security Code, Cron Token, and preferably `MOBO_CONFIG_CACHE_DIR` through `wp-config.php` or environment variables.
-6. Open **Mobo > تنظیمات مرکزی** and refresh once. Existing local settings are imported to Portal only on the first bind.
-7. Make future business-setting changes only in the .NET Portal; the WordPress forms become read-only.
-8. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
-9. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
+4. Open **Mobo > لایسنس و امنیت** and enter only the License Key / Token and Webhook Security Code.
+5. Configure every business setting in the .NET Portal; WordPress does not expose local product, pricing, category, queue, image, checkout, shipping, or SMS setting forms.
+6. Open **Mobo > تنظیمات مرکزی** only for read-only signed-cache diagnostics and manual refresh.
+7. Configure the CLI queue-worker constants and cPanel cron as documented.
+8. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
 
 == Frequently Asked Questions ==
 
@@ -131,19 +130,25 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 == Screenshots ==
 
 1. Mobo Core dashboard and sync status.
-2. Purchase and activation screen.
-3. Connection and license information.
-4. WooCommerce to Mobo shipping method mapping.
-5. Queue, cron, and image refresh settings.
+2. License and webhook security screen.
+3. Read-only signed configuration diagnostics.
+4. Health and queue diagnostics.
+5. WooCommerce product last-Mobo-change column.
 
 == Changelog ==
+
+= 10.33.3 =
+* Removed all local business-configuration forms and menu entries; product, pricing, category, queue, image, checkout, shipping and SMS settings are controlled only by signed Portal .NET configuration.
+* Whitelisted only License Key / Token and Webhook Security Code for secure local updates, including server-side rejection of legacy settings POST requests.
+* Rebuilt the license panel with a compact status, plan, remaining days, expiry, domain and suspension display.
+* Converted the Health screen to fully read-only output; its interval and timeout now display values received from the signed Portal configuration.
 
 = 10.33.2 =
 * Added an "آخرین تغییر موبو" column to the WooCommerce products table.
 * Records exact Mobo-originated product changes from product, variant, price, category, image sync, and image refresh processes.
 * Shows a clearly marked approximate fallback date for legacy Mobo products until their next exact Mobo update.
 
-= 10.33.2 =
+= 10.33.1 =
 * Added a CLI-only cPanel queue worker that stays alive for a bounded 50-second window and rechecks idle queues every 10 seconds.
 * Added a non-blocking flock process lock, fair rotating queue order, microtime deadline checks, and structured CLI logging.
 * Disabled loopback Self Runner, REST queue execution, synchronous webhook processing, and WP-Cron order queue processing when the dedicated CLI worker is enabled.

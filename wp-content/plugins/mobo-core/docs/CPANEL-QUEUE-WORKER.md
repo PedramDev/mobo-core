@@ -1,4 +1,4 @@
-# cPanel CLI Queue Worker — Mobo Core 10.33.2
+# cPanel CLI Queue Worker — Mobo Core 10.33.3
 
 این Worker برای هاست‌هایی طراحی شده است که Cron را حداقل هر یک دقیقه اجرا می‌کنند. cPanel هر دقیقه `mobo-cron.php` را اجرا می‌کند، اما همان Process تا سقف زمان تعیین‌شده زنده می‌ماند و Queueها را چند بار بررسی می‌کند.
 

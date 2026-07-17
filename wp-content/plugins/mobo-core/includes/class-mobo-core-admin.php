@@ -109,19 +109,9 @@ class Mobo_Core_Admin {
 	 */
 	private function get_admin_navigation_items() {
 		return array(
-			'dashboard'     => 'داشبورد',
-			'connection'    => 'اتصال',
-			'purchase'      => 'خرید و فعال سازی',
-			'product'       => 'محصول',
-			'categories'    => 'دسته بندی',
-			'pricing'       => 'قیمت گذاری',
-			'filters'       => 'فیلترها',
-			'queue'         => 'صف و پردازش',
-			'image-refresh' => 'نوسازی تصاویر',
-			'cron'          => 'کران واقعی',
-			'checkout'      => 'اعتبارسنجی خرید',
-			'sms'           => 'پیامک سفارش',
-			'health'        => 'سلامت سایت',
+			'dashboard'  => 'داشبورد و عملیات',
+			'connection' => 'لایسنس و امنیت',
+			'health'     => 'سلامت و عیب‌یابی',
 		);
 	}
 
@@ -376,16 +366,6 @@ class Mobo_Core_Admin {
 		$allowed_tabs = array(
 			'dashboard',
 			'connection',
-			'purchase',
-			'product',
-			'categories',
-			'pricing',
-			'filters',
-			'queue',
-			'image-refresh',
-			'cron',
-			'checkout',
-			'sms',
 			'health',
 		);
 
@@ -401,7 +381,7 @@ class Mobo_Core_Admin {
 			<div class="mobo-hero">
 				<div>
 					<h1>موبو | همگام‌سازی ووکامرس</h1>
-					<p>مدیریت همگام‌سازی محصولات، قیمت‌گذاری، دسته‌بندی، تصاویر و صف وب‌هوک.</p>
+					<p>وضعیت همگام‌سازی، لایسنس، امنیت وب‌هوک و سلامت اتصال. تنظیمات عملیاتی فقط از Portal .NET مدیریت می‌شوند.</p>
 				</div>
 
 				<div class="mobo-hero-badge">
@@ -414,20 +394,10 @@ class Mobo_Core_Admin {
 
 			<?php $this->render_notices(); ?>
 
-			<nav class="mobo-tabs" aria-label="Mobo settings tabs">
-				<?php $this->tab_link( 'dashboard', 'داشبورد', $active_tab ); ?>
-				<?php $this->tab_link( 'connection', 'اتصال', $active_tab ); ?>
-				<?php $this->tab_link( 'purchase', 'خرید و فعال سازی', $active_tab ); ?>
-				<?php $this->tab_link( 'product', 'محصول', $active_tab ); ?>
-				<?php $this->tab_link( 'categories', 'دسته‌بندی', $active_tab ); ?>
-				<?php $this->tab_link( 'pricing', 'قیمت‌گذاری', $active_tab ); ?>
-				<?php $this->tab_link( 'filters', 'فیلترها', $active_tab ); ?>
-				<?php $this->tab_link( 'queue', 'صف و پردازش', $active_tab ); ?>
-				<?php $this->tab_link( 'image-refresh', 'نوسازی تصاویر', $active_tab ); ?>
-				<?php $this->tab_link( 'cron', 'کران واقعی', $active_tab ); ?>
-				<?php $this->tab_link( 'checkout', 'اعتبارسنجی خرید', $active_tab ); ?>
-				<?php $this->tab_link( 'sms', 'پیامک سفارش', $active_tab ); ?>
-				<?php $this->tab_link( 'health', 'سلامت سایت', $active_tab ); ?>
+			<nav class="mobo-tabs" aria-label="Mobo admin tabs">
+				<?php $this->tab_link( 'dashboard', 'داشبورد و عملیات', $active_tab ); ?>
+				<?php $this->tab_link( 'connection', 'لایسنس و امنیت', $active_tab ); ?>
+				<?php $this->tab_link( 'health', 'سلامت و عیب‌یابی', $active_tab ); ?>
 			</nav>
 
 			<div class="mobo-panel">
@@ -435,26 +405,6 @@ class Mobo_Core_Admin {
 					<?php $this->render_dashboard_tab( $status ); ?>
 				<?php elseif ( 'connection' === $active_tab ) : ?>
 					<?php $this->render_connection_tab(); ?>
-				<?php elseif ( 'purchase' === $active_tab ) : ?>
-					<?php $this->render_purchase_tab(); ?>
-				<?php elseif ( 'product' === $active_tab ) : ?>
-					<?php $this->render_product_tab(); ?>
-				<?php elseif ( 'categories' === $active_tab ) : ?>
-					<?php $this->render_categories_tab(); ?>
-				<?php elseif ( 'pricing' === $active_tab ) : ?>
-					<?php $this->render_pricing_tab(); ?>
-				<?php elseif ( 'filters' === $active_tab ) : ?>
-					<?php $this->render_filters_tab(); ?>
-				<?php elseif ( 'queue' === $active_tab ) : ?>
-					<?php $this->render_queue_tab(); ?>
-				<?php elseif ( 'image-refresh' === $active_tab ) : ?>
-					<?php $this->render_image_refresh_tab(); ?>
-				<?php elseif ( 'cron' === $active_tab ) : ?>
-					<?php $this->render_cron_tab(); ?>
-				<?php elseif ( 'checkout' === $active_tab ) : ?>
-					<?php $this->render_checkout_tab(); ?>
-				<?php elseif ( 'sms' === $active_tab ) : ?>
-					<?php $this->render_sms_tab(); ?>
 				<?php elseif ( 'health' === $active_tab ) : ?>
 					<?php $this->render_health_tab(); ?>
 				<?php endif; ?>
@@ -685,7 +635,7 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_purchase_tab() {
-		$purchase_url   = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'http://mobo.codeya.ir/';
+		$purchase_url   = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'https://mobo.codeya.ir/';
 		$github_url     = defined( 'MOBO_CORE_GITHUB_URL' ) ? MOBO_CORE_GITHUB_URL : 'https://github.com/PedramDev/mobo-core';
 		$sales_phone   = defined( 'MOBO_CORE_SALES_PHONE' ) ? MOBO_CORE_SALES_PHONE : '+989124508218';
 		$sales_tel     = defined( 'MOBO_CORE_SALES_TEL_URL' ) ? MOBO_CORE_SALES_TEL_URL : 'tel:+989124508218';
@@ -761,8 +711,8 @@ class Mobo_Core_Admin {
 							<tr><td>۱</td><td>از طریق <a href="<?php echo esc_url( $purchase_url ); ?>" target="_blank" rel="noopener noreferrer">mobo.codeya.ir</a> لایسنس تهیه یا وارد پنل شوید.</td></tr>
 							<tr><td>۲</td><td>دامنه همین سایت را در MoboCore ثبت کنید. این اتصال برای فروشگاه های ایران و منبع <code dir="ltr">mobomobo.ir</code> طراحی شده است.</td></tr>
 							<tr><td>۳</td><td>Token و Webhook Security Code را از پنل MoboCore بردارید.</td></tr>
-							<tr><td>۴</td><td>در تب «اتصال»، Token و Webhook Security Code را ذخیره کنید.</td></tr>
-							<tr><td>۵</td><td>در تب «اعتبارسنجی خرید»، نگاشت آدرس و روش های ارسال را تکمیل کنید.</td></tr>
+							<tr><td>۴</td><td>در تب «لایسنس و امنیت»، کلید لایسنس و Webhook Security Code را ذخیره کنید.</td></tr>
+							<tr><td>۵</td><td>تمام تنظیمات محصول، قیمت، دسته‌بندی، صف، تصویر، Checkout، ارسال و پیامک را فقط در Portal .NET انجام دهید.</td></tr>
 							<tr><td>۶</td><td>اگر از نسخه قدیمی مثل ۷ ارتقا داده اید، یک بار Repair کامل محصولات را از داشبورد اجرا کنید.</td></tr>
 						</tbody>
 					</table>
@@ -791,94 +741,60 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_connection_tab() {
-		$has_token         = '' !== (string) get_option( 'mobo_core_token', '' );
-		$security_code     = trim( (string) get_option( 'mobo_core_security_code', '' ) );
-		$has_security_code = '' !== $security_code;
-		$security_valid    = $this->is_webhook_security_code_valid( $security_code );
-
+		$license_token = trim( (string) Mobo_Core_Settings::get( 'mobo_core_token', '' ) );
+		$security_code = trim( (string) Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
+		$has_license   = '' !== $license_token;
+		$has_security  = '' !== $security_code;
+		$security_valid = $this->is_webhook_security_code_valid( $security_code );
+		$portal_url = defined( 'MOBO_CORE_PURCHASE_URL' ) ? MOBO_CORE_PURCHASE_URL : 'https://mobo.codeya.ir/';
 		?>
+		<div class="mobo-message mobo-message-info">
+			<strong>مدیریت مرکزی فعال است.</strong>
+			تمام تنظیمات محصول، قیمت، دسته‌بندی، صف، تصویر، Checkout، ارسال و پیامک فقط در Portal .NET تغییر می‌کنند. در WordPress فقط کلید لایسنس و کد امنیتی وب‌هوک قابل تغییر هستند.
+		</div>
 
-		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form mobo-credentials-form" data-mobo-bootstrap-credentials-form="1" autocomplete="off">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
 			<input type="hidden" name="mobo_active_tab" value="connection">
 			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
 
-		<div class="mobo-grid">
-				<div class="mobo-card">
+			<div class="mobo-credential-grid">
+				<div class="mobo-credential-card">
+					<div class="mobo-credential-icon" aria-hidden="true"><span class="dashicons dashicons-admin-network"></span></div>
 					<div class="mobo-card-head">
-						<h2>اتصال به API موبو</h2>
-						<p>توکن برای درخواست‌هایی استفاده می‌شود که وردپرس به سمت API موبو ارسال می‌کند.</p>
+						<h2>کلید لایسنس</h2>
+						<p>برای شناسایی این سایت و درخواست‌های امن افزونه به Portal استفاده می‌شود.</p>
 					</div>
-
-					<?php
-					$this->secret_field(
-						'Token',
-						'mobo_core_token',
-						$has_token ? 'توکن قبلاً ثبت شده است. برای تغییر، مقدار جدید وارد کنید.' : 'توکن هنوز ثبت نشده است.'
-					);
-					?>
-
-					<div class="mobo-note">
-						این مقدار در دیتابیس با کلید <code>mobo_core_token</code> ذخیره می‌شود و در درخواست‌های API به عنوان Header با نام <code>Token</code> ارسال می‌شود.
+					<?php $this->secret_field( 'License Key / Token', 'mobo_core_token', $has_license ? 'کلید لایسنس ثبت شده است. برای حفظ مقدار فعلی، این فیلد را خالی بگذارید.' : 'هنوز کلید لایسنس ثبت نشده است.' ); ?>
+					<div class="mobo-credential-state <?php echo $has_license ? 'is-ok' : 'is-missing'; ?>">
+						<?php echo $has_license ? 'کلید لایسنس ثبت شده' : 'کلید لایسنس ثبت نشده'; ?>
 					</div>
 				</div>
 
-				<div class="mobo-card">
+				<div class="mobo-credential-card">
+					<div class="mobo-credential-icon" aria-hidden="true"><span class="dashicons dashicons-shield-alt"></span></div>
 					<div class="mobo-card-head">
 						<h2>کد امنیتی وب‌هوک</h2>
-						<p>این مقدار برای اعتبارسنجی درخواست‌هایی استفاده می‌شود که از سیستم مرکزی به وردپرس ارسال می‌شوند.</p>
+						<p>درخواست‌های ورودی Portal فقط با کد هماهنگ و معتبر پذیرفته می‌شوند.</p>
 					</div>
-
-					<?php
-					$this->secret_field(
-						'Webhook Security Code',
-						'mobo_core_security_code',
-						$has_security_code ? 'کد امنیتی قبلاً ثبت شده است. برای تغییر، مقدار جدید وارد کنید.' : 'کد امنیتی هنوز ثبت نشده است.'
-					);
-					?>
-
-					<div class="mobo-note">
-						این مقدار در دیتابیس با کلید <code>mobo_core_security_code</code> ذخیره می‌شود و با Header <code>X-SEC</code> مقایسه می‌شود.
+					<?php $this->secret_field( 'Webhook Security Code', 'mobo_core_security_code', $has_security ? 'کد امنیتی ثبت شده است. برای حفظ مقدار فعلی، این فیلد را خالی بگذارید.' : 'هنوز کد امنیتی ثبت نشده است.' ); ?>
+					<div class="mobo-credential-state <?php echo $security_valid ? 'is-ok' : 'is-missing'; ?>">
+						<?php echo $security_valid ? 'ساختار کد امنیتی معتبر است' : ( $has_security ? 'ساختار کد امنیتی نامعتبر است' : 'کد امنیتی ثبت نشده' ); ?>
 					</div>
 				</div>
 			</div>
 
-			<?php if ( $has_security_code && ! $security_valid ) : ?>
-				<div class="mobo-message mobo-message-warning">
-					<strong>هشدار کد امنیتی وب هوک:</strong>
-					کد فعلی شامل کاراکتر خارج از الگوی <code dir="ltr">[A-Za-z0-9]</code> است و ممکن است وب هوک را دچار مشکل کند. برای اطمینان بهتر است کد جدید بگیرید و با پشتیبانی هماهنگ کنید.
-				</div>
-			<?php elseif ( ! $has_security_code ) : ?>
-				<div class="mobo-message mobo-message-error">کد امنیتی وب هوک ثبت نشده و درخواست های ورودی قابل اعتبارسنجی نیستند.</div>
-			<?php else : ?>
-				<div class="mobo-message mobo-message-success">ساختار کد امنیتی وب هوک معتبر است و فقط از حروف انگلیسی و عدد تشکیل شده است.</div>
-			<?php endif; ?>
+			<div class="mobo-note">
+				Secret قبلی در HTML نمایش داده نمی‌شود. مقدار خالی یعنی حفظ مقدار فعلی. تغییر این دو مقدار باید با Installation همین دامنه در Portal هماهنگ باشد.
+			</div>
 
-			<?php $this->render_license_info_card(); ?>
-
-			<?php
-			$this->guide_box(
-				'راهنمای اتصال و امنیت',
-				array(
-					array( 'title' => 'Token', 'text' => 'برای درخواست‌هایی است که وردپرس به MoboCore یا API موبو می‌فرستد. اگر خالی ذخیره شود، مقدار قبلی حذف نمی‌شود.' ),
-					array( 'title' => 'Webhook Security Code', 'text' => 'برای اعتبارسنجی درخواست‌های ورودی از MoboCore استفاده می‌شود و با header امنیتی X-SEC مقایسه می‌شود.' ),
-					array( 'title' => 'تعویض اطلاعات', 'text' => 'برای تغییر هر secret فقط مقدار جدید را وارد کنید. نمایش ندادن مقدار قبلی به معنی پاک شدن آن نیست.' ),
-				),
-				'این اطلاعات را در اختیار کاربر نهایی قرار ندهید. تغییر Token یا Security Code باید با تنظیمات MoboCore هماهنگ باشد.'
-			);
-			$this->recommendation_box(
-				'تنظیمات پیشنهادی اتصال',
-				array(
-					array( 'setting' => 'Token', 'value' => 'یک مقدار اختصاصی برای هر سایت', 'reason' => 'اگر چند سایت از یک Token مشترک استفاده کنند، ردیابی و محدودسازی خطا سخت می‌شود.' ),
-					array( 'setting' => 'Webhook Security Code', 'value' => 'یک مقدار قوی و هماهنگ با MoboCore', 'reason' => 'این مقدار جلوی پذیرش webhook جعلی را می‌گیرد و باید با تنظیمات MoboCore یکی باشد.' ),
-					array( 'setting' => 'تعویض secretها', 'value' => 'فقط هنگام جابه‌جایی لایسنس یا نشت اطلاعات', 'reason' => 'تغییر بی‌برنامه باعث reject شدن درخواست‌های MoboCore یا API می‌شود.' ),
-				),
-				'برای امنیت و پشتیبانی دقیق‌تر، Token و Security Code باید برای همین سایت اختصاصی باشند. از مقدار مشترک بین چند سایت استفاده نکنید.'
-			);
-			?>
-
-			<?php $this->save_button(); ?>
+			<div class="mobo-save-row mobo-save-row-split">
+				<a class="mobo-btn mobo-btn-light" href="<?php echo esc_url( $portal_url ); ?>" target="_blank" rel="noopener noreferrer">بازکردن Portal</a>
+				<button type="submit" class="mobo-btn mobo-btn-primary">ذخیره لایسنس و کد امنیتی</button>
+			</div>
 		</form>
+
+		<?php $this->render_license_info_card(); ?>
 		<?php
 	}
 
@@ -892,69 +808,56 @@ class Mobo_Core_Admin {
 		$license_info = $this->get_license_info_for_display();
 		$is_error     = ! empty( $license_info['error'] );
 		$is_expired   = ! empty( $license_info['isExpired'] );
-		$status_text  = $is_error ? 'نامشخص' : ( $is_expired ? 'منقضی شده' : 'فعال' );
-		$message      = isset( $license_info['message'] ) ? (string) $license_info['message'] : '';
+		$message      = isset( $license_info['message'] ) ? trim( (string) $license_info['message'] ) : '';
 		$raw          = isset( $license_info['raw'] ) && is_array( $license_info['raw'] ) ? $license_info['raw'] : array();
-		$details      = $this->license_info_display_details( $raw );
 
+		$status_text  = $is_error ? 'نامشخص' : ( $is_expired ? 'منقضی شده' : 'فعال' );
+		$status_class = $is_error ? 'is-unknown' : ( $is_expired ? 'is-expired' : 'is-active' );
+		$remaining    = $this->first_license_value( $raw, array( 'remainingDays', 'remainDays', 'daysRemaining', 'leftDays', 'remainingDayCount', 'RemainingDays', 'DaysRemaining' ) );
+		$expires      = $this->first_license_value( $raw, array( 'expiresAt', 'expireAt', 'expirationDate', 'expiryDate', 'expireDate', 'validUntil', 'endDate', 'licenseEndAt', 'ExpiresAt', 'ExpireDate', 'ValidUntil' ) );
+		$plan         = $this->first_license_value( $raw, array( 'planName', 'packageName', 'licenseType', 'plan', 'package', 'productName', 'PlanName', 'PackageName' ) );
+		$domain       = $this->first_license_value( $raw, array( 'domain', 'siteDomain', 'website', 'host', 'Domain', 'SiteDomain' ) );
+		$license_id   = $this->first_license_value( $raw, array( 'licenseId', 'licenseID', 'id', 'licenseCode', 'code', 'LicenseId', 'LicenseCode' ) );
+
+		$webhook_suspended = $this->first_license_value( $raw, array( 'webhook_suspended', 'webhookSuspended', 'WebhookSuspended' ) );
+		$webhook_suspended = in_array( strtolower( (string) $webhook_suspended ), array( '1', 'true', 'yes', 'فعال' ), true );
+		$webhook_suspended_until = $this->first_license_value( $raw, array( 'webhook_suspended_until', 'webhookSuspendedUntil', 'WebhookSuspendedUntil' ) );
+		$webhook_suspension_reason = $this->first_license_value( $raw, array( 'webhook_suspension_reason', 'webhookSuspensionReason', 'WebhookSuspensionReason' ) );
 		?>
-		<div class="mobo-card mobo-card-license" style="margin-top:16px;">
-			<div class="mobo-card-head">
-				<h2>اطلاعات لایسنس</h2>
-				<p>این بخش از endpoint قدیمی <code>LicenseInfo</code> خوانده می‌شود و وضعیت اعتبار لایسنس را نمایش می‌دهد.</p>
-			</div>
-
-			<div class="mobo-status-grid">
-				<?php $this->status_box( 'وضعیت لایسنس', $status_text ); ?>
-				<?php $this->status_box( 'روزهای باقی‌مانده', $this->first_license_value( $raw, array( 'remainingDays', 'remainDays', 'daysRemaining', 'leftDays', 'remainingDayCount', 'RemainingDays', 'DaysRemaining' ) ) ); ?>
-				<?php $this->status_box( 'تاریخ پایان', $this->first_license_value( $raw, array( 'expiresAt', 'expireAt', 'expirationDate', 'expiryDate', 'expireDate', 'validUntil', 'endDate', 'licenseEndAt', 'ExpiresAt', 'ExpireDate', 'ValidUntil' ) ) ); ?>
-			</div>
-
-			<?php if ( '' !== trim( $message ) ) : ?>
-				<div class="mobo-message <?php echo $is_error || $is_expired ? 'mobo-message-error' : 'mobo-message-info'; ?>">
-					<?php echo esc_html( $message ); ?>
+		<section class="mobo-license-card <?php echo esc_attr( $status_class ); ?>">
+			<div class="mobo-license-head">
+				<div>
+					<span class="mobo-license-eyebrow">وضعیت اشتراک</span>
+					<h2>لایسنس Mobo Core</h2>
+					<p>خلاصه وضعیت این دامنه از Portal دریافت می‌شود. کلید و Secret هیچ‌گاه در این کارت نمایش داده نمی‌شوند.</p>
 				</div>
+				<span class="mobo-license-pill <?php echo esc_attr( $status_class ); ?>"><?php echo esc_html( $status_text ); ?></span>
+			</div>
+
+			<div class="mobo-license-metrics">
+				<div><span>پلن</span><strong><?php echo esc_html( $plan ); ?></strong></div>
+				<div><span>روزهای باقی‌مانده</span><strong><?php echo esc_html( $remaining ); ?></strong></div>
+				<div><span>تاریخ پایان</span><strong dir="ltr"><?php echo esc_html( $expires ); ?></strong></div>
+				<div><span>دامنه</span><strong dir="ltr"><?php echo esc_html( $domain ); ?></strong></div>
+			</div>
+
+			<?php if ( '—' !== $license_id ) : ?>
+				<div class="mobo-license-reference"><span>شناسه لایسنس</span><code dir="ltr"><?php echo esc_html( $license_id ); ?></code></div>
 			<?php endif; ?>
 
-			<?php
-			$webhook_suspended = $this->first_license_value( $raw, array( 'webhook_suspended', 'webhookSuspended', 'WebhookSuspended' ) );
-			$webhook_suspended = in_array( strtolower( (string) $webhook_suspended ), array( '1', 'true', 'yes', 'فعال' ), true );
-			$webhook_suspended_until = $this->first_license_value( $raw, array( 'webhook_suspended_until', 'webhookSuspendedUntil', 'WebhookSuspendedUntil' ) );
-			$webhook_suspension_reason = $this->first_license_value( $raw, array( 'webhook_suspension_reason', 'webhookSuspensionReason', 'WebhookSuspensionReason' ) );
-			?>
+			<?php if ( '' !== $message ) : ?>
+				<div class="mobo-message <?php echo $is_error || $is_expired ? 'mobo-message-error' : 'mobo-message-info'; ?>"><?php echo esc_html( $message ); ?></div>
+			<?php endif; ?>
+
 			<?php if ( $webhook_suspended ) : ?>
 				<div class="mobo-alert mobo-alert-warning">
-					ارسال webhook از MoboCore برای این سایت موقتاً معلق شده است<?php echo '—' !== $webhook_suspended_until ? ' تا ' . esc_html( $webhook_suspended_until ) : ''; ?>. دلیل: <?php echo esc_html( '—' !== $webhook_suspension_reason ? $webhook_suspension_reason : 'خطاهای متوالی در دریافت webhook' ); ?>
+					ارسال Webhook موقتاً معلق است<?php echo '—' !== $webhook_suspended_until ? ' تا ' . esc_html( $webhook_suspended_until ) : ''; ?>. دلیل: <?php echo esc_html( '—' !== $webhook_suspension_reason ? $webhook_suspension_reason : 'خطاهای متوالی در دریافت Webhook' ); ?>
 				</div>
 			<?php endif; ?>
-
-			<?php if ( ! empty( $details ) ) : ?>
-				<div class="mobo-guide-table-wrap">
-					<table class="widefat striped mobo-guide-table">
-						<thead>
-							<tr>
-								<th>فیلد</th>
-								<th>مقدار</th>
-							</tr>
-						</thead>
-						<tbody>
-							<?php foreach ( $details as $row ) : ?>
-								<tr>
-									<td><code><?php echo esc_html( $row['key'] ); ?></code></td>
-									<td><?php echo esc_html( $row['value'] ); ?></td>
-								</tr>
-							<?php endforeach; ?>
-						</tbody>
-					</table>
-				</div>
-			<?php endif; ?>
-
-			<div class="mobo-note">
-				اگر این بخش خطای اتصال نشان دهد، معمولاً Token یا API Base URL مشکل دارد. این بخش sync را متوقف نمی‌کند، فقط وضعیت لایسنس را از MoboCore نمایش می‌دهد.
-			</div>
-		</div>
+		</section>
 		<?php
 	}
+
 
 	/**
 	 * Fetch license info for admin display.
@@ -1991,113 +1894,94 @@ type:{mobo_order_type_label}</textarea>
 		$wp_cron_ok     = $this->is_wp_cron_disabled();
 		$phpinfo_url    = wp_nonce_url( MOBO_CORE_PLUGIN_URL . 'mobo-phpinfo.php', 'mobo_core_phpinfo' );
 		$report_url     = isset( $status['reportUrl'] ) ? (string) $status['reportUrl'] : '';
+		$report_interval = absint( Mobo_Core_Settings::get( 'mobo_core_health_report_min_interval_seconds', 900 ) );
+		$report_timeout  = absint( Mobo_Core_Settings::get( 'mobo_core_health_report_timeout_seconds', 15 ) );
 		?>
-		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
-			<input type="hidden" name="action" value="mobo_core_save_settings">
-			<input type="hidden" name="mobo_active_tab" value="health">
-			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
+		<div class="mobo-message mobo-message-info">
+			<strong>این صفحه فقط برای مشاهده وضعیت است.</strong>
+			فاصله ارسال گزارش، Timeout و سایر سیاست‌های سلامت از Portal .NET دریافت می‌شوند و در WordPress قابل تغییر نیستند.
+		</div>
 
-			<div class="mobo-grid">
-				<div class="mobo-card mobo-card-wide">
-					<div class="mobo-card-head">
-						<h2>گزارش سلامت سایت</h2>
-						<p>گزارش سلامت همیشه فعال است و به آدرس مرکزی MoboCore ارسال می‌شود. مدیر سایت نمی‌تواند مقصد گزارش یا فعال بودن ارسال را تغییر دهد.</p>
-					</div>
-
-					<div class="mobo-status-grid">
-						<?php $this->status_box( 'ارسال گزارش سلامت', 'همیشه فعال' ); ?>
-						<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'نسخه افزونه', defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '—' ); ?>
-					</div>
-
-					<div class="mobo-field mobo-field-full">
-						<label>مقصد ثابت گزارش سلامت</label>
-						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( '' !== $report_url ? $report_url : 'API Base URL تنظیم نشده است' ); ?>" onclick="this.select();">
-						<div class="mobo-help">این آدرس از API مرکزی موبو ساخته می‌شود و در این صفحه قابل ویرایش نیست.</div>
-					</div>
+		<div class="mobo-grid">
+			<div class="mobo-card mobo-card-wide">
+				<div class="mobo-card-head">
+					<h2>گزارش سلامت سایت</h2>
+					<p>گزارش سلامت به مقصد مرکزی MoboCore ارسال می‌شود. مقصد و سیاست ارسال از تنظیمات امضاشده Portal خوانده می‌شوند.</p>
 				</div>
 
-				<div class="mobo-card">
-					<div class="mobo-card-head">
-						<h2>تنظیمات زمان‌بندی گزارش</h2>
-						<p>فقط فاصله ارسال و timeout قابل تنظیم هستند.</p>
-					</div>
-					<div class="mobo-fields-grid">
-						<?php $this->int_field( 'حداقل فاصله ارسال / ثانیه', 'mobo_core_health_report_min_interval_seconds', 60, 3600 ); ?>
-						<?php $this->int_field( 'Timeout ارسال / ثانیه', 'mobo_core_health_report_timeout_seconds', 5, 60 ); ?>
-					</div>
+				<div class="mobo-status-grid">
+					<?php $this->status_box( 'ارسال گزارش سلامت', 'فعال و مدیریت‌شده توسط Portal' ); ?>
+					<?php $this->status_box( 'فاصله ارسال', $report_interval > 0 ? $report_interval . ' ثانیه' : '—' ); ?>
+					<?php $this->status_box( 'Timeout ارسال', $report_timeout > 0 ? $report_timeout . ' ثانیه' : '—' ); ?>
+					<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'نسخه افزونه', defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '—' ); ?>
 				</div>
 
-				<div class="mobo-card">
-					<div class="mobo-card-head">
-						<h2>PHP و پردازش تصویر</h2>
-						<p>خلاصه امن این اطلاعات همراه گزارش سلامت ارسال می‌شود. خروجی کامل phpinfo فقط برای مدیر واردشده قابل مشاهده است.</p>
-					</div>
-					<div class="mobo-status-grid">
-						<?php $this->status_box( 'نسخه PHP', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
-						<?php $this->status_box( 'GD', ! empty( $image['gdLoaded'] ) ? ( ! empty( $image['gdWebp'] ) ? 'فعال با WebP' : 'فعال بدون WebP' ) : 'نصب نیست' ); ?>
-						<?php $this->status_box( 'Imagick', ! empty( $image['imagickLoaded'] ) ? ( ! empty( $image['imagickWebp'] ) ? 'فعال با WebP' : 'فعال بدون WebP' ) : 'نصب نیست' ); ?>
-						<?php $this->status_box( 'پشتیبانی WebP وردپرس', ! empty( $image['wordpressWebp'] ) ? 'دارد' : 'ندارد' ); ?>
-						<?php $this->status_box( 'دسترسی نوشتن uploads', ! empty( $image['uploadsWritable'] ) ? 'دارد' : 'ندارد' ); ?>
-					</div>
-					<p><a class="button button-secondary" href="<?php echo esc_url( $phpinfo_url ); ?>" target="_blank" rel="noopener">مشاهده phpinfo کامل و محافظت‌شده</a></p>
-					<div class="mobo-help">لینک phpinfo دارای nonce کوتاه‌مدت است و فقط برای مدیر واردشده باز می‌شود. آن را عمومی منتشر نکنید.</div>
-				</div>
-
-				<div class="mobo-card mobo-card-wide">
-					<div class="mobo-card-head">
-						<h2>وضعیت محلی فعلی</h2>
-						<p>این مقادیر در گزارش سلامت مرکزی نیز ثبت می‌شوند.</p>
-					</div>
-
-					<div class="<?php echo $wp_cron_ok ? 'mobo-alert mobo-alert-success' : 'mobo-alert mobo-alert-error'; ?>">
-						<strong>DISABLE_WP_CRON:</strong>
-						<?php if ( $wp_cron_ok ) : ?>درست است و WP-Cron داخلی غیرفعال شده است.<?php else : ?>تعریف نشده یا false است. در <code>wp-config.php</code> و قبل از خط پایان ویرایش‌ها قرار دهید: <code dir="ltr">define('DISABLE_WP_CRON', true);</code><?php endif; ?>
-					</div>
-
-					<div class="mobo-status-grid">
-						<?php $this->status_box( 'دیباگ وردپرس', ! empty( $local['wpDebug'] ) ? 'فعال' : 'غیرفعال' ); ?>
-						<?php $this->status_box( 'نمایش خطا روی سایت', ! empty( $local['wpDebugDisplay'] ) ? 'فعال' : 'غیرفعال' ); ?>
-						<?php $this->status_box( 'محدودیت حافظه PHP', isset( $local['phpMemoryLimitRaw'] ) ? $local['phpMemoryLimitRaw'] : '—' ); ?>
-						<?php $this->status_box( 'فضای خالی دیسک', isset( $local['diskFreePercent'] ) && null !== $local['diskFreePercent'] ? $local['diskFreePercent'] . '%' : '—' ); ?>
-						<?php $this->status_box( 'وب‌هوک‌های در صف', isset( $local['pendingWebhookJobs'] ) ? absint( $local['pendingWebhookJobs'] ) : 0 ); ?>
-						<?php $this->status_box( 'وب‌هوک‌های ناموفق', isset( $local['failedWebhookJobs'] ) ? absint( $local['failedWebhookJobs'] ) : 0 ); ?>
-						<?php $this->status_box( 'حالت اجرای کران', isset( $local['cronMode'] ) ? $local['cronMode'] : '—' ); ?>
-					</div>
-
-					<?php if ( ! empty( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) : ?>
-						<details class="mobo-collapsible-log">
-							<summary>آخرین نتیجه ارسال گزارش سلامت</summary>
-							<div class="mobo-log-box"><pre dir="ltr"><?php echo esc_html( wp_json_encode( $status['lastResult'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre></div>
-						</details>
-					<?php endif; ?>
+				<div class="mobo-field mobo-field-full">
+					<label>مقصد ثابت گزارش سلامت</label>
+					<input type="text" readonly dir="ltr" value="<?php echo esc_attr( '' !== $report_url ? $report_url : 'API Base URL تنظیم نشده است' ); ?>" onclick="this.select();">
+					<div class="mobo-help">این آدرس فقط برای مشاهده است و در WordPress قابل ویرایش نیست.</div>
 				</div>
 			</div>
 
-			<?php
-			$this->guide_box(
-				'راهنمای سلامت سایت',
-				array(
-					array( 'title' => 'ارسال خودکار', 'text' => 'گزارش سلامت همیشه فعال است. فقط فاصله ارسال قابل تنظیم است و مقصد از API مرکزی موبو ساخته می‌شود.' ),
-					array( 'title' => 'phpinfo', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP ارسال می‌شود. خروجی کامل phpinfo فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
-					array( 'title' => 'کران', 'text' => 'برای جلوگیری از اجرای همزمان WP-Cron داخلی و Cron واقعی، DISABLE_WP_CRON باید true باشد.' ),
-				),
-				'اگر WebP یا دسترسی نوشتن uploads در وضعیت خطا بود، قبل از نوسازی تصاویر آن را در هاست اصلاح کنید.'
-			);
-			$this->recommendation_box(
-				'تنظیمات پیشنهادی سلامت سایت',
-				array(
-					array( 'setting' => 'حداقل فاصله ارسال', 'value' => '۹۰۰ ثانیه در حالت عادی؛ ۳۰۰ ثانیه برای عیب‌یابی', 'reason' => 'گزارش کافی تولید می‌کند و فشار اضافی ایجاد نمی‌کند.' ),
-					array( 'setting' => 'Timeout ارسال', 'value' => '۱۰ تا ۱۵ ثانیه', 'reason' => 'برای هاست‌های معمولی کافی است و worker را طولانی نگه نمی‌دارد.' ),
-					array( 'setting' => 'DISABLE_WP_CRON', 'value' => 'true', 'reason' => 'اجرای صف‌ها باید با Cron واقعی و قابل مشاهده انجام شود.' ),
-				),
-				'بعد از تغییر PHP، فعال‌سازی Imagick/GD یا اصلاح wp-config.php، این صفحه را دوباره باز کنید تا وضعیت تازه محاسبه شود.'
-			);
-			?>
+			<div class="mobo-card">
+				<div class="mobo-card-head">
+					<h2>PHP و پردازش تصویر</h2>
+					<p>خلاصه امن این اطلاعات همراه گزارش سلامت ارسال می‌شود. خروجی کامل phpinfo فقط برای مدیر واردشده قابل مشاهده است.</p>
+				</div>
+				<div class="mobo-status-grid">
+					<?php $this->status_box( 'نسخه PHP', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
+					<?php $this->status_box( 'GD', ! empty( $image['gdLoaded'] ) ? ( ! empty( $image['gdWebp'] ) ? 'فعال با WebP' : 'فعال بدون WebP' ) : 'نصب نیست' ); ?>
+					<?php $this->status_box( 'Imagick', ! empty( $image['imagickLoaded'] ) ? ( ! empty( $image['imagickWebp'] ) ? 'فعال با WebP' : 'فعال بدون WebP' ) : 'نصب نیست' ); ?>
+					<?php $this->status_box( 'پشتیبانی WebP وردپرس', ! empty( $image['wordpressWebp'] ) ? 'دارد' : 'ندارد' ); ?>
+					<?php $this->status_box( 'دسترسی نوشتن uploads', ! empty( $image['uploadsWritable'] ) ? 'دارد' : 'ندارد' ); ?>
+				</div>
+				<p><a class="button button-secondary" href="<?php echo esc_url( $phpinfo_url ); ?>" target="_blank" rel="noopener">مشاهده phpinfo کامل و محافظت‌شده</a></p>
+				<div class="mobo-help">لینک phpinfo دارای nonce کوتاه‌مدت است و فقط برای مدیر واردشده باز می‌شود. آن را عمومی منتشر نکنید.</div>
+			</div>
 
-			<?php $this->save_button(); ?>
-		</form>
+			<div class="mobo-card mobo-card-wide">
+				<div class="mobo-card-head">
+					<h2>وضعیت محلی فعلی</h2>
+					<p>این مقادیر در گزارش سلامت مرکزی نیز ثبت می‌شوند.</p>
+				</div>
+
+				<div class="<?php echo $wp_cron_ok ? 'mobo-alert mobo-alert-success' : 'mobo-alert mobo-alert-error'; ?>">
+					<strong>DISABLE_WP_CRON:</strong>
+					<?php if ( $wp_cron_ok ) : ?>درست است و WP-Cron داخلی غیرفعال شده است.<?php else : ?>تعریف نشده یا false است. در <code>wp-config.php</code> و قبل از خط پایان ویرایش‌ها قرار دهید: <code dir="ltr">define('DISABLE_WP_CRON', true);</code><?php endif; ?>
+				</div>
+
+				<div class="mobo-status-grid">
+					<?php $this->status_box( 'دیباگ وردپرس', ! empty( $local['wpDebug'] ) ? 'فعال' : 'غیرفعال' ); ?>
+					<?php $this->status_box( 'نمایش خطا روی سایت', ! empty( $local['wpDebugDisplay'] ) ? 'فعال' : 'غیرفعال' ); ?>
+					<?php $this->status_box( 'محدودیت حافظه PHP', isset( $local['phpMemoryLimitRaw'] ) ? $local['phpMemoryLimitRaw'] : '—' ); ?>
+					<?php $this->status_box( 'فضای خالی دیسک', isset( $local['diskFreePercent'] ) && null !== $local['diskFreePercent'] ? $local['diskFreePercent'] . '%' : '—' ); ?>
+					<?php $this->status_box( 'وب‌هوک‌های در صف', isset( $local['pendingWebhookJobs'] ) ? absint( $local['pendingWebhookJobs'] ) : 0 ); ?>
+					<?php $this->status_box( 'وب‌هوک‌های ناموفق', isset( $local['failedWebhookJobs'] ) ? absint( $local['failedWebhookJobs'] ) : 0 ); ?>
+					<?php $this->status_box( 'حالت اجرای کران', isset( $local['cronMode'] ) ? $local['cronMode'] : '—' ); ?>
+				</div>
+
+				<?php if ( ! empty( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) : ?>
+					<details class="mobo-collapsible-log">
+						<summary>آخرین نتیجه ارسال گزارش سلامت</summary>
+						<div class="mobo-log-box"><pre dir="ltr"><?php echo esc_html( wp_json_encode( $status['lastResult'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre></div>
+					</details>
+				<?php endif; ?>
+			</div>
+		</div>
+
+		<?php
+		$this->guide_box(
+			'راهنمای سلامت سایت',
+			array(
+				array( 'title' => 'مدیریت مرکزی', 'text' => 'فاصله ارسال و Timeout از تنظیمات امضاشده Portal دریافت می‌شوند و در این صفحه فقط نمایش داده می‌شوند.' ),
+				array( 'title' => 'phpinfo', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP ارسال می‌شود. خروجی کامل phpinfo فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
+				array( 'title' => 'کران', 'text' => 'برای جلوگیری از اجرای هم‌زمان WP-Cron داخلی و Cron واقعی، DISABLE_WP_CRON باید true باشد.' ),
+			),
+			'اگر WebP یا دسترسی نوشتن uploads در وضعیت خطا بود، آن را در سطح هاست اصلاح کنید؛ این موارد تنظیم Mobo نیستند.'
+		);
+		?>
 
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
 			<input type="hidden" name="action" value="mobo_core_retry_failed_webhooks">
@@ -2106,6 +1990,7 @@ type:{mobo_order_type_label}</textarea>
 		</form>
 		<?php
 	}
+
 	/**
 	 * Render real cron tab.
 	 *
@@ -5056,14 +4941,16 @@ type:{mobo_order_type_label}</textarea>
 	}
 
 	/**
-	 * Webhook codes are expected to contain English letters and digits only.
+	 * Validate a webhook shared secret without changing its original format.
+	 * Printable punctuation such as GUID hyphens is allowed; control characters
+	 * are rejected so the value remains safe for an HTTP header.
 	 *
 	 * @param string $code Security code.
 	 * @return bool
 	 */
 	private function is_webhook_security_code_valid( $code ) {
 		$code = trim( (string) $code );
-		return '' !== $code && 1 === preg_match( '/^[A-Za-z0-9]+$/', $code );
+		return strlen( $code ) >= 8 && strlen( $code ) <= 256 && ! preg_match( '/[\x00-\x1F\x7F]/', $code );
 	}
 
 	/**
@@ -5786,197 +5673,24 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function save_current_tab_settings( $tab ) {
-		switch ( $tab ) {
-			case 'connection':
-				$this->save_secret_option_from_post( 'mobo_core_token' );
-				$this->save_secret_option_from_post( 'mobo_core_security_code' );
-				break;
+		if ( 'connection' !== sanitize_key( (string) $tab ) ) {
+			return;
+		}
 
-			case 'product':
-				$this->save_bool_options_from_post(
-					array(
-						'global_product_auto_stock',
-						'global_product_auto_price',
-						'global_product_auto_title',
-						'global_product_auto_slug',
-						'mobo_core_only_in_stock',
-						'global_product_auto_compare_price',
-						'global_update_images',
-					)
-				);
-				break;
+		$changes = array();
+		foreach ( array( 'mobo_core_token', 'mobo_core_security_code' ) as $key ) {
+			if ( ! isset( $_POST[ $key ] ) ) {
+				continue;
+			}
 
-			case 'categories':
-				$this->save_bool_options_from_post( array( 'global_update_categories', 'mobo_core_category_mapping_enabled', 'mobo_core_category_mapping_required' ) );
-				$this->save_int_options_from_post( array( 'mobo_default_category_id' => array( 0, PHP_INT_MAX ) ) );
-				$this->save_category_mapping_from_post();
-				break;
+			$value = trim( (string) wp_unslash( $_POST[ $key ] ) );
+			if ( '' !== $value ) {
+				$changes[ $key ] = $value;
+			}
+		}
 
-			case 'pricing':
-				$this->save_pricing_tab_from_post();
-				break;
-
-			case 'filters':
-				if ( isset( $_POST['mobo_core_excluded_product_urls'] ) ) {
-					update_option( 'mobo_core_excluded_product_urls', sanitize_textarea_field( wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) ), false );
-				}
-				break;
-
-			case 'queue':
-				$this->save_bool_options_from_post(
-					array(
-						'mobo_core_product_cursor_sync_enabled',
-						'mobo_core_variant_cursor_sync_enabled',
-						'mobo_core_image_queue_enabled',
-						'mobo_core_image_queue_blocking',
-					)
-				);
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_sync_time_budget_seconds' => array( 2, 25 ),
-						'mobo_core_products_per_page' => array( 1, 20 ),
-						'mobo_core_variants_per_page' => array( 1, 100 ),
-						'mobo_core_images_per_run' => array( 0, 10 ),
-						'mobo_core_image_max_try' => array( 1, 20 ),
-						'mobo_core_image_retry_base_seconds' => array( 30, 900 ),
-						'mobo_core_webhook_files_per_run' => array( 1, 10 ),
-						'mobo_core_webhook_max_try' => array( 1, 20 ),
-						'mobo_core_webhook_expire_days' => array( 1, 30 ),
-						'mobo_core_variant_parent_wait_timeout_seconds' => array( 60, 86400 ),
-					)
-				);
-				if ( isset( $_POST['mobo_core_missing_variants_behavior'] ) ) {
-					$behavior = sanitize_key( wp_unslash( $_POST['mobo_core_missing_variants_behavior'] ) );
-					if ( ! in_array( $behavior, array( 'outofstock', 'ignore' ), true ) ) {
-						$behavior = 'outofstock';
-					}
-					update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
-				}
-				break;
-
-			case 'image-refresh':
-				$this->save_bool_options_from_post( array( 'mobo_core_image_refresh_enabled', 'mobo_core_image_refresh_delete_old', 'mobo_core_image_refresh_generate_subsizes', 'mobo_core_image_refresh_cleanup_leftover_subsizes', 'mobo_core_orphan_image_cleanup_enabled' ) );
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_image_refresh_per_run' => array( 1, 20 ),
-						'mobo_core_image_refresh_scan_limit' => array( 50, 5000 ),
-						'mobo_core_image_refresh_max_try' => array( 1, 20 ),
-						'mobo_core_image_refresh_retry_base_seconds' => array( 30, 1800 ),
-						'mobo_core_orphan_image_scan_limit' => array( 50, 5000 ),
-						'mobo_core_orphan_image_delete_per_run' => array( 1, 200 ),
-					)
-				);
-
-				$workflow = $this->get_image_refresh_workflow_state();
-				if ( empty( $workflow['flags']['canEnableRefresh'] ) ) {
-					update_option( 'mobo_core_image_refresh_enabled', '0', false );
-				}
-				if ( empty( $workflow['flags']['canEnableDeleteOld'] ) ) {
-					update_option( 'mobo_core_image_refresh_delete_old', '0', false );
-				}
-				if ( empty( $workflow['flags']['canEnableOrphanDelete'] ) ) {
-					update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
-				}
-				break;
-
-			case 'cron':
-				$this->save_bool_options_from_post(
-					array(
-						'mobo_core_self_runner_enabled',
-						'mobo_core_self_runner_continue_enabled',
-						'mobo_core_real_cron_process_webhooks',
-						'mobo_core_process_webhook_on_receive',
-						'mobo_core_pull_payload_enabled',
-					)
-				);
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_real_cron_time_budget_seconds' => array( 5, 55 ),
-						'mobo_core_real_cron_max_sync_steps' => array( 1, 20 ),
-						'mobo_core_real_cron_lock_ttl_seconds' => array( 30, 600 ),
-						'mobo_core_real_cron_expected_interval_seconds' => array( 60, 3600 ),
-						'mobo_core_self_runner_min_interval_seconds' => array( 0, 60 ),
-						'mobo_core_self_runner_http_timeout_seconds' => array( 1, 10 ),
-						'mobo_core_payload_pull_timeout_seconds' => array( 5, 180 ),
-						'mobo_core_api_request_timeout_seconds' => array( 5, 180 ),
-						'mobo_core_transient_retry_max_try' => array( 1, 50 ),
-						'mobo_core_waiting_for_portal_retry_delay_seconds' => array( 10, 3600 ),
-					)
-				);
-				$this->save_secret_option_from_post( 'mobo_core_cron_token' );
-				break;
-
-			case 'checkout':
-				$this->save_bool_options_from_post(
-					array(
-						'mobo_core_checkout_validation_enabled',
-						'mobo_core_checkout_local_stock_check_enabled',
-						'mobo_core_checkout_mobo_cart_validation_enabled',
-						'mobo_core_checkout_mobo_debug_enabled',
-						'mobo_core_shipping_diagnostics_enabled',
-						'mobo_core_mobo_order_submission_enabled',
-						'mobo_core_mobo_order_auto_complete_enabled',
-						'mobo_core_checkout_external_validation_enabled',
-						'mobo_core_address_mapping_show_all_countries',
-					)
-				);
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_checkout_mobo_timeout_seconds' => array( 2, 20 ),
-						'mobo_core_checkout_mobo_cart_lock_wait_seconds' => array( 0, 45 ),
-						'mobo_core_checkout_mobo_cart_lock_ttl_seconds' => array( 15, 300 ),
-						'mobo_core_checkout_external_timeout_seconds' => array( 1, 10 ),
-						'mobo_core_address_mapping_sync_interval_days' => array( 1, 30 ),
-						'mobo_core_remote_shipping_sync_interval_hours' => array( 1, 168 ),
-					)
-				);
-				$old_mobo_username = (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_username', '' );
-				update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
-				$this->save_text_option_from_post( 'mobo_core_checkout_mobo_username' );
-				$this->save_text_option_from_post( 'mobo_core_mobo_order_sender_name' );
-				$this->save_text_option_from_post( 'mobo_core_mobo_order_sender_mobile' );
-				$this->save_url_option_from_post( 'mobo_core_checkout_external_validation_url' );
-				if ( isset( $_POST['mobo_core_checkout_mobo_password'] ) ) {
-					$mobo_password = (string) wp_unslash( $_POST['mobo_core_checkout_mobo_password'] );
-					if ( '' !== $mobo_password ) {
-						update_option( 'mobo_core_checkout_mobo_password', sanitize_text_field( $mobo_password ), false );
-						delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
-					}
-				}
-				if ( $old_mobo_username !== (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_username', '' ) ) {
-					delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
-				}
-				if ( isset( $_POST['mobo_core_checkout_external_error_behavior'] ) ) {
-					$checkout_error_behavior = sanitize_key( wp_unslash( $_POST['mobo_core_checkout_external_error_behavior'] ) );
-					if ( ! in_array( $checkout_error_behavior, array( 'allow', 'block' ), true ) ) {
-						$checkout_error_behavior = 'allow';
-					}
-					update_option( 'mobo_core_checkout_external_error_behavior', $checkout_error_behavior, false );
-				}
-				$this->save_mobo_shipping_rules_from_post();
-				if ( class_exists( 'Mobo_Core_Address_Mapping' ) ) {
-					$address_mapping_for_save = new Mobo_Core_Address_Mapping();
-					if ( method_exists( $address_mapping_for_save, 'save_manual_mapping_from_post' ) ) {
-						$address_mapping_for_save->save_manual_mapping_from_post( $_POST );
-					}
-				}
-				$this->apply_checkout_save_dependencies();
-				break;
-
-			case 'sms':
-				$this->save_sms_notification_settings_from_post();
-				break;
-
-			case 'health':
-				update_option( 'mobo_core_health_report_enabled', '1', false );
-				delete_option( 'mobo_core_health_report_url' );
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_health_report_min_interval_seconds' => array( 60, 3600 ),
-						'mobo_core_health_report_timeout_seconds' => array( 5, 60 ),
-					)
-				);
-				break;
+		if ( ! empty( $changes ) && class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			Mobo_Core_Remote_Config::instance()->update_bootstrap_credentials( $changes );
 		}
 	}
 
@@ -6103,153 +5817,48 @@ type:{mobo_order_type_label}</textarea>
 
 		check_admin_referer( 'mobo_core_save_settings', 'mobo_core_nonce' );
 
-		if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
-			$this->redirect_with_message(
-				'تنظیمات Mobo Core از Portal .NET مدیریت می‌شوند و امکان ذخیره محلی وجود ندارد.',
-				'warning',
-				'dashboard'
-			);
+		$tab = isset( $_POST['mobo_active_tab'] ) ? sanitize_key( wp_unslash( $_POST['mobo_active_tab'] ) ) : '';
+		if ( 'connection' !== $tab ) {
+			$this->redirect_with_message( 'تمام تنظیمات عملیاتی Mobo Core فقط از Portal .NET مدیریت می‌شوند.', 'warning', 'dashboard' );
 		}
 
-		$tab = isset( $_POST['mobo_active_tab'] ) ? sanitize_key( wp_unslash( $_POST['mobo_active_tab'] ) ) : 'dashboard';
-		$allowed_tabs = array( 'connection', 'product', 'categories', 'pricing', 'filters', 'queue', 'image-refresh', 'cron', 'checkout', 'sms', 'health' );
-		if ( ! in_array( $tab, $allowed_tabs, true ) ) {
-			$tab = 'dashboard';
-		}
-
-		if ( 'queue' === $tab && class_exists( 'Mobo_Core_Sync_Settings_Guard' ) ) {
-			$queue_settings_lock = Mobo_Core_Sync_Settings_Guard::get_lock_state();
-			if ( ! empty( $queue_settings_lock['locked'] ) ) {
-				$operation_label = isset( $queue_settings_lock['operationLabel'] )
-					? sanitize_text_field( (string) $queue_settings_lock['operationLabel'] )
-					: 'همگام سازی محصولات';
-
-				$this->redirect_with_message(
-					'تنظیمات صف و پردازش در زمان اجرای ' . $operation_label . ' قفل است و هیچ تغییری ذخیره نشد. پس از پایان عملیات دوباره تلاش کنید.',
-					'warning',
-					'queue'
-				);
-			}
-		}
-
-		$was_order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
-
-		$this->save_current_tab_settings( $tab );
-
-		if ( isset( $_POST['mobo_core_clear_mobo_debug_log'] ) && 'checkout' === $tab ) {
-			if ( class_exists( 'Mobo_Core_Checkout_Validator' ) ) {
-				$validator = new Mobo_Core_Checkout_Validator();
-				if ( method_exists( $validator, 'clear_mobo_debug_log' ) ) {
-					$validator->clear_mobo_debug_log();
+		$changes = array();
+		if ( isset( $_POST['mobo_core_token'] ) ) {
+			$token = trim( (string) wp_unslash( $_POST['mobo_core_token'] ) );
+			if ( '' !== $token ) {
+				if ( strlen( $token ) < 16 || strlen( $token ) > 1024 || preg_match( '/[\\x00-\\x1F\\x7F]/', $token ) ) {
+					$this->redirect_with_message( 'کلید لایسنس نامعتبر است.', 'error', 'connection' );
 				}
+				$changes['mobo_core_token'] = $token;
 			}
-
-			$this->redirect_with_message( 'لاگ دیباگ سبد موبو پاک شد.', 'success', 'checkout' );
 		}
 
-		if ( isset( $_POST['mobo_core_clear_shipping_diagnostics'] ) && 'checkout' === $tab ) {
-			if ( class_exists( 'Mobo_Core_Shipping_Diagnostics' ) ) {
-				$shipping_diagnostics = new Mobo_Core_Shipping_Diagnostics();
-				if ( method_exists( $shipping_diagnostics, 'clear' ) ) {
-					$shipping_diagnostics->clear();
+		if ( isset( $_POST['mobo_core_security_code'] ) ) {
+			$security_code = trim( (string) wp_unslash( $_POST['mobo_core_security_code'] ) );
+			if ( '' !== $security_code ) {
+				if ( strlen( $security_code ) < 8 || strlen( $security_code ) > 256 || preg_match( '/[\x00-\x1F\x7F]/', $security_code ) ) {
+					$this->redirect_with_message( 'کد امنیتی وب‌هوک باید بین ۸ تا ۲۵۶ کاراکتر باشد و نباید نویسه کنترلی یا خط جدید داشته باشد.', 'error', 'connection' );
 				}
-			}
-
-			$this->redirect_with_message( 'گزارش دیباگ حمل و نقل پاک شد.', 'success', 'checkout' );
-		}
-
-		if ( isset( $_POST['mobo_core_sync_address_mapping'] ) && 'checkout' === $tab ) {
-			if ( ! class_exists( 'Mobo_Core_Address_Mapping' ) ) {
-				$this->redirect_with_message( 'کلاس بروزرسانی آدرس‌ها در دسترس نیست.', 'error', 'checkout' );
-			}
-
-			$address_mapping = new Mobo_Core_Address_Mapping();
-			$result = $address_mapping->sync_now( 'manual', true );
-
-			if ( empty( $result['success'] ) ) {
-				$message = isset( $result['message'] ) ? $result['message'] : 'بروزرسانی آدرس‌ها ناموفق بود.';
-				$this->redirect_with_message( 'بروزرسانی آدرس‌ها ناموفق بود: ' . $message, 'error', 'checkout' );
-			}
-
-			$this->redirect_with_message( 'کشور، استان و شهرها از MoboCore بروزرسانی و فایل‌های شهر Checkout ساخته شدند.', 'success', 'checkout' );
-		}
-
-		if ( isset( $_POST['mobo_core_sync_remote_shipping_methods'] ) && 'checkout' === $tab ) {
-			if ( ! class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
-				$this->redirect_with_message( 'کلاس بروزرسانی روش‌های ارسال موبو در دسترس نیست.', 'error', 'checkout' );
-			}
-
-			$remote_shipping = new Mobo_Core_Remote_Shipping_Methods();
-			$result = $remote_shipping->sync_now( 'manual', true );
-
-			if ( empty( $result['success'] ) ) {
-				$message = isset( $result['message'] ) ? $result['message'] : 'بروزرسانی روش‌های ارسال موبو ناموفق بود.';
-				$this->redirect_with_message( 'بروزرسانی روش‌های ارسال موبو ناموفق بود: ' . $message, 'error', 'checkout' );
-			}
-
-			$this->redirect_with_message( 'روش‌های ارسال موبو از MoboCore بروزرسانی شدند.', 'success', 'checkout' );
-		}
-
-		if ( isset( $_POST['mobo_core_test_mobo_login'] ) && 'checkout' === $tab ) {
-			if ( ! class_exists( 'Mobo_Core_Checkout_Validator' ) ) {
-				$this->redirect_with_message( 'کلاس اعتبارسنجی خرید در دسترس نیست.', 'error', 'checkout' );
-			}
-
-			$validator = new Mobo_Core_Checkout_Validator();
-			$result    = $validator->test_mobo_login();
-
-			if ( is_wp_error( $result ) ) {
-				$this->redirect_with_message( 'تست ورود ناموفق بود: ' . $result->get_error_message(), 'error', 'checkout' );
-			}
-
-			$this->redirect_with_message( 'تست ورود به موبو موفق بود.', 'success', 'checkout' );
-		}
-
-		if ( isset( $_POST['mobo_core_run_cron_now'] ) && 'cron' === $tab ) {
-			if ( ! class_exists( 'Mobo_Core_Cron_Runner' ) ) {
-				$this->redirect_with_message( 'کلاس Cron Runner در دسترس نیست.', 'error', 'cron' );
-			}
-
-			$runner = new Mobo_Core_Cron_Runner();
-			$result = $runner->run( 'admin-manual-cron-test' );
-			$webhook_processed = 0;
-			$webhook_failed    = 0;
-
-			if ( is_array( $result ) && isset( $result['webhookQueue'] ) && is_array( $result['webhookQueue'] ) ) {
-				$webhook_processed = isset( $result['webhookQueue']['processed'] ) ? absint( $result['webhookQueue']['processed'] ) : 0;
-				$webhook_failed    = isset( $result['webhookQueue']['failed'] ) ? absint( $result['webhookQueue']['failed'] ) : 0;
-			}
-
-			$message = sprintf( 'تست Cron اجرا شد. وب‌هوک پردازش‌شده: %d، خطا: %d. جزئیات در آخرین نتیجه Cron ثبت شد.', $webhook_processed, $webhook_failed );
-			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'cron' );
-		}
-
-		if ( 'checkout' === $tab && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
-			if ( class_exists( 'Mobo_Core_Address_Mapping' ) ) {
-				$address_mapping = new Mobo_Core_Address_Mapping();
-				$address_status  = method_exists( $address_mapping, 'get_status' ) ? $address_mapping->get_status() : array();
-				$counts = isset( $address_status['counts'] ) && is_array( $address_status['counts'] ) ? $address_status['counts'] : array();
-				if ( ! $was_order_submission_enabled || empty( $counts['countries'] ) || empty( $counts['states'] ) || empty( $counts['cities'] ) ) {
-					$address_mapping->sync_now( 'auto-order-enabled', true );
-				}
-			}
-
-			if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
-				$remote_shipping = new Mobo_Core_Remote_Shipping_Methods();
-				$status = method_exists( $remote_shipping, 'get_status' ) ? $remote_shipping->get_status() : array();
-				if ( ! $was_order_submission_enabled || empty( $status['count'] ) ) {
-					$remote_shipping->sync_now( 'auto-order-enabled', true );
-				}
-			}
-
-			$required_validation = $this->validate_mobo_order_submission_required_config();
-			if ( is_wp_error( $required_validation ) ) {
-				$this->redirect_with_message( $required_validation->get_error_message(), 'error', 'checkout' );
+				$changes['mobo_core_security_code'] = $security_code;
 			}
 		}
 
-		$this->redirect_with_message( 'تنظیمات همین تب ذخیره شد.', 'success', $tab );
+		if ( empty( $changes ) ) {
+			$this->redirect_with_message( 'مقدار جدیدی وارد نشده است؛ Secretهای فعلی بدون تغییر باقی ماندند.', 'warning', 'connection' );
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			$this->redirect_with_message( 'مدیر Credentialهای امن افزونه در دسترس نیست.', 'error', 'connection' );
+		}
+
+		$result = Mobo_Core_Remote_Config::instance()->update_bootstrap_credentials( $changes );
+		if ( is_wp_error( $result ) ) {
+			$this->redirect_with_message( $result->get_error_message(), 'error', 'connection' );
+		}
+
+		$this->redirect_with_message( 'اطلاعات لایسنس و امنیت وب‌هوک با موفقیت ذخیره شد.', 'success', 'connection' );
 	}
+
 
 	/**
 	 * Return current sync status for admin auto-refresh.
@@ -10149,6 +9758,76 @@ type:{mobo_order_type_label}</textarea>
 				word-break: break-word;
 			}
 
+
+			.mobo-credential-grid {
+				display: grid;
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+				gap: 16px;
+			}
+
+			.mobo-credential-card {
+				position: relative;
+				background: #fff;
+				border: 1px solid #dbe4ef;
+				border-radius: 22px;
+				padding: 20px;
+				box-shadow: 0 12px 30px rgba(15,23,42,.05);
+			}
+
+			.mobo-credential-icon {
+				position: absolute;
+				top: 18px;
+				left: 18px;
+				width: 38px;
+				height: 38px;
+				border-radius: 12px;
+				display: grid;
+				place-items: center;
+				font-weight: 900;
+				color: #1d4ed8;
+				background: #eff6ff;
+				border: 1px solid #bfdbfe;
+			}
+
+			.mobo-credential-state {
+				margin-top: 12px;
+				padding: 9px 11px;
+				border-radius: 12px;
+				font-size: 12px;
+				font-weight: 800;
+			}
+
+			.mobo-credential-state.is-ok { color:#166534; background:#f0fdf4; border:1px solid #bbf7d0; }
+			.mobo-credential-state.is-missing { color:#9a3412; background:#fff7ed; border:1px solid #fed7aa; }
+			.mobo-save-row-split { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+
+			.mobo-license-card {
+				margin-top: 18px;
+				padding: 22px;
+				border-radius: 24px;
+				border: 1px solid #dbe4ef;
+				background: linear-gradient(180deg,#fff 0%,#f8fafc 100%);
+				box-shadow: 0 16px 38px rgba(15,23,42,.07);
+			}
+
+			.mobo-license-card.is-active { border-top: 4px solid #16a34a; }
+			.mobo-license-card.is-expired { border-top: 4px solid #dc2626; }
+			.mobo-license-card.is-unknown { border-top: 4px solid #d97706; }
+			.mobo-license-head { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:18px; }
+			.mobo-license-head h2 { margin:4px 0 6px; font-size:20px; color:#0f172a; }
+			.mobo-license-head p { margin:0; color:#64748b; }
+			.mobo-license-eyebrow { font-size:11px; letter-spacing:.12em; font-weight:900; color:#2563eb; }
+			.mobo-license-pill { display:inline-flex; align-items:center; padding:8px 13px; border-radius:999px; font-size:12px; font-weight:900; white-space:nowrap; }
+			.mobo-license-pill.is-active { color:#166534; background:#dcfce7; }
+			.mobo-license-pill.is-expired { color:#991b1b; background:#fee2e2; }
+			.mobo-license-pill.is-unknown { color:#92400e; background:#fef3c7; }
+			.mobo-license-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+			.mobo-license-metrics > div { background:#fff; border:1px solid #e2e8f0; border-radius:16px; padding:13px; min-width:0; }
+			.mobo-license-metrics span { display:block; color:#64748b; font-size:11px; margin-bottom:6px; }
+			.mobo-license-metrics strong { display:block; color:#0f172a; font-size:13px; overflow-wrap:anywhere; }
+			.mobo-license-reference { margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; color:#64748b; }
+			.mobo-license-reference code { direction:ltr; }
+
 			.mobo-message,
 
 			.mobo-image-command-center {
@@ -10339,6 +10018,15 @@ type:{mobo_order_type_label}</textarea>
 			}
 
 			@media (max-width: 960px) {
+				.mobo-credential-grid,
+				.mobo-license-metrics {
+					grid-template-columns: 1fr;
+				}
+
+				.mobo-license-head {
+					flex-direction: column;
+				}
+
 				.mobo-hero,
 				.mobo-grid-dashboard {
 					display: block;

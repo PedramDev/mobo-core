@@ -73,4 +73,4 @@ MoboCore از Token و Webhook Security Code برای کنترل دسترسی ا
 
 وب سایت سرویس:
 
-http://mobo.codeya.ir/
+https://mobo.codeya.ir/

@@ -5,7 +5,7 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.33.2-1f6feb)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.33.3-1f6feb)
 ![Portal](https://img.shields.io/badge/Portal-v32%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
@@ -22,7 +22,7 @@
 
 ## معرفی فارسی
 
-Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های ایرانی است که محصولات، تنوع ها، دسته بندی ها، تصاویر، قیمت و موجودی را از MoboCore دریافت می کند و رویدادهای تغییر را از طریق وب هوک پردازش می کند. در صورت فعال سازی تنظیمات مربوطه، افزونه می تواند اعتبارسنجی خرید، نگاشت آدرس، نگاشت روش ارسال و ثبت خودکار سفارش در جریان اختصاصی `mobomobo.ir` را نیز انجام دهد.
+Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های ایرانی است که محصولات، تنوع ها، دسته بندی ها، تصاویر، قیمت و موجودی را از MoboCore دریافت می کند و رویدادهای تغییر را از طریق وب هوک پردازش می کند. براساس تنظیمات امضاشده Portal، افزونه می‌تواند اعتبارسنجی خرید، نگاشت آدرس، نگاشت روش ارسال و ثبت خودکار سفارش در جریان اختصاصی `mobomobo.ir` را نیز انجام دهد.
 
 این مخزن مربوط به افزونه وردپرس است. بک اند سازگار فعلی، Portal نسخه 25 با `.NET 10` است؛ با این حال هیچ کد یا مستند مشتری در پروژه .NET قرار داده نشده و تمام توضیحات قابل انتشار در همین افزونه نگهداری می شوند.
 
@@ -51,26 +51,25 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WooCommerce | `8.2+` |
 | ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.33.2` |
-| Portal سازگار | `v32 / .NET 10` |
+| Mobo Core | `10.33.3` |
+| Portal سازگار | `v33 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
 ### نصب سریع
 
 1. پوشه `mobo-core` را در مسیر `/wp-content/plugins/` قرار دهید یا ZIP را از بخش افزونه های وردپرس نصب کنید.
 2. WooCommerce و افزونه «ووکامرس فارسی» با slug برابر `persian-woocommerce` را نصب و فعال کنید. سپس Mobo Core را فعال کنید.
-3. از مسیر **موبو > خرید و فعال سازی** وضعیت حساب و لایسنس را بررسی کنید.
-4. در **موبو > اتصال**، مقدار API Base URL، Token و Webhook Security Code را وارد کنید.
+3. در **موبو > لایسنس و امنیت** فقط License Key / Token و Webhook Security Code را ثبت کنید.
+4. همه تنظیمات محصول، قیمت، دسته‌بندی، صف، تصویر، Checkout، ارسال و پیامک را در Portal .NET انجام دهید.
 5. Constantهای Worker را در `wp-config.php` تعریف و Cron دقیقه‌ای cPanel را برای `mobo-cron.php` فعال کنید.
-6. قبل از فعال کردن ثبت خودکار سفارش، نگاشت کشور/استان را ذخیره کنید، فایل شهرهای موبو را بسازید و نگاشت روش ارسال را تست کنید.
-7. در سایت هایی که از نسخه های قدیمی مانند نسخه 7 ارتقا یافته اند، یک Repair کامل اجرا کنید.
+6. در سایت‌هایی که از نسخه‌های قدیمی مانند نسخه 7 ارتقا یافته‌اند، یک Repair کامل اجرا کنید.
 
 ### اتصال پایه
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.33.2:
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+// مقدار فعلی پیش فرض افزونه در نسخه 10.33.3:
+define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 ```
 
 هدرهای اصلی ارتباط:
@@ -111,7 +110,7 @@ define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
 برای Production ترجیحاً Bootstrap و Cache را خارج از دیتابیس/Web Root قرار دهید:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 define( 'MOBO_TOKEN', '...' );
 define( 'MOBO_SECURITY_CODE', '...' );
 define( 'MOBO_CRON_TOKEN', '...' );
@@ -138,7 +137,7 @@ define( 'MOBO_CONFIG_CACHE_DIR', '/var/lib/mobo/config' );
 
 - فروش و فعال سازی: `+989124508218` — [Telegram](https://t.me/yazdan_ghadiri) — [WhatsApp](https://wa.me/989124508218)
 - پشتیبانی فنی: `+989367362228` — [Telegram](https://t.me/Codeya)
-- سرویس: [mobo.codeya.ir](http://mobo.codeya.ir/)
+- سرویس: [mobo.codeya.ir](https://mobo.codeya.ir/)
 - مخزن: [PedramDev/mobo-core](https://github.com/PedramDev/mobo-core)
 
 ### مجوز
@@ -191,7 +190,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 | WooCommerce | `8.2+` |
 | Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.33.2` |
+| Mobo Core | `10.33.3` |
 | Compatible Portal | `v25 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 
@@ -200,7 +199,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 1. Place the `mobo-core` directory in `/wp-content/plugins/`, or upload the ZIP through WordPress.
 2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`), then activate Mobo Core.
 3. Open **Mobo > Purchase & Activation** to verify the account and license.
-4. Open **Mobo > Connection** and enter the API base URL, Token, and Webhook Security Code.
+4. Open **Mobo > License & Security** and enter only the License Key / Token and Webhook Security Code. The API base URL and all operational settings are centrally managed.
 5. Define the CLI worker constants in `wp-config.php`, then add the once-per-minute cPanel cron entry.
 6. Save country/state mapping, generate the Mobo city assets, and test shipping mapping before enabling automatic order submission.
 7. Run one full Repair after upgrading a legacy installation such as version 7.
@@ -209,8 +208,8 @@ This repository contains the WordPress plugin. The current compatible backend is
 
 ```php
 // wp-config.php
-// Current built-in default in version 10.33.2:
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+// Current built-in default in version 10.33.3:
+define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 ```
 
 Primary transport headers:
@@ -260,7 +259,7 @@ This is not a generic marketplace connector and must not be described as the off
 
 - Sales and activation: `+989124508218` — [Telegram](https://t.me/yazdan_ghadiri) — [WhatsApp](https://wa.me/989124508218)
 - Technical support: `+989367362228` — [Telegram](https://t.me/Codeya)
-- Service: [mobo.codeya.ir](http://mobo.codeya.ir/)
+- Service: [mobo.codeya.ir](https://mobo.codeya.ir/)
 - Repository: [PedramDev/mobo-core](https://github.com/PedramDev/mobo-core)
 
 ### License

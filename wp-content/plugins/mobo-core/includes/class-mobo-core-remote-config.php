@@ -410,7 +410,7 @@ class Mobo_Core_Remote_Config {
 			return;
 		}
 		?>
-		<div class="notice notice-info"><p><strong>Mobo Core:</strong> تنظیمات این افزونه از Portal .NET دریافت و با امضای دیجیتال کنترل می‌شوند. فرم‌های تنظیمات محلی فقط خواندنی هستند.</p></div>
+		<div class="notice notice-info"><p><strong>Mobo Core:</strong> تنظیمات این افزونه از Portal .NET دریافت و با امضای دیجیتال کنترل می‌شوند. تنظیمات عملیاتی محلی حذف شده‌اند؛ فقط لایسنس و کد امنیتی وب‌هوک در WordPress قابل تغییر هستند.</p></div>
 		<?php
 	}
 
@@ -427,6 +427,7 @@ class Mobo_Core_Remote_Config {
 		<script>
 		document.addEventListener('DOMContentLoaded', function () {
 			document.querySelectorAll('form').forEach(function (form) {
+				if (form.hasAttribute('data-mobo-bootstrap-credentials-form')) return;
 				var action = form.querySelector('input[name="action"][value="mobo_core_save_settings"]');
 				if (!action) return;
 				form.querySelectorAll('input, select, textarea, button').forEach(function (field) {
@@ -927,6 +928,90 @@ class Mobo_Core_Remote_Config {
 
 		return $default;
 	}
+
+	/**
+	 * Update the only two credentials intentionally editable in WordPress.
+	 * Business configuration remains signed and controlled by Portal .NET.
+	 *
+	 * @param array $changes Credential changes.
+	 * @return array|WP_Error
+	 */
+	public function update_bootstrap_credentials( $changes ) {
+		if ( ! is_array( $changes ) ) {
+			return new WP_Error( 'credential_changes_invalid', 'Credential changes are invalid.' );
+		}
+
+		$allowed = array( 'mobo_core_token', 'mobo_core_security_code' );
+		$map     = self::bootstrap_option_map();
+		$values  = $this->read_bootstrap_credentials();
+		$updated = array();
+
+		foreach ( $map as $option_name => $constant_name ) {
+			if ( ! array_key_exists( $option_name, $values ) ) {
+				$values[ $option_name ] = $this->get_bootstrap_credential(
+					$option_name,
+					$this->read_raw_option( $option_name, '' ),
+					true
+				);
+			}
+		}
+
+		foreach ( $changes as $option_name => $value ) {
+			$option_name = (string) $option_name;
+			if ( ! in_array( $option_name, $allowed, true ) ) {
+				continue;
+			}
+
+			$constant_name = $map[ $option_name ];
+			$environment_value = getenv( $constant_name );
+			if ( ( defined( $constant_name ) && '' !== trim( (string) constant( $constant_name ) ) ) || ( false !== $environment_value && '' !== trim( (string) $environment_value ) ) ) {
+				return new WP_Error(
+					'credential_managed_externally',
+					'این Credential از طریق wp-config.php یا Environment مدیریت می‌شود و از پنل WordPress قابل تغییر نیست.'
+				);
+			}
+
+			$value = trim( (string) $value );
+			if ( '' === $value ) {
+				continue;
+			}
+
+			$values[ $option_name ] = $value;
+			$updated[ $option_name ] = $value;
+		}
+
+		if ( empty( $updated ) ) {
+			return new WP_Error( 'credential_changes_empty', 'No credential value was changed.' );
+		}
+
+		foreach ( array( 'mobo_core_api_base_url', 'mobo_core_token', 'mobo_core_security_code' ) as $required ) {
+			if ( empty( $values[ $required ] ) || '' === trim( (string) $values[ $required ] ) ) {
+				return new WP_Error( 'bootstrap_credentials_missing', 'Required Mobo bootstrap credentials are missing: ' . $required );
+			}
+		}
+
+		$dir = $this->cache_dir();
+		if ( ! wp_mkdir_p( $dir ) ) {
+			return new WP_Error( 'credential_directory_failed', 'Unable to create Mobo private credential directory.' );
+		}
+		$this->protect_cache_dir( $dir );
+
+		$json = wp_json_encode( $values, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+		if ( false === $json || ! $this->atomic_write( $this->cache_file( 'credentials.php' ), self::CACHE_PREFIX . $json ) ) {
+			return new WP_Error( 'credential_write_failed', 'Unable to persist Mobo credentials in the private credential file.' );
+		}
+
+		// Before the first signed bind, legacy code still reads wp_options. Once
+		// bound, pre_option filters make the private credential file authoritative.
+		if ( ! $this->is_enforced() ) {
+			foreach ( $updated as $option_name => $value ) {
+				update_option( $option_name, $value, false );
+			}
+		}
+
+		return array( 'success' => true, 'updated' => array_keys( $updated ) );
+	}
+
 
 	private function ensure_bootstrap_credentials_migrated() {
 		if ( is_readable( $this->cache_file( 'credentials.php' ) ) ) {

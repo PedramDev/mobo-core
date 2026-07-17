@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.33.2` and Portal `v32 / .NET 10`**
+**Generated against Mobo Core `10.33.3` and Portal `v32 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,17 +14,17 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.33.2` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.33.3` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.33.2` |
+| `MOBO_CORE_VERSION` | `10.33.3` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
-| `MOBO_CORE_PURCHASE_URL` | `http://mobo.codeya.ir/` |
+| `MOBO_CORE_PURCHASE_URL` | `https://mobo.codeya.ir/` |
 | `MOBO_CORE_GITHUB_URL` | `https://github.com/PedramDev/mobo-core` |
 | `MOBO_API_BASE_URL` | آدرس API پیش فرض/قابل override |
 | `MOBO_CORE_DATA_DIR` | `wp-content/uploads/mobo-core/` |
@@ -930,7 +930,7 @@ Public methods: **5** · Internal non-public methods: **8**
 | `public static function get($key, $fallback = null)` | اجرای عملیات `get` در بخش تعریف و خواندن تنظیمات افزونه. | Get option. |
 | `public static function get_int($key, $default, $min, $max)` | خواندن option عددی و محدود کردن آن به بازه مجاز. | Get integer option with min/max clamp. |
 | `public static function enabled($key, $default = '0')` | خواندن یک option بولی با مقدار پیش فرض. | Get boolean-like option. |
-| `public static function save_from_post($post)` | ذخیره from post در بخش تعریف و خواندن تنظیمات افزونه. | Save settings from admin post. |
+| `public static function save_from_post($post)` | فقط License Key / Token و Webhook Security Code را می‌پذیرد؛ سایر تنظیمات از Portal مدیریت می‌شوند. | Accept only bootstrap license and webhook security credentials. |
 
 ### `Mobo_Core_Shipping_Diagnostics`
 
@@ -1021,7 +1021,7 @@ Public methods: **4** · Internal non-public methods: **31**
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.33.2`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.33.3`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 

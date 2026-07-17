@@ -260,151 +260,31 @@ class Mobo_Core_Settings {
 	 * @return void
 	 */
 	public static function save_from_post( $post ) {
-		self::save_text( $post, 'mobo_core_security_code' );
-		self::save_url( $post, 'mobo_core_api_base_url' );
-		self::save_text( $post, 'mobo_core_token' );
-		self::save_text( $post, 'mobo_core_cron_token' );
-		delete_option( 'mobo_core_health_report_url' );
-		update_option( 'mobo_core_health_report_enabled', '1', false );
-		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
-		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
-		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
-		if ( isset( $post['mobo_core_checkout_mobo_password'] ) ) {
-			$password = sanitize_text_field( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
+		if ( ! is_array( $post ) ) {
+			return new WP_Error( 'mobo_settings_payload_invalid', 'Settings payload is invalid.' );
+		}
 
-			if ( '' !== $password ) {
-				update_option( 'mobo_core_checkout_mobo_password', $password, false );
-				delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
+		$changes = array();
+		foreach ( array( 'mobo_core_token', 'mobo_core_security_code' ) as $key ) {
+			if ( ! isset( $post[ $key ] ) ) {
+				continue;
+			}
+
+			$value = trim( (string) wp_unslash( $post[ $key ] ) );
+			if ( '' !== $value ) {
+				$changes[ $key ] = $value;
 			}
 		}
 
-		self::save_bool( $post, 'mobo_core_only_in_stock' );
-		self::save_bool( $post, 'global_product_auto_stock' );
-		self::save_bool( $post, 'global_product_auto_price' );
-		self::save_bool( $post, 'global_product_auto_title' );
-		self::save_bool( $post, 'global_product_auto_compare_price' );
-		self::save_bool( $post, 'global_product_auto_slug' );
-		self::save_bool( $post, 'global_update_categories' );
-		self::save_bool( $post, 'global_update_images' );
-		self::save_bool( $post, 'mobo_core_category_mapping_enabled' );
-		self::save_bool( $post, 'mobo_core_category_mapping_required' );
-
-		if ( isset( $post['mobo_core_excluded_product_urls'] ) ) {
-			update_option(
-				'mobo_core_excluded_product_urls',
-				sanitize_textarea_field( wp_unslash( $post['mobo_core_excluded_product_urls'] ) ),
-				false
-			);
+		if ( empty( $changes ) ) {
+			return new WP_Error( 'mobo_settings_no_allowed_changes', 'Only License Key / Token and Webhook Security Code can be changed in WordPress.' );
 		}
 
-		update_option(
-			'mobo_default_category_id',
-			absint( isset( $post['mobo_default_category_id'] ) ? wp_unslash( $post['mobo_default_category_id'] ) : 0 ),
-			false
-		);
-
-		$price_type = isset( $post['mobo_price_type'] )
-			? sanitize_key( wp_unslash( $post['mobo_price_type'] ) )
-			: null;
-
-		if ( null === $price_type ) {
-			$price_type = (string) self::get( 'mobo_price_type', 'static-price' );
+		if ( ! class_exists( 'Mobo_Core_Remote_Config' ) ) {
+			return new WP_Error( 'mobo_remote_config_unavailable', 'Mobo remote configuration manager is unavailable.' );
 		}
 
-		if ( ! in_array( $price_type, array( 'static-price', 'static-percentage', 'dynamic-price' ), true ) ) {
-			$price_type = 'static-price';
-		}
-
-		update_option( 'mobo_price_type', $price_type, false );
-
-		/*
-		 * Preserve old option names, but only save the relevant value based on selected price type.
-		 */
-		if ( 'static-price' === $price_type ) {
-			self::save_decimal( $post, 'global_additional_price' );
-			update_option( 'global_additional_percentage', '0', false );
-			update_option( 'mobo_dynamic_price', '[]', false );
-		} elseif ( 'static-percentage' === $price_type ) {
-			update_option( 'global_additional_price', '0', false );
-			self::save_decimal( $post, 'global_additional_percentage' );
-			update_option( 'mobo_dynamic_price', '[]', false );
-		} else {
-			update_option( 'global_additional_price', '0', false );
-			update_option( 'global_additional_percentage', '0', false );
-			update_option( 'mobo_dynamic_price', self::sanitize_dynamic_price_rows( $post ), false );
-		}
-
-		self::save_int( $post, 'mobo_core_sync_time_budget_seconds', 8, 2, 25 );
-		self::save_int( $post, 'mobo_core_webhook_files_per_run', 4, 1, 10 );
-		self::save_int( $post, 'mobo_core_webhook_max_try', 5, 1, 20 );
-		self::save_int( $post, 'mobo_core_webhook_expire_days', 2, 1, 30 );
-		self::save_int_if_present( $post, 'mobo_core_variant_parent_wait_timeout_seconds', 600, 60, 86400 );
-		self::save_bool_if_present( $post, 'mobo_core_pull_payload_enabled' );
-		self::save_int_if_present( $post, 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
-		self::save_int_if_present( $post, 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
-		self::save_int_if_present( $post, 'mobo_core_transient_retry_max_try', 10, 1, 50 );
-		self::save_int_if_present( $post, 'mobo_core_waiting_for_portal_retry_delay_seconds', 60, 10, 3600 );
-		self::save_int_if_present( $post, 'mobo_core_reprice_batch_size', 20, 1, 200 );
-		self::save_int( $post, 'mobo_core_products_per_page', 1, 1, 20 );
-		self::save_bool_if_present( $post, 'mobo_core_product_cursor_sync_enabled' );
-		self::save_int( $post, 'mobo_core_variants_per_page', 5, 1, 100 );
-		self::save_bool_if_present( $post, 'mobo_core_variant_cursor_sync_enabled' );
-		self::save_int( $post, 'mobo_core_images_per_run', 1, 0, 10 );
-		self::save_bool_if_present( $post, 'mobo_core_image_queue_enabled' );
-		self::save_bool_if_present( $post, 'mobo_core_image_queue_blocking' );
-		self::save_int_if_present( $post, 'mobo_core_image_max_try', 5, 1, 20 );
-		self::save_int_if_present( $post, 'mobo_core_image_retry_base_seconds', 120, 30, 900 );
-		self::save_int( $post, 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
-		self::save_int( $post, 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
-		self::save_int( $post, 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
-		self::save_int( $post, 'mobo_core_real_cron_expected_interval_seconds', 60, 60, 3600 );
-		self::save_bool( $post, 'mobo_core_real_cron_process_webhooks' );
-		self::save_bool( $post, 'mobo_core_process_webhook_on_receive' );
-		self::save_bool_if_present( $post, 'mobo_core_self_runner_enabled' );
-		self::save_bool_if_present( $post, 'mobo_core_self_runner_continue_enabled' );
-		self::save_int_if_present( $post, 'mobo_core_self_runner_min_interval_seconds', 3, 0, 60 );
-		self::save_int_if_present( $post, 'mobo_core_self_runner_http_timeout_seconds', 1, 1, 10 );
-		update_option( 'mobo_core_health_report_enabled', '1', false );
-		self::save_int( $post, 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
-		self::save_int( $post, 'mobo_core_health_report_timeout_seconds', 15, 5, 60 );
-
-		self::save_bool_if_present( $post, 'mobo_core_checkout_validation_enabled' );
-		update_option( 'mobo_core_checkout_validate_only_mobo_products', '1', false );
-		update_option( 'mobo_core_checkout_require_remote_guid', '1', false );
-		update_option( 'mobo_core_checkout_block_incomplete_sync', '1', false );
-		if ( ! self::enabled( 'mobo_core_checkout_validation_enabled', '0' ) ) {
-			delete_option( 'mobo_core_shared_mobo_cart_lock' );
-		}
-		self::save_bool_if_present( $post, 'mobo_core_checkout_local_stock_check_enabled' );
-		self::save_bool_if_present( $post, 'mobo_core_checkout_mobo_cart_validation_enabled' );
-		self::save_bool_if_present( $post, 'mobo_core_checkout_mobo_debug_enabled' );
-		self::save_bool_if_present( $post, 'mobo_core_shipping_diagnostics_enabled' );
-		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
-		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_cart_lock_wait_seconds', 15, 0, 45 );
-		self::save_int_if_present( $post, 'mobo_core_checkout_mobo_cart_lock_ttl_seconds', 60, 15, 300 );
-		self::save_int_if_present( $post, 'mobo_core_remote_shipping_sync_interval_hours', 1, 1, 168 );
-		self::save_bool_if_present( $post, 'mobo_core_checkout_external_validation_enabled' );
-		self::save_int_if_present( $post, 'mobo_core_checkout_external_timeout_seconds', 3, 1, 10 );
-
-		$checkout_error_behavior = isset( $post['mobo_core_checkout_external_error_behavior'] )
-			? sanitize_key( wp_unslash( $post['mobo_core_checkout_external_error_behavior'] ) )
-			: 'allow';
-
-		if ( ! in_array( $checkout_error_behavior, array( 'allow', 'block' ), true ) ) {
-			$checkout_error_behavior = 'allow';
-		}
-
-		update_option( 'mobo_core_checkout_external_error_behavior', $checkout_error_behavior, false );
-
-		$behavior = isset( $post['mobo_core_missing_variants_behavior'] )
-			? sanitize_key( wp_unslash( $post['mobo_core_missing_variants_behavior'] ) )
-			: 'outofstock';
-
-		if ( ! in_array( $behavior, array( 'outofstock', 'ignore' ), true ) ) {
-			$behavior = 'outofstock';
-		}
-
-		update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
+		return Mobo_Core_Remote_Config::instance()->update_bootstrap_credentials( $changes );
 	}
 
 	/**

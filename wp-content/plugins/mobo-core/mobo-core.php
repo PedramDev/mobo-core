@@ -3,9 +3,9 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.33.2
+ * Version: 10.33.3
  * Author: Pedram Karimi
- * Author URI: http://mobo.codeya.ir/
+ * Author URI: https://mobo.codeya.ir/
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * WC requires at least: 8.2
@@ -20,11 +20,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.33.2' );
+define( 'MOBO_CORE_VERSION', '10.33.3' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
-define( 'MOBO_CORE_PURCHASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_CORE_PURCHASE_URL', 'https://mobo.codeya.ir/' );
 define( 'MOBO_CORE_CHECKOUT_SITE_URL', 'https://mobomobo.ir' );
 define( 'MOBO_CORE_GITHUB_URL', 'https://github.com/PedramDev/mobo-core' );
 define( 'MOBO_CORE_SALES_PHONE', '+989124508218' );
@@ -43,7 +43,7 @@ define( 'MOBO_CORE_LEGACY_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-fil
 add_filter(
 	'plugin_action_links_' . plugin_basename( __FILE__ ),
 	function ( $links ) {
-		$settings    = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core' ) ) . '">تنظیمات موبو</a>';
+		$settings    = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core' ) ) . '">مدیریت موبو</a>';
 		$health      = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core&tab=health' ) ) . '">سلامت</a>';
 		$woocommerce = '<a href="' . esc_url( admin_url( 'plugin-install.php?s=woocommerce&tab=search&type=term' ) ) . '">پیش نیاز WooCommerce</a>';
 		$persian_wc  = '<a href="' . esc_url( admin_url( 'plugin-install.php?s=persian-woocommerce&tab=search&type=term' ) ) . '">پیش نیاز ووکامرس فارسی</a>';
@@ -76,7 +76,7 @@ if ( ! defined( 'MOBO_API_BASE_URL' ) ) {
 		'MOBO_API_BASE_URL',
 		false !== $mobo_api_base_url_env && '' !== trim( (string) $mobo_api_base_url_env )
 			? (string) $mobo_api_base_url_env
-			: 'http://mobo.codeya.ir/'
+			: 'https://mobo.codeya.ir/'
 	);
 }
 

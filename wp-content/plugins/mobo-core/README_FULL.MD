@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.33.2` · Compatible with Portal `v33 / .NET 10`**
+**Version `10.33.3` · Compatible with Portal `v33 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 اجزای اصلی:
 
 1. **MoboCore Portal v32**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.33.2**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+2. **Mobo Core 10.33.3**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.33.2` |
+| Mobo Core | `10.33.3` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -52,7 +52,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 2. WooCommerce و افزونه «ووکامرس فارسی» (`persian-woocommerce`) را نصب و فعال کنید.
 3. ZIP افزونه را از **افزونه ها > افزودن افزونه > بارگذاری** نصب کنید.
 4. افزونه را فعال کنید؛ Migration داخلی optionهای پیش فرض و جدول های محلی را ایجاد می کند.
-5. از **موبو > اتصال** ارتباط را تنظیم کنید.
+5. از **موبو > لایسنس و امنیت** فقط کلید لایسنس و کد امنیتی وب‌هوک را ثبت کنید.
 6. قبل از شروع Sync، Cron واقعی را آماده کنید.
 
 ### ارتقا از نسخه قدیمی
@@ -66,55 +66,42 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 Repair برای بازسازی map داخلی، متادیتای GUID، hashها و وضعیت صف ها استفاده می شود و رکوردهای عادی WooCommerce را بدون نیاز حذف نمی کند.
 
-## 4. تنظیم اتصال
+## 4. لایسنس و امنیت اتصال
 
-مسیر: **موبو > اتصال**
+مسیر: **موبو > لایسنس و امنیت**
 
 | فیلد | کاربرد |
 |---|---|
-| API Base URL | آدرس ریشه API پرتال |
-| Token | GUID لایسنس/دسترسی مشتری برای درخواست های خروجی افزونه |
-| Webhook Security Code | مقدار مشترک `X-SEC` برای درخواست های ورودی و Pull API |
+| License Key / Token | کلید شناسایی و دسترسی این Installation در Portal |
+| Webhook Security Code | مقدار مشترک `X-SEC` برای درخواست‌های ورودی و Pull API |
 
-اولویت تعیین API Base URL:
-
-1. فیلتر `mobo_core_api_base_url`
-2. ثابت `MOBO_API_BASE_URL`
-3. option با نام `mobo_core_api_base_url`
+آدرس API از ثابت `MOBO_API_BASE_URL` یا Credential خصوصی Bootstrap خوانده می‌شود و از UI وردپرس قابل تغییر نیست. بعد از اولین Bind، دیتابیس WordPress منبع تنظیمات یا Credentialها نیست.
 
 نمونه در `wp-config.php`:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 ```
 
 تست پایه:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'https://mobo.codeya.ir/LicenseInfo'
 ```
 
 Token و کد امنیتی باید با اطلاعات Webhook/License در پرتال یکسان باشند.
 
 ## 5. پنل مدیریت افزونه
 
-پنل افزونه یک منوی اصلی با تب های زیر دارد:
+پنل افزونه فقط سه بخش اصلی دارد:
 
 | تب | وظیفه |
 |---|---|
-| داشبورد | وضعیت Sync، پیشرفت، خطا، Repair و سلامت صف ها |
-| اتصال | API Base URL، Token و Security Code |
-| خرید و فعال سازی | وضعیت LicenseInfo و اطلاعات فروش |
-| محصول | batch size، موجودی، Cursor و رفتار تنوع های حذف شده |
-| دسته بندی | Sync دسته ها، mapping دستی و reapply دسته بندی |
-| قیمت گذاری | قواعد قیمت، افزایش قیمت تنوع و Reprice |
-| فیلترها | URLهای مستثنا و قوانین انتخاب محصول |
-| صف و پردازش | وب هوک ها، retry و وضعیت صف های داخلی |
-| نوسازی تصاویر | اسکن قدیمی، WebP refresh و orphan cleanup |
-| کران واقعی | token، بودجه اجرا، interval و وضعیت آخرین run |
-| اعتبارسنجی خرید | بررسی سبد، ورود موبو، سفارش خودکار، آدرس و ارسال |
-| پیامک سفارش | سناریوی غیرموبو، فقط موبو و ترکیبی |
-| سلامت سایت | گزارش دوره ای و ارسال دستی Health Report |
+| داشبورد و عملیات | وضعیت Sync، Repair، صف‌ها و عملیات اجرایی |
+| لایسنس و امنیت | تنها محل تغییر License Key / Token و Webhook Security Code |
+| سلامت و عیب‌یابی | گزارش اتصال، Cron، Queue و وضعیت فنی |
+
+تنظیمات محصول، قیمت، دسته‌بندی، صف، تصویر، Checkout، ارسال و پیامک فقط در Portal .NET قابل تغییر هستند. صفحه «تنظیمات مرکزی» در WordPress صرفاً Cache امضاشده و وضعیت Revision را به‌صورت Read-only نمایش می‌دهد.
 
 ## 6. همگام سازی محصول
 
@@ -381,7 +368,7 @@ Content-Type: application/json
 
 ### LicenseInfo خطا می دهد
 
-- API Base URL و Token را بررسی کنید.
+- License Key / Token و دسترسی شبکه به API مرکزی را بررسی کنید. API Base URL از UI وردپرس قابل تغییر نیست.
 - trailing slash را درست نگه دارید.
 - دسترسی DNS/HTTP از سرور وردپرس را تست کنید.
 - پاسخ endpoint `LicenseInfo` را با curl بررسی کنید.
@@ -442,7 +429,7 @@ Content-Type: application/json
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#fa)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#fa)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](http://mobo.codeya.ir/)
+- [MoboCore service](https://mobo.codeya.ir/)
 - فروش: `+989124508218`
 - فنی: `+989367362228`
 
@@ -459,7 +446,7 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 Primary components:
 
 1. **MoboCore Portal v32**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.33.2**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+2. **Mobo Core 10.33.3**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -469,7 +456,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.33.2` |
+| Mobo Core | `10.33.3` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
@@ -490,7 +477,7 @@ Legacy page-number requests remain supported. New installations prefer cursor pa
 2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`).
 3. Upload the plugin ZIP through **Plugins > Add New > Upload Plugin**.
 4. Activate Mobo Core; its migration creates defaults and local tables.
-5. Configure the connection under **Mobo > Connection**.
+5. Under **Mobo > License & Security**, enter only the License Key / Token and Webhook Security Code.
 6. Configure real cron before starting a production sync.
 
 ### Legacy upgrade
@@ -506,7 +493,7 @@ Repair rebuilds internal maps, GUID metadata, hashes, and queue state without ar
 
 ## 4. Connection configuration
 
-Path: **Mobo > Connection**
+Path: **Mobo > License & Security**
 
 | Field | Purpose |
 |---|---|
@@ -523,13 +510,13 @@ API base URL priority:
 Example:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
 ```
 
 Basic test:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'https://mobo.codeya.ir/LicenseInfo'
 ```
 
 The Token and security code must match the customer license and webhook record in Portal.
@@ -539,7 +526,7 @@ The Token and security code must match the customer license and webhook record i
 | Tab | Responsibility |
 |---|---|
 | Dashboard | Sync progress, errors, Repair, and queue health |
-| Connection | API base URL, Token, and Security Code |
+| License & Security | The only editable values: License Key / Token and Webhook Security Code |
 | Purchase & Activation | LicenseInfo status and sales information |
 | Product | Batch sizes, stock, cursor mode, and missing-variation behavior |
 | Categories | Category sync, manual mapping, and recategorization |
@@ -721,7 +708,7 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#en)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#en)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](http://mobo.codeya.ir/)
+- [MoboCore service](https://mobo.codeya.ir/)
 - Sales: `+989124508218`
 - Technical support: `+989367362228`
 
