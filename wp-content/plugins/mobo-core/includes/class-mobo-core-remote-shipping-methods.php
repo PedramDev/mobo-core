@@ -331,7 +331,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$instance_id = absint( $instance_id );
 
 		$key = $this->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $scenario );
-		$id  = absint( Mobo_Core_Settings::get_dynamic( $key, 0 ) );
+		$id  = absint( get_option( $key, 0 ) );
 		if ( $id > 0 ) {
 			return array( 'shippingId' => $id, 'zoneId' => $zone_id );
 		}
@@ -341,7 +341,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		// because mixed orders need an explicit separate decision.
 		if ( 'mobo_only' === $scenario ) {
 			$legacy_key = $this->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id );
-			$legacy_id  = absint( Mobo_Core_Settings::get_dynamic( $legacy_key, 0 ) );
+			$legacy_id  = absint( get_option( $legacy_key, 0 ) );
 			if ( $legacy_id > 0 ) {
 				return array( 'shippingId' => $legacy_id, 'zoneId' => $zone_id );
 			}
@@ -357,14 +357,14 @@ class Mobo_Core_Remote_Shipping_Methods {
 				continue;
 			}
 			$candidate_key = $this->build_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id, $scenario );
-			$candidate_id  = absint( Mobo_Core_Settings::get_dynamic( $candidate_key, 0 ) );
+			$candidate_id  = absint( get_option( $candidate_key, 0 ) );
 			if ( $candidate_id > 0 ) {
 				return array( 'shippingId' => $candidate_id, 'zoneId' => $candidate_zone_id );
 			}
 
 			if ( 'mobo_only' === $scenario ) {
 				$candidate_legacy_key = $this->build_legacy_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id );
-				$candidate_legacy_id  = absint( Mobo_Core_Settings::get_dynamic( $candidate_legacy_key, 0 ) );
+				$candidate_legacy_id  = absint( get_option( $candidate_legacy_key, 0 ) );
 				if ( $candidate_legacy_id > 0 ) {
 					return array( 'shippingId' => $candidate_legacy_id, 'zoneId' => $candidate_zone_id );
 				}
@@ -630,7 +630,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function parse_allowed_ids_option( $key ) {
-		$value = Mobo_Core_Settings::get_dynamic( $key, '' );
+		$value = get_option( $key, '' );
 		if ( is_array( $value ) ) {
 			$parts = $value;
 		} else {

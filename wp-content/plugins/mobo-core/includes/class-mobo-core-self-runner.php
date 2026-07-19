@@ -22,10 +22,6 @@ class Mobo_Core_Self_Runner {
 	 * @return string
 	 */
 	public static function build_worker_url( $source = 'self-kick' ) {
-		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
-			return '';
-		}
-
 		$token = (string) get_option( 'mobo_core_cron_token', '' );
 
 		if ( '' === trim( $token ) ) {
@@ -49,16 +45,6 @@ class Mobo_Core_Self_Runner {
 	 * @return array
 	 */
 	public static function kick( $reason = 'webhook', $force = false ) {
-		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
-			return self::save_kick_result(
-				array(
-					'success' => true,
-					'status'  => 'managed-by-cli-worker',
-					'message' => 'The dedicated CLI queue worker will process this work.',
-				)
-			);
-		}
-
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ) ) {
 			return self::save_kick_result(
 				array(
@@ -186,16 +172,21 @@ class Mobo_Core_Self_Runner {
 	 * @return bool
 	 */
 	public static function should_continue_after_result( $result ) {
-		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
-			return false;
-		}
-
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_self_runner_continue_enabled', '1' ) ) {
 			return false;
 		}
 
 		if ( ! is_array( $result ) || empty( $result['success'] ) ) {
 			return false;
+		}
+
+		/*
+		 * New runner versions calculate continuation after a full multi-round
+		 * drain slice. Trust that explicit decision so every entry point behaves
+		 * identically and no queue family is forgotten here.
+		 */
+		if ( array_key_exists( 'needsContinuation', $result ) ) {
+			return ! empty( $result['needsContinuation'] );
 		}
 
 		$webhook = isset( $result['webhookQueue'] ) && is_array( $result['webhookQueue'] ) ? $result['webhookQueue'] : array();
@@ -242,6 +233,18 @@ class Mobo_Core_Self_Runner {
 			return true;
 		}
 
+		$recategorize = isset( $result['recategorizeQueue'] ) && is_array( $result['recategorizeQueue'] ) ? $result['recategorizeQueue'] : array();
+		$processed_recategorize = isset( $recategorize['processed'] ) ? absint( $recategorize['processed'] ) : 0;
+		if ( $processed_recategorize > 0 && ! empty( $recategorize['remaining'] ) ) {
+			return true;
+		}
+
+		$order_submissions = isset( $result['orderSubmissions'] ) && is_array( $result['orderSubmissions'] ) ? $result['orderSubmissions'] : array();
+		$processed_orders = isset( $order_submissions['processed'] ) ? absint( $order_submissions['processed'] ) : 0;
+		if ( $processed_orders > 0 && ! empty( $order_submissions['remaining'] ) ) {
+			return true;
+		}
+
 		return false;
 	}
 
@@ -259,8 +262,7 @@ class Mobo_Core_Self_Runner {
 		}
 
 		return array(
-			'managedByCliWorker' => class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled(),
-			'enabled'            => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ) && ! ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ),
+			'enabled'            => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ),
 			'continueEnabled'    => Mobo_Core_Settings::enabled( 'mobo_core_self_runner_continue_enabled', '1' ),
 			'workerUrl'          => self::build_worker_url( 'manual' ),
 			'lastKickAttemptAt'  => absint( get_option( 'mobo_core_self_runner_last_kick_attempt_at', 0 ) ),

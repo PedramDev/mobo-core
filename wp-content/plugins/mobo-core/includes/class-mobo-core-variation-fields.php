@@ -104,6 +104,9 @@ class Mobo_Core_Variation_Fields {
 
 		if ( '' === $value ) {
 			delete_post_meta( $variation_id, 'mobo_additional_price' );
+			if ( class_exists( 'Mobo_Core_Cache_Purger' ) ) {
+				Mobo_Core_Cache_Purger::queue_product( $variation_id, 'variation-additional-price-removed' );
+			}
 			return;
 		}
 
@@ -111,9 +114,15 @@ class Mobo_Core_Variation_Fields {
 
 		if ( $value <= 0 ) {
 			delete_post_meta( $variation_id, 'mobo_additional_price' );
+			if ( class_exists( 'Mobo_Core_Cache_Purger' ) ) {
+				Mobo_Core_Cache_Purger::queue_product( $variation_id, 'variation-additional-price-removed' );
+			}
 			return;
 		}
 
 		update_post_meta( $variation_id, 'mobo_additional_price', $value );
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) ) {
+			Mobo_Core_Cache_Purger::queue_product( $variation_id, 'variation-additional-price-updated' );
+		}
 	}
 }

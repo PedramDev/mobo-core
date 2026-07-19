@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Mobo Core `10.33.3` · Portal `v33 / .NET 10`**
+**Mobo Core `10.31.75` · Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -20,8 +20,8 @@
 
 ```mermaid
 flowchart LR
-    P["MoboCore Portal v32<br/>.NET 10 + PostgreSQL"]
-    W["Mobo Core 10.33.3<br/>WordPress Plugin"]
+    P["MoboCore Portal v25<br/>.NET 10 + PostgreSQL"]
+    W["Mobo Core 10.31.75<br/>WordPress Plugin"]
     WC["WooCommerce<br/>Products / Variations / Orders"]
     M["mobomobo.ir<br/>Cart & Order Workflow"]
     C["Server Cron / cPanel"]
@@ -100,20 +100,31 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     CR["GET/POST /cron/run?token=..
-کران سرور"] --> SECCron token valid?
+کران سرور یا Self Runner"] --> SEC{"Cron token / X-SEC معتبر است؟"}
     SEC -- No --> E401["401 Unauthorized"]
-    SEC -- Yes --> LOCKRunner lock acquired?
-    LOCK -- No --> BUSY["locked / another slice active"]
-    LOCK -- Yes --> BUDGET["Start bounded time budget"]
-    BUDGET --> WH["Process webhook queue"]
-    WH --> SY["Continue product sync / repair"]
-    SY --> IM["Process image queues"]
-    IM --> RP["Reprice / Recategorize"]
-    RP --> OR["Process queued Mobo orders"]
-    OR --> HL["Health report if due"]
-    HL --> MT["Bounded maintenance"]
-    MT --> SAVE["Save last result and release lock"]
+    SEC -- Yes --> LOCK{"Lease اتمیک Runner دریافت شد؟"}
+    LOCK -- No --> BUSY["locked؛ اجرای همزمان بدون ورود به صف خارج می‌شود"]
+    LOCK -- Yes --> CFG["محاسبه بودجه امن، سقف دورها و TTL موثر محدود"]
+    CFG --> HB["تمدید heartbeat با token مالک"]
+    HB -- مالکیت از دست رفت --> LOST["توقف فوری عملیات محافظت‌شده"]
+    HB -- موفق --> ROUND["شروع دور منصفانه"]
+    ROUND --> WH["Webhook سهم محدود"]
+    WH --> IM["Image و Image Refresh سهم محدود"]
+    IM --> SY["Product Sync چند step در همان دور"]
+    SY --> RP["Reprice و Recategorize سهم محدود"]
+    RP --> OR["Queued orders سهم محدود"]
+    OR --> CHECK{"زمان امن + کار فوری + پیشرفت + دور باقی مانده؟"}
+    CHECK -- Yes --> HB
+    CHECK -- No --> HM["Health / maintenance محدود"]
+    HM --> SAVE["ذخیره telemetry و release فقط با token مالک"]
+    SAVE --> CONT{"پیشرفت شده و کار فوری باقی است؟"}
+    CONT -- Yes --> KICK["Continuation loopback غیرمسدودکننده"]
+    CONT -- No --> END["پایان slice"]
+    KICK --> END
+    LOST --> SAVE
 ```
+
+Lease دائمی نیست. اگر Process crash یا kill شود، heartbeat قطع می‌شود و رکورد پس از TTL منقضی در اجرای بعدی خودکار بازیابی می‌شود. فیلد `cronRunner` در Health Report علت توقف، تعداد دورها، تمدیدها، stageهای خطادار و heartbeat/expiry فعلی را بدون token گزارش می‌کند.
 
 ## 5. صف ها و Storage محلی
 

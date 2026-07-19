@@ -53,9 +53,9 @@ class Mobo_Core_Category_Sync {
 			}
 
 			$category_guid = $this->get_category_guid( $category_data );
-			$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
-			$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
-			$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
+			$title         = $this->get_category_title( $category_data, $category_guid );
+			$url           = $this->get_category_url( $category_data );
+			$parent_guid   = $this->get_parent_category_guid( $category_data );
 
 			if ( '' === $category_guid ) {
 				$skipped++;
@@ -510,9 +510,9 @@ class Mobo_Core_Category_Sync {
 
 	public function upsert_category( $category_data ) {
 		$category_guid = $this->get_category_guid( $category_data );
-		$title         = sanitize_text_field( (string) $this->get_value( $category_data, 'title', '' ) );
-		$url           = sanitize_text_field( (string) $this->get_value( $category_data, 'url', '' ) );
-		$parent_guid   = sanitize_text_field( (string) $this->get_value( $category_data, 'parentId', '' ) );
+		$title         = $this->get_category_title( $category_data, $category_guid );
+		$url           = $this->get_category_url( $category_data );
+		$parent_guid   = $this->get_parent_category_guid( $category_data );
 
 		if ( '' === $category_guid ) {
 			return array(
@@ -522,22 +522,6 @@ class Mobo_Core_Category_Sync {
 		}
 
 		$term_id = $this->find_term_id_by_guid( $category_guid );
-
-		/*
-		 * A product webhook may reference a category before the full category
-		 * catalogue has reached WordPress. A GUID by itself is not enough to
-		 * create a customer-facing WooCommerce term. Creating a fallback such as
-		 * "Mobo Category <GUID>" causes a permanent placeholder because normal
-		 * synced categories are intentionally protected from later renames.
-		 */
-		if ( $term_id <= 0 && '' === $title ) {
-			return array(
-				'term_id'   => 0,
-				'created'   => false,
-				'incomplete' => true,
-				'guid'      => $category_guid,
-			);
-		}
 
 		$args = array();
 
@@ -562,45 +546,53 @@ class Mobo_Core_Category_Sync {
 		}
 
 		if ( $term_id > 0 ) {
+			$placeholder_repaired = false;
+			$current_term         = get_term( $term_id, 'product_cat' );
+
 			/*
-			 * Existing customer-managed WooCommerce categories remain protected.
-			 * The only safe automatic rename is an exact placeholder created by an
-			 * older Mobo Core version for this same GUID.
+			 * Existing WooCommerce categories are protected by default. The only
+			 * exception is a placeholder created by older Mobo Core versions. When
+			 * the API finally supplies a real readable title, repairing only that
+			 * generated placeholder is safe and does not overwrite customer titles.
 			 */
-			if ( '' !== $title && $this->is_generated_placeholder_term( $term_id, $category_guid ) ) {
-				$repair_args = $args;
+			if (
+				'' !== $title
+				&& $current_term instanceof WP_Term
+				&& $this->is_placeholder_category_title( $current_term->name, $category_guid )
+			) {
+				$updated_term = wp_update_term(
+					$term_id,
+					'product_cat',
+					array( 'name' => $title )
+				);
 
-				if ( ! isset( $repair_args['slug'] ) || '' === $repair_args['slug'] ) {
-					$repair_args['slug'] = sanitize_title( $title );
-				}
-
-				$repair_result = wp_update_term( $term_id, 'product_cat', $repair_args );
-
-				if ( is_wp_error( $repair_result ) && isset( $repair_args['slug'] ) ) {
-					unset( $repair_args['slug'] );
-					$repair_result = wp_update_term( $term_id, 'product_cat', $repair_args );
-				}
-
-				if ( ! is_wp_error( $repair_result ) ) {
-					delete_term_meta( $term_id, 'mobo_generated_placeholder' );
-					delete_term_meta( $term_id, 'mobo_sync_incomplete' );
-					$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
-					$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
-
-					return array(
-						'term_id'             => $term_id,
-						'created'             => false,
-						'repaired_placeholder' => true,
-					);
-				}
+				$placeholder_repaired = ! is_wp_error( $updated_term );
 			}
 
 			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
 
 			return array(
-				'term_id'        => $term_id,
-				'created'        => false,
-				'skipped_update' => true,
+				'term_id'              => $term_id,
+				'created'              => false,
+				'skipped_update'       => ! $placeholder_repaired,
+				'placeholder_repaired' => $placeholder_repaired,
+			);
+		}
+
+		/*
+		 * Never create a customer-visible WooCommerce category from a GUID. A
+		 * missing title means the payload is incomplete; keep the remote mapping
+		 * row and wait for a later complete category payload.
+		 */
+		if ( '' === $title ) {
+			if ( $this->category_map instanceof Mobo_Core_Category_Map ) {
+				$this->category_map->upsert_remote_category_for_mapping( $category_guid, '', $url, $parent_guid );
+			}
+
+			return array(
+				'term_id'      => 0,
+				'created'      => false,
+				'missing_title' => true,
 			);
 		}
 
@@ -646,38 +638,6 @@ class Mobo_Core_Category_Sync {
 			'term_id' => $term_id,
 			'created' => true,
 		);
-	}
-
-	/**
-	 * Detect an exact placeholder created by older plugin versions.
-	 *
-	 * @param int    $term_id Term ID.
-	 * @param string $category_guid Remote category GUID.
-	 * @return bool
-	 */
-	private function is_generated_placeholder_term( $term_id, $category_guid ) {
-		$term_id       = absint( $term_id );
-		$category_guid = sanitize_text_field( (string) $category_guid );
-
-		if ( $term_id <= 0 || '' === $category_guid ) {
-			return false;
-		}
-
-		if ( '1' === (string) get_term_meta( $term_id, 'mobo_generated_placeholder', true ) ) {
-			return true;
-		}
-
-		$term = get_term( $term_id, 'product_cat' );
-
-		if ( ! $term || is_wp_error( $term ) ) {
-			return false;
-		}
-
-		$placeholder_name = 'Mobo Category ' . $category_guid;
-		$placeholder_slug = sanitize_title( $placeholder_name );
-
-		return (string) $term->name === $placeholder_name
-			|| (string) $term->slug === $placeholder_slug;
 	}
 
 	public function find_term_id_by_guid( $category_guid ) {
@@ -758,6 +718,134 @@ class Mobo_Core_Category_Sync {
 		$identifiers = $this->collect_category_guid_candidates( $category_data );
 
 		return ! empty( $identifiers ) ? sanitize_text_field( (string) $identifiers[0] ) : '';
+	}
+
+	/**
+	 * Extract a readable category title from flat or relation-wrapped payloads.
+	 *
+	 * Product payloads may wrap the real category object inside `category`, while
+	 * category-list endpoints may return a flat object. Older code only checked
+	 * top-level `title`, which caused GUID placeholders to be created.
+	 *
+	 * @param array  $category_data Category payload.
+	 * @param string $category_guid Resolved category GUID.
+	 * @return string
+	 */
+	private function get_category_title( $category_data, $category_guid = '' ) {
+		$title_keys = array( 'title', 'name', 'categoryTitle', 'categoryName', 'displayName', 'label' );
+
+		foreach ( $title_keys as $key ) {
+			$title = $this->normalize_category_title( $this->get_value( $category_data, $key, '' ), $category_guid );
+
+			if ( '' !== $title ) {
+				return $title;
+			}
+		}
+
+		$nested = $this->get_value( $category_data, 'category', null );
+
+		if ( is_array( $nested ) && $nested !== $category_data ) {
+			return $this->get_category_title( $nested, $category_guid );
+		}
+
+		return '';
+	}
+
+	/**
+	 * Extract category URL/path from flat or relation-wrapped payloads.
+	 *
+	 * @param array $category_data Category payload.
+	 * @return string
+	 */
+	private function get_category_url( $category_data ) {
+		foreach ( array( 'url', 'path', 'categoryUrl', 'categoryPath' ) as $key ) {
+			$value = trim( sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) ) );
+
+			if ( '' !== $value ) {
+				return $value;
+			}
+		}
+
+		$nested = $this->get_value( $category_data, 'category', null );
+
+		if ( is_array( $nested ) && $nested !== $category_data ) {
+			return $this->get_category_url( $nested );
+		}
+
+		return '';
+	}
+
+	/**
+	 * Extract parent category GUID from flat or relation-wrapped payloads.
+	 *
+	 * @param array $category_data Category payload.
+	 * @return string
+	 */
+	private function get_parent_category_guid( $category_data ) {
+		foreach ( array( 'parentId', 'parentGuid', 'parentCategoryId', 'parentCategoryGuid' ) as $key ) {
+			$value = trim( sanitize_text_field( (string) $this->get_value( $category_data, $key, '' ) ) );
+
+			if ( $this->is_remote_guid_value( $value ) ) {
+				return $value;
+			}
+		}
+
+		$nested = $this->get_value( $category_data, 'category', null );
+
+		if ( is_array( $nested ) && $nested !== $category_data ) {
+			return $this->get_parent_category_guid( $nested );
+		}
+
+		return '';
+	}
+
+	/**
+	 * Normalize and validate a customer-visible category title.
+	 *
+	 * @param mixed  $title Raw title.
+	 * @param string $category_guid Category GUID.
+	 * @return string
+	 */
+	private function normalize_category_title( $title, $category_guid = '' ) {
+		$title = trim( sanitize_text_field( (string) $title ) );
+
+		if ( '' === $title ) {
+			return '';
+		}
+
+		$category_guid = trim( sanitize_text_field( (string) $category_guid ) );
+
+		if ( '' !== $category_guid && 0 === strcasecmp( $title, $category_guid ) ) {
+			return '';
+		}
+
+		if ( $this->is_placeholder_category_title( $title, $category_guid ) ) {
+			return '';
+		}
+
+		return $title;
+	}
+
+	/**
+	 * Determine whether a title is the old generated GUID placeholder.
+	 *
+	 * @param string $title Category title.
+	 * @param string $category_guid Category GUID.
+	 * @return bool
+	 */
+	private function is_placeholder_category_title( $title, $category_guid = '' ) {
+		$title         = trim( sanitize_text_field( (string) $title ) );
+		$category_guid = trim( sanitize_text_field( (string) $category_guid ) );
+
+		if ( '' === $title ) {
+			return false;
+		}
+
+		if ( '' !== $category_guid && 0 === strcasecmp( $title, 'Mobo Category ' . $category_guid ) ) {
+			return true;
+		}
+
+		return 1 === preg_match( '/^Mobo Category\s+[0-9a-f-]{16,}$/i', $title );
 	}
 
 	/**

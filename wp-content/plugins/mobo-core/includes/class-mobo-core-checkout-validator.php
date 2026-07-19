@@ -1464,8 +1464,12 @@ class Mobo_Core_Checkout_Validator {
 			'Content-Type' => 'application/json; charset=utf-8',
 		);
 
-		$security_code = trim( (string) Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
+		$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
 		if ( '' !== $security_code ) {
+			if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
+				return $this->external_error_result( Mobo_Core_Settings::get_security_code_validation_error( $security_code ) );
+			}
+
 			$headers['X-SEC'] = $security_code;
 		}
 
@@ -2385,10 +2389,6 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function handle_scheduled_queued_order_submissions() {
-		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
-			return;
-		}
-
 		$this->process_queued_mobo_order_submissions( 1, 'wp-cron' );
 	}
 

@@ -88,14 +88,6 @@ class Mobo_Core_Category_Map {
 	 * @return int
 	 */
 	public function get_manual_term_id( $guid ) {
-		if ( class_exists( 'Mobo_Core_Remote_Config' ) ) {
-			$remote_config = Mobo_Core_Remote_Config::instance();
-			if ( $remote_config->is_enforced() ) {
-				$term_id = $remote_config->get_category_term_id( $guid );
-				return $term_id > 0 && $this->term_exists( $term_id ) ? $term_id : 0;
-			}
-		}
-
 		return $this->get_term_id_by_column( $guid, 'manual_term_id', true );
 	}
 
@@ -109,19 +101,6 @@ class Mobo_Core_Category_Map {
 	 * @return int
 	 */
 	public function get_manual_term_id_by_identifiers( $identifiers ) {
-		if ( is_array( $identifiers ) && class_exists( 'Mobo_Core_Remote_Config' ) ) {
-			$remote_config = Mobo_Core_Remote_Config::instance();
-			if ( $remote_config->is_enforced() ) {
-				foreach ( $identifiers as $identifier ) {
-					$term_id = $remote_config->get_category_term_id( $identifier );
-					if ( $term_id > 0 && $this->term_exists( $term_id ) ) {
-						return $term_id;
-					}
-				}
-				return 0;
-			}
-		}
-
 		return $this->get_term_id_by_identifiers( $identifiers, 'manual_term_id', true );
 	}
 
@@ -238,26 +217,54 @@ class Mobo_Core_Category_Map {
 		$now   = current_time( 'mysql', true );
 		$table = self::table_name();
 
-		$existing_id = $wpdb->get_var(
+		$existing = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				"SELECT id, remote_name, remote_slug, remote_url, parent_remote_guid
+				FROM {$table}
+				WHERE remote_guid = %s
+				LIMIT 1",
 				$guid
-			)
+			),
+			ARRAY_A
 		);
+
+		$remote_name        = sanitize_text_field( (string) $name );
+		$remote_url         = sanitize_text_field( (string) $url );
+		$remote_slug        = sanitize_title( $this->slug_from_url( $remote_url ) );
+		$parent_remote_guid = sanitize_text_field( (string) $parent_guid );
+
+		/*
+		 * Product payloads may contain only the remote GUID. Never erase richer
+		 * metadata previously received from a category payload with empty values.
+		 */
+		if ( is_array( $existing ) ) {
+			if ( '' === $remote_name ) {
+				$remote_name = isset( $existing['remote_name'] ) ? (string) $existing['remote_name'] : '';
+			}
+			if ( '' === $remote_slug ) {
+				$remote_slug = isset( $existing['remote_slug'] ) ? (string) $existing['remote_slug'] : '';
+			}
+			if ( '' === $remote_url ) {
+				$remote_url = isset( $existing['remote_url'] ) ? (string) $existing['remote_url'] : '';
+			}
+			if ( '' === $parent_remote_guid ) {
+				$parent_remote_guid = isset( $existing['parent_remote_guid'] ) ? (string) $existing['parent_remote_guid'] : '';
+			}
+		}
 
 		$data = array(
 			'remote_guid'        => $guid,
-			'remote_name'        => sanitize_text_field( (string) $name ),
-			'remote_slug'        => sanitize_title( $this->slug_from_url( $url ) ),
-			'remote_url'         => sanitize_text_field( (string) $url ),
-			'parent_remote_guid' => sanitize_text_field( (string) $parent_guid ),
+			'remote_name'        => $remote_name,
+			'remote_slug'        => $remote_slug,
+			'remote_url'         => $remote_url,
+			'parent_remote_guid' => $parent_remote_guid,
 			'updated_at'         => $now,
 		);
 
 		$formats = array( '%s', '%s', '%s', '%s', '%s', '%s' );
 
-		if ( $existing_id ) {
-			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing_id ) ), $formats, array( '%d' ) );
+		if ( is_array( $existing ) && ! empty( $existing['id'] ) ) {
+			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
 
 			return array(
 				'success' => $success,
@@ -303,27 +310,52 @@ class Mobo_Core_Category_Map {
 		$now   = current_time( 'mysql', true );
 		$table = self::table_name();
 
-		$existing_id = $wpdb->get_var(
+		$existing = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				"SELECT id, remote_name, remote_slug, remote_url, parent_remote_guid
+				FROM {$table}
+				WHERE remote_guid = %s
+				LIMIT 1",
 				$guid
-			)
+			),
+			ARRAY_A
 		);
+
+		$remote_name        = sanitize_text_field( (string) $name );
+		$remote_url         = sanitize_text_field( (string) $url );
+		$remote_slug        = sanitize_title( $this->slug_from_url( $remote_url ) );
+		$parent_remote_guid = sanitize_text_field( (string) $parent_guid );
+
+		/* Preserve previously known category metadata on partial product payloads. */
+		if ( is_array( $existing ) ) {
+			if ( '' === $remote_name ) {
+				$remote_name = isset( $existing['remote_name'] ) ? (string) $existing['remote_name'] : '';
+			}
+			if ( '' === $remote_slug ) {
+				$remote_slug = isset( $existing['remote_slug'] ) ? (string) $existing['remote_slug'] : '';
+			}
+			if ( '' === $remote_url ) {
+				$remote_url = isset( $existing['remote_url'] ) ? (string) $existing['remote_url'] : '';
+			}
+			if ( '' === $parent_remote_guid ) {
+				$parent_remote_guid = isset( $existing['parent_remote_guid'] ) ? (string) $existing['parent_remote_guid'] : '';
+			}
+		}
 
 		$data = array(
 			'remote_guid'        => $guid,
 			'synced_term_id'     => $synced_term_id,
-			'remote_name'        => sanitize_text_field( (string) $name ),
-			'remote_slug'        => sanitize_title( $this->slug_from_url( $url ) ),
-			'remote_url'         => sanitize_text_field( (string) $url ),
-			'parent_remote_guid' => sanitize_text_field( (string) $parent_guid ),
+			'remote_name'        => $remote_name,
+			'remote_slug'        => $remote_slug,
+			'remote_url'         => $remote_url,
+			'parent_remote_guid' => $parent_remote_guid,
 			'updated_at'         => $now,
 		);
 
 		$formats = array( '%s', '%d', '%s', '%s', '%s', '%s', '%s' );
 
-		if ( $existing_id ) {
-			return false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing_id ) ), $formats, array( '%d' ) );
+		if ( is_array( $existing ) && ! empty( $existing['id'] ) ) {
+			return false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
 		}
 
 		$data['manual_term_id'] = 0;
@@ -342,10 +374,6 @@ class Mobo_Core_Category_Map {
 	 * @return bool
 	 */
 	public function update_manual_mapping( $guid, $term_id ) {
-		if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
-			return false;
-		}
-
 		global $wpdb;
 
 		$guid    = sanitize_text_field( (string) $guid );
@@ -426,11 +454,6 @@ class Mobo_Core_Category_Map {
 
 		foreach ( $rows as $index => $row ) {
 			$manual_id = absint( isset( $row['manual_term_id'] ) ? $row['manual_term_id'] : 0 );
-			if ( class_exists( 'Mobo_Core_Remote_Config' ) && Mobo_Core_Remote_Config::instance()->is_enforced() ) {
-				$remote_guid = isset( $row['remote_guid'] ) ? (string) $row['remote_guid'] : '';
-				$manual_id = Mobo_Core_Remote_Config::instance()->get_category_term_id( $remote_guid );
-				$rows[ $index ]['manual_term_id'] = $manual_id;
-			}
 			$synced_id = absint( isset( $row['synced_term_id'] ) ? $row['synced_term_id'] : 0 );
 
 			$rows[ $index ]['manual_term_name'] = $manual_id > 0 ? $this->get_term_name( $manual_id ) : '';

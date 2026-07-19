@@ -29,6 +29,7 @@ class Mobo_Core_Health_Reporter {
 		$self_status  = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
 		$logs         = $this->get_log_stats();
 		$cache        = $this->get_cache_stats();
+		$cache_purge  = class_exists( 'Mobo_Core_Cache_Purger' ) ? Mobo_Core_Cache_Purger::get_health_status() : array();
 		$wp_memory    = $this->get_wordpress_memory_stats();
 		$environment  = $this->get_environment_stats();
 
@@ -63,6 +64,7 @@ class Mobo_Core_Health_Reporter {
 			'pageCacheDetected'     => $cache['page_cache_detected'],
 			'cacheSystem'           => $cache['cache_system'],
 			'cachePlugins'          => $cache['cache_plugins'],
+			'cachePurge'            => $cache_purge,
 
 			'phpMemoryLimitRaw'     => (string) ini_get( 'memory_limit' ),
 			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( (string) ini_get( 'memory_limit' ) ),
@@ -81,6 +83,7 @@ class Mobo_Core_Health_Reporter {
 			'diskFreePercent'       => $disk['percent'],
 
 			'cronMode'              => $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ),
+			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
 			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : $last_cron_hit ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),
 			'lastWebhookSuccessAt'  => $this->format_timestamp( $this->get_last_webhook_success_timestamp( $cron_status ) ),
@@ -133,7 +136,7 @@ class Mobo_Core_Health_Reporter {
 			);
 		}
 
-		$security_code = trim( (string) get_option( 'mobo_core_security_code', '' ) );
+		$security_code = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
 
 		if ( '' === $security_code ) {
 			return $this->save_result(
@@ -141,6 +144,16 @@ class Mobo_Core_Health_Reporter {
 					'success' => false,
 					'status'  => 'missing-security-code',
 					'message' => 'کد امنیتی وب هوک ثبت نشده است.',
+				)
+			);
+		}
+
+		if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
+			return $this->save_result(
+				array(
+					'success' => false,
+					'status'  => 'invalid-security-code',
+					'message' => Mobo_Core_Settings::get_security_code_validation_error( $security_code ),
 				)
 			);
 		}

@@ -26,11 +26,11 @@ class Mobo_Core_Product_Concurrency {
 	 * Acquire a product GUID lock.
 	 *
 	 * Uses MySQL GET_LOCK when available because it is atomic. Falls back to the
-	 * existing transient lock helper if the database does not support named locks.
+	 * Mobo runtime lease helper if the database does not support named locks.
 	 *
 	 * @param string $product_guid Product GUID.
 	 * @param int    $wait_seconds Maximum wait seconds for MySQL lock.
-	 * @param int    $ttl_seconds Fallback transient TTL.
+	 * @param int    $ttl_seconds Fallback runtime lease TTL.
 	 * @return array|false Lock token array or false.
 	 */
 	public static function acquire_product_lock( $product_guid, $wait_seconds = 5, $ttl_seconds = 180 ) {
@@ -65,7 +65,7 @@ class Mobo_Core_Product_Concurrency {
 
 			if ( false !== $token ) {
 				return array(
-					'type'  => 'transient',
+					'type'  => 'runtime',
 					'name'  => $fallback_name,
 					'token' => $token,
 				);
@@ -97,7 +97,7 @@ class Mobo_Core_Product_Concurrency {
 			return;
 		}
 
-		if ( 'transient' === $lock['type'] && class_exists( 'Mobo_Core_Lock' ) && ! empty( $lock['token'] ) ) {
+		if ( in_array( $lock['type'], array( 'runtime', 'transient' ), true ) && class_exists( 'Mobo_Core_Lock' ) && ! empty( $lock['token'] ) ) {
 			Mobo_Core_Lock::release( sanitize_key( (string) $lock['name'] ), sanitize_text_field( (string) $lock['token'] ) );
 		}
 	}
@@ -413,7 +413,7 @@ class Mobo_Core_Product_Concurrency {
 	}
 
 	/**
-	 * Fallback transient lock name.
+	 * Fallback runtime lock name.
 	 *
 	 * @param string $product_guid Product GUID.
 	 * @return string

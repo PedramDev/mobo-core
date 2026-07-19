@@ -346,11 +346,6 @@ class Mobo_Core_Reprice_Queue {
 		$product->update_meta_data( 'mobo_price_policy_updated_at', gmdate( 'c' ) );
 
 		$product->save();
-
-		if ( $changed && class_exists( 'Mobo_Core_Product_Activity' ) ) {
-			Mobo_Core_Product_Activity::mark( $post_id, 'price_sync' );
-		}
-
 		wc_delete_product_transients( $post_id );
 
 		return array(

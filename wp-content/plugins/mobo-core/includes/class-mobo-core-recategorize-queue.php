@@ -305,10 +305,6 @@ class Mobo_Core_Recategorize_Queue {
 		update_post_meta( $post_id, 'mobo_category_reapply_at', gmdate( 'c' ) );
 		update_post_meta( $post_id, 'mobo_category_reapply_source', isset( $result['source'] ) ? sanitize_text_field( (string) $result['source'] ) : '' );
 
-		if ( $changed && class_exists( 'Mobo_Core_Product_Activity' ) ) {
-			Mobo_Core_Product_Activity::mark( $post_id, 'category_sync' );
-		}
-
 		return array(
 			'changed' => $changed,
 			'skipped' => ! $changed,

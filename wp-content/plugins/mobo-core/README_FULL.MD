@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.33.3` · Compatible with Portal `v33 / .NET 10`**
+**Version `10.31.75` · Compatible with Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -20,8 +20,8 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 اجزای اصلی:
 
-1. **MoboCore Portal v32**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.33.3**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
+2. **Mobo Core 10.31.75**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,7 +31,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.33.3` |
+| Mobo Core | `10.31.75` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -52,7 +52,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 2. WooCommerce و افزونه «ووکامرس فارسی» (`persian-woocommerce`) را نصب و فعال کنید.
 3. ZIP افزونه را از **افزونه ها > افزودن افزونه > بارگذاری** نصب کنید.
 4. افزونه را فعال کنید؛ Migration داخلی optionهای پیش فرض و جدول های محلی را ایجاد می کند.
-5. از **موبو > لایسنس و امنیت** فقط کلید لایسنس و کد امنیتی وب‌هوک را ثبت کنید.
+5. از **موبو > اتصال** ارتباط را تنظیم کنید.
 6. قبل از شروع Sync، Cron واقعی را آماده کنید.
 
 ### ارتقا از نسخه قدیمی
@@ -66,42 +66,57 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 Repair برای بازسازی map داخلی، متادیتای GUID، hashها و وضعیت صف ها استفاده می شود و رکوردهای عادی WooCommerce را بدون نیاز حذف نمی کند.
 
-## 4. لایسنس و امنیت اتصال
+## 4. تنظیم اتصال
 
-مسیر: **موبو > لایسنس و امنیت**
+مسیر: **موبو > اتصال**
 
 | فیلد | کاربرد |
 |---|---|
-| License Key / Token | کلید شناسایی و دسترسی این Installation در Portal |
-| Webhook Security Code | مقدار مشترک `X-SEC` برای درخواست‌های ورودی و Pull API |
+| API Base URL | آدرس ریشه API پرتال |
+| Token | GUID لایسنس/دسترسی مشتری برای درخواست های خروجی افزونه |
+| Webhook Security Code | مقدار مشترک `X-SEC` برای درخواست های ورودی و Pull API |
 
-آدرس API از ثابت `MOBO_API_BASE_URL` یا Credential خصوصی Bootstrap خوانده می‌شود و از UI وردپرس قابل تغییر نیست. بعد از اولین Bind، دیتابیس WordPress منبع تنظیمات یا Credentialها نیست.
+`Webhook Security Code` یک secret متنی عمومی نیست؛ مقدار آن داخل Header ارسال می‌شود و باید فقط شامل ASCII قابل‌چاپ بازه `0x21` تا `0x7E` باشد. حروف انگلیسی، عدد و نمادهایی مانند `@ # $ % & * _ [ ] -` مجاز هستند. فاصله، Tab، Enter، حروف فارسی، ایموجی و سایر Unicodeها مجاز نیستند. حداکثر طول قابل قبول ۲۵۵ کاراکتر است.
+
+اولویت تعیین API Base URL:
+
+1. فیلتر `mobo_core_api_base_url`
+2. ثابت `MOBO_API_BASE_URL`
+3. option با نام `mobo_core_api_base_url`
 
 نمونه در `wp-config.php`:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
 تست پایه:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'https://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
 ```
 
 Token و کد امنیتی باید با اطلاعات Webhook/License در پرتال یکسان باشند.
 
 ## 5. پنل مدیریت افزونه
 
-پنل افزونه فقط سه بخش اصلی دارد:
+پنل افزونه یک منوی اصلی با تب های زیر دارد:
 
 | تب | وظیفه |
 |---|---|
-| داشبورد و عملیات | وضعیت Sync، Repair، صف‌ها و عملیات اجرایی |
-| لایسنس و امنیت | تنها محل تغییر License Key / Token و Webhook Security Code |
-| سلامت و عیب‌یابی | گزارش اتصال، Cron، Queue و وضعیت فنی |
-
-تنظیمات محصول، قیمت، دسته‌بندی، صف، تصویر، Checkout، ارسال و پیامک فقط در Portal .NET قابل تغییر هستند. صفحه «تنظیمات مرکزی» در WordPress صرفاً Cache امضاشده و وضعیت Revision را به‌صورت Read-only نمایش می‌دهد.
+| داشبورد | وضعیت Sync، پیشرفت، خطا، Repair و سلامت صف ها |
+| اتصال | API Base URL، Token و Security Code |
+| خرید و فعال سازی | وضعیت LicenseInfo و اطلاعات فروش |
+| محصول | batch size، موجودی، Cursor و رفتار تنوع های حذف شده |
+| دسته بندی | Sync دسته ها، mapping دستی و reapply دسته بندی |
+| قیمت گذاری | قواعد قیمت، افزایش قیمت تنوع و Reprice |
+| فیلترها | URLهای مستثنا و قوانین انتخاب محصول |
+| صف و پردازش | وب هوک ها، retry و وضعیت صف های داخلی |
+| نوسازی تصاویر | اسکن قدیمی، WebP refresh و orphan cleanup |
+| کران واقعی | token، بودجه اجرا، interval و وضعیت آخرین run |
+| اعتبارسنجی خرید | بررسی سبد، ورود موبو، سفارش خودکار، آدرس و ارسال |
+| پیامک سفارش | سناریوی غیرموبو، فقط موبو و ترکیبی |
+| سلامت سایت | گزارش دوره ای و ارسال دستی Health Report |
 
 ## 6. همگام سازی محصول
 
@@ -151,22 +166,27 @@ Content-Type: application/json
 
 صف جدید ابتدا از جدول `wp_mobo_sync_events` استفاده می کند. اگر جدول در دسترس نباشد یا enqueue شکست بخورد، فایل JSON در `wp-content/uploads/mobo-core/webhook-files/` ذخیره می شود. مسیر fallback با `index.php` و `.htaccess` محافظت می شود.
 
-## 8. Worker اختصاصی CLI برای cPanel
+## 8. Cron واقعی و Self Runner
 
-در هاست‌هایی که Cron فقط هر یک دقیقه اجرا می‌شود، `mobo-cron.php` یک Process CLI محدود ایجاد می‌کند که تا حدود ۵۰ ثانیه زنده می‌ماند. Queueها در Roundهای چرخشی پردازش می‌شوند؛ در صورت انجام کار، Round بعدی فوری است و در صورت خالی بودن Queueها، Worker ده ثانیه صبر می‌کند.
+Mobo Core برای عملیات حیاتی به WP-Cron وابسته نیست. Endpoint کران واقعی:
 
-```php
-define( 'MOBO_QUEUE_WORKER_ENABLED', true );
-define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
-define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
-define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
+```text
+/wp-json/mobo-core/v1/cron/run?token=<cron-token>
 ```
+
+نمونه cPanel/cron:
 
 ```cron
-* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
+* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
 ```
 
-قفل اصلی `flock()` و Non-blocking است. Self Runner، اجرای Queue از REST، پردازش Queue سفارش توسط WP-Cron و پردازش Queue از Poll پنل، هنگام فعال بودن Worker اختصاصی غیرفعال می‌شوند. جزئیات کامل در [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md) است.
+از نسخه `10.31.75` هر slice در چند دور منصفانه اجرا می شود. در هر دور، صف های Webhook، تصویر معمولی، نوسازی تصاویر، Sync محصول، Reprice، Recategorize و سفارش queued سهم محدود خود را می گیرند. تا وقتی زمان امن باقی مانده، کار قابل اجرای فوری وجود دارد و پیشرفت واقعی اتفاق می افتد، دور بعدی در همان Process شروع می شود. توقف فقط در پایان بودجه امن، خالی شدن صف قابل اجرا، نبود پیشرفت، رسیدن به سقف دورها، خطای غیرقابل ادامه یا از دست رفتن lease انجام می شود. Health و maintenance نیز در همان slice به شکل کنترل شده اجرا می شوند.
+
+Runner از lease اتمیک token-based استفاده می کند. پیش از هر stage اصلی، مالک heartbeat می زند و انقضای lease را تمدید می کند. اجرای همزمان دوم lock را می بیند و بدون ورود به صف ها خارج می شود. اگر Process crash کند، توسط هاست kill شود یا قبل از `finally` پایان یابد، heartbeat متوقف می شود و lock پس از TTL محدود خودکار منقضی می شود. TTL موثر حداقل تنظیم مدیر است، اما برای پوشش بودجه اجرا و طولانی ترین timeout شبکه به طور محدود افزایش پیدا می کند. اگر CAS تمدید شکست بخورد یا token دیگر مالک نباشد، Worker فعلی فوراً از ادامه عملیات محافظت شده دست می کشد.
+
+Self Runner با loopback request غیرمسدودکننده، بعد از دریافت وب هوک یا شروع Sync یک اجرای محلی را kick می کند. از `10.31.75` اگر یک Cron مستقیم cPanel نیز با وجود پیشرفت به انتهای slice برسد و هنوز کار فوری باقی باشد، همان Runner یک continuation غیرمسدودکننده dispatch می کند؛ در صورت مسدود بودن loopback، Cron بعدی سرور fallback باقی می ماند. خطای یک queue stage مهار می شود، همان stage برای ادامه slice غیرفعال می شود و صف های مستقل بعدی ادامه پیدا می کنند.
+
+گزارش سلامت فیلد `cronRunner` را نیز ارسال می کند: نسخه Mobo، نتیجه آخرین اجرا، source، بودجه تنظیم شده و موثر، مدت، تعداد دورها، علت توقف، میزان پیشرفت، نیاز به continuation، تعداد تمدید lock، از دست رفتن lease، stageهای خطادار، آمار passهای صف و وضعیت فعلی lease شامل heartbeat، زمان انقضا و ثانیه باقی مانده. token مالک در گزارش قرار نمی گیرد.
 
 ## 9. دسته بندی و Mapping
 
@@ -355,6 +375,7 @@ Content-Type: application/json
 
 - تمام routeهای عملیاتی با `X-SEC` یا Cron Token محافظت می شوند.
 - مقایسه secret با `hash_equals` انجام می شود.
+- مقدار `mobo_core_security_code` قبل از ذخیره و قبل از استفاده در Header به صورت visible ASCII اعتبارسنجی می‌شود و مقدار نامعتبر جایگزین مقدار قبلی نمی‌شود.
 - درخواست های خروجی با WordPress HTTP API ارسال می شوند.
 - SSL verification برای HTTPS به صورت پیش فرض فعال است و فقط با filter توسعه دهنده قابل تغییر است.
 - URLهای تصویر محلی/خصوصی ناامن به صورت پیش فرض مجاز نیستند.
@@ -368,7 +389,7 @@ Content-Type: application/json
 
 ### LicenseInfo خطا می دهد
 
-- License Key / Token و دسترسی شبکه به API مرکزی را بررسی کنید. API Base URL از UI وردپرس قابل تغییر نیست.
+- API Base URL و Token را بررسی کنید.
 - trailing slash را درست نگه دارید.
 - دسترسی DNS/HTTP از سرور وردپرس را تست کنید.
 - پاسخ endpoint `LicenseInfo` را با curl بررسی کنید.
@@ -429,15 +450,30 @@ Content-Type: application/json
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#fa)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#fa)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](https://mobo.codeya.ir/)
+- [MoboCore service](http://mobo.codeya.ir/)
 - فروش: `+989124508218`
 - فنی: `+989367362228`
 
 ---
 
+
+## پاک‌سازی هدفمند Cache پس از Sync
+
+Mobo Core `10.31.73` ذخیره‌های تکراری یک محصول/Variation را در طول request جمع می‌کند و یک بار در shutdown پاک‌سازی انجام می‌دهد. محدوده شامل WooCommerce transients، Post/Object Cache، صفحه محصول، آرشیو دسته و برچسب فعلی یا حذف‌شده، Shop و Home است. اتصال مستقیم هدفمند برای LiteSpeed Cache و WP Rocket وجود دارد و در صورت موجود بودن APIهای هدفمند، W3 Total Cache و WP Super Cache نیز پشتیبانی می‌شوند. Purge کل سایت یا Flush کل Object Cache انجام نمی‌شود. صفحات listing سفارشی را می‌توان با filter `mobo_core_cache_purge_urls` اضافه کرد.
+
+از نسخه `10.31.74` آخرین نتیجه این عملیات در option غیرautoload با نام `mobo_core_cache_purge_last_result` نگهداری و در فیلد `cachePurge` گزارش سلامت ارسال می‌شود. گزارش شامل نسخه Mobo هنگام اجرا، زمان تلاش/موفقیت، تعداد هدف‌ها، مدت اجرا، خطای محدودشده و نتیجه و نسخه هر Integration است؛ Product ID و URL واقعی در گزارش ذخیره یا ارسال نمی‌شوند. خطای Cache همچنان non-blocking است و Sync محصول ادامه پیدا می‌کند.
+
 <a id="en"></a>
 
 # Full English documentation
+
+## Targeted cache invalidation after sync
+
+Mobo Core `10.31.73` batches repeated saves for the same product/variation and invalidates them once during shutdown. The scope includes WooCommerce transients, targeted post/object cache entries, the product page, current and removed category/tag archives, Shop, and Home. LiteSpeed Cache and WP Rocket receive direct targeted purge calls; W3 Total Cache and WP Super Cache are used when their targeted APIs exist. No site-wide page-cache purge or global object-cache flush is performed. Additional custom listing URLs can be supplied through `mobo_core_cache_purge_urls`.
+
+Since `10.31.74`, the last result is persisted in the non-autoloaded `mobo_core_cache_purge_last_result` option and sent in the health payload as `cachePurge`. It contains Mobo/plugin versions, attempt/full-success times, target counts, duration, bounded errors, and per-integration status without storing or transmitting the target product-ID or URL lists. Cache failures remain non-blocking for product synchronization.
+
+
 
 ## 1. Product purpose and architecture
 
@@ -445,8 +481,8 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 
 Primary components:
 
-1. **MoboCore Portal v32**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.33.3**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
+2. **Mobo Core 10.31.75**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -456,7 +492,7 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.33.3` |
+| Mobo Core | `10.31.75` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
@@ -477,7 +513,7 @@ Legacy page-number requests remain supported. New installations prefer cursor pa
 2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`).
 3. Upload the plugin ZIP through **Plugins > Add New > Upload Plugin**.
 4. Activate Mobo Core; its migration creates defaults and local tables.
-5. Under **Mobo > License & Security**, enter only the License Key / Token and Webhook Security Code.
+5. Configure the connection under **Mobo > Connection**.
 6. Configure real cron before starting a production sync.
 
 ### Legacy upgrade
@@ -493,13 +529,15 @@ Repair rebuilds internal maps, GUID metadata, hashes, and queue state without ar
 
 ## 4. Connection configuration
 
-Path: **Mobo > License & Security**
+Path: **Mobo > Connection**
 
 | Field | Purpose |
 |---|---|
 | API Base URL | Portal API root URL |
 | Token | Customer license/access GUID used by outbound requests |
 | Webhook Security Code | Shared `X-SEC` secret for inbound requests and payload pulls |
+
+`Webhook Security Code` is transported as an HTTP header value and must contain only visible ASCII bytes from `0x21` through `0x7E`. English letters, digits, and symbols such as `@ # $ % & * _ [ ] -` are valid. Spaces, tabs, line breaks, Persian text, emoji, and all other Unicode characters are rejected. Maximum length is 255 characters.
 
 API base URL priority:
 
@@ -510,13 +548,13 @@ API base URL priority:
 Example:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'https://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
 Basic test:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'https://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
 ```
 
 The Token and security code must match the customer license and webhook record in Portal.
@@ -526,7 +564,7 @@ The Token and security code must match the customer license and webhook record i
 | Tab | Responsibility |
 |---|---|
 | Dashboard | Sync progress, errors, Repair, and queue health |
-| License & Security | The only editable values: License Key / Token and Webhook Security Code |
+| Connection | API base URL, Token, and Security Code |
 | Purchase & Activation | LicenseInfo status and sales information |
 | Product | Batch sizes, stock, cursor mode, and missing-variation behavior |
 | Categories | Category sync, manual mapping, and recategorization |
@@ -574,22 +612,27 @@ Content-Type: application/json
 
 In lightweight mode, Portal sends metadata and a `changesUrl`. The plugin retrieves the real payload with `X-SEC` and `Token`. The primary queue is `wp_mobo_sync_events`; protected JSON files under `wp-content/uploads/mobo-core/webhook-files/` are used only as a fallback.
 
-## 8. Dedicated cPanel CLI worker
+## 8. Real cron and self-runner
 
-`mobo-cron.php` is started once per minute and keeps the same CLI process alive for a bounded window. Ready queues continue immediately; idle queues are checked again after the configured sleep interval.
+Production endpoint:
 
-```php
-define( 'MOBO_QUEUE_WORKER_ENABLED', true );
-define( 'MOBO_QUEUE_WORKER_MAX_RUNTIME', 50 );
-define( 'MOBO_QUEUE_WORKER_IDLE_SLEEP', 10 );
-define( 'MOBO_QUEUE_WORKER_LOCK_PATH', '' );
+```text
+/wp-json/mobo-core/v1/cron/run?token=<cron-token>
 ```
+
+Example:
 
 ```cron
-* * * * * /usr/local/bin/php -q /home/USER/public_html/wp-content/plugins/mobo-core/mobo-cron.php >> /home/USER/logs/mobo-cron.log 2>&1
+* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
 ```
 
-The worker uses a non-blocking OS `flock`, rotates queue order to avoid starvation, and disables loopback/REST/WP-Cron queue execution while dedicated mode is enabled. See [`docs/CPANEL-QUEUE-WORKER.md`](docs/CPANEL-QUEUE-WORKER.md).
+Since `10.31.75`, each invocation runs repeated fair rounds rather than stopping after one fixed batch for most queues. Every round gives webhook, normal-image, image-refresh, product-sync, reprice, recategorize, and queued-order work a bounded share. The same process continues until the safe PHP deadline is near, no immediately runnable work remains, no progress is possible, the configured round cap is reached, or lease ownership is lost. Health and maintenance remain bounded within the same slice.
+
+The runner owns an atomic token-based lease and renews its heartbeat before every major stage. A concurrent invocation returns `locked` without entering the queues. If PHP crashes, is killed by the host, or ends before normal cleanup, heartbeat renewal stops and the finite lease expires automatically. The effective TTL treats the administrator value as a minimum, expands enough to cover the runtime budget and longest blocking HTTP timeout, and remains capped. A failed compare-and-swap renewal means ownership is no longer proven, so the current process stops protected work immediately.
+
+The self-runner uses non-blocking loopback requests to accelerate progress after a webhook or sync start. A direct cPanel/REST cron invocation now also dispatches a non-blocking continuation when it made progress and immediately runnable work remains. If loopback is blocked by the host, the next real-cron invocation is the fallback. A queue-stage exception is isolated, recorded, and disables only that stage for the rest of the current slice so independent queues can continue.
+
+The health payload includes token-free `cronRunner` telemetry: Mobo version, last result/source, configured and effective budget, elapsed time, round count, stop reason, progress and continuation decisions, renewals, lease-loss state, failed stages, queue-pass counters, and the current lease heartbeat, expiry, and remaining seconds.
 
 ## 9. Category mapping
 
@@ -667,6 +710,7 @@ Additional runtime state is stored in WordPress options and WooCommerce object m
 
 - Operational endpoints are protected by `X-SEC` or a dedicated Cron Token.
 - Secrets are compared with `hash_equals`.
+- `mobo_core_security_code` is validated as visible ASCII before storage and before header transport; an invalid submitted value does not overwrite the previous secret.
 - Outbound requests use the WordPress HTTP API.
 - HTTPS certificate verification is enabled by default for HTTPS URLs.
 - Unsafe private/local image downloads are disabled by default.
@@ -708,7 +752,7 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#en)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#en)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](https://mobo.codeya.ir/)
+- [MoboCore service](http://mobo.codeya.ir/)
 - Sales: `+989124508218`
 - Technical support: `+989367362228`
 
@@ -719,12 +763,3 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
-
-
-## Private Shared Media
-
-Mobo Core 10.33.0 supports a hidden `wp-config.php`-only mode for a central,
-read-only image repository. A separate worker downloads originals, converts
-them to WebP and prepares the exact registered WordPress/WooCommerce cuts.
-Each WordPress site creates only local attachment records and never copies,
-resizes or deletes shared files. See `docs/SHARED-MEDIA.md`.

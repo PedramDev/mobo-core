@@ -2,9 +2,9 @@
 /**
  * Real cron runner.
  *
- * This class is independent from WP-Cron. The preferred cPanel integration is
- * the CLI-only mobo-cron.php worker. REST/manual callers use the same process
- * lock so they cannot overlap the dedicated CLI worker.
+ * This class is intentionally independent from WP-Cron. It is triggered by a
+ * server/cPanel cron that calls /wp-json/mobo-core/v1/cron/run?token=...
+ * or by WP-CLI/custom integrations.
  *
  * PHP 7.4 compatible.
  */
@@ -16,110 +16,110 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Cron_Runner {
 
 	/**
-	 * Run one bounded cron slice or one fair CLI-worker round.
+	 * Run one bounded cron slice.
 	 *
-	 * @param string $source  Source label.
-	 * @param array  $options Runtime options.
+	 * One invocation drains multiple fair queue rounds until the effective time
+	 * budget is exhausted, no immediately runnable work remains, or progress
+	 * stops. The global runner lease is renewed before every major stage.
+	 *
+	 * @param string $source Source label.
 	 * @return array
 	 */
-	public function run( $source = 'real-cron', $options = array() ) {
-		$options = is_array( $options ) ? $options : array();
-		$source  = sanitize_key( (string) $source );
-		$source  = '' !== $source ? $source : 'real-cron';
+	public function run( $source = 'real-cron' ) {
+		$source = sanitize_key( (string) $source );
+		$source = '' !== $source ? $source : 'real-cron';
 
-		$owns_process_lock = false;
-		$process_lock      = null;
+		update_option( 'mobo_core_real_cron_last_hit_at', time(), false );
 
-		if ( empty( $options['processLockHeld'] ) && class_exists( 'Mobo_Core_Queue_Worker_Lock' ) ) {
-			$process_lock = Mobo_Core_Queue_Worker_Lock::acquire();
-
-			if ( is_wp_error( $process_lock ) ) {
-				$result = array(
-					'success' => false,
-					'status'  => 'process-locked',
-					'message' => $process_lock->get_error_message(),
-					'source'  => $source,
-				);
-				$this->save_last_result( $result );
-				return $result;
-			}
-
-			$owns_process_lock = true;
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
 		}
 
 		try {
-			$now = time();
-			update_option( 'mobo_core_real_cron_last_hit_at', $now, false );
+			$config = $this->get_runtime_config();
+			$lock   = Mobo_Core_Lock::acquire( 'real_cron_runner', $config['lockTtlSeconds'] );
+		} catch ( Throwable $e ) {
+			$result = $this->exception_result( 'lock-exception', $e, array( 'source' => $source ) );
+			$this->save_last_result( $result );
+			return $result;
+		}
 
-			$config_result = array( 'success' => true, 'status' => 'skipped' );
-			$refresh_remote_configuration = ! array_key_exists( 'refreshRemoteConfiguration', $options ) || ! empty( $options['refreshRemoteConfiguration'] );
-
-			if ( $refresh_remote_configuration && class_exists( 'Mobo_Core_Remote_Config' ) ) {
-				try {
-					$config_result = Mobo_Core_Remote_Config::instance()->refresh_if_due( $source );
-				} catch ( Throwable $e ) {
-					$config_result = $this->exception_result( 'remote-config-exception', $e );
-				}
-			}
-
-			$use_runtime_lock = empty( $options['queueWorkerMode'] );
-			$lock             = null;
-
-			if ( $use_runtime_lock ) {
-				try {
-					$ttl  = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
-					$lock = Mobo_Core_Lock::acquire( 'real_cron_runner', $ttl );
-				} catch ( Throwable $e ) {
-					$result = $this->exception_result( 'lock-exception', $e, array( 'source' => $source ) );
-					$this->save_last_result( $result );
-					return $result;
-				}
-
-				if ( false === $lock ) {
-					$result = array(
-						'success' => false,
-						'status'  => 'locked',
-						'message' => 'Cron runner is already running.',
-						'source'  => $source,
-					);
-
-					$this->save_last_result( $result );
-					return $result;
-				}
-			}
-
-			try {
-				if ( ! empty( $options['queueWorkerMode'] ) ) {
-					$result = $this->run_queue_worker_round_locked( $source, $options );
-				} else {
-					$result = $this->run_legacy_locked( $source );
-				}
-				$result['remoteConfiguration'] = $config_result;
-			} catch ( Throwable $e ) {
-				$result = $this->exception_result( 'runner-exception', $e, array( 'source' => $source ) );
-			} finally {
-				if ( $use_runtime_lock && false !== $lock && null !== $lock ) {
-					Mobo_Core_Lock::release( 'real_cron_runner', $lock );
-				}
-			}
-
-			$send_health_report = ! array_key_exists( 'sendHealthReport', $options ) || ! empty( $options['sendHealthReport'] );
-			if ( $send_health_report && class_exists( 'Mobo_Core_Health_Reporter' ) ) {
-				try {
-					$health_reporter = new Mobo_Core_Health_Reporter();
-					$result['healthReport'] = $health_reporter->send_report( $source );
-				} catch ( Throwable $e ) {
-					$result['healthReport'] = $this->exception_result( 'health-report-exception', $e );
-				}
-			}
+		if ( false === $lock ) {
+			$result = array(
+				'success' => false,
+				'status'  => 'locked',
+				'source'  => $source,
+				'message' => 'Cron runner is already running.',
+				'lock'    => Mobo_Core_Lock::get_status( 'real_cron_runner' ),
+			);
 
 			$this->save_last_result( $result );
 			return $result;
+		}
+
+		/*
+		 * A fatal error or explicit exit normally still runs shutdown callbacks.
+		 * release() verifies the token, so it cannot delete a newer owner's lease.
+		 * If shutdown itself is skipped, the finite lease expires automatically.
+		 */
+		register_shutdown_function( array( 'Mobo_Core_Lock', 'release' ), 'real_cron_runner', $lock );
+
+		try {
+			$result = $this->run_locked( $source, $lock, $config );
+		} catch ( Throwable $e ) {
+			$result = $this->exception_result(
+				'runner-exception',
+				$e,
+				array(
+					'source' => $source,
+					'runner' => array(
+						'configuredTimeBudgetSeconds' => $config['configuredTimeBudgetSeconds'],
+						'effectiveTimeBudgetSeconds'  => $config['effectiveTimeBudgetSeconds'],
+						'lockTtlSeconds'              => $config['lockTtlSeconds'],
+					),
+				)
+			);
 		} finally {
-			if ( $owns_process_lock && class_exists( 'Mobo_Core_Queue_Worker_Lock' ) ) {
-				Mobo_Core_Queue_Worker_Lock::release( $process_lock );
+			$result['lockReleased'] = Mobo_Core_Lock::release( 'real_cron_runner', $lock );
+		}
+
+		/*
+		 * Continue immediately after a bounded slice when real progress was made
+		 * and due work remains. This applies to direct cPanel/PHP cron as well as
+		 * the local REST worker, so a full queue does not wait for the next minute.
+		 */
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			try {
+				if ( Mobo_Core_Self_Runner::should_continue_after_result( $result ) ) {
+					$result['continuationKick'] = Mobo_Core_Self_Runner::kick( 'cron-continuation', true );
+				} else {
+					$result['continuationKick'] = array(
+						'success' => true,
+						'status'  => 'not-needed',
+					);
+				}
+			} catch ( Throwable $e ) {
+				$result['continuationKick'] = $this->exception_result( 'continuation-kick-exception', $e );
 			}
 		}
+
+		/*
+		 * Persist the current runner result before building health payloads so the
+		 * report contains this invocation rather than the previous cron slice.
+		 */
+		$this->save_last_result( $result );
+
+		if ( class_exists( 'Mobo_Core_Health_Reporter' ) ) {
+			try {
+				$health_reporter       = new Mobo_Core_Health_Reporter();
+				$result['healthReport'] = $health_reporter->send_report( $source );
+			} catch ( Throwable $e ) {
+				$result['healthReport'] = $this->exception_result( 'health-report-exception', $e );
+			}
+		}
+
+		$this->save_last_result( $result );
+		return $result;
 	}
 
 	/**
@@ -128,10 +128,6 @@ class Mobo_Core_Cron_Runner {
 	 * @return string
 	 */
 	public static function build_cron_url() {
-		if ( class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled() ) {
-			return '';
-		}
-
 		$token = (string) get_option( 'mobo_core_cron_token', '' );
 
 		if ( '' === trim( $token ) ) {
@@ -160,14 +156,10 @@ class Mobo_Core_Cron_Runner {
 
 		$expected_interval = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_expected_interval_seconds', 60, 60, 3600 );
 		$next_estimated_at = $last_hit > 0 ? $last_hit + $expected_interval : 0;
-		$is_overdue       = $next_estimated_at > 0 && time() > ( $next_estimated_at + 30 );
+		$is_overdue        = $next_estimated_at > 0 && time() > ( $next_estimated_at + 30 );
+		$lock_status       = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'real_cron_runner' ) : array();
 
 		return array(
-			'queueWorkerEnabled'      => class_exists( 'Mobo_Core_Queue_Worker_Lock' ) && Mobo_Core_Queue_Worker_Lock::is_cli_worker_enabled(),
-			'queueWorkerLockPath'     => class_exists( 'Mobo_Core_Queue_Worker_Lock' ) ? Mobo_Core_Queue_Worker_Lock::path() : '',
-			'queueWorkerLastStartAt'  => absint( get_option( 'mobo_core_queue_worker_last_start_at', 0 ) ),
-			'queueWorkerLastEndAt'    => absint( get_option( 'mobo_core_queue_worker_last_end_at', 0 ) ),
-			'queueWorkerLastResult'   => get_option( 'mobo_core_queue_worker_last_result', array() ),
 			'cronUrl'                 => self::build_cron_url(),
 			'lastHitAt'               => $last_hit,
 			'lastSuccessAt'           => $last_ok,
@@ -177,466 +169,766 @@ class Mobo_Core_Cron_Runner {
 			'secondsSinceLastHit'     => $last_hit > 0 ? max( 0, time() - $last_hit ) : 0,
 			'secondsSinceLastSuccess' => $last_ok > 0 ? max( 0, time() - $last_ok ) : 0,
 			'isActive'                => $last_hit > 0 && ( time() - $last_hit ) < HOUR_IN_SECONDS,
+			'lock'                    => $lock_status,
 			'lastResult'              => $last_res,
 		);
 	}
 
 	/**
-	 * Run one fair queue round for the long-lived CLI worker.
+	 * Return a compact, token-free status for the central health report.
 	 *
-	 * Every ready queue receives at most one bounded batch per round. The starting
-	 * queue rotates between rounds so a slow queue cannot permanently starve later
-	 * queues. A new batch is not started when the process is too close to its
-	 * microtime deadline.
-	 *
-	 * @param string $source  Source label.
-	 * @param array  $options Runtime options.
 	 * @return array
 	 */
-	private function run_queue_worker_round_locked( $source, $options ) {
-		$started_at = microtime( true );
-		$deadline   = isset( $options['deadline'] ) ? (float) $options['deadline'] : $started_at + 8.0;
-		$guard      = 2.0;
-		$offset     = isset( $options['queueOffset'] ) ? absint( $options['queueOffset'] ) : 0;
-		$batch_estimates = isset( $options['batchEstimatesMs'] ) && is_array( $options['batchEstimatesMs'] ) ? $options['batchEstimatesMs'] : array();
+	public static function get_health_status() {
+		$status = self::get_status();
+		$last   = isset( $status['lastResult'] ) && is_array( $status['lastResult'] ) ? $status['lastResult'] : array();
+		$runner = isset( $last['runner'] ) && is_array( $last['runner'] ) ? $last['runner'] : array();
 
-		$queue_order = array(
-			'webhook',
-			'image',
-			'image-refresh',
-			'product-sync',
-			'reprice',
-			'recategorize',
-			'order-submission',
+		return array(
+			'pluginVersion'           => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'lastHitAt'               => isset( $status['lastHitAt'] ) ? absint( $status['lastHitAt'] ) : 0,
+			'lastSuccessAt'           => isset( $status['lastSuccessAt'] ) ? absint( $status['lastSuccessAt'] ) : 0,
+			'expectedIntervalSeconds' => isset( $status['expectedIntervalSeconds'] ) ? absint( $status['expectedIntervalSeconds'] ) : 0,
+			'isOverdue'               => ! empty( $status['isOverdue'] ),
+			'lock'                    => isset( $status['lock'] ) && is_array( $status['lock'] ) ? $status['lock'] : array(),
+			'lastRun'                 => array(
+				'success'                       => ! empty( $last['success'] ),
+				'status'                        => isset( $last['status'] ) ? sanitize_key( (string) $last['status'] ) : 'never-run',
+				'source'                        => isset( $last['source'] ) ? sanitize_key( (string) $last['source'] ) : '',
+				'executedAt'                    => isset( $last['executedAt'] ) ? absint( $last['executedAt'] ) : 0,
+				'needsContinuation'             => ! empty( $last['needsContinuation'] ),
+				'rounds'                        => isset( $runner['rounds'] ) ? absint( $runner['rounds'] ) : 0,
+				'maxRounds'                     => isset( $runner['maxRounds'] ) ? absint( $runner['maxRounds'] ) : 0,
+				'productStepsPerRound'          => isset( $runner['productStepsPerRound'] ) ? absint( $runner['productStepsPerRound'] ) : 0,
+				'configuredTimeBudgetSeconds'   => isset( $runner['configuredTimeBudgetSeconds'] ) ? absint( $runner['configuredTimeBudgetSeconds'] ) : 0,
+				'effectiveTimeBudgetSeconds'    => isset( $runner['effectiveTimeBudgetSeconds'] ) ? absint( $runner['effectiveTimeBudgetSeconds'] ) : 0,
+				'safetyMarginSeconds'           => isset( $runner['safetyMarginSeconds'] ) ? absint( $runner['safetyMarginSeconds'] ) : 0,
+				'elapsedMs'                     => isset( $runner['elapsedMs'] ) ? absint( $runner['elapsedMs'] ) : 0,
+				'stopReason'                    => isset( $runner['stopReason'] ) ? sanitize_key( (string) $runner['stopReason'] ) : '',
+				'madeProgress'                  => ! empty( $runner['madeProgress'] ),
+				'hasImmediateWork'              => ! empty( $runner['hasImmediateWork'] ),
+				'lockRenewals'                  => isset( $runner['lockRenewals'] ) ? absint( $runner['lockRenewals'] ) : 0,
+				'lockLost'                      => ! empty( $runner['lockLost'] ),
+				'configuredLockTtlSeconds'      => isset( $runner['configuredLockTtlSeconds'] ) ? absint( $runner['configuredLockTtlSeconds'] ) : 0,
+				'effectiveLockTtlSeconds'       => isset( $runner['effectiveLockTtlSeconds'] ) ? absint( $runner['effectiveLockTtlSeconds'] ) : 0,
+				'longestBlockingTimeoutSeconds' => isset( $runner['longestBlockingTimeoutSeconds'] ) ? absint( $runner['longestBlockingTimeoutSeconds'] ) : 0,
+				'queuePasses'                   => isset( $runner['queuePasses'] ) && is_array( $runner['queuePasses'] )
+					? array_map( 'absint', $runner['queuePasses'] )
+					: array(),
+				'failedStages'                  => isset( $runner['failedStages'] ) && is_array( $runner['failedStages'] )
+					? array_values( array_map( 'sanitize_key', $runner['failedStages'] ) )
+					: array(),
+			),
 		);
+	}
 
-		$count = count( $queue_order );
-		if ( $count > 0 ) {
-			$offset      = $offset % $count;
-			$queue_order = array_merge( array_slice( $queue_order, $offset ), array_slice( $queue_order, 0, $offset ) );
+	/**
+	 * Resolve safe runtime budgets and lease TTL.
+	 *
+	 * The configured lock TTL is treated as a minimum. The actual lease also
+	 * covers the longest configured blocking HTTP request plus recovery grace,
+	 * preventing overlap while one request is legitimately still in flight.
+	 *
+	 * @return array
+	 */
+	private function get_runtime_config() {
+		$configured_budget = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
+		$safety_margin     = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_safety_margin_seconds', 3, 1, 10 );
+		$php_limit         = absint( ini_get( 'max_execution_time' ) );
+		$effective_budget  = $configured_budget;
+
+		if ( $php_limit > 0 ) {
+			$effective_budget = min( $configured_budget, max( 1, $php_limit - $safety_margin ) );
 		}
 
-		$webhook_result = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped', 'remainingFile' => false, 'remainingTable' => false, 'remainingDueTable' => false );
-		$image_result = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		$image_refresh_result = array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false );
-		$image_refresh_automation = array( 'success' => true, 'status' => 'disabled', 'needsContinuation' => false, 'progressed' => false );
-		$reprice_result = array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		$recategorize_result = array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		$order_submission_result = array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'remaining' => false );
-		$status = array( 'shouldContinue' => false );
-		$steps = 0;
-		$last_step = null;
-		$batch_durations = array();
-		$deadline_reached = false;
+		$api_timeout      = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
+		$payload_timeout  = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
+		$checkout_timeout = Mobo_Core_Settings::get_int( 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
+		$blocking_timeout = max( 15, $api_timeout, $payload_timeout, $checkout_timeout );
+		$configured_ttl   = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
+		$lock_ttl         = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
 
-		foreach ( $queue_order as $queue_name ) {
-			$estimated_ms = isset( $batch_estimates[ $queue_name ] ) ? max( 0, absint( $batch_estimates[ $queue_name ] ) ) : 0;
-			$queue_guard  = $estimated_ms > 0
-				? max( $guard, min( 15.0, ( $estimated_ms / 1000 ) * 1.25 + 0.5 ) )
-				: max( 3.0, $guard );
+		return array(
+			'configuredTimeBudgetSeconds' => $configured_budget,
+			'effectiveTimeBudgetSeconds'  => $effective_budget,
+			'safetyMarginSeconds'         => $safety_margin,
+			'maxRounds'                   => Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_rounds', 100, 1, 500 ),
+			'productStepsPerRound'        => Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 ),
+			'lockTtlSeconds'              => $lock_ttl,
+			'configuredLockTtlSeconds'    => $configured_ttl,
+			'longestBlockingTimeout'      => $blocking_timeout,
+		);
+	}
 
-			if ( ! $this->can_start_worker_batch( $deadline, $queue_guard ) ) {
-				$deadline_reached = true;
+	/**
+	 * Drain fair queue rounds while the runner lease is held.
+	 *
+	 * @param string $source Source.
+	 * @param string $lock_token Lock owner token.
+	 * @param array  $config Runtime configuration.
+	 * @return array
+	 */
+	private function run_locked( $source, $lock_token, $config ) {
+		$started_at      = microtime( true );
+		$deadline        = $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] );
+		$rounds          = 0;
+		$lock_renewals   = 0;
+		$lock_lost       = false;
+		$stop_reason     = 'queues-empty-or-deferred';
+		$made_progress   = false;
+		$immediate_work  = false;
+		$disabled_stages = array();
+		$aggregate       = $this->empty_aggregate_result( $source );
+
+		while ( $rounds < absint( $config['maxRounds'] ) ) {
+			if ( ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
+				$stop_reason = 'time-budget-exhausted';
 				break;
 			}
 
-			$batch_started = microtime( true );
-
-			try {
-				switch ( $queue_name ) {
-					case 'webhook':
-						if ( Mobo_Core_Settings::enabled( 'mobo_core_real_cron_process_webhooks', '1' ) && class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
-							$queue          = new Mobo_Core_Webhook_Queue();
-							$webhook_result = $queue->process();
-						}
-						break;
-
-					case 'image':
-						if ( class_exists( 'Mobo_Core_Image_Sync' ) ) {
-							$image_sync   = new Mobo_Core_Image_Sync();
-							$image_limit  = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
-							$image_result = $image_sync->process_queue( $image_limit );
-						}
-						break;
-
-					case 'image-refresh':
-						if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_automation_enabled', '0' ) ) {
-							$automation               = new Mobo_Core_Image_Refresh_Automation();
-							$image_refresh_automation = $automation->run_tick( $source );
-							if ( isset( $image_refresh_automation['operation'] ) && is_array( $image_refresh_automation['operation'] ) && 'process-queue' === ( isset( $image_refresh_automation['status'] ) ? $image_refresh_automation['status'] : '' ) ) {
-								$image_refresh_result = $image_refresh_automation['operation'];
-							}
-						} elseif ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) ) {
-							$image_refresh_service = new Mobo_Core_Image_Refresh_Service();
-							$image_refresh_limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
-							$image_refresh_result  = $image_refresh_service->process_queue( $image_refresh_limit );
-						}
-						break;
-
-					case 'product-sync':
-						if ( class_exists( 'Mobo_Core_Product_Sync' ) ) {
-							$product_sync = new Mobo_Core_Product_Sync();
-							$status       = $product_sync->get_manual_sync_status();
-
-							if ( ! empty( $status['shouldContinue'] ) ) {
-								$sync_lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
-								if ( false === $sync_lock ) {
-									$last_step = array( 'success' => false, 'status' => 'locked', 'message' => 'Product sync step is already running.' );
-								} else {
-									try {
-										$last_step = $product_sync->run_manual_sync_step();
-										$steps     = 1;
-										$status    = $product_sync->get_manual_sync_status();
-									} finally {
-										Mobo_Core_Lock::release( 'manual_sync', $sync_lock );
-									}
-								}
-							}
-						}
-						break;
-
-					case 'reprice':
-						if ( class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
-							$reprice_queue  = new Mobo_Core_Reprice_Queue();
-							$reprice_result = $reprice_queue->process_batch();
-						}
-						break;
-
-					case 'recategorize':
-						if ( class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
-							$recategorize_queue  = new Mobo_Core_Recategorize_Queue();
-							$recategorize_result = $recategorize_queue->process_batch();
-						}
-						break;
-
-					case 'order-submission':
-						if ( class_exists( 'Mobo_Core_Checkout_Validator' ) ) {
-							$checkout_validator      = new Mobo_Core_Checkout_Validator();
-							$order_submission_result = $checkout_validator->process_queued_mobo_order_submissions( 1, $source );
-						}
-						break;
-				}
-			} catch ( Throwable $e ) {
-				$failure = $this->exception_result( $queue_name . '-exception', $e, array( 'processed' => 0, 'failed' => 1, 'remaining' => true ) );
-
-				switch ( $queue_name ) {
-					case 'webhook':
-						$webhook_result = $failure;
-						update_option( 'mobo_core_webhook_queue_last_result', $failure, false );
-						update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
-						break;
-					case 'image':
-						$image_result = $failure;
-						break;
-					case 'image-refresh':
-						$image_refresh_result = $failure;
-						break;
-					case 'reprice':
-						$reprice_result = $failure;
-						break;
-					case 'recategorize':
-						$recategorize_result = $failure;
-						break;
-					case 'order-submission':
-						$order_submission_result = $failure;
-						break;
-					case 'product-sync':
-						$last_step = $failure;
-						break;
-				}
+			if ( ! $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+				$lock_lost   = true;
+				$stop_reason = 'lock-lost';
+				break;
 			}
 
-			$batch_durations[ $queue_name ] = (int) round( ( microtime( true ) - $batch_started ) * 1000 );
-		}
+			$rounds++;
+			$round = $this->run_one_round(
+				$source,
+				$rounds,
+				$deadline,
+				$config,
+				$lock_token,
+				$lock_renewals,
+				$disabled_stages
+			);
 
-		$address_mapping_result = array( 'status' => 'skipped' );
-		$remote_shipping_result = array( 'status' => 'skipped' );
-		$maintenance_result = array( 'status' => 'skipped' );
+			$this->merge_round_result( $aggregate, $round );
+			$made_progress  = $made_progress || ! empty( $round['madeProgress'] );
+			$immediate_work = ! empty( $round['hasImmediateWork'] );
 
-		if ( ! empty( $options['includeHousekeeping'] ) ) {
-			if ( $this->can_start_worker_batch( $deadline, $guard ) && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
-				try {
-					$address_mapping = new Mobo_Core_Address_Mapping();
-					$address_mapping_result = $address_mapping->maybe_sync_if_due( $source, false );
-				} catch ( Throwable $e ) {
-					$address_mapping_result = $this->exception_result( 'address-mapping-exception', $e );
-				}
+			if ( ! empty( $round['lockLost'] ) ) {
+				$lock_lost   = true;
+				$stop_reason = 'lock-lost';
+				break;
 			}
 
-			if ( $this->can_start_worker_batch( $deadline, $guard ) && class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
-				try {
-					$remote_shipping = new Mobo_Core_Remote_Shipping_Methods();
-					$remote_shipping_result = $remote_shipping->maybe_sync_if_due( $source, false );
-				} catch ( Throwable $e ) {
-					$remote_shipping_result = $this->exception_result( 'remote-shipping-exception', $e );
-				}
+			if ( ! empty( $round['deadlineReached'] ) || ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
+				$stop_reason = 'time-budget-exhausted';
+				break;
 			}
 
-			if ( $this->can_start_worker_batch( $deadline, max( 3.0, $guard ) ) && class_exists( 'Mobo_Core_Maintenance' ) ) {
-				try {
-					$maintenance_result = Mobo_Core_Maintenance::maybe_run( $source );
-				} catch ( Throwable $e ) {
-					$maintenance_result = $this->exception_result( 'maintenance-exception', $e );
-				}
+			if ( empty( $round['madeProgress'] ) ) {
+				$stop_reason = $immediate_work ? 'no-progress' : 'queues-empty-or-deferred';
+				break;
+			}
+
+			if ( ! $immediate_work ) {
+				$stop_reason = 'queues-empty-or-deferred';
+				break;
 			}
 		}
 
-		$processed_webhooks = isset( $webhook_result['processed'] ) ? absint( $webhook_result['processed'] ) : 0;
-		$processed_images = isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0;
-		$processed_image_refresh = isset( $image_refresh_result['processed'] ) ? absint( $image_refresh_result['processed'] ) : 0;
-		$processed_reprice = isset( $reprice_result['processed'] ) ? absint( $reprice_result['processed'] ) : 0;
-		$processed_recategorize = isset( $recategorize_result['processed'] ) ? absint( $recategorize_result['processed'] ) : 0;
-		$processed_orders = isset( $order_submission_result['processed'] ) ? absint( $order_submission_result['processed'] ) : 0;
+		if ( $rounds >= absint( $config['maxRounds'] ) && $immediate_work ) {
+			$stop_reason = 'max-rounds-reached';
+		}
 
-		$did_work = $processed_webhooks > 0
-			|| $processed_images > 0
-			|| $processed_image_refresh > 0
-			|| ! empty( $image_refresh_automation['progressed'] )
-			|| $steps > 0
-			|| $processed_reprice > 0
-			|| $processed_recategorize > 0
-			|| $processed_orders > 0;
+		$elapsed_ms = max( 0, (int) round( ( microtime( true ) - $started_at ) * 1000 ) );
 
-		$needs_continuation = ! empty( $webhook_result['remainingFile'] )
-			|| ! empty( $webhook_result['remainingTable'] )
-			|| ! empty( $webhook_result['remainingDueTable'] )
-			|| ! empty( $image_result['remaining'] )
-			|| ! empty( $image_refresh_result['remaining'] )
-			|| ! empty( $image_refresh_automation['needsContinuation'] )
-			|| ! empty( $status['shouldContinue'] )
-			|| ! empty( $reprice_result['remaining'] )
-			|| ! empty( $recategorize_result['remaining'] )
-			|| ! empty( $order_submission_result['remaining'] );
+		/*
+		 * Auto-chain only when progress was made. A no-progress/locked/deferred
+		 * queue waits for the next real cron and cannot create a tight loop.
+		 */
+		$needs_continuation = ! $lock_lost
+			&& $made_progress
+			&& (
+				$immediate_work
+				|| in_array( $stop_reason, array( 'time-budget-exhausted', 'max-rounds-reached' ), true )
+			);
 
-		$result = array(
-			'success'                  => true,
-			'status'                   => 'ok',
-			'source'                   => sanitize_key( (string) $source ),
-			'executedAt'               => time(),
-			'webhookQueue'             => $webhook_result,
-			'imageQueue'               => $image_result,
-			'imageRefreshQueue'        => $image_refresh_result,
-			'imageRefreshAutomation'   => $image_refresh_automation,
-			'repriceQueue'             => $reprice_result,
-			'recategorizeQueue'        => $recategorize_result,
-			'addressMapping'           => $address_mapping_result,
-			'remoteShipping'           => $remote_shipping_result,
-			'orderSubmissions'         => $order_submission_result,
-			'maintenance'              => $maintenance_result,
-			'productSteps'             => $steps,
-			'productStatus'            => $status,
-			'lastStep'                 => $last_step,
-			'didWork'                  => $did_work,
-			'needsContinuation'        => $needs_continuation,
-			'deadlineReached'          => $deadline_reached || ! $this->can_start_worker_batch( $deadline, $guard ),
-			'queueOrder'               => $queue_order,
-			'batchDurationsMs'         => $batch_durations,
-			'roundDurationMs'          => (int) round( ( microtime( true ) - $started_at ) * 1000 ),
-			'message'                  => 'Fair queue round completed.',
+		$aggregate['success']           = ! $lock_lost;
+		$aggregate['status']            = $lock_lost ? 'lock-lost' : ( empty( $aggregate['runnerErrors'] ) ? 'ok' : 'partial' );
+		$aggregate['executedAt']        = time();
+		$aggregate['needsContinuation'] = $needs_continuation;
+		$aggregate['message']           = $lock_lost
+			? 'Cron processing stopped because the runner lease was lost.'
+			: 'Cron queue drain slice completed.';
+		$aggregate['runner']            = array(
+			'pluginVersion'                   => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'configuredTimeBudgetSeconds'     => absint( $config['configuredTimeBudgetSeconds'] ),
+			'effectiveTimeBudgetSeconds'      => absint( $config['effectiveTimeBudgetSeconds'] ),
+			'safetyMarginSeconds'             => absint( $config['safetyMarginSeconds'] ),
+			'elapsedMs'                       => $elapsed_ms,
+			'rounds'                          => $rounds,
+			'maxRounds'                       => absint( $config['maxRounds'] ),
+			'productStepsPerRound'            => absint( $config['productStepsPerRound'] ),
+			'stopReason'                      => $stop_reason,
+			'madeProgress'                    => $made_progress,
+			'hasImmediateWork'                => $immediate_work,
+			'lockLost'                        => $lock_lost,
+			'lockRenewals'                    => $lock_renewals,
+			'configuredLockTtlSeconds'        => absint( $config['configuredLockTtlSeconds'] ),
+			'effectiveLockTtlSeconds'         => absint( $config['lockTtlSeconds'] ),
+			'longestBlockingTimeoutSeconds'   => absint( $config['longestBlockingTimeout'] ),
+			'failedStages'                    => array_values( array_keys( $disabled_stages ) ),
+			'queuePasses'                     => $aggregate['queuePasses'],
 		);
 
-		update_option( 'mobo_core_real_cron_last_success_at', time(), false );
-		return $result;
+		if ( ! $lock_lost ) {
+			update_option( 'mobo_core_real_cron_last_success_at', time(), false );
+		}
+
+		return $aggregate;
 	}
 
 	/**
-	 * Determine whether another batch may safely start before the deadline.
+	 * Run one fair pass over all queue families.
 	 *
-	 * @param float $deadline Absolute microtime deadline.
-	 * @param float $guard    Required time remaining.
-	 * @return bool
+	 * @param string $source Source.
+	 * @param int    $round_number Round number.
+	 * @param float  $deadline Absolute microtime deadline.
+	 * @param array  $config Runtime config.
+	 * @param string $lock_token Lock token.
+	 * @param int    $lock_renewals Renewal counter by reference.
+	 * @param array  $disabled_stages Stages disabled after an exception by reference.
+	 * @return array
 	 */
-	private function can_start_worker_batch( $deadline, $guard = 2.0 ) {
-		return ( (float) $deadline - microtime( true ) ) > max( 0.5, (float) $guard );
+	private function run_one_round( $source, $round_number, $deadline, $config, $lock_token, &$lock_renewals, &$disabled_stages ) {
+		$round = $this->empty_round_result();
+
+		/* Webhook queue. */
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_real_cron_process_webhooks', '1' ) && ! isset( $disabled_stages['webhookQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$remaining_seconds = max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) );
+			$webhook_budget     = min( Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 ), $remaining_seconds );
+			$round['webhookQueue'] = $this->execute_stage(
+				'webhookQueue',
+				function () use ( $webhook_budget ) {
+					$queue = new Mobo_Core_Webhook_Queue();
+					return $queue->process( $webhook_budget );
+				},
+				array( 'processed' => 0, 'failed' => 1, 'status' => 'exception', 'remainingFile' => true, 'remainingTable' => true, 'remainingDueTable' => false ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['webhookQueue']++;
+		}
+
+		/* Product image queue. */
+		$image_sync  = null;
+		$image_limit = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
+		if ( class_exists( 'Mobo_Core_Image_Sync' ) && ! isset( $disabled_stages['imageQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$image_sync = new Mobo_Core_Image_Sync();
+			$round['imageQueue'] = $this->execute_stage(
+				'imageQueue',
+				function () use ( $image_sync, $image_limit ) {
+					return $image_sync->process_queue( $image_limit );
+				},
+				array( 'processed' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['imageQueue']++;
+		}
+
+		/* Image refresh workflow/queue. */
+		if ( ! isset( $disabled_stages['imageRefreshQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_automation_enabled', '0' ) ) {
+				$round['imageRefreshAutomation'] = $this->execute_stage(
+					'imageRefreshQueue',
+					function () use ( $source ) {
+						$automation = new Mobo_Core_Image_Refresh_Automation();
+						return $automation->run_tick( $source );
+					},
+					array( 'success' => false, 'status' => 'exception', 'needsContinuation' => false, 'progressed' => false ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+
+				if ( isset( $round['imageRefreshAutomation']['operation'] ) && is_array( $round['imageRefreshAutomation']['operation'] ) ) {
+					$round['imageRefreshQueue'] = $round['imageRefreshAutomation']['operation'];
+				}
+			} elseif ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) ) {
+				$image_refresh_limit = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
+				$round['imageRefreshQueue'] = $this->execute_stage(
+					'imageRefreshQueue',
+					function () use ( $image_refresh_limit ) {
+						$service = new Mobo_Core_Image_Refresh_Service();
+						return $service->process_queue( $image_refresh_limit );
+					},
+					array( 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'status' => 'exception', 'remaining' => true ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+			$round['queuePasses']['imageRefreshQueue']++;
+		}
+
+		/* Product sync steps. */
+		if ( ! isset( $disabled_stages['productSync'] ) ) {
+			$product_sync = new Mobo_Core_Product_Sync();
+			$status       = $product_sync->get_manual_sync_status();
+			$steps        = 0;
+
+			while ( ! empty( $status['shouldContinue'] ) && $steps < absint( $config['productStepsPerRound'] ) ) {
+				if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+					break;
+				}
+
+				try {
+					$round['lastStep'] = $product_sync->run_manual_sync_step();
+					$steps++;
+					$status = $product_sync->get_manual_sync_status();
+				} catch ( Throwable $e ) {
+					$disabled_stages['productSync'] = true;
+					$round['stageErrors'][] = $this->compact_stage_error( 'productSync', $e );
+					break;
+				}
+			}
+
+			$round['productSteps']  = $steps;
+			$round['productStatus'] = $status;
+			if ( $steps > 0 ) {
+				$round['queuePasses']['productSync']++;
+			}
+		}
+
+		/* Reprice queue. */
+		if ( class_exists( 'Mobo_Core_Reprice_Queue' ) && ! isset( $disabled_stages['repriceQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$round['repriceQueue'] = $this->execute_stage(
+				'repriceQueue',
+				function () {
+					$queue = new Mobo_Core_Reprice_Queue();
+					return $queue->process_batch();
+				},
+				array( 'processed' => 0, 'updated' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['repriceQueue']++;
+		}
+
+		/* Recategorize queue. */
+		if ( class_exists( 'Mobo_Core_Recategorize_Queue' ) && ! isset( $disabled_stages['recategorizeQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$round['recategorizeQueue'] = $this->execute_stage(
+				'recategorizeQueue',
+				function () {
+					$queue = new Mobo_Core_Recategorize_Queue();
+					return $queue->process_batch();
+				},
+				array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['recategorizeQueue']++;
+		}
+
+		/* Due configuration syncs only need one check per invocation. */
+		if ( 1 === absint( $round_number ) ) {
+			if ( class_exists( 'Mobo_Core_Address_Mapping' ) && ! isset( $disabled_stages['addressMapping'] ) ) {
+				if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+					return $round;
+				}
+
+				$round['addressMapping'] = $this->execute_stage(
+					'addressMapping',
+					function () use ( $source ) {
+						$mapping = new Mobo_Core_Address_Mapping();
+						return $mapping->maybe_sync_if_due( $source, false );
+					},
+					array( 'success' => false, 'status' => 'exception' ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+
+			if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) && ! isset( $disabled_stages['remoteShipping'] ) ) {
+				if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+					return $round;
+				}
+
+				$round['remoteShipping'] = $this->execute_stage(
+					'remoteShipping',
+					function () use ( $source ) {
+						$shipping = new Mobo_Core_Remote_Shipping_Methods();
+						return $shipping->maybe_sync_if_due( $source, false );
+					},
+					array( 'success' => false, 'status' => 'exception' ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		/* Queued order submissions. */
+		if ( class_exists( 'Mobo_Core_Checkout_Validator' ) && ! isset( $disabled_stages['orderSubmissions'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$round['orderSubmissions'] = $this->execute_stage(
+				'orderSubmissions',
+				function () use ( $source ) {
+					$validator = new Mobo_Core_Checkout_Validator();
+					return $validator->process_queued_mobo_order_submissions( 1, $source );
+				},
+				array( 'status' => 'exception', 'processed' => 0, 'success' => 0, 'failed' => 1, 'skipped' => 0, 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['orderSubmissions']++;
+		}
+
+		/* A late image pass consumes images enqueued by product sync in this round. */
+		if ( $image_sync instanceof Mobo_Core_Image_Sync && ! isset( $disabled_stages['imageQueue'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$late_image = $this->execute_stage(
+				'imageQueue',
+				function () use ( $image_sync, $image_limit ) {
+					return $image_sync->process_queue( $image_limit );
+				},
+				array( 'processed' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+
+			$round['imageQueue'] = $this->merge_queue_counters(
+				$round['imageQueue'],
+				$late_image,
+				array( 'processed', 'failed' ),
+				array( 'remaining' )
+			);
+			$round['imageQueue']['latePass'] = $late_image;
+			$round['queuePasses']['imageQueue']++;
+		}
+
+		/* Maintenance is opportunistic and only checked once per invocation. */
+		if ( 1 === absint( $round_number ) && class_exists( 'Mobo_Core_Maintenance' ) && ! isset( $disabled_stages['maintenance'] ) ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['maintenance'] = $this->execute_stage(
+					'maintenance',
+					function () use ( $source ) {
+						return Mobo_Core_Maintenance::maybe_run( $source );
+					},
+					array( 'success' => false, 'status' => 'exception' ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		$this->finalize_round_state( $round, $disabled_stages );
+		return $round;
 	}
 
 	/**
-	 * Execute work while cron lock is held.
+	 * Initialize aggregate result.
 	 *
 	 * @param string $source Source.
 	 * @return array
 	 */
-	private function run_legacy_locked( $source ) {
-		$started_at = time();
-		$budget     = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
-		$max_steps  = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
+	private function empty_aggregate_result( $source ) {
+		return array(
+			'success'                => true,
+			'status'                 => 'ok',
+			'source'                 => sanitize_key( (string) $source ),
+			'webhookQueue'           => array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped', 'remainingFile' => false, 'remainingTable' => false, 'remainingDueTable' => false ),
+			'imageQueue'             => array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false ),
+			'imageRefreshQueue'      => array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false ),
+			'imageRefreshAutomation' => array( 'success' => true, 'status' => 'disabled', 'needsContinuation' => false, 'progressed' => false ),
+			'repriceQueue'           => array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false ),
+			'recategorizeQueue'      => array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false ),
+			'addressMapping'         => array( 'status' => 'skipped' ),
+			'remoteShipping'         => array( 'status' => 'skipped' ),
+			'orderSubmissions'       => array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => false ),
+			'maintenance'            => array( 'status' => 'skipped' ),
+			'productSteps'           => 0,
+			'productStatus'          => array(),
+			'lastStep'               => null,
+			'runnerErrors'           => array(),
+			'queuePasses'            => array(
+				'webhookQueue'      => 0,
+				'imageQueue'        => 0,
+				'imageRefreshQueue' => 0,
+				'productSync'       => 0,
+				'repriceQueue'      => 0,
+				'recategorizeQueue' => 0,
+				'orderSubmissions'  => 0,
+			),
+		);
+	}
 
+	/**
+	 * Initialize one round result.
+	 *
+	 * @return array
+	 */
+	private function empty_round_result() {
+		$result = $this->empty_aggregate_result( 'round' );
+		$result['stageErrors']      = array();
+		$result['madeProgress']     = false;
+		$result['hasImmediateWork'] = false;
+		$result['deadlineReached']  = false;
+		$result['lockLost']         = false;
+		unset( $result['source'], $result['runnerErrors'] );
+		return $result;
+	}
 
-		$webhook_result = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped' );
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_real_cron_process_webhooks', '1' ) ) {
+	/**
+	 * Renew lease and verify time before a major stage.
+	 *
+	 * @param float  $deadline Deadline.
+	 * @param array  $config Config.
+	 * @param string $lock_token Token.
+	 * @param int    $lock_renewals Renewal counter.
+	 * @param array  $round Round result.
+	 * @return bool
+	 */
+	private function prepare_stage( $deadline, $config, $lock_token, &$lock_renewals, &$round, $disabled_stages = array() ) {
+		if ( ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
+			$round['deadlineReached'] = true;
+			$this->finalize_round_state( $round, $disabled_stages );
+			return false;
+		}
+
+		if ( ! $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+			$round['lockLost'] = true;
+			$this->finalize_round_state( $round, $disabled_stages );
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Execute one stage without allowing its exception to abort other queues.
+	 *
+	 * @param string   $stage Stage name.
+	 * @param callable $callback Callback.
+	 * @param array    $fallback Fallback result.
+	 * @param array    $disabled_stages Disabled stages by reference.
+	 * @param array    $errors Errors by reference.
+	 * @return array
+	 */
+	private function execute_stage( $stage, $callback, $fallback, &$disabled_stages, &$errors ) {
+		try {
+			$result = call_user_func( $callback );
+			return is_array( $result ) ? $result : $fallback;
+		} catch ( Throwable $e ) {
+			$disabled_stages[ (string) $stage ] = true;
+			$errors[] = $this->compact_stage_error( $stage, $e );
+			$fallback['exceptionClass'] = get_class( $e );
+			$fallback['message']        = $e->getMessage();
+			return $fallback;
+		}
+	}
+
+	/**
+	 * Finalize progress and immediate-work flags for a round.
+	 *
+	 * @param array $round Round by reference.
+	 * @param array $disabled_stages Disabled stages.
+	 * @return void
+	 */
+	private function finalize_round_state( &$round, $disabled_stages ) {
+		$webhook_processed = absint( isset( $round['webhookQueue']['processed'] ) ? $round['webhookQueue']['processed'] : 0 );
+		$image_processed   = absint( isset( $round['imageQueue']['processed'] ) ? $round['imageQueue']['processed'] : 0 );
+		$refresh_processed = absint( isset( $round['imageRefreshQueue']['processed'] ) ? $round['imageRefreshQueue']['processed'] : 0 );
+		$reprice_processed = absint( isset( $round['repriceQueue']['processed'] ) ? $round['repriceQueue']['processed'] : 0 );
+		$recat_processed   = absint( isset( $round['recategorizeQueue']['processed'] ) ? $round['recategorizeQueue']['processed'] : 0 );
+		$order_processed   = absint( isset( $round['orderSubmissions']['processed'] ) ? $round['orderSubmissions']['processed'] : 0 );
+		$product_steps     = absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
+		$automation_moved  = ! empty( $round['imageRefreshAutomation']['progressed'] );
+
+		$round['madeProgress'] = ( $webhook_processed + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $product_steps ) > 0 || $automation_moved;
+
+		$webhook_due = false;
+		if ( ! isset( $disabled_stages['webhookQueue'] ) && class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
 			try {
-				$queue          = new Mobo_Core_Webhook_Queue();
-				$webhook_result = $queue->process();
+				$queue       = new Mobo_Core_Webhook_Queue();
+				$webhook_due = $queue->has_due_work();
 			} catch ( Throwable $e ) {
-				$webhook_result = $this->exception_result(
-					'webhook-queue-exception',
-					$e,
-					array(
-						'processed' => 0,
-						'failed'    => 1,
-						'remaining' => true,
-					)
-				);
-
-				update_option( 'mobo_core_webhook_queue_last_result', $webhook_result, false );
-				update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
+				$webhook_due = false;
 			}
 		}
 
-		$image_result = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		if ( class_exists( 'Mobo_Core_Image_Sync' ) ) {
-			$image_sync   = new Mobo_Core_Image_Sync();
-			$image_limit  = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
-			$image_result = $image_sync->process_queue( $image_limit );
-		}
+		$product_continue = ! isset( $disabled_stages['productSync'] ) && ! empty( $round['productStatus']['shouldContinue'] );
+		$automation_continue = ! isset( $disabled_stages['imageRefreshQueue'] )
+			&& ! empty( $round['imageRefreshAutomation']['needsContinuation'] )
+			&& ! empty( $round['imageRefreshAutomation']['progressed'] );
 
-		$image_refresh_result     = array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'status' => 'skipped', 'remaining' => false );
-		$image_refresh_automation = array( 'success' => true, 'status' => 'disabled', 'needsContinuation' => false, 'progressed' => false );
-		if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_automation_enabled', '0' ) && ( time() - $started_at ) < $budget ) {
-			$automation               = new Mobo_Core_Image_Refresh_Automation();
-			$image_refresh_automation = $automation->run_tick( $source );
-			if ( isset( $image_refresh_automation['operation'] ) && is_array( $image_refresh_automation['operation'] ) && 'process-queue' === ( isset( $image_refresh_automation['status'] ) ? $image_refresh_automation['status'] : '' ) ) {
-				$image_refresh_result = $image_refresh_automation['operation'];
-			}
-		} elseif ( class_exists( 'Mobo_Core_Image_Refresh_Service' ) && ( time() - $started_at ) < $budget ) {
-			$image_refresh_service = new Mobo_Core_Image_Refresh_Service();
-			$image_refresh_limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
-			$image_refresh_result  = $image_refresh_service->process_queue( $image_refresh_limit );
-		}
+		$round['hasImmediateWork'] = $webhook_due
+			|| ( ! isset( $disabled_stages['imageQueue'] ) && ! empty( $round['imageQueue']['remaining'] ) )
+			|| ( ! isset( $disabled_stages['imageRefreshQueue'] ) && ! empty( $round['imageRefreshQueue']['remaining'] ) )
+			|| $automation_continue
+			|| $product_continue
+			|| ( ! isset( $disabled_stages['repriceQueue'] ) && ! empty( $round['repriceQueue']['remaining'] ) )
+			|| ( ! isset( $disabled_stages['recategorizeQueue'] ) && ! empty( $round['recategorizeQueue']['remaining'] ) )
+			|| ( ! isset( $disabled_stages['orderSubmissions'] ) && ! empty( $round['orderSubmissions']['remaining'] ) );
+	}
 
-		$product_sync = new Mobo_Core_Product_Sync();
-		$status       = $product_sync->get_manual_sync_status();
-		$steps        = 0;
-		$last_step    = null;
-
-		while ( ! empty( $status['shouldContinue'] ) && $steps < $max_steps && ( time() - $started_at ) < $budget ) {
-			$last_step = $product_sync->run_manual_sync_step();
-			$steps++;
-			$status = $product_sync->get_manual_sync_status();
-		}
-
-		$reprice_result = array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		if ( class_exists( 'Mobo_Core_Reprice_Queue' ) && ( time() - $started_at ) < $budget ) {
-			$reprice_queue  = new Mobo_Core_Reprice_Queue();
-			$reprice_result = $reprice_queue->process_batch();
-		}
-
-		$recategorize_result = array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false );
-		if ( class_exists( 'Mobo_Core_Recategorize_Queue' ) && ( time() - $started_at ) < $budget ) {
-			$recategorize_queue  = new Mobo_Core_Recategorize_Queue();
-			$recategorize_result = $recategorize_queue->process_batch();
-		}
-
-		$address_mapping_result = array( 'status' => 'skipped' );
-		if ( class_exists( 'Mobo_Core_Address_Mapping' ) && ( time() - $started_at ) < $budget ) {
-			$address_mapping = new Mobo_Core_Address_Mapping();
-			$address_mapping_result = $address_mapping->maybe_sync_if_due( $source, false );
-		}
-
-		$remote_shipping_result = array( 'status' => 'skipped' );
-		if ( class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) && ( time() - $started_at ) < $budget ) {
-			$remote_shipping = new Mobo_Core_Remote_Shipping_Methods();
-			$remote_shipping_result = $remote_shipping->maybe_sync_if_due( $source, false );
-		}
-
-		$order_submission_result = array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'remaining' => false );
-		if ( class_exists( 'Mobo_Core_Checkout_Validator' ) && ( time() - $started_at ) < $budget ) {
-			$checkout_validator = new Mobo_Core_Checkout_Validator();
-			$order_submission_result = $checkout_validator->process_queued_mobo_order_submissions( 1, $source );
-		}
-
-		if ( isset( $image_sync ) && $image_sync instanceof Mobo_Core_Image_Sync && ( time() - $started_at ) < $budget ) {
-			$image_limit       = isset( $image_limit ) ? absint( $image_limit ) : max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
-			$late_image_result = $image_sync->process_queue( $image_limit );
-
-			$image_result['processed'] = ( isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0 ) + ( isset( $late_image_result['processed'] ) ? absint( $late_image_result['processed'] ) : 0 );
-			$image_result['failed']    = ( isset( $image_result['failed'] ) ? absint( $image_result['failed'] ) : 0 ) + ( isset( $late_image_result['failed'] ) ? absint( $late_image_result['failed'] ) : 0 );
-			$image_result['remaining'] = ! empty( $image_result['remaining'] ) || ! empty( $late_image_result['remaining'] );
-			$image_result['latePass']  = $late_image_result;
-		}
-
-		$maintenance_result = array( 'status' => 'skipped' );
-		if ( class_exists( 'Mobo_Core_Maintenance' ) && ( time() - $started_at ) < max( 1, $budget - 2 ) ) {
-			try {
-				$maintenance_result = Mobo_Core_Maintenance::maybe_run( $source );
-			} catch ( Throwable $e ) {
-				$maintenance_result = $this->exception_result( 'maintenance-exception', $e );
-			}
-		}
-
-		$needs_continuation = false;
-		$processed_webhooks = isset( $webhook_result['processed'] ) ? absint( $webhook_result['processed'] ) : 0;
-		$remaining_webhooks = ! empty( $webhook_result['remainingFile'] ) || ! empty( $webhook_result['remainingTable'] ) || ! empty( $webhook_result['remainingDueTable'] );
-		$processed_images   = isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0;
-		$remaining_images   = ! empty( $image_result['remaining'] );
-		$processed_image_refresh = isset( $image_refresh_result['processed'] ) ? absint( $image_refresh_result['processed'] ) : 0;
-		$remaining_image_refresh = ! empty( $image_refresh_result['remaining'] );
-		$automation_progressed = ! empty( $image_refresh_automation['progressed'] );
-		$automation_continue   = ! empty( $image_refresh_automation['needsContinuation'] );
-		$processed_reprice  = isset( $reprice_result['processed'] ) ? absint( $reprice_result['processed'] ) : 0;
-		$remaining_reprice  = ! empty( $reprice_result['remaining'] );
-		$processed_recategorize = isset( $recategorize_result['processed'] ) ? absint( $recategorize_result['processed'] ) : 0;
-		$remaining_recategorize = ! empty( $recategorize_result['remaining'] );
-		$processed_order_submissions = isset( $order_submission_result['processed'] ) ? absint( $order_submission_result['processed'] ) : 0;
-		$remaining_order_submissions = ! empty( $order_submission_result['remaining'] );
-
-		if ( $processed_webhooks > 0 && $remaining_webhooks ) {
-			$needs_continuation = true;
-		}
-
-		if ( $processed_images > 0 && $remaining_images ) {
-			$needs_continuation = true;
-		}
-
-		if ( $processed_image_refresh > 0 && $remaining_image_refresh ) {
-			$needs_continuation = true;
-		}
-
-		if ( $automation_progressed && $automation_continue ) {
-			$needs_continuation = true;
-		}
-
-		if ( $processed_reprice > 0 && $remaining_reprice ) {
-			$needs_continuation = true;
-		}
-
-		if ( $processed_recategorize > 0 && $remaining_recategorize ) {
-			$needs_continuation = true;
-		}
-
-		if ( $processed_order_submissions > 0 && $remaining_order_submissions ) {
-			$needs_continuation = true;
-		}
-
-		if ( $steps > 0 && ! empty( $status['shouldContinue'] ) ) {
-			$needs_continuation = true;
-		}
-
-		$result = array(
-			'success'           => true,
-			'status'            => 'ok',
-			'source'            => sanitize_key( (string) $source ),
-			'executedAt'        => time(),
-			'webhookQueue'      => $webhook_result,
-			'imageQueue'        => $image_result,
-			'imageRefreshQueue' => $image_refresh_result,
-			'imageRefreshAutomation' => $image_refresh_automation,
-			'repriceQueue'      => $reprice_result,
-			'recategorizeQueue' => $recategorize_result,
-			'addressMapping'     => $address_mapping_result,
-			'remoteShipping'     => isset( $remote_shipping_result ) ? $remote_shipping_result : array( 'status' => 'skipped' ),
-			'orderSubmissions'  => $order_submission_result,
-			'maintenance'       => $maintenance_result,
-			'productSteps'      => $steps,
-			'productStatus'     => $status,
-			'lastStep'          => $last_step,
-			'needsContinuation' => $needs_continuation,
-			'message'           => 'Cron slice completed.',
+	/**
+	 * Merge a round into aggregate counters and latest statuses.
+	 *
+	 * @param array $aggregate Aggregate by reference.
+	 * @param array $round Round.
+	 * @return void
+	 */
+	private function merge_round_result( &$aggregate, $round ) {
+		$aggregate['webhookQueue'] = $this->merge_queue_counters(
+			$aggregate['webhookQueue'],
+			$round['webhookQueue'],
+			array( 'processed', 'failed' ),
+			array( 'remainingFile', 'remainingTable', 'remainingDueTable' )
+		);
+		$aggregate['imageQueue'] = $this->merge_queue_counters(
+			$aggregate['imageQueue'],
+			$round['imageQueue'],
+			array( 'processed', 'failed' ),
+			array( 'remaining' )
+		);
+		$aggregate['imageRefreshQueue'] = $this->merge_queue_counters(
+			$aggregate['imageRefreshQueue'],
+			$round['imageRefreshQueue'],
+			array( 'processed', 'failed', 'skipped' ),
+			array( 'remaining' )
+		);
+		$aggregate['repriceQueue'] = $this->merge_queue_counters(
+			$aggregate['repriceQueue'],
+			$round['repriceQueue'],
+			array( 'processed', 'updated', 'failed' ),
+			array( 'remaining' )
+		);
+		$aggregate['recategorizeQueue'] = $this->merge_queue_counters(
+			$aggregate['recategorizeQueue'],
+			$round['recategorizeQueue'],
+			array( 'processed', 'updated', 'skipped', 'failed' ),
+			array( 'remaining' )
+		);
+		$aggregate['orderSubmissions'] = $this->merge_queue_counters(
+			$aggregate['orderSubmissions'],
+			$round['orderSubmissions'],
+			array( 'processed', 'success', 'failed', 'skipped' ),
+			array( 'remaining' )
 		);
 
-		update_option( 'mobo_core_real_cron_last_success_at', time(), false );
+		$aggregate['imageRefreshAutomation'] = $round['imageRefreshAutomation'];
+		$aggregate['productSteps'] += absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
+		$aggregate['productStatus'] = isset( $round['productStatus'] ) && is_array( $round['productStatus'] ) ? $round['productStatus'] : $aggregate['productStatus'];
+		if ( null !== $round['lastStep'] ) {
+			$aggregate['lastStep'] = $round['lastStep'];
+		}
 
-		return $result;
+		foreach ( array( 'addressMapping', 'remoteShipping', 'maintenance' ) as $key ) {
+			if ( isset( $round[ $key ] ) && is_array( $round[ $key ] ) && 'skipped' !== ( isset( $round[ $key ]['status'] ) ? $round[ $key ]['status'] : '' ) ) {
+				$aggregate[ $key ] = $round[ $key ];
+			}
+		}
+
+		if ( ! empty( $round['stageErrors'] ) && is_array( $round['stageErrors'] ) ) {
+			$aggregate['runnerErrors'] = array_slice( array_merge( $aggregate['runnerErrors'], $round['stageErrors'] ), -20 );
+		}
+
+		foreach ( $aggregate['queuePasses'] as $key => $count ) {
+			$aggregate['queuePasses'][ $key ] = absint( $count ) + absint( isset( $round['queuePasses'][ $key ] ) ? $round['queuePasses'][ $key ] : 0 );
+		}
+	}
+
+	/**
+	 * Merge counters while preserving latest status/remaining flags.
+	 *
+	 * @param array $current Current aggregate.
+	 * @param array $next Next result.
+	 * @param array $sum_keys Numeric keys to sum.
+	 * @param array $latest_bool_keys Boolean keys to take from latest result.
+	 * @return array
+	 */
+	private function merge_queue_counters( $current, $next, $sum_keys, $latest_bool_keys ) {
+		$current = is_array( $current ) ? $current : array();
+		$next    = is_array( $next ) ? $next : array();
+		$merged  = array_merge( $current, $next );
+
+		foreach ( $sum_keys as $key ) {
+			$merged[ $key ] = absint( isset( $current[ $key ] ) ? $current[ $key ] : 0 ) + absint( isset( $next[ $key ] ) ? $next[ $key ] : 0 );
+		}
+
+		$next_status = isset( $next['status'] ) ? sanitize_key( (string) $next['status'] ) : '';
+		foreach ( $latest_bool_keys as $key ) {
+			if ( 'skipped' === $next_status && array_key_exists( $key, $current ) ) {
+				$merged[ $key ] = ! empty( $current[ $key ] );
+			} else {
+				$merged[ $key ] = ! empty( $next[ $key ] );
+			}
+		}
+
+		return $merged;
+	}
+
+	/**
+	 * Renew the current runner lease.
+	 *
+	 * @param string $token Token.
+	 * @param int    $ttl TTL.
+	 * @param int    $renewals Renewal counter.
+	 * @return bool
+	 */
+	private function renew_runner_lock( $token, $ttl, &$renewals ) {
+		$renewed = Mobo_Core_Lock::renew( 'real_cron_runner', $token, $ttl );
+		if ( $renewed ) {
+			$renewals++;
+		}
+		return $renewed;
+	}
+
+	/**
+	 * Whether enough cooperative time remains to start another stage.
+	 *
+	 * @param float $deadline Deadline.
+	 * @param int   $margin Safety margin.
+	 * @return bool
+	 */
+	private function has_time_remaining( $deadline, $margin = 0 ) {
+		return microtime( true ) < ( (float) $deadline - max( 0, (int) $margin ) );
+	}
+
+	/**
+	 * Compact stage exception for diagnostics and health reports.
+	 *
+	 * @param string    $stage Stage.
+	 * @param Throwable $e Exception.
+	 * @return array
+	 */
+	private function compact_stage_error( $stage, Throwable $e ) {
+		return array(
+			'stage'          => sanitize_key( (string) $stage ),
+			'message'        => sanitize_text_field( $e->getMessage() ),
+			'exceptionClass' => get_class( $e ),
+			'file'           => $e->getFile(),
+			'line'           => $e->getLine(),
+			'at'             => time(),
+		);
 	}
 
 	/**
@@ -653,8 +945,8 @@ class Mobo_Core_Cron_Runner {
 	 * Build a compact, JSON-safe exception result for admin/CLI diagnostics.
 	 *
 	 * @param string    $status Status key.
-	 * @param Throwable $e      Exception.
-	 * @param array     $extra  Extra fields.
+	 * @param Throwable $e Exception.
+	 * @param array     $extra Extra fields.
 	 * @return array
 	 */
 	private function exception_result( $status, Throwable $e, $extra = array() ) {

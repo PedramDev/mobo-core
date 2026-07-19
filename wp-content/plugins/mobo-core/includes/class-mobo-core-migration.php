@@ -43,6 +43,7 @@ class Mobo_Core_Migration {
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_103171_runtime_lock_recovery( '' );
 		self::apply_103164_image_family_migration( '' );
 		self::apply_103165_image_refresh_safety( '' );
 		self::apply_103166_admin_health_defaults( '' );
@@ -80,6 +81,7 @@ class Mobo_Core_Migration {
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_103171_runtime_lock_recovery( $current );
 		self::apply_103164_image_family_migration( $current );
 		self::apply_103165_image_refresh_safety( $current );
 		self::apply_103166_admin_health_defaults( $current );
@@ -246,6 +248,144 @@ class Mobo_Core_Migration {
 		}
 
 		update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
+	}
+
+
+	/**
+	 * Recover stale runtime locks when installing/upgrading to 10.31.71.
+	 *
+	 * Legacy transient locks could become permanent when their value option
+	 * existed without the matching timeout option. The new lock helper stores
+	 * token and expiry atomically, and this migration removes every old/current
+	 * Mobo runtime lock before normal workers resume.
+	 *
+	 * Category placeholder repair is deferred until `init`, where WooCommerce has
+	 * registered the product_cat taxonomy.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103171_runtime_lock_recovery( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.71', '>=' ) ) {
+			return;
+		}
+
+		$lock_result = array(
+			'deleted' => 0,
+			'found'   => 0,
+		);
+
+		if ( class_exists( 'Mobo_Core_Lock' ) && method_exists( 'Mobo_Core_Lock', 'force_release_all' ) ) {
+			$lock_result = Mobo_Core_Lock::force_release_all();
+		}
+
+		update_option( 'mobo_core_103171_lock_cleanup_result', $lock_result, false );
+		update_option( 'mobo_core_103171_lock_cleanup_at', time(), false );
+		update_option( 'mobo_core_category_placeholder_repair_pending', '1', false );
+	}
+
+
+	/**
+	 * Run repairs that require taxonomies registered on WordPress init.
+	 *
+	 * @return void
+	 */
+	public static function run_deferred_repairs() {
+		if ( '1' !== (string) get_option( 'mobo_core_category_placeholder_repair_pending', '0' ) ) {
+			return;
+		}
+
+		if ( ! taxonomy_exists( 'product_cat' ) ) {
+			return;
+		}
+
+		$result = self::repair_placeholder_category_titles_from_map();
+
+		update_option( 'mobo_core_category_placeholder_repair_result', $result, false );
+		update_option( 'mobo_core_category_placeholder_repair_at', time(), false );
+		delete_option( 'mobo_core_category_placeholder_repair_pending' );
+	}
+
+
+	/**
+	 * Repair old `Mobo Category <GUID>` names when the mapping table already has
+	 * a real remote category name.
+	 *
+	 * Normal customer-edited category names are never changed.
+	 *
+	 * @return array Repair summary.
+	 */
+	private static function repair_placeholder_category_titles_from_map() {
+		global $wpdb;
+
+		$result = array(
+			'checked'  => 0,
+			'repaired' => 0,
+			'skipped'  => 0,
+			'failed'   => 0,
+		);
+
+		if ( ! class_exists( 'Mobo_Core_Category_Map' ) || ! Mobo_Core_Category_Map::table_exists() ) {
+			return $result;
+		}
+
+		$table = Mobo_Core_Category_Map::table_name();
+		$rows  = $wpdb->get_results(
+			"SELECT remote_guid, synced_term_id, remote_name
+			FROM {$table}
+			WHERE synced_term_id > 0 AND remote_name <> ''
+			ORDER BY id ASC
+			LIMIT 1000",
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) ) {
+			return $result;
+		}
+
+		foreach ( $rows as $row ) {
+			$result['checked']++;
+
+			$guid        = trim( sanitize_text_field( isset( $row['remote_guid'] ) ? (string) $row['remote_guid'] : '' ) );
+			$term_id     = absint( isset( $row['synced_term_id'] ) ? $row['synced_term_id'] : 0 );
+			$remote_name = trim( sanitize_text_field( isset( $row['remote_name'] ) ? (string) $row['remote_name'] : '' ) );
+
+			if (
+				'' === $guid
+				|| $term_id <= 0
+				|| '' === $remote_name
+				|| 0 === strcasecmp( $remote_name, $guid )
+				|| 0 === strcasecmp( $remote_name, 'Mobo Category ' . $guid )
+				|| 1 === preg_match( '/^Mobo Category\s+[0-9a-f-]{16,}$/i', $remote_name )
+			) {
+				$result['skipped']++;
+				continue;
+			}
+
+			$term = get_term( $term_id, 'product_cat' );
+
+			if ( ! $term instanceof WP_Term || 0 !== strcasecmp( trim( (string) $term->name ), 'Mobo Category ' . $guid ) ) {
+				$result['skipped']++;
+				continue;
+			}
+
+			$updated = wp_update_term(
+				$term_id,
+				'product_cat',
+				array( 'name' => $remote_name )
+			);
+
+			if ( is_wp_error( $updated ) ) {
+				$result['failed']++;
+				continue;
+			}
+
+			$result['repaired']++;
+		}
+
+		return $result;
 	}
 
 

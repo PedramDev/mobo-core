@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.33.3` and Portal `v32 / .NET 10`**
+**Generated against Mobo Core `10.31.75` and Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,25 +14,21 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.33.3` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.75` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.33.3` |
+| `MOBO_CORE_VERSION` | `10.31.75` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
-| `MOBO_CORE_PURCHASE_URL` | `https://mobo.codeya.ir/` |
+| `MOBO_CORE_PURCHASE_URL` | `http://mobo.codeya.ir/` |
 | `MOBO_CORE_GITHUB_URL` | `https://github.com/PedramDev/mobo-core` |
 | `MOBO_API_BASE_URL` | آدرس API پیش فرض/قابل override |
 | `MOBO_CORE_DATA_DIR` | `wp-content/uploads/mobo-core/` |
 | `MOBO_CORE_WEBHOOK_FILE_DIR` | مسیر fallback فایل های وب هوک |
-| `MOBO_QUEUE_WORKER_ENABLED` | فعال‌سازی Worker اختصاصی CLI از `wp-config.php` |
-| `MOBO_QUEUE_WORKER_MAX_RUNTIME` | حداکثر زمان Process، پیش‌فرض ۵۰ ثانیه |
-| `MOBO_QUEUE_WORKER_IDLE_SLEEP` | فاصله بررسی Queue خالی، پیش‌فرض ۱۰ ثانیه |
-| `MOBO_QUEUE_WORKER_LOCK_PATH` | مسیر اختیاری فایل `flock` |
 
 ## 2. REST routeهای وردپرس
 
@@ -86,6 +82,8 @@ Base: `/wp-json/mobo-core/v1`
 | `mobo_core_allow_unsafe_local_image_download` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_api_base_url` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_calculated_price_pair` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
+| `mobo_core_cache_purge_urls` | افزودن URLهای listing سفارشی به purge هدفمند محصول. | Add custom listing URLs to targeted product purge. |
+| `mobo_core_cache_purge_home_enabled` | فعال یا غیرفعال کردن purge صفحه اصلی برای هر محصول. | Enable or disable homepage purge per product. |
 | `mobo_core_checkout_validation_errors` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_checkout_validation_external_response` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_checkout_validation_external_url` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
@@ -100,6 +98,8 @@ Base: `/wp-json/mobo-core/v1`
 - `mobo_core_http_sslverify`: کنترل certificate verification درخواست خروجی؛ خاموش کردن آن برای production توصیه نمی شود.
 - `mobo_core_allow_unsafe_local_image_download`: opt-in توسعه دهنده برای تست URLهای local/private تصویر.
 - `mobo_core_calculated_price_pair`: تغییر خروجی `regular_price` و `sale_price`.
+- `mobo_core_cache_purge_urls`: افزودن URL صفحات سفارشی که محصول را نمایش می دهند.
+- `mobo_core_cache_purge_home_enabled`: کنترل پاک سازی Home برای تغییرات محصول.
 - `mobo_core_checkout_validation_payload`: تغییر payload اعتبارسنجی خارجی.
 - `mobo_core_checkout_validation_errors`: افزودن یا تغییر خطاهای Checkout.
 - `mobo_core_local_city_candidates`: توسعه لیست شهرهای محلی برای mapping.
@@ -109,6 +109,7 @@ Base: `/wp-json/mobo-core/v1`
 
 Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متصل می شود:
 
+- `mobo_core_cache_purger_after_flush`
 - `add_meta_boxes`
 - `admin_enqueue_scripts`
 - `admin_init`
@@ -451,8 +452,8 @@ Public methods: **14** · Internal non-public methods: **8**
 ### `Mobo_Core_Category_Sync`
 
 Source: [`includes/class-mobo-core-category-sync.php`](includes/class-mobo-core-category-sync.php)  
-ساخت، بروزرسانی و assignment دسته بندی ها. / Creates, updates, and assigns WooCommerce product categories.  
-Public methods: **6** · Internal non-public methods: **12**
+ساخت، بروزرسانی و assignment دسته بندی ها با پشتیبانی از payload تو در تو و جلوگیری از عنوان GUID. / Creates, updates, and assigns WooCommerce product categories while handling nested payloads and preventing GUID placeholder titles.  
+Public methods: **6** · Internal non-public methods: **17**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -497,13 +498,14 @@ Public methods: **21** · Internal non-public methods: **91**
 
 Source: [`includes/class-mobo-core-cron-runner.php`](includes/class-mobo-core-cron-runner.php)  
 اجرای محدود عملیات افزونه مستقل از WP-Cron. / Runs bounded plugin work independently from WP-Cron.  
-Public methods: **3** · Internal non-public methods: **3**
+Public methods: **4** · Internal non-public methods: **15**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
-| `public function run($source = 'real-cron', $options = array())` | اجرای یک Slice معمولی یا یک Round منصفانه Worker CLI. | Run one bounded slice or fair CLI-worker round. |
-| `public static function build_cron_url()` | ساخت cron url در بخش اجرای محدود عملیات افزونه مستقل از WP-Cron. | Build a secure cron URL for the current site. |
-| `public static function get_status()` | دریافت status در بخش اجرای محدود عملیات افزونه مستقل از WP-Cron. | Get cron status for admin UI and central health checks. |
+| `public function run($source = 'real-cron')` | اجرای چنددوره‌ای و منصفانه صف‌ها تا بودجه امن، توقف پیشرفت، سقف دورها یا از دست رفتن lease؛ در صورت باقی‌ماندن کار قابل‌اجرا continuation غیرمسدودکننده dispatch می‌کند. | Drain runnable queues in repeated fair rounds within a safe budget and dispatch a non-blocking continuation when useful work remains. |
+| `public static function build_cron_url()` | ساخت URL امن Cron برای سایت فعلی. | Build a secure cron URL for the current site. |
+| `public static function get_status()` | دریافت وضعیت آخرین اجرا به همراه telemetry و وضعیت lease برای پنل مدیر. | Get the last cron result, runner telemetry, and current lease status for the admin UI. |
+| `public static function get_health_status()` | ساخت نمای token-free از نتیجه آخرین Runner، علت توقف، دورها، خطاها، continuation و heartbeat/expiry قفل برای گزارش سلامت. | Return token-free runner and lease telemetry for central health reporting. |
 
 ### `Mobo_Core_Health_Reporter`
 
@@ -638,34 +640,39 @@ Public methods: **13** · Internal non-public methods: **2**
 | `public function default_category_id()` | اجرای عملیات `default_category_id` در بخش دسترسی متمرکز به قواعد سازگاری قدیمی. | Get default category ID. |
 | `public function missing_variants_behavior()` | اجرای عملیات `missing_variants_behavior` در بخش دسترسی متمرکز به قواعد سازگاری قدیمی. | Missing variants behavior. |
 
-
-### `Mobo_Core_Queue_Worker_Lock`
-
-Source: [`includes/class-mobo-core-queue-worker-lock.php`](includes/class-mobo-core-queue-worker-lock.php)  
-قفل سیستم‌عامل و تنظیمات Runtime Worker اختصاصی CLI. / OS process lock and runtime constants for the dedicated CLI worker.  
-Public methods: **6**
-
-| Signature | توضیح فارسی | English summary |
-|---|---|---|
-| `public static function is_cli_worker_enabled()` | بررسی Constant فعال‌سازی Worker. | Whether dedicated CLI mode is enabled. |
-| `public static function max_runtime()` | دریافت Runtime محدودشده. | Resolve bounded runtime. |
-| `public static function idle_sleep()` | دریافت فاصله Idle. | Resolve idle sleep. |
-| `public static function path()` | ساخت مسیر Lock اختصاصی سایت. | Resolve the site-specific lock path. |
-| `public static function acquire()` | گرفتن `flock` انحصاری و Non-blocking. | Acquire a non-blocking exclusive OS lock. |
-| `public static function release($lock)` | آزادسازی Handle و Lock. | Release the OS lock. |
-
 ### `Mobo_Core_Lock`
 
 Source: [`includes/class-mobo-core-lock.php`](includes/class-mobo-core-lock.php)  
-قفل runtime مبتنی بر transient. / Transient-based runtime lock helper.  
-Public methods: **4** · Internal non-public methods: **1**
+قفل runtime اتمیک با lease دارای انقضا در جدول options. / Atomic option-backed runtime lease helper with embedded expiry.  
+Public methods: **7** · Internal non-public methods: **10**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
-| `public static function acquire($name, $ttl = 30)` | اجرای عملیات `acquire` در بخش قفل runtime مبتنی بر transient. | Acquire a named lock. |
-| `public static function release($name, $token)` | اجرای عملیات `release` در بخش قفل runtime مبتنی بر transient. | Release a named lock. |
+| `public static function acquire($name, $ttl = 30)` | دریافت اتمیک lease و بازیابی خودکار رکورد منقضی یا خراب. | Acquire an atomic named lease and recover expired or malformed rows. |
+| `public static function renew($name, $token, $ttl = 30)` | تمدید heartbeat و انقضای lease فقط با token مالک و compare-and-swap روی مقدار دقیق قبلی. | Renew an owned lease heartbeat/expiry using token validation and compare-and-swap. |
+| `public static function get_status($name)` | دریافت وضعیت غیرحساس lease شامل active، زمان دریافت، heartbeat، انقضا و زمان باقی‌مانده بدون افشای token. | Return token-free lease status with acquisition, heartbeat, expiry, and remaining time. |
+| `public static function release($name, $token)` | آزادسازی مالک محور با تطبیق token و مقدار دقیق رکورد. | Release an owned lease using token and exact-value checks. |
 | `public static function is_locked($name)` | بررسی فقط خواندنی فعال بودن قفل برای نمایش وضعیت و تشخیص batch در حال اجرا. | Check whether a named runtime lock currently exists. |
-| `public static function force_release($name)` | اجرای عملیات `force_release` در بخش قفل runtime مبتنی بر transient. | Force delete a lock. |
+| `public static function force_release($name)` | حذف اجباری lease فعلی و transient قدیمی همان نام. | Force delete the current and legacy lock for one name. |
+| `public static function force_release_all()` | پاکسازی تمام leaseها و transientهای قدیمی Mobo هنگام نصب یا ارتقا. | Remove all current and legacy Mobo runtime locks during activation or upgrade. |
+
+### `Mobo_Core_Cache_Purger`
+
+Source: [`includes/class-mobo-core-cache-purger.php`](includes/class-mobo-core-cache-purger.php)  
+پاک‌سازی هدفمند و تجمیعی Cache محصول بدون Purge All. / Batched targeted product cache invalidation without full-site purges.  
+Public methods: **9** · Internal non-public methods: **25**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function init()` | ثبت listenerهای ذخیره محصول، taxonomy و shutdown. | Register product, taxonomy, and deferred shutdown listeners. |
+| `public static function handle_product_saved($product_id, $product = null)` | صف کردن محصول یا Variation متصل به موبو پس از WooCommerce CRUD save. | Queue a Mobo-linked product or variation after CRUD save. |
+| `public static function handle_object_terms_set($object_id, $terms, $tt_ids, $taxonomy, $append = false, $old_tt_ids = array())` | حفظ URL دسته/برچسب قبلی و جدید و صف کردن محصول. | Preserve old/new term archive URLs and queue the product. |
+| `public static function handle_post_updated($post_id, $post_after, $post_before)` | حفظ permalink قبلی هنگام تغییر slug یا status. | Preserve the previous permalink when slug/status changes. |
+| `public static function snapshot_product($product_id, $reason = '')` | ثبت URLهای فعلی پیش از mutation مستقیم بدون درخواست purge. | Snapshot related URLs before a direct mutation. |
+| `public static function queue_product($product_id, $reason = '')` | صف deduplicate محصول/Parent و URLهای وابسته. | Queue a deduplicated product/parent and related URLs. |
+| `public static function queue_url($url, $reason = '')` | افزودن URL سفارشی به purge بعدی. | Add a custom URL to the next targeted purge. |
+| `public static function flush()` | پاک‌سازی هدفمند WordPress/WooCommerce و adapterهای Cache در shutdown. | Flush targeted core and page-cache integrations at shutdown. |
+| `public static function get_health_status()` | دریافت نتیجه ساختاری آخرین Purge برای REST، UI و گزارش سلامت مرکزی، بدون شناسه یا URL واقعی. | Return structured last-purge telemetry for REST, UI, and the central health report without exposing IDs or URLs. |
 
 ### `Mobo_Core_Dependencies`
 
@@ -707,13 +714,14 @@ Public methods: **2** · Internal non-public methods: **7**
 ### `Mobo_Core_Migration`
 
 Source: [`includes/class-mobo-core-migration.php`](includes/class-mobo-core-migration.php)  
-Migration گزینه ها، جدول ها و داده های legacy. / Migrates options, tables, and legacy data.  
-Public methods: **2** · Internal non-public methods: **17**
+Migration گزینه ها، جدول ها، lockها و داده های legacy. / Migrates options, tables, runtime locks, and legacy data.  
+Public methods: **3** · Internal non-public methods: **22**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function activate()` | اجرای عملیات `activate` در بخش Migration گزینه ها، جدول ها و داده های legacy. | Activation hook. |
 | `public static function maybe_run()` | اجرای شرطی run در بخش Migration گزینه ها، جدول ها و داده های legacy. | Run lightweight migrations if version changed. |
+| `public static function run_deferred_repairs()` | اجرای تعمیر یک باره عنوان placeholder پس از ثبت taxonomy ووکامرس. | Run deferred one-time repairs after WooCommerce taxonomies are registered. |
 
 ### `Mobo_Core_Orphan_Image_Cleanup`
 
@@ -922,7 +930,7 @@ Public methods: **5** · Internal non-public methods: **1**
 
 Source: [`includes/class-mobo-core-settings.php`](includes/class-mobo-core-settings.php)  
 تعریف و خواندن تنظیمات افزونه. / Defines, reads, and saves plugin settings.  
-Public methods: **5** · Internal non-public methods: **8**
+Public methods: **8** · Internal non-public methods: **8**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -930,7 +938,10 @@ Public methods: **5** · Internal non-public methods: **8**
 | `public static function get($key, $fallback = null)` | اجرای عملیات `get` در بخش تعریف و خواندن تنظیمات افزونه. | Get option. |
 | `public static function get_int($key, $default, $min, $max)` | خواندن option عددی و محدود کردن آن به بازه مجاز. | Get integer option with min/max clamp. |
 | `public static function enabled($key, $default = '0')` | خواندن یک option بولی با مقدار پیش فرض. | Get boolean-like option. |
-| `public static function save_from_post($post)` | فقط License Key / Token و Webhook Security Code را می‌پذیرد؛ سایر تنظیمات از Portal مدیریت می‌شوند. | Accept only bootstrap license and webhook security credentials. |
+| `public static function normalize_security_code($code)` | نرمال‌سازی secret بدون تغییر نمادهای معتبر ASCII. | Normalize an opaque security code without mutating valid punctuation. |
+| `public static function is_valid_security_code($code)` | اعتبارسنجی visible ASCII بدون فاصله برای Header امنیتی. | Validate a visible-ASCII security code for HTTP header transport. |
+| `public static function get_security_code_validation_error($code)` | برگرداندن پیام دقیق خطای اعتبارسنجی کد امنیتی. | Return a specific security-code validation error. |
+| `public static function save_from_post($post)` | ذخیره from post در بخش تعریف و خواندن تنظیمات افزونه. | Save settings from admin post. |
 
 ### `Mobo_Core_Shipping_Diagnostics`
 
@@ -1014,14 +1025,14 @@ Public methods: **4** · Internal non-public methods: **31**
 | `public function store($payload)` | اجرای عملیات `store` در بخش پذیرش و پردازش صف وب هوک با fallback فایل. | Store webhook payload as a file. |
 | `public function get_status()` | دریافت status در بخش پذیرش و پردازش صف وب هوک با fallback فایل. | Return lightweight queue status. |
 | `public function has_due_work()` | بررسی وجود due work در بخش پذیرش و پردازش صف وب هوک با fallback فایل. | Whether there is due work that can run now. |
-| `public function process()` | اجرای عملیات `process` در بخش پذیرش و پردازش صف وب هوک با fallback فایل. | Process webhook queue. |
+| `public function process($time_budget = null, $max_items = null)` | پردازش صف وب هوک با امکان override محدود بودجه و تعداد آیتم برای سهم هر دور Cron. | Process the webhook queue with bounded per-round time and item overrides. |
 ---
 
 <a id="en"></a>
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.33.3`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.31.75`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 
@@ -1068,22 +1079,3 @@ The detailed class tables intentionally combine Persian and English descriptions
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
-
-
-### `Mobo_Core_Shared_Media`
-
-Hidden `wp-config.php`-only shared media bridge. Public surface:
-
-- `init()`
-- `enabled()`
-- `downloads_enabled()`
-- `import_attachment( $image_guid, $source_url, $product_id )`
-- `refresh_attachment( $attachment_id, $image_guid, $source_url = '' )`
-- `get_last_error()`
-- `filter_attachment_url( $url, $attachment_id )`
-- `filter_attached_file( $file, $attachment_id )`
-- `filter_intermediate_sizes( $sizes, $image_meta, $attachment_id )`
-- `filter_big_image_threshold( $threshold, $imagesize, $file, $attachment_id )`
-- `protect_attachment_metadata( $data, $attachment_id )`
-- `protect_shared_file_from_delete( $file )`
-- `is_shared_attachment( $attachment_id )`

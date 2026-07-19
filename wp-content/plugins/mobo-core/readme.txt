@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.3
+Stable tag: 10.31.75
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -23,8 +23,8 @@ Required plugins: WooCommerce and Persian WooCommerce (`persian-woocommerce`). M
 
 Main features:
 
-* Centrally managed, RSA-signed configuration with immutable revisions and a Last Known Good cache that ignores direct database edits after binding.
 * Step-based product, variation, category, price, and image synchronization.
+* Targeted WooCommerce object-cache and page-cache invalidation for updated Mobo products, including LiteSpeed Cache and WP Rocket integrations without Purge All.
 * Queue-based webhook processing to avoid timeout in WordPress requests.
 * Shipping method mapping between WooCommerce shipping zones/methods and Mobo shipping methods.
 * Separate shipping mapping for Mobo-only orders and mixed Mobo/non-Mobo orders.
@@ -36,7 +36,7 @@ Main features:
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
 
-https://mobo.codeya.ir/
+http://mobo.codeya.ir/
 
 Sales and activation contact:
 
@@ -76,26 +76,25 @@ After the site administrator enters a Token, Mobo Core can communicate with the 
 
 Service website:
 
-https://mobo.codeya.ir/
+http://mobo.codeya.ir/
 
 Terms of Service:
 
-https://mobo.codeya.ir/terms
+http://mobo.codeya.ir/terms
 
 Privacy Policy:
 
-https://mobo.codeya.ir/privacy
+http://mobo.codeya.ir/privacy
 
 == Installation ==
 
 1. Upload the `mobo-core` folder to `/wp-content/plugins/`, or install the plugin through the WordPress plugins screen.
 2. Install and activate both WooCommerce and Persian WooCommerce (`persian-woocommerce`).
 3. Activate Mobo Core through the Plugins screen in WordPress.
-4. Open **Mobo > لایسنس و امنیت** and enter only the License Key / Token and Webhook Security Code.
-5. Configure every business setting in the .NET Portal; WordPress does not expose local product, pricing, category, queue, image, checkout, shipping, or SMS setting forms.
-6. Open **Mobo > تنظیمات مرکزی** only for read-only signed-cache diagnostics and manual refresh.
-7. Configure the CLI queue-worker constants and cPanel cron as documented.
-8. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
+4. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
+5. Go to **Mobo > اتصال** and enter the Token and Webhook Security Code from MoboCore.
+6. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
+7. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
 
 == Frequently Asked Questions ==
 
@@ -130,43 +129,66 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 == Screenshots ==
 
 1. Mobo Core dashboard and sync status.
-2. License and webhook security screen.
-3. Read-only signed configuration diagnostics.
-4. Health and queue diagnostics.
-5. WooCommerce product last-Mobo-change column.
+2. Purchase and activation screen.
+3. Connection and license information.
+4. WooCommerce to Mobo shipping method mapping.
+5. Queue, cron, and image refresh settings.
+
+
+= Does product synchronization clear page caches? =
+
+Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
 
-= 10.33.3 =
-* Removed all local business-configuration forms and menu entries; product, pricing, category, queue, image, checkout, shipping and SMS settings are controlled only by signed Portal .NET configuration.
-* Whitelisted only License Key / Token and Webhook Security Code for secure local updates, including server-side rejection of legacy settings POST requests.
-* Rebuilt the license panel with a compact status, plan, remaining days, expiry, domain and suspension display.
-* Converted the Health screen to fully read-only output; its interval and timeout now display values received from the signed Portal configuration.
+= 10.31.75 =
+* Real Cron now drains webhook, image, image-refresh, product-sync, reprice, recategorize, and queued-order work in repeated fair rounds within one safe runtime slice.
+* Added configurable round limits and PHP execution safety margin; product-sync step count is now the per-round share rather than the whole-run queue ceiling.
+* Replaced fixed runner ownership with a finite atomic token lease renewed by heartbeat before every major stage.
+* Concurrent cron invocations exit safely as locked, while crashed/killed workers stop renewing and their leases expire automatically.
+* The effective lock TTL automatically expands for the runtime budget and longest blocking network timeout, remains capped, and is never permanent.
+* A runner that loses lease ownership stops protected work immediately.
+* Queue-stage exceptions are isolated and reported while independent queues continue in the same slice.
+* Direct cPanel/REST cron runs now dispatch a non-blocking continuation when progress was made and immediately runnable work remains.
+* Added token-free `cronRunner` telemetry to health reports and the local cron status UI, including rounds, stop reason, elapsed time, lock heartbeat/expiry, renewals, failed stages, queue passes, and continuation state.
 
-= 10.33.2 =
-* Added an "آخرین تغییر موبو" column to the WooCommerce products table.
-* Records exact Mobo-originated product changes from product, variant, price, category, image sync, and image refresh processes.
-* Shows a clearly marked approximate fallback date for legacy Mobo products until their next exact Mobo update.
+= 10.31.74 =
+* Added structured targeted-cache purge telemetry to the health report under `cachePurge`.
+* Reports the last purge status, Mobo Core version, attempt/success times, duration, affected product/object/URL counts, consecutive failures, and bounded last error.
+* Reports per-integration detection, tested/current version, version changes since the last test, duration, and `success`, `failed`, `not_detected`, or `not_tested` status.
+* Cache integration exceptions remain non-blocking for product synchronization and are also logged with Mobo Core and cache-plugin versions.
+* Added the same cache-purge health details to the local Mobo health administration screen and REST health response.
 
-= 10.33.1 =
-* Added a CLI-only cPanel queue worker that stays alive for a bounded 50-second window and rechecks idle queues every 10 seconds.
-* Added a non-blocking flock process lock, fair rotating queue order, microtime deadline checks, and structured CLI logging.
-* Disabled loopback Self Runner, REST queue execution, synchronous webhook processing, and WP-Cron order queue processing when the dedicated CLI worker is enabled.
+= 10.31.73 =
+* Added a central deferred cache purger for Mobo-linked WooCommerce products and variations.
+* Deduplicates repeated saves during one sync/worker request and performs one targeted purge at shutdown.
+* Clears WooCommerce product transients and targeted WordPress post/object cache entries without flushing the complete persistent object cache.
+* Purges the product page, current and removed product category/tag archives, Shop, and Home through LiteSpeed Cache and WP Rocket targeted APIs.
+* Added targeted adapters for W3 Total Cache and WP Super Cache when their per-post/per-URL APIs are available.
+* Prevented full-site purge calls such as `wp_cache_flush()`, `rocket_clean_domain()`, and `litespeed_purge_all`.
+* Added `mobo_core_cache_purge_urls`, `mobo_core_cache_purge_home_enabled`, and `mobo_core_cache_purger_after_flush` extension points for custom listing pages and cache integrations.
 
-= 10.33.0 =
-* Fixed GUID-only WooCommerce categories named `Mobo Category <GUID>`.
-* Product webhooks now carry category title, URL and parent identity.
-* GUID-only category references no longer create customer-facing placeholders.
-* Existing exact Mobo placeholders are repaired on the next full category synchronization without renaming customer-managed categories.
+= 10.31.72 =
+* Corrected Webhook Security Code validation from alphanumeric-only to visible ASCII suitable for the `X-SEC` HTTP header.
+* Symbols such as `@`, `#`, `$`, `%`, `&`, `*`, `_`, `[`, `]` and `-` are accepted; whitespace, control characters, Persian text, emoji and other Unicode remain rejected.
+* Invalid security codes are blocked before saving and the previous stored value remains unchanged.
+* Added browser-side validation, clearer diagnostics, and runtime guards for API pulls, health reports, checkout validation and inbound REST authentication.
+* Security codes are stored as opaque secrets without `sanitize_text_field()` mutation, preventing valid percent-like sequences from being altered.
 
-= 10.32.0 =
-* Moved managed Mobo settings to immutable revisions in the .NET Portal.
-* Added RSA-SHA256 signed configuration envelopes bound to installation and domain.
-* Added atomic current/previous Last Known Good caches and fail-closed behavior after binding.
-* Moved bootstrap connection credentials out of `wp_options` into a private mode-0600 file after first bind.
-* Added immediate ConfigurationChanged pull with webhook retry on refresh failure and periodic recovery polling.
-* Converted WordPress settings to read-only diagnostics after remote enforcement.
-* Kept runtime queues, locks, cursors, timestamps, and logs local.
+= 10.31.71 =
+* Replaced transient runtime locks with atomic database leases that store token and expiry in one non-autoloaded option row.
+* Expired or malformed locks are recovered automatically, and the real cron lock is also released through a token-safe shutdown callback.
+* Plugin activation and upgrade now remove all legacy Mobo lock transients, including stale value rows that have no timeout row.
+* Category sync no longer creates visible WooCommerce categories named `Mobo Category <GUID>` when the remote title is missing.
+* Added support for category titles and metadata wrapped inside nested `category` payloads.
+* Existing generated placeholder category names are repaired only when a real remote name is available; customer-edited category names remain untouched.
+
+= 10.31.70 =
+* Added one authoritative image-refresh command center at the top of the tab instead of relying on scattered status boxes.
+* Clearly distinguishes an actively running batch, an enabled workflow waiting for the next runner, a stalled workflow, a paused workflow, approval gates, terminal errors, and a completed cycle.
+* Added current-stage progress, estimated whole-cycle progress, a nine-stage timeline, last real worker activity, Cron/Self Runner heartbeat, and the last batch summary.
+* Added tick start/finish diagnostics and runtime-lock visibility so timeout or abandoned batch conditions are visible to the administrator.
+* Clarified that the live AJAX timestamp is only the time the page display was refreshed, not proof that the background worker ran.
 
 = 10.31.69 =
 * Added automatic live status refresh to the image-refresh tab without reloading the WordPress admin page.
@@ -335,8 +357,28 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 == Upgrade Notice ==
 
-= 10.32.0 =
-Deploy the matching Portal release and signing key first. Then update the plugin, open Mobo > Central Settings, and confirm a valid signed revision before changing operational features.
+= 10.31.75 =
+Queue-heavy sites now keep draining work in fair rounds during each safe cron slice and chain a local continuation when useful work remains. The runner uses a finite renewable lease: concurrent invocations exit safely, and a crashed process cannot leave a permanent lock because the lease expires automatically.
+
+
+= 10.31.74 =
+* Added structured targeted-cache purge telemetry to the health report under `cachePurge`.
+* Reports the last purge status, Mobo Core version, attempt/success times, duration, affected product/object/URL counts, consecutive failures, and bounded last error.
+* Reports per-integration detection, tested/current version, version changes since the last test, duration, and `success`, `failed`, `not_detected`, or `not_tested` status.
+* Cache integration exceptions remain non-blocking for product synchronization and are also logged with Mobo Core and cache-plugin versions.
+* Added the same cache-purge health details to the local Mobo health administration screen and REST health response.
+
+= 10.31.73 =
+Product and variation updates now perform a deferred targeted cache purge for WooCommerce/WordPress object caches and supported page-cache plugins. No full-site cache purge is performed. Add custom Elementor or block-listing URLs with the `mobo_core_cache_purge_urls` filter when needed.
+
+= 10.31.72 =
+Webhook security codes may contain printable ASCII symbols but must not contain spaces, Persian characters, emoji or other Unicode. Invalid existing values are reported and must be replaced with the exact ASCII value configured in Portal.
+
+= 10.31.71 =
+The upgrade automatically clears legacy Mobo runtime locks. Category placeholders are no longer created, and old generated placeholders are repaired when their real remote names are available.
+
+= 10.31.70 =
+The image-refresh tab now starts with a single command center that states whether work is actually running, merely enabled, stalled, paused, waiting for approval, failed, or completed. Review this panel first after upgrade.
 
 = 10.31.69 =
 The image-refresh dashboard now updates itself while it remains open. Unsaved settings are protected: automatic refresh pauses as soon as a field is edited and resumes after the normal page reload following save.

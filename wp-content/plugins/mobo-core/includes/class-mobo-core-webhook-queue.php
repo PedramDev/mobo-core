@@ -145,13 +145,24 @@ class Mobo_Core_Webhook_Queue {
 	/**
 	 * Process webhook queue.
 	 *
+	 * @param int|null $time_budget Optional bounded time budget override.
+	 * @param int|null $max_items Optional item limit override.
 	 * @return array
 	 */
-	public function process() {
+	public function process( $time_budget = null, $max_items = null ) {
 		$this->ensure_dirs();
 		update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
 
-		$lock = Mobo_Core_Lock::acquire( 'webhook_queue', 30 );
+		$configured_budget = null === $time_budget
+			? Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 )
+			: max( 1, min( 25, absint( $time_budget ) ) );
+		$request_timeout = max(
+			15,
+			Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 ),
+			Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 )
+		);
+		$lock_ttl = min( 300, max( 30, $configured_budget + 15, $request_timeout + 30 ) );
+		$lock = Mobo_Core_Lock::acquire( 'webhook_queue', $lock_ttl );
 
 		if ( false === $lock ) {
 			$result = array(
@@ -168,7 +179,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		try {
-			$result = $this->process_locked();
+			$result = $this->process_locked( $configured_budget, $max_items );
 		} finally {
 			Mobo_Core_Lock::release( 'webhook_queue', $lock );
 		}
@@ -318,12 +329,18 @@ class Mobo_Core_Webhook_Queue {
 	/**
 	 * Process queue while lock is held.
 	 *
+	 * @param int|null $time_budget Optional bounded time budget override.
+	 * @param int|null $max_items Optional item limit override.
 	 * @return array
 	 */
-	private function process_locked() {
+	private function process_locked( $time_budget = null, $max_items = null ) {
 		$started_at = time();
-		$budget     = Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 );
-		$max_files  = Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 );
+		$budget     = null === $time_budget
+			? Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 )
+			: max( 1, min( 25, absint( $time_budget ) ) );
+		$max_files  = null === $max_items
+			? Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 )
+			: max( 1, min( 10, absint( $max_items ) ) );
 
 		$processed = 0;
 		$failed    = 0;

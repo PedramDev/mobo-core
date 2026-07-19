@@ -71,6 +71,8 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_real_cron_last_result' );
 	delete_option( 'mobo_core_real_cron_time_budget_seconds' );
 	delete_option( 'mobo_core_real_cron_max_sync_steps' );
+	delete_option( 'mobo_core_real_cron_max_rounds' );
+	delete_option( 'mobo_core_real_cron_safety_margin_seconds' );
 	delete_option( 'mobo_core_real_cron_lock_ttl_seconds' );
 	delete_option( 'mobo_core_real_cron_expected_interval_seconds' );
 	delete_option( 'mobo_core_real_cron_process_webhooks' );
@@ -92,6 +94,12 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_started_at' );
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_finished_at' );
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_source' );
+	delete_option( 'mobo_core_103171_lock_cleanup_result' );
+	delete_option( 'mobo_core_103171_lock_cleanup_at' );
+	delete_option( 'mobo_core_category_placeholder_repair_pending' );
+	delete_option( 'mobo_core_category_placeholder_repair_result' );
+	delete_option( 'mobo_core_category_placeholder_repair_at' );
+	delete_option( 'mobo_core_cache_purge_last_result' );
 	delete_transient( 'mobo_core_pw_options_enforced_notice' );
 
 	/*
@@ -148,14 +156,16 @@ function mobo_core_uninstall_runtime_state() {
 	}
 
 	/*
-	 * Remove transient locks.
+	 * Remove current atomic runtime locks and legacy transient locks.
 	 */
-	$lock_prefix    = $wpdb->esc_like( '_transient_mobo_core_lock_' ) . '%';
-	$timeout_prefix = $wpdb->esc_like( '_transient_timeout_mobo_core_lock_' ) . '%';
+	$current_lock_prefix = $wpdb->esc_like( 'mobo_core_runtime_lock_' ) . '%';
+	$lock_prefix         = $wpdb->esc_like( '_transient_mobo_core_lock_' ) . '%';
+	$timeout_prefix      = $wpdb->esc_like( '_transient_timeout_mobo_core_lock_' ) . '%';
 
 	$transient_names = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s",
+			$current_lock_prefix,
 			$lock_prefix,
 			$timeout_prefix
 		)

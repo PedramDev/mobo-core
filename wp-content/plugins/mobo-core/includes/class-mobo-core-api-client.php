@@ -315,10 +315,17 @@ class Mobo_Core_API_Client {
 			'Accept' => 'application/json',
 		);
 
-		$security_code = (string) Mobo_Core_Settings::get( 'mobo_core_security_code', '' );
+		$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
 
-		if ( '' !== trim( $security_code ) ) {
-			$headers['X-SEC'] = trim( $security_code );
+		if ( '' !== $security_code ) {
+			if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
+				return new WP_Error(
+					'mobo_core_invalid_security_code',
+					Mobo_Core_Settings::get_security_code_validation_error( $security_code )
+				);
+			}
+
+			$headers['X-SEC'] = $security_code;
 		}
 
 		$token = (string) Mobo_Core_Settings::get( 'mobo_core_token', '' );

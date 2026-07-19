@@ -669,14 +669,6 @@ class Mobo_Core_Image_Queue {
 			return false;
 		}
 
-		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::enabled() ) {
-			if ( ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
-				return false;
-			}
-			$image_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
-			return Mobo_Core_Shared_Media::refresh_attachment( $attachment_id, $image_guid, $url ) > 0;
-		}
-
 		if ( $this->is_webp_url( $url ) ) {
 			return $this->is_attachment_webp( $attachment_id );
 		}
