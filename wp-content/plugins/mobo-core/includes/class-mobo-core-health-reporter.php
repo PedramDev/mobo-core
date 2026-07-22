@@ -66,13 +66,13 @@ class Mobo_Core_Health_Reporter {
 			'cachePlugins'          => $cache['cache_plugins'],
 			'cachePurge'            => $cache_purge,
 
-			'phpMemoryLimitRaw'     => (string) ini_get( 'memory_limit' ),
-			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( (string) ini_get( 'memory_limit' ) ),
-			'phpMemoryUsageBytes'   => memory_get_usage( true ),
-			'phpMemoryPeakUsageBytes'=> memory_get_peak_usage( true ),
-			'phpMaxExecutionTime'   => absint( ini_get( 'max_execution_time' ) ),
-			'phpUploadMaxFilesize'  => (string) ini_get( 'upload_max_filesize' ),
-			'phpPostMaxSize'        => (string) ini_get( 'post_max_size' ),
+			'phpMemoryLimitRaw'     => $this->safe_ini_get( 'memory_limit' ),
+			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( $this->safe_ini_get( 'memory_limit' ) ),
+			'phpMemoryUsageBytes'   => function_exists( 'memory_get_usage' ) ? memory_get_usage( true ) : null,
+			'phpMemoryPeakUsageBytes'=> function_exists( 'memory_get_peak_usage' ) ? memory_get_peak_usage( true ) : null,
+			'phpMaxExecutionTime'   => absint( $this->safe_ini_get( 'max_execution_time' ) ),
+			'phpUploadMaxFilesize'  => $this->safe_ini_get( 'upload_max_filesize' ),
+			'phpPostMaxSize'        => $this->safe_ini_get( 'post_max_size' ),
 			'wpMemoryLimitRaw'      => $wp_memory['wp_memory_limit_raw'],
 			'wpMemoryLimitBytes'    => $wp_memory['wp_memory_limit_bytes'],
 			'wpMaxMemoryLimitRaw'   => $wp_memory['wp_max_memory_limit_raw'],
@@ -100,6 +100,11 @@ class Mobo_Core_Health_Reporter {
 			'wpCronDisabled'         => defined( 'DISABLE_WP_CRON' ) && true === DISABLE_WP_CRON,
 			'imageProcessing'        => $this->get_image_processing_stats(),
 			'phpInfoSummary'         => $this->get_php_info_summary(),
+			'phpCapabilities'        => class_exists( 'Mobo_Core_Php_Capabilities' ) ? Mobo_Core_Php_Capabilities::get_report( true, false ) : array(),
+			'runtimeProbe'           => class_exists( 'Mobo_Core_Php_Capabilities' ) ? Mobo_Core_Php_Capabilities::get_runtime_probe_status() : array(),
+			'pluginUpdate'           => class_exists( 'Mobo_Core_Auto_Updater' ) ? Mobo_Core_Auto_Updater::get_status() : array(),
+			'syncRecoveryAck'        => class_exists( 'Mobo_Core_Sync_Recovery_Ack' ) ? Mobo_Core_Sync_Recovery_Ack::get_status() : array(),
+			'syncVersionLedger'     => class_exists( 'Mobo_Core_Sync_Version_Ledger' ) ? Mobo_Core_Sync_Version_Ledger::get_status() : array(),
 
 			'lastError'             => $last_error,
 		);
@@ -283,18 +288,28 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	private function get_php_info_summary() {
-		$extensions = get_loaded_extensions();
-		sort( $extensions, SORT_NATURAL | SORT_FLAG_CASE );
+		$extensions = function_exists( 'get_loaded_extensions' ) ? get_loaded_extensions() : array();
+		if ( is_array( $extensions ) ) {
+			sort( $extensions, SORT_NATURAL | SORT_FLAG_CASE );
+		} else {
+			$extensions = array();
+		}
+
+		$ini_file = '';
+		if ( function_exists( 'php_ini_loaded_file' ) ) {
+			$loaded = php_ini_loaded_file();
+			$ini_file = false === $loaded ? '' : (string) $loaded;
+		}
 
 		return array(
 			'sapi'               => PHP_SAPI,
-			'os'                 => PHP_OS_FAMILY,
-			'iniFile'            => (string) php_ini_loaded_file(),
-			'memoryLimit'        => (string) ini_get( 'memory_limit' ),
-			'maxExecutionTime'   => (string) ini_get( 'max_execution_time' ),
-			'maxInputVars'       => (string) ini_get( 'max_input_vars' ),
-			'postMaxSize'        => (string) ini_get( 'post_max_size' ),
-			'uploadMaxFilesize'  => (string) ini_get( 'upload_max_filesize' ),
+			'os'                 => defined( 'PHP_OS_FAMILY' ) ? PHP_OS_FAMILY : PHP_OS,
+			'iniFile'            => $ini_file,
+			'memoryLimit'        => $this->safe_ini_get( 'memory_limit' ),
+			'maxExecutionTime'   => $this->safe_ini_get( 'max_execution_time' ),
+			'maxInputVars'       => $this->safe_ini_get( 'max_input_vars' ),
+			'postMaxSize'        => $this->safe_ini_get( 'post_max_size' ),
+			'uploadMaxFilesize'  => $this->safe_ini_get( 'upload_max_filesize' ),
 			'extensions'         => array_values( $extensions ),
 		);
 	}
@@ -457,7 +472,7 @@ class Mobo_Core_Health_Reporter {
 	 */
 	private function get_log_stats() {
 		$debug_path = $this->resolve_debug_log_path();
-		$error_path = (string) ini_get( 'error_log' );
+		$error_path = $this->safe_ini_get( 'error_log' );
 
 		return array(
 			'debug_log_path'          => $debug_path,
@@ -578,6 +593,21 @@ class Mobo_Core_Health_Reporter {
 	 * @param string $value Size string.
 	 * @return int|null
 	 */
+	/**
+	 * Safely read a PHP ini value when ini_get is disabled by hosting.
+	 *
+	 * @param string $name Directive name.
+	 * @return string
+	 */
+	private function safe_ini_get( $name ) {
+		if ( ! function_exists( 'ini_get' ) ) {
+			return '';
+		}
+
+		$value = ini_get( (string) $name );
+		return false === $value ? '' : (string) $value;
+	}
+
 	private function parse_size_to_bytes( $value ) {
 		$value = trim( (string) $value );
 

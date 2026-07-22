@@ -310,6 +310,8 @@ class Mobo_Core_Sync_Event_Store {
 		return array(
 			'id'            => isset( $row['event_uuid'] ) ? sanitize_text_field( (string) $row['event_uuid'] ) : '',
 			'remoteEventId' => isset( $row['remote_event_id'] ) ? sanitize_text_field( (string) $row['remote_event_id'] ) : '',
+			'portalEventId' => isset( $payload['_moboPortalEventId'] ) ? sanitize_text_field( (string) $payload['_moboPortalEventId'] ) : '',
+			'eventVersion'  => isset( $row['event_version'] ) ? sanitize_text_field( (string) $row['event_version'] ) : '',
 			'event'         => isset( $row['event_type'] ) ? sanitize_text_field( (string) $row['event_type'] ) : '',
 			'syncId'        => isset( $row['sync_id'] ) ? sanitize_text_field( (string) $row['sync_id'] ) : '',
 			'try'       => isset( $row['try_count'] ) ? absint( $row['try_count'] ) : 0,
@@ -916,30 +918,68 @@ class Mobo_Core_Sync_Event_Store {
 			$payload['syncId'] = $sync_id;
 		}
 
+		$portal_event_id = $this->first_non_empty(
+			array(
+				$this->get_value( $raw, 'eventId', '' ),
+				$this->get_value( $raw, 'event_id', '' ),
+				$this->get_value( $raw, 'id', '' ),
+				$this->get_value( $raw, 'webhookId', '' ),
+				$this->get_value( $raw, 'WebhookId', '' ),
+			)
+		);
+		$entity_version = $this->first_non_empty(
+			array(
+				$this->get_value( $raw, 'version', '' ),
+				$this->get_value( $raw, 'Version', '' ),
+				$this->get_value( $raw, 'entityVersion', '' ),
+				$this->get_value( $payload, 'componentVersion', '' ),
+			)
+		);
+		$aggregate_version = $this->first_non_empty(
+			array(
+				$this->get_value( $raw, 'aggregateVersion', '' ),
+				$this->get_value( $payload, 'aggregateVersion', '' ),
+			)
+		);
+		$delivery_component = $this->first_non_empty(
+			array(
+				$this->get_value( $raw, 'deliveryComponent', '' ),
+				$this->get_value( $payload, 'deliveryComponent', '' ),
+			)
+		);
+		$delivery_kind = $this->first_non_empty(
+			array(
+				$this->get_value( $raw, 'deliveryKind', '' ),
+				$this->get_value( $payload, 'deliveryKind', '' ),
+			)
+		);
+
+		if ( '' !== $portal_event_id ) {
+			$payload['_moboPortalEventId'] = sanitize_text_field( $portal_event_id );
+		}
+		if ( '' !== $entity_version ) {
+			$payload['_moboEntityVersion'] = sanitize_text_field( $entity_version );
+		}
+		if ( '' !== $aggregate_version ) {
+			$payload['_moboAggregateVersion'] = sanitize_text_field( $aggregate_version );
+		}
+		if ( '' !== $delivery_component ) {
+			$payload['_moboDeliveryComponent'] = sanitize_key( $delivery_component );
+		}
+		if ( '' !== $delivery_kind ) {
+			$payload['_moboDeliveryKind'] = sanitize_key( $delivery_kind );
+		}
+
 		$entity = $this->extract_entity( $event_type, $payload );
 
 		return array(
 			'eventType'     => $event_type,
 			'payload'       => $payload,
-			'remoteEventId' => $this->first_non_empty(
-				array(
-					$this->get_value( $raw, 'eventId', '' ),
-					$this->get_value( $raw, 'event_id', '' ),
-					$this->get_value( $raw, 'id', '' ),
-					$this->get_value( $raw, 'webhookId', '' ),
-					$this->get_value( $raw, 'WebhookId', '' ),
-				)
-			),
+			'remoteEventId' => $portal_event_id,
 			'entityType'    => $entity['type'],
 			'entityGuid'    => $entity['guid'],
 			'syncId'        => $sync_id,
-			'version'       => $this->first_non_empty(
-				array(
-					$this->get_value( $raw, 'version', '' ),
-					$this->get_value( $raw, 'Version', '' ),
-					$this->get_value( $raw, 'entityVersion', '' ),
-				)
-			),
+			'version'       => $entity_version,
 		);
 	}
 
@@ -969,7 +1009,7 @@ class Mobo_Core_Sync_Event_Store {
 					$guid = $product_guid;
 				}
 			}
-		} elseif ( 'ShippingMethodsChanged' === $event_type || 'WebhookDeliveryStatusChanged' === $event_type ) {
+		} elseif ( 'ShippingMethodsChanged' === $event_type || 'WebhookDeliveryStatusChanged' === $event_type || 'PluginUpdateRequested' === $event_type ) {
 			return array(
 				'entityType' => 'system',
 				'entityGuid' => null,
@@ -1044,6 +1084,7 @@ class Mobo_Core_Sync_Event_Store {
 			4 => 'UpdateVariant',
 			20 => 'ShippingMethodsChanged',
 			21 => 'WebhookDeliveryStatusChanged',
+			23 => 'PluginUpdateRequested',
 		);
 
 		return isset( $map[ $type ] ) ? $map[ $type ] : '';

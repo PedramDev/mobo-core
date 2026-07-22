@@ -108,6 +108,36 @@ class Mobo_Core_Rest_Controller {
 
 		register_rest_route(
 			'mobo-core/v1',
+			'/update/apply',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'apply_plugin_update' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/update/run',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'run_plugin_update' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/update/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_plugin_update_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
 			'/webhook',
 			array(
 				'methods'             => 'POST',
@@ -268,6 +298,38 @@ class Mobo_Core_Rest_Controller {
 		$result       = $product_sync->ensure_categories_synced_if_due( $sync_id, $force );
 
 		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Accept a Portal-signed plugin update command.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function apply_plugin_update( $request ) {
+		$payload = $request->get_json_params();
+		$result  = Mobo_Core_Auto_Updater::accept_command( is_array( $payload ) ? $payload : array() );
+		return is_wp_error( $result ) ? $result : rest_ensure_response( $result );
+	}
+
+	/**
+	 * Execute an already accepted update command.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function run_plugin_update( $request ) {
+		return rest_ensure_response( Mobo_Core_Auto_Updater::run_pending( 'portal-loopback' ) );
+	}
+
+	/**
+	 * Return secret-free remote update state.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_plugin_update_status( $request ) {
+		return rest_ensure_response( Mobo_Core_Auto_Updater::get_status() );
 	}
 
 	/**

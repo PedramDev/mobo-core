@@ -1257,7 +1257,12 @@ class Mobo_Core_Product_Sync {
 			$expected_variant_total = absint( $this->get_value( $payload, 'totalCount', 0 ) );
 			$seen_variant_count     = $this->count_seen_variants( $product_guid, $sync_id );
 
-			if ( $expected_variant_total > 0 && $seen_variant_count >= $expected_variant_total ) {
+			if ( ( 0 === $expected_variant_total && 0 === $seen_variant_count ) || ( $expected_variant_total > 0 && $seen_variant_count >= $expected_variant_total ) ) {
+				/*
+				 * An authoritative empty snapshot is meaningful: all previously known
+				 * variants are now missing and must follow the configured missing-variant
+				 * behavior. Delta webhooks never reach this branch.
+				 */
 				$this->finalize_missing_variants( $product, $product_guid, $sync_id );
 			} else {
 				update_post_meta( $product_id, '_mobo_missing_variants_finalize_skipped_at', gmdate( 'c' ) );

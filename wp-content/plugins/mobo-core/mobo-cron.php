@@ -9,6 +9,24 @@
  */
 
 /**
+ * Record that the host scheduler reached PHP CLI before WordPress bootstrap.
+ * This distinguishes a broken scheduler/command from a later WordPress fatal.
+ */
+function mobo_core_cron_write_bootstrap_marker() {
+	if ( 'cli' !== PHP_SAPI ) {
+		return;
+	}
+	$target = dirname( dirname( __DIR__ ) ) . '/mobo-core-cron-bootstrap.json';
+	$payload = json_encode( array( 'at' => time(), 'sapi' => PHP_SAPI, 'php' => PHP_VERSION ) );
+	if ( is_string( $payload ) ) {
+		@file_put_contents( $target . '.tmp', $payload, LOCK_EX );
+		@rename( $target . '.tmp', $target );
+	}
+}
+
+mobo_core_cron_write_bootstrap_marker();
+
+/**
  * Locate and load WordPress when this script is invoked directly by PHP CLI.
  *
  * @return void

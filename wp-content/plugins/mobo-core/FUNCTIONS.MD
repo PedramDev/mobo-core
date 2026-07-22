@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Generated against Mobo Core `10.31.75` and Portal `v25 / .NET 10`**
+**Generated against Mobo Core `10.31.81` and Portal `v39 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -14,13 +14,13 @@
 
 # مرجع فارسی
 
-این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.75` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
+این فایل مرجع توسعه دهنده افزونه است. امضای متدهای public مستقیماً از سورس نسخه `10.31.81` استخراج شده است. متدهای `private` و `protected` جزو قرارداد پایدار افزونه نیستند و فقط تعداد آنها برای هر کلاس نمایش داده می شود.
 
 ## 1. ثابت های اصلی
 
 | Constant | مقدار / کاربرد |
 |---|---|
-| `MOBO_CORE_VERSION` | `10.31.75` |
+| `MOBO_CORE_VERSION` | `10.31.81` |
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
@@ -42,6 +42,9 @@ Base: `/wp-json/mobo-core/v1`
 | GET/POST | `/worker/run` | `check_cron_security` | `token`, `source` |
 | GET | `/worker/status` | `check_security` | `X-SEC` |
 | GET | `/health` | `check_security` | `X-SEC` |
+| POST | `/update/apply` | `check_security` | فرمان امضاشده Deployment |
+| POST | `/update/run` | `check_security` | اجرای فرمان Pending |
+| GET | `/update/status` | `check_security` | وضعیت آمادگی، نصب و ACK |
 | GET/POST | `/health/report-now` | `check_security` | `X-SEC` |
 | POST | `/webhook` | `check_security` | JSON event payload |
 | POST | `/webhook/run` | `check_security` | `X-SEC` |
@@ -51,6 +54,14 @@ Base: `/wp-json/mobo-core/v1`
 | POST | `/sync/cancel` | `check_security` | `X-SEC` |
 
 `check_security` مقدار option `mobo_core_security_code` را با هدر `X-SEC` مقایسه می کند. `check_cron_security` مقدار `mobo_core_cron_token` را از query/body `token` می خواند و `X-SEC` را به عنوان fallback می پذیرد.
+
+
+Endpoint مستقیم مستقل از WordPress:
+
+| Method | Path | Authentication | کاربرد |
+|---|---|---|---|
+| GET | `/wp-content/plugins/mobo-core/mobo-runtime-probe.php` | Header `X-SEC` | تشخیص امن Runtime PHP و `disable_functions` حتی وقتی WordPress/REST بالا نمی‌آید. |
+
 
 ## 3. Endpointهای خروجی به Portal
 
@@ -74,6 +85,7 @@ Base: `/wp-json/mobo-core/v1`
 | `UpdateVariant` | `1` و مقدار فعلی `4` | `process_update_variant_payload()` |
 | `ShippingMethodsChanged` | `20` | refresh روش ارسال |
 | `WebhookDeliveryStatusChanged` | `21` | ذخیره delivery status |
+| `PluginUpdateRequested` | `23` | اعتبارسنجی و صف فرمان AutoUpdater |
 
 ## 5. Filterهای توسعه دهنده
 
@@ -494,6 +506,21 @@ Public methods: **21** · Internal non-public methods: **91**
 | `public function add_hpos_order_column($columns)` | افزودن hpos order column در بخش اعتبارسنجی سبد، اتصال موبو و صف ثبت سفارش. | Executes `add_hpos_order_column` for this component. |
 | `public function render_hpos_order_column($column, $order)` | رندر hpos order column در بخش اعتبارسنجی سبد، اتصال موبو و صف ثبت سفارش. | Executes `render_hpos_order_column` for this component. |
 
+
+### `Mobo_Core_Auto_Updater`
+
+AutoUpdater امن تحت کنترل Portal؛ فرمان امضاشده را نگهداری، بسته را اعتبارسنجی، Backup/Install/Rollback را اجرا و ACK را Retry می‌کند.
+
+| متد public | کاربرد |
+|---|---|
+| `public static function init()` | ثبت fallback اجرای Admin و Retry ACK. |
+| `public static function is_enabled()` | بررسی `MOBO_CORE_REMOTE_UPDATES_ENABLED`. |
+| `public static function accept_command($command)` | اعتبارسنجی HMAC، نسخه، URL، Hash، expiry و نگهداری فرمان Pending. |
+| `public static function run_pending($source = 'remote-update')` | دانلود، Verify، Backup، نصب، بررسی نسخه و Rollback. |
+| `public static function maybe_run_on_admin_request()` | fallback اجرای Pending در درخواست مدیر. |
+| `public static function retry_pending_ack()` | Retry نتیجه Deployment در Portal. |
+| `public static function get_status()` | وضعیت Readiness، Filesystem، Pending و ACK برای Health/REST. |
+
 ### `Mobo_Core_Cron_Runner`
 
 Source: [`includes/class-mobo-core-cron-runner.php`](includes/class-mobo-core-cron-runner.php)  
@@ -519,6 +546,27 @@ Public methods: **4** · Internal non-public methods: **25**
 | `public function send_report($source = 'real-cron', $force = false)` | ارسال report در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Send report to MoboCore. |
 | `public function get_local_status()` | دریافت local status در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Return current local health status for REST /health. |
 | `public function get_last_report_status()` | دریافت last report status در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Get last report status for UI. |
+
+### `Mobo_Core_Php_Capabilities`
+
+Source: [`includes/class-mobo-core-php-capabilities.php`](includes/class-mobo-core-php-capabilities.php)  
+تشخیص امن قابلیت‌های PHP و نگهداری Hash احراز هویت Runtime Probe. / Safely inspects PHP capabilities and maintains the hashed runtime-probe authentication cache.  
+Public methods: **12** · Internal non-public methods: **2**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function init()` | ثبت hookهای همگام‌سازی Auth Cache و ایجاد آن برای نصب‌های موجود. | Register auth-cache synchronization hooks and initialize existing installs. |
+| `public static function handle_option_change($option, $old_value, $value)` | بازسازی Hash پس از تغییر Webhook Security Code. | Refresh the hash after Webhook Security Code changes. |
+| `public static function handle_option_add($option, $value)` | ایجاد Auth Cache پس از افزودن Webhook Security Code. | Create the auth cache after the security code is added. |
+| `public static function handle_option_delete($option)` | حذف Auth Cache پس از حذف Webhook Security Code. | Remove the auth cache after the security code is deleted. |
+| `public static function get_function_catalog()` | دریافت کاتالوگ توابع بررسی‌شده همراه Severity و Impact. | Return the audited function catalog with severity and impact metadata. |
+| `public static function get_disabled_functions()` | خواندن و نرمال‌سازی کل فهرست `disable_functions` و blacklist قدیمی Suhosin. | Read and normalize the complete disabled-function configuration. |
+| `public static function inspect_function($function_name, $meta = array(), $disabled = null)` | بررسی وجود، callable بودن و وضعیت غیرفعال بدون اجرای تابع. | Inspect availability and host-disabled status without executing the function. |
+| `public static function get_report($include_extensions = true, $redact_paths = false)` | ساخت گزارش قابلیت‌های PHP، Extensionها و فهرست کامل توابع بسته‌شده. | Build the PHP capability, extension, and complete disabled-functions report. |
+| `public static function get_runtime_probe_status()` | دریافت URL و آمادگی Auth Cache برای UI و Health Report. | Return the runtime-probe URL and auth-cache readiness. |
+| `public static function sync_runtime_probe_auth($force = false)` | ذخیره اتمیک فقط SHA-256 کد امنیتی در مسیر محافظت‌شده. | Atomically persist only the security-code SHA-256 in protected storage. |
+| `public static function get_runtime_probe_auth_path()` | محاسبه مسیر Auth Cache با پشتیبانی از override سرور. | Resolve the auth-cache path with server-level overrides. |
+| `public static function remove_runtime_probe_auth()` | حذف Auth Cache تولیدشده. | Remove the generated runtime-probe auth cache. |
 
 ### `Mobo_Core_Image_Queue`
 
@@ -906,6 +954,9 @@ Public methods: **17** · Internal non-public methods: **1**
 | `public function get_self_worker_status($request)` | دریافت self worker status در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Return local self-worker status. |
 | `public function get_health($request)` | دریافت health در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Return local site health for MoboCore probe. |
 | `public function send_health_report_now($request)` | ارسال health report now در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Force-send health report to MoboCore. |
+| `public function apply_plugin_update($request)` | دریافت فرمان امضاشده Update Center. | Accept a signed Portal deployment command. |
+| `public function run_plugin_update($request)` | اجرای فرمان Pending. | Run the pending plugin deployment. |
+| `public function get_plugin_update_status($request)` | گزارش وضعیت AutoUpdater. | Return updater readiness and deployment status. |
 | `public function run_webhook_queue($request)` | اجرای عملیات `run_webhook_queue` در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Run webhook queue. |
 | `public function start_product_sync($request)` | شروع product sync در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Start product sync from C#. |
 | `public function run_product_sync($request)` | اجرای عملیات `run_product_sync` در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Run one product sync step. |
@@ -1032,7 +1083,7 @@ Public methods: **4** · Internal non-public methods: **31**
 
 # English integration reference
 
-This file documents the developer-facing surface of Mobo Core `10.31.75`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
+This file documents the developer-facing surface of Mobo Core `10.31.81`. Public method signatures are extracted from the current source. Private and protected methods are implementation details and are not a stable integration contract.
 
 ## 1. Stable integration surfaces
 

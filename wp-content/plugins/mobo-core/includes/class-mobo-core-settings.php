@@ -99,6 +99,9 @@ class Mobo_Core_Settings {
 
 			// Real cron is the primary execution path on customer hosts.
 			'mobo_core_cron_token'                    => '',
+			'mobo_core_any_runner_last_hit_at'         => 0,
+			'mobo_core_any_runner_last_success_at'     => 0,
+			'mobo_core_any_runner_last_result'         => array(),
 			'mobo_core_real_cron_last_hit_at'          => 0,
 			'mobo_core_real_cron_last_success_at'      => 0,
 			'mobo_core_real_cron_last_result'          => array(),

@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.75
+ * Version: 10.31.81
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.75' );
+define( 'MOBO_CORE_VERSION', '10.31.81' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -95,6 +95,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-dependencies.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cache-purger.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-php-capabilities.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
@@ -119,6 +120,9 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-maintenance.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cron-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-self-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-health-reporter.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-auto-updater.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-version-ledger.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-recovery-ack.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-checkout-validator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-city-assets.php';
@@ -129,6 +133,10 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.ph
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-variation-fields.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-migration.php';
+
+/* Keep the WordPress-free runtime probe authentication cache synchronized. */
+Mobo_Core_Php_Capabilities::init();
+Mobo_Core_Auto_Updater::init();
 
 
 /**
@@ -183,6 +191,7 @@ add_filter(
 function mobo_core_activate() {
 	Mobo_Core_Dependencies::enforce_activation_requirements();
 	Mobo_Core_Migration::activate();
+	Mobo_Core_Php_Capabilities::sync_runtime_probe_auth( true );
 }
 
 register_activation_hook( __FILE__, 'mobo_core_activate' );

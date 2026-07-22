@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mobo Settings Exporter
  * Description: One-time, read-only exporter for legacy Mobo Core settings and the exact registered WordPress image size profile.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Requires at least: 6.0
  * Requires PHP: 7.4
  */
@@ -149,6 +149,8 @@ final class Mobo_Settings_Exporter {
 			'mobo_core_categories_refresh_interval_hours',
 			'mobo_core_real_cron_time_budget_seconds',
 			'mobo_core_real_cron_max_sync_steps',
+			'mobo_core_real_cron_max_rounds',
+			'mobo_core_real_cron_safety_margin_seconds',
 			'mobo_core_real_cron_lock_ttl_seconds',
 			'mobo_core_real_cron_expected_interval_seconds',
 			'mobo_core_real_cron_process_webhooks',

@@ -102,6 +102,16 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_cache_purge_last_result' );
 	delete_transient( 'mobo_core_pw_options_enforced_notice' );
 
+
+	/* Remove the hashed X-SEC cache used by the WordPress-free runtime probe. */
+	$runtime_probe_upload = wp_upload_dir( null, false );
+	if ( empty( $runtime_probe_upload['error'] ) && ! empty( $runtime_probe_upload['basedir'] ) ) {
+		$runtime_probe_auth = trailingslashit( (string) $runtime_probe_upload['basedir'] ) . 'mobo-core/runtime-probe-auth.php';
+		if ( is_file( $runtime_probe_auth ) && function_exists( 'unlink' ) ) {
+			@unlink( $runtime_probe_auth );
+		}
+	}
+
 	/*
 	 * Generated checkout city files are runtime assets, not business data.
 	 */

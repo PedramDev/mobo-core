@@ -5,8 +5,8 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.75-1f6feb)
-![Portal](https://img.shields.io/badge/Portal-v25%20%2F%20.NET%2010-512bd4)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.81-1f6feb)
+![Portal](https://img.shields.io/badge/Portal-v38%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
 ![WooCommerce](https://img.shields.io/badge/WooCommerce-8.2%2B-96588a?logo=woocommerce&logoColor=white)
@@ -40,6 +40,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 - اعتبارسنجی واقعی افزودن به سبد موبو؛ اجباری هنگام ثبت خودکار سفارش
 - پیامک بر اساس نوع سفارش از طریق افزونه «پیامک حرفه ای ووکامرس»
 - Real Cron، Self Runner، گزارش سلامت و ابزارهای عیب یابی
+- AutoUpdater امن و کنترل‌شده از Portal با اعتبارسنجی Manifest، Backup، Rollback و ACK
 - اعلام سازگاری با WooCommerce HPOS
 
 ### نیازمندی ها
@@ -51,8 +52,8 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WooCommerce | `8.2+` |
 | ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.75` |
-| Portal سازگار | `v25 / .NET 10` |
+| Mobo Core | `10.31.81` |
+| Portal سازگار | `v38 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
 ### نصب سریع
@@ -69,7 +70,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.31.75:
+// مقدار فعلی پیش فرض افزونه در نسخه 10.31.79:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -95,6 +96,29 @@ https://example.com/wp-json/mobo-core/v1/cron/run?token=<cron-token>
 ```
 
 > Token، Security Code، رمز حساب موبو و Cron Token را داخل مخزن Git ثبت نکنید. اطلاعات حساب موبو در WordPress options ذخیره می شود؛ دسترسی مدیر، دیتابیس و فایل های backup باید محدود باشد.
+
+
+### AutoUpdater کنترل‌شده از Portal — نسخه Bootstrap 10.31.79
+
+نسخه `10.31.79` باید فقط یک بار روی سایت‌های فعلی به‌صورت دستی نصب شود. پس از آن Portal Update Center می‌تواند نسخه‌های جدیدتر را بدون ورود به پیشخوان هر سایت ارسال کند. نسخه‌های قدیمی‌تر از Bootstrap عمداً فرمان آپدیت را قبول نمی‌کنند، چون هنوز کد امن دریافت و نصب بسته را ندارند.
+
+فرآیند هر Deployment:
+
+1. Portal بسته ZIP را خارج از Web Root نگهداری و Header نسخه، ساختار ZIP و پوشش دقیق Manifest SHA-256 را اعتبارسنجی می‌کند.
+2. فرمان به شناسه Deployment، نسخه مقصد، SHA-256، حجم، URL بسته، URL ACK، زمان انقضا و Token دانلود متصل و با `X-SEC` امضای HMAC می‌شود.
+3. افزونه فرمان را دوباره اعتبارسنجی، بسته را Stream و Hash می‌کند و فایل اضافه، گمشده، مسیر ناامن یا Symlink را رد می‌کند.
+4. از پوشه افزونه در Temp خصوصی Backup می‌گیرد، با `Plugin_Upgrader` نصب می‌کند و نسخه مقصد را دوباره می‌سنجد.
+5. در خطای نصب یا عدم تطابق نسخه، Backup بازگردانی می‌شود؛ وضعیت و ACK ناموفق برای Retry نگهداری می‌شوند.
+
+برای خاموش‌کردن کامل قابلیت روی یک سرور:
+
+```php
+define( 'MOBO_CORE_REMOTE_UPDATES_ENABLED', false );
+```
+
+آپدیت بدون حضور فقط وقتی Ready است که `DISALLOW_FILE_MODS` فعال نباشد، روش Filesystem برابر `direct` باشد، پوشه افزونه قابل‌نوشتن باشد و فرمان دیگری Pending نباشد. Portal این موارد را پیش از صف‌کردن بررسی می‌کند.
+
+> Portal فعلی روی HTTP نیز کار می‌کند، اما HMAC و SHA-256 محرمانگی انتقال ایجاد نمی‌کنند. برای Token و X-SEC از شبکه خصوصی، VPN، Allowlist یا TLS روی Reverse Proxy استفاده شود.
 
 ### مستندات
 
@@ -157,7 +181,7 @@ GPLv2 or later. فایل [`LICENSE`](LICENSE) را ببینید.
 
 Mobo Core is a specialized WooCommerce integration for Iranian stores. It imports products, variations, categories, images, prices, and stock from MoboCore, then applies incremental changes delivered through webhooks. When explicitly enabled, it can also validate checkout data, map Mobo addresses and shipping methods, and submit eligible WooCommerce orders through the dedicated `mobomobo.ir` workflow.
 
-This repository contains the WordPress plugin. The current compatible backend is Portal v25 on `.NET 10`; no customer-facing documentation or code is added to the .NET project. All publishable customer documentation is maintained inside `mobo-core`.
+This repository contains the WordPress plugin. The current compatible backend is Portal v38 on `.NET 10`; no customer-facing documentation or code is added to the .NET project. All publishable customer documentation is maintained inside `mobo-core`.
 
 ### Main capabilities
 
@@ -200,8 +224,8 @@ Since `10.31.74`, the health payload includes structured `cachePurge` telemetry:
 | WooCommerce | `8.2+` |
 | Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.75` |
-| Compatible Portal | `v25 / .NET 10` |
+| Mobo Core | `10.31.81` |
+| Compatible Portal | `v38 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 
 ### Quick installation
@@ -218,7 +242,7 @@ Since `10.31.74`, the health payload includes structured `cachePurge` telemetry:
 
 ```php
 // wp-config.php
-// Current built-in default in version 10.31.75:
+// Current built-in default in version 10.31.79:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -276,3 +300,8 @@ GPLv2 or later. See [`LICENSE`](LICENSE).
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+## Direct health and external Cron proof
+
+`healthcheck.php` provides an authenticated health response without relying on WordPress REST rewrites. Send the configured Webhook Security Code in the `X-SEC` header. `mobo-cron.php` records a best-effort pre-WordPress CLI marker, while only external sources confirm Real Cron; self-runner and administrator tests remain separate.
+

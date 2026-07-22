@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Mobo Core `10.31.75` · Portal `v25 / .NET 10`**
+**Mobo Core `10.31.81` · Portal `v39 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -20,8 +20,8 @@
 
 ```mermaid
 flowchart LR
-    P["MoboCore Portal v25<br/>.NET 10 + PostgreSQL"]
-    W["Mobo Core 10.31.75<br/>WordPress Plugin"]
+    P["MoboCore Portal v38<br/>.NET 10 + PostgreSQL"]
+    W["Mobo Core 10.31.81<br/>WordPress Plugin"]
     WC["WooCommerce<br/>Products / Variations / Orders"]
     M["mobomobo.ir<br/>Cart & Order Workflow"]
     C["Server Cron / cPanel"]
@@ -36,6 +36,36 @@ flowchart LR
     H -- "X-SEC health probe" --> W
     W -. "Always-on operational health report" .-> P
 ```
+
+
+## AutoUpdater امن Portal
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Portal Admin
+    participant P as Portal Update Center
+    participant W as Mobo Core 10.31.81+
+    participant F as WordPress Filesystem
+
+    A->>P: Upload validated mobo-core ZIP
+    P->>P: Verify root, version, exact Manifest, SHA-256
+    A->>P: Select filtered ready sites
+    P->>W: PluginUpdateRequested + X-SEC + HMAC command
+    W->>W: Validate signature, host, version, expiry
+    W->>P: Download with short-lived token
+    W->>W: Verify size, package hash and internal Manifest
+    W->>F: Private backup
+    W->>F: Plugin_Upgrader install
+    alt version matches
+        W->>P: ACK succeeded
+    else install/version failure
+        W->>F: Restore backup
+        W->>P: ACK failed (durable retry)
+    end
+```
+
+نسخه‌های قبل از `10.31.79` باید Bootstrap را یک بار دستی دریافت کنند. Update Center فقط سایت‌های دارای گزارش تازه، Filesystem مستقیم، فایل قابل‌نوشتن و بدون Deployment فعال را انتخاب‌پذیر می‌کند.
 
 ## 2. Sync کامل با Cursor
 

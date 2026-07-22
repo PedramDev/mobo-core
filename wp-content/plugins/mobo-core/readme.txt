@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.75
+Stable tag: 10.31.81
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -32,6 +32,7 @@ Main features:
 * Address mapping for checkout country, state, and city values used in Iran.
 * Image refresh workflow for legacy images after a full Repair run.
 * Always-on operational health reporting for cron, queue, PHP/image capabilities, memory, disk, and debug status.
+* Secure WordPress-free runtime probe that detects hosting-disabled PHP functions even when WordPress bootstrap fails.
 * Optional order SMS notifications through the Persian WooCommerce SMS plugin.
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
@@ -140,6 +141,43 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.31.81 =
+* Added durable product/variant sync recovery so an unreachable WordPress site no longer permanently misses a change merely because no later source change occurs.
+* Added monotonic product, variant and aggregate versions. A variant change advances VariantVersion and AggregateVersion; scalar/relations changes advance ProductVersion and AggregateVersion.
+* WordPress now sends an authenticated apply ACK only after the queued snapshot was actually applied; HTTP acceptance alone no longer marks the installation in sync.
+* Added a per-product applied-version ledger that rejects delayed older snapshots while allowing equal-version multi-page snapshots to finish.
+* Added classified final-failure ACKs for expired, max-try and parent-wait-timeout queue events.
+* Added authoritative current-state variant snapshots, including an empty snapshot when all variants were removed.
+* Preserved the 10.31.79 AutoUpdater bootstrap, 10.31.76 Lock Renewal fix, Cron proof and PHP runtime diagnostics.
+
+= 10.31.79 =
+* Added the Portal-controlled AutoUpdater bootstrap for unattended Mobo Core upgrades after this version has been installed once manually.
+* Update commands require the existing X-SEC request authentication plus a persisted HMAC-SHA256 command signature bound to deployment ID, target version, package hash, size, URLs, expiry and one-time download token.
+* Packages are downloaded with bounded streaming, checked against the Portal SHA-256 and size, then rejected unless the ZIP has one `mobo-core/` root and exact SHA-256 Manifest coverage with no extra, missing, unsafe or symlink entries.
+* Added pre-install backup, WordPress Plugin_Upgrader installation, target-version verification and rollback on installation failure or version mismatch.
+* Added durable deployment ACK retry and structured `pluginUpdate` health telemetry for Update Center readiness, filesystem method, file writability, pending commands and ACK state.
+* Added authenticated `/update/apply`, `/update/run` and `/update/status` REST routes and webhook event `PluginUpdateRequested` (`23`).
+* Remote updates can be disabled at server level with `MOBO_CORE_REMOTE_UPDATES_ENABLED=false`; `DISALLOW_FILE_MODS` and non-direct/unwritable filesystem states prevent unattended deployment.
+* Preserved Lock Renewal, Cron proof, PHP runtime diagnostics, direct healthcheck and all prior queue/synchronization behavior.
+
+= 10.31.78 =
+* Consolidated the 10.31.77 PHP runtime diagnostics with the Lock Renewal fix and external Cron proof diagnostics.
+* Added authenticated direct `healthcheck.php` independent of WordPress REST rewrites.
+* Separated external/server Cron heartbeat from Self Runner and administrator test runs.
+* Added a pre-WordPress PHP CLI bootstrap marker for cPanel/DirectAdmin cron diagnosis.
+* Added a secure WordPress-free runtime probe at `mobo-runtime-probe.php`, authenticated by the existing Webhook Security Code (`X-SEC`) without storing the plain secret in the probe cache.
+* Added a structured PHP capability report covering required, optional, image, network, filesystem, security, compression, diagnostic, and system functions without executing risky functions.
+* Reports the complete normalized `disable_functions` list separately, including functions outside Mobo Core's audited capability catalog.
+* Fixed `mobo-phpinfo.php` so a hosting-disabled `phpinfo()` returns a controlled HTTP 501 diagnostic response instead of a PHP Fatal Error.
+* Health reports and the local administration page now show disabled/unavailable functions, severity, related extension, and functional impact.
+* Hardened PHP health collection against disabled `ini_get`, `php_ini_loaded_file`, `get_loaded_extensions`, memory telemetry, and disk telemetry functions.
+* Preserved the 10.31.76 lock-renewal no-op fix and all existing cron/queue behavior.
+
+= 10.31.76 =
+* Fixed an immediate false `lock-lost` result when lock acquisition and the first lease renewal occurred within the same second.
+* A byte-identical renewal now verifies that the owned database value still exists instead of treating MySQL zero affected rows as lost ownership.
+* Preserved compare-and-swap ownership checks for replaced, expired, deleted, or foreign-token locks.
 
 = 10.31.75 =
 * Real Cron now drains webhook, image, image-refresh, product-sync, reprice, recategorize, and queued-order work in repeated fair rounds within one safe runtime slice.
@@ -356,6 +394,18 @@ Yes. Mobo Core batches changed Mobo product/variation IDs during the request and
 * Updated plugin metadata, license headers, and GitHub URL.
 
 == Upgrade Notice ==
+
+= 10.31.81 =
+Adds durable product/variant version tracking, apply acknowledgements, stale-event protection and automatic current-state recovery for sites that missed webhooks while unreachable.
+
+= 10.31.79 =
+This is the one-time AutoUpdater bootstrap. Install it manually on existing sites; future compatible Mobo Core releases can then be validated, deployed, rolled back and monitored from Portal Update Center without signing in to each WordPress dashboard.
+
+= 10.31.78 =
+Adds an authenticated runtime probe and safe PHP function capability diagnostics. Hosts that disable `phpinfo()` no longer trigger a Fatal Error in the protected phpinfo viewer.
+
+= 10.31.76 =
+Fixes manual and server Cron runs that could stop immediately with `lock-lost`, zero rounds, and zero lease renewals when the first renewal happened in the same second as acquisition.
 
 = 10.31.75 =
 Queue-heavy sites now keep draining work in fair rounds during each safe cron slice and chain a local continuation when useful work remains. The runner uses a finite renewable lease: concurrent invocations exit safely, and a crashed process cannot leave a permanent lock because the lease expires automatically.

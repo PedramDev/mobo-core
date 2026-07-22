@@ -29,7 +29,31 @@ class Mobo_Core_Cron_Runner {
 		$source = sanitize_key( (string) $source );
 		$source = '' !== $source ? $source : 'real-cron';
 
-		update_option( 'mobo_core_real_cron_last_hit_at', time(), false );
+		if ( class_exists( 'Mobo_Core_Auto_Updater' ) ) {
+			Mobo_Core_Auto_Updater::retry_pending_ack();
+		}
+
+		if ( class_exists( 'Mobo_Core_Sync_Recovery_Ack' ) ) {
+			Mobo_Core_Sync_Recovery_Ack::retry_pending( 10 );
+		}
+
+		if ( class_exists( 'Mobo_Core_Auto_Updater' ) && get_option( Mobo_Core_Auto_Updater::OPTION_PENDING, array() ) ) {
+			$update_result = Mobo_Core_Auto_Updater::run_pending( 'cron-before-queues' );
+			if ( ! empty( $update_result['success'] ) && 'succeeded' === ( isset( $update_result['status'] ) ? $update_result['status'] : '' ) ) {
+				return array(
+					'success'      => true,
+					'status'       => 'plugin-updated',
+					'source'       => $source,
+					'pluginUpdate' => $update_result,
+				);
+			}
+		}
+
+		$now = time();
+		update_option( 'mobo_core_any_runner_last_hit_at', $now, false );
+		if ( self::is_external_cron_source( $source ) ) {
+			update_option( 'mobo_core_real_cron_last_hit_at', $now, false );
+		}
 
 		if ( function_exists( 'ignore_user_abort' ) ) {
 			ignore_user_abort( true );
@@ -158,6 +182,7 @@ class Mobo_Core_Cron_Runner {
 		$next_estimated_at = $last_hit > 0 ? $last_hit + $expected_interval : 0;
 		$is_overdue        = $next_estimated_at > 0 && time() > ( $next_estimated_at + 30 );
 		$lock_status       = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'real_cron_runner' ) : array();
+		$cli_marker        = self::read_cli_bootstrap_marker();
 
 		return array(
 			'cronUrl'                 => self::build_cron_url(),
@@ -170,7 +195,31 @@ class Mobo_Core_Cron_Runner {
 			'secondsSinceLastSuccess' => $last_ok > 0 ? max( 0, time() - $last_ok ) : 0,
 			'isActive'                => $last_hit > 0 && ( time() - $last_hit ) < HOUR_IN_SECONDS,
 			'lock'                    => $lock_status,
+			'cliBootstrapMarker'       => $cli_marker,
 			'lastResult'              => $last_res,
+		);
+	}
+
+	/**
+	 * Read the best-effort pre-WordPress CLI bootstrap marker.
+	 *
+	 * @return array
+	 */
+	private static function read_cli_bootstrap_marker() {
+		$path = dirname( dirname( MOBO_CORE_PLUGIN_DIR ) ) . '/mobo-core-cron-bootstrap.json';
+		if ( ! is_file( $path ) || ! is_readable( $path ) ) {
+			return array();
+		}
+		$raw = @file_get_contents( $path );
+		$data = is_string( $raw ) ? json_decode( $raw, true ) : null;
+		if ( ! is_array( $data ) ) {
+			return array();
+		}
+		return array(
+			'at'     => isset( $data['at'] ) ? absint( $data['at'] ) : 0,
+			'sapi'   => isset( $data['sapi'] ) ? sanitize_text_field( (string) $data['sapi'] ) : '',
+			'php'    => isset( $data['php'] ) ? sanitize_text_field( (string) $data['php'] ) : '',
+			'source' => 'mobo-cron.php',
 		);
 	}
 
@@ -375,7 +424,10 @@ class Mobo_Core_Cron_Runner {
 		);
 
 		if ( ! $lock_lost ) {
-			update_option( 'mobo_core_real_cron_last_success_at', time(), false );
+			update_option( 'mobo_core_any_runner_last_success_at', time(), false );
+			if ( self::is_external_cron_source( $source ) ) {
+				update_option( 'mobo_core_real_cron_last_success_at', time(), false );
+			}
 		}
 
 		return $aggregate;
@@ -938,7 +990,23 @@ class Mobo_Core_Cron_Runner {
 	 * @return void
 	 */
 	private function save_last_result( $result ) {
-		update_option( 'mobo_core_real_cron_last_result', $result, false );
+		update_option( 'mobo_core_any_runner_last_result', $result, false );
+		$source = isset( $result['source'] ) ? sanitize_key( (string) $result['source'] ) : '';
+		if ( self::is_external_cron_source( $source ) ) {
+			update_option( 'mobo_core_real_cron_last_result', $result, false );
+		}
+	}
+
+	/**
+	 * Whether a runner source proves an external/server Cron invocation.
+	 * Self runner and administrator tests must not confirm Real Cron.
+	 *
+	 * @param string $source Source label.
+	 * @return bool
+	 */
+	private static function is_external_cron_source( $source ) {
+		$source = sanitize_key( (string) $source );
+		return in_array( $source, array( 'real-cron', 'rest-cron', 'server-cron', 'cpanel-local-php-cron', 'directadmin-local-php-cron', 'wp-cli' ), true );
 	}
 
 	/**

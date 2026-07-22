@@ -449,6 +449,7 @@ class Mobo_Core_Webhook_Queue {
 				* Expired item is no longer valid.
 				* Move it away and continue to the next file.
 				*/
+				Mobo_Core_Sync_Recovery_Ack::queue_failure( $item, 'expired', 'Webhook event expired before it could be applied.' );
 				$this->move_to_failed( $file, 'expired' );
 				$failed++;
 				$messages[] = 'یک وب‌هوک منقضی شد و به failed منتقل شد.';
@@ -473,6 +474,7 @@ class Mobo_Core_Webhook_Queue {
 					$data = $this->build_waiting_parent_retired_data( $item, $data );
 					$item['lastResult'] = $data;
 					$this->write_item( $file, $item );
+					Mobo_Core_Sync_Recovery_Ack::queue_failure( $item, 'parent-wait-timeout', 'Variant waited too long for its parent product.' );
 					$this->move_to_failed( $file, 'parent-wait-timeout' );
 
 					$processed++;
@@ -482,6 +484,8 @@ class Mobo_Core_Webhook_Queue {
 				}
 
 				if ( $delete_file ) {
+					$ack_item = $this->item_with_result_payload( $item, $result );
+					Mobo_Core_Sync_Recovery_Ack::queue_success( $ack_item );
 					wp_delete_file( $file );
 				} else {
 					$item['try']       = absint( $item['try'] );
@@ -541,6 +545,7 @@ class Mobo_Core_Webhook_Queue {
 				* continue with the next ordered file after the failed blocker is moved.
 				*/
 				$this->write_item( $file, $item );
+				Mobo_Core_Sync_Recovery_Ack::queue_failure( $item, 'max-try', $item['lastError'] );
 				$this->move_to_failed( $file, 'max-try' );
 
 				$failed++;
@@ -727,6 +732,10 @@ class Mobo_Core_Webhook_Queue {
 			$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
 
 			if ( $expires_at > 0 && time() > $expires_at ) {
+				$expired_item = $store->row_to_item( $row );
+				if ( ! is_wp_error( $expired_item ) ) {
+					Mobo_Core_Sync_Recovery_Ack::queue_failure( $expired_item, 'expired', 'Webhook event expired before it could be applied.' );
+				}
 				$store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true );
 				$failed++;
 				$messages[] = 'یک event وب‌هوک منقضی شد و failed شد.';
@@ -770,6 +779,7 @@ class Mobo_Core_Webhook_Queue {
 						$store->mark_done( $event_id );
 					}
 
+					Mobo_Core_Sync_Recovery_Ack::queue_failure( $item, 'parent-wait-timeout', 'Variant waited too long for its parent product.' );
 					$processed++;
 					$messages[] = 'UpdateVariant بیش از مهلت مجاز منتظر محصول مادر ماند و از صف خارج شد.';
 
@@ -786,6 +796,8 @@ class Mobo_Core_Webhook_Queue {
 
 				if ( $delete_file ) {
 					$store->mark_done( $event_id );
+					$ack_item = $this->item_with_result_payload( $item, $result );
+					Mobo_Core_Sync_Recovery_Ack::queue_success( $ack_item );
 				} else {
 					$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
 					$store->mark_pending_progress( $event_id, $updated_payload, $data );
@@ -823,6 +835,7 @@ class Mobo_Core_Webhook_Queue {
 			$failed++;
 
 			if ( $try_count >= $max_try ) {
+				Mobo_Core_Sync_Recovery_Ack::queue_failure( $item, 'max-try', $message );
 				$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
 			} else {
 				$messages[] = 'پردازش event وب‌هوک ناموفق بود و برای retry در صف ماند. پردازش در این اجرا متوقف شد.';
@@ -838,6 +851,28 @@ class Mobo_Core_Webhook_Queue {
 			'remainingDueTable' => method_exists( $store, 'count_due' ) ? $store->count_due() > 0 : $store->count_pending() > 0,
 			'messages'          => $messages,
 		);
+	}
+
+	/**
+	 * Return a queue item with the fully resolved payload produced by the processor.
+	 *
+	 * Lightweight notifications do not carry paging metadata. The ACK and version
+	 * ledger must use the pulled payload so a multi-page snapshot is committed only
+	 * after its actual final page.
+	 *
+	 * @param array $item Queue item.
+	 * @param array $result Processor result.
+	 * @return array
+	 */
+	private function item_with_result_payload( $item, $result ) {
+		$item   = is_array( $item ) ? $item : array();
+		$result = is_array( $result ) ? $result : array();
+
+		if ( isset( $result['payload'] ) && is_array( $result['payload'] ) ) {
+			$item['payload'] = $result['payload'];
+		}
+
+		return $item;
 	}
 
 	/**
@@ -874,6 +909,20 @@ class Mobo_Core_Webhook_Queue {
 			$payload = $payload_result;
 		}
 
+		if ( in_array( $event, array( 'ProductUpdated', 'UpdateVariant' ), true )
+			&& class_exists( 'Mobo_Core_Sync_Version_Ledger' )
+			&& Mobo_Core_Sync_Version_Ledger::is_stale( $event, $payload ) ) {
+			return array(
+				'success' => true,
+				'message' => 'رویداد قدیمی‌تر از نسخه اعمال‌شده بود و بدون بازنویسی داده جدیدتر ACK شد.',
+				'data'    => array(
+					'deleteFile'          => true,
+					'staleVersionSkipped' => true,
+				),
+				'payload' => $payload,
+			);
+		}
+
 		$product_sync = new Mobo_Core_Product_Sync();
 
 		switch ( $event ) {
@@ -887,13 +936,26 @@ class Mobo_Core_Webhook_Queue {
 				return $result;
 
 			case 'UpdateVariant':
-				return $product_sync->process_update_variant_payload( $payload );
+				$result = $product_sync->process_update_variant_payload( $payload );
+
+				if ( is_array( $result ) ) {
+					$result['payload'] = $payload;
+				}
+
+				return $result;
 
 			case 'ShippingMethodsChanged':
 				return $this->process_shipping_methods_changed_payload( $payload );
 
 			case 'WebhookDeliveryStatusChanged':
 				return $this->process_webhook_delivery_status_payload( $payload );
+
+			case 'PluginUpdateRequested':
+				$result = Mobo_Core_Auto_Updater::accept_command( $payload );
+				if ( is_wp_error( $result ) ) {
+					return array( 'success' => false, 'message' => $result->get_error_message(), 'data' => array() );
+				}
+				return array( 'success' => true, 'message' => 'Plugin update command accepted.', 'data' => $result );
 
 			default:
 				return array(
@@ -962,6 +1024,12 @@ class Mobo_Core_Webhook_Queue {
 			$sync_id = $this->get_value( $payload, 'syncId', '' );
 			if ( '' !== $sync_id ) {
 				$normalized['syncId'] = sanitize_text_field( (string) $sync_id );
+			}
+		}
+
+		foreach ( array( '_moboPortalEventId', '_moboEntityVersion', '_moboAggregateVersion', '_moboDeliveryComponent', '_moboDeliveryKind' ) as $metadata_key ) {
+			if ( isset( $payload[ $metadata_key ] ) && ! isset( $normalized[ $metadata_key ] ) ) {
+				$normalized[ $metadata_key ] = $payload[ $metadata_key ];
 			}
 		}
 
@@ -1405,6 +1473,7 @@ class Mobo_Core_Webhook_Queue {
 			4 => 'UpdateVariant',
 			20 => 'ShippingMethodsChanged',
 			21 => 'WebhookDeliveryStatusChanged',
+			23 => 'PluginUpdateRequested',
 		);
 
 		return isset( $map[ $type ] ) ? $map[ $type ] : '';

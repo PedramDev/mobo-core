@@ -1946,9 +1946,30 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->status_box( 'Imagick', ! empty( $image['imagickLoaded'] ) ? ( ! empty( $image['imagickWebp'] ) ? 'فعال با WebP' : 'فعال بدون WebP' ) : 'نصب نیست' ); ?>
 						<?php $this->status_box( 'پشتیبانی WebP وردپرس', ! empty( $image['wordpressWebp'] ) ? 'دارد' : 'ندارد' ); ?>
 						<?php $this->status_box( 'دسترسی نوشتن uploads', ! empty( $image['uploadsWritable'] ) ? 'دارد' : 'ندارد' ); ?>
+						<?php $this->status_box( 'phpinfo()', ! empty( $php_caps['phpinfoAvailable'] ) ? 'در دسترس' : 'غیرفعال یا موجود نیست' ); ?>
+						<?php $this->status_box( 'توابع بحرانی unavailable', absint( isset( $php_cap_counts['critical'] ) ? $php_cap_counts['critical'] : 0 ) ); ?>
+						<?php $this->status_box( 'توابع غیرفعال‌شده توسط هاست', absint( isset( $php_cap_counts['disabledByHost'] ) ? $php_cap_counts['disabledByHost'] : 0 ) ); ?>
 					</div>
 					<p><a class="button button-secondary" href="<?php echo esc_url( $phpinfo_url ); ?>" target="_blank" rel="noopener">مشاهده phpinfo کامل و محافظت‌شده</a></p>
+					<?php if ( ! empty( $runtime_probe['endpointUrl'] ) ) : ?>
+						<div class="mobo-field mobo-field-full">
+							<label>Runtime Probe مستقل از WordPress</label>
+							<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $runtime_probe['endpointUrl'] ); ?>" onclick="this.select();">
+							<div class="mobo-help">Portal این مسیر را با Header امنیتی X-SEC بررسی می‌کند. پاسخ آن حتی در صورت Fatal شدن WordPress قابل دریافت است. وضعیت Auth Cache: <?php echo ! empty( $runtime_probe['authCacheReady'] ) ? 'آماده' : 'آماده نیست'; ?></div>
+						</div>
+					<?php endif; ?>
 					<div class="mobo-help">لینک phpinfo دارای nonce کوتاه‌مدت است و فقط برای مدیر واردشده باز می‌شود. آن را عمومی منتشر نکنید.</div>
+					<?php if ( ! empty( $php_caps['functions'] ) && is_array( $php_caps['functions'] ) ) : ?>
+						<details class="mobo-collapsible-log"><summary>مشاهده توابع PHP unavailable/disabled</summary><div class="mobo-log-box"><pre dir="ltr"><?php
+							$unavailable_functions = array();
+							foreach ( $php_caps['functions'] as $function_name => $function_status ) {
+								if ( is_array( $function_status ) && 'available' !== ( isset( $function_status['status'] ) ? $function_status['status'] : '' ) ) {
+									$unavailable_functions[ $function_name ] = $function_status;
+								}
+							}
+							echo esc_html( wp_json_encode( $unavailable_functions, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+						?></pre></div></details>
+					<?php endif; ?>
 				</div>
 
 				<div class="mobo-card mobo-card-wide">

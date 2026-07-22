@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.75` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.31.81` · Compatible with Portal `v39 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -20,8 +20,8 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 اجزای اصلی:
 
-1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.75**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+1. **MoboCore Portal v38**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
+2. **Mobo Core 10.31.81**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
@@ -31,8 +31,8 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.75` |
-| Portal | `v25` |
+| Mobo Core | `10.31.81` |
+| Portal | `v38` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
@@ -46,7 +46,12 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 
 ## 3. نصب و ارتقا
 
-### نصب جدید
+#
+## AutoUpdater و Update Center
+
+نسخه `10.31.79` Bootstrap اولیه AutoUpdater است و باید یک بار به‌صورت دستی نصب شود. از این نسخه به بعد Portal می‌تواند بسته‌های جدیدتر را با فرمان HMAC‌شده، Token دانلود کوتاه‌عمر، کنترل SHA-256 و Manifest دقیق، Backup، نصب با WordPress Upgrader، بررسی نسخه مقصد و Rollback مدیریت کند. وضعیت آمادگی Filesystem، Pending command، نتیجه نصب و Pending ACK داخل `pluginUpdate` گزارش سلامت قرار می‌گیرد. `MOBO_CORE_REMOTE_UPDATES_ENABLED=false` یا `DISALLOW_FILE_MODS=true` نصب از راه دور را متوقف می‌کند.
+
+## نصب جدید
 
 1. از دیتابیس و فایل های سایت backup بگیرید.
 2. WooCommerce و افزونه «ووکامرس فارسی» (`persian-woocommerce`) را نصب و فعال کنید.
@@ -481,8 +486,8 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 
 Primary components:
 
-1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.75**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+1. **MoboCore Portal v38**: API, licensing, product data, event payloads, health, and central mappings.
+2. **Mobo Core 10.31.81**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
@@ -492,8 +497,8 @@ See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.75` |
-| Portal | `v25` |
+| Mobo Core | `10.31.81` |
+| Portal | `v38` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
@@ -763,3 +768,9 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+
+## Portal AutoUpdater and Update Center
+
+Mobo Core `10.31.79` is the one-time AutoUpdater bootstrap and must be installed manually on existing sites. Later releases can be delivered by Portal using an HMAC-bound command, short-lived download token, package SHA-256, exact internal Manifest coverage, private backup, WordPress upgrader installation, target-version verification, rollback, and durable acknowledgement retry. The `pluginUpdate` health payload reports unattended readiness, filesystem method, pending commands and ACK state. Set `MOBO_CORE_REMOTE_UPDATES_ENABLED` to `false`, or use WordPress `DISALLOW_FILE_MODS`, to block remote installation.
+
