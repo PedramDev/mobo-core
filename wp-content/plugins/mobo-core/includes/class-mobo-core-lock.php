@@ -125,6 +125,20 @@ class Mobo_Core_Lock {
 			return false;
 		}
 
+		/*
+		 * acquire() and the first renew() can run within the same second. Since
+		 * lock timestamps use second precision, the renewed payload may be
+		 * byte-for-byte identical to the stored payload. MySQL reports zero
+		 * affected rows for that no-op UPDATE, which does not mean ownership
+		 * was lost. Re-read the exact value so a concurrent replacement or
+		 * forced release is still detected before renewal is accepted.
+		 */
+		if ( hash_equals( $raw, $renewed ) ) {
+			$current_raw = self::read_raw_option( $key );
+
+			return null !== $current_raw && hash_equals( $raw, $current_raw );
+		}
+
 		return self::update_raw_option_if_value( $key, $raw, $renewed );
 	}
 

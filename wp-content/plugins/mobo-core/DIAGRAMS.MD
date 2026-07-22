@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Mobo Core `10.31.75` · Portal `v25 / .NET 10`**
+**Mobo Core `10.31.76` · Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,7 +21,7 @@
 ```mermaid
 flowchart LR
     P["MoboCore Portal v25<br/>.NET 10 + PostgreSQL"]
-    W["Mobo Core 10.31.75<br/>WordPress Plugin"]
+    W["Mobo Core 10.31.76<br/>WordPress Plugin"]
     WC["WooCommerce<br/>Products / Variations / Orders"]
     M["mobomobo.ir<br/>Cart & Order Workflow"]
     C["Server Cron / cPanel"]

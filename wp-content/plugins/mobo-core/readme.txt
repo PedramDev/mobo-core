@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.75
+Stable tag: 10.31.76
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -140,6 +140,11 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.31.76 =
+* Fixed an immediate false `lock-lost` result when lock acquisition and the first lease renewal occurred within the same second.
+* A byte-identical renewal now verifies that the owned database value still exists instead of treating MySQL zero affected rows as lost ownership.
+* Preserved compare-and-swap ownership checks for replaced, expired, deleted, or foreign-token locks.
 
 = 10.31.75 =
 * Real Cron now drains webhook, image, image-refresh, product-sync, reprice, recategorize, and queued-order work in repeated fair rounds within one safe runtime slice.
@@ -356,6 +361,9 @@ Yes. Mobo Core batches changed Mobo product/variation IDs during the request and
 * Updated plugin metadata, license headers, and GitHub URL.
 
 == Upgrade Notice ==
+
+= 10.31.76 =
+Fixes manual and server Cron runs that could stop immediately with `lock-lost`, zero rounds, and zero lease renewals when the first renewal happened in the same second as acquisition.
 
 = 10.31.75 =
 Queue-heavy sites now keep draining work in fair rounds during each safe cron slice and chain a local continuation when useful work remains. The runner uses a finite renewable lease: concurrent invocations exit safely, and a crashed process cannot leave a permanent lock because the lease expires automatically.

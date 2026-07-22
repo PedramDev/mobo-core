@@ -5,7 +5,7 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.75-1f6feb)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.76-1f6feb)
 ![Portal](https://img.shields.io/badge/Portal-v25%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
@@ -51,7 +51,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WooCommerce | `8.2+` |
 | ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.75` |
+| Mobo Core | `10.31.76` |
 | Portal سازگار | `v25 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
@@ -69,7 +69,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.31.75:
+// مقدار فعلی پیش فرض افزونه در نسخه 10.31.76:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -200,7 +200,7 @@ Since `10.31.74`, the health payload includes structured `cachePurge` telemetry:
 | WooCommerce | `8.2+` |
 | Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.75` |
+| Mobo Core | `10.31.76` |
 | Compatible Portal | `v25 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 
@@ -218,7 +218,7 @@ Since `10.31.74`, the health payload includes structured `cachePurge` telemetry:
 
 ```php
 // wp-config.php
-// Current built-in default in version 10.31.75:
+// Current built-in default in version 10.31.76:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
