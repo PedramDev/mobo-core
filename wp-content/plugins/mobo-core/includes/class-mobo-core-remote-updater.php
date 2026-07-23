@@ -265,7 +265,7 @@ class Mobo_Core_Remote_Updater {
 
 			return new WP_Error( 'mobo_core_upgrade_failed', $message, array( 'status' => 500 ) );
 		} finally {
-			if ( '' !== $tmp_file && is_file( $tmp_file ) ) {
+			if ( is_string( $tmp_file ) && '' !== $tmp_file && is_file( $tmp_file ) ) {
 				@unlink( $tmp_file );
 			}
 			if ( '' !== $staging_dir && is_dir( $staging_dir ) ) {
