@@ -1,0 +1,207 @@
+--- a/includes/class-mobo-core-upgrade-coordinator.php
++++ b/includes/class-mobo-core-upgrade-coordinator.php
+@@ -17,6 +17,7 @@
+ 
+ 	const BARRIER_LOCK = 'plugin_upgrade_barrier';
+ 	const STATE_OPTION = 'mobo_core_upgrade_barrier_state';
++	const AUDIT_OPTION = 'mobo_core_last_upgrade_barrier_audit';
+ 	const DEFAULT_TTL_SECONDS = 900;
+ 	const DEFAULT_DRAIN_TIMEOUT_SECONDS = 120;
+ 	const DEFAULT_RETRY_AFTER_SECONDS = 60;
+@@ -118,15 +119,71 @@
+ 	}
+ 
+ 	/**
++	 * Move the barrier lifecycle to a named stage while preserving ownership.
++	 *
++	 * @param string $token Barrier token.
++	 * @param string $stage Lifecycle stage.
++	 * @param array  $details Optional bounded diagnostics.
++	 * @return bool
++	 */
++	public static function mark_stage( $token, $stage, $details = array() ) {
++		$stage = sanitize_key( (string) $stage );
++		if ( '' === $stage || ! self::renew( $token, self::DEFAULT_TTL_SECONDS ) ) {
++			return false;
++		}
++
++		$state           = self::read_state();
++		$state['active'] = true;
++		$state['status'] = $stage;
++		$now             = time();
++
++		if ( 'drained' === $stage && empty( $state['drainCompletedAt'] ) ) {
++			$state['drainCompletedAt'] = $now;
++		} elseif ( 'backing-up' === $stage && empty( $state['backupStartedAt'] ) ) {
++			$state['backupStartedAt'] = $now;
++		} elseif ( 'installing' === $stage && empty( $state['installStartedAt'] ) ) {
++			$state['installStartedAt'] = $now;
++		} elseif ( 'verifying' === $stage && empty( $state['verifyStartedAt'] ) ) {
++			$state['verifyStartedAt'] = $now;
++		}
++
++		if ( isset( $details['lastError'] ) ) {
++			$state['lastError'] = sanitize_text_field( (string) $details['lastError'] );
++		}
++		self::write_state( $state );
++
++		return true;
++	}
++
++	/**
+ 	 * Release the barrier and allow queues to resume from their stored cursors.
+ 	 *
+ 	 * @param string $token Barrier token.
+ 	 * @return bool
+ 	 */
+-	public static function release( $token ) {
++	public static function release( $token, $result = 'released', $details = array() ) {
++		$state = self::read_state();
++		$lock  = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::BARRIER_LOCK ) : array();
+ 		$released = Mobo_Core_Lock::release( self::BARRIER_LOCK, $token );
+ 
+ 		if ( $released ) {
++			$released_at = time();
++			$audit = array(
++				'deploymentId'     => isset( $state['deploymentId'] ) ? sanitize_text_field( (string) $state['deploymentId'] ) : '',
++				'result'           => sanitize_key( (string) $result ),
++				'activatedAt'      => isset( $state['activatedAt'] ) ? absint( $state['activatedAt'] ) : 0,
++				'drainStartedAt'   => isset( $state['drainStartedAt'] ) ? absint( $state['drainStartedAt'] ) : 0,
++				'drainCompletedAt' => isset( $state['drainCompletedAt'] ) ? absint( $state['drainCompletedAt'] ) : 0,
++				'backupStartedAt'  => isset( $state['backupStartedAt'] ) ? absint( $state['backupStartedAt'] ) : 0,
++				'installStartedAt' => isset( $state['installStartedAt'] ) ? absint( $state['installStartedAt'] ) : 0,
++				'verifyStartedAt'  => isset( $state['verifyStartedAt'] ) ? absint( $state['verifyStartedAt'] ) : 0,
++				'releasedAt'       => $released_at,
++				'lastStage'        => isset( $state['status'] ) ? sanitize_key( (string) $state['status'] ) : '',
++				'blockingLocks'    => isset( $state['blockingLocks'] ) && is_array( $state['blockingLocks'] ) ? $state['blockingLocks'] : array(),
++				'lock'             => is_array( $lock ) ? $lock : array(),
++				'lastError'        => isset( $details['lastError'] ) ? sanitize_text_field( (string) $details['lastError'] ) : '',
++			);
++			update_option( self::AUDIT_OPTION, $audit, false );
+ 			delete_option( self::STATE_OPTION );
+ 			self::clear_sync_pause();
+ 		}
+@@ -243,6 +300,11 @@
+ 		$state  = self::read_state();
+ 		$lock   = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::BARRIER_LOCK ) : array();
+ 
++		$audit = get_option( self::AUDIT_OPTION, array() );
++		if ( ! is_array( $audit ) ) {
++			$audit = array();
++		}
++
+ 		return array(
+ 			'active'           => $active,
+ 			'status'           => $active ? ( isset( $state['status'] ) ? sanitize_key( (string) $state['status'] ) : 'active' ) : 'inactive',
+@@ -251,9 +313,13 @@
+ 			'lastRenewedAt'    => isset( $state['lastRenewedAt'] ) ? absint( $state['lastRenewedAt'] ) : 0,
+ 			'drainStartedAt'   => isset( $state['drainStartedAt'] ) ? absint( $state['drainStartedAt'] ) : 0,
+ 			'drainCompletedAt' => isset( $state['drainCompletedAt'] ) ? absint( $state['drainCompletedAt'] ) : 0,
++			'backupStartedAt'  => isset( $state['backupStartedAt'] ) ? absint( $state['backupStartedAt'] ) : 0,
++			'installStartedAt' => isset( $state['installStartedAt'] ) ? absint( $state['installStartedAt'] ) : 0,
++			'verifyStartedAt'  => isset( $state['verifyStartedAt'] ) ? absint( $state['verifyStartedAt'] ) : 0,
+ 			'retryAfter'       => isset( $state['retryAfter'] ) ? absint( $state['retryAfter'] ) : self::DEFAULT_RETRY_AFTER_SECONDS,
+ 			'blockingLocks'    => $active ? self::get_blocking_locks() : array(),
+ 			'lock'             => is_array( $lock ) ? $lock : array(),
++			'lastAudit'        => $audit,
+ 		);
+ 	}
+ 
+--- a/includes/class-mobo-core-remote-updater.php
++++ b/includes/class-mobo-core-remote-updater.php
+@@ -115,6 +115,8 @@
+ 		$destination_touched = false;
+ 		$barrier_token = false;
+ 		$barrier_activated = false;
++		$barrier_result = 'not-started';
++		$barrier_error = '';
+ 
+ 		self::write_status(
+ 			array(
+@@ -165,6 +167,7 @@
+ 				return new WP_Error( 'mobo_core_upgrade_barrier_locked', $busy['lastError'], array( 'status' => 423, 'retryAfter' => 60 ) );
+ 			}
+ 			$barrier_activated = true;
++			$barrier_result = 'draining';
+ 
+ 			$drain_timeout = class_exists( 'Mobo_Core_Settings' )
+ 				? Mobo_Core_Settings::get_int( 'mobo_core_upgrade_drain_timeout_seconds', 120, 15, 300 )
+@@ -183,6 +186,8 @@
+ 					'lastError'     => sanitize_text_field( $drained->get_error_message() ),
+ 				);
+ 				self::write_status( $blocked );
++				$barrier_result = 'blocked-site-busy';
++				$barrier_error  = $blocked['lastError'];
+ 				return new WP_Error(
+ 					$drained->get_error_code(),
+ 					$drained->get_error_message(),
+@@ -197,11 +202,16 @@
+ 				);
+ 			}
+ 
++			$barrier_result = 'drained';
++			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'drained' );
++
+ 			if ( ! Mobo_Core_Lock::renew( 'remote_plugin_upgrade', $lock, 900 ) || ! Mobo_Core_Upgrade_Coordinator::renew( $barrier_token, 900 ) ) {
+ 				return new WP_Error( 'mobo_core_upgrade_lease_lost', 'Upgrade lease was lost before filesystem replacement.', array( 'status' => 409, 'retryAfter' => 60 ) );
+ 			}
+ 
+ 			self::update_status_stage( 'backing-up' );
++			$barrier_result = 'backing-up';
++			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'backing-up' );
+ 			$backup = self::create_backup();
+ 			if ( is_wp_error( $backup ) ) {
+ 				throw new RuntimeException( $backup->get_error_message() );
+@@ -209,12 +219,18 @@
+ 			$backup_created = true;
+ 
+ 			self::update_status_stage( 'installing' );
++			$barrier_result = 'installing';
++			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'installing' );
+ 			$destination_touched = true;
+ 			$installed = self::install_package( $tmp_file );
+ 			if ( is_wp_error( $installed ) ) {
+ 				throw new RuntimeException( $installed->get_error_message() );
+ 			}
+ 
++			self::update_status_stage( 'verifying' );
++			$barrier_result = 'verifying';
++			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'verifying' );
++
+ 			$disk_version = self::read_disk_plugin_version();
+ 			if ( ! hash_equals( $target_version, $disk_version ) ) {
+ 				throw new RuntimeException( 'Installed files do not report the requested target version.' );
+@@ -231,6 +247,8 @@
+ 			);
+ 			self::write_status( $completed );
+ 			self::append_history( $completed );
++			$barrier_result = 'completed';
++			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'completed' );
+ 
+ 			return array(
+ 				'success'          => true,
+@@ -251,6 +269,11 @@
+ 			}
+ 
+ 			$message = sanitize_text_field( $e->getMessage() . $rollback_error );
++			$barrier_result = 'failed';
++			$barrier_error  = $message;
++			if ( $barrier_activated && false !== $barrier_token && class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ) {
++				Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'failed', array( 'lastError' => $message ) );
++			}
+ 			$failed = array(
+ 				'status'        => 'failed',
+ 				'deploymentId'  => $deployment_id,
+@@ -272,7 +295,11 @@
+ 				self::delete_tree( $staging_dir );
+ 			}
+ 			if ( $barrier_activated && false !== $barrier_token && class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ) {
+-				Mobo_Core_Upgrade_Coordinator::release( $barrier_token );
++				Mobo_Core_Upgrade_Coordinator::release(
++					$barrier_token,
++					$barrier_result,
++					array( 'lastError' => $barrier_error )
++				);
+ 			}
+ 			Mobo_Core_Lock::release( 'remote_plugin_upgrade', $lock );
+ 
