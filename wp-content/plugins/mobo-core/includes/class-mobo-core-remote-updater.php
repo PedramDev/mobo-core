@@ -288,6 +288,10 @@ class Mobo_Core_Remote_Updater {
 	}
 
 	private static function download_package( $url, $token ) {
+		if ( ! function_exists( 'wp_tempnam' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/file.php';
+		}
+
 		$tmp = wp_tempnam( 'mobo-core-update.zip' );
 		if ( ! $tmp ) {
 			return new WP_Error( 'mobo_core_upgrade_temp_failed', 'Could not create a temporary package file.' );
