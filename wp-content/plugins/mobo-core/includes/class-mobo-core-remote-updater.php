@@ -457,7 +457,21 @@ class Mobo_Core_Remote_Updater {
 			$file = trailingslashit( $plugin_root ) . $relative;
 			$real_root = realpath( $plugin_root );
 			$real_file = realpath( $file );
-			if ( false === $real_root || false === $real_file || 0 !== strpos( $real_file, trailingslashit( $real_root ) ) || ! is_file( $real_file ) ) {
+
+			if ( false !== $real_root ) {
+				$real_root = trailingslashit( wp_normalize_path( $real_root ) );
+			}
+
+			if ( false !== $real_file ) {
+				$real_file = wp_normalize_path( $real_file );
+			}
+
+			if (
+				false === $real_root ||
+				false === $real_file ||
+				0 !== strpos( $real_file, $real_root ) ||
+				! is_file( $real_file )
+			) {
 				return new WP_Error( 'mobo_core_upgrade_manifest_file_missing', 'Plugin manifest references a missing file: ' . sanitize_text_field( $relative ) );
 			}
 
