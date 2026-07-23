@@ -163,11 +163,11 @@ class Mobo_Core_Upgrade_Coordinator {
 	 */
 	public static function release( $token, $result = 'released', $details = array() ) {
 		$state = self::read_state();
-		$lock  = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::BARRIER_LOCK ) : array();
 		$released = Mobo_Core_Lock::release( self::BARRIER_LOCK, $token );
 
 		if ( $released ) {
 			$released_at = time();
+			$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::BARRIER_LOCK ) : array();
 			$audit = array(
 				'deploymentId'     => isset( $state['deploymentId'] ) ? sanitize_text_field( (string) $state['deploymentId'] ) : '',
 				'result'           => sanitize_key( (string) $result ),
