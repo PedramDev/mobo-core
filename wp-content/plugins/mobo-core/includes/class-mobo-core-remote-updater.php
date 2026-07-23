@@ -335,8 +335,49 @@ class Mobo_Core_Remote_Updater {
 		return $tmp;
 	}
 
-	private static function validate_package( $zip_file, $target_version, $deployment_id ) {
+	/**
+	 * Initialize the only filesystem mode suitable for unattended REST upgrades.
+	 * FTP/SSH credential prompts cannot be completed by a background deployment.
+	 *
+	 * @return true|WP_Error
+	 */
+	private static function initialize_direct_filesystem() {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
+
+		global $wp_filesystem;
+		if ( is_object( $wp_filesystem ) ) {
+			return true;
+		}
+
+		$force_direct = static function () {
+			return 'direct';
+		};
+		add_filter( 'filesystem_method', $force_direct, PHP_INT_MAX );
+		$initialized = WP_Filesystem( array(), ABSPATH, true );
+		remove_filter( 'filesystem_method', $force_direct, PHP_INT_MAX );
+
+		if ( ! $initialized || ! is_object( $wp_filesystem ) ) {
+			return new WP_Error(
+				'mobo_core_upgrade_filesystem',
+				'Could not access filesystem. PHP must have direct write access to wp-content and the plugin directory.'
+			);
+		}
+
+		if ( ! $wp_filesystem->is_writable( WP_CONTENT_DIR ) || ! $wp_filesystem->is_writable( WP_PLUGIN_DIR ) ) {
+			return new WP_Error(
+				'mobo_core_upgrade_filesystem_not_writable',
+				'WordPress content or plugin directory is not writable by PHP.'
+			);
+		}
+
+		return true;
+	}
+
+	private static function validate_package( $zip_file, $target_version, $deployment_id ) {
+		$filesystem = self::initialize_direct_filesystem();
+		if ( is_wp_error( $filesystem ) ) {
+			return $filesystem;
+		}
 
 		$staging = trailingslashit( MOBO_CORE_DATA_DIR ) . 'upgrade-staging/' . sanitize_file_name( $deployment_id );
 		self::delete_tree( $staging );
@@ -450,12 +491,12 @@ class Mobo_Core_Remote_Updater {
 	}
 
 	private static function install_package( $zip_file ) {
-		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 		require_once ABSPATH . 'wp-admin/includes/plugin.php';
 
-		if ( ! WP_Filesystem() ) {
-			return new WP_Error( 'mobo_core_upgrade_filesystem', 'WordPress filesystem could not be initialized.' );
+		$filesystem = self::initialize_direct_filesystem();
+		if ( is_wp_error( $filesystem ) ) {
+			return $filesystem;
 		}
 
 		$skin = class_exists( 'Automatic_Upgrader_Skin' ) ? new Automatic_Upgrader_Skin() : new WP_Upgrader_Skin();
