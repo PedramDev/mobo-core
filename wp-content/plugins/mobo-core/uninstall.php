@@ -77,6 +77,17 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_real_cron_expected_interval_seconds' );
 	delete_option( 'mobo_core_real_cron_process_webhooks' );
 	delete_option( 'mobo_core_process_webhook_on_receive' );
+	delete_option( 'mobo_core_heartbeat_time_budget_seconds' );
+	delete_option( 'mobo_core_heartbeat_max_rounds' );
+	delete_option( 'mobo_core_heartbeat_remote_timeout_seconds' );
+	delete_option( 'mobo_core_portal_heartbeat_last_attempt_at' );
+	delete_option( 'mobo_core_portal_heartbeat_last_success_at' );
+	delete_option( 'mobo_core_portal_heartbeat_last_result' );
+	delete_option( 'mobo_core_remote_upgrade_status' );
+	delete_option( 'mobo_core_remote_upgrade_history' );
+	delete_option( 'mobo_core_upgrade_barrier_state' );
+	delete_option( 'mobo_core_upgrade_drain_timeout_seconds' );
+	delete_option( 'mobo_core_remote_update_allowed_hosts' );
 	delete_option( 'mobo_core_webhook_queue_last_attempt_at' );
 	delete_option( 'mobo_core_webhook_queue_last_success_at' );
 	delete_option( 'mobo_core_webhook_queue_last_activity_at' );
@@ -100,6 +111,19 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_category_placeholder_repair_result' );
 	delete_option( 'mobo_core_category_placeholder_repair_at' );
 	delete_option( 'mobo_core_cache_purge_last_result' );
+	delete_option( 'mobo_core_auto_reconciliation_enabled' );
+	delete_option( 'mobo_core_reconciliation_fast_interval' );
+	delete_option( 'mobo_core_reconciliation_products_per_run' );
+	delete_option( 'mobo_core_reconciliation_variation_batch' );
+	delete_option( 'mobo_core_reconciliation_deep_schedule' );
+	delete_option( 'mobo_core_reconciliation_state' );
+	delete_option( 'mobo_core_reconciliation_revision' );
+	delete_option( 'mobo_core_reconciliation_fallback_cursor' );
+	delete_option( 'mobo_core_reconciliation_last_check_at' );
+	delete_option( 'mobo_core_reconciliation_last_success_at' );
+	delete_option( 'mobo_core_reconciliation_last_deep_at' );
+	delete_option( 'mobo_core_reconciliation_last_result' );
+	delete_option( 'mobo_core_reconciliation_changes_endpoint' );
 	delete_transient( 'mobo_core_pw_options_enforced_notice' );
 
 	/*

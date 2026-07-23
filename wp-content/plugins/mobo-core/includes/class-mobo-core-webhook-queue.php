@@ -150,6 +150,10 @@ class Mobo_Core_Webhook_Queue {
 	 * @return array
 	 */
 	public function process( $time_budget = null, $max_items = null ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'webhook-queue' ), array( 'processed' => 0, 'failed' => 0, 'remainingFile' => true, 'remainingTable' => true, 'remainingDueTable' => false ) );
+		}
+
 		$this->ensure_dirs();
 		update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
 
@@ -404,6 +408,11 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		foreach ( $files as $file ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$messages[] = 'پردازش صف برای آپدیت امن افزونه در مرز امن متوقف شد.';
+				break;
+			}
+
 			if ( $processed >= $max_files ) {
 				break;
 			}
@@ -709,6 +718,11 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		foreach ( $rows as $row ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$messages[] = 'پردازش جدول وب‌هوک برای آپدیت امن افزونه در مرز امن متوقف شد.';
+				break;
+			}
+
 			if ( $processed >= $max_items ) {
 				break;
 			}
@@ -880,6 +894,10 @@ class Mobo_Core_Webhook_Queue {
 			case 'ProductUpdated':
 				$result = $product_sync->process_product_updated_payload( $payload );
 
+				if ( class_exists( 'Mobo_Core_Reconciliation' ) && is_array( $result ) ) {
+					Mobo_Core_Reconciliation::record_webhook_result( 'ProductUpdated', $payload, $result );
+				}
+
 				if ( is_array( $result ) ) {
 					$result['payload'] = $payload;
 				}
@@ -887,7 +905,11 @@ class Mobo_Core_Webhook_Queue {
 				return $result;
 
 			case 'UpdateVariant':
-				return $product_sync->process_update_variant_payload( $payload );
+				$result = $product_sync->process_update_variant_payload( $payload );
+				if ( class_exists( 'Mobo_Core_Reconciliation' ) && is_array( $result ) ) {
+					Mobo_Core_Reconciliation::record_webhook_result( 'UpdateVariant', $payload, $result );
+				}
+				return $result;
 
 			case 'ShippingMethodsChanged':
 				return $this->process_shipping_methods_changed_payload( $payload );

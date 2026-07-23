@@ -319,6 +319,137 @@ class Mobo_Core_Product_Map {
 	}
 
 	/**
+	 * Delete a variation mapping by remote GUID.
+	 *
+	 * @param string $guid Remote variant GUID.
+	 * @return bool
+	 */
+	public function delete_variation( $guid ) {
+		return $this->delete_by_remote_guid( $guid, self::TYPE_VARIATION );
+	}
+
+	/**
+	 * Delete every map row pointing to a local WordPress object.
+	 *
+	 * @param int $post_id WordPress post ID.
+	 * @return bool
+	 */
+	public function delete_by_post_id( $post_id ) {
+		global $wpdb;
+
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! self::table_exists() ) {
+			return false;
+		}
+
+		return false !== $wpdb->delete( self::table_name(), array( 'wp_post_id' => $post_id ), array( '%d' ) );
+	}
+
+	/**
+	 * Delete variation map rows pointing to a local WordPress object without
+	 * touching the product mapping for the same post ID.
+	 *
+	 * @param int $post_id WordPress post ID.
+	 * @return bool
+	 */
+	public function delete_variation_by_post_id( $post_id ) {
+		global $wpdb;
+
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! self::table_exists() ) {
+			return false;
+		}
+
+		return false !== $wpdb->delete(
+			self::table_name(),
+			array(
+				'wp_post_id' => $post_id,
+				'object_type' => self::TYPE_VARIATION,
+			),
+			array( '%d', '%s' )
+		);
+	}
+
+	/**
+	 * Delete variation mappings owned by one remote product, optionally keeping
+	 * the GUIDs present in the current authoritative snapshot.
+	 *
+	 * @param string $parent_guid Parent remote product GUID.
+	 * @param array  $keep_guids Remote variation GUIDs to retain.
+	 * @return int Number of deleted rows.
+	 */
+	public function delete_variations_for_parent( $parent_guid, $keep_guids = array() ) {
+		global $wpdb;
+
+		$parent_guid = sanitize_text_field( (string) $parent_guid );
+		if ( '' === $parent_guid || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$keep = array();
+		foreach ( is_array( $keep_guids ) ? $keep_guids : array() as $guid ) {
+			$guid = sanitize_text_field( (string) $guid );
+			if ( '' !== $guid ) {
+				$keep[ $guid ] = true;
+			}
+		}
+
+		$table = self::table_name();
+		$rows  = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, remote_guid FROM {$table} WHERE object_type = %s AND parent_remote_guid = %s",
+				self::TYPE_VARIATION,
+				$parent_guid
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) || empty( $rows ) ) {
+			return 0;
+		}
+
+		$deleted = 0;
+		foreach ( $rows as $row ) {
+			$remote_guid = sanitize_text_field( (string) ( $row['remote_guid'] ?? '' ) );
+			if ( '' !== $remote_guid && isset( $keep[ $remote_guid ] ) ) {
+				continue;
+			}
+
+			if ( false !== $wpdb->delete( $table, array( 'id' => absint( $row['id'] ?? 0 ) ), array( '%d' ) ) ) {
+				$deleted++;
+			}
+		}
+
+		return $deleted;
+	}
+
+	/**
+	 * Delete a map row by remote identity and object type.
+	 *
+	 * @param string $guid Remote GUID.
+	 * @param string $object_type Object type.
+	 * @return bool
+	 */
+	private function delete_by_remote_guid( $guid, $object_type ) {
+		global $wpdb;
+
+		$guid        = sanitize_text_field( (string) $guid );
+		$object_type = sanitize_key( (string) $object_type );
+		if ( '' === $guid || ! self::table_exists() ) {
+			return false;
+		}
+
+		return false !== $wpdb->delete(
+			self::table_name(),
+			array(
+				'remote_guid' => $guid,
+				'object_type' => $object_type,
+			),
+			array( '%s', '%s' )
+		);
+	}
+
+	/**
 	 * Incrementally seed product/variation map from legacy post meta.
 	 *
 	 * This method is intentionally bounded. If a site has many products, missing

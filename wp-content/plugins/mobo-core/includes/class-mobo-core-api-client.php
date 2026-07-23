@@ -78,6 +78,61 @@ class Mobo_Core_API_Client {
 
 
 	/**
+	 * Get revision-based product changes for adaptive reconciliation.
+	 *
+	 * Preferred endpoint: /sync/changes?afterRevision=...&limit=...
+	 * Compatibility endpoint: /api/sync/changes?afterRevision=...&limit=...
+	 *
+	 * @param int $after_revision Last applied revision.
+	 * @param int $limit Maximum changes.
+	 * @return array|WP_Error
+	 */
+	public function get_sync_changes( $after_revision, $limit ) {
+		$args = array(
+			'afterRevision' => max( 0, absint( $after_revision ) ),
+			'limit'         => max( 1, min( 500, absint( $limit ) ) ),
+		);
+
+		$response = $this->get_json( add_query_arg( $args, 'sync/changes' ) );
+		if ( ! is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		return $this->get_json( add_query_arg( $args, 'api/sync/changes' ) );
+	}
+
+	/**
+	 * Get a single product payload by Portal numeric product ID.
+	 *
+	 * @param int    $portal_product_id Portal product ID.
+	 * @param string $sync_id Sync ID.
+	 * @return array|WP_Error
+	 */
+	public function get_product_by_portal_id( $portal_product_id, $sync_id = '' ) {
+		$portal_product_id = absint( $portal_product_id );
+		$sync_id           = sanitize_text_field( (string) $sync_id );
+
+		if ( $portal_product_id <= 0 ) {
+			return new WP_Error( 'mobo_core_missing_portal_product_id', 'Portal product ID is missing.' );
+		}
+
+		if ( '' === $sync_id ) {
+			$sync_id = 'reconcile-' . gmdate( 'YmdHis' );
+		}
+
+		$path = add_query_arg(
+			array(
+				'ProductPortalId' => $portal_product_id,
+				'SyncId'         => $sync_id,
+			),
+			'get-products-by-portal-id'
+		);
+
+		return $this->get_json( $path );
+	}
+
+
+	/**
 	 * Get a single product payload by remote product GUID.
 	 *
 	 * MoboCore endpoint:

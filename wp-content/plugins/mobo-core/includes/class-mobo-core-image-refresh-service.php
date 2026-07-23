@@ -323,7 +323,21 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function process_queue( $limit = 0 ) {
-		if ( ! $this->is_unlocked() ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-refresh-queue' ), array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => true ) );
+		}
+
+		$worker_lock = Mobo_Core_Lock::acquire( 'image_refresh_queue_worker', 300 );
+		if ( false === $worker_lock ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-refresh-queue' ), array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => true ) );
+			}
+
+			return array( 'success' => true, 'status' => 'locked', 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => true );
+		}
+
+		try {
+			if ( ! $this->is_unlocked() ) {
 			return $this->save_last_result( $this->locked_result() );
 		}
 
@@ -390,8 +404,14 @@ class Mobo_Core_Image_Refresh_Service {
 		$processed = 0;
 		$failed    = 0;
 		$skipped   = 0;
+		$paused_for_upgrade = false;
 
 		foreach ( $rows as $row ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$paused_for_upgrade = true;
+				break;
+			}
+
 			$id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
 
 			if ( $id <= 0 || ! $queue->lock( $id, 180 ) ) {
@@ -421,13 +441,17 @@ class Mobo_Core_Image_Refresh_Service {
 		return $this->save_last_result(
 			array(
 				'success'   => true,
-				'status'    => 'processed',
+				'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : 'processed',
 				'processed' => $processed,
 				'failed'    => $failed,
 				'skipped'   => $skipped,
-				'remaining' => $queue->count_due() > 0,
+				'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
 			)
 		);
+	
+		} finally {
+			Mobo_Core_Lock::release( 'image_refresh_queue_worker', $worker_lock );
+		}
 	}
 
 	/**

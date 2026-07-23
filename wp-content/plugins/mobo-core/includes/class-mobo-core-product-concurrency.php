@@ -44,35 +44,49 @@ class Mobo_Core_Product_Concurrency {
 
 		$wait_seconds = max( 0, min( 10, absint( $wait_seconds ) ) );
 		$ttl_seconds  = max( 30, absint( $ttl_seconds ) );
-		$lock_name    = self::mysql_lock_name( $product_guid );
+		$mysql_name   = self::mysql_lock_name( $product_guid );
+		$runtime_name = self::fallback_lock_name( $product_guid );
+		$runtime_token = class_exists( 'Mobo_Core_Lock' )
+			? Mobo_Core_Lock::acquire( $runtime_name, $ttl_seconds )
+			: false;
+
+		/*
+		 * Every product write owns an observable runtime lease, even when MySQL
+		 * GET_LOCK is available. The upgrade coordinator can therefore wait for
+		 * active product writes to finish instead of replacing files underneath
+		 * an unobservable named MySQL lock.
+		 */
+		if ( false === $runtime_token ) {
+			return false;
+		}
 
 		if ( $wpdb instanceof wpdb ) {
 			$previous_suppress = $wpdb->suppress_errors( true );
-			$result = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, $wait_seconds ) );
+			$result = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $mysql_name, $wait_seconds ) );
 			$wpdb->suppress_errors( $previous_suppress );
 
 			if ( '1' === (string) $result ) {
 				return array(
-					'type' => 'mysql',
-					'name' => $lock_name,
+					'type'        => 'mysql-runtime',
+					'name'        => $mysql_name,
+					'runtimeName' => $runtime_name,
+					'token'       => $runtime_token,
 				);
+			}
+
+			/* A supported MySQL lock is busy; do not fall through to runtime-only. */
+			if ( '0' === (string) $result ) {
+				Mobo_Core_Lock::release( $runtime_name, $runtime_token );
+				return false;
 			}
 		}
 
-		if ( class_exists( 'Mobo_Core_Lock' ) ) {
-			$fallback_name = self::fallback_lock_name( $product_guid );
-			$token         = Mobo_Core_Lock::acquire( $fallback_name, $ttl_seconds );
-
-			if ( false !== $token ) {
-				return array(
-					'type'  => 'runtime',
-					'name'  => $fallback_name,
-					'token' => $token,
-				);
-			}
-		}
-
-		return false;
+		/* Database does not support named locks; the runtime lease remains valid. */
+		return array(
+			'type'  => 'runtime',
+			'name'  => $runtime_name,
+			'token' => $runtime_token,
+		);
 	}
 
 	/**
@@ -88,17 +102,17 @@ class Mobo_Core_Product_Concurrency {
 			return;
 		}
 
-		if ( 'mysql' === $lock['type'] ) {
-			if ( $wpdb instanceof wpdb ) {
-				$previous_suppress = $wpdb->suppress_errors( true );
-				$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', sanitize_text_field( (string) $lock['name'] ) ) );
-				$wpdb->suppress_errors( $previous_suppress );
-			}
-			return;
+		if ( 'mysql-runtime' === $lock['type'] && $wpdb instanceof wpdb ) {
+			$previous_suppress = $wpdb->suppress_errors( true );
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', sanitize_text_field( (string) $lock['name'] ) ) );
+			$wpdb->suppress_errors( $previous_suppress );
 		}
 
-		if ( in_array( $lock['type'], array( 'runtime', 'transient' ), true ) && class_exists( 'Mobo_Core_Lock' ) && ! empty( $lock['token'] ) ) {
-			Mobo_Core_Lock::release( sanitize_key( (string) $lock['name'] ), sanitize_text_field( (string) $lock['token'] ) );
+		if ( in_array( $lock['type'], array( 'runtime', 'transient', 'mysql-runtime' ), true ) && class_exists( 'Mobo_Core_Lock' ) && ! empty( $lock['token'] ) ) {
+			$runtime_name = 'mysql-runtime' === $lock['type'] && ! empty( $lock['runtimeName'] )
+				? sanitize_key( (string) $lock['runtimeName'] )
+				: sanitize_key( (string) $lock['name'] );
+			Mobo_Core_Lock::release( $runtime_name, sanitize_text_field( (string) $lock['token'] ) );
 		}
 	}
 

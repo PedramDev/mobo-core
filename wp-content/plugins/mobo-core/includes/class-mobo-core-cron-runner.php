@@ -23,20 +23,30 @@ class Mobo_Core_Cron_Runner {
 	 * stops. The global runner lease is renewed before every major stage.
 	 *
 	 * @param string $source Source label.
+	 * @param bool   $send_health_report Send the outbound health report after the slice.
+	 * @param array  $runtime_overrides Optional bounded runtime overrides.
 	 * @return array
 	 */
-	public function run( $source = 'real-cron' ) {
+	public function run( $source = 'real-cron', $send_health_report = true, $runtime_overrides = array() ) {
 		$source = sanitize_key( (string) $source );
 		$source = '' !== $source ? $source : 'real-cron';
 
 		update_option( 'mobo_core_real_cron_last_hit_at', time(), false );
+
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			$result               = Mobo_Core_Upgrade_Coordinator::paused_result( 'cron-runner' );
+			$result['source']     = $source;
+			$result['executedAt'] = time();
+			$this->save_last_result( $result );
+			return $result;
+		}
 
 		if ( function_exists( 'ignore_user_abort' ) ) {
 			ignore_user_abort( true );
 		}
 
 		try {
-			$config = $this->get_runtime_config();
+			$config = $this->get_runtime_config( $runtime_overrides );
 			$lock   = Mobo_Core_Lock::acquire( 'real_cron_runner', $config['lockTtlSeconds'] );
 		} catch ( Throwable $e ) {
 			$result = $this->exception_result( 'lock-exception', $e, array( 'source' => $source ) );
@@ -109,7 +119,7 @@ class Mobo_Core_Cron_Runner {
 		 */
 		$this->save_last_result( $result );
 
-		if ( class_exists( 'Mobo_Core_Health_Reporter' ) ) {
+		if ( $send_health_report && class_exists( 'Mobo_Core_Health_Reporter' ) ) {
 			try {
 				$health_reporter       = new Mobo_Core_Health_Reporter();
 				$result['healthReport'] = $health_reporter->send_report( $source );
@@ -229,9 +239,10 @@ class Mobo_Core_Cron_Runner {
 	 * covers the longest configured blocking HTTP request plus recovery grace,
 	 * preventing overlap while one request is legitimately still in flight.
 	 *
+	 * @param array $overrides Optional heartbeat/runtime limits.
 	 * @return array
 	 */
-	private function get_runtime_config() {
+	private function get_runtime_config( $overrides = array() ) {
 		$configured_budget = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
 		$safety_margin     = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_safety_margin_seconds', 3, 1, 10 );
 		$php_limit         = absint( ini_get( 'max_execution_time' ) );
@@ -248,12 +259,33 @@ class Mobo_Core_Cron_Runner {
 		$configured_ttl   = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
 		$lock_ttl         = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
 
+		$max_rounds              = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_rounds', 100, 1, 500 );
+		$product_steps_per_round = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
+
+		if ( is_array( $overrides ) ) {
+			if ( isset( $overrides['maxTimeBudgetSeconds'] ) ) {
+				$override_budget  = max( 3, min( 55, absint( $overrides['maxTimeBudgetSeconds'] ) ) );
+				$configured_budget = min( $configured_budget, $override_budget );
+				$effective_budget  = min( $effective_budget, $override_budget );
+			}
+
+			if ( isset( $overrides['maxRounds'] ) ) {
+				$max_rounds = max( 1, min( 500, absint( $overrides['maxRounds'] ) ) );
+			}
+
+			if ( isset( $overrides['productStepsPerRound'] ) ) {
+				$product_steps_per_round = max( 1, min( 20, absint( $overrides['productStepsPerRound'] ) ) );
+			}
+		}
+
+		$lock_ttl = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
+
 		return array(
 			'configuredTimeBudgetSeconds' => $configured_budget,
 			'effectiveTimeBudgetSeconds'  => $effective_budget,
 			'safetyMarginSeconds'         => $safety_margin,
-			'maxRounds'                   => Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_rounds', 100, 1, 500 ),
-			'productStepsPerRound'        => Mobo_Core_Settings::get_int( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 ),
+			'maxRounds'                   => $max_rounds,
+			'productStepsPerRound'        => $product_steps_per_round,
 			'lockTtlSeconds'              => $lock_ttl,
 			'configuredLockTtlSeconds'    => $configured_ttl,
 			'longestBlockingTimeout'      => $blocking_timeout,
@@ -274,6 +306,7 @@ class Mobo_Core_Cron_Runner {
 		$rounds          = 0;
 		$lock_renewals   = 0;
 		$lock_lost       = false;
+		$upgrade_paused  = false;
 		$stop_reason     = 'queues-empty-or-deferred';
 		$made_progress   = false;
 		$immediate_work  = false;
@@ -281,6 +314,12 @@ class Mobo_Core_Cron_Runner {
 		$aggregate       = $this->empty_aggregate_result( $source );
 
 		while ( $rounds < absint( $config['maxRounds'] ) ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$upgrade_paused = true;
+				$stop_reason    = 'plugin-upgrade-barrier';
+				break;
+			}
+
 			if ( ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
 				$stop_reason = 'time-budget-exhausted';
 				break;
@@ -313,6 +352,12 @@ class Mobo_Core_Cron_Runner {
 				break;
 			}
 
+			if ( ! empty( $round['upgradePaused'] ) ) {
+				$upgrade_paused = true;
+				$stop_reason    = 'plugin-upgrade-barrier';
+				break;
+			}
+
 			if ( ! empty( $round['deadlineReached'] ) || ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
 				$stop_reason = 'time-budget-exhausted';
 				break;
@@ -329,7 +374,7 @@ class Mobo_Core_Cron_Runner {
 			}
 		}
 
-		if ( $rounds >= absint( $config['maxRounds'] ) && $immediate_work ) {
+		if ( ! $upgrade_paused && $rounds >= absint( $config['maxRounds'] ) && $immediate_work ) {
 			$stop_reason = 'max-rounds-reached';
 		}
 
@@ -340,6 +385,7 @@ class Mobo_Core_Cron_Runner {
 		 * queue waits for the next real cron and cannot create a tight loop.
 		 */
 		$needs_continuation = ! $lock_lost
+			&& ! $upgrade_paused
 			&& $made_progress
 			&& (
 				$immediate_work
@@ -347,12 +393,19 @@ class Mobo_Core_Cron_Runner {
 			);
 
 		$aggregate['success']           = ! $lock_lost;
-		$aggregate['status']            = $lock_lost ? 'lock-lost' : ( empty( $aggregate['runnerErrors'] ) ? 'ok' : 'partial' );
+		$aggregate['status']            = $upgrade_paused
+			? 'paused-for-upgrade'
+			: ( $lock_lost ? 'lock-lost' : ( empty( $aggregate['runnerErrors'] ) ? 'ok' : 'partial' ) );
 		$aggregate['executedAt']        = time();
 		$aggregate['needsContinuation'] = $needs_continuation;
-		$aggregate['message']           = $lock_lost
-			? 'Cron processing stopped because the runner lease was lost.'
-			: 'Cron queue drain slice completed.';
+		$aggregate['message']           = $upgrade_paused
+			? 'Cron processing reached a safe boundary and paused for plugin upgrade.'
+			: ( $lock_lost
+				? 'Cron processing stopped because the runner lease was lost.'
+				: 'Cron queue drain slice completed.' );
+		if ( $upgrade_paused && class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ) {
+			$aggregate['upgradeBarrier'] = Mobo_Core_Upgrade_Coordinator::get_status();
+		}
 		$aggregate['runner']            = array(
 			'pluginVersion'                   => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'configuredTimeBudgetSeconds'     => absint( $config['configuredTimeBudgetSeconds'] ),
@@ -366,6 +419,7 @@ class Mobo_Core_Cron_Runner {
 			'madeProgress'                    => $made_progress,
 			'hasImmediateWork'                => $immediate_work,
 			'lockLost'                        => $lock_lost,
+			'upgradePaused'                    => $upgrade_paused,
 			'lockRenewals'                    => $lock_renewals,
 			'configuredLockTtlSeconds'        => absint( $config['configuredLockTtlSeconds'] ),
 			'effectiveLockTtlSeconds'         => absint( $config['lockTtlSeconds'] ),
@@ -502,6 +556,26 @@ class Mobo_Core_Cron_Runner {
 			if ( $steps > 0 ) {
 				$round['queuePasses']['productSync']++;
 			}
+		}
+
+
+		/* Adaptive reconciliation / sync health. */
+		if ( 1 === absint( $round_number ) && class_exists( 'Mobo_Core_Reconciliation' ) && ! isset( $disabled_stages['reconciliation'] ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$round['reconciliation'] = $this->execute_stage(
+				'reconciliation',
+				function () use ( $source ) {
+					$reconciliation = new Mobo_Core_Reconciliation();
+					return $reconciliation->run_tick( $source, false, false );
+				},
+				array( 'success' => false, 'status' => 'exception', 'processedProducts' => 0, 'processedVariations' => 0, 'needsContinuation' => false ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['reconciliation']++;
 		}
 
 		/* Reprice queue. */
@@ -666,6 +740,7 @@ class Mobo_Core_Cron_Runner {
 			'maintenance'            => array( 'status' => 'skipped' ),
 			'productSteps'           => 0,
 			'productStatus'          => array(),
+			'reconciliation'          => array( 'success' => true, 'status' => 'skipped', 'processedProducts' => 0, 'processedVariations' => 0, 'needsContinuation' => false ),
 			'lastStep'               => null,
 			'runnerErrors'           => array(),
 			'queuePasses'            => array(
@@ -673,6 +748,7 @@ class Mobo_Core_Cron_Runner {
 				'imageQueue'        => 0,
 				'imageRefreshQueue' => 0,
 				'productSync'       => 0,
+				'reconciliation'    => 0,
 				'repriceQueue'      => 0,
 				'recategorizeQueue' => 0,
 				'orderSubmissions'  => 0,
@@ -707,6 +783,12 @@ class Mobo_Core_Cron_Runner {
 	 * @return bool
 	 */
 	private function prepare_stage( $deadline, $config, $lock_token, &$lock_renewals, &$round, $disabled_stages = array() ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			$round['upgradePaused'] = true;
+			$this->finalize_round_state( $round, $disabled_stages );
+			return false;
+		}
+
 		if ( ! $this->has_time_remaining( $deadline, $config['safetyMarginSeconds'] ) ) {
 			$round['deadlineReached'] = true;
 			$this->finalize_round_state( $round, $disabled_stages );
@@ -760,9 +842,11 @@ class Mobo_Core_Cron_Runner {
 		$recat_processed   = absint( isset( $round['recategorizeQueue']['processed'] ) ? $round['recategorizeQueue']['processed'] : 0 );
 		$order_processed   = absint( isset( $round['orderSubmissions']['processed'] ) ? $round['orderSubmissions']['processed'] : 0 );
 		$product_steps     = absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
+		$reconciliation_products = absint( isset( $round['reconciliation']['processedProducts'] ) ? $round['reconciliation']['processedProducts'] : 0 );
+		$reconciliation_variations = absint( isset( $round['reconciliation']['processedVariations'] ) ? $round['reconciliation']['processedVariations'] : 0 );
 		$automation_moved  = ! empty( $round['imageRefreshAutomation']['progressed'] );
 
-		$round['madeProgress'] = ( $webhook_processed + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $product_steps ) > 0 || $automation_moved;
+		$round['madeProgress'] = ( $webhook_processed + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $product_steps + $reconciliation_products + $reconciliation_variations ) > 0 || $automation_moved;
 
 		$webhook_due = false;
 		if ( ! isset( $disabled_stages['webhookQueue'] ) && class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
@@ -784,6 +868,7 @@ class Mobo_Core_Cron_Runner {
 			|| ( ! isset( $disabled_stages['imageRefreshQueue'] ) && ! empty( $round['imageRefreshQueue']['remaining'] ) )
 			|| $automation_continue
 			|| $product_continue
+			|| ( ! isset( $disabled_stages['reconciliation'] ) && ! empty( $round['reconciliation']['needsContinuation'] ) )
 			|| ( ! isset( $disabled_stages['repriceQueue'] ) && ! empty( $round['repriceQueue']['remaining'] ) )
 			|| ( ! isset( $disabled_stages['recategorizeQueue'] ) && ! empty( $round['recategorizeQueue']['remaining'] ) )
 			|| ( ! isset( $disabled_stages['orderSubmissions'] ) && ! empty( $round['orderSubmissions']['remaining'] ) );
@@ -835,6 +920,9 @@ class Mobo_Core_Cron_Runner {
 		);
 
 		$aggregate['imageRefreshAutomation'] = $round['imageRefreshAutomation'];
+		if ( isset( $round['reconciliation'] ) && is_array( $round['reconciliation'] ) && 'skipped' !== ( isset( $round['reconciliation']['status'] ) ? $round['reconciliation']['status'] : '' ) ) {
+			$aggregate['reconciliation'] = $round['reconciliation'];
+		}
 		$aggregate['productSteps'] += absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
 		$aggregate['productStatus'] = isset( $round['productStatus'] ) && is_array( $round['productStatus'] ) ? $round['productStatus'] : $aggregate['productStatus'];
 		if ( null !== $round['lastStep'] ) {

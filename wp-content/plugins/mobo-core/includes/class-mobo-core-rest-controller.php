@@ -96,6 +96,38 @@ class Mobo_Core_Rest_Controller {
 			)
 		);
 
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/heartbeat',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'run_heartbeat' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/upgrade/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_upgrade_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/upgrade/apply',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'apply_remote_upgrade' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
 		register_rest_route(
 			'mobo-core/v1',
 			'/health/report-now',
@@ -424,6 +456,163 @@ class Mobo_Core_Rest_Controller {
 		return rest_ensure_response( $reporter->get_local_status() );
 	}
 
+
+	/**
+	 * Wake the site, execute one bounded shared-engine slice and return health.
+	 *
+	 * Portal calls this endpoint periodically. It is intentionally POST-only and
+	 * explicitly non-cacheable so a CDN/page cache cannot answer without booting
+	 * WordPress/PHP. The work is executed by the same cron runner used by cPanel
+	 * and the self worker; no parallel sync implementation is introduced.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function run_heartbeat( $request ) {
+		$started_at = microtime( true );
+		$attempt_at = time();
+
+		update_option( 'mobo_core_portal_heartbeat_last_attempt_at', $attempt_at, false );
+
+		$work = array(
+			'success' => false,
+			'status'  => 'runner-unavailable',
+		);
+
+		$heartbeat_budget = Mobo_Core_Settings::get_int( 'mobo_core_heartbeat_time_budget_seconds', 12, 5, 25 );
+		$remote_timeout  = Mobo_Core_Settings::get_int( 'mobo_core_heartbeat_remote_timeout_seconds', 10, 5, 20 );
+		$overrides       = array(
+			'mobo_core_api_request_timeout_seconds'       => $remote_timeout,
+			'mobo_core_payload_pull_timeout_seconds'      => $remote_timeout,
+			'mobo_core_real_cron_time_budget_seconds'     => $heartbeat_budget,
+			'mobo_core_images_per_run'                    => 1,
+			'mobo_core_image_refresh_per_run'             => 1,
+			'mobo_core_webhook_files_per_run'             => 2,
+			'mobo_core_reprice_batch_size'                => 5,
+		);
+
+		foreach ( $overrides as $key => $value ) {
+			Mobo_Core_Settings::set_runtime_override( $key, $value );
+		}
+
+		try {
+			$runner = new Mobo_Core_Cron_Runner();
+			$work   = $runner->run(
+				'portal-heartbeat',
+				false,
+				array(
+					'maxTimeBudgetSeconds' => $heartbeat_budget,
+					'maxRounds'             => Mobo_Core_Settings::get_int( 'mobo_core_heartbeat_max_rounds', 2, 1, 10 ),
+					'productStepsPerRound'  => 1,
+				)
+			);
+		} catch ( Throwable $e ) {
+			$work = array(
+				'success'        => false,
+				'status'         => 'heartbeat-runner-exception',
+				'message'        => $e->getMessage(),
+				'exceptionClass' => get_class( $e ),
+			);
+		} finally {
+			foreach ( array_keys( $overrides ) as $key ) {
+				Mobo_Core_Settings::clear_runtime_override( $key );
+			}
+		}
+
+		$reporter = new Mobo_Core_Health_Reporter();
+		$health   = $reporter->get_local_status();
+		$duration = max( 0, (int) round( ( microtime( true ) - $started_at ) * 1000 ) );
+		$status   = ! empty( $work['success'] ) ? 'online' : 'online-worker-warning';
+
+		$result = array(
+			'success'       => true,
+			'status'        => $status,
+			'heartbeatAt'   => gmdate( 'c' ),
+			'durationMs'    => $duration,
+			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'worker'        => $this->compact_heartbeat_work( $work ),
+			'data'          => isset( $health['data'] ) && is_array( $health['data'] ) ? $health['data'] : array(),
+			'lastReport'    => isset( $health['lastReport'] ) && is_array( $health['lastReport'] ) ? $health['lastReport'] : array(),
+		);
+
+		$stored_result = array(
+			'success'       => $result['success'],
+			'status'        => $result['status'],
+			'heartbeatAt'   => $result['heartbeatAt'],
+			'durationMs'    => $result['durationMs'],
+			'pluginVersion' => $result['pluginVersion'],
+			'worker'        => $result['worker'],
+		);
+
+		update_option( 'mobo_core_portal_heartbeat_last_success_at', time(), false );
+		update_option( 'mobo_core_portal_heartbeat_last_result', $stored_result, false );
+
+		$response = new WP_REST_Response( $result, 200 );
+		$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+		$response->header( 'Pragma', 'no-cache' );
+		$response->header( 'Expires', 'Wed, 11 Jan 1984 05:00:00 GMT' );
+		$response->header( 'X-Mobo-Heartbeat', '1' );
+
+		return $response;
+	}
+
+	/**
+	 * Keep the heartbeat payload bounded while preserving operational evidence.
+	 *
+	 * @param array $work Runner result.
+	 * @return array
+	 */
+	private function compact_heartbeat_work( $work ) {
+		if ( ! is_array( $work ) ) {
+			return array(
+				'success' => false,
+				'status'  => 'invalid-result',
+			);
+		}
+
+		$runner = isset( $work['runner'] ) && is_array( $work['runner'] ) ? $work['runner'] : array();
+
+		return array(
+			'success'           => ! empty( $work['success'] ),
+			'status'            => isset( $work['status'] ) ? sanitize_key( (string) $work['status'] ) : 'unknown',
+			'executedAt'        => isset( $work['executedAt'] ) ? absint( $work['executedAt'] ) : 0,
+			'needsContinuation' => ! empty( $work['needsContinuation'] ),
+			'message'           => isset( $work['message'] ) ? sanitize_text_field( (string) $work['message'] ) : '',
+			'runner'            => array(
+				'elapsedMs'       => isset( $runner['elapsedMs'] ) ? absint( $runner['elapsedMs'] ) : 0,
+				'rounds'          => isset( $runner['rounds'] ) ? absint( $runner['rounds'] ) : 0,
+				'stopReason'      => isset( $runner['stopReason'] ) ? sanitize_key( (string) $runner['stopReason'] ) : '',
+				'madeProgress'    => ! empty( $runner['madeProgress'] ),
+				'hasImmediateWork' => ! empty( $runner['hasImmediateWork'] ),
+			),
+			'webhookQueue'      => isset( $work['webhookQueue'] ) && is_array( $work['webhookQueue'] ) ? $work['webhookQueue'] : array(),
+			'productStatus'     => isset( $work['productStatus'] ) && is_array( $work['productStatus'] ) ? $work['productStatus'] : array(),
+			'reconciliation'    => isset( $work['reconciliation'] ) && is_array( $work['reconciliation'] ) ? $work['reconciliation'] : array(),
+		);
+	}
+
+
+	/**
+	 * Return Portal-driven plugin upgrade state.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_upgrade_status( $request ) {
+		return rest_ensure_response( Mobo_Core_Remote_Updater::get_status() );
+	}
+
+	/**
+	 * Download, verify and install one release selected in Portal.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function apply_remote_upgrade( $request ) {
+		$result = Mobo_Core_Remote_Updater::apply( $request );
+		return is_wp_error( $result ) ? $result : rest_ensure_response( $result );
+	}
+
 	/**
 	 * Force-send health report to MoboCore.
 	 *
@@ -492,6 +681,10 @@ class Mobo_Core_Rest_Controller {
 		$lock = Mobo_Core_Lock::acquire( 'manual_sync_start', 20 );
 
 		if ( false === $lock ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return rest_ensure_response( Mobo_Core_Upgrade_Coordinator::paused_result( 'sync-start' ) );
+			}
+
 			return rest_ensure_response(
 				array(
 					'success' => false,
@@ -545,6 +738,10 @@ class Mobo_Core_Rest_Controller {
 		$lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
 
 		if ( false === $lock ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return rest_ensure_response( Mobo_Core_Upgrade_Coordinator::paused_result( 'sync-run' ) );
+			}
+
 			$sync = new Mobo_Core_Product_Sync();
 
 			return rest_ensure_response(

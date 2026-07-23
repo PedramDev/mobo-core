@@ -208,6 +208,10 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	public function run_tick( $source = 'real-cron' ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-refresh-automation' ), array( 'progressed' => false, 'needsContinuation' => false ) );
+		}
+
 		if ( ! Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ) ) {
 			return array(
 				'success'           => true,

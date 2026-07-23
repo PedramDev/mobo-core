@@ -36,6 +36,15 @@ class Mobo_Core_Lock {
 			return false;
 		}
 
+		/*
+		 * Once an upgrade barrier is active, no new sync/queue/maintenance lease
+		 * may start. Existing owners can still renew and release their own lease,
+		 * allowing a graceful drain without force-unlocking live work.
+		 */
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::should_block_lock( $name ) ) {
+			return false;
+		}
+
 		$key   = self::option_key( $name );
 		$now   = time();
 		$token = wp_generate_uuid4();
@@ -70,6 +79,15 @@ class Mobo_Core_Lock {
 		}
 
 		if ( ! self::insert_raw_option( $key, $payload ) ) {
+			return false;
+		}
+
+		/*
+		 * Close the check/insert race with barrier activation. If the barrier was
+		 * installed after our first check, surrender only the lease we just created.
+		 */
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::should_block_lock( $name ) ) {
+			self::release( $name, $token );
 			return false;
 		}
 
@@ -263,6 +281,44 @@ class Mobo_Core_Lock {
 	}
 
 	/**
+	 * Return all currently active Mobo runtime locks.
+	 *
+	 * Malformed and expired rows are removed through get_status(). This method is
+	 * used by the plugin upgrade drain to observe live work without releasing it.
+	 *
+	 * @return array<string,array>
+	 */
+	public static function get_active_locks() {
+		global $wpdb;
+
+		$prefix = 'mobo_core_runtime_lock_';
+		$like   = $wpdb->esc_like( $prefix ) . '%';
+		$names  = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_name ASC",
+				$like
+			)
+		);
+
+		$result = array();
+		foreach ( is_array( $names ) ? $names : array() as $option_name ) {
+			$option_name = (string) $option_name;
+			if ( 0 !== strpos( $option_name, $prefix ) ) {
+				continue;
+			}
+
+			$name   = sanitize_key( substr( $option_name, strlen( $prefix ) ) );
+			$status = self::get_status( $name );
+			if ( '' !== $name && ! empty( $status['active'] ) ) {
+				$result[ $name ] = $status;
+			}
+		}
+
+		ksort( $result );
+		return $result;
+	}
+
+	/**
 	 * Force delete one current or legacy lock.
 	 *
 	 * Use only for migration/admin/debug cleanup.
@@ -295,6 +351,8 @@ class Mobo_Core_Lock {
 
 		$known_names = array(
 			'real_cron_runner',
+			'plugin_upgrade_barrier',
+			'remote_plugin_upgrade',
 			'image_refresh_automation',
 			'maintenance_cleanup',
 			'manual_sync_start',

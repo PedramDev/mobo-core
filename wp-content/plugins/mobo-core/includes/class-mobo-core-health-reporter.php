@@ -84,6 +84,16 @@ class Mobo_Core_Health_Reporter {
 
 			'cronMode'              => $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ),
 			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
+			'portalHeartbeat'       => array(
+				'lastAttemptAt'       => absint( get_option( 'mobo_core_portal_heartbeat_last_attempt_at', 0 ) ),
+				'lastSuccessAt'       => absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ),
+				'secondsSinceSuccess' => absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) > 0
+					? max( 0, time() - absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) )
+					: 0,
+				'lastResult'          => get_option( 'mobo_core_portal_heartbeat_last_result', array() ),
+			),
+			'syncHealth'            => class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array(),
+			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
 			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : $last_cron_hit ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),
 			'lastWebhookSuccessAt'  => $this->format_timestamp( $this->get_last_webhook_success_timestamp( $cron_status ) ),

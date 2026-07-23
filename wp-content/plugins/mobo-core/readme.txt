@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.76
+Stable tag: 10.31.84
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -140,6 +140,41 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.31.84 =
+
+* Added a global upgrade barrier that blocks new Sync, Repair, reconciliation, webhook, image, reprice, recategorize, maintenance and self-runner work during remote plugin replacement.
+* Added graceful draining of active runtime and product-write locks without force-releasing live workers.
+* Existing Sync/Repair state, product/variation cursors and queued jobs are preserved and resume after the upgrade barrier is released.
+* Remote upgrades return `blocked-site-busy` with retry metadata when a site cannot reach an idle boundary; Portal can safely retry later.
+* Long-running queues now stop between items when the upgrade barrier becomes active.
+
+= 10.31.82 =
+
+* Added secure Portal-driven remote plugin deployment endpoints.
+* Verifies a short-lived Portal HMAC request, expected source version, package SHA-256 and plugin header version before install.
+* Creates a local plugin backup and restores it automatically when installation validation fails.
+* Exposes upgrade status for Portal verification after a deployment.
+
+= 10.31.81 =
+* Added a secure, POST-only `/wp-json/mobo-core/v1/heartbeat` endpoint that cannot be satisfied by normal page cache and records each Portal heartbeat.
+* Portal heartbeat runs a bounded slice of the existing shared cron/reconciliation engine; webhook, automatic recovery, cPanel cron, and manual repair continue to use one engine.
+* Added heartbeat runtime limits, continuation support, local heartbeat telemetry, and health-report visibility without creating a second sync path.
+* Central Portal can now wake dormant WordPress sites and recover missed product/variation/delete changes after downtime.
+
+= 10.31.80 =
+* Added Adaptive Reconciliation so webhook delivery, automatic recovery, and manual health actions converge on the existing desired-state product/variation sync engine.
+* Added per-product sync health with Portal revision/hash, last successful sync time, synced/behind/repairing/failed status, and bounded error details.
+* Added configurable fast checks (15 minutes through daily), product batches, variation budgets, and daily/weekly deep integrity checks.
+* Added revision endpoint support with a bounded rolling-catalog fallback for Portal versions that do not expose `/sync/changes`.
+* Added a Sync Health administration tab with health counters, last/next check, Run Repair, and Run Deep Integrity Check actions.
+* Deep integrity now removes missing products, extra variations through authoritative snapshots, invalid attribute structures through full rebuild, stale product/variation mappings, and orphan health rows.
+* Added reconciliation telemetry to local and remote health reports.
+
+= 10.31.77 =
+* Variable products now use authoritative desired-state synchronization. Missing variations and stale mappings are permanently removed.
+* Attribute structure changes trigger a full variation/attribute rebuild before the current Portal snapshot is recreated.
+* Upgrade automatically enqueues one bounded, resumable Repair for existing Mobo installations; active Sync/Repair state is not overwritten.
 
 = 10.31.76 =
 * Fixed an immediate false `lock-lost` result when lock acquisition and the first lease renewal occurred within the same second.
@@ -361,6 +396,18 @@ Yes. Mobo Core batches changed Mobo product/variation IDs during the request and
 * Updated plugin metadata, license headers, and GitHub URL.
 
 == Upgrade Notice ==
+
+= 10.31.82 =
+Adds Portal-controlled, version-locked remote deployment with HMAC authentication, complete-package and per-file SHA-256 verification, local backup, rollback attempt, and post-install version confirmation. This version must be installed once before future Portal deployments can operate.
+
+= 10.31.81 =
+Adds central five-minute WordPress keep-alive, bounded shared-engine recovery, and pull-based health reporting through the authenticated heartbeat endpoint.
+
+= 10.31.80 =
+Adds bounded automatic recovery after WordPress downtime, a Sync Health dashboard, revision-aware change detection with rolling fallback, and scheduled deep integrity checks while preserving authoritative desired-state variation cleanup.
+
+= 10.31.77 =
+Adds authoritative desired-state variation synchronization, permanent stale-variation cleanup, full attribute-structure rebuilds, and an automatic bounded Repair queue for existing stores.
 
 = 10.31.76 =
 Fixes manual and server Cron runs that could stop immediately with `lock-lost`, zero rounds, and zero lease renewals when the first renewal happened in the same second as acquisition.

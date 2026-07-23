@@ -42,6 +42,7 @@ Base: `/wp-json/mobo-core/v1`
 | GET/POST | `/worker/run` | `check_cron_security` | `token`, `source` |
 | GET | `/worker/status` | `check_security` | `X-SEC` |
 | GET | `/health` | `check_security` | `X-SEC` |
+| POST | `/heartbeat` | `check_security` | `X-SEC`; اجرای bounded shared-engine slice و پاسخ no-cache |
 | GET/POST | `/health/report-now` | `check_security` | `X-SEC` |
 | POST | `/webhook` | `check_security` | JSON event payload |
 | POST | `/webhook/run` | `check_security` | `X-SEC` |
@@ -260,6 +261,9 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_self_runner_last_run_result` | `array()` |
 | `mobo_core_health_report_enabled` | `'1'` (همیشه فعال / always on) |
 | `mobo_core_health_report_url` | حذف شده؛ مقصد از API مرکزی ساخته می شود / removed; derived from central API |
+| `mobo_core_heartbeat_time_budget_seconds` | `12` |
+| `mobo_core_heartbeat_max_rounds` | `2` |
+| `mobo_core_heartbeat_remote_timeout_seconds` | `10` |
 | `mobo_core_health_report_min_interval_seconds` | `300` |
 | `mobo_core_health_report_timeout_seconds` | `15` |
 | `mobo_core_health_last_report_attempt_at` | `0` |
@@ -905,6 +909,7 @@ Public methods: **17** · Internal non-public methods: **1**
 | `public function run_self_worker($request)` | اجرای عملیات `run_self_worker` در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Run one local self-worker slice. |
 | `public function get_self_worker_status($request)` | دریافت self worker status در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Return local self-worker status. |
 | `public function get_health($request)` | دریافت health در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Return local site health for MoboCore probe. |
+| `public function run_heartbeat($request)` | بیدار کردن WordPress و اجرای یک برش محدود از همان Cron/Sync Engine مشترک. | Run a non-cacheable, bounded shared-engine recovery slice for Portal heartbeat. |
 | `public function send_health_report_now($request)` | ارسال health report now در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Force-send health report to MoboCore. |
 | `public function run_webhook_queue($request)` | اجرای عملیات `run_webhook_queue` در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Run webhook queue. |
 | `public function start_product_sync($request)` | شروع product sync در بخش Routeهای REST ورودی افزونه و امنیت آنها. | Start product sync from C#. |

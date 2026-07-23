@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.31.76
+ * Version: 10.31.84
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.31.76' );
+define( 'MOBO_CORE_VERSION', '10.31.84' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -99,6 +99,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-lock.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-upgrade-coordinator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-concurrency.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-api-client.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-map.php';
@@ -113,12 +114,14 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-auto
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-recategorize-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reconciliation.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-settings-guard.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-maintenance.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cron-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-self-runner.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-health-reporter.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-updater.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-checkout-validator.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-city-assets.php';

@@ -59,33 +59,56 @@ class Mobo_Core_Image_Sync {
 	 * @return array
 	 */
 	public function process_queue( $limit = 0 ) {
-		if ( ! $this->should_use_queue() ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-queue' ), array( 'processed' => 0, 'failed' => 0, 'remaining' => true ) );
+		}
+
+		$worker_lock = Mobo_Core_Lock::acquire( 'image_queue_worker', 300 );
+		if ( false === $worker_lock ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-queue' ), array( 'processed' => 0, 'failed' => 0, 'remaining' => true ) );
+			}
+
 			return array(
 				'success'   => true,
-				'status'    => 'disabled',
+				'status'    => 'locked',
 				'processed' => 0,
 				'failed'    => 0,
-				'remaining' => false,
+				'remaining' => true,
 			);
 		}
 
-		$limit = $limit > 0 ? absint( $limit ) : Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
+		try {
+			if ( ! $this->should_use_queue() ) {
+				return array(
+					'success'   => true,
+					'status'    => 'disabled',
+					'processed' => 0,
+					'failed'    => 0,
+					'remaining' => false,
+				);
+			}
 
-		if ( $limit <= 0 ) {
+			$limit = $limit > 0 ? absint( $limit ) : Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
+
+			if ( $limit <= 0 ) {
+				$queue = new Mobo_Core_Image_Queue();
+				return array(
+					'success'   => true,
+					'status'    => 'disabled-by-limit',
+					'processed' => 0,
+					'failed'    => 0,
+					'remaining' => $queue->count_due() > 0,
+				);
+			}
+
 			$queue = new Mobo_Core_Image_Queue();
-			return array(
-				'success'   => true,
-				'status'    => 'disabled-by-limit',
-				'processed' => 0,
-				'failed'    => 0,
-				'remaining' => $queue->count_due() > 0,
-			);
+			$rows  = $queue->get_due_images( $limit );
+
+			return $this->process_queue_rows( $queue, $rows, $limit );
+		} finally {
+			Mobo_Core_Lock::release( 'image_queue_worker', $worker_lock );
 		}
-
-		$queue = new Mobo_Core_Image_Queue();
-		$rows  = $queue->get_due_images( $limit );
-
-		return $this->process_queue_rows( $queue, $rows, $limit );
 	}
 
 	/**
@@ -239,6 +262,7 @@ class Mobo_Core_Image_Sync {
 		$processed = 0;
 		$failed    = 0;
 		$touched   = array();
+		$paused_for_upgrade = false;
 
 		if ( ! is_array( $rows ) || empty( $rows ) ) {
 			return array(
@@ -253,6 +277,11 @@ class Mobo_Core_Image_Sync {
 		$this->load_media_dependencies();
 
 		foreach ( $rows as $row ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$paused_for_upgrade = true;
+				break;
+			}
+
 			if ( $processed >= $limit ) {
 				break;
 			}
@@ -302,10 +331,10 @@ class Mobo_Core_Image_Sync {
 
 		return array(
 			'success'   => true,
-			'status'    => 'processed',
+			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : 'processed',
 			'processed' => $processed,
 			'failed'    => $failed,
-			'remaining' => $queue->count_due() > 0,
+			'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
 		);
 	}
 

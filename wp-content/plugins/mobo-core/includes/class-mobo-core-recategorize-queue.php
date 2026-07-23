@@ -108,7 +108,21 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	public function process_batch( $limit = null ) {
-		$state = $this->get_state();
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'recategorize-queue' ), array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'remaining' => true ) );
+		}
+
+		$worker_lock = Mobo_Core_Lock::acquire( 'recategorize_queue_worker', 300 );
+		if ( false === $worker_lock ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'recategorize-queue' ), array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'remaining' => true ) );
+			}
+
+			return array( 'success' => true, 'status' => 'locked', 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'remaining' => true );
+		}
+
+		try {
+			$state = $this->get_state();
 
 		if ( 'running' !== $state['status'] ) {
 			return array(
@@ -154,7 +168,14 @@ class Mobo_Core_Recategorize_Queue {
 		$skipped   = 0;
 		$failed    = 0;
 
+		$paused_for_upgrade = false;
+
 		foreach ( $ids as $post_id ) {
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				$paused_for_upgrade = true;
+				break;
+			}
+
 			$post_id = absint( $post_id );
 			$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
 			$processed++;
@@ -190,7 +211,7 @@ class Mobo_Core_Recategorize_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d محصول بررسی شد؛ %d محصول تغییر کرد، %d محصول رد شد.', $processed, $updated, $skipped );
 
-		$remaining = count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -206,9 +227,13 @@ class Mobo_Core_Recategorize_Queue {
 			'skipped'   => $skipped,
 			'failed'    => $failed,
 			'remaining' => $remaining,
-			'status'    => $state['status'],
+			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : $state['status'],
 			'state'     => $state,
 		);
+	
+		} finally {
+			Mobo_Core_Lock::release( 'recategorize_queue_worker', $worker_lock );
+		}
 	}
 
 	/**

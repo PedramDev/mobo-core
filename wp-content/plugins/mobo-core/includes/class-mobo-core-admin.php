@@ -34,6 +34,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_tool_run_cron_now', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_start_sync', array( $this, 'handle_start_sync' ) );
 		add_action( 'admin_post_mobo_core_start_repair', array( $this, 'handle_start_repair' ) );
+		add_action( 'admin_post_mobo_core_run_auto_reconciliation', array( $this, 'handle_run_auto_reconciliation' ) );
+		add_action( 'admin_post_mobo_core_run_deep_integrity', array( $this, 'handle_run_deep_integrity' ) );
 		add_action( 'admin_post_mobo_core_sync_categories', array( $this, 'handle_sync_categories' ) );
 		add_action( 'admin_post_mobo_core_resume_sync', array( $this, 'handle_resume_sync' ) );
 		add_action( 'admin_post_mobo_core_cancel_sync', array( $this, 'handle_cancel_sync' ) );
@@ -115,6 +117,7 @@ class Mobo_Core_Admin {
 			'pricing'       => 'قیمت گذاری',
 			'filters'       => 'فیلترها',
 			'queue'         => 'صف و پردازش',
+			'sync-health'   => 'سلامت Sync',
 			'image-refresh' => 'نوسازی تصاویر',
 			'cron'          => 'کران واقعی',
 			'checkout'      => 'اعتبارسنجی خرید',
@@ -274,6 +277,7 @@ class Mobo_Core_Admin {
 			'pricing',
 			'filters',
 			'queue',
+			'sync-health',
 			'image-refresh',
 			'cron',
 			'checkout',
@@ -315,6 +319,7 @@ class Mobo_Core_Admin {
 				<?php $this->tab_link( 'pricing', 'قیمت‌گذاری', $active_tab ); ?>
 				<?php $this->tab_link( 'filters', 'فیلترها', $active_tab ); ?>
 				<?php $this->tab_link( 'queue', 'صف و پردازش', $active_tab ); ?>
+				<?php $this->tab_link( 'sync-health', 'سلامت Sync', $active_tab ); ?>
 				<?php $this->tab_link( 'image-refresh', 'نوسازی تصاویر', $active_tab ); ?>
 				<?php $this->tab_link( 'cron', 'کران واقعی', $active_tab ); ?>
 				<?php $this->tab_link( 'checkout', 'اعتبارسنجی خرید', $active_tab ); ?>
@@ -339,6 +344,8 @@ class Mobo_Core_Admin {
 					<?php $this->render_filters_tab(); ?>
 				<?php elseif ( 'queue' === $active_tab ) : ?>
 					<?php $this->render_queue_tab(); ?>
+				<?php elseif ( 'sync-health' === $active_tab ) : ?>
+					<?php $this->render_sync_health_tab(); ?>
 				<?php elseif ( 'image-refresh' === $active_tab ) : ?>
 					<?php $this->render_image_refresh_tab(); ?>
 				<?php elseif ( 'cron' === $active_tab ) : ?>
@@ -2582,6 +2589,88 @@ type:{mobo_order_type_label}</textarea>
 	 *
 	 * @return void
 	 */
+
+	/**
+	 * Render adaptive reconciliation health dashboard.
+	 *
+	 * @return void
+	 */
+	private function render_sync_health_tab() {
+		$status = class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array();
+		$counts = isset( $status['counts'] ) && is_array( $status['counts'] ) ? $status['counts'] : array();
+		$state  = isset( $status['state'] ) && is_array( $status['state'] ) ? $status['state'] : array();
+		$interval = Mobo_Core_Settings::get_int( 'mobo_core_reconciliation_fast_interval', 3600, 900, 86400 );
+		$deep_schedule = (string) Mobo_Core_Settings::get( 'mobo_core_reconciliation_deep_schedule', 'weekly' );
+		?>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
+			<input type="hidden" name="action" value="mobo_core_save_settings">
+			<input type="hidden" name="mobo_active_tab" value="sync-health">
+			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
+
+			<div class="mobo-grid">
+				<div class="mobo-card mobo-card-wide">
+					<div class="mobo-card-head">
+						<h2>Sync Health</h2>
+						<p>Auto Reconciliation از همان Desired State Sync Engine وب‌هوک و Repair استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدود Catalog را بررسی می‌کند.</p>
+					</div>
+					<div class="mobo-status-grid">
+						<?php $this->status_box( 'Synced Products', absint( isset( $counts['synced'] ) ? $counts['synced'] : 0 ) ); ?>
+						<?php $this->status_box( 'Behind Products', absint( isset( $counts['behind'] ) ? $counts['behind'] : 0 ) ); ?>
+						<?php $this->status_box( 'Failed Products', absint( isset( $counts['failed'] ) ? $counts['failed'] : 0 ) ); ?>
+						<?php $this->status_box( 'Pending Repair', absint( isset( $status['pendingRepair'] ) ? $status['pendingRepair'] : 0 ) ); ?>
+						<?php $this->status_box( 'Last Check', ! empty( $status['lastCheckAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastCheckAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'Next Check', ! empty( $status['nextCheckAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextCheckAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'Change Detection', ! empty( $status['endpointSupport'] ) ? $status['endpointSupport'] : 'unknown' ); ?>
+						<?php $this->status_box( 'Current Mode', ! empty( $state['mode'] ) ? $state['mode'] . ' / ' . ( isset( $state['phase'] ) ? $state['phase'] : '' ) : 'idle' ); ?>
+					</div>
+				</div>
+
+				<div class="mobo-card mobo-card-wide">
+					<div class="mobo-card-head">
+						<h2>Auto Reconciliation Settings</h2>
+						<p>در حالت Revision endpoint فقط شناسه محصولات تغییرکرده دریافت می‌شود. اگر Portal endpoint را نداشته باشد، Rolling Fallback در هر اجرا فقط Batch تنظیم‌شده را بررسی می‌کند.</p>
+					</div>
+					<div class="mobo-fields-grid">
+						<?php $this->bool_field( 'Enable Auto Reconciliation', 'mobo_core_auto_reconciliation_enabled' ); ?>
+						<div class="mobo-field">
+							<label for="mobo_core_reconciliation_fast_interval">Fast Check Interval</label>
+							<select id="mobo_core_reconciliation_fast_interval" name="mobo_core_reconciliation_fast_interval">
+								<?php foreach ( array( 900 => '15 min', 1800 => '30 min', 3600 => '1 hour', 10800 => '3 hours', 21600 => '6 hours', 43200 => '12 hours', 86400 => 'Daily' ) as $value => $label ) : ?>
+									<option value="<?php echo esc_attr( $value ); ?>" <?php selected( $interval, $value ); ?>><?php echo esc_html( $label ); ?></option>
+								<?php endforeach; ?>
+							</select>
+						</div>
+						<?php $this->int_field( 'Products Per Run', 'mobo_core_reconciliation_products_per_run', 10, 500 ); ?>
+						<?php $this->int_field( 'Variation Batch', 'mobo_core_reconciliation_variation_batch', 100, 10000 ); ?>
+						<div class="mobo-field">
+							<label for="mobo_core_reconciliation_deep_schedule">Deep Integrity Check</label>
+							<select id="mobo_core_reconciliation_deep_schedule" name="mobo_core_reconciliation_deep_schedule">
+								<option value="daily" <?php selected( $deep_schedule, 'daily' ); ?>>Daily</option>
+								<option value="weekly" <?php selected( $deep_schedule, 'weekly' ); ?>>Weekly</option>
+							</select>
+						</div>
+					</div>
+					<div class="mobo-help">Default: یک ساعت، ۱۰۰ محصول، ۱۰۰۰ Variation و Deep Check هفتگی.</div>
+				</div>
+			</div>
+			<?php $this->save_button(); ?>
+		</form>
+
+		<div class="mobo-inline-actions">
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
+				<input type="hidden" name="action" value="mobo_core_run_auto_reconciliation">
+				<?php wp_nonce_field( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' ); ?>
+				<button type="submit" class="button button-primary">Run Repair</button>
+			</form>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
+				<input type="hidden" name="action" value="mobo_core_run_deep_integrity">
+				<?php wp_nonce_field( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' ); ?>
+				<button type="submit" class="button button-secondary">Run Deep Integrity Check</button>
+			</form>
+		</div>
+		<?php
+	}
+
 	private function render_image_refresh_tab() {
 		$queue  = class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ? new Mobo_Core_Image_Refresh_Queue() : null;
 		$status = $queue ? $queue->get_status() : array();
@@ -5810,6 +5899,29 @@ type:{mobo_order_type_label}</textarea>
 				}
 				break;
 
+
+			case 'sync-health':
+				$this->save_bool_options_from_post( array( 'mobo_core_auto_reconciliation_enabled' ) );
+				$this->save_int_options_from_post(
+					array(
+						'mobo_core_reconciliation_fast_interval' => array( 900, 86400 ),
+						'mobo_core_reconciliation_products_per_run' => array( 10, 500 ),
+						'mobo_core_reconciliation_variation_batch' => array( 100, 10000 ),
+					)
+				);
+				if ( isset( $_POST['mobo_core_reconciliation_fast_interval'] ) ) {
+					$interval = absint( wp_unslash( $_POST['mobo_core_reconciliation_fast_interval'] ) );
+					if ( ! in_array( $interval, array( 900, 1800, 3600, 10800, 21600, 43200, 86400 ), true ) ) {
+						$interval = 3600;
+					}
+					update_option( 'mobo_core_reconciliation_fast_interval', $interval, false );
+				}
+				if ( isset( $_POST['mobo_core_reconciliation_deep_schedule'] ) ) {
+					$schedule = sanitize_key( wp_unslash( $_POST['mobo_core_reconciliation_deep_schedule'] ) );
+					update_option( 'mobo_core_reconciliation_deep_schedule', in_array( $schedule, array( 'daily', 'weekly' ), true ) ? $schedule : 'weekly', false );
+				}
+				break;
+
 			case 'image-refresh':
 				$this->save_bool_options_from_post( array( 'mobo_core_image_refresh_enabled', 'mobo_core_image_refresh_delete_old', 'mobo_core_image_refresh_generate_subsizes', 'mobo_core_image_refresh_cleanup_leftover_subsizes', 'mobo_core_orphan_image_cleanup_enabled' ) );
 				$this->save_int_options_from_post(
@@ -6499,6 +6611,43 @@ type:{mobo_order_type_label}</textarea>
 		$message = isset( $result['message'] ) ? $result['message'] : 'Repair شروع شد.';
 
 		$this->redirect_with_message( $message, $type, 'dashboard' );
+	}
+
+
+	/**
+	 * Force one fast reconciliation run.
+	 *
+	 * @return void
+	 */
+	public function handle_run_auto_reconciliation() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+		check_admin_referer( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' );
+		$service = new Mobo_Core_Reconciliation();
+		$result  = $service->run_tick( 'admin-fast-repair', true, false );
+		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::kick( 'admin-fast-repair', true );
+		}
+		$this->redirect_with_message( ! empty( $result['success'] ) ? 'Auto Reconciliation اجرا شد.' : 'Auto Reconciliation با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
+	}
+
+	/**
+	 * Force a complete deep integrity pass.
+	 *
+	 * @return void
+	 */
+	public function handle_run_deep_integrity() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+		check_admin_referer( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' );
+		$service = new Mobo_Core_Reconciliation();
+		$result  = $service->run_tick( 'admin-deep-integrity', true, true );
+		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::kick( 'admin-deep-integrity', true );
+		}
+		$this->redirect_with_message( ! empty( $result['success'] ) ? 'Deep Integrity Check شروع شد.' : 'Deep Integrity Check با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
 	}
 
 	/**

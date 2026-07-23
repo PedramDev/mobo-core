@@ -13,6 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Settings {
 
 	/**
+	 * Request-local overrides used by bounded runners such as Portal heartbeat.
+	 *
+	 * @var array
+	 */
+	private static $runtime_overrides = array();
+
+	/**
 	 * Webhook security code must be safe for an HTTP header value.
 	 *
 	 * Visible ASCII is 0x21 (!) through 0x7E (~). Spaces, tabs, line breaks,
@@ -91,6 +98,13 @@ class Mobo_Core_Settings {
 			'mobo_core_orphan_image_delete_per_run' => 20,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
 
+			// Adaptive desired-state reconciliation.
+			'mobo_core_auto_reconciliation_enabled' => '1',
+			'mobo_core_reconciliation_fast_interval' => 3600,
+			'mobo_core_reconciliation_products_per_run' => 100,
+			'mobo_core_reconciliation_variation_batch' => 1000,
+			'mobo_core_reconciliation_deep_schedule' => 'weekly',
+
 			'mobo_core_excluded_product_urls' => '',
 			'mobo_core_categories_last_sync_at'              => 0,
 			'mobo_core_categories_refresh_interval_hours'    => 12,
@@ -125,6 +139,9 @@ class Mobo_Core_Settings {
 
 			// Customer-side health reporting to MoboCore.
 			'mobo_core_health_report_enabled'          => '1',
+			'mobo_core_heartbeat_time_budget_seconds'  => 12,
+			'mobo_core_heartbeat_max_rounds'          => 2,
+			'mobo_core_heartbeat_remote_timeout_seconds' => 10,
 			'mobo_core_health_report_min_interval_seconds' => 300,
 			'mobo_core_health_report_timeout_seconds'  => 15,
 			'mobo_core_health_last_report_attempt_at'  => 0,
@@ -197,6 +214,10 @@ class Mobo_Core_Settings {
 			$fallback = $defaults[ $key ];
 		}
 
+		if ( array_key_exists( $key, self::$runtime_overrides ) ) {
+			return self::$runtime_overrides[ $key ];
+		}
+
 		return get_option( $key, $fallback );
 	}
 
@@ -210,7 +231,9 @@ class Mobo_Core_Settings {
 	 * @return int
 	 */
 	public static function get_int( $key, $default, $min, $max ) {
-		$value = absint( get_option( $key, $default ) );
+		$value = array_key_exists( $key, self::$runtime_overrides )
+			? absint( self::$runtime_overrides[ $key ] )
+			: absint( get_option( $key, $default ) );
 
 		if ( $value < $min ) {
 			return $min;
@@ -221,6 +244,27 @@ class Mobo_Core_Settings {
 		}
 
 		return $value;
+	}
+
+	/**
+	 * Set a request-local setting override.
+	 *
+	 * @param string $key Option key.
+	 * @param mixed  $value Override value.
+	 * @return void
+	 */
+	public static function set_runtime_override( $key, $value ) {
+		self::$runtime_overrides[ (string) $key ] = $value;
+	}
+
+	/**
+	 * Clear one request-local override.
+	 *
+	 * @param string $key Option key.
+	 * @return void
+	 */
+	public static function clear_runtime_override( $key ) {
+		unset( self::$runtime_overrides[ (string) $key ] );
 	}
 
 	/**
