@@ -408,6 +408,7 @@ class Mobo_Core_Reconciliation {
 		}
 
 		$sync = new Mobo_Core_Product_Sync();
+		$sync->set_repair_mode( true );
 		$api  = new Mobo_Core_API_Client();
 
 		if ( empty( $item['parentDone'] ) ) {

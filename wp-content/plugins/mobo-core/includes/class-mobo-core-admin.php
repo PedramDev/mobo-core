@@ -100,6 +100,15 @@ class Mobo_Core_Admin {
 				array( $this, 'render' )
 			);
 		}
+
+		add_submenu_page(
+			self::MENU_SLUG,
+			'تنظیمات پیشرفته موبو',
+			'تنظیمات پیشرفته',
+			'manage_options',
+			self::MENU_SLUG . '&view=advanced&tab=filters',
+			array( $this, 'render' )
+		);
 	}
 
 	/**
@@ -107,22 +116,38 @@ class Mobo_Core_Admin {
 	 *
 	 * @return array<string,string>
 	 */
-	private function get_admin_navigation_items() {
+	private function get_admin_navigation_items( $include_advanced = false ) {
+		$items = array(
+			'dashboard'   => 'نمای کلی',
+			'connection'  => 'اتصال و لایسنس',
+			'purchase'    => 'خرید و فعال‌سازی',
+			'product'     => 'تنظیمات محصول',
+			'categories'  => 'دسته‌بندی‌ها',
+			'pricing'     => 'قیمت‌گذاری',
+			'sync-health' => 'سلامت همگام‌سازی',
+			'health'      => 'سلامت فنی سایت',
+		);
+
+		if ( $include_advanced ) {
+			$items = array_merge( $items, $this->get_advanced_navigation_items() );
+		}
+
+		return $items;
+	}
+
+	/**
+	 * Technical pages hidden from the default manager view.
+	 *
+	 * @return array<string,string>
+	 */
+	private function get_advanced_navigation_items() {
 		return array(
-			'dashboard'     => 'داشبورد',
-			'connection'    => 'اتصال',
-			'purchase'      => 'خرید و فعال سازی',
-			'product'       => 'محصول',
-			'categories'    => 'دسته بندی',
-			'pricing'       => 'قیمت گذاری',
-			'filters'       => 'فیلترها',
-			'queue'         => 'صف و پردازش',
-			'sync-health'   => 'سلامت Sync',
+			'filters'       => 'فیلترهای پیشرفته',
+			'queue'         => 'صف‌ها و پردازش',
 			'image-refresh' => 'نوسازی تصاویر',
-			'cron'          => 'کران واقعی',
-			'checkout'      => 'اعتبارسنجی خرید',
+			'cron'          => 'زمان‌بندی و Cron',
+			'checkout'      => 'ثبت و اعتبارسنجی سفارش',
 			'sms'           => 'پیامک سفارش',
-			'health'        => 'سلامت سایت',
 		);
 	}
 
@@ -160,6 +185,15 @@ class Mobo_Core_Admin {
 				)
 			);
 		}
+
+		$wp_admin_bar->add_node(
+			array(
+				'id'     => 'mobo-core-advanced',
+				'parent' => 'mobo-core',
+				'title'  => 'تنظیمات پیشرفته',
+				'href'   => add_query_arg( array( 'view' => 'advanced', 'tab' => 'filters' ), admin_url( 'admin.php?page=' . self::MENU_SLUG ) ),
+			)
+		);
 	}
 
 
@@ -267,6 +301,9 @@ class Mobo_Core_Admin {
 
 		// Read-only admin navigation parameter; no state is changed here.
 		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'dashboard'; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$requested_view = isset( $_GET['view'] ) ? sanitize_key( wp_unslash( $_GET['view'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$advanced_tabs = array_keys( $this->get_advanced_navigation_items() );
+		$advanced_view = 'advanced' === $requested_view || in_array( $active_tab, $advanced_tabs, true );
 
 		$allowed_tabs = array(
 			'dashboard',
@@ -310,21 +347,23 @@ class Mobo_Core_Admin {
 
 			<?php $this->render_notices(); ?>
 
-			<nav class="mobo-tabs" aria-label="Mobo settings tabs">
-				<?php $this->tab_link( 'dashboard', 'داشبورد', $active_tab ); ?>
-				<?php $this->tab_link( 'connection', 'اتصال', $active_tab ); ?>
-				<?php $this->tab_link( 'purchase', 'خرید و فعال سازی', $active_tab ); ?>
-				<?php $this->tab_link( 'product', 'محصول', $active_tab ); ?>
-				<?php $this->tab_link( 'categories', 'دسته‌بندی', $active_tab ); ?>
-				<?php $this->tab_link( 'pricing', 'قیمت‌گذاری', $active_tab ); ?>
-				<?php $this->tab_link( 'filters', 'فیلترها', $active_tab ); ?>
-				<?php $this->tab_link( 'queue', 'صف و پردازش', $active_tab ); ?>
-				<?php $this->tab_link( 'sync-health', 'سلامت Sync', $active_tab ); ?>
-				<?php $this->tab_link( 'image-refresh', 'نوسازی تصاویر', $active_tab ); ?>
-				<?php $this->tab_link( 'cron', 'کران واقعی', $active_tab ); ?>
-				<?php $this->tab_link( 'checkout', 'اعتبارسنجی خرید', $active_tab ); ?>
-				<?php $this->tab_link( 'sms', 'پیامک سفارش', $active_tab ); ?>
-				<?php $this->tab_link( 'health', 'سلامت سایت', $active_tab ); ?>
+			<div class="mobo-message mobo-message-info">
+				<?php if ( $advanced_view ) : ?>
+					نمای پیشرفته فعال است. ابزارهای صف، Cron، تصویر و عیب‌یابی تخصصی در دسترس هستند.
+				<?php else : ?>
+					نمای ساده مدیر فعال است. فقط بخش‌های روزمره نمایش داده می‌شوند و هیچ قابلیت فنی حذف نشده است.
+				<?php endif; ?>
+			</div>
+
+			<nav class="mobo-tabs" aria-label="زبانه‌های تنظیمات موبو">
+				<?php foreach ( $this->get_admin_navigation_items( $advanced_view ) as $tab => $label ) : ?>
+					<?php $this->tab_link( $tab, $label, $active_tab ); ?>
+				<?php endforeach; ?>
+				<?php if ( $advanced_view ) : ?>
+					<a class="mobo-tab mobo-tab-view" href="<?php echo esc_url( admin_url( 'admin.php?page=' . self::MENU_SLUG ) ); ?>">نمای ساده مدیر</a>
+				<?php else : ?>
+					<a class="mobo-tab mobo-tab-view" href="<?php echo esc_url( add_query_arg( array( 'view' => 'advanced', 'tab' => 'filters' ), admin_url( 'admin.php?page=' . self::MENU_SLUG ) ) ); ?>">نمایش تنظیمات پیشرفته</a>
+				<?php endif; ?>
 			</nav>
 
 			<div class="mobo-panel">
@@ -441,14 +480,14 @@ class Mobo_Core_Admin {
 
 				<div class="mobo-status-grid">
 					<?php $this->status_box( 'وضعیت', $this->status_label( $status['status'] ), 'statusLabel' ); ?>
-					<?php $this->status_box( 'Sync ID', $status['syncId'] ? $status['syncId'] : '—', 'syncId' ); ?>
-					<?php $this->status_box( 'نوع اجرا', ! empty( $status['repairMode'] ) ? 'Repair / hash bypass' : 'Normal sync' ); ?>
+					<?php $this->status_box( 'شناسه همگام‌سازی', $status['syncId'] ? $status['syncId'] : '—', 'syncId' ); ?>
+					<?php $this->status_box( 'نوع اجرا', ! empty( $status['repairMode'] ) ? 'ترمیم کامل / عبور از Hash' : 'همگام‌سازی عادی' ); ?>
 					<?php $this->status_box( 'محصولات پردازش‌شده', absint( $status['processedProducts'] ), 'processedProducts' ); ?>
 					<?php $this->status_box( 'محصولات باقی‌مانده', absint( $status['remainingProducts'] ), 'remainingProducts' ); ?>
 					<?php $this->status_box( 'صفحه محصول', absint( $status['productPage'] ), 'productPage' ); ?>
 					<?php $this->status_box( 'صفحه تنوع', absint( $status['variantPage'] ), 'variantPage' ); ?>
-					<?php $this->status_box( 'تلاش بعدی', ! empty( $status['nextRetryAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—', 'nextRetryAt' ); ?>
-					<?php $this->status_box( 'Repair', $is_repair_completed ? 'انجام شده: ' . wp_date( 'Y-m-d H:i:s', $repair_completed_at ) : 'انجام نشده' ); ?>
+					<?php $this->status_box( 'تلاش بعدی', ! empty( $status['nextRetryAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—', 'nextRetryAt' ); ?>
+					<?php $this->status_box( 'ترمیم کامل', $is_repair_completed ? 'انجام شده: ' . Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $repair_completed_at ) : 'انجام نشده' ); ?>
 				</div>
 
 				<div class="mobo-message mobo-message-info" data-mobo-sync-message="lastMessage" style="<?php echo empty( $status['lastMessage'] ) ? 'display:none;' : ''; ?>">
@@ -812,7 +851,7 @@ class Mobo_Core_Admin {
 			<div class="mobo-status-grid">
 				<?php $this->status_box( 'وضعیت لایسنس', $status_text ); ?>
 				<?php $this->status_box( 'روزهای باقی‌مانده', $this->first_license_value( $raw, array( 'remainingDays', 'remainDays', 'daysRemaining', 'leftDays', 'remainingDayCount', 'RemainingDays', 'DaysRemaining' ) ) ); ?>
-				<?php $this->status_box( 'تاریخ پایان', $this->first_license_value( $raw, array( 'expiresAt', 'expireAt', 'expirationDate', 'expiryDate', 'expireDate', 'validUntil', 'endDate', 'licenseEndAt', 'ExpiresAt', 'ExpireDate', 'ValidUntil' ) ) ); ?>
+				<?php $this->status_box( 'تاریخ پایان', $this->first_license_value( $raw, array( 'expires_at_persian', 'expired_at_persian', 'expiresAtPersian', 'expiredAtPersian', 'expiresAt', 'expireAt', 'expirationDate', 'expiryDate', 'expireDate', 'validUntil', 'endDate', 'licenseEndAt', 'ExpiresAt', 'ExpireDate', 'ValidUntil' ) ) ); ?>
 			</div>
 
 			<?php if ( '' !== trim( $message ) ) : ?>
@@ -823,8 +862,8 @@ class Mobo_Core_Admin {
 
 			<?php
 			$webhook_suspended = $this->first_license_value( $raw, array( 'webhook_suspended', 'webhookSuspended', 'WebhookSuspended' ) );
-			$webhook_suspended = in_array( strtolower( (string) $webhook_suspended ), array( '1', 'true', 'yes', 'فعال' ), true );
-			$webhook_suspended_until = $this->first_license_value( $raw, array( 'webhook_suspended_until', 'webhookSuspendedUntil', 'WebhookSuspendedUntil' ) );
+			$webhook_suspended = in_array( strtolower( (string) $webhook_suspended ), array( '1', 'true', 'بله', 'فعال' ), true );
+			$webhook_suspended_until = $this->first_license_value( $raw, array( 'webhook_suspended_until_persian', 'webhookSuspendedUntilPersian', 'webhook_suspended_until', 'webhookSuspendedUntil', 'WebhookSuspendedUntil' ) );
 			$webhook_suspension_reason = $this->first_license_value( $raw, array( 'webhook_suspension_reason', 'webhookSuspensionReason', 'WebhookSuspensionReason' ) );
 			?>
 			<?php if ( $webhook_suspended ) : ?>
@@ -910,7 +949,7 @@ class Mobo_Core_Admin {
 			return $value;
 		}
 
-		return in_array( strtolower( trim( (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+		return in_array( strtolower( trim( (string) $value ) ), array( '1', 'true', 'بله', 'on' ), true );
 	}
 
 	/**
@@ -949,11 +988,13 @@ class Mobo_Core_Admin {
 			}
 
 			if ( is_bool( $value ) ) {
-				$value = $value ? 'true' : 'false';
+				$value = $value ? 'بله' : 'خیر';
 			} elseif ( is_array( $value ) || is_object( $value ) ) {
 				continue;
 			} elseif ( null === $value || '' === trim( (string) $value ) ) {
 				continue;
+			} elseif ( preg_match( '/(?:at|until|date)$/i', $key ) && false !== strtotime( (string) $value ) && false === stripos( $key, 'persian' ) && false === stripos( $key, 'display' ) ) {
+				$value = Mobo_Core_Iran_Date::format_value( $value );
 			}
 
 			$rows[] = array(
@@ -1099,7 +1140,7 @@ class Mobo_Core_Admin {
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'Poina Domain Allowlist', ! empty( $poina_allowlist_status['installed'] ) ? ( ! empty( $poina_allowlist_status['active'] ) ? 'نصب و فعال' : 'نصب شده / غیرفعال' ) : 'پیدا نشد' ); ?>
+						<?php $this->status_box( 'محدودسازی دامنه Poina', ! empty( $poina_allowlist_status['installed'] ) ? ( ! empty( $poina_allowlist_status['active'] ) ? 'نصب و فعال' : 'نصب شده / غیرفعال' ) : 'پیدا نشد' ); ?>
 						<?php $this->status_box( 'دامنه‌های لازم برای allowlist', 'mobo.codeya.ir / mobomobo.ir' ); ?>
 						<?php $this->status_box( 'افزونه‌های فارسی ووکامرس', ! empty( $persian_wc_plugins ) ? implode( '، ', $persian_wc_plugins ) : 'پیدا نشد' ); ?>
 					</div>
@@ -1123,7 +1164,7 @@ class Mobo_Core_Admin {
 							<?php endif; ?>
 							<?php if ( ! empty( $remote_shipping_snapshot ) && is_array( $remote_shipping_snapshot ) ) : ?>
 								<?php $shipping_items = isset( $remote_shipping_snapshot['shippings'] ) && is_array( $remote_shipping_snapshot['shippings'] ) ? $remote_shipping_snapshot['shippings'] : array(); ?>
-								<?php $this->status_box( 'آخرین تغییر روش‌های ارسال موبو', $remote_shipping_changed_at > 0 ? wp_date( 'Y-m-d H:i:s', $remote_shipping_changed_at ) : 'دریافت شده' ); ?>
+								<?php $this->status_box( 'آخرین تغییر روش‌های ارسال موبو', $remote_shipping_changed_at > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $remote_shipping_changed_at ) : 'دریافت شده' ); ?>
 								<?php $this->status_box( 'تعداد روش‌های ارسال دریافت‌شده', count( $shipping_items ) ); ?>
 							<?php endif; ?>
 						</div>
@@ -1226,7 +1267,7 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'کشورهای نگاشت‌شده', ( isset( $address_manual_status['countriesMapped'] ) ? absint( $address_manual_status['countriesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['countriesTotal'] ) ? absint( $address_manual_status['countriesTotal'] ) : 0 ) ); ?>
 					<?php $this->status_box( 'استان‌های نگاشت‌شده', ( isset( $address_manual_status['statesMapped'] ) ? absint( $address_manual_status['statesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['statesTotal'] ) ? absint( $address_manual_status['statesTotal'] ) : 0 ) ); ?>
 					<?php $this->status_box( 'شهرهای فایل Checkout', ( isset( $address_manual_status['citiesMapped'] ) ? absint( $address_manual_status['citiesMapped'] ) : 0 ) . ' از ' . ( isset( $address_manual_status['citiesTotal'] ) ? absint( $address_manual_status['citiesTotal'] ) : 0 ) ); ?>
-					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $address_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $address_status['lastSuccessAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $address_status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $address_status['lastSuccessAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین خطا', ! empty( $address_status['lastError'] ) ? $address_status['lastError'] : '—' ); ?>
 				</div>
 
@@ -1258,8 +1299,8 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'نمایش روش ارسال در checkout', 'کاملا با WooCommerce' ); ?>
 					<?php $this->status_box( 'نگاشت روش‌های ارسال ووکامرس', 'فعال برای انتخاب shipping_id موبو' ); ?>
 					<?php $this->status_box( 'تعداد روش‌های ارسال cache شده', isset( $remote_shipping_status['count'] ) ? absint( $remote_shipping_status['count'] ) : 0 ); ?>
-					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $remote_shipping_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastSuccessAt'] ) ) : '—' ); ?>
-					<?php $this->status_box( 'آخرین تغییر از MoboCore', ! empty( $remote_shipping_status['lastChangedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastChangedAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $remote_shipping_status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastSuccessAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین تغییر از MoboCore', ! empty( $remote_shipping_status['lastChangedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastChangedAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین خطا', ! empty( $remote_shipping_status['lastError'] ) ? $remote_shipping_status['lastError'] : '—' ); ?>
 				</div>
 
@@ -1328,13 +1369,13 @@ class Mobo_Core_Admin {
 				<?php else : ?>
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'آخرین رویداد', isset( $shipping_report['event'] ) ? $shipping_report['event'] : '—' ); ?>
-						<?php $this->status_box( 'زمان ثبت', ! empty( $shipping_report['capturedat'] ) ? wp_date( 'Y-m-d H:i:s', absint( $shipping_report['capturedat'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'زمان ثبت', ! empty( $shipping_report['capturedat'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $shipping_report['capturedat'] ) ) : '—' ); ?>
 						<?php $customer_report = isset( $shipping_report['customer'] ) && is_array( $shipping_report['customer'] ) ? $shipping_report['customer'] : array(); ?>
-						<?php $this->status_box( 'Shipping Country', isset( $customer_report['shipping_country'] ) ? $customer_report['shipping_country'] : '—' ); ?>
-						<?php $this->status_box( 'Shipping State', isset( $customer_report['shipping_state'] ) ? $customer_report['shipping_state'] : '—' ); ?>
-						<?php $this->status_box( 'Shipping City', isset( $customer_report['shipping_city'] ) ? $customer_report['shipping_city'] : '—' ); ?>
+						<?php $this->status_box( 'کشور ارسال', isset( $customer_report['shipping_country'] ) ? $customer_report['shipping_country'] : '—' ); ?>
+						<?php $this->status_box( 'استان ارسال', isset( $customer_report['shipping_state'] ) ? $customer_report['shipping_state'] : '—' ); ?>
+						<?php $this->status_box( 'شهر ارسال', isset( $customer_report['shipping_city'] ) ? $customer_report['shipping_city'] : '—' ); ?>
 						<?php $cart_report = isset( $shipping_report['cart'] ) && is_array( $shipping_report['cart'] ) ? $shipping_report['cart'] : array(); ?>
-						<?php $this->status_box( 'Cart needs shipping', isset( $cart_report['needsshipping'] ) ? ( $cart_report['needsshipping'] ? 'yes' : 'no' ) : '—' ); ?>
+						<?php $this->status_box( 'سبد نیازمند ارسال', isset( $cart_report['needsshipping'] ) ? ( $cart_report['needsshipping'] ? 'بله' : 'خیر' ) : '—' ); ?>
 					</div>
 
 					<details style="margin-top:12px;">
@@ -1355,17 +1396,17 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'اجرای checkout توسط موبو', ! empty( $status['runtimeEnabled'] ) ? 'فعال' : 'غیرفعال - کنترل‌های قبل از پرداخت یا ثبت سفارش خودکار فعال نیستند' ); ?>
 					<?php $this->status_box( 'بررسی محلی موجودی', ! empty( $status['localStockEnabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'بررسی سبد موبو', ! empty( $status['moboCartEnabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
-					<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
-					<?php $this->status_box( 'آخرین موفقیت', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
-					<?php $this->status_box( 'آخرین ورود موفق موبو', ! empty( $status['lastMoboLoginAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastMoboLoginAt'] ) ) : '—' ); ?>
-					<?php $this->status_box( 'آخرین تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_at' ) ? wp_date( 'Y-m-d H:i:s', absint( get_option( 'mobo_core_checkout_mobo_login_test_at' ) ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین موفقیت', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین ورود موفق موبو', ! empty( $status['lastMoboLoginAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastMoboLoginAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_at' ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( get_option( 'mobo_core_checkout_mobo_login_test_at' ) ) ) : '—' ); ?>
 					<?php $this->status_box( 'نتیجه تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_result', '—' ) ); ?>
-					<?php $this->status_box( 'آخرین Cart موفق موبو', ! empty( $status['lastMoboCartAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastMoboCartAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین Cart موفق موبو', ! empty( $status['lastMoboCartAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastMoboCartAt'] ) ) : '—' ); ?>
 					<?php $lock_disabled = empty( $status['moboCartEnabled'] ) && empty( $status['autoOrderEnabled'] ); ?>
 					<?php $this->status_box( 'وضعیت lock سبد موبو', $lock_disabled ? 'غیرفعال - بررسی سبد و ثبت سفارش خاموش است' : ( get_option( 'mobo_core_shared_mobo_cart_lock' ) ? 'فعال / در حال استفاده' : 'آزاد' ) ); ?>
 					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'آخرین نتیجه', isset( $last['success'] ) ? ( ! empty( $last['success'] ) ? 'موفق' : 'ناموفق' ) : '—' ); ?>
-					<?php $this->status_box( 'HTTP Status', isset( $last['status'] ) ? absint( $last['status'] ) : '—' ); ?>
+					<?php $this->status_box( 'وضعیت HTTP', isset( $last['status'] ) ? absint( $last['status'] ) : '—' ); ?>
 				</div>
 			</div>
 
@@ -1520,7 +1561,7 @@ class Mobo_Core_Admin {
 			<div class="mobo-status-grid">
 				<?php $this->status_box( 'تعداد رخدادها', count( $debug_log ) ); ?>
 				<?php $this->status_box( 'تعداد Sessionها', count( $sessions ) ); ?>
-				<?php $this->status_box( 'آخرین رخداد', $last_time ? wp_date( 'Y-m-d H:i:s', $last_time ) : '—' ); ?>
+				<?php $this->status_box( 'آخرین رخداد', $last_time ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $last_time ) : '—' ); ?>
 				<?php $this->status_box( 'آخرین خطا', $last_err ); ?>
 			</div>
 
@@ -1534,7 +1575,7 @@ class Mobo_Core_Admin {
 						<summary>
 							<strong dir="ltr">Session <?php echo esc_html( $session_id ); ?></strong>
 							— رخداد: <?php echo esc_html( (string) $session['count'] ); ?>
-							— آخرین: <?php echo esc_html( $session['last'] ? wp_date( 'H:i:s', $session['last'] ) : '—' ); ?>
+							— آخرین: <?php echo esc_html( $session['last'] ? Mobo_Core_Iran_Date::format( 'H:i:s', $session['last'] ) : '—' ); ?>
 							— cart cookie: <code dir="ltr"><?php echo esc_html( '' !== $session['cartCookie'] ? $session['cartCookie'] : '—' ); ?></code>
 						</summary>
 
@@ -1549,16 +1590,16 @@ class Mobo_Core_Admin {
 								<thead>
 									<tr>
 										<th>زمان</th>
-										<th>Action</th>
-										<th>Variant</th>
-										<th>Qty</th>
-										<th>Cart item</th>
+										<th>عملیات</th>
+										<th>تنوع</th>
+										<th>تعداد</th>
+										<th>آیتم سبد</th>
 										<th>HTTP</th>
-										<th>Method</th>
-										<th>Path</th>
-										<th>Cart cookie</th>
-										<th>Userauth</th>
-										<th>Map</th>
+										<th>متد</th>
+										<th>مسیر</th>
+										<th>کوکی سبد</th>
+										<th>احراز هویت کاربر</th>
+										<th>نگاشت</th>
 										<th>خطا / توضیح</th>
 									</tr>
 								</thead>
@@ -1569,7 +1610,7 @@ class Mobo_Core_Admin {
 										$cookies = $this->debug_cookie_summary( $context );
 										?>
 										<tr>
-											<td dir="ltr"><?php echo esc_html( ! empty( $entry['time'] ) ? wp_date( 'H:i:s', absint( $entry['time'] ) ) : '—' ); ?></td>
+											<td dir="ltr"><?php echo esc_html( ! empty( $entry['time'] ) ? Mobo_Core_Iran_Date::format( 'H:i:s', absint( $entry['time'] ) ) : '—' ); ?></td>
 											<td><code dir="ltr"><?php echo esc_html( isset( $entry['action'] ) ? (string) $entry['action'] : '—' ); ?></code></td>
 											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'portalVariantId', 'variantid', 'variant_id' ) ) ?: '—' ); ?></td>
 											<td dir="ltr"><?php echo esc_html( $this->debug_context_value( $context, array( 'quantity' ) ) ?: '—' ); ?></td>
@@ -1919,8 +1960,8 @@ type:{mobo_order_type_label}</textarea>
 
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'ارسال گزارش سلامت', 'همیشه فعال' ); ?>
-						<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'نسخه افزونه', defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '—' ); ?>
 					</div>
 
@@ -1967,8 +2008,8 @@ type:{mobo_order_type_label}</textarea>
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'وضعیت آخرین Purge', isset( $cache_purge_status_labels[ $cache_purge_status ] ) ? $cache_purge_status_labels[ $cache_purge_status ] : $cache_purge_status ); ?>
 						<?php $this->status_box( 'نسخه Mobo هنگام تست', ! empty( $cache_purge['pluginVersion'] ) ? $cache_purge['pluginVersion'] : '—' ); ?>
-						<?php $this->status_box( 'آخرین تلاش', ! empty( $cache_purge['lastAttemptAt'] ) ? $cache_purge['lastAttemptAt'] : '—' ); ?>
-						<?php $this->status_box( 'آخرین موفقیت کامل', ! empty( $cache_purge['lastSuccessAt'] ) ? $cache_purge['lastSuccessAt'] : '—' ); ?>
+						<?php $this->status_box( 'آخرین تلاش', ! empty( $cache_purge['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format_value( $cache_purge['lastAttemptAt'] ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین موفقیت کامل', ! empty( $cache_purge['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format_value( $cache_purge['lastSuccessAt'] ) : '—' ); ?>
 						<?php $this->status_box( 'محصول / URL', absint( isset( $cache_purge['productCount'] ) ? $cache_purge['productCount'] : 0 ) . ' / ' . absint( isset( $cache_purge['urlCount'] ) ? $cache_purge['urlCount'] : 0 ) ); ?>
 						<?php $this->status_box( 'خطاهای متوالی', absint( isset( $cache_purge['consecutiveFailures'] ) ? $cache_purge['consecutiveFailures'] : 0 ) ); ?>
 					</div>
@@ -2100,21 +2141,21 @@ type:{mobo_order_type_label}</textarea>
 
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'کران واقعی', ! empty( $status['isActive'] ) ? 'فعال' : 'تشخیص داده نشده' ); ?>
-						<?php $this->status_box( 'آخرین اجرای کران واقعی', ! empty( $status['lastHitAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastHitAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین اجرای موفق کران', ! empty( $status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'اجرای بعدی Cron، تقریبی', ! empty( $status['lastHitAt'] ) && ! empty( $status['nextEstimatedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextEstimatedAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای کران واقعی', ! empty( $status['lastHitAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastHitAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای موفق کران', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'اجرای بعدی Cron، تقریبی', ! empty( $status['lastHitAt'] ) && ! empty( $status['nextEstimatedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextEstimatedAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'فاصله مورد انتظار Cron', ! empty( $status['expectedIntervalSeconds'] ) ? absint( $status['expectedIntervalSeconds'] ) . ' ثانیه' : '—' ); ?>
 						<?php $this->status_box( 'وضعیت زمان‌بندی Cron', empty( $status['lastHitAt'] ) ? '—' : ( ! empty( $status['isOverdue'] ) ? 'عقب‌افتاده' : 'به‌موقع' ) ); ?>
-						<?php $this->status_box( 'آخرین اجرای Worker داخلی', ! empty( $self_status['lastRunAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastRunAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین Kick داخلی', ! empty( $self_status['lastKickAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $self_status['lastKickAttemptAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای Worker داخلی', ! empty( $self_status['lastRunAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $self_status['lastRunAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین Kick داخلی', ! empty( $self_status['lastKickAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $self_status['lastKickAttemptAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'اجرای داخلی', ! empty( $self_status['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 						<?php $cron_lock = isset( $status['lock'] ) && is_array( $status['lock'] ) ? $status['lock'] : array(); ?>
 						<?php $this->status_box( 'Lease اجرای Cron', ! empty( $cron_lock['active'] ) ? 'فعال - ' . absint( isset( $cron_lock['remainingSeconds'] ) ? $cron_lock['remainingSeconds'] : 0 ) . ' ثانیه تا انقضا' : 'آزاد' ); ?>
-						<?php $this->status_box( 'آخرین Heartbeat قفل', ! empty( $cron_lock['lastHeartbeatAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $cron_lock['lastHeartbeatAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین تلاش پردازش وب‌هوک', ! empty( $webhook_status['lastAttemptAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastAttemptAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین اجرای موفق صف وب‌هوک', ! empty( $webhook_status['lastSuccessAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastSuccessAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین فعالیت واقعی وب‌هوک', ! empty( $webhook_status['lastActivityAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $webhook_status['lastActivityAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'اجرای بعدی وب‌هوک، تقریبی', $next_webhook_at > 0 ? wp_date( 'Y-m-d H:i:s', $next_webhook_at ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین Heartbeat قفل', ! empty( $cron_lock['lastHeartbeatAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $cron_lock['lastHeartbeatAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین تلاش پردازش وب‌هوک', ! empty( $webhook_status['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $webhook_status['lastAttemptAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین اجرای موفق صف وب‌هوک', ! empty( $webhook_status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $webhook_status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین فعالیت واقعی وب‌هوک', ! empty( $webhook_status['lastActivityAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $webhook_status['lastActivityAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'اجرای بعدی وب‌هوک، تقریبی', $next_webhook_at > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $next_webhook_at ) : '—' ); ?>
 						<?php $this->status_box( 'وب‌هوک‌های pending / due / failed', absint( isset( $webhook_status['pendingTableEvents'] ) ? $webhook_status['pendingTableEvents'] : 0 ) . ' / ' . absint( isset( $webhook_status['dueTableEvents'] ) ? $webhook_status['dueTableEvents'] : 0 ) . ' / ' . absint( isset( $webhook_status['failedTableEvents'] ) ? $webhook_status['failedTableEvents'] : 0 ) ); ?>
 						<?php $this->status_box( 'فایل‌های pending قدیمی', absint( isset( $webhook_status['pendingFiles'] ) ? $webhook_status['pendingFiles'] : 0 ) ); ?>
 					</div>
@@ -2610,32 +2651,32 @@ type:{mobo_order_type_label}</textarea>
 			<div class="mobo-grid">
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
-						<h2>Sync Health</h2>
-						<p>Auto Reconciliation از همان Desired State Sync Engine وب‌هوک و Repair استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدود Catalog را بررسی می‌کند.</p>
+						<h2>سلامت همگام‌سازی</h2>
+						<p>بازبینی و ترمیم خودکار از همان موتور وضعیت مطلوب وب‌هوک استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدودی از کاتالوگ را بررسی می‌کند.</p>
 					</div>
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'Synced Products', absint( isset( $counts['synced'] ) ? $counts['synced'] : 0 ) ); ?>
-						<?php $this->status_box( 'Behind Products', absint( isset( $counts['behind'] ) ? $counts['behind'] : 0 ) ); ?>
-						<?php $this->status_box( 'Failed Products', absint( isset( $counts['failed'] ) ? $counts['failed'] : 0 ) ); ?>
-						<?php $this->status_box( 'Pending Repair', absint( isset( $status['pendingRepair'] ) ? $status['pendingRepair'] : 0 ) ); ?>
-						<?php $this->status_box( 'Last Check', ! empty( $status['lastCheckAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['lastCheckAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'Next Check', ! empty( $status['nextCheckAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextCheckAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'Change Detection', ! empty( $status['endpointSupport'] ) ? $status['endpointSupport'] : 'unknown' ); ?>
-						<?php $this->status_box( 'Current Mode', ! empty( $state['mode'] ) ? $state['mode'] . ' / ' . ( isset( $state['phase'] ) ? $state['phase'] : '' ) : 'idle' ); ?>
+						<?php $this->status_box( 'محصولات هماهنگ', absint( isset( $counts['synced'] ) ? $counts['synced'] : 0 ) ); ?>
+						<?php $this->status_box( 'محصولات عقب‌مانده', absint( isset( $counts['behind'] ) ? $counts['behind'] : 0 ) ); ?>
+						<?php $this->status_box( 'محصولات خطادار', absint( isset( $counts['failed'] ) ? $counts['failed'] : 0 ) ); ?>
+						<?php $this->status_box( 'در انتظار ترمیم', absint( isset( $status['pendingRepair'] ) ? $status['pendingRepair'] : 0 ) ); ?>
+						<?php $this->status_box( 'آخرین بررسی', ! empty( $status['lastCheckAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastCheckAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'بررسی بعدی', ! empty( $status['nextCheckAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextCheckAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'روش تشخیص تغییر', ! empty( $status['endpointSupport'] ) ? $status['endpointSupport'] : 'unknown' ); ?>
+						<?php $this->status_box( 'حالت فعلی', ! empty( $state['mode'] ) ? $state['mode'] . ' / ' . ( isset( $state['phase'] ) ? $state['phase'] : '' ) : 'idle' ); ?>
 					</div>
 				</div>
 
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
-						<h2>Auto Reconciliation Settings</h2>
+						<h2>تنظیمات بازبینی و ترمیم خودکار</h2>
 						<p>در حالت Revision endpoint فقط شناسه محصولات تغییرکرده دریافت می‌شود. اگر Portal endpoint را نداشته باشد، Rolling Fallback در هر اجرا فقط Batch تنظیم‌شده را بررسی می‌کند.</p>
 					</div>
 					<div class="mobo-fields-grid">
-						<?php $this->bool_field( 'Enable Auto Reconciliation', 'mobo_core_auto_reconciliation_enabled' ); ?>
+						<?php $this->bool_field( 'فعال‌سازی بازبینی و ترمیم خودکار', 'mobo_core_auto_reconciliation_enabled' ); ?>
 						<div class="mobo-field">
-							<label for="mobo_core_reconciliation_fast_interval">Fast Check Interval</label>
+							<label for="mobo_core_reconciliation_fast_interval">فاصله بررسی سریع</label>
 							<select id="mobo_core_reconciliation_fast_interval" name="mobo_core_reconciliation_fast_interval">
-								<?php foreach ( array( 900 => '15 min', 1800 => '30 min', 3600 => '1 hour', 10800 => '3 hours', 21600 => '6 hours', 43200 => '12 hours', 86400 => 'Daily' ) as $value => $label ) : ?>
+								<?php foreach ( array( 900 => '۱۵ دقیقه', 1800 => '۳۰ دقیقه', 3600 => '۱ ساعت', 10800 => '۳ ساعت', 21600 => '۶ ساعت', 43200 => '۱۲ ساعت', 86400 => 'روزانه' ) as $value => $label ) : ?>
 									<option value="<?php echo esc_attr( $value ); ?>" <?php selected( $interval, $value ); ?>><?php echo esc_html( $label ); ?></option>
 								<?php endforeach; ?>
 							</select>
@@ -2643,10 +2684,10 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->int_field( 'Products Per Run', 'mobo_core_reconciliation_products_per_run', 10, 500 ); ?>
 						<?php $this->int_field( 'Variation Batch', 'mobo_core_reconciliation_variation_batch', 100, 10000 ); ?>
 						<div class="mobo-field">
-							<label for="mobo_core_reconciliation_deep_schedule">Deep Integrity Check</label>
+							<label for="mobo_core_reconciliation_deep_schedule">بازبینی عمیق یکپارچگی</label>
 							<select id="mobo_core_reconciliation_deep_schedule" name="mobo_core_reconciliation_deep_schedule">
-								<option value="daily" <?php selected( $deep_schedule, 'daily' ); ?>>Daily</option>
-								<option value="weekly" <?php selected( $deep_schedule, 'weekly' ); ?>>Weekly</option>
+								<option value="daily" <?php selected( $deep_schedule, 'daily' ); ?>>روزانه</option>
+								<option value="weekly" <?php selected( $deep_schedule, 'weekly' ); ?>>هفتگی</option>
 							</select>
 						</div>
 					</div>
@@ -2660,12 +2701,12 @@ type:{mobo_order_type_label}</textarea>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
 				<input type="hidden" name="action" value="mobo_core_run_auto_reconciliation">
 				<?php wp_nonce_field( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' ); ?>
-				<button type="submit" class="button button-primary">Run Repair</button>
+				<button type="submit" class="button button-primary">اجرای ترمیم</button>
 			</form>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
 				<input type="hidden" name="action" value="mobo_core_run_deep_integrity">
 				<?php wp_nonce_field( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' ); ?>
-				<button type="submit" class="button button-secondary">Run Deep Integrity Check</button>
+				<button type="submit" class="button button-secondary">اجرای بازبینی عمیق</button>
 			</form>
 		</div>
 		<?php
@@ -2782,7 +2823,7 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->status_box( 'صف در انتظار / آماده پردازش / ناموفق', absint( isset( $status['pending'] ) ? $status['pending'] : 0 ) . ' / ' . absint( isset( $status['due'] ) ? $status['due'] : 0 ) . ' / ' . absint( isset( $status['failed'] ) ? $status['failed'] : 0 ) ); ?>
 						<?php $this->status_box( 'در حال پردازش / منتظر زمان retry', absint( isset( $status['activeProcessing'] ) ? $status['activeProcessing'] : 0 ) . ' / ' . absint( isset( $status['waitingRetry'] ) ? $status['waitingRetry'] : 0 ) ); ?>
 					<?php $this->status_box( 'انجام شده / رد شده', absint( isset( $status['done'] ) ? $status['done'] : 0 ) . ' / ' . absint( isset( $status['skipped'] ) ? $status['skipped'] : 0 ) ); ?>
-					<?php $this->status_box( 'آخرین اجرای صف', ! empty( $last['executedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $last['executedAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین اجرای صف', ! empty( $last['executedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $last['executedAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'نتیجه آخر', ! empty( $last['status'] ) ? $this->image_refresh_status_label( $last['status'] ) : '—' ); ?>
 					<?php $this->status_box( 'پیشرفت ساخت صف', $this->format_scan_progress( $enqueue, 'scanned' ) ); ?>
 					<?php $this->status_box( 'اجرای تقریبی باقی مانده برای ساخت صف', ! empty( $workflow_flags['enqueueComplete'] ) ? '۰ - کامل شده' : ( isset( $workflow_flags['enqueueClicks'] ) ? absint( $workflow_flags['enqueueClicks'] ) . ' بار' : 'نامشخص' ) ); ?>
@@ -2801,7 +2842,7 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->status_box( 'قابل صف شدن', absint( isset( $scan['queueable'] ) ? $scan['queueable'] : 0 ) ); ?>
 					<?php $this->status_box( 'حجم تقریبی قدیمی', $this->format_bytes( isset( $scan['totalLegacyBytes'] ) ? $scan['totalLegacyBytes'] : 0 ) ); ?>
 					<?php $this->status_box( 'بدون محصول / بدون نشانی تصویر جدید', absint( isset( $scan['withoutProduct'] ) ? $scan['withoutProduct'] : 0 ) . ' / ' . absint( isset( $scan['withoutSourceUrl'] ) ? $scan['withoutSourceUrl'] : 0 ) ); ?>
-					<?php $this->status_box( 'آخرین اسکن', ! empty( $scan['checkedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $scan['checkedAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'آخرین اسکن', ! empty( $scan['checkedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $scan['checkedAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'پیشرفت اسکن تصاویر قدیمی', $this->format_scan_progress( $scan, 'scanned' ) ); ?>
 				</div>
 			</div>
@@ -3179,12 +3220,12 @@ type:{mobo_order_type_label}</textarea>
 			<div class="mobo-status-grid">
 				<?php $this->status_box( 'خانواده آماده حذف / ناموفق', absint( isset( $orphan_status['candidate'] ) ? $orphan_status['candidate'] : 0 ) . ' / ' . absint( isset( $orphan_status['failed'] ) ? $orphan_status['failed'] : 0 ) ); ?>
 				<?php $this->status_box( 'خانواده حذف شده', absint( isset( $orphan_status['deleted'] ) ? $orphan_status['deleted'] : 0 ) ); ?>
-				<?php $this->status_box( 'آخرین اسکن خانواده', ! empty( $orphan_scan['checkedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $orphan_scan['checkedAt'] ) ) : '—' ); ?>
+				<?php $this->status_box( 'آخرین اسکن خانواده', ! empty( $orphan_scan['checkedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $orphan_scan['checkedAt'] ) ) : '—' ); ?>
 				<?php $this->status_box( 'خانواده / فایل آماده حذف', absint( isset( $orphan_scan['candidateFamilies'] ) ? $orphan_scan['candidateFamilies'] : 0 ) . ' / ' . absint( isset( $orphan_scan['candidateFiles'] ) ? $orphan_scan['candidateFiles'] : 0 ) ); ?>
 				<?php $this->status_box( 'ثبت شده در وردپرس / دارای مرجع', absint( isset( $orphan_scan['registeredFamilies'] ) ? $orphan_scan['registeredFamilies'] : 0 ) . ' / ' . absint( isset( $orphan_scan['referencedFamilies'] ) ? $orphan_scan['referencedFamilies'] : 0 ) ); ?>
 				<?php $this->status_box( 'حجم قابل حذف', $this->format_bytes( isset( $orphan_scan['totalBytes'] ) ? $orphan_scan['totalBytes'] : 0 ) ); ?>
 				<?php $this->status_box( 'پیشرفت اسکن خانواده فایل ها', $this->format_scan_progress( $orphan_scan, 'processedAttachments' ) ); ?>
-				<?php $this->status_box( 'آخرین حذف خانواده', ! empty( $orphan_delete['executedAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $orphan_delete['executedAt'] ) ) : '—' ); ?>
+				<?php $this->status_box( 'آخرین حذف خانواده', ! empty( $orphan_delete['executedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $orphan_delete['executedAt'] ) ) : '—' ); ?>
 				<?php $this->status_box( 'خانواده / فایل حذف شده آخر', absint( isset( $orphan_delete['deletedFamilies'] ) ? $orphan_delete['deletedFamilies'] : 0 ) . ' / ' . absint( isset( $orphan_delete['deletedFiles'] ) ? $orphan_delete['deletedFiles'] : ( isset( $orphan_delete['deleted'] ) ? $orphan_delete['deleted'] : 0 ) ) ); ?>
 				<?php $this->status_box( 'حجم آزاد شده آخر', $this->format_bytes( isset( $orphan_delete['bytes'] ) ? $orphan_delete['bytes'] : 0 ) ); ?>
 			</div>
@@ -3536,7 +3577,7 @@ type:{mobo_order_type_label}</textarea>
 					<tbody>
 						<tr><th style="width:220px;">نسخه توسعه</th><td><code dir="ltr"><?php echo esc_html( isset( $city_status['jsPath'] ) ? (string) $city_status['jsPath'] : '—' ); ?></code></td></tr>
 						<tr><th>نسخه Minified</th><td><code dir="ltr"><?php echo esc_html( isset( $city_status['minPath'] ) ? (string) $city_status['minPath'] : '—' ); ?></code></td></tr>
-						<tr><th>آخرین تولید</th><td><?php echo ! empty( $city_status['generatedAt'] ) ? esc_html( wp_date( 'Y-m-d H:i:s', absint( $city_status['generatedAt'] ) ) ) : '—'; ?></td></tr>
+						<tr><th>آخرین تولید</th><td><?php echo ! empty( $city_status['generatedAt'] ) ? esc_html( Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $city_status['generatedAt'] ) ) ) : '—'; ?></td></tr>
 						<tr><th>استان‌های بدون اتصال</th><td><?php echo isset( $city_status['unmappedStates'] ) && is_array( $city_status['unmappedStates'] ) ? esc_html( count( $city_status['unmappedStates'] ) ) : '—'; ?></td></tr>
 					</tbody>
 				</table>
@@ -6402,8 +6443,8 @@ type:{mobo_order_type_label}</textarea>
 
 		$status['statusLabel']          = $this->status_label( $status['status'] );
 		$status['progressPercentLabel'] = $this->format_percent( $status['progressPercent'] );
-		$status['nextRetryAtLabel']     = ! empty( $status['nextRetryAt'] ) ? wp_date( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—';
-		$status['serverTime']           = wp_date( 'Y-m-d H:i:s' );
+		$status['nextRetryAtLabel']     = ! empty( $status['nextRetryAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—';
+		$status['serverTime']           = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' );
 
 		wp_send_json_success( $status );
 	}
@@ -6433,7 +6474,7 @@ type:{mobo_order_type_label}</textarea>
 
 		$status['statusLabel']  = $this->reprice_status_label( isset( $status['status'] ) ? $status['status'] : 'idle' );
 		$status['percentLabel'] = $this->format_percent( isset( $status['percent'] ) ? (float) $status['percent'] : 0 );
-		$status['serverTime']   = wp_date( 'Y-m-d H:i:s' );
+		$status['serverTime']   = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' );
 
 		wp_send_json_success( $status );
 	}
@@ -6465,7 +6506,7 @@ type:{mobo_order_type_label}</textarea>
 
 		$status['statusLabel']  = $this->recategorize_status_label( isset( $status['status'] ) ? $status['status'] : 'idle' );
 		$status['percentLabel'] = $this->format_percent( isset( $status['percent'] ) ? (float) $status['percent'] : 0 );
-		$status['serverTime']   = wp_date( 'Y-m-d H:i:s' );
+		$status['serverTime']   = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' );
 
 		wp_send_json_success( $status );
 	}
@@ -6499,7 +6540,7 @@ type:{mobo_order_type_label}</textarea>
 		wp_send_json_success(
 			array(
 				'html'       => $html,
-				'serverTime' => wp_date( 'Y-m-d H:i:s' ),
+				'serverTime' => Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' ),
 			)
 		);
 	}
@@ -6629,7 +6670,7 @@ type:{mobo_order_type_label}</textarea>
 		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::kick( 'admin-fast-repair', true );
 		}
-		$this->redirect_with_message( ! empty( $result['success'] ) ? 'Auto Reconciliation اجرا شد.' : 'Auto Reconciliation با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
+		$this->redirect_with_message( ! empty( $result['success'] ) ? 'بازبینی و ترمیم خودکار اجرا شد.' : 'بازبینی و ترمیم خودکار با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
 	}
 
 	/**
@@ -6647,7 +6688,7 @@ type:{mobo_order_type_label}</textarea>
 		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::kick( 'admin-deep-integrity', true );
 		}
-		$this->redirect_with_message( ! empty( $result['success'] ) ? 'Deep Integrity Check شروع شد.' : 'Deep Integrity Check با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
+		$this->redirect_with_message( ! empty( $result['success'] ) ? 'بازبینی عمیق یکپارچگی شروع شد.' : 'بازبینی عمیق یکپارچگی با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
 	}
 
 	/**

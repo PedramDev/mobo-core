@@ -38,6 +38,20 @@ class Mobo_Core_Product_Sync {
 		$this->product_map      = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
 	}
 
+	/**
+	 * Enable repair semantics for this Product Sync instance.
+	 *
+	 * Repair mode bypasses only the stored remote source-hash shortcut.
+	 * Field-level rules, price policy and stock policy remain unchanged.
+	 *
+	 * @param bool $enabled Enable repair mode.
+	 * @return self
+	 */
+	public function set_repair_mode( $enabled = true ) {
+		$this->repair_mode = (bool) $enabled;
+		return $this;
+	}
+
 	public function start_manual_sync( $sync_id = '', $source = 'admin', $repair_mode = false ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return $this->result( false, 'شروع Sync تا پایان آپدیت افزونه متوقف است.', array_merge( $this->get_manual_sync_status(), array( 'pausedForUpgrade' => true, 'upgradeBarrier' => Mobo_Core_Upgrade_Coordinator::get_status() ) ) );
