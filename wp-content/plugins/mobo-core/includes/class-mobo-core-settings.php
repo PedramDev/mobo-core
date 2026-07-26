@@ -47,6 +47,7 @@ class Mobo_Core_Settings {
 			'global_update_images'                => '1',
 			'mobo_core_category_mapping_enabled'  => '1',
 			'mobo_core_category_mapping_required' => '0',
+			'mobo_core_address_mapping_show_all_countries' => '0',
 
 			'mobo_default_category_id'            => '0',
 
@@ -97,6 +98,8 @@ class Mobo_Core_Settings {
 			'mobo_core_orphan_image_scan_limit' => 500,
 			'mobo_core_orphan_image_delete_per_run' => 20,
 			'mobo_core_missing_variants_behavior' => 'outofstock',
+			'mobo_core_upgrade_drain_timeout_seconds' => 120,
+			'mobo_core_remote_update_allowed_hosts' => array(),
 
 			// Adaptive desired-state reconciliation.
 			'mobo_core_auto_reconciliation_enabled' => '1',
@@ -185,6 +188,7 @@ class Mobo_Core_Settings {
 			// Mobo checkout address mapping defaults.
 			'mobo_core_address_mapping_enabled'             => '0',
 			'mobo_core_address_mapping_sync_interval_days'  => 7,
+			'mobo_core_address_manual_mapping'              => array(),
 
 			// SMS notifications through Persian WooCommerce SMS.
 			'mobo_core_sms_notifications_enabled'           => '0',
@@ -512,6 +516,207 @@ class Mobo_Core_Settings {
 		}
 
 		update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
+	}
+
+
+	/**
+	 * Export all non-secret, configurable plugin settings for Portal.
+	 *
+	 * Webhook security code, license token and every other credential/runtime
+	 * secret are intentionally excluded. Internal timestamps and transient state
+	 * are also omitted because they are diagnostics, not settings.
+	 *
+	 * @return array
+	 */
+	public static function get_portal_settings_snapshot() {
+		$defaults = self::defaults();
+		$items = array();
+		$excluded = array();
+
+		foreach ( $defaults as $key => $default ) {
+			if ( self::is_secret_setting_key( $key ) ) {
+				$excluded[] = array( 'key' => $key, 'reason' => 'secret' );
+				continue;
+			}
+
+			if ( self::is_runtime_only_setting_key( $key ) ) {
+				continue;
+			}
+
+			$value = self::get( $key, $default );
+			$source = false === get_option( $key, false ) ? 'default' : 'option';
+
+			if ( 'mobo_core_api_base_url' === $key ) {
+				$effective = apply_filters( 'mobo_core_api_base_url', '' );
+				if ( is_string( $effective ) && '' !== trim( $effective ) ) {
+					$value = $effective;
+					$source = defined( 'MOBO_API_BASE_URL' ) && trim( (string) MOBO_API_BASE_URL ) === trim( $effective ) ? 'constant' : 'filter';
+				}
+			}
+
+			$items[] = array(
+				'key'      => $key,
+				'label'    => self::get_portal_setting_label( $key ),
+				'group'    => self::get_portal_setting_group( $key ),
+				'type'     => self::get_portal_setting_type( $key, $default, $value ),
+				'value'    => self::normalize_portal_setting_value( $value ),
+				'default'  => self::normalize_portal_setting_value( $default ),
+				'source'   => $source,
+				'readOnly' => 'constant' === $source || 'filter' === $source,
+			);
+		}
+
+		usort( $items, function ( $a, $b ) {
+			$group_compare = strcmp( (string) $a['group'], (string) $b['group'] );
+			return 0 !== $group_compare ? $group_compare : strcmp( (string) $a['key'], (string) $b['key'] );
+		} );
+
+		$encoded = wp_json_encode( $items, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+		return array(
+			'schemaVersion' => 1,
+			'generatedAt'   => time(),
+			'siteUrl'       => home_url( '/' ),
+			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'settingsCount' => count( $items ),
+			'settingsHash'  => hash( 'sha256', false === $encoded ? '' : $encoded ),
+			'settings'      => $items,
+			'excluded'      => $excluded,
+		);
+	}
+
+	/**
+	 * Compact settings metadata for regular health reports.
+	 *
+	 * @return array
+	 */
+	public static function get_portal_settings_metadata() {
+		$snapshot = self::get_portal_settings_snapshot();
+		return array(
+			'schemaVersion' => $snapshot['schemaVersion'],
+			'generatedAt'   => $snapshot['generatedAt'],
+			'settingsCount' => $snapshot['settingsCount'],
+			'settingsHash'  => $snapshot['settingsHash'],
+		);
+	}
+
+	private static function is_secret_setting_key( $key ) {
+		$key = strtolower( (string) $key );
+		$explicit = array(
+			'mobo_core_security_code',
+			'mobo_core_token',
+			'mobo_core_cron_token',
+			'mobo_core_checkout_mobo_password',
+			'mobo_core_checkout_mobo_cookie_jar',
+			'mobo_core_shared_mobo_cart_lock',
+		);
+		if ( in_array( $key, $explicit, true ) ) {
+			return true;
+		}
+		return false !== strpos( $key, 'password' ) ||
+			false !== strpos( $key, 'cookie' ) ||
+			false !== strpos( $key, 'security_code' ) ||
+			false !== strpos( $key, 'secret' ) ||
+			false !== strpos( $key, 'credential' ) ||
+			(bool) preg_match( '/(^|_)token($|_)/', $key );
+	}
+
+	private static function is_runtime_only_setting_key( $key ) {
+		$key = strtolower( (string) $key );
+		$exact = array(
+			'mobo_core_categories_last_sync_at',
+			'mobo_core_health_last_report_result',
+			'mobo_core_real_cron_last_result',
+			'mobo_core_self_runner_last_kick_result',
+			'mobo_core_self_runner_last_run_result',
+			'mobo_core_image_refresh_automation_last_result',
+		);
+		if ( in_array( $key, $exact, true ) ) {
+			return true;
+		}
+		return (bool) preg_match( '/(_last_(attempt|success|kick|run|tick|report)|_(started|completed|updated|finished|hit|received|checked|login|cart|snapshot)_at$|_(attempt|success|failure)_at$|_last_result$)/', $key );
+	}
+
+	private static function get_portal_setting_label( $key ) {
+		$labels = array(
+			'mobo_core_api_base_url' => 'نشانی API پرتال',
+			'mobo_core_only_in_stock' => 'دریافت فقط محصولات موجود',
+			'global_product_auto_stock' => 'بروزرسانی خودکار موجودی',
+			'global_product_auto_price' => 'بروزرسانی خودکار قیمت',
+			'global_product_auto_title' => 'بروزرسانی خودکار عنوان',
+			'global_product_auto_compare_price' => 'بروزرسانی قیمت مقایسه‌ای',
+			'global_product_auto_slug' => 'بروزرسانی نامک محصول',
+			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
+			'global_update_images' => 'بروزرسانی تصاویر',
+			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
+			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
+			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',
+			'mobo_price_type' => 'روش قیمت‌گذاری',
+			'global_additional_price' => 'مبلغ افزوده عمومی',
+			'global_additional_percentage' => 'درصد افزوده عمومی',
+			'mobo_dynamic_price' => 'قواعد قیمت‌گذاری پویا',
+			'mobo_core_auto_reconciliation_enabled' => 'ترمیم خودکار اختلاف‌ها',
+			'mobo_core_reconciliation_fast_interval' => 'فاصله بازبینی سریع',
+			'mobo_core_reconciliation_products_per_run' => 'محصول در هر نوبت بازبینی',
+			'mobo_core_reconciliation_variation_batch' => 'تعداد تنوع در هر دسته بازبینی',
+			'mobo_core_reconciliation_deep_schedule' => 'زمان‌بندی بازبینی عمیق',
+			'mobo_core_missing_variants_behavior' => 'رفتار با تنوع‌های حذف‌شده',
+			'mobo_core_product_cursor_sync_enabled' => 'ادامه Sync محصول با Cursor',
+			'mobo_core_variant_cursor_sync_enabled' => 'ادامه Sync تنوع با Cursor',
+			'mobo_core_products_per_page' => 'محصول در هر صفحه Sync',
+			'mobo_core_variants_per_page' => 'تنوع در هر صفحه Sync',
+			'mobo_core_pull_payload_enabled' => 'دریافت مستقیم Payload از Portal',
+			'mobo_core_self_runner_enabled' => 'فعال بودن اجراکننده داخلی',
+			'mobo_core_health_report_enabled' => 'ارسال گزارش سلامت',
+			'mobo_core_checkout_validation_enabled' => 'اعتبارسنجی هنگام ثبت سفارش',
+			'mobo_core_mobo_order_submission_enabled' => 'ثبت خودکار سفارش موبو',
+			'mobo_core_address_mapping_enabled' => 'نگاشت آدرس موبو',
+			'mobo_core_address_mapping_show_all_countries' => 'نمایش همه کشورها در نگاشت',
+			'mobo_core_sms_notifications_enabled' => 'پیامک سفارش',
+			'mobo_core_image_queue_enabled' => 'صف پردازش تصاویر',
+			'mobo_core_image_refresh_enabled' => 'نوسازی تصاویر',
+			'mobo_core_orphan_image_cleanup_enabled' => 'پاک‌سازی تصاویر بدون استفاده',
+			'mobo_core_upgrade_drain_timeout_seconds' => 'مهلت تخلیه امن پیش از ارتقا',
+			'mobo_core_remote_update_allowed_hosts' => 'دامنه‌های مجاز دریافت بسته ارتقا',
+			'mobo_core_excluded_product_urls' => 'نشانی محصولات مستثنا',
+			'mobo_core_address_manual_mapping' => 'نگاشت دستی کشور و استان',
+		);
+		if ( isset( $labels[ $key ] ) ) {
+			return $labels[ $key ];
+		}
+		$clean = preg_replace( '/^(mobo_core_|mobo_|global_)/', '', (string) $key );
+		return ucwords( str_replace( '_', ' ', (string) $clean ) );
+	}
+
+	private static function get_portal_setting_group( $key ) {
+		$key = strtolower( (string) $key );
+		if ( false !== strpos( $key, 'checkout' ) || false !== strpos( $key, 'order_' ) || false !== strpos( $key, 'address_mapping' ) || false !== strpos( $key, 'shipping' ) ) return 'checkout';
+		if ( false !== strpos( $key, 'image' ) || false !== strpos( $key, 'webp' ) || false !== strpos( $key, 'orphan' ) ) return 'images';
+		if ( false !== strpos( $key, 'reconciliation' ) || false !== strpos( $key, 'sync' ) || false !== strpos( $key, 'variant' ) || false !== strpos( $key, 'product' ) ) return 'sync';
+		if ( false !== strpos( $key, 'cron' ) || false !== strpos( $key, 'runner' ) || false !== strpos( $key, 'webhook' ) || false !== strpos( $key, 'health' ) ) return 'runtime';
+		if ( false !== strpos( $key, 'price' ) || false !== strpos( $key, 'percentage' ) ) return 'pricing';
+		if ( false !== strpos( $key, 'category' ) ) return 'categories';
+		if ( false !== strpos( $key, 'sms' ) ) return 'sms';
+		return 'general';
+	}
+
+	private static function get_portal_setting_type( $key, $default, $value ) {
+		if ( is_array( $default ) || is_array( $value ) ) return 'object';
+		if ( is_bool( $default ) || ( is_scalar( $default ) && in_array( (string) $default, array( '0', '1' ), true ) ) ) return 'boolean';
+		if ( is_int( $default ) ) return 'integer';
+		if ( is_float( $default ) ) return 'decimal';
+		if ( is_string( $value ) ) {
+			$trimmed = trim( $value );
+			if ( ( '' !== $trimmed && ( '[' === $trimmed[0] || '{' === $trimmed[0] ) ) && null !== json_decode( $trimmed, true ) ) return 'json';
+			if ( false !== strpos( strtolower( (string) $key ), 'url' ) ) return 'url';
+			if ( is_numeric( $value ) ) return false !== strpos( (string) $value, '.' ) ? 'decimal' : 'integer';
+		}
+		return 'text';
+	}
+
+	private static function normalize_portal_setting_value( $value ) {
+		if ( is_scalar( $value ) || null === $value || is_array( $value ) ) return $value;
+		return (string) $value;
 	}
 
 	/**

@@ -83,6 +83,7 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_portal_heartbeat_last_attempt_at' );
 	delete_option( 'mobo_core_portal_heartbeat_last_success_at' );
 	delete_option( 'mobo_core_portal_heartbeat_last_result' );
+	delete_option( 'mobo_core_webhook_auth_status' );
 	delete_option( 'mobo_core_remote_upgrade_status' );
 	delete_option( 'mobo_core_remote_upgrade_history' );
 	delete_option( 'mobo_core_upgrade_barrier_state' );

@@ -188,6 +188,57 @@ class Mobo_Core_Rest_Controller {
 			)
 		);
 
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/portal/webhook-test',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'test_webhook_connection' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/portal/settings',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_portal_settings' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/portal/operations/start',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'start_portal_operation' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/portal/operations/status',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_portal_operation_status' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/portal/operations/cancel',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'cancel_portal_operation' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
 		register_rest_route(
 			'mobo-core/v1',
 			'/sync/cancel',
@@ -210,8 +261,13 @@ class Mobo_Core_Rest_Controller {
 	 */
 	public function check_security( $request ) {
 		$expected = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
+		$record_test = class_exists( 'Mobo_Core_Webhook_Auth_Status' ) && Mobo_Core_Webhook_Auth_Status::should_record_request( $request );
 
 		if ( '' === $expected ) {
+			if ( $record_test ) {
+				Mobo_Core_Webhook_Auth_Status::record( 'missing', 'portal', 'کد امنیتی وب‌هوک در افزونه ثبت نشده است.' );
+			}
+
 			return new WP_Error(
 				'mobo_core_security_missing',
 				'Security code is not configured.',
@@ -220,6 +276,10 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		if ( ! Mobo_Core_Settings::is_valid_security_code( $expected ) ) {
+			if ( $record_test ) {
+				Mobo_Core_Webhook_Auth_Status::record( 'misconfigured', 'portal', 'ساختار کد امنیتی ذخیره‌شده در افزونه برای Header معتبر نیست.' );
+			}
+
 			return new WP_Error(
 				'mobo_core_security_invalid',
 				'Configured security code is not a valid visible-ASCII HTTP header value.',
@@ -234,6 +294,10 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		if ( '' === $provided || ! hash_equals( $expected, $provided ) ) {
+			if ( $record_test ) {
+				Mobo_Core_Webhook_Auth_Status::record( 'invalid', 'portal', 'کد وب‌هوک ثبت‌شده در Portal با کد این افزونه یکسان نیست.' );
+			}
+
 			return new WP_Error(
 				'mobo_core_unauthorized',
 				'Unauthorized.',
@@ -241,9 +305,42 @@ class Mobo_Core_Rest_Controller {
 			);
 		}
 
+		if ( $record_test ) {
+			Mobo_Core_Webhook_Auth_Status::record( 'valid', 'portal', 'کد وب‌هوک Portal و افزونه یکسان است.' );
+		}
+
 		return true;
 	}
 
+
+	/**
+	 * Explicit Portal-to-WordPress webhook credential test.
+	 *
+	 * The permission callback validates X-SEC and records the result. This
+	 * callback only returns a safe acknowledgement; no credential is exposed.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function test_webhook_connection( $request ) {
+		$status = class_exists( 'Mobo_Core_Webhook_Auth_Status' )
+			? Mobo_Core_Webhook_Auth_Status::get_status()
+			: array( 'status' => 'valid', 'checkedAt' => time() );
+
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'valid',
+				'message' => 'کد وب‌هوک Portal و افزونه معتبر و یکسان است.',
+				'data'    => array(
+					'siteUrl'       => home_url( '/' ),
+					'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+					'checkedAt'     => isset( $status['checkedAt'] ) ? absint( $status['checkedAt'] ) : time(),
+					'credential'    => $status,
+				),
+			)
+		);
+	}
 
 	/**
 	 * Check real cron token.
@@ -792,6 +889,64 @@ class Mobo_Core_Rest_Controller {
 		$sync = new Mobo_Core_Product_Sync();
 
 		return rest_ensure_response( $sync->cancel_manual_sync() );
+	}
+
+
+	/**
+	 * Return every non-secret configurable setting to Portal.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_portal_settings( $request ) {
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'ok',
+				'message' => 'تنظیمات غیرمحرمانه افزونه دریافت شد.',
+				'data'    => Mobo_Core_Settings::get_portal_settings_snapshot(),
+			)
+		);
+	}
+
+	/**
+	 * Start a Portal-requested Sync or Repair.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function start_portal_operation( $request ) {
+		$params = $request->get_json_params();
+		$params = is_array( $params ) ? $params : array();
+		$operation = isset( $params['operation'] ) ? sanitize_key( (string) $params['operation'] ) : '';
+		$request_id = isset( $params['requestId'] ) ? sanitize_text_field( (string) $params['requestId'] ) : '';
+		return rest_ensure_response( Mobo_Core_Remote_Control::start_operation( $operation, $request_id ) );
+	}
+
+	/**
+	 * Return Portal-requested operation status.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_portal_operation_status( $request ) {
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status'  => 'ok',
+				'data'    => Mobo_Core_Remote_Control::get_status(),
+			)
+		);
+	}
+
+	/**
+	 * Cancel current Portal/manual operation.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function cancel_portal_operation( $request ) {
+		return rest_ensure_response( Mobo_Core_Remote_Control::cancel_operation() );
 	}
 
 	private function to_bool( $value ) {

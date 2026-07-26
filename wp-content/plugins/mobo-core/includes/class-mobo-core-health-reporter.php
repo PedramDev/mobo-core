@@ -32,6 +32,7 @@ class Mobo_Core_Health_Reporter {
 		$cache_purge  = class_exists( 'Mobo_Core_Cache_Purger' ) ? Mobo_Core_Cache_Purger::get_health_status() : array();
 		$wp_memory    = $this->get_wordpress_memory_stats();
 		$environment  = $this->get_environment_stats();
+		$webhook_auth = class_exists( 'Mobo_Core_Webhook_Auth_Status' ) ? Mobo_Core_Webhook_Auth_Status::get_status() : array();
 
 		$last_self_run     = isset( $self_status['lastRunAt'] ) ? absint( $self_status['lastRunAt'] ) : 0;
 		$last_cron_hit     = isset( $cron_status['lastHitAt'] ) ? absint( $cron_status['lastHitAt'] ) : 0;
@@ -42,6 +43,7 @@ class Mobo_Core_Health_Reporter {
 			'siteUrl'               => home_url( '/' ),
 			'licenseToken'          => (string) get_option( 'mobo_core_token', '' ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'webhookCredential'      => $webhook_auth,
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,
 			'wooCommerceVersion'    => $this->get_woocommerce_version(),
@@ -93,6 +95,9 @@ class Mobo_Core_Health_Reporter {
 				'lastResult'          => get_option( 'mobo_core_portal_heartbeat_last_result', array() ),
 			),
 			'syncHealth'            => class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array(),
+			'syncStatus'            => $sync_status,
+			'remoteControl'          => class_exists( 'Mobo_Core_Remote_Control' ) ? Mobo_Core_Remote_Control::get_status() : array(),
+			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
 			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : $last_cron_hit ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),

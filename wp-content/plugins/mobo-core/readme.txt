@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.90
+Stable tag: 10.31.92
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -140,6 +140,20 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.31.92 =
+
+* Added an X-SEC-protected Portal webhook credential test endpoint.
+* Portal heartbeat requests now record whether the configured Webhook Security Code is valid, missing, mismatched, or malformed.
+* Added clear webhook credential status to the plugin dashboard, connection page, and central Site Health screen.
+* HTTP 401/403 credential failures are reported separately from WordPress downtime.
+
+= 10.31.91 =
+
+* Added X-SEC-protected Portal APIs for reading all non-secret plugin settings.
+* Added Portal-triggered Sync and full Repair with idempotent request IDs.
+* Added live operation status, progress, cancellation, and Health report telemetry.
+* License Token, Webhook Security Code, passwords, cookies, Cron Token, and similar credentials are never returned in the settings snapshot.
 
 = 10.31.84 =
 

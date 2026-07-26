@@ -461,6 +461,8 @@ class Mobo_Core_Admin {
 			<div class="mobo-message mobo-message-error"><strong>وب‌هوک قابل ارسال نیست:</strong> کد امنیتی فعلی برای Header معتبر نیست. مقدار باید فقط شامل ASCII قابل‌چاپ و بدون فاصله باشد؛ نمادهایی مانند <code dir="ltr">@ # $ % &amp; * _ [ ] -</code> مجاز هستند، اما حروف فارسی و سایر Unicodeها مجاز نیستند.</div>
 		<?php endif; ?>
 
+		<?php $this->render_webhook_auth_test_status(); ?>
+
 		<div class="mobo-grid mobo-grid-dashboard">
 			<div class="mobo-card mobo-card-wide" id="mobo-sync-status-card" data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( wp_create_nonce( 'mobo_core_sync_status' ) ); ?>">
 				<div class="mobo-card-head">
@@ -729,6 +731,39 @@ class Mobo_Core_Admin {
 		<?php
 	}
 
+	/**
+	 * Render the last Portal webhook credential test result.
+	 *
+	 * @return void
+	 */
+	private function render_webhook_auth_test_status() {
+		$status = class_exists( 'Mobo_Core_Webhook_Auth_Status' )
+			? Mobo_Core_Webhook_Auth_Status::get_status()
+			: array( 'status' => 'unknown', 'checkedAt' => 0, 'message' => '' );
+
+		$code = isset( $status['status'] ) ? sanitize_key( (string) $status['status'] ) : 'unknown';
+		$checked_at = isset( $status['checkedAt'] ) ? absint( $status['checkedAt'] ) : 0;
+		$message = isset( $status['message'] ) ? (string) $status['message'] : '';
+		$time = $checked_at > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $checked_at ) : 'هنوز تست نشده';
+
+		$labels = array(
+			'valid'         => array( 'success', 'کد وب‌هوک صحیح است', 'آخرین درخواست تست Portal با X-SEC معتبر پذیرفته شد.' ),
+			'invalid'       => array( 'error', 'کد وب‌هوک Portal اشتباه است', 'کد ثبت‌شده در Portal با کد ذخیره‌شده در این افزونه یکسان نیست. هر دو سمت را با یک مقدار واحد ذخیره کنید.' ),
+			'missing'       => array( 'error', 'کد وب‌هوک در افزونه ثبت نشده', 'ابتدا یک کد امنیتی معتبر در همین صفحه ذخیره کنید و همان مقدار را در Portal قرار دهید.' ),
+			'misconfigured' => array( 'error', 'ساختار کد وب‌هوک نامعتبر است', 'کد باید فقط شامل ASCII قابل‌چاپ و بدون فاصله باشد.' ),
+			'unknown'       => array( 'warning', 'هنوز از Portal تست نشده', 'پس از اجرای Health Check یا دکمه «تست وب‌هوک» در Portal، نتیجه اینجا ثبت می‌شود.' ),
+		);
+
+		$view = isset( $labels[ $code ] ) ? $labels[ $code ] : $labels['unknown'];
+		?>
+		<div class="mobo-message mobo-message-<?php echo esc_attr( $view[0] ); ?>">
+			<strong><?php echo esc_html( $view[1] ); ?>:</strong>
+			<?php echo esc_html( '' !== $message ? $message : $view[2] ); ?>
+			<span style="display:block;margin-top:6px;opacity:.78;">آخرین بررسی: <?php echo esc_html( $time ); ?> به وقت تهران</span>
+		</div>
+		<?php
+	}
+
 	 /**
 	 * Render connection tab.
 	 *
@@ -797,6 +832,8 @@ class Mobo_Core_Admin {
 			<?php else : ?>
 				<div class="mobo-message mobo-message-success">ساختار کد امنیتی وب هوک معتبر است: ASCII قابل‌چاپ، بدون فاصله و مناسب برای Header <code dir="ltr">X-SEC</code>.</div>
 			<?php endif; ?>
+
+			<?php $this->render_webhook_auth_test_status(); ?>
 
 			<?php $this->render_license_info_card(); ?>
 
@@ -5876,6 +5913,9 @@ type:{mobo_order_type_label}</textarea>
 			case 'connection':
 				$this->save_secret_option_from_post( 'mobo_core_token' );
 				$this->save_secret_option_from_post( 'mobo_core_security_code' );
+				if ( isset( $_POST['mobo_core_security_code'] ) && '' !== trim( (string) wp_unslash( $_POST['mobo_core_security_code'] ) ) && class_exists( 'Mobo_Core_Webhook_Auth_Status' ) ) {
+					delete_option( Mobo_Core_Webhook_Auth_Status::OPTION_KEY );
+				}
 				break;
 
 			case 'product':
