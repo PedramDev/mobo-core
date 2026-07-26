@@ -315,6 +315,14 @@ class Mobo_Core_Remote_Updater {
 	}
 
 	private static function download_package( $url, $token ) {
+		$license_token = trim( (string) get_option( 'mobo_core_token', '' ) );
+		if ( '' === $license_token ) {
+			return new WP_Error( 'mobo_core_upgrade_missing_license_token', 'کد لایسنس برای دانلود بسته Deploy ثبت نشده است.' );
+		}
+		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $license_token ) ) {
+			return new WP_Error( 'mobo_core_upgrade_invalid_license_token', 'ساختار کد لایسنس برای دانلود بسته Deploy معتبر نیست.' );
+		}
+
 		if ( ! function_exists( 'wp_tempnam' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
@@ -335,6 +343,7 @@ class Mobo_Core_Remote_Updater {
 				'limit_response_size' => self::MAX_PACKAGE_BYTES,
 				'headers'             => array(
 					'Accept'                  => 'application/zip, application/octet-stream',
+					'Token'                   => $license_token,
 					'X-Mobo-Package-Token'    => $token,
 					'Cache-Control'            => 'no-store',
 					'X-Mobo-Plugin-Version'    => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',

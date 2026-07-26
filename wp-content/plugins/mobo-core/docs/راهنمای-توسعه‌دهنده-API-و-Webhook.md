@@ -114,3 +114,14 @@ X-Mobo-Webhook-Test: 1
 - `503`: کد ذخیره‌شده در افزونه برای Header معتبر نیست.
 
 آخرین نتیجه تست به‌صورت غیرمحرمانه در option `mobo_core_webhook_auth_status` ذخیره و در داشبورد، صفحه اتصال و گزارش Health نمایش داده می‌شود.
+
+
+## قرارداد لایسنس API — نسخه 10.31.93
+
+فقط `GET /get-products-free` بدون لایسنس است. تمام درخواست‌های Portal که این افزونه مصرف می‌کند Header زیر را ارسال می‌کنند:
+
+```http
+Token: <LICENSE-GUID>
+```
+
+Portal مقدار را با `FillTokenDto()` می‌خواند. گزارش سلامت علاوه بر Token، هدر `X-SEC` و دانلود بسته Deploy علاوه بر Token، هدر `X-Mobo-Package-Token` را ارسال می‌کند. payloadهای Webhook نیز Token و X-SEC را همزمان دارند.

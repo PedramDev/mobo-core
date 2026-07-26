@@ -319,6 +319,34 @@ class Mobo_Core_API_Client {
 	}
 
 
+
+	/**
+	 * Return the license GUID required by every Portal API consumed by the plugin.
+	 * The only anonymous Portal endpoint is get-products-free, which this client
+	 * intentionally does not use for sync or repair.
+	 *
+	 * @return string|WP_Error
+	 */
+	private function get_license_token() {
+		$token = trim( (string) Mobo_Core_Settings::get( 'mobo_core_token', '' ) );
+
+		if ( '' === $token ) {
+			return new WP_Error(
+				'mobo_core_missing_license_token',
+				'کد لایسنس ثبت نشده است. همه APIهای Portal به‌جز get-products-free به Header Token نیاز دارند.'
+			);
+		}
+
+		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $token ) ) {
+			return new WP_Error(
+				'mobo_core_invalid_license_token',
+				'ساختار کد لایسنس معتبر نیست؛ مقدار Token باید یک GUID باشد.'
+			);
+		}
+
+		return $token;
+	}
+
 	/**
 	 * Normalize a payload URL.
 	 *
@@ -366,8 +394,14 @@ class Mobo_Core_API_Client {
 			return new WP_Error( 'mobo_core_invalid_payload_url', 'Payload URL is invalid.' );
 		}
 
+		$license_token = $this->get_license_token();
+		if ( is_wp_error( $license_token ) ) {
+			return $license_token;
+		}
+
 		$headers = array(
 			'Accept' => 'application/json',
+			'Token'  => $license_token,
 		);
 
 		$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
@@ -381,12 +415,6 @@ class Mobo_Core_API_Client {
 			}
 
 			$headers['X-SEC'] = $security_code;
-		}
-
-		$token = (string) Mobo_Core_Settings::get( 'mobo_core_token', '' );
-
-		if ( '' !== trim( $token ) ) {
-			$headers['Token'] = trim( $token );
 		}
 
 		$response = wp_remote_get(
@@ -419,18 +447,25 @@ class Mobo_Core_API_Client {
 
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
 
+		$body = (string) wp_remote_retrieve_body( $response );
+
 		if ( $code < 200 || $code >= 300 ) {
+			$error_payload = json_decode( $body, true );
+			$error_status  = is_array( $error_payload ) && isset( $error_payload['status'] ) ? sanitize_key( (string) $error_payload['status'] ) : '';
+			$error_message = is_array( $error_payload ) && isset( $error_payload['message'] ) ? sanitize_text_field( (string) $error_payload['message'] ) : '';
+
 			return new WP_Error(
 				'mobo_core_payload_http_error',
-				sprintf( 'Payload HTTP error. URL=%s Status=%d', $url, $code ),
+				'' !== $error_message ? $error_message : sprintf( 'Portal API HTTP error. URL=%s Status=%d', $url, $code ),
 				array(
-					'url'    => $url,
-					'status' => $code,
+					'url'           => $url,
+					'status'        => $code,
+					'portal_status' => $error_status,
+					'body'          => function_exists( 'mb_substr' ) ? mb_substr( $body, 0, 1000 ) : substr( $body, 0, 1000 ),
 				)
 			);
 		}
 
-		$body = wp_remote_retrieve_body( $response );
 
 		if ( '' === trim( (string) $body ) ) {
 			return new WP_Error( 'mobo_core_empty_payload_response', 'Payload endpoint returned empty response.' );

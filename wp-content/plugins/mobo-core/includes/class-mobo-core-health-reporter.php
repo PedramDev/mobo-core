@@ -151,6 +151,27 @@ class Mobo_Core_Health_Reporter {
 			);
 		}
 
+		$license_token = trim( (string) get_option( 'mobo_core_token', '' ) );
+		if ( '' === $license_token ) {
+			return $this->save_result(
+				array(
+					'success' => false,
+					'status'  => 'missing-license-token',
+					'message' => 'کد لایسنس ثبت نشده است؛ گزارش سلامت به Header Token نیاز دارد.',
+				)
+			);
+		}
+
+		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $license_token ) ) {
+			return $this->save_result(
+				array(
+					'success' => false,
+					'status'  => 'invalid-license-token',
+					'message' => 'ساختار کد لایسنس معتبر نیست؛ Token باید GUID باشد.',
+				)
+			);
+		}
+
 		$security_code = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
 
 		if ( '' === $security_code ) {
@@ -187,6 +208,7 @@ class Mobo_Core_Health_Reporter {
 				'headers'     => array(
 					'Accept'       => 'application/json',
 					'Content-Type' => 'application/json; charset=utf-8',
+					'Token'        => $license_token,
 					'X-SEC'        => $security_code,
 				),
 				'body'        => wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
