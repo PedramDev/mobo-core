@@ -23,11 +23,11 @@ class Mobo_Core_Cron_Runner {
 	 * stops. The global runner lease is renewed before every major stage.
 	 *
 	 * @param string $source Source label.
-	 * @param bool   $send_health_report Send the outbound health report after the slice.
+	 * @param bool   $send_health_report Legacy opt-in push. Portal normally pulls /health.
 	 * @param array  $runtime_overrides Optional bounded runtime overrides.
 	 * @return array
 	 */
-	public function run( $source = 'real-cron', $send_health_report = true, $runtime_overrides = array() ) {
+	public function run( $source = 'real-cron', $send_health_report = false, $runtime_overrides = array() ) {
 		$source = sanitize_key( (string) $source );
 		$source = '' !== $source ? $source : 'real-cron';
 

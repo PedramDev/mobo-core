@@ -320,15 +320,9 @@ GET /wp-json/mobo-core/v1/health
 X-SEC: <security-code>
 ```
 
-ارسال گزارش از افزونه به پرتال:
+Portal گزارش را مستقیماً از endpoint بالا Pull می‌کند. افزونه گزارش دوره‌ای به Portal Push نمی‌کند. در صورت قدیمی بودن Cron، Portal می‌تواند endpoint جداگانه `/heartbeat` را برای Recovery فراخوانی کند؛ نتیجه Heartbeat مستقل از دسترسی Health ثبت می‌شود.
 
-```http
-POST /api/site-health/report
-X-SEC: <security-code>
-Content-Type: application/json
-```
-
-گزارش می تواند نسخه WordPress/PHP/WooCommerce، وضعیت Debug، memory، disk، cron، Sync، صف وب هوک و Action Scheduler را شامل شود. ارسال Health در نصب جدید به صورت پیش فرض خاموش است.
+گزارش می‌تواند نسخه WordPress/PHP/WooCommerce، وضعیت Debug، memory، disk، cron، Sync، صف وب‌هوک و Action Scheduler را شامل شود.
 
 ## 15. REST API افزونه
 
@@ -682,14 +676,7 @@ GET /wp-json/mobo-core/v1/health
 X-SEC: <security-code>
 ```
 
-The plugin can report detailed site state to:
-
-```http
-POST /api/site-health/report
-X-SEC: <security-code>
-```
-
-Health reporting is disabled by default on fresh installations.
+Portal pulls detailed site state from the authenticated Health endpoint. The plugin does not periodically push Health reports. If the reported cron is stale, Portal may invoke `/heartbeat` separately for recovery; heartbeat outcomes do not determine endpoint reachability.
 
 ## 15. Plugin REST API
 

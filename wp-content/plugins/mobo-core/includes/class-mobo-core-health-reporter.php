@@ -2,9 +2,9 @@
 /**
  * Customer-side WordPress health reporter.
  *
- * Builds a compact site-health snapshot and posts it to MoboCore on the configured interval:
- * POST /api/site-health/report
- * X-SEC: <mobo_core_security_code>
+ * Builds a compact site-health snapshot for Portal pull requests.
+ * Automatic outbound reports are disabled; Portal reads /health directly.
+ * The legacy manual send action remains available for diagnostics only.
  *
  * PHP 7.4 compatible.
  */
@@ -121,122 +121,18 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
-	 * Send report to MoboCore.
+	 * Legacy compatibility method. No outbound request is performed.
 	 *
 	 * @param string $source Source label.
-	 * @param bool   $force Ignore minimum interval.
+	 * @param bool   $force Retained for backward compatibility.
 	 * @return array
 	 */
 	public function send_report( $source = 'real-cron', $force = false ) {
-		$min_interval = Mobo_Core_Settings::get_int( 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
-		$last_success = absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) );
-
-		if ( ! $force && $last_success > 0 && ( time() - $last_success ) < $min_interval ) {
-			return array(
-				'success' => true,
-				'status'  => 'throttled',
-				'message' => 'به دلیل نگذشتن حداقل فاصله زمانی، ارسال گزارش سلامت در این اجرا انجام نشد.',
-			);
-		}
-
-		$url = $this->get_report_url();
-
-		if ( '' === $url ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'missing-url',
-					'message' => 'آدرس مرکزی گزارش سلامت از API Base URL قابل محاسبه نیست.',
-				)
-			);
-		}
-
-		$license_token = trim( (string) get_option( 'mobo_core_token', '' ) );
-		if ( '' === $license_token ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'missing-license-token',
-					'message' => 'کد لایسنس ثبت نشده است؛ گزارش سلامت به Header Token نیاز دارد.',
-				)
-			);
-		}
-
-		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $license_token ) ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'invalid-license-token',
-					'message' => 'ساختار کد لایسنس معتبر نیست؛ Token باید GUID باشد.',
-				)
-			);
-		}
-
-		$security_code = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
-
-		if ( '' === $security_code ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'missing-security-code',
-					'message' => 'کد امنیتی وب هوک ثبت نشده است.',
-				)
-			);
-		}
-
-		if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'invalid-security-code',
-					'message' => Mobo_Core_Settings::get_security_code_validation_error( $security_code ),
-				)
-			);
-		}
-
-		$payload = $this->build_report();
-		$payload['reportSource'] = sanitize_key( (string) $source );
-
-		update_option( 'mobo_core_health_last_report_attempt_at', time(), false );
-
-		$response = wp_remote_post(
-			$url,
-			array(
-				'timeout'     => Mobo_Core_Settings::get_int( 'mobo_core_health_report_timeout_seconds', 15, 5, 60 ),
-				'redirection' => 2,
-				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'health_reporter' ),
-				'headers'     => array(
-					'Accept'       => 'application/json',
-					'Content-Type' => 'application/json; charset=utf-8',
-					'Token'        => $license_token,
-					'X-SEC'        => $security_code,
-				),
-				'body'        => wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
-			)
+		return array(
+			'success' => true,
+			'status'  => 'portal-pull-only',
+			'message' => 'ارسال گزارش سلامت غیرفعال است؛ Portal گزارش را مستقیماً از endpoint سلامت دریافت می‌کند.',
 		);
-
-		if ( is_wp_error( $response ) ) {
-			return $this->save_result(
-				array(
-					'success' => false,
-					'status'  => 'request-failed',
-					'message' => 'ارسال گزارش سلامت ناموفق بود. جزئیات فنی: ' . $response->get_error_message(),
-				)
-			);
-		}
-
-		$code = absint( wp_remote_retrieve_response_code( $response ) );
-		$body = (string) wp_remote_retrieve_body( $response );
-
-		$result = array(
-			'success'    => $code >= 200 && $code < 300,
-			'status'     => $code >= 200 && $code < 300 ? 'sent' : 'http-error',
-			'httpStatus' => $code,
-			'message'    => $code >= 200 && $code < 300 ? 'گزارش سلامت با موفقیت ارسال شد.' : 'MoboCore پاسخ HTTP ' . $code . ' برگرداند.',
-			'body'       => $this->trim_string( $body, 1000 ),
-		);
-
-		return $this->save_result( $result );
 	}
 
 	/**
@@ -268,11 +164,13 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		return array(
-			'enabled'       => true,
-			'reportUrl'     => $this->get_report_url(),
+			'enabled'       => false,
+			'deliveryMode'  => 'portal-pull',
+			'reportUrl'     => '',
 			'lastAttemptAt' => absint( get_option( 'mobo_core_health_last_report_attempt_at', 0 ) ),
 			'lastSuccessAt' => absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) ),
-			'lastResult'    => $last_result,
+			'lastResult'    => array(),
+			'message'       => 'Portal گزارش سلامت را مستقیماً از endpoint افزونه دریافت می‌کند.',
 		);
 	}
 

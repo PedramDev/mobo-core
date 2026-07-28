@@ -1433,7 +1433,7 @@ class Mobo_Core_Admin {
 					<?php $this->status_box( 'اجرای checkout توسط موبو', ! empty( $status['runtimeEnabled'] ) ? 'فعال' : 'غیرفعال - کنترل‌های قبل از پرداخت یا ثبت سفارش خودکار فعال نیستند' ); ?>
 					<?php $this->status_box( 'بررسی محلی موجودی', ! empty( $status['localStockEnabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'بررسی سبد موبو', ! empty( $status['moboCartEnabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
-					<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
+					<?php $this->status_box( 'Endpoint سلامت', 'فعال و آماده پاسخ' ); ?>
 					<?php $this->status_box( 'آخرین موفقیت', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین ورود موفق موبو', ! empty( $status['lastMoboLoginAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastMoboLoginAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین تست ورود', get_option( 'mobo_core_checkout_mobo_login_test_at' ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( get_option( 'mobo_core_checkout_mobo_login_test_at' ) ) ) : '—' ); ?>
@@ -1968,7 +1968,6 @@ type:{mobo_order_type_label}</textarea>
 	 */
 	private function render_health_tab() {
 		$reporter       = new Mobo_Core_Health_Reporter();
-		$status         = $reporter->get_last_report_status();
 		$local          = $reporter->build_report();
 		$image          = isset( $local['imageProcessing'] ) && is_array( $local['imageProcessing'] ) ? $local['imageProcessing'] : array();
 		$cache_purge    = isset( $local['cachePurge'] ) && is_array( $local['cachePurge'] ) ? $local['cachePurge'] : array();
@@ -1981,7 +1980,6 @@ type:{mobo_order_type_label}</textarea>
 		$cache_purge_status = isset( $cache_purge['status'] ) ? sanitize_key( (string) $cache_purge['status'] ) : 'never_run';
 		$wp_cron_ok     = $this->is_wp_cron_disabled();
 		$phpinfo_url    = wp_nonce_url( MOBO_CORE_PLUGIN_URL . 'mobo-phpinfo.php', 'mobo_core_phpinfo' );
-		$report_url     = isset( $status['reportUrl'] ) ? (string) $status['reportUrl'] : '';
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
@@ -1992,38 +1990,27 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>گزارش سلامت سایت</h2>
-						<p>گزارش سلامت همیشه فعال است و به آدرس مرکزی MoboCore ارسال می‌شود. مدیر سایت نمی‌تواند مقصد گزارش یا فعال بودن ارسال را تغییر دهد.</p>
+						<p>Portal گزارش سلامت را با درخواست مستقیم و احراز هویت‌شده از endpoint افزونه دریافت می‌کند؛ افزونه گزارش دوره‌ای به بیرون ارسال نمی‌کند.</p>
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'ارسال گزارش سلامت', 'همیشه فعال' ); ?>
-						<?php $this->status_box( 'آخرین تلاش', ! empty( $status['lastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastAttemptAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'آخرین ارسال موفق', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
+						<?php $this->status_box( 'مدل دریافت سلامت', 'Pull توسط Portal' ); ?>
+						<?php $this->status_box( 'Endpoint سلامت', 'فعال و آماده پاسخ' ); ?>
+						<?php $this->status_box( 'ارسال خودکار افزونه', 'غیرفعال' ); ?>
 						<?php $this->status_box( 'نسخه افزونه', defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '—' ); ?>
 					</div>
 
 					<div class="mobo-field mobo-field-full">
-						<label>مقصد ثابت گزارش سلامت</label>
-						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( '' !== $report_url ? $report_url : 'API Base URL تنظیم نشده است' ); ?>" onclick="this.select();">
-						<div class="mobo-help">این آدرس از API مرکزی موبو ساخته می‌شود و در این صفحه قابل ویرایش نیست.</div>
-					</div>
-				</div>
-
-				<div class="mobo-card">
-					<div class="mobo-card-head">
-						<h2>تنظیمات زمان‌بندی گزارش</h2>
-						<p>فقط فاصله ارسال و timeout قابل تنظیم هستند.</p>
-					</div>
-					<div class="mobo-fields-grid">
-						<?php $this->int_field( 'حداقل فاصله ارسال / ثانیه', 'mobo_core_health_report_min_interval_seconds', 60, 3600 ); ?>
-						<?php $this->int_field( 'Timeout ارسال / ثانیه', 'mobo_core_health_report_timeout_seconds', 5, 60 ); ?>
+						<label>Endpoint استاندارد سلامت</label>
+						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( rest_url( 'mobo-core/v1/health' ) ); ?>" onclick="this.select();">
+						<div class="mobo-help">Portal این endpoint را دوره‌ای با Header امنیتی X-SEC فراخوانی می‌کند. این درخواست علاوه بر ثبت وضعیت زنده، سایت را از حالت Sleep خارج نگه می‌دارد.</div>
 					</div>
 				</div>
 
 				<div class="mobo-card">
 					<div class="mobo-card-head">
 						<h2>PHP و پردازش تصویر</h2>
-						<p>خلاصه امن این اطلاعات همراه گزارش سلامت ارسال می‌شود. خروجی کامل phpinfo فقط برای مدیر واردشده قابل مشاهده است.</p>
+						<p>خلاصه امن این اطلاعات در پاسخ endpoint سلامت قرار می‌گیرد. خروجی کامل phpinfo فقط برای مدیر واردشده قابل مشاهده است.</p>
 					</div>
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'نسخه PHP', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
@@ -2039,7 +2026,7 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>سلامت پاک‌سازی Cache محصول</h2>
-						<p>آخرین نتیجه Purge هدفمند و نسخه Integrationهای Cache در گزارش سلامت مرکزی ارسال می‌شود. خطای Cache Sync محصول را متوقف نمی‌کند.</p>
+						<p>آخرین نتیجه Purge هدفمند و نسخه Integrationهای Cache در پاسخ سلامت Portal قرار می‌گیرد. خطای Cache Sync محصول را متوقف نمی‌کند.</p>
 					</div>
 
 					<div class="mobo-status-grid">
@@ -2066,7 +2053,7 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>وضعیت محلی فعلی</h2>
-						<p>این مقادیر در گزارش سلامت مرکزی نیز ثبت می‌شوند.</p>
+						<p>این مقادیر در پاسخ سلامت Portal نیز قرار می‌گیرند.</p>
 					</div>
 
 					<div class="<?php echo $wp_cron_ok ? 'mobo-alert mobo-alert-success' : 'mobo-alert mobo-alert-error'; ?>">
@@ -2084,12 +2071,6 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->status_box( 'حالت اجرای کران', isset( $local['cronMode'] ) ? $local['cronMode'] : '—' ); ?>
 					</div>
 
-					<?php if ( ! empty( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) : ?>
-						<details class="mobo-collapsible-log">
-							<summary>آخرین نتیجه ارسال گزارش سلامت</summary>
-							<div class="mobo-log-box"><pre dir="ltr"><?php echo esc_html( wp_json_encode( $status['lastResult'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre></div>
-						</details>
-					<?php endif; ?>
 				</div>
 			</div>
 
@@ -2097,8 +2078,8 @@ type:{mobo_order_type_label}</textarea>
 			$this->guide_box(
 				'راهنمای سلامت سایت',
 				array(
-					array( 'title' => 'ارسال خودکار', 'text' => 'گزارش سلامت همیشه فعال است. فقط فاصله ارسال قابل تنظیم است و مقصد از API مرکزی موبو ساخته می‌شود.' ),
-					array( 'title' => 'phpinfo', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP ارسال می‌شود. خروجی کامل phpinfo فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
+					array( 'title' => 'دریافت خودکار', 'text' => 'Portal endpoint سلامت را دوره‌ای با X-SEC فراخوانی می‌کند. افزونه هیچ گزارش دوره‌ای به بیرون Push نمی‌کند.' ),
+					array( 'title' => 'phpinfo', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP در پاسخ سلامت قرار می‌گیرد. خروجی کامل phpinfo فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
 					array( 'title' => 'کران', 'text' => 'برای جلوگیری از اجرای همزمان WP-Cron داخلی و Cron واقعی، DISABLE_WP_CRON باید true باشد.' ),
 				),
 				'اگر WebP یا دسترسی نوشتن uploads در وضعیت خطا بود، قبل از نوسازی تصاویر آن را در هاست اصلاح کنید.'
@@ -2106,8 +2087,8 @@ type:{mobo_order_type_label}</textarea>
 			$this->recommendation_box(
 				'تنظیمات پیشنهادی سلامت سایت',
 				array(
-					array( 'setting' => 'حداقل فاصله ارسال', 'value' => '۹۰۰ ثانیه در حالت عادی؛ ۳۰۰ ثانیه برای عیب‌یابی', 'reason' => 'گزارش کافی تولید می‌کند و فشار اضافی ایجاد نمی‌کند.' ),
-					array( 'setting' => 'Timeout ارسال', 'value' => '۱۰ تا ۱۵ ثانیه', 'reason' => 'برای هاست‌های معمولی کافی است و worker را طولانی نگه نمی‌دارد.' ),
+					array( 'setting' => 'فاصله Health Poll در Portal', 'value' => '۳۰۰ ثانیه', 'reason' => 'سایت را بیدار نگه می‌دارد و بدون Push افزونه وضعیت زنده می‌دهد.' ),
+					array( 'setting' => 'Timeout Health در Portal', 'value' => '۳۰ ثانیه', 'reason' => 'برای پاسخ read-only سلامت کافی است و عملیات Recovery جداگانه محدود می‌ماند.' ),
 					array( 'setting' => 'DISABLE_WP_CRON', 'value' => 'true', 'reason' => 'اجرای صف‌ها باید با Cron واقعی و قابل مشاهده انجام شود.' ),
 				),
 				'بعد از تغییر PHP، فعال‌سازی Imagick/GD یا اصلاح wp-config.php، این صفحه را دوباره باز کنید تا وضعیت تازه محاسبه شود.'
@@ -6119,14 +6100,9 @@ type:{mobo_order_type_label}</textarea>
 				break;
 
 			case 'health':
-				update_option( 'mobo_core_health_report_enabled', '1', false );
+				// Health is pull-only. Keep legacy options explicitly disabled.
+				update_option( 'mobo_core_health_report_enabled', '0', false );
 				delete_option( 'mobo_core_health_report_url' );
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_health_report_min_interval_seconds' => array( 60, 3600 ),
-						'mobo_core_health_report_timeout_seconds' => array( 5, 60 ),
-					)
-				);
 				break;
 		}
 	}

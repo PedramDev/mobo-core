@@ -514,13 +514,13 @@ Public methods: **4** · Internal non-public methods: **15**
 ### `Mobo_Core_Health_Reporter`
 
 Source: [`includes/class-mobo-core-health-reporter.php`](includes/class-mobo-core-health-reporter.php)  
-ساخت و ارسال گزارش سلامت سایت مشتری. / Builds and sends customer-site health reports.  
+ساخت snapshot سلامت سایت مشتری برای Pull توسط Portal. / Builds customer-site health snapshots for Portal pull requests.  
 Public methods: **4** · Internal non-public methods: **25**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public function build_report()` | ساخت report در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Build a health report compatible with MoboCore WordPressSiteHealthReportDto. |
-| `public function send_report($source = 'real-cron', $force = false)` | ارسال report در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Send report to MoboCore. |
+| `public function send_report($source = 'real-cron', $force = false)` | متد سازگاری قدیمی؛ هیچ درخواست خروجی ارسال نمی‌کند. | Legacy compatibility method; no outbound request is performed. |
 | `public function get_local_status()` | دریافت local status در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Return current local health status for REST /health. |
 | `public function get_last_report_status()` | دریافت last report status در بخش ساخت و ارسال گزارش سلامت سایت مشتری. | Get last report status for UI. |
 

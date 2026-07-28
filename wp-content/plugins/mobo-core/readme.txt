@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.93
+Stable tag: 10.31.94
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -140,6 +140,13 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.31.94 =
+
+* Portal now pulls health directly from the plugin; automatic cron-based health report pushes are disabled.
+* The legacy report-now route now returns a local snapshot and never performs an outbound request.
+* The Health admin tab now documents the Portal pull model and the active endpoint.
+* Health responses continue to expose current plugin, cron, queue, sync, WebP, settings, and credential telemetry.
 
 = 10.31.93 =
 

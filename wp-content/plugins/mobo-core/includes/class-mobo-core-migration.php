@@ -50,6 +50,7 @@ class Mobo_Core_Migration {
 		self::apply_103167_image_workflow_safety( '' );
 		self::apply_103168_image_automation_safety( '' );
 		self::apply_103177_desired_state_repair( '' );
+		self::apply_103194_health_pull_only( '' );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -89,6 +90,7 @@ class Mobo_Core_Migration {
 		self::apply_103167_image_workflow_safety( $current );
 		self::apply_103168_image_automation_safety( $current );
 		self::apply_103177_desired_state_repair( $current );
+		self::apply_103194_health_pull_only( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -493,7 +495,7 @@ class Mobo_Core_Migration {
 
 
 	/**
-	 * Enforce non-editable Mobo endpoints and always-on health reporting.
+	 * Enforce non-editable Mobo endpoints and initialize legacy health options.
 	 *
 	 * @param string $previous_version Previously stored plugin DB version.
 	 * @return void
@@ -509,6 +511,30 @@ class Mobo_Core_Migration {
 		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
 	}
 
+
+
+	/**
+	 * Disable the retired outbound health-report path.
+	 *
+	 * Portal 51+ pulls the authenticated /health endpoint. Existing installs may
+	 * still have the legacy option enabled from older releases, so normalize it
+	 * once when upgrading to 10.31.94.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103194_health_pull_only( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.94', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_health_report_enabled', '0', false );
+		delete_option( 'mobo_core_health_report_url' );
+		delete_option( 'mobo_core_health_last_report_attempt_at' );
+		delete_option( 'mobo_core_health_last_report_success_at' );
+		delete_option( 'mobo_core_health_last_report_result' );
+	}
 
 	/**
 	 * Start the strict image workflow with destructive switches disabled.

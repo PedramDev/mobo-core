@@ -140,8 +140,8 @@ class Mobo_Core_Settings {
 			'mobo_core_self_runner_last_run_success_at'=> 0,
 			'mobo_core_self_runner_last_run_result'    => array(),
 
-			// Customer-side health reporting to MoboCore.
-			'mobo_core_health_report_enabled'          => '1',
+			// Legacy health-report options retained for upgrade compatibility; Portal uses pull.
+			'mobo_core_health_report_enabled'          => '0',
 			'mobo_core_heartbeat_time_budget_seconds'  => 12,
 			'mobo_core_heartbeat_max_rounds'          => 2,
 			'mobo_core_heartbeat_remote_timeout_seconds' => 10,
@@ -374,7 +374,7 @@ class Mobo_Core_Settings {
 		self::save_text( $post, 'mobo_core_token' );
 		self::save_text( $post, 'mobo_core_cron_token' );
 		delete_option( 'mobo_core_health_report_url' );
-		update_option( 'mobo_core_health_report_enabled', '1', false );
+		update_option( 'mobo_core_health_report_enabled', '0', false );
 		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
 		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
 		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
@@ -475,7 +475,7 @@ class Mobo_Core_Settings {
 		self::save_bool_if_present( $post, 'mobo_core_self_runner_continue_enabled' );
 		self::save_int_if_present( $post, 'mobo_core_self_runner_min_interval_seconds', 3, 0, 60 );
 		self::save_int_if_present( $post, 'mobo_core_self_runner_http_timeout_seconds', 1, 1, 10 );
-		update_option( 'mobo_core_health_report_enabled', '1', false );
+		update_option( 'mobo_core_health_report_enabled', '0', false );
 		self::save_int( $post, 'mobo_core_health_report_min_interval_seconds', 300, 60, 3600 );
 		self::save_int( $post, 'mobo_core_health_report_timeout_seconds', 15, 5, 60 );
 
@@ -667,7 +667,7 @@ class Mobo_Core_Settings {
 			'mobo_core_variants_per_page' => 'تنوع در هر صفحه Sync',
 			'mobo_core_pull_payload_enabled' => 'دریافت مستقیم Payload از Portal',
 			'mobo_core_self_runner_enabled' => 'فعال بودن اجراکننده داخلی',
-			'mobo_core_health_report_enabled' => 'ارسال گزارش سلامت',
+			'mobo_core_health_report_enabled' => 'Push گزارش سلامت (قدیمی و غیرفعال)',
 			'mobo_core_checkout_validation_enabled' => 'اعتبارسنجی هنگام ثبت سفارش',
 			'mobo_core_mobo_order_submission_enabled' => 'ثبت خودکار سفارش موبو',
 			'mobo_core_address_mapping_enabled' => 'نگاشت آدرس موبو',

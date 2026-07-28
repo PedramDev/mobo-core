@@ -253,16 +253,14 @@ sequenceDiagram
     participant P as Portal
     participant HW as Portal Health Worker
 
-    opt Customer health reporting enabled
-        WP->>P: POST /api/site-health/report + X-SEC
-        P-->>WP: accepted / state updated
-    end
-    loop Probe interval
-        HW->>WP: GET /wp-json/mobo-core/v1/health + X-SEC
+    loop Health interval
+        HW->>WP: GET /health + X-SEC
         WP-->>HW: Local health snapshot
-        HW->>WP: GET /sync/status + X-SEC
-        WP-->>HW: Sync state
         HW->>P: Store reachable/warning/critical state
+        opt Cron is stale and recovery is enabled
+            HW->>WP: POST /heartbeat + X-SEC
+            WP-->>HW: Recovery status (does not decide reachability)
+        end
     end
 ```
 

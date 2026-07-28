@@ -711,7 +711,7 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
-	 * Force-send health report to MoboCore.
+	 * Return a local health snapshot for backward-compatible diagnostics.
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response
@@ -722,8 +722,9 @@ class Mobo_Core_Rest_Controller {
 		return rest_ensure_response(
 			array(
 				'success' => true,
-				'status'  => 'ok',
-				'data'    => $reporter->send_report( 'manual', true ),
+				'status'  => 'portal-pull-only',
+				'message' => 'Portal گزارش سلامت را مستقیماً از endpoint افزونه دریافت می‌کند.',
+				'data'    => $reporter->build_report(),
 			)
 		);
 	}
@@ -785,8 +786,8 @@ class Mobo_Core_Rest_Controller {
 			return rest_ensure_response(
 				array(
 					'success' => false,
-					'status'  => 'locked',
-					'message' => 'Sync start is locked.',
+				'status'  => 'locked',
+				'message' => 'Sync start is locked.',
 				)
 			);
 		}
@@ -798,9 +799,9 @@ class Mobo_Core_Rest_Controller {
 			if ( ! empty( $current_state['isRunning'] ) ) {
 				$result = array(
 					'success' => false,
-					'status'  => 'running',
-					'message' => 'Product sync is already running.',
-					'data'    => $current_state,
+				'status'  => 'running',
+				'message' => 'Product sync is already running.',
+				'data'    => $current_state,
 				);
 			} else {
 				$params  = $request->get_json_params();
@@ -844,9 +845,9 @@ class Mobo_Core_Rest_Controller {
 			return rest_ensure_response(
 				array(
 					'success' => false,
-					'status'  => 'locked',
-					'message' => 'Product sync is locked.',
-					'data'    => $sync->get_manual_sync_status(),
+				'status'  => 'locked',
+				'message' => 'Product sync is locked.',
+				'data'    => $sync->get_manual_sync_status(),
 				)
 			);
 		}
