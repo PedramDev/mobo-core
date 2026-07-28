@@ -694,7 +694,7 @@ class Mobo_Core_Remote_Updater {
 		if ( ! is_array( $parts ) || empty( $parts['host'] ) || empty( $parts['scheme'] ) || empty( $parts['path'] ) ) {
 			return false;
 		}
-		if ( 'https' !== strtolower( (string) $parts['scheme'] ) && ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+		if ( 'http' !== strtolower( (string) $parts['scheme'] ) && ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
 			return false;
 		}
 		if ( false === strpos( (string) $parts['path'], '/api/plugin-packages/' ) ) {
