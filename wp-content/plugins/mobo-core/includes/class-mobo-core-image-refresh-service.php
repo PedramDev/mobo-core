@@ -502,17 +502,32 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'message' => 'تصویر جایگزین یک فایل WebP مستقل و معتبر نیست.' );
 		}
 
-		$generate_subsizes = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_generate_subsizes', '1' );
-		if ( $generate_subsizes ) {
-			$subsize_result = $this->ensure_attachment_subsizes( $new_attachment_id );
-		} else {
-			$subsize_health = $this->inspect_attachment_subsizes( $new_attachment_id );
+		$shared_attachment = class_exists( 'Mobo_Core_Shared_Media' )
+			&& Mobo_Core_Shared_Media::is_enabled()
+			&& Mobo_Core_Shared_Media::is_shared_attachment( $new_attachment_id );
+
+		if ( $shared_attachment ) {
+			/* The central worker already generated and verified the approved cuts. */
+			$shared_health = Mobo_Core_Shared_Media::attachment_health( $new_attachment_id );
 			$subsize_result = array(
-				'success'    => ! empty( $subsize_health['healthy'] ),
+				'success'    => ! empty( $shared_health['healthy'] ),
 				'generated'  => 0,
-				'registered' => isset( $subsize_health['registered'] ) ? absint( $subsize_health['registered'] ) : 0,
-				'message'    => isset( $subsize_health['message'] ) ? (string) $subsize_health['message'] : 'وضعیت برش های تصویر مشخص نیست.',
+				'registered' => isset( $shared_health['registered'] ) ? absint( $shared_health['registered'] ) : 0,
+				'message'    => isset( $shared_health['message'] ) ? (string) $shared_health['message'] : 'وضعیت مخزن اشتراکی تصویر مشخص نیست.',
 			);
+		} else {
+			$generate_subsizes = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_generate_subsizes', '1' );
+			if ( $generate_subsizes ) {
+				$subsize_result = $this->ensure_attachment_subsizes( $new_attachment_id );
+			} else {
+				$subsize_health = $this->inspect_attachment_subsizes( $new_attachment_id );
+				$subsize_result = array(
+					'success'    => ! empty( $subsize_health['healthy'] ),
+					'generated'  => 0,
+					'registered' => isset( $subsize_health['registered'] ) ? absint( $subsize_health['registered'] ) : 0,
+					'message'    => isset( $subsize_health['message'] ) ? (string) $subsize_health['message'] : 'وضعیت برش های تصویر مشخص نیست.',
+				);
+			}
 		}
 
 		if ( empty( $subsize_result['success'] ) ) {
@@ -526,7 +541,9 @@ class Mobo_Core_Image_Refresh_Service {
 		$this->mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
 
 		$note = 'تصویر قدیمی نگه داشته شد.';
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
+		$delete_old = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+			|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() );
+		if ( $delete_old ) {
 			$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
 			$note         = ! empty( $delete_check['deleted'] ) ? ( isset( $delete_check['message'] ) ? (string) $delete_check['message'] : 'تصویر قدیمی با موفقیت و به صورت امن حذف شد.' ) : ( isset( $delete_check['message'] ) ? $delete_check['message'] : 'تصویر قدیمی نگه داشته شد.' );
 		}

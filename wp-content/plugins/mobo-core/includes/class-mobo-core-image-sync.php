@@ -217,11 +217,7 @@ class Mobo_Core_Image_Sync {
 				continue;
 			}
 
-			$attachment_id = $this->find_existing_attachment( $image_guid, $url );
-
-			if ( $attachment_id <= 0 ) {
-				$attachment_id = $this->download_image( $url, $product_id, $image_guid );
-			}
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 
 			if ( $attachment_id > 0 ) {
 				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
@@ -304,11 +300,7 @@ class Mobo_Core_Image_Sync {
 				continue;
 			}
 
-			$attachment_id = $this->find_existing_attachment( $image_guid, $url );
-
-			if ( $attachment_id <= 0 ) {
-				$attachment_id = $this->download_image( $url, $product_id, $image_guid );
-			}
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 
 			if ( $attachment_id > 0 ) {
 				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
@@ -318,10 +310,21 @@ class Mobo_Core_Image_Sync {
 				continue;
 			}
 
-			$try_count = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
-			$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_image_max_try', 5, 1, 20 );
+			$try_count  = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
+			$max_try    = Mobo_Core_Settings::get_int( 'mobo_core_image_max_try', 5, 1, 20 );
+			$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
 
-			$queue->mark_failure( $id, 'Image download failed.', $try_count, $try_count >= $max_try );
+			/*
+			 * A private shared-media site must wait for the single writer instead of
+			 * permanently failing after the normal sideload retry limit. The retry
+			 * delay is still bounded by Mobo_Core_Image_Queue::mark_failure().
+			 */
+			$queue->mark_failure(
+				$id,
+				$shared_mode ? 'Shared-media manifest is not ready or is incompatible.' : 'Image download failed.',
+				$try_count,
+				! $shared_mode && $try_count >= $max_try
+			);
 			$failed++;
 		}
 
@@ -350,6 +353,46 @@ class Mobo_Core_Image_Sync {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 			require_once ABSPATH . 'wp-admin/includes/image.php';
 		}
+	}
+
+	/**
+	 * Resolve an attachment from the private shared repository or the normal
+	 * per-site WordPress media library. Shared mode is strict by default: when
+	 * the worker manifest is not ready, the queue retries later and no duplicate
+	 * site-local image is downloaded.
+	 *
+	 * @param string $url Source URL.
+	 * @param int    $product_id Product ID.
+	 * @param string $image_guid Remote image GUID.
+	 * @return int Attachment ID or 0.
+	 */
+	private function resolve_image_attachment( $url, $product_id, $image_guid ) {
+		$existing_id = $this->find_existing_attachment( $image_guid, $url );
+
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled() ) {
+			/* Convert an older jpg/png attachment in place even when normal reuse rules reject it. */
+			$shared_existing_id = $existing_id > 0 ? $existing_id : $this->find_attachment_by_guid( $image_guid );
+			$shared_id = Mobo_Core_Shared_Media::import_attachment(
+				$image_guid,
+				$product_id,
+				$url,
+				$shared_existing_id
+			);
+
+			if ( $shared_id > 0 ) {
+				return $shared_id;
+			}
+
+			if ( ! Mobo_Core_Shared_Media::allow_download_fallback() ) {
+				return 0;
+			}
+		}
+
+		if ( $existing_id > 0 ) {
+			return $existing_id;
+		}
+
+		return $this->download_image( $url, $product_id, $image_guid );
 	}
 
 	private function download_image( $url, $product_id, $image_guid ) {
@@ -636,7 +679,27 @@ class Mobo_Core_Image_Sync {
 	public function import_image_for_refresh( $url, $product_id, $image_guid, $old_attachment_id = 0 ) {
 		$this->load_media_dependencies();
 
-		$attachment_id = $this->download_image( $url, $product_id, $image_guid );
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled() ) {
+			/*
+			 * The legacy refresh service replaces one attachment ID with another. Do
+			 * not convert the old local attachment in place here; create/reuse the
+			 * dedicated virtual shared attachment and let the service safely remove
+			 * the superseded local attachment after product references are changed.
+			 */
+			$attachment_id = Mobo_Core_Shared_Media::import_attachment(
+				$image_guid,
+				$product_id,
+				$url,
+				0
+			);
+
+			if ( $attachment_id <= 0 && Mobo_Core_Shared_Media::allow_download_fallback() ) {
+				$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+			}
+		} else {
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+		}
+
 		$attachment_id = absint( $attachment_id );
 
 		if ( $attachment_id > 0 ) {
