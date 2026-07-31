@@ -45,6 +45,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug'            => '1',
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
+			'mobo_core_cache_purge_archives_on_product_update' => '0',
 			'mobo_core_category_mapping_enabled'  => '1',
 			'mobo_core_category_mapping_required' => '0',
 			'mobo_core_address_mapping_show_all_countries' => '0',
@@ -76,6 +77,7 @@ class Mobo_Core_Settings {
 			'mobo_core_image_queue_blocking'      => '1',
 			'mobo_core_image_max_try'             => 5,
 			'mobo_core_image_retry_base_seconds'  => 120,
+			'mobo_core_image_long_retry_seconds'  => 21600,
 			'mobo_core_image_refresh_enabled'     => '0',
 			'mobo_core_image_refresh_delete_old'  => '0',
 			'mobo_core_image_refresh_generate_subsizes' => '1',
@@ -102,7 +104,7 @@ class Mobo_Core_Settings {
 			'mobo_core_remote_update_allowed_hosts' => array(),
 
 			// Adaptive desired-state reconciliation.
-			'mobo_core_auto_reconciliation_enabled' => '1',
+			'mobo_core_auto_reconciliation_enabled' => '0',
 			'mobo_core_reconciliation_fast_interval' => 3600,
 			'mobo_core_reconciliation_products_per_run' => 100,
 			'mobo_core_reconciliation_variation_batch' => 1000,
@@ -461,8 +463,10 @@ class Mobo_Core_Settings {
 		self::save_int( $post, 'mobo_core_images_per_run', 1, 0, 10 );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_blocking' );
+		self::save_bool_if_present( $post, 'mobo_core_cache_purge_archives_on_product_update' );
 		self::save_int_if_present( $post, 'mobo_core_image_max_try', 5, 1, 20 );
 		self::save_int_if_present( $post, 'mobo_core_image_retry_base_seconds', 120, 30, 900 );
+		self::save_int_if_present( $post, 'mobo_core_image_long_retry_seconds', 21600, 3600, 604800 );
 		self::save_int( $post, 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
 		self::save_int( $post, 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 );
 		self::save_int_if_present( $post, 'mobo_core_real_cron_max_rounds', 100, 1, 500 );
@@ -648,6 +652,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug' => 'بروزرسانی نامک محصول',
 			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
 			'global_update_images' => 'بروزرسانی تصاویر',
+			'mobo_core_cache_purge_archives_on_product_update' => 'پاک‌سازی کش آرشیوها پس از بروزرسانی محصول',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
 			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
 			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',

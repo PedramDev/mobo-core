@@ -105,14 +105,14 @@ class Mobo_Core_Address_Mapping {
 	 * Force sync from MoboCore.
 	 *
 	 * @param string $source Source name.
-	 * @param bool   $force Force flag forwarded to MoboCore.
+	 * @param bool   $force Force the local refresh cadence only; Portal rebuild is administrator-only.
 	 * @return array
 	 */
 	public function sync_now( $source = 'manual', $force = true ) {
 		update_option( 'mobo_core_address_mapping_last_attempt_at', time(), false );
 
 		$api    = new Mobo_Core_API_Client();
-		$result = $api->get_address_mapping( $force );
+		$result = $api->get_address_mapping();
 
 		if ( is_wp_error( $result ) ) {
 			update_option( 'mobo_core_address_mapping_last_error', $result->get_error_message(), false );

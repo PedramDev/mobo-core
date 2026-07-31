@@ -1069,6 +1069,11 @@ class Mobo_Core_Admin {
 					<?php $this->bool_field( 'فقط محصولات موجود', 'mobo_core_only_in_stock' ); ?>
 					<?php $this->bool_field( 'اعمال تخفیف‌های موبو', 'global_product_auto_compare_price' ); ?>
 					<?php $this->bool_field( 'آپدیت اتوماتیک عکس‌های محصول', 'global_update_images' ); ?>
+					<?php $this->bool_field( 'پاک‌سازی کش آرشیوها هنگام بروزرسانی محصول', 'mobo_core_cache_purge_archives_on_product_update' ); ?>
+				</div>
+
+				<div class="mobo-note">
+					اگر پاک‌سازی کش آرشیوها خاموش باشد، کش صفحه خود محصول و Object Cache همچنان پاک می‌شود؛ اما Mobo Core به‌صورت صریح Shop، دسته‌ها، برچسب‌ها و صفحه اصلی را purge نمی‌کند. افزونه کش ممکن است قوانین داخلی مستقل خودش را داشته باشد.
 				</div>
 
 				<div class="mobo-note">
@@ -2584,8 +2589,9 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->int_field( 'تعداد تصویر در هر اجرا', 'mobo_core_images_per_run', 0, 10 ); ?>
 						<?php $this->bool_field( 'فعال بودن صف مستقل تصویر', 'mobo_core_image_queue_enabled' ); ?>
 						<?php $this->bool_field( 'منتظر ماندن sync تا تکمیل تصاویر', 'mobo_core_image_queue_blocking' ); ?>
-						<?php $this->int_field( 'حداکثر تلاش دانلود تصویر', 'mobo_core_image_max_try', 1, 20 ); ?>
-						<?php $this->int_field( 'فاصله پایه retry تصویر / ثانیه', 'mobo_core_image_retry_base_seconds', 30, 900 ); ?>
+						<?php $this->int_field( 'تعداد تلاش سریع تصویر قبل از Retry بلندمدت', 'mobo_core_image_max_try', 1, 20 ); ?>
+						<?php $this->int_field( 'فاصله پایه Retry سریع تصویر / ثانیه', 'mobo_core_image_retry_base_seconds', 30, 900 ); ?>
+						<?php $this->int_field( 'فاصله Retry بلندمدت تصویر / ثانیه', 'mobo_core_image_long_retry_seconds', 3600, 604800 ); ?>
 					</div>
 				</div>
 
@@ -5909,6 +5915,7 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_only_in_stock',
 						'global_product_auto_compare_price',
 						'global_update_images',
+						'mobo_core_cache_purge_archives_on_product_update',
 					)
 				);
 				break;
@@ -5946,6 +5953,7 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_images_per_run' => array( 0, 10 ),
 						'mobo_core_image_max_try' => array( 1, 20 ),
 						'mobo_core_image_retry_base_seconds' => array( 30, 900 ),
+						'mobo_core_image_long_retry_seconds' => array( 3600, 604800 ),
 						'mobo_core_webhook_files_per_run' => array( 1, 10 ),
 						'mobo_core_webhook_max_try' => array( 1, 20 ),
 						'mobo_core_webhook_expire_days' => array( 1, 30 ),
@@ -9097,6 +9105,7 @@ type:{mobo_order_type_label}</textarea>
 								mobo_core_image_queue_blocking: '0',
 								mobo_core_image_max_try: 6,
 								mobo_core_image_retry_base_seconds: 60,
+								mobo_core_image_long_retry_seconds: 10800,
 								mobo_core_webhook_files_per_run: 8,
 								mobo_core_webhook_max_try: 8,
 								mobo_core_webhook_expire_days: 14,
@@ -9117,6 +9126,7 @@ type:{mobo_order_type_label}</textarea>
 								mobo_core_image_queue_blocking: '0',
 								mobo_core_image_max_try: 5,
 								mobo_core_image_retry_base_seconds: 90,
+								mobo_core_image_long_retry_seconds: 14400,
 								mobo_core_webhook_files_per_run: 5,
 								mobo_core_webhook_max_try: 7,
 								mobo_core_webhook_expire_days: 14,
@@ -9137,6 +9147,7 @@ type:{mobo_order_type_label}</textarea>
 								mobo_core_image_queue_blocking: '0',
 								mobo_core_image_max_try: 5,
 								mobo_core_image_retry_base_seconds: 120,
+								mobo_core_image_long_retry_seconds: 21600,
 								mobo_core_webhook_files_per_run: 3,
 								mobo_core_webhook_max_try: 5,
 								mobo_core_webhook_expire_days: 14,
@@ -9157,6 +9168,7 @@ type:{mobo_order_type_label}</textarea>
 								mobo_core_image_queue_blocking: '0',
 								mobo_core_image_max_try: 3,
 								mobo_core_image_retry_base_seconds: 180,
+								mobo_core_image_long_retry_seconds: 43200,
 								mobo_core_webhook_files_per_run: 1,
 								mobo_core_webhook_max_try: 3,
 								mobo_core_webhook_expire_days: 7,

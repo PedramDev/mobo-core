@@ -52,6 +52,7 @@ class Mobo_Core_Sync_Settings_Guard {
 			'mobo_core_image_queue_blocking',
 			'mobo_core_image_max_try',
 			'mobo_core_image_retry_base_seconds',
+			'mobo_core_image_long_retry_seconds',
 			'mobo_core_webhook_files_per_run',
 			'mobo_core_webhook_max_try',
 			'mobo_core_webhook_expire_days',

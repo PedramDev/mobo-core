@@ -234,7 +234,7 @@ class Mobo_Core_Image_Queue {
 				"SELECT * FROM {$table}
 				WHERE product_id = %d
 				AND (
-					(status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)
 				ORDER BY position_index ASC, id ASC
@@ -274,7 +274,7 @@ class Mobo_Core_Image_Queue {
 					"SELECT COUNT(*) FROM {$table}
 					WHERE product_id = %d
 					AND (
-						(status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 					)",
 					$product_id,
@@ -307,7 +307,7 @@ class Mobo_Core_Image_Queue {
 			$wpdb->prepare(
 				"SELECT * FROM {$table}
 				WHERE (
-					(status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)
 				ORDER BY updated_at ASC, id ASC
@@ -348,7 +348,7 @@ class Mobo_Core_Image_Queue {
 				SET status = 'processing', locked_until = %s, updated_at = %s
 				WHERE id = %d
 				AND (
-					status = 'pending'
+					status IN ('pending','attaching')
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)",
 				$until,
@@ -359,6 +359,31 @@ class Mobo_Core_Image_Queue {
 		);
 
 		return 1 === absint( $updated );
+	}
+
+	/**
+	 * Mark an imported attachment as waiting for WooCommerce linkage.
+	 *
+	 * The intermediate state closes the race window between creating an
+	 * attachment and assigning the product featured/gallery images. If PHP stops
+	 * after this update, the next queue pass can finish the linkage without
+	 * downloading the file again.
+	 *
+	 * @param int $id Row ID.
+	 * @param int $attachment_id Attachment ID.
+	 * @return void
+	 */
+	public function mark_attaching( $id, $attachment_id ) {
+		$this->update_status(
+			$id,
+			'attaching',
+			array(
+				'attachment_id' => absint( $attachment_id ),
+				'next_retry_at' => null,
+				'locked_until'  => null,
+				'last_error'    => null,
+			)
+		);
 	}
 
 	/**
@@ -391,20 +416,56 @@ class Mobo_Core_Image_Queue {
 	 * @return void
 	 */
 	public function mark_failure( $id, $message, $try_count, $final_failed = false ) {
-		$status = $final_failed ? 'failed' : 'pending';
-		$delay  = $final_failed ? null : min( 900, max( 60, absint( $try_count ) * Mobo_Core_Settings::get_int( 'mobo_core_image_retry_base_seconds', 120, 30, 900 ) ) );
+		$try_count = max( 1, absint( $try_count ) );
+		$status    = $final_failed ? 'failed' : 'pending';
+		$delay     = $final_failed ? null : $this->calculate_retry_delay( $id, $try_count );
+		$message   = sanitize_text_field( (string) $message );
+
+		if ( $final_failed && 0 !== strpos( $message, 'Permanent:' ) ) {
+			$message = 'Permanent: ' . $message;
+		}
 
 		$this->update_status(
 			$id,
 			$status,
 			array(
-				'try_count'     => absint( $try_count ),
+				'attachment_id' => 0,
+				'try_count'     => $try_count,
 				'next_retry_at' => null === $delay ? null : gmdate( 'Y-m-d H:i:s', time() + $delay ),
 				'locked_until'  => null,
-				'last_error'    => sanitize_text_field( (string) $message ),
+				'last_error'    => $message,
 			)
 		);
 	}
+
+	/**
+	 * Calculate bounded retry delay.
+	 *
+	 * The first configured attempts use the legacy short backoff. Later attempts
+	 * switch to a long retry interval instead of becoming terminal. A small
+	 * deterministic jitter prevents many customer sites retrying the same image
+	 * at exactly the same second.
+	 *
+	 * @param int $id Queue row ID.
+	 * @param int $try_count Try count.
+	 * @return int Delay in seconds.
+	 */
+	private function calculate_retry_delay( $id, $try_count ) {
+		$base_seconds = Mobo_Core_Settings::get_int( 'mobo_core_image_retry_base_seconds', 120, 30, 900 );
+		$fast_tries   = Mobo_Core_Settings::get_int( 'mobo_core_image_max_try', 5, 1, 20 );
+
+		if ( $try_count <= $fast_tries ) {
+			$delay = min( 900, max( 60, $try_count * $base_seconds ) );
+		} else {
+			$delay = Mobo_Core_Settings::get_int( 'mobo_core_image_long_retry_seconds', 21600, 3600, 604800 );
+		}
+
+		$jitter_max = max( 1, (int) floor( $delay / 10 ) );
+		$jitter     = absint( $id + ( $try_count * 37 ) ) % $jitter_max;
+
+		return $delay + $jitter;
+	}
+
 
 	/**
 	 * Count not-done images for product.
@@ -428,7 +489,7 @@ class Mobo_Core_Image_Queue {
 			return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE product_id = %d AND status <> 'done'", $product_id ) ) );
 		}
 
-		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE product_id = %d AND status IN ('pending', 'processing')", $product_id ) ) );
+		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE product_id = %d AND status IN ('pending', 'processing', 'attaching')", $product_id ) ) );
 	}
 
 	/**
@@ -513,7 +574,7 @@ class Mobo_Core_Image_Queue {
 			$wpdb->get_var(
 				$wpdb->prepare(
 					"SELECT COUNT(*) FROM {$table}
-					WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)",
 					$now,
 					$now
@@ -528,7 +589,7 @@ class Mobo_Core_Image_Queue {
 	 * @return int
 	 */
 	public function count_pending() {
-		return $this->count_by_statuses( array( 'pending', 'processing' ) );
+		return $this->count_by_statuses( array( 'pending', 'processing', 'attaching' ) );
 	}
 
 	/**
@@ -541,6 +602,205 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Count attachments waiting for product linkage.
+	 *
+	 * @return int
+	 */
+	public function count_attaching() {
+		return $this->count_by_statuses( array( 'attaching' ) );
+	}
+
+	/**
+	 * Return the nearest scheduled retry timestamp.
+	 *
+	 * @return string
+	 */
+	public function get_next_retry_at() {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return '';
+		}
+
+		$value = $wpdb->get_var(
+			"SELECT MIN(next_retry_at)
+			FROM " . self::table_name() . "
+			WHERE status IN ('pending','attaching')
+				AND next_retry_at IS NOT NULL"
+		);
+
+		return is_string( $value ) ? $value : '';
+	}
+
+	/**
+	 * Re-open non-permanent failed rows created by older releases.
+	 *
+	 * Only rows with an existing WooCommerce product, GUID and HTTP(S) source URL
+	 * are recovered. New permanent failures are prefixed with `Permanent:` and
+	 * remain terminal.
+	 *
+	 * @param int $limit Maximum rows to recover.
+	 * @return array
+	 */
+	public static function recover_legacy_failed( $limit = 500 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 5000, absint( $limit ) ) );
+
+		if ( ! self::table_exists() ) {
+			return array( 'status' => 'missing-table', 'recovered' => 0, 'remaining' => 0 );
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$ids   = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT q.id
+				FROM {$table} q
+				INNER JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+				WHERE q.status = 'failed'
+					AND q.image_guid <> ''
+					AND q.source_url IS NOT NULL
+					AND q.source_url <> ''
+					AND q.source_url REGEXP '^https?://'
+					AND (q.last_error IS NULL OR q.last_error NOT LIKE 'Permanent:%%')
+				ORDER BY q.updated_at ASC, q.id ASC
+				LIMIT %d",
+				$limit
+			)
+		);
+
+		$ids       = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		$recovered = 0;
+
+		if ( ! empty( $ids ) ) {
+			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+			$args         = array_merge( array( $now, $now ), $ids );
+			$query        = "UPDATE {$table}
+				SET status = 'pending',
+					try_count = 0,
+					next_retry_at = %s,
+					locked_until = NULL,
+					last_error = 'Recovered legacy terminal image failure; retry scheduled.',
+					updated_at = %s
+				WHERE id IN ({$placeholders})";
+
+			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
+			$recovered = absint( false === $updated ? 0 : $updated );
+		}
+
+		$remaining = absint(
+			$wpdb->get_var(
+				"SELECT COUNT(*)
+				FROM {$table} q
+				INNER JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+				WHERE q.status = 'failed'
+					AND q.image_guid <> ''
+					AND q.source_url IS NOT NULL
+					AND q.source_url <> ''
+					AND q.source_url REGEXP '^https?://'
+					AND (q.last_error IS NULL OR q.last_error NOT LIKE 'Permanent:%')"
+			)
+		);
+
+		return array(
+			'status'    => 'ok',
+			'recovered' => $recovered,
+			'remaining' => $remaining,
+		);
+	}
+
+	/**
+	 * Schedule repair for completed rows whose featured-image linkage was lost.
+	 *
+	 * This catches the old race where an attachment was marked done immediately
+	 * before PHP stopped, leaving `_thumbnail_id` unchanged. The source file is
+	 * reused; no re-download occurs.
+	 *
+	 * @param int $limit Product limit.
+	 * @return array
+	 */
+	public static function schedule_linkage_repairs( $limit = 100 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 1000, absint( $limit ) ) );
+
+		if ( ! self::table_exists() ) {
+			return array( 'status' => 'missing-table', 'scheduled' => 0 );
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$rows  = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT q.id, q.product_id, q.attachment_id
+				FROM {$table} q
+				INNER JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+				INNER JOIN {$wpdb->posts} a
+					ON a.ID = q.attachment_id
+					AND a.post_type = 'attachment'
+				LEFT JOIN {$wpdb->postmeta} thumb
+					ON thumb.post_id = q.product_id
+					AND thumb.meta_key = '_thumbnail_id'
+				WHERE q.status = 'done'
+					AND q.position_index = 0
+					AND q.attachment_id > 0
+					AND (
+						thumb.meta_value IS NULL
+						OR thumb.meta_value = ''
+						OR CAST(thumb.meta_value AS UNSIGNED) <> q.attachment_id
+					)
+				ORDER BY q.updated_at ASC, q.id ASC
+				LIMIT %d",
+				$limit
+			),
+			ARRAY_A
+		);
+
+		$ids = array();
+
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+			if ( $id > 0 ) {
+				$ids[] = $id;
+			}
+		}
+
+		$ids       = array_values( array_unique( $ids ) );
+		$scheduled = 0;
+
+		if ( ! empty( $ids ) ) {
+			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+			$args         = array_merge( array( $now, $now ), $ids );
+			$query        = "UPDATE {$table}
+				SET status = 'attaching',
+					next_retry_at = %s,
+					locked_until = NULL,
+					last_error = 'Product image linkage recovery scheduled.',
+					updated_at = %s
+				WHERE status = 'done'
+					AND id IN ({$placeholders})";
+
+			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
+			$scheduled = absint( false === $updated ? 0 : $updated );
+		}
+
+		return array(
+			'status'    => 'ok',
+			'scheduled' => $scheduled,
+		);
+	}
+
+	/**
 	 * Get compact status.
 	 *
 	 * @return array
@@ -548,9 +808,11 @@ class Mobo_Core_Image_Queue {
 	public function get_status() {
 		return array(
 			'enabled' => Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ),
-			'pending' => $this->count_pending(),
-			'due'     => $this->count_due(),
-			'failed'  => $this->count_failed(),
+			'pending'     => $this->count_pending(),
+			'attaching'   => $this->count_attaching(),
+			'due'         => $this->count_due(),
+			'failed'      => $this->count_failed(),
+			'nextRetryAt' => $this->get_next_retry_at(),
 		);
 	}
 

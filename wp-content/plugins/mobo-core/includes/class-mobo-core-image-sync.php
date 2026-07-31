@@ -18,6 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Image_Sync {
 
 	/**
+	 * Last image resolution error for queue diagnostics.
+	 *
+	 * @var string
+	 */
+	private $last_image_error = '';
+
+
+	/**
 	 * Process images for a product.
 	 *
 	 * When the image queue is enabled, image rows are first upserted into the
@@ -282,16 +290,26 @@ class Mobo_Core_Image_Sync {
 				break;
 			}
 
-			$id         = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
-			$product_id = isset( $row['product_id'] ) ? absint( $row['product_id'] ) : 0;
-			$image_guid = isset( $row['image_guid'] ) ? sanitize_text_field( (string) $row['image_guid'] ) : '';
-			$url        = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
+			$id            = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+			$product_id    = isset( $row['product_id'] ) ? absint( $row['product_id'] ) : 0;
+			$image_guid    = isset( $row['image_guid'] ) ? sanitize_text_field( (string) $row['image_guid'] ) : '';
+			$url           = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
+			$attachment_id = isset( $row['attachment_id'] ) ? absint( $row['attachment_id'] ) : 0;
+			$try_count     = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
 
-			if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $url ) {
-				if ( $id > 0 ) {
-					$queue->mark_failure( $id, 'Invalid image queue row.', isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1, true );
-				}
+			if ( $id <= 0 ) {
+				$failed++;
+				continue;
+			}
 
+			if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
+				$queue->mark_failure( $id, 'Product does not exist.', $try_count, true );
+				$failed++;
+				continue;
+			}
+
+			if ( '' === $image_guid || ! $this->is_valid_image_source_url( $url ) ) {
+				$queue->mark_failure( $id, 'Image GUID or HTTP(S) source URL is invalid.', $try_count, true );
 				$failed++;
 				continue;
 			}
@@ -300,31 +318,54 @@ class Mobo_Core_Image_Sync {
 				continue;
 			}
 
-			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+			/*
+			 * An attachment may already exist when a previous PHP request stopped
+			 * between import and WooCommerce product linkage. Reuse it and finish
+			 * the state transition without downloading again. In Shared Media mode
+			 * only a real shared attachment may bypass import/conversion.
+			 */
+			$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
+			$can_reuse_queued_attachment = $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
 
-			if ( $attachment_id > 0 ) {
+			if ( $can_reuse_queued_attachment && $shared_mode
+				&& method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
+				&& ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+				$can_reuse_queued_attachment = false;
+			}
+
+			if ( $can_reuse_queued_attachment ) {
 				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+				$queue->mark_attaching( $id, $attachment_id );
+				$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
 				$queue->mark_done( $id, $attachment_id );
 				$touched[ $product_id ] = true;
 				$processed++;
 				continue;
 			}
 
-			$try_count  = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
-			$max_try    = Mobo_Core_Settings::get_int( 'mobo_core_image_max_try', 5, 1, 20 );
-			$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+
+			if ( $attachment_id > 0 ) {
+				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+				$queue->mark_attaching( $id, $attachment_id );
+				$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
+				$queue->mark_done( $id, $attachment_id );
+				$touched[ $product_id ] = true;
+				$processed++;
+				continue;
+			}
+
+			$message = $this->get_last_image_error();
+			if ( '' === $message ) {
+				$message = 'Image source is not ready or the download/import failed.';
+			}
 
 			/*
-			 * A private shared-media site must wait for the single writer instead of
-			 * permanently failing after the normal sideload retry limit. The retry
-			 * delay is still bounded by Mobo_Core_Image_Queue::mark_failure().
+			 * Network errors, timeouts, HTTP 404/5xx responses and a not-yet-ready
+			 * shared-media manifest are recoverable. They remain pending forever
+			 * with a bounded long-term backoff instead of becoming terminal.
 			 */
-			$queue->mark_failure(
-				$id,
-				$shared_mode ? 'Shared-media manifest is not ready or is incompatible.' : 'Image download failed.',
-				$try_count,
-				! $shared_mode && $try_count >= $max_try
-			);
+			$queue->mark_failure( $id, $message, $try_count, false );
 			$failed++;
 		}
 
@@ -339,6 +380,39 @@ class Mobo_Core_Image_Sync {
 			'failed'    => $failed,
 			'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
 		);
+	}
+
+	/**
+	 * Validate an HTTP(S) source URL without rejecting local development hosts.
+	 *
+	 * @param string $url URL.
+	 * @return bool
+	 */
+	private function is_valid_image_source_url( $url ) {
+		$parts  = wp_parse_url( (string) $url );
+		$scheme = is_array( $parts ) && isset( $parts['scheme'] ) ? strtolower( (string) $parts['scheme'] ) : '';
+		$host   = is_array( $parts ) && isset( $parts['host'] ) ? trim( (string) $parts['host'] ) : '';
+
+		return in_array( $scheme, array( 'http', 'https' ), true ) && '' !== $host;
+	}
+
+	/**
+	 * Store a bounded diagnostic message.
+	 *
+	 * @param string $message Message.
+	 * @return void
+	 */
+	private function set_last_image_error( $message ) {
+		$this->last_image_error = sanitize_text_field( (string) $message );
+	}
+
+	/**
+	 * Return the latest diagnostic message.
+	 *
+	 * @return string
+	 */
+	private function get_last_image_error() {
+		return sanitize_text_field( (string) $this->last_image_error );
 	}
 
 	private function should_use_queue() {
@@ -367,6 +441,7 @@ class Mobo_Core_Image_Sync {
 	 * @return int Attachment ID or 0.
 	 */
 	private function resolve_image_attachment( $url, $product_id, $image_guid ) {
+		$this->last_image_error = '';
 		$existing_id = $this->find_existing_attachment( $image_guid, $url );
 
 		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled() ) {
@@ -384,6 +459,7 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( ! Mobo_Core_Shared_Media::allow_download_fallback() ) {
+				$this->set_last_image_error( 'Shared-media manifest is not ready or is incompatible.' );
 				return 0;
 			}
 		}
@@ -401,6 +477,7 @@ class Mobo_Core_Image_Sync {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 
 		if ( '' === $url || $product_id <= 0 || '' === $image_guid ) {
+			$this->set_last_image_error( 'Image download arguments are invalid.' );
 			return 0;
 		}
 
@@ -412,6 +489,7 @@ class Mobo_Core_Image_Sync {
 
 		if ( $this->is_local_or_private_image_url( $url ) ) {
 			if ( ! (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id ) ) {
+				$this->set_last_image_error( 'WordPress blocked a local/private image URL.' );
 				return 0;
 			}
 
@@ -438,8 +516,11 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( is_wp_error( $attachment_id ) ) {
+				$error_message = $attachment_id->get_error_message();
+				$this->set_last_image_error( 'WordPress image sideload failed: ' . $error_message );
+
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					Mobo_Core_Logger::error( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $attachment_id->get_error_message() );
+					Mobo_Core_Logger::error( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $error_message );
 				}
 
 				$attachment_id = (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id )
@@ -451,6 +532,9 @@ class Mobo_Core_Image_Sync {
 		$attachment_id = absint( $attachment_id );
 
 		if ( $attachment_id <= 0 ) {
+			if ( '' === $this->get_last_image_error() ) {
+				$this->set_last_image_error( 'Image download/import returned no attachment.' );
+			}
 			return 0;
 		}
 
@@ -493,6 +577,7 @@ class Mobo_Core_Image_Sync {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 
 		if ( '' === $url || $product_id <= 0 ) {
+			$this->set_last_image_error( 'Unsafe-local fallback arguments are invalid.' );
 			return 0;
 		}
 
@@ -500,6 +585,7 @@ class Mobo_Core_Image_Sync {
 		$tmp_file  = wp_tempnam( $file_name );
 
 		if ( ! $tmp_file ) {
+			$this->set_last_image_error( 'Could not create a temporary image file.' );
 			return 0;
 		}
 
@@ -520,9 +606,11 @@ class Mobo_Core_Image_Sync {
 
 		if ( is_wp_error( $response ) ) {
 			wp_delete_file( $tmp_file );
+			$error_message = $response->get_error_message();
+			$this->set_last_image_error( 'Image HTTP request failed: ' . $error_message );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed: ' . $response->get_error_message() );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed: ' . $error_message );
 			}
 
 			return 0;
@@ -532,6 +620,7 @@ class Mobo_Core_Image_Sync {
 
 		if ( $code < 200 || $code >= 300 || ! file_exists( $tmp_file ) || filesize( $tmp_file ) <= 0 ) {
 			wp_delete_file( $tmp_file );
+			$this->set_last_image_error( 'Image HTTP response was ' . $code . ' or the response body was empty.' );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed with HTTP ' . $code . ': ' . $url );
@@ -560,9 +649,11 @@ class Mobo_Core_Image_Sync {
 
 		if ( is_wp_error( $attachment_id ) ) {
 			wp_delete_file( $tmp_file );
+			$error_message = $attachment_id->get_error_message();
+			$this->set_last_image_error( 'WordPress media import failed: ' . $error_message );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				Mobo_Core_Logger::error( 'Mobo Core image fallback sideload failed: ' . $attachment_id->get_error_message() );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback sideload failed: ' . $error_message );
 			}
 
 			return 0;
@@ -764,7 +855,7 @@ class Mobo_Core_Image_Sync {
 				$first_position = $position;
 			}
 
-			if ( 'done' !== $status || $attachment_id <= 0 ) {
+			if ( ! in_array( $status, array( 'done', 'attaching', 'processing' ), true ) || $attachment_id <= 0 ) {
 				continue;
 			}
 

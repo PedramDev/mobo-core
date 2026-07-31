@@ -24,7 +24,11 @@ class Mobo_Core_Health_Reporter {
 		$sync_status = $this->get_sync_status();
 		$queue_stats = $this->get_webhook_queue_stats();
 		$image_stats = $this->get_image_queue_stats();
-		$disk         = $this->get_disk_stats();
+		try {
+			$disk = $this->get_disk_stats();
+		} catch ( Throwable $error ) {
+			$disk = $this->get_unavailable_disk_stats( 'بررسی فضای ذخیره‌سازی در دسترس نیست.' );
+		}
 		$cron_status  = Mobo_Core_Cron_Runner::get_status();
 		$self_status  = class_exists( 'Mobo_Core_Self_Runner' ) ? Mobo_Core_Self_Runner::get_status() : array();
 		$logs         = $this->get_log_stats();
@@ -80,9 +84,35 @@ class Mobo_Core_Health_Reporter {
 			'wpMaxMemoryLimitRaw'   => $wp_memory['wp_max_memory_limit_raw'],
 			'wpMaxMemoryLimitBytes' => $wp_memory['wp_max_memory_limit_bytes'],
 
-			'diskFreeBytes'         => $disk['free'],
-			'diskTotalBytes'        => $disk['total'],
-			'diskFreePercent'       => $disk['percent'],
+			// Account-level quota fields. Legacy disk* values remain null when only
+			// the underlying server filesystem capacity is visible to PHP.
+			'diskFreeBytes'              => $disk['free'],
+			'diskTotalBytes'             => $disk['total'],
+			'diskFreePercent'            => $disk['percent'],
+			'diskMetricScope'            => $disk['metric_scope'],
+			'diskMetricSource'           => $disk['metric_source'],
+			'diskMetricNote'             => $disk['metric_note'],
+			'accountDiskQuotaAvailable'  => $disk['account_available'],
+			'accountDiskQuotaUnlimited'  => $disk['account_unlimited'],
+			'accountDiskUsedBytes'       => $disk['account_used'],
+			'accountDiskQuotaBytes'      => $disk['account_limit'],
+			'accountDiskFreeBytes'       => $disk['account_free'],
+			'accountDiskFreePercent'     => $disk['account_free_percent'],
+			'accountDiskUnderLimit'      => $disk['account_under_limit'],
+			'accountInodesUsed'          => $disk['account_inodes_used'],
+			'accountInodesLimit'         => $disk['account_inodes_limit'],
+			'accountInodesFree'          => $disk['account_inodes_free'],
+			'accountInodesFreePercent'   => $disk['account_inodes_percent'],
+			'accountUnderInodeLimit'     => $disk['account_under_inode_limit'],
+			'accountQuotaError'          => $disk['quota_error'],
+			'filesystemDiskFreeBytes'    => $disk['filesystem_free'],
+			'filesystemDiskTotalBytes'   => $disk['filesystem_total'],
+			'filesystemDiskFreePercent' => $disk['filesystem_percent'],
+			'storageWriteProbeOk'        => isset( $disk['write_probe']['ok'] ) ? (bool) $disk['write_probe']['ok'] : null,
+			'storageWriteProbeStatus'    => isset( $disk['write_probe']['status'] ) ? sanitize_key( (string) $disk['write_probe']['status'] ) : 'unavailable',
+			'storageWriteProbeError'     => isset( $disk['write_probe']['error'] ) ? sanitize_text_field( (string) $disk['write_probe']['error'] ) : '',
+			'storageWriteProbeCheckedAt' => isset( $disk['write_probe']['checked_at'] ) ? $this->format_timestamp( absint( $disk['write_probe']['checked_at'] ) ) : null,
+			'storageWriteProbeBytes'     => isset( $disk['write_probe']['bytes'] ) ? absint( $disk['write_probe']['bytes'] ) : 0,
 
 			'cronMode'              => $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ),
 			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
@@ -106,7 +136,9 @@ class Mobo_Core_Health_Reporter {
 			'pendingWebhookJobs'    => $queue_stats['pending'],
 			'failedWebhookJobs'     => $queue_stats['failed'],
 			'pendingImageJobs'      => $image_stats['pending'],
+			'attachingImageJobs'    => isset( $image_stats['attaching'] ) ? absint( $image_stats['attaching'] ) : 0,
 			'failedImageJobs'       => $image_stats['failed'],
+			'nextImageRetryAt'      => isset( $image_stats['nextRetryAt'] ) ? (string) $image_stats['nextRetryAt'] : '',
 			'pendingSyncJobs'       => $this->get_pending_sync_jobs( $sync_status ),
 			'actionSchedulerPastDue'=> $this->get_action_scheduler_past_due_count(),
 			'actionSchedulerFailed' => $this->get_action_scheduler_failed_count(),
@@ -256,7 +288,17 @@ class Mobo_Core_Health_Reporter {
 
 		$wp_webp = function_exists( 'wp_image_editor_supports' ) ? wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) ) : ( $gd_webp || $imagick_webp );
 		$uploads = wp_upload_dir();
+		$probe   = $this->get_storage_write_probe();
 		$automation = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
+
+		$uploads_writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && is_writable( $uploads['basedir'] );
+		$uploads_error    = ! empty( $uploads['error'] ) ? (string) $uploads['error'] : '';
+		if ( $uploads_writable && isset( $probe['ok'] ) && false === (bool) $probe['ok'] ) {
+			$uploads_writable = false;
+			$uploads_error    = isset( $probe['error'] ) && '' !== trim( (string) $probe['error'] )
+				? (string) $probe['error']
+				: 'آزمون نوشتن واقعی در uploads ناموفق بود.';
+		}
 
 		return array(
 			'gdLoaded'          => $gd_loaded,
@@ -264,8 +306,11 @@ class Mobo_Core_Health_Reporter {
 			'imagickLoaded'     => $imagick_loaded,
 			'imagickWebp'       => $imagick_webp,
 			'wordpressWebp'     => (bool) $wp_webp,
-			'uploadsWritable'   => empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && is_writable( $uploads['basedir'] ),
-			'uploadsError'      => ! empty( $uploads['error'] ) ? (string) $uploads['error'] : '',
+			'uploadsWritable'   => $uploads_writable,
+			'uploadsError'      => sanitize_text_field( $uploads_error ),
+			'writeProbeOk'      => isset( $probe['ok'] ) ? (bool) $probe['ok'] : null,
+			'writeProbeStatus'  => isset( $probe['status'] ) ? sanitize_key( (string) $probe['status'] ) : 'unavailable',
+			'writeProbeError'   => isset( $probe['error'] ) ? sanitize_text_field( (string) $probe['error'] ) : '',
 			'refreshAutomationEnabled'         => ! empty( $automation['enabled'] ),
 			'refreshAutomationStep'            => absint( isset( $automation['currentStep'] ) ? $automation['currentStep'] : 0 ),
 			'refreshAutomationStatus'          => isset( $automation['status'] ) ? sanitize_key( (string) $automation['status'] ) : 'idle',
@@ -334,15 +379,17 @@ class Mobo_Core_Health_Reporter {
 	 */
 	private function get_image_queue_stats() {
 		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
-			return array( 'pending' => 0, 'failed' => 0, 'due' => 0 );
+			return array( 'pending' => 0, 'attaching' => 0, 'failed' => 0, 'due' => 0, 'nextRetryAt' => '' );
 		}
 
 		$queue = new Mobo_Core_Image_Queue();
 
 		return array(
-			'pending' => $queue->count_pending(),
-			'failed'  => $queue->count_failed(),
-			'due'     => $queue->count_due(),
+			'pending'     => $queue->count_pending(),
+			'attaching'   => method_exists( $queue, 'count_attaching' ) ? $queue->count_attaching() : 0,
+			'failed'      => $queue->count_failed(),
+			'due'         => $queue->count_due(),
+			'nextRetryAt' => method_exists( $queue, 'get_next_retry_at' ) ? $queue->get_next_retry_at() : '',
 		);
 	}
 
@@ -539,22 +586,497 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
+	 * Return storage statistics without confusing server filesystem capacity with
+	 * the hosting account quota. The legacy disk* fields are populated only when
+	 * an account-level quota is known. Filesystem capacity is reported separately.
+	 *
 	 * @return array
 	 */
 	private function get_disk_stats() {
-		$free  = $this->safe_disk_free_space( ABSPATH );
-		$total = $this->safe_disk_total_space( ABSPATH );
+		try {
+			return $this->build_disk_stats();
+		} catch ( Throwable $error ) {
+			return $this->get_unavailable_disk_stats( 'بررسی فضای ذخیره‌سازی در دسترس نیست.' );
+		}
+	}
 
-		$percent = null;
-		if ( null !== $free && null !== $total && $total > 0 ) {
-			$percent = round( ( $free / $total ) * 100, 2 );
+	/**
+	 * Build storage statistics. All callers use get_disk_stats(), which provides
+	 * the final Throwable boundary for the Site Health endpoint.
+	 *
+	 * @return array
+	 */
+	private function build_disk_stats() {
+		$filesystem_free    = $this->safe_disk_free_space( ABSPATH );
+		$filesystem_total   = $this->safe_disk_total_space( ABSPATH );
+		$filesystem_percent = null;
+
+		if ( null !== $filesystem_free && null !== $filesystem_total && $filesystem_total > 0 ) {
+			$filesystem_percent = round( ( $filesystem_free / $filesystem_total ) * 100, 2 );
+		}
+
+		try {
+			$quota = $this->get_hosting_quota_stats();
+		} catch ( Throwable $error ) {
+			$quota = $this->get_unavailable_quota_stats( 'بررسی سهمیه اکانت در دسترس نیست.' );
+		}
+
+		try {
+			$probe = $this->get_storage_write_probe();
+		} catch ( Throwable $error ) {
+			$probe = $this->get_unavailable_write_probe( 'آزمون نوشتن در uploads در دسترس نیست.' );
+		}
+
+		$metric_scope  = 'filesystem_only';
+		$metric_source = 'php_disk_functions';
+		$metric_note   = 'این مقدار ظرفیت Filesystem سرور است و سهمیه اکانت هاست محسوب نمی‌شود.';
+		$free          = null;
+		$total         = null;
+		$percent       = null;
+
+		if ( ! empty( $quota['available'] ) ) {
+			$metric_source = isset( $quota['source'] ) ? sanitize_key( (string) $quota['source'] ) : 'hosting_quota';
+
+			if ( ! empty( $quota['unlimited'] ) ) {
+				$metric_scope = 'account_unlimited';
+				$metric_note  = 'سهمیه اکانت هاست نامحدود گزارش شده است.';
+			} else {
+				$metric_scope = 'account_quota';
+				$metric_note  = 'مقادیر دیسک از سهمیه اکانت هاست محاسبه شده‌اند.';
+				$free         = isset( $quota['free'] ) ? $quota['free'] : null;
+				$total        = isset( $quota['limit'] ) ? $quota['limit'] : null;
+				$percent      = isset( $quota['free_percent'] ) ? $quota['free_percent'] : null;
+			}
+		} elseif ( null === $filesystem_free && null === $filesystem_total ) {
+			$metric_scope  = 'unavailable';
+			$metric_source = 'unavailable';
+			$metric_note   = 'اطلاعات سهمیه اکانت و ظرفیت Filesystem در دسترس PHP نیست.';
 		}
 
 		return array(
-			'free'    => $free,
-			'total'   => $total,
-			'percent' => $percent,
+			// Backward-compatible fields. Deliberately null without account quota.
+			'free'                     => $free,
+			'total'                    => $total,
+			'percent'                  => $percent,
+			'metric_scope'             => $metric_scope,
+			'metric_source'            => $metric_source,
+			'metric_note'              => $metric_note,
+			'account_available'        => ! empty( $quota['available'] ),
+			'account_unlimited'        => ! empty( $quota['unlimited'] ),
+			'account_used'             => isset( $quota['used'] ) ? $quota['used'] : null,
+			'account_limit'            => isset( $quota['limit'] ) ? $quota['limit'] : null,
+			'account_free'             => isset( $quota['free'] ) ? $quota['free'] : null,
+			'account_free_percent'     => isset( $quota['free_percent'] ) ? $quota['free_percent'] : null,
+			'account_under_limit'      => isset( $quota['under_limit'] ) ? $quota['under_limit'] : null,
+			'account_inodes_used'      => isset( $quota['inodes_used'] ) ? $quota['inodes_used'] : null,
+			'account_inodes_limit'     => isset( $quota['inodes_limit'] ) ? $quota['inodes_limit'] : null,
+			'account_inodes_free'      => isset( $quota['inodes_free'] ) ? $quota['inodes_free'] : null,
+			'account_inodes_percent'   => isset( $quota['inodes_free_percent'] ) ? $quota['inodes_free_percent'] : null,
+			'account_under_inode_limit'=> isset( $quota['under_inode_limit'] ) ? $quota['under_inode_limit'] : null,
+			'quota_error'              => isset( $quota['error'] ) ? sanitize_text_field( (string) $quota['error'] ) : '',
+			'filesystem_free'          => $filesystem_free,
+			'filesystem_total'         => $filesystem_total,
+			'filesystem_percent'       => $filesystem_percent,
+			'write_probe'              => $probe,
 		);
+	}
+
+	/**
+	 * Resolve account-level hosting quota data.
+	 *
+	 * Integrations may provide data through the mobo_core_hosting_quota_stats
+	 * filter. cPanel UAPI is also supported when the following wp-config.php
+	 * constants are explicitly configured: MOBO_CORE_CPANEL_QUOTA_URL,
+	 * MOBO_CORE_CPANEL_USERNAME and MOBO_CORE_CPANEL_API_TOKEN.
+	 *
+	 * @return array
+	 */
+	private function get_hosting_quota_stats() {
+		try {
+			$filtered = apply_filters( 'mobo_core_hosting_quota_stats', null, ABSPATH );
+			if ( is_array( $filtered ) ) {
+				$normalized = $this->normalize_hosting_quota_stats( $filtered, 'filter' );
+				if ( ! empty( $normalized['available'] ) ) {
+					return $normalized;
+				}
+			}
+
+			if (
+				! defined( 'MOBO_CORE_CPANEL_QUOTA_URL' ) ||
+				! defined( 'MOBO_CORE_CPANEL_USERNAME' ) ||
+				! defined( 'MOBO_CORE_CPANEL_API_TOKEN' )
+			) {
+				return array(
+					'available' => false,
+					'source'    => 'none',
+					'error'     => '',
+				);
+			}
+
+			$url      = trim( (string) MOBO_CORE_CPANEL_QUOTA_URL );
+			$username = trim( (string) MOBO_CORE_CPANEL_USERNAME );
+			$token    = trim( (string) MOBO_CORE_CPANEL_API_TOKEN );
+
+			if ( '' === $url || '' === $username || '' === $token ) {
+				return array(
+					'available' => false,
+					'source'    => 'cpanel_uapi',
+					'error'     => 'تنظیمات cPanel UAPI ناقص است.',
+				);
+			}
+
+			if ( false === strpos( $url, '/execute/' ) ) {
+				$url = untrailingslashit( $url ) . '/execute/Quota/get_quota_info';
+			}
+
+			$parts = wp_parse_url( $url );
+			if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) || 'https' !== strtolower( (string) $parts['scheme'] ) ) {
+				return array(
+					'available' => false,
+					'source'    => 'cpanel_uapi',
+					'error'     => 'آدرس cPanel UAPI باید یک URL معتبر HTTPS باشد.',
+				);
+			}
+
+			$cache_key = 'mobo_core_cpanel_quota_' . md5( strtolower( $url . '|' . $username ) );
+			$cached    = get_transient( $cache_key );
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+
+			$response = wp_remote_get(
+				$url,
+				array(
+					'timeout'     => 8,
+					'redirection' => 0,
+					'sslverify'   => true,
+					'headers'     => array(
+						'Accept'        => 'application/json',
+						'Authorization' => 'cpanel ' . $username . ':' . $token,
+					),
+				)
+			);
+
+			if ( is_wp_error( $response ) ) {
+				$result = array(
+					'available' => false,
+					'source'    => 'cpanel_uapi',
+					'error'     => 'اتصال به cPanel UAPI ناموفق بود: ' . $response->get_error_message(),
+				);
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			$status_code = absint( wp_remote_retrieve_response_code( $response ) );
+			$body        = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+
+			if ( 200 !== $status_code || ! is_array( $body ) || empty( $body['status'] ) || empty( $body['data'] ) || ! is_array( $body['data'] ) ) {
+				$result = array(
+					'available' => false,
+					'source'    => 'cpanel_uapi',
+					'error'     => 'پاسخ معتبر سهمیه از cPanel UAPI دریافت نشد. HTTP ' . $status_code,
+				);
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			$data = $body['data'];
+			$raw  = array(
+				'used'              => $this->megabytes_to_bytes( isset( $data['megabytes_used'] ) ? $data['megabytes_used'] : null ),
+				'limit'             => $this->megabytes_to_bytes( isset( $data['megabyte_limit'] ) ? $data['megabyte_limit'] : null ),
+				'free'              => $this->megabytes_to_bytes( isset( $data['megabytes_remain'] ) ? $data['megabytes_remain'] : null ),
+				'unlimited'         => isset( $data['megabyte_limit'] ) && is_numeric( $data['megabyte_limit'] ) && (float) $data['megabyte_limit'] <= 0,
+				'under_limit'       => isset( $data['under_megabyte_limit'] ) ? (bool) absint( $data['under_megabyte_limit'] ) : null,
+				'inodes_used'       => isset( $data['inodes_used'] ) && is_numeric( $data['inodes_used'] ) ? (int) $data['inodes_used'] : null,
+				'inodes_limit'      => isset( $data['inode_limit'] ) && is_numeric( $data['inode_limit'] ) ? (int) $data['inode_limit'] : null,
+				'inodes_free'       => isset( $data['inodes_remain'] ) && is_numeric( $data['inodes_remain'] ) ? (int) $data['inodes_remain'] : null,
+				'under_inode_limit' => isset( $data['under_inode_limit'] ) ? (bool) absint( $data['under_inode_limit'] ) : null,
+			);
+
+			$result = $this->normalize_hosting_quota_stats( $raw, 'cpanel_uapi' );
+			set_transient( $cache_key, $result, 10 * MINUTE_IN_SECONDS );
+
+			return $result;
+		} catch ( Throwable $error ) {
+			return $this->get_unavailable_quota_stats( 'بررسی سهمیه اکانت در دسترس نیست.' );
+		}
+	}
+
+	/**
+	 * Normalize quota values from filters or cPanel.
+	 *
+	 * @param array  $stats  Raw stats.
+	 * @param string $source Source name.
+	 * @return array
+	 */
+	private function normalize_hosting_quota_stats( $stats, $source ) {
+		$used      = isset( $stats['used'] ) && is_numeric( $stats['used'] ) ? max( 0, (int) $stats['used'] ) : null;
+		$limit     = isset( $stats['limit'] ) && is_numeric( $stats['limit'] ) ? max( 0, (int) $stats['limit'] ) : null;
+		$free      = isset( $stats['free'] ) && is_numeric( $stats['free'] ) ? max( 0, (int) $stats['free'] ) : null;
+		$unlimited = ! empty( $stats['unlimited'] );
+
+		if ( ! $unlimited && null !== $limit && $limit > 0 ) {
+			if ( null === $free && null !== $used ) {
+				$free = max( 0, $limit - $used );
+			}
+			if ( null === $used && null !== $free ) {
+				$used = max( 0, $limit - $free );
+			}
+		}
+
+		$free_percent = null;
+		if ( ! $unlimited && null !== $limit && $limit > 0 && null !== $free ) {
+			$free_percent = round( min( 100, max( 0, ( $free / $limit ) * 100 ) ), 2 );
+		}
+
+		$inodes_used  = isset( $stats['inodes_used'] ) && is_numeric( $stats['inodes_used'] ) ? max( 0, (int) $stats['inodes_used'] ) : null;
+		$inodes_limit = isset( $stats['inodes_limit'] ) && is_numeric( $stats['inodes_limit'] ) ? max( 0, (int) $stats['inodes_limit'] ) : null;
+		$inodes_free  = isset( $stats['inodes_free'] ) && is_numeric( $stats['inodes_free'] ) ? max( 0, (int) $stats['inodes_free'] ) : null;
+
+		if ( null !== $inodes_limit && $inodes_limit > 0 ) {
+			if ( null === $inodes_free && null !== $inodes_used ) {
+				$inodes_free = max( 0, $inodes_limit - $inodes_used );
+			}
+			if ( null === $inodes_used && null !== $inodes_free ) {
+				$inodes_used = max( 0, $inodes_limit - $inodes_free );
+			}
+		}
+
+		$inodes_free_percent = null;
+		if ( null !== $inodes_limit && $inodes_limit > 0 && null !== $inodes_free ) {
+			$inodes_free_percent = round( min( 100, max( 0, ( $inodes_free / $inodes_limit ) * 100 ) ), 2 );
+		}
+
+		$available = $unlimited || ( null !== $limit && $limit > 0 );
+
+		return array(
+			'available'           => $available,
+			'source'              => sanitize_key( (string) $source ),
+			'used'                => $used,
+			'limit'               => $limit,
+			'free'                => $free,
+			'free_percent'        => $free_percent,
+			'unlimited'           => $unlimited,
+			'under_limit'         => isset( $stats['under_limit'] ) ? (bool) $stats['under_limit'] : ( $available && ! $unlimited && null !== $free ? $free > 0 : null ),
+			'inodes_used'         => $inodes_used,
+			'inodes_limit'        => $inodes_limit,
+			'inodes_free'         => $inodes_free,
+			'inodes_free_percent' => $inodes_free_percent,
+			'under_inode_limit'   => isset( $stats['under_inode_limit'] ) ? (bool) $stats['under_inode_limit'] : ( null !== $inodes_limit && $inodes_limit > 0 && null !== $inodes_free ? $inodes_free > 0 : null ),
+			'error'               => isset( $stats['error'] ) ? sanitize_text_field( (string) $stats['error'] ) : '',
+		);
+	}
+
+	/**
+	 * Perform a real, cached write test inside uploads. is_writable() may still
+	 * return true after a hosting account has exhausted its byte or inode quota.
+	 *
+	 * @return array
+	 */
+	private function get_storage_write_probe() {
+		$probe_handle   = null;
+		$probe_filename = '';
+
+		try {
+			$cache_key = 'mobo_core_storage_write_probe_v1';
+			$cached    = get_transient( $cache_key );
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+
+			$checked_at = time();
+			$bytes      = 64 * 1024;
+			$uploads    = wp_upload_dir();
+			$basedir    = isset( $uploads['basedir'] ) ? (string) $uploads['basedir'] : '';
+			$result     = array(
+				'ok'         => false,
+				'status'     => 'failed',
+				'error'      => '',
+				'checked_at' => $checked_at,
+				'bytes'      => $bytes,
+				'path'       => $basedir,
+			);
+
+			if ( ! empty( $uploads['error'] ) ) {
+				$result['error'] = sanitize_text_field( (string) $uploads['error'] );
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			if ( '' === $basedir || ( ! is_dir( $basedir ) && ! wp_mkdir_p( $basedir ) ) ) {
+				$result['error'] = 'پوشه uploads وجود ندارد یا قابل ایجاد نیست.';
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			if ( ! is_writable( $basedir ) ) {
+				$result['error'] = 'پوشه uploads بر اساس مجوزهای Filesystem قابل نوشتن نیست.';
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			$filename       = trailingslashit( $basedir ) . '.mobo-core-write-probe-' . wp_generate_password( 12, false, false ) . '.tmp';
+			$probe_filename = $filename;
+			if ( function_exists( 'error_clear_last' ) ) {
+				error_clear_last();
+			}
+			$handle       = @fopen( $filename, 'x+b' );
+			$probe_handle = $handle;
+			if ( false === $handle ) {
+				$result['error'] = $this->get_last_php_error_message( 'ایجاد فایل آزمایشی در uploads ناموفق بود؛ سهمیه دیسک یا inode ممکن است تمام شده باشد.' );
+				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
+				return $result;
+			}
+
+			$written = 0;
+			$chunk   = str_repeat( 'M', 4096 );
+			if ( function_exists( 'error_clear_last' ) ) {
+				error_clear_last();
+			}
+			while ( $written < $bytes ) {
+				$remaining = $bytes - $written;
+				$length    = min( strlen( $chunk ), $remaining );
+				$count     = @fwrite( $handle, substr( $chunk, 0, $length ) );
+				if ( false === $count || $count <= 0 ) {
+					break;
+				}
+				$written += $count;
+			}
+
+			$flushed = @fflush( $handle );
+			if ( function_exists( 'fsync' ) ) {
+				@fsync( $handle );
+			}
+			@fclose( $handle );
+			$probe_handle = null;
+			clearstatcache( true, $filename );
+			$actual_size = @filesize( $filename );
+			$deleted        = @unlink( $filename );
+			$probe_filename = $deleted ? '' : $filename;
+
+			if ( $written === $bytes && false !== $flushed && false !== $actual_size && (int) $actual_size >= $bytes ) {
+				$result['ok']     = true;
+				$result['status'] = $deleted ? 'ok' : 'ok_cleanup_failed';
+				if ( ! $deleted ) {
+					$result['error'] = 'نوشتن موفق بود اما حذف فایل آزمایشی ناموفق بود.';
+				}
+			} else {
+				$result['error'] = $this->get_last_php_error_message( 'نوشتن واقعی در uploads کامل نشد؛ سهمیه دیسک، inode یا مجوز نوشتن را بررسی کنید.' );
+			}
+
+			set_transient( $cache_key, $result, $result['ok'] ? 10 * MINUTE_IN_SECONDS : 5 * MINUTE_IN_SECONDS );
+			return $result;
+		} catch ( Throwable $error ) {
+			try {
+				if ( is_resource( $probe_handle ) ) {
+					@fclose( $probe_handle );
+				}
+			} catch ( Throwable $cleanup_error ) {
+				// Cleanup must never make Site Health fail.
+			}
+
+			try {
+				if ( '' !== $probe_filename ) {
+					@unlink( $probe_filename );
+				}
+			} catch ( Throwable $cleanup_error ) {
+				// Cleanup must never make Site Health fail.
+			}
+
+			return $this->get_unavailable_write_probe( 'آزمون نوشتن در uploads در دسترس نیست.' );
+		}
+	}
+
+	/**
+	 * Return a stable account-quota fallback without exposing exception details.
+	 *
+	 * @param string $message Public diagnostic message.
+	 * @return array
+	 */
+	private function get_unavailable_quota_stats( $message ) {
+		return array(
+			'available' => false,
+			'source'    => 'unavailable',
+			'error'     => (string) $message,
+		);
+	}
+
+	/**
+	 * Return a stable storage write-probe fallback.
+	 *
+	 * @param string $message Public diagnostic message.
+	 * @return array
+	 */
+	private function get_unavailable_write_probe( $message ) {
+		return array(
+			'ok'         => null,
+			'status'     => 'unavailable',
+			'error'      => (string) $message,
+			'checked_at' => time(),
+			'bytes'      => 0,
+			'path'       => '',
+		);
+	}
+
+	/**
+	 * Return a complete storage fallback so Site Health remains available even
+	 * when a hosting integration, filter, filesystem function or write probe
+	 * throws an unexpected Throwable.
+	 *
+	 * @param string $message Public diagnostic message.
+	 * @return array
+	 */
+	private function get_unavailable_disk_stats( $message ) {
+		return array(
+			'free'                      => null,
+			'total'                     => null,
+			'percent'                   => null,
+			'metric_scope'              => 'unavailable',
+			'metric_source'             => 'unavailable',
+			'metric_note'               => (string) $message,
+			'account_available'         => false,
+			'account_unlimited'         => false,
+			'account_used'              => null,
+			'account_limit'             => null,
+			'account_free'              => null,
+			'account_free_percent'      => null,
+			'account_under_limit'       => null,
+			'account_inodes_used'       => null,
+			'account_inodes_limit'      => null,
+			'account_inodes_free'       => null,
+			'account_inodes_percent'    => null,
+			'account_under_inode_limit' => null,
+			'quota_error'               => (string) $message,
+			'filesystem_free'           => null,
+			'filesystem_total'          => null,
+			'filesystem_percent'        => null,
+			'write_probe'               => $this->get_unavailable_write_probe( $message ),
+		);
+	}
+
+	/**
+	 * @param mixed $megabytes Megabytes.
+	 * @return int|null
+	 */
+	private function megabytes_to_bytes( $megabytes ) {
+		if ( ! is_numeric( $megabytes ) ) {
+			return null;
+		}
+
+		return (int) round( max( 0, (float) $megabytes ) * 1024 * 1024 );
+	}
+
+	/**
+	 * @param string $fallback Fallback message.
+	 * @return string
+	 */
+	private function get_last_php_error_message( $fallback ) {
+		$error = error_get_last();
+		if ( is_array( $error ) && ! empty( $error['message'] ) ) {
+			return sanitize_text_field( (string) $error['message'] );
+		}
+
+		return sanitize_text_field( (string) $fallback );
 	}
 
 	/**
@@ -562,13 +1084,17 @@ class Mobo_Core_Health_Reporter {
 	 * @return int|null
 	 */
 	private function safe_disk_free_space( $path ) {
-		if ( ! function_exists( 'disk_free_space' ) ) {
+		try {
+			if ( ! function_exists( 'disk_free_space' ) ) {
+				return null;
+			}
+
+			$value = @disk_free_space( $path );
+
+			return false === $value ? null : (int) $value;
+		} catch ( Throwable $error ) {
 			return null;
 		}
-
-		$value = @disk_free_space( $path );
-
-		return false === $value ? null : (int) $value;
 	}
 
 	/**
@@ -576,13 +1102,17 @@ class Mobo_Core_Health_Reporter {
 	 * @return int|null
 	 */
 	private function safe_disk_total_space( $path ) {
-		if ( ! function_exists( 'disk_total_space' ) ) {
+		try {
+			if ( ! function_exists( 'disk_total_space' ) ) {
+				return null;
+			}
+
+			$value = @disk_total_space( $path );
+
+			return false === $value ? null : (int) $value;
+		} catch ( Throwable $error ) {
 			return null;
 		}
-
-		$value = @disk_total_space( $path );
-
-		return false === $value ? null : (int) $value;
 	}
 
 	/**

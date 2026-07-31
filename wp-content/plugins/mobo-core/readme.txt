@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.31.96
+Stable tag: 10.32.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -137,9 +137,39 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 = Does product synchronization clear page caches? =
 
-Yes. Mobo Core batches changed Mobo product/variation IDs during the request and performs a targeted purge at shutdown. It clears WooCommerce product transients and WordPress post/object caches, then purges the product URL, current and removed product-category/tag archives, Shop, and Home through supported cache integrations. LiteSpeed Cache and WP Rocket are handled directly. W3 Total Cache and WP Super Cache are handled when their targeted APIs are available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
+Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can separately enable archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. Archive invalidation is disabled by default on new installations to avoid making high-frequency archive caches ineffective. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.32.1 =
+* Wrapped account-quota lookup, uploads write probing, server filesystem checks, and final storage report composition in independent Throwable boundaries. Unexpected hosting integrations now return an explicit unavailable state instead of breaking the Site Health endpoint.
+* Storage fallback responses use stable generic diagnostics and never expose exception details, cPanel tokens, or internal connection values.
+* Removed Portal force-refresh query parameters from address-mapping and Mobo shipping-method API requests. WordPress can refresh its local snapshot, but rebuilding Portal reference data is now restricted to the Portal administrator UI.
+
+= 10.32.0 =
+* Site Health no longer presents PHP `disk_free_space()` as the hosting account quota. Server-filesystem capacity is reported separately and is not used for account-quota scoring.
+* Added a cached real-write probe in `wp-content/uploads` so exhausted byte quotas, inode quotas, and write failures are detected even when `is_writable()` and server disk capacity look healthy.
+* Added optional exact cPanel account byte/inode quota reporting through cPanel UAPI constants or the `mobo_core_hosting_quota_stats` filter; credentials are never included in health output.
+* Legacy Portal consumers receive null account disk values when only server filesystem capacity is known, preventing false healthy readings such as hundreds of gigabytes free on a full shared-hosting account.
+
+= 10.31.99 =
+* Image download/source-readiness failures no longer become terminal after the short retry limit. They continue with a bounded long-term retry interval controlled by the site administrator.
+* Added an `attaching` queue state so an imported attachment is not marked done until WooCommerce featured/gallery linkage finishes; interrupted requests resume without downloading the image again.
+* Existing recoverable `failed` image rows are reopened automatically in bounded batches after upgrade. Permanent structural failures remain terminal and are clearly prefixed in diagnostics.
+* Maintenance now requeues completed rows whose attachment disappeared, schedules repair for lost featured-image linkage, and deletes only old permanent image failures.
+* Health output now includes attachments waiting for linkage and the nearest scheduled image retry time.
+
+= 10.31.98 =
+* Added an administrator-controlled option for purging Shop, product-category, product-tag, and Home cache entries after Mobo product updates; it is disabled by default on new installations.
+* Product transients, WordPress object/post caches, and the exact product URL continue to be invalidated even when archive purge is disabled.
+* Fresh installations no longer enable automatic reconciliation by default, and legacy migration flags can no longer auto-start a full desired-state Repair; Sync and Repair require an explicit administrator or Portal action.
+* Existing installations keep their saved automatic-reconciliation preference, and already-running operations are not cancelled during upgrade.
+
+= 10.31.97 =
+* Shared-media attachments now map registered WordPress and WooCommerce image sizes to the worker-generated cuts even when a size uses an unconstrained dimension or a bounding box.
+* `medium_large` and `large` can resolve to the generated 768x1024 cut, while `woocommerce_single` can resolve to the generated 600x800 cut for 960x1280 source images.
+* Existing shared-media attachments receive the missing aliases at runtime after the plugin update; no database migration, per-site image generation, or local uploads copy is required.
+* Existing exact mappings such as thumbnail, medium, WooCommerce thumbnail, and gallery thumbnail remain unchanged.
 
 = 10.31.96 =
 * Added an opt-in private shared-media adapter configured only by server constants or environment variables; no public setting or database secret was added.

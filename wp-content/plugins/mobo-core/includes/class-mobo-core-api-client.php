@@ -239,40 +239,28 @@ class Mobo_Core_API_Client {
 	 * cache this locally and use it for checkout address selects.
 	 *
 	 * Expected endpoint:
-	 * /get-address-mapping?force=true|false
+	 * /get-address-mapping
 	 *
-	 * @param bool $force Ask MoboCore to refresh if needed.
+	 * Portal force-refresh is intentionally not exposed through the customer API.
+	 *
 	 * @return array|WP_Error
 	 */
-	public function get_address_mapping( $force = false ) {
-		$path = add_query_arg(
-			array(
-				'force' => $force ? 'true' : 'false',
-			),
-			'get-address-mapping'
-		);
-
-		return $this->get_json( $path );
+	public function get_address_mapping() {
+		return $this->get_json( 'get-address-mapping' );
 	}
 
 	/**
 	 * Get cached Mobo shipping methods from MoboCore.
 	 *
 	 * Expected endpoint:
-	 * /get-mobo-shipping-methods?force=true|false
+	 * /get-mobo-shipping-methods
 	 *
-	 * @param bool $force Ask MoboCore to refresh if supported.
+	 * Portal force-refresh is intentionally not exposed through the customer API.
+	 *
 	 * @return array|WP_Error
 	 */
-	public function get_mobo_shipping_methods( $force = false ) {
-		$path = add_query_arg(
-			array(
-				'force' => $force ? 'true' : 'false',
-			),
-			'get-mobo-shipping-methods'
-		);
-
-		return $this->get_json( $path );
+	public function get_mobo_shipping_methods() {
+		return $this->get_json( 'get-mobo-shipping-methods' );
 	}
 
 

@@ -184,11 +184,23 @@ class Mobo_Core_Maintenance {
 		$orphan_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$done_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
 
+		$legacy_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
+			? Mobo_Core_Image_Queue::recover_legacy_failed( min( 250, $limit ) )
+			: array( 'status' => 'unavailable', 'recovered' => 0, 'remaining' => 0 );
+		$linkage_recovery = method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
+			? Mobo_Core_Image_Queue::schedule_linkage_repairs( min( 100, $limit ) )
+			: array( 'status' => 'unavailable', 'scheduled' => 0 );
+
+		/*
+		 * Only structurally permanent failures are deleted. Recoverable network,
+		 * source-readiness and old terminal failures are reopened above.
+		 */
 		$deleted_failed = $wpdb->query(
 			$wpdb->prepare(
 				"DELETE FROM {$table}
 				WHERE status = 'failed'
-				AND updated_at < %s
+					AND last_error LIKE 'Permanent:%%'
+					AND updated_at < %s
 				ORDER BY id ASC
 				LIMIT %d",
 				$fail_cutoff,
@@ -198,7 +210,7 @@ class Mobo_Core_Maintenance {
 
 		$used = absint( false === $deleted_failed ? 0 : $deleted_failed );
 		$deleted_missing_product = 0;
-		$deleted_missing_attachment = 0;
+		$requeued_missing_attachment = 0;
 		$deleted_old_done = 0;
 
 		if ( $used < $limit ) {
@@ -238,8 +250,27 @@ class Mobo_Core_Maintenance {
 				)
 			);
 
-			$deleted_missing_attachment = self::delete_ids( $table, $ids );
-			$used += $deleted_missing_attachment;
+			$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+
+			if ( ! empty( $ids ) ) {
+				$now          = current_time( 'mysql', true );
+				$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+				$args         = array_merge( array( $now, $now ), $ids );
+				$query        = "UPDATE {$table}
+					SET status = 'pending',
+						attachment_id = 0,
+						try_count = 0,
+						next_retry_at = %s,
+						locked_until = NULL,
+						last_error = 'Completed image attachment was missing; source retry scheduled.',
+						updated_at = %s
+					WHERE id IN ({$placeholders})";
+
+				$updated = $wpdb->query( $wpdb->prepare( $query, $args ) );
+				$requeued_missing_attachment = absint( false === $updated ? 0 : $updated );
+			}
+
+			$used += $requeued_missing_attachment;
 		}
 
 		if ( $used < $limit ) {
@@ -258,10 +289,15 @@ class Mobo_Core_Maintenance {
 
 		return array(
 			'status'                   => 'ok',
-			'deletedFailed'            => $used >= 0 ? absint( false === $deleted_failed ? 0 : $deleted_failed ) : 0,
-			'deletedMissingProduct'    => absint( $deleted_missing_product ),
-			'deletedMissingAttachment' => absint( $deleted_missing_attachment ),
-			'deletedOldDone'           => absint( false === $deleted_old_done ? 0 : $deleted_old_done ),
+			'recoveredLegacyFailed'     => isset( $legacy_recovery['recovered'] ) ? absint( $legacy_recovery['recovered'] ) : 0,
+			'remainingLegacyFailed'     => isset( $legacy_recovery['remaining'] ) ? absint( $legacy_recovery['remaining'] ) : 0,
+			'scheduledLinkageRepairs'   => isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0,
+			'deletedPermanentFailed'    => absint( false === $deleted_failed ? 0 : $deleted_failed ),
+			'deletedFailed'             => absint( false === $deleted_failed ? 0 : $deleted_failed ),
+			'deletedMissingProduct'     => absint( $deleted_missing_product ),
+			'requeuedMissingAttachment'=> absint( $requeued_missing_attachment ),
+			'deletedMissingAttachment'  => 0,
+			'deletedOldDone'            => absint( false === $deleted_old_done ? 0 : $deleted_old_done ),
 			'failedRetentionDays'      => self::IMAGE_FAILED_RETENTION_DAYS,
 			'orphanRetentionDays'      => self::IMAGE_ORPHAN_RETENTION_DAYS,
 			'doneRetentionDays'        => self::IMAGE_DONE_RETENTION_DAYS,

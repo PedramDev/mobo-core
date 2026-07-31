@@ -61,11 +61,14 @@ Base: `/wp-json/mobo-core/v1`
 | GET | `/get-products?...&UseCursor=true&Cursor=...` | `Token`, `X-SEC` |
 | GET | `/get-products-by-guid?ProductId=...&SyncId=...` | `Token`, `X-SEC` |
 | GET | `/{productGuid}/get-variants?...` | `Token`, `X-SEC` |
-| GET | `/get-address-mapping?force=true|false` | `Token`, `X-SEC` |
-| GET | `/get-mobo-shipping-methods?force=true|false` | `Token`, `X-SEC` |
+| GET | `/get-address-mapping` | `Token`, `X-SEC` |
+| GET | `/get-mobo-shipping-methods` | `Token`, `X-SEC` |
 | GET | `/LicenseInfo` | `Token`, `X-SEC` |
 | GET | `changesUrl` از Lightweight webhook | `Token`, `X-SEC` |
 | POST | `/api/site-health/report` | `X-SEC` |
+
+
+پارامتر عمومی `force` برای `get-address-mapping` و `get-mobo-shipping-methods` پشتیبانی نمی‌شود. دکمه‌های Refresh داخل WordPress فقط cadence و cache محلی افزونه را نادیده می‌گیرند؛ بازسازی اجباری داده مرجع Portal فقط از UI مدیر Portal قابل اجرا است.
 
 ## 4. رویدادهای وب هوک
 
@@ -223,6 +226,7 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_image_queue_blocking` | `'1'` |
 | `mobo_core_image_max_try` | `5` |
 | `mobo_core_image_retry_base_seconds` | `120` |
+| `mobo_core_image_long_retry_seconds` | `21600` |
 | `mobo_core_image_refresh_enabled` | `'0'` |
 | `mobo_core_image_refresh_delete_old` | `'0'` |
 | `mobo_core_image_refresh_generate_subsizes` | `'1'` |
@@ -514,8 +518,8 @@ Public methods: **4** · Internal non-public methods: **15**
 ### `Mobo_Core_Health_Reporter`
 
 Source: [`includes/class-mobo-core-health-reporter.php`](includes/class-mobo-core-health-reporter.php)  
-ساخت snapshot سلامت سایت مشتری برای Pull توسط Portal. / Builds customer-site health snapshots for Portal pull requests.  
-Public methods: **4** · Internal non-public methods: **25**
+ساخت snapshot سلامت سایت مشتری برای Pull توسط Portal، همراه با تفکیک سهمیه اکانت از Filesystem سرور و آزمون واقعی نوشتن uploads. / Builds customer-site health snapshots for Portal pull requests, separating account quota from server filesystem capacity and performing a real uploads write probe.
+Public methods: **4** · Internal non-public methods: **32**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|

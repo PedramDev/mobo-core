@@ -64,14 +64,14 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * Force sync remote methods from MoboCore.
 	 *
 	 * @param string $source Source name.
-	 * @param bool   $force Force portal refresh if supported.
+	 * @param bool   $force Force the local refresh cadence only; Portal rebuild is administrator-only.
 	 * @return array
 	 */
 	public function sync_now( $source = 'manual', $force = true ) {
 		update_option( self::OPTION_LAST_ATTEMPT, time(), false );
 
 		$api    = new Mobo_Core_API_Client();
-		$result = method_exists( $api, 'get_mobo_shipping_methods' ) ? $api->get_mobo_shipping_methods( $force ) : new WP_Error( 'mobo_core_missing_shipping_api', 'MoboCore shipping-methods API is not available in this plugin build.' );
+		$result = method_exists( $api, 'get_mobo_shipping_methods' ) ? $api->get_mobo_shipping_methods() : new WP_Error( 'mobo_core_missing_shipping_api', 'MoboCore shipping-methods API is not available in this plugin build.' );
 
 		if ( is_wp_error( $result ) ) {
 			update_option( self::OPTION_LAST_ERROR, $result->get_error_message(), false );

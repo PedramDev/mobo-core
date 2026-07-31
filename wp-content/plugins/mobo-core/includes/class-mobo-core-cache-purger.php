@@ -102,7 +102,7 @@ final class Mobo_Core_Cache_Purger {
 			return;
 		}
 
-		if ( in_array( $taxonomy, array( 'product_cat', 'product_tag' ), true ) ) {
+		if ( self::archive_purge_enabled() && in_array( $taxonomy, array( 'product_cat', 'product_tag' ), true ) ) {
 			try {
 				self::capture_term_taxonomy_urls( $old_tt_ids, $taxonomy );
 				self::capture_term_taxonomy_urls( $tt_ids, $taxonomy );
@@ -258,7 +258,8 @@ final class Mobo_Core_Cache_Purger {
 		$urls             = array();
 		$custom_urls      = array();
 		$reasons          = array();
-		$integration_data = array();
+		$integration_data      = array();
+		$archive_purge_enabled = self::archive_purge_enabled();
 		$overall_status   = 'failed';
 		$last_error       = '';
 
@@ -298,9 +299,9 @@ final class Mobo_Core_Cache_Purger {
 			}
 
 			/*
-			 * WP Rocket's URL API is recursive. Only explicitly queued or filter-added
-			 * custom listing URLs are sent to rocket_clean_files(); automatic product,
-			 * taxonomy, Shop and Home relationships are handled by rocket_clean_post().
+			 * WP Rocket's post API may invalidate related archives. When archive purge
+			 * is disabled, use only the exact collected product URLs. When enabled, the
+			 * post API handles standard relationships and this list holds custom URLs.
 			 */
 			$custom_urls = array_values(
 				array_unique(
@@ -327,8 +328,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['wpRocket'] = self::run_integration(
 				'wpRocket',
 				$inventory['wpRocket'],
-				static function () use ( $product_ids, $custom_urls ) {
-					if ( ! self::purge_wp_rocket( $product_ids, $custom_urls ) ) {
+				static function () use ( $product_ids, $urls, $custom_urls, $archive_purge_enabled ) {
+					if ( ! self::purge_wp_rocket( $product_ids, $urls, $custom_urls, $archive_purge_enabled ) ) {
 						throw new RuntimeException( 'WP Rocket targeted purge API is unavailable.' );
 					}
 				}
@@ -337,8 +338,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['liteSpeedCache'] = self::run_integration(
 				'liteSpeedCache',
 				$inventory['liteSpeedCache'],
-				static function () use ( $product_ids, $urls ) {
-					if ( ! self::purge_litespeed( $product_ids, $urls ) ) {
+				static function () use ( $product_ids, $urls, $archive_purge_enabled ) {
+					if ( ! self::purge_litespeed( $product_ids, $urls, $archive_purge_enabled ) ) {
 						throw new RuntimeException( 'LiteSpeed targeted purge hooks are unavailable.' );
 					}
 				}
@@ -347,8 +348,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['w3TotalCache'] = self::run_integration(
 				'w3TotalCache',
 				$inventory['w3TotalCache'],
-				static function () use ( $product_ids, $urls ) {
-					if ( ! self::purge_w3_total_cache( $product_ids, $urls ) ) {
+				static function () use ( $product_ids, $urls, $archive_purge_enabled ) {
+					if ( ! self::purge_w3_total_cache( $product_ids, $urls, $archive_purge_enabled ) ) {
 						throw new RuntimeException( 'W3 Total Cache targeted purge API is unavailable.' );
 					}
 				}
@@ -357,8 +358,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['wpSuperCache'] = self::run_integration(
 				'wpSuperCache',
 				$inventory['wpSuperCache'],
-				static function () use ( $product_ids ) {
-					if ( ! self::purge_wp_super_cache( $product_ids ) ) {
+				static function () use ( $product_ids, $archive_purge_enabled ) {
+					if ( ! self::purge_wp_super_cache( $product_ids, $archive_purge_enabled ) ) {
 						throw new RuntimeException( 'WP Super Cache targeted purge API is unavailable.' );
 					}
 				}
@@ -369,8 +370,9 @@ final class Mobo_Core_Cache_Purger {
 				'object_ids'         => $object_ids,
 				'urls'               => $urls,
 				'custom_urls'        => $custom_urls,
-				'reasons'            => $reasons,
-				'integrationResults' => $integration_data,
+				'reasons'             => $reasons,
+				'archivePurgeEnabled' => $archive_purge_enabled,
+				'integrationResults'  => $integration_data,
 			);
 
 			$integration_data['customHooks'] = self::run_custom_hooks_integration(
@@ -411,6 +413,7 @@ final class Mobo_Core_Cache_Purger {
 				'customUrlCount'      => count( $custom_urls ),
 				'durationMs'          => self::elapsed_ms( $started_at ),
 				'reasons'             => array_slice( $reasons, 0, 20 ),
+				'archivePurgeEnabled' => $archive_purge_enabled,
 				'lastError'           => $last_error,
 				'integrations'        => $integration_data,
 			);
@@ -449,26 +452,22 @@ final class Mobo_Core_Cache_Purger {
 		}
 	}
 
-	private static function purge_wp_rocket( $product_ids, $custom_urls ) {
+	private static function purge_wp_rocket( $product_ids, $urls, $custom_urls, $archive_purge_enabled ) {
 		$available = false;
 
-		if ( function_exists( 'rocket_clean_post' ) ) {
+		if ( $archive_purge_enabled && function_exists( 'rocket_clean_post' ) ) {
 			$available = true;
 			foreach ( $product_ids as $product_id ) {
 				rocket_clean_post( $product_id );
 			}
 		}
 
-		if ( function_exists( 'rocket_clean_files' ) && ! empty( $custom_urls ) ) {
-			/*
-			 * WP Rocket clears URLs recursively. Passing the site root to
-			 * rocket_clean_files() would effectively become a domain-wide purge, so
-			 * the homepage is handled only by rocket_clean_home().
-			 */
-			$home_url = trailingslashit( home_url( '/' ) );
-			$file_urls = array_values(
+		if ( function_exists( 'rocket_clean_files' ) ) {
+			$target_urls = $archive_purge_enabled ? $custom_urls : $urls;
+			$home_url    = trailingslashit( home_url( '/' ) );
+			$file_urls   = array_values(
 				array_filter(
-					$custom_urls,
+					$target_urls,
 					static function ( $url ) use ( $home_url ) {
 						return trailingslashit( (string) $url ) !== $home_url;
 					}
@@ -481,7 +480,7 @@ final class Mobo_Core_Cache_Purger {
 			}
 		}
 
-		if ( function_exists( 'rocket_clean_home' ) ) {
+		if ( $archive_purge_enabled && function_exists( 'rocket_clean_home' ) ) {
 			$available = true;
 			rocket_clean_home();
 		}
@@ -489,25 +488,29 @@ final class Mobo_Core_Cache_Purger {
 		return $available;
 	}
 
-	private static function purge_litespeed( $product_ids, $urls ) {
-		/* A loaded plugin constant alone is not enough; at least one targeted hook must be registered. */
-		$available = false !== has_action( 'litespeed_purge_post' ) || false !== has_action( 'litespeed_purge_url' );
+	private static function purge_litespeed( $product_ids, $urls, $archive_purge_enabled ) {
+		$has_post_hook = false !== has_action( 'litespeed_purge_post' );
+		$has_url_hook  = false !== has_action( 'litespeed_purge_url' );
 
-		foreach ( $product_ids as $product_id ) {
-			do_action( 'litespeed_purge_post', $product_id );
+		if ( $archive_purge_enabled && $has_post_hook ) {
+			foreach ( $product_ids as $product_id ) {
+				do_action( 'litespeed_purge_post', $product_id );
+			}
 		}
 
-		foreach ( $urls as $url ) {
-			do_action( 'litespeed_purge_url', $url );
+		if ( $has_url_hook ) {
+			foreach ( $urls as $url ) {
+				do_action( 'litespeed_purge_url', $url );
+			}
 		}
 
-		return $available;
+		return $archive_purge_enabled ? ( $has_post_hook || $has_url_hook ) : $has_url_hook;
 	}
 
-	private static function purge_w3_total_cache( $product_ids, $urls ) {
+	private static function purge_w3_total_cache( $product_ids, $urls, $archive_purge_enabled ) {
 		$available = false;
 
-		if ( function_exists( 'w3tc_flush_post' ) ) {
+		if ( $archive_purge_enabled && function_exists( 'w3tc_flush_post' ) ) {
 			$available = true;
 			foreach ( $product_ids as $product_id ) {
 				w3tc_flush_post( $product_id );
@@ -524,13 +527,28 @@ final class Mobo_Core_Cache_Purger {
 		return $available;
 	}
 
-	private static function purge_wp_super_cache( $product_ids ) {
+
+	private static function purge_wp_super_cache( $product_ids, $archive_purge_enabled ) {
 		if ( ! function_exists( 'wp_cache_post_change' ) ) {
 			return false;
 		}
 
-		foreach ( $product_ids as $product_id ) {
-			wp_cache_post_change( $product_id );
+		$related_pages_filter = static function () {
+			return 0;
+		};
+
+		if ( ! $archive_purge_enabled ) {
+			add_filter( 'wpsc_delete_related_pages_on_edit', $related_pages_filter, PHP_INT_MAX );
+		}
+
+		try {
+			foreach ( $product_ids as $product_id ) {
+				wp_cache_post_change( $product_id );
+			}
+		} finally {
+			if ( ! $archive_purge_enabled ) {
+				remove_filter( 'wpsc_delete_related_pages_on_edit', $related_pages_filter, PHP_INT_MAX );
+			}
 		}
 
 		return true;
@@ -828,6 +846,12 @@ final class Mobo_Core_Cache_Purger {
 		return $timestamp > 0 ? gmdate( 'c', $timestamp ) : null;
 	}
 
+	private static function archive_purge_enabled() {
+		return class_exists( 'Mobo_Core_Settings' )
+			? Mobo_Core_Settings::enabled( 'mobo_core_cache_purge_archives_on_product_update', '0' )
+			: '1' === (string) get_option( 'mobo_core_cache_purge_archives_on_product_update', '0' );
+	}
+
 	private static function capture_related_urls( $product_id ) {
 		$product_id = absint( $product_id );
 		if ( $product_id <= 0 ) {
@@ -837,6 +861,10 @@ final class Mobo_Core_Cache_Purger {
 		$permalink = get_permalink( $product_id );
 		if ( is_string( $permalink ) && '' !== $permalink ) {
 			self::store_url( $permalink );
+		}
+
+		if ( ! self::archive_purge_enabled() ) {
+			return;
 		}
 
 		foreach ( array( 'product_cat', 'product_tag' ) as $taxonomy ) {

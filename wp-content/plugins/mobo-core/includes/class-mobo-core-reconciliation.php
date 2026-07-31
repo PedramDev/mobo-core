@@ -87,7 +87,7 @@ class Mobo_Core_Reconciliation {
 		$force_deep = (bool) $force_deep;
 		$state      = $this->get_state();
 
-		if ( 'idle' === $state['status'] && ! $force && ! $force_deep && ! Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '1' ) ) {
+		if ( 'idle' === $state['status'] && ! $force && ! $force_deep && ! Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) ) {
 			return $this->finish_result( array( 'success' => true, 'status' => 'disabled', 'source' => $source ) );
 		}
 

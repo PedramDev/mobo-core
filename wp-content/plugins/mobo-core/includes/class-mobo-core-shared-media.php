@@ -30,6 +30,7 @@ class Mobo_Core_Shared_Media {
 
 		add_filter( 'wp_get_attachment_url', array( __CLASS__, 'filter_attachment_url' ), 20, 2 );
 		add_filter( 'get_attached_file', array( __CLASS__, 'filter_attached_file' ), 20, 2 );
+		add_filter( 'wp_get_attachment_metadata', array( __CLASS__, 'filter_attachment_metadata' ), 20, 2 );
 	}
 
 	/**
@@ -189,6 +190,28 @@ class Mobo_Core_Shared_Media {
 	}
 
 	/**
+	 * Add missing WordPress/WooCommerce aliases to existing shared attachments.
+	 *
+	 * Older shared attachments may contain the centrally generated dimension keys
+	 * (for example 600x800 and 768x1024) without the registered aliases used by
+	 * wp_get_attachment_image_src(), such as woocommerce_single or large. Returning
+	 * the augmented metadata makes those existing attachments use the generated
+	 * shared-media cuts immediately after the plugin update, without rewriting the
+	 * database or generating per-site files.
+	 *
+	 * @param array|false $metadata Attachment metadata.
+	 * @param int         $attachment_id Attachment ID.
+	 * @return array|false
+	 */
+	public static function filter_attachment_metadata( $metadata, $attachment_id ) {
+		if ( ! is_array( $metadata ) || ! self::is_shared_attachment( $attachment_id ) ) {
+			return $metadata;
+		}
+
+		return self::add_registered_size_aliases( $metadata );
+	}
+
+	/**
 	 * Verify that a virtual attachment still has its complete worker manifest and
 	 * all generated files. This intentionally ignores unrelated WordPress image
 	 * sizes that are not part of the centrally approved profile.
@@ -253,7 +276,6 @@ class Mobo_Core_Shared_Media {
 			'image_meta' => array(),
 		);
 
-		$dimension_map = array();
 		$sizes = isset( $manifest['sizes'] ) && is_array( $manifest['sizes'] ) ? $manifest['sizes'] : array();
 		foreach ( $sizes as $name => $row ) {
 			if ( ! is_array( $row ) ) {
@@ -275,21 +297,123 @@ class Mobo_Core_Shared_Media {
 				'filesize'  => isset( $row['bytes'] ) ? absint( $row['bytes'] ) : 0,
 			);
 			$metadata['sizes'][ sanitize_key( (string) $name ) ] = $size_row;
-			$dimension_map[ $sw . 'x' . $sh ] = $size_row;
 		}
 
-		if ( function_exists( 'wp_get_registered_image_subsizes' ) ) {
-			foreach ( wp_get_registered_image_subsizes() as $registered_name => $definition ) {
-				$rw = isset( $definition['width'] ) ? absint( $definition['width'] ) : 0;
-				$rh = isset( $definition['height'] ) ? absint( $definition['height'] ) : 0;
-				$key = $rw . 'x' . $rh;
-				if ( $rw > 0 && $rh > 0 && isset( $dimension_map[ $key ] ) ) {
-					$metadata['sizes'][ sanitize_key( (string) $registered_name ) ] = $dimension_map[ $key ];
-				}
+		return self::add_registered_size_aliases( $metadata );
+	}
+
+	/**
+	 * Map registered WordPress/WooCommerce image-size names to generated shared cuts.
+	 *
+	 * Exact width/height matches retain the existing behavior. When a registered
+	 * size is a bounding box (for example 1024x1024) or has one unconstrained
+	 * dimension (for example 600x0), WordPress' own resize calculation is used to
+	 * resolve the actual output dimensions before looking up the worker-generated
+	 * file. This maps, among others, large and medium_large to 768x1024 and
+	 * woocommerce_single to 600x800 for a 960x1280 source image.
+	 *
+	 * @param array $metadata Attachment metadata.
+	 * @return array
+	 */
+	private static function add_registered_size_aliases( $metadata ) {
+		if ( ! is_array( $metadata ) || ! function_exists( 'wp_get_registered_image_subsizes' ) ) {
+			return $metadata;
+		}
+
+		$original_width  = isset( $metadata['width'] ) ? absint( $metadata['width'] ) : 0;
+		$original_height = isset( $metadata['height'] ) ? absint( $metadata['height'] ) : 0;
+		if ( $original_width <= 0 || $original_height <= 0 || empty( $metadata['sizes'] ) || ! is_array( $metadata['sizes'] ) ) {
+			return $metadata;
+		}
+
+		$dimension_map = array();
+		foreach ( $metadata['sizes'] as $size_row ) {
+			if ( ! is_array( $size_row ) || empty( $size_row['file'] ) ) {
+				continue;
+			}
+
+			$size_width  = isset( $size_row['width'] ) ? absint( $size_row['width'] ) : 0;
+			$size_height = isset( $size_row['height'] ) ? absint( $size_row['height'] ) : 0;
+			if ( $size_width <= 0 || $size_height <= 0 ) {
+				continue;
+			}
+
+			$key = $size_width . 'x' . $size_height;
+			if ( ! isset( $dimension_map[ $key ] ) ) {
+				$dimension_map[ $key ] = $size_row;
+			}
+		}
+
+		foreach ( wp_get_registered_image_subsizes() as $registered_name => $definition ) {
+			$alias = sanitize_key( (string) $registered_name );
+			if ( '' === $alias || isset( $metadata['sizes'][ $alias ] ) || ! is_array( $definition ) ) {
+				continue;
+			}
+
+			$requested_width  = isset( $definition['width'] ) ? absint( $definition['width'] ) : 0;
+			$requested_height = isset( $definition['height'] ) ? absint( $definition['height'] ) : 0;
+			$crop             = isset( $definition['crop'] ) ? $definition['crop'] : false;
+
+			if ( $requested_width <= 0 && $requested_height <= 0 ) {
+				continue;
+			}
+
+			/* Preserve the previous exact-dimension mapping whenever available. */
+			$exact_key = $requested_width . 'x' . $requested_height;
+			if ( $requested_width > 0 && $requested_height > 0 && isset( $dimension_map[ $exact_key ] ) ) {
+				$metadata['sizes'][ $alias ] = $dimension_map[ $exact_key ];
+				continue;
+			}
+
+			$resolved = self::resolve_registered_size_dimensions(
+				$original_width,
+				$original_height,
+				$requested_width,
+				$requested_height,
+				$crop
+			);
+
+			if ( empty( $resolved ) ) {
+				continue;
+			}
+
+			$resolved_key = absint( $resolved[0] ) . 'x' . absint( $resolved[1] );
+			if ( isset( $dimension_map[ $resolved_key ] ) ) {
+				$metadata['sizes'][ $alias ] = $dimension_map[ $resolved_key ];
 			}
 		}
 
 		return $metadata;
+	}
+
+	/**
+	 * Resolve the output dimensions WordPress expects for a registered image size.
+	 *
+	 * @return array<int,int> Empty when WordPress would use the original image.
+	 */
+	private static function resolve_registered_size_dimensions( $original_width, $original_height, $requested_width, $requested_height, $crop ) {
+		if ( ! function_exists( 'image_resize_dimensions' ) ) {
+			return array();
+		}
+
+		$dimensions = image_resize_dimensions(
+			absint( $original_width ),
+			absint( $original_height ),
+			absint( $requested_width ),
+			absint( $requested_height ),
+			$crop
+		);
+
+		if ( ! is_array( $dimensions ) || ! isset( $dimensions[4], $dimensions[5] ) ) {
+			return array();
+		}
+
+		$output_width  = absint( $dimensions[4] );
+		$output_height = absint( $dimensions[5] );
+
+		return $output_width > 0 && $output_height > 0
+			? array( $output_width, $output_height )
+			: array();
 	}
 
 	private static function read_manifest( $image_id ) {

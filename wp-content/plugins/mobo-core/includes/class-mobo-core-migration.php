@@ -51,6 +51,8 @@ class Mobo_Core_Migration {
 		self::apply_103168_image_automation_safety( '' );
 		self::apply_103177_desired_state_repair( '' );
 		self::apply_103194_health_pull_only( '' );
+		self::apply_103198_manual_initial_sync_safety( '' );
+		self::apply_103199_image_queue_recovery( '' );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -91,6 +93,8 @@ class Mobo_Core_Migration {
 		self::apply_103168_image_automation_safety( $current );
 		self::apply_103177_desired_state_repair( $current );
 		self::apply_103194_health_pull_only( $current );
+		self::apply_103198_manual_initial_sync_safety( $current );
+		self::apply_103199_image_queue_recovery( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -301,55 +305,51 @@ class Mobo_Core_Migration {
 	 * @return void
 	 */
 	public static function run_deferred_repairs() {
-		self::maybe_start_desired_state_repair_queue();
+		if ( '1' === (string) get_option( 'mobo_core_category_placeholder_repair_pending', '0' )
+			&& taxonomy_exists( 'product_cat' ) ) {
+			$result = self::repair_placeholder_category_titles_from_map();
 
-		if ( '1' !== (string) get_option( 'mobo_core_category_placeholder_repair_pending', '0' ) ) {
+			update_option( 'mobo_core_category_placeholder_repair_result', $result, false );
+			update_option( 'mobo_core_category_placeholder_repair_at', time(), false );
+			delete_option( 'mobo_core_category_placeholder_repair_pending' );
+		}
+
+		if ( '1' !== (string) get_option( 'mobo_core_image_queue_recovery_pending', '0' ) ) {
 			return;
 		}
 
-		if ( ! taxonomy_exists( 'product_cat' ) ) {
+		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
 			return;
 		}
 
-		$result = self::repair_placeholder_category_titles_from_map();
+		$failed_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
+			? Mobo_Core_Image_Queue::recover_legacy_failed( 500 )
+			: array( 'status' => 'unavailable', 'recovered' => 0, 'remaining' => 0 );
+		$linkage_recovery = method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
+			? Mobo_Core_Image_Queue::schedule_linkage_repairs( 200 )
+			: array( 'status' => 'unavailable', 'scheduled' => 0 );
 
-		update_option( 'mobo_core_category_placeholder_repair_result', $result, false );
-		update_option( 'mobo_core_category_placeholder_repair_at', time(), false );
-		delete_option( 'mobo_core_category_placeholder_repair_pending' );
+		$result = array(
+			'failedRows' => $failed_recovery,
+			'linkage'    => $linkage_recovery,
+			'executedAt' => time(),
+		);
+
+		update_option( 'mobo_core_103199_image_queue_recovery_result', $result, false );
+		update_option( 'mobo_core_103199_image_queue_recovery_at', time(), false );
+
+		$scheduled_work = ( isset( $failed_recovery['recovered'] ) ? absint( $failed_recovery['recovered'] ) : 0 )
+			+ ( isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0 );
+
+		if ( $scheduled_work > 0 && class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+			Mobo_Core_Self_Runner::kick( 'image-queue-recovery', true );
+		}
+
+		if ( empty( $failed_recovery['remaining'] ) ) {
+			delete_option( 'mobo_core_image_queue_recovery_pending' );
+		}
 	}
 
-	/**
-	 * Start the one-time desired-state Repair through the normal resumable queue.
-	 * Existing active manual syncs are never overwritten.
-	 *
-	 * @return void
-	 */
-	private static function maybe_start_desired_state_repair_queue() {
-		if ( '1' !== (string) get_option( 'mobo_core_desired_state_repair_queue_pending', '0' ) ) {
-			return;
-		}
-
-		if ( ! class_exists( 'Mobo_Core_Product_Sync' ) || ! class_exists( 'WooCommerce' ) ) {
-			return;
-		}
-
-		$state  = get_option( 'mobo_core_sync_state', array() );
-		$status = is_array( $state ) ? sanitize_key( (string) ( $state['status'] ?? '' ) ) : '';
-		if ( in_array( $status, array( 'running', 'waiting_for_portal' ), true ) ) {
-			return;
-		}
-
-		$sync   = new Mobo_Core_Product_Sync();
-		$result = $sync->start_manual_sync( '', 'desired-state-migration', true );
-		if ( is_array( $result ) && ! empty( $result['success'] ) ) {
-			delete_option( 'mobo_core_desired_state_repair_queue_pending' );
-			update_option( 'mobo_core_desired_state_repair_queue_started_at', time(), false );
-
-			if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
-				Mobo_Core_Self_Runner::kick( 'desired-state-migration', true );
-			}
-		}
-	}
 
 
 	/**
@@ -514,6 +514,41 @@ class Mobo_Core_Migration {
 
 
 	/**
+	 * Re-open recoverable image failures and repair the old import/linkage race.
+	 *
+	 * The work is deferred and bounded so plugin activation/upgrade does not run a
+	 * product Sync or Repair. Existing queue rows are reused.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103199_image_queue_recovery( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.99', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_image_queue_recovery_pending', '1', false );
+	}
+
+	/**
+	 * Prevent legacy migration flags from starting a heavy Repair automatically.
+	 * Existing active operations are not cancelled.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103198_manual_initial_sync_safety( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.31.98', '>=' ) ) {
+			return;
+		}
+
+		delete_option( 'mobo_core_desired_state_repair_queue_pending' );
+	}
+
+	/**
 	 * Disable the retired outbound health-report path.
 	 *
 	 * Portal 51+ pulls the authenticated /health endpoint. Existing installs may
@@ -582,10 +617,8 @@ class Mobo_Core_Migration {
 	}
 
 	/**
-	 * Require one authoritative Repair after installing the desired-state variation engine.
-	 *
-	 * The Repair uses the normal bounded product/variant queue and therefore fixes
-	 * existing WooCommerce products without a destructive database migration.
+	 * Mark one authoritative manual Repair as required after installing the
+	 * desired-state variation engine. The migration never starts that heavy job.
 	 *
 	 * @param string $previous_version Previously stored DB version.
 	 * @return void
@@ -604,7 +637,7 @@ class Mobo_Core_Migration {
 		delete_option( 'mobo_core_repair_last_sync_id' );
 		update_option( 'mobo_core_legacy_repair_required', '1', false );
 		update_option( 'mobo_core_desired_state_repair_required', '1', false );
-		update_option( 'mobo_core_desired_state_repair_queue_pending', '1', false );
+		delete_option( 'mobo_core_desired_state_repair_queue_pending' );
 		update_option( 'mobo_core_desired_state_repair_marked_at', time(), false );
 	}
 
