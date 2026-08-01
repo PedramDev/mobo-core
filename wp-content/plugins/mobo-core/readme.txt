@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.32.1
+Stable tag: 10.32.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -140,6 +140,11 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can separately enable archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. Archive invalidation is disabled by default on new installations to avoid making high-frequency archive caches ineffective. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.32.2 =
+* Image Refresh now removes local JPG/JPEG files whose base filename matches the successfully validated replacement WebP, including same-base derivative files such as `name-300x300.jpg` and `name-scaled.jpeg`.
+* Cleanup checks both the new WebP directory and the previous attachment directory inside WordPress uploads. PNG, WebP, and different base filenames are not removed.
+* Filesystem deletion errors are isolated and reported in the refresh result; they do not cause a fatal error or roll back the completed WebP replacement.
 
 = 10.32.1 =
 * Wrapped account-quota lookup, uploads write probing, server filesystem checks, and final storage report composition in independent Throwable boundaries. Unexpected hosting integrations now return an explicit unavailable state instead of breaking the Site Health endpoint.

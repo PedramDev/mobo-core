@@ -540,12 +540,20 @@ class Mobo_Core_Image_Refresh_Service {
 		$this->replace_product_attachment( $product, $old_attachment_id, $new_attachment_id );
 		$this->mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
 
-		$note = 'تصویر قدیمی نگه داشته شد.';
+		$jpeg_cleanup = $this->cleanup_same_basename_jpeg_files( $new_attachment_id, $old_attachment_id );
+		$note         = 'تصویر قدیمی نگه داشته شد.';
 		$delete_old = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
 			|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() );
 		if ( $delete_old ) {
 			$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
 			$note         = ! empty( $delete_check['deleted'] ) ? ( isset( $delete_check['message'] ) ? (string) $delete_check['message'] : 'تصویر قدیمی با موفقیت و به صورت امن حذف شد.' ) : ( isset( $delete_check['message'] ) ? $delete_check['message'] : 'تصویر قدیمی نگه داشته شد.' );
+		}
+
+		if ( ! empty( $jpeg_cleanup['deletedFiles'] ) ) {
+			$note .= ' فایل های JPG/JPEG هم نام حذف شده: ' . absint( $jpeg_cleanup['deletedFiles'] ) . '، فضای آزاد شده: ' . size_format( absint( isset( $jpeg_cleanup['bytes'] ) ? $jpeg_cleanup['bytes'] : 0 ) ) . '.';
+		}
+		if ( ! empty( $jpeg_cleanup['failedFiles'] ) ) {
+			$note .= ' حذف ' . absint( $jpeg_cleanup['failedFiles'] ) . ' فایل JPG/JPEG هم نام ناموفق بود و نوسازی بدون Fatal ادامه یافت.';
 		}
 
 		$note .= ' برش های WebP کنترل نهایی شدند؛ تعداد برش های ثبت شده: ' . absint( isset( $subsize_result['registered'] ) ? $subsize_result['registered'] : 0 ) . '، فایل جدید ساخته شده: ' . absint( isset( $subsize_result['generated'] ) ? $subsize_result['generated'] : 0 ) . '.';
@@ -619,6 +627,93 @@ class Mobo_Core_Image_Refresh_Service {
 			update_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_at', $now );
 			update_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', absint( $new_attachment_id ) );
 		}
+	}
+
+	/**
+	 * Remove local JPG/JPEG files that share the new WebP base filename.
+	 *
+	 * This intentionally uses filename similarity only. It runs after the WebP
+	 * attachment has passed validation and has replaced the product image. Any
+	 * filesystem error is contained so image refresh cannot fail fatally.
+	 *
+	 * @param int $new_attachment_id New WebP attachment ID.
+	 * @param int $old_attachment_id Previous attachment ID.
+	 * @return array
+	 */
+	private function cleanup_same_basename_jpeg_files( $new_attachment_id, $old_attachment_id = 0 ) {
+		$result = array(
+			'deletedFiles' => 0,
+			'failedFiles'  => 0,
+			'bytes'        => 0,
+		);
+
+		try {
+			$new_file = get_attached_file( absint( $new_attachment_id ) );
+			$new_file = is_string( $new_file ) ? $this->normalize_file_path( $new_file ) : '';
+
+			if ( '' === $new_file || 'webp' !== strtolower( pathinfo( $new_file, PATHINFO_EXTENSION ) ) ) {
+				return $result;
+			}
+
+			$base_name = pathinfo( basename( $new_file ), PATHINFO_FILENAME );
+			if ( '' === $base_name ) {
+				return $result;
+			}
+
+			$directories = array( dirname( $new_file ) );
+			$old_file    = get_attached_file( absint( $old_attachment_id ) );
+			$old_file    = is_string( $old_file ) ? $this->normalize_file_path( $old_file ) : '';
+			if ( '' !== $old_file ) {
+				$directories[] = dirname( $old_file );
+			}
+
+			$pattern = '/^' . preg_quote( $base_name, '/' ) . '(?:-[^.]+)?\.jpe?g$/i';
+			$seen    = array();
+
+			foreach ( array_values( array_unique( array_filter( array_map( array( $this, 'normalize_file_path' ), $directories ) ) ) ) as $directory ) {
+				if ( ! is_dir( $directory ) || ! $this->is_inside_uploads_path( $directory ) ) {
+					continue;
+				}
+
+				$entries = @scandir( $directory );
+				if ( ! is_array( $entries ) ) {
+					continue;
+				}
+
+				foreach ( $entries as $entry ) {
+					if ( '.' === $entry || '..' === $entry || ! preg_match( $pattern, (string) $entry ) ) {
+						continue;
+					}
+
+					$path = $this->normalize_file_path( trailingslashit( $directory ) . basename( (string) $entry ) );
+					if ( isset( $seen[ $path ] ) || ! is_file( $path ) || ! $this->is_inside_uploads_path( $path ) ) {
+						continue;
+					}
+					$seen[ $path ] = true;
+
+					$size = @filesize( $path );
+					$size = false === $size ? 0 : absint( $size );
+
+					try {
+						wp_delete_file( $path );
+					} catch ( Throwable $error ) {
+						$result['failedFiles']++;
+						continue;
+					}
+
+					if ( ! is_file( $path ) ) {
+						$result['deletedFiles']++;
+						$result['bytes'] += $size;
+					} else {
+						$result['failedFiles']++;
+					}
+				}
+			}
+		} catch ( Throwable $error ) {
+			$result['failedFiles']++;
+		}
+
+		return $result;
 	}
 
 	/**
