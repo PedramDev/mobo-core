@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.32.11
+Stable tag: 10.33.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -145,7 +145,7 @@ Mobo Core always clears WooCommerce product transients, WordPress post/object ca
 
 == Changelog ==
 
-= 10.32.11 =
+= 10.33.0 =
 * Choosing current store methods no longer keeps the Mobo-created fallback visible.
 * Real WooCommerce store methods from a broader or fallback Zone are connected into the Mobo Iran Zone when WooCommerce Zone precedence would otherwise hide them.
 * The old managed fallback is disabled only after a real store method is available, preventing checkout gaps.

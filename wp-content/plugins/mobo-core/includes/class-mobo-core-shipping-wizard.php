@@ -40,16 +40,7 @@ class Mobo_Core_Shipping_Wizard {
 	 * @return void
 	 */
 	public function init() {
-		if ( ! $this->is_completed() ) {
-			return;
-		}
-
-		add_filter( 'woocommerce_cart_shipping_packages', array( $this, 'configure_shipping_packages' ), 5, 1 );
-		add_filter( 'woocommerce_package_rates', array( $this, 'filter_package_rates' ), 100, 2 );
-		add_action( 'woocommerce_check_cart_items', array( $this, 'validate_mixed_cart' ), 20 );
-		add_action( 'woocommerce_after_checkout_validation', array( $this, 'validate_checkout' ), 20, 2 );
-		add_filter( 'woocommerce_store_api_cart_errors', array( $this, 'validate_store_api_cart' ), 20, 1 );
-		add_action( 'woocommerce_checkout_order_created', array( $this, 'annotate_created_order' ), 20, 1 );
+		// Deprecated since 10.33.0: Mobo does not modify checkout shipping runtime.
 	}
 
 	/**
@@ -60,6 +51,14 @@ class Mobo_Core_Shipping_Wizard {
 	 * @return array
 	 */
 	public function apply( $input, $source = 'admin-wizard' ) {
+		unset( $input, $source );
+		return array(
+			'success' => false,
+			'status' => 'deprecated',
+			'message' => 'ویزارد حمل‌ونقل حذف شده است؛ Checkout فقط توسط WooCommerce مدیریت می‌شود و Mobo Core فقط نگاشت روش ارسال را نگه می‌دارد.',
+		);
+
+		/* Legacy implementation below is intentionally unreachable. */
 		$result = array(
 			'success'       => false,
 			'profile'       => '',

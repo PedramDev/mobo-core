@@ -32,7 +32,6 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_tool_sync_address_mapping', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_sync_remote_shipping_methods', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_install_automatic_shipping', array( $this, 'handle_admin_tool_action' ) );
-		add_action( 'admin_post_mobo_core_apply_shipping_wizard', array( $this, 'handle_apply_shipping_wizard' ) );
 		add_action( 'admin_post_mobo_core_tool_run_cron_now', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_start_sync', array( $this, 'handle_start_sync' ) );
 		add_action( 'admin_post_mobo_core_start_repair', array( $this, 'handle_start_repair' ) );
@@ -1133,10 +1132,6 @@ class Mobo_Core_Admin {
 		$remote_shipping_manager = class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ? new Mobo_Core_Remote_Shipping_Methods() : null;
 		$remote_shipping_status  = $remote_shipping_manager && method_exists( $remote_shipping_manager, 'get_status' ) ? $remote_shipping_manager->get_status() : array();
 		$remote_shipping_methods = $remote_shipping_manager && method_exists( $remote_shipping_manager, 'get_methods' ) ? $remote_shipping_manager->get_methods() : array();
-		$automatic_shipping_manager = class_exists( 'Mobo_Core_Automatic_Shipping' ) ? new Mobo_Core_Automatic_Shipping() : null;
-		$automatic_shipping_status  = $automatic_shipping_manager && method_exists( $automatic_shipping_manager, 'get_status' ) ? $automatic_shipping_manager->get_status() : array();
-		$shipping_wizard_manager = class_exists( 'Mobo_Core_Shipping_Wizard' ) ? new Mobo_Core_Shipping_Wizard() : null;
-		$shipping_wizard_status  = $shipping_wizard_manager && method_exists( $shipping_wizard_manager, 'get_status' ) ? $shipping_wizard_manager->get_status() : array();
 		$remote_shipping_snapshot = get_option( 'mobo_core_remote_shipping_methods_snapshot', array() );
 		$remote_shipping_changed_at = absint( get_option( 'mobo_core_remote_shipping_methods_changed_at', 0 ) );
 		$portal_webhook_delivery_status = get_option( 'mobo_core_portal_webhook_delivery_status', array() );
@@ -1217,7 +1212,7 @@ class Mobo_Core_Admin {
 							<?php endif; ?>
 						</div>
 						<?php if ( ! empty( $remote_shipping_snapshot['shippings'] ) && is_array( $remote_shipping_snapshot['shippings'] ) ) : ?>
-							<div class="mobo-note">روش‌های ارسال جدید از MoboCore دریافت شده‌اند. برای استفاده در checkout، در بخش «روش‌های ارسال برای ثبت سفارش در موبو» مشخص کنید کدام روش‌ها برای هر نوع سبد خرید مجاز باشند.</div>
+							<div class="mobo-note">روش‌های ارسال جدید از MoboCore دریافت شده‌اند. این لیست فقط برای نگاشت روش‌های WooCommerce به shipping_id موبو استفاده می‌شود و هیچ گزینه‌ای به Checkout اضافه نمی‌کند.</div>
 							<div style="max-height:240px;overflow:auto;border:1px solid #e5e7eb;background:#fff;border-radius:10px;padding:10px;">
 								<?php foreach ( array_slice( $remote_shipping_snapshot['shippings'], 0, 12 ) as $shipping_item ) : ?>
 									<div style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
@@ -1330,26 +1325,21 @@ class Mobo_Core_Admin {
 
 			<div class="mobo-card mobo-card-wide mobo-shipping-admin-card">
 				<div class="mobo-card-head">
-					<h2>روش‌های ارسال موبو و محاسبه حمل‌ونقل WooCommerce</h2>
-					<p>جزئیات کامل روش‌های ارسال موبو برای راهنمای تنظیم WooCommerce ذخیره می‌شود. نمایش نرخ‌ها همچنان با WooCommerce است و نگاشت shipping_id فقط هنگام ثبت خودکار سفارش استفاده می‌شود.</p>
+					<h2>نگاشت روش‌های ارسال WooCommerce به موبو</h2>
+					<p>روش‌های ارسال موبو فقط به‌عنوان مقصد نگاشت ذخیره می‌شوند. Mobo Core هیچ نرخ یا روش ارسالی در Checkout ایجاد نمی‌کند.</p>
 				</div>
 
 				<div class="mobo-fields-grid">
 					<?php $this->int_field( 'بازه بروزرسانی روش‌های ارسال از MoboCore / ساعت', 'mobo_core_remote_shipping_sync_interval_hours', 1, 168, 1 ); ?>
-					<?php $this->bool_field( 'فعال بودن روش‌های ارسال خودکار موبو در Checkout', 'mobo_core_automatic_shipping_enabled' ); ?>
-					<?php $this->bool_field( 'اعمال کلاس و مبلغ موبویی فقط در محاسبه حمل‌ونقل', 'mobo_core_mobo_shipping_package_enabled' ); ?>
-					<?php $this->bool_field( 'استفاده از mobo_api_price به‌جای قیمت فروشگاه در Shipping Package', 'mobo_core_mobo_shipping_use_api_price' ); ?>
-					<?php $this->render_mobo_shipping_class_select(); ?>
 				</div>
 
-
 				<div class="mobo-note">
-					در زمان محاسبه نرخ ارسال، افزونه یک کپی موقت از Shipping Package می‌سازد. برای آیتم‌های موبو، کلاس انتخاب‌شده و مقدار <code>mobo_api_price × quantity</code> فقط در همان کپی قرار می‌گیرد. قیمت محصول، تخفیف، مبلغ سبد و سفارش ووکامرس تغییر نمی‌کند.
+					<strong>سیاست جدید حمل‌ونقل:</strong> Mobo Core هیچ Shipping Zone، Shipping Method، Package یا Rate در Checkout ایجاد یا تغییر نمی‌دهد. مشتری فقط روش‌های ارسال عادی خود فروشگاه را می‌بیند. این صفحه فقط همان روش انتخاب‌شده در WooCommerce را به <code>shipping_id</code> موبو نگاشت می‌کند تا هنگام ارسال سفارش به موبو استفاده شود.
 				</div>
 
 				<div class="mobo-status-grid">
-					<?php $this->status_box( 'نمایش روش ارسال در checkout', 'کاملا با WooCommerce' ); ?>
-					<?php $this->status_box( 'نگاشت روش‌های ارسال ووکامرس', 'فعال برای انتخاب shipping_id موبو' ); ?>
+					<?php $this->status_box( 'مالک Checkout و نرخ ارسال', 'فقط WooCommerce / افزونه حمل‌ونقل فروشگاه' ); ?>
+					<?php $this->status_box( 'کاربرد روش‌های موبو', 'فقط Mapping هنگام Submit Order' ); ?>
 					<?php $this->status_box( 'تعداد روش‌های ارسال cache شده', isset( $remote_shipping_status['count'] ) ? absint( $remote_shipping_status['count'] ) : 0 ); ?>
 					<?php $this->status_box( 'آخرین بروزرسانی موفق', ! empty( $remote_shipping_status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastSuccessAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'آخرین تغییر از MoboCore', ! empty( $remote_shipping_status['lastChangedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $remote_shipping_status['lastChangedAt'] ) ) : '—' ); ?>
@@ -1358,35 +1348,24 @@ class Mobo_Core_Admin {
 
 
 				<div class="mobo-note" style="margin-top:14px;">
-					<strong>ویزارد راه‌اندازی حمل‌ونقل و سفارش ترکیبی</strong><br>
-					قبل از ساخت Zoneها و روش‌ها، مدل واقعی ارسال سفارش‌های ترکیبی مشخص می‌شود: تجمیع در فروشگاه تهران، ارسال در دو بسته یا جلوگیری از سفارش ترکیبی. سپس کلاس محصولات موبو، روش‌های free/static/rules، نگاشت shipping_id و رفتار Checkout به‌صورت idempotent ساخته یا ترمیم می‌شوند. در ترمیم، پیک‌ها فقط برای مقصد تهران و دراپ‌شیپینگ پست پیشتاز برای کل ایران تنظیم می‌شود.
-					<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-						<a href="#mobo-shipping-wizard" class="button button-primary">باز کردن ویزارد حمل‌ونقل</a>
-						<span><?php echo ! empty( $shipping_wizard_status['completed'] ) ? ( 'سناریوی فعال: ' . esc_html( isset( $shipping_wizard_status['profileLabel'] ) ? $shipping_wizard_status['profileLabel'] : 'تنظیم‌شده' ) ) : 'ویزارد هنوز تکمیل نشده است'; ?></span>
+					<strong>ترمیم سیاست نگاشت</strong><br>
+					این عملیات روش‌های ارسال موبو را از MoboCore تازه می‌کند و هر روش/Flat Rate/کپی Zone که نسخه‌های قدیمی Mobo Core ساخته‌اند غیرفعال می‌کند. روش‌های واقعی خود فروشگاه دست‌نخورده باقی می‌مانند.
+					<div style="margin-top:12px;">
+						<?php $this->admin_tool_button( 'mobo_core_tool_install_automatic_shipping', 'بروزرسانی و ترمیم نگاشت ارسال', 'button button-primary', 'روش‌های ارسال قدیمی ساخته‌شده توسط موبو غیرفعال و لیست روش‌های موبو بروزرسانی شود؟' ); ?>
 					</div>
-				</div>
-
-				<div class="mobo-status-grid" style="margin-top:12px;">
-					<?php $this->status_box( 'کلاس محصولات موبو', ! empty( $automatic_shipping_status['classReady'] ) ? ( 'آماده / ID ' . absint( $automatic_shipping_status['classId'] ) ) : 'آماده نیست' ); ?>
-					<?php $this->status_box( 'Zoneهای مدیریت‌شده', isset( $automatic_shipping_status['zoneCount'] ) ? absint( $automatic_shipping_status['zoneCount'] ) : 0 ); ?>
-					<?php $this->status_box( 'Instanceهای خودکار', isset( $automatic_shipping_status['instanceCount'] ) ? absint( $automatic_shipping_status['instanceCount'] ) : 0 ); ?>
-					<?php $this->status_box( 'آخرین اجرای راه‌اندازی', ! empty( $automatic_shipping_status['lastRunAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $automatic_shipping_status['lastRunAt'] ) ) : '—' ); ?>
-					<?php $auto_last = isset( $automatic_shipping_status['lastResult'] ) && is_array( $automatic_shipping_status['lastResult'] ) ? $automatic_shipping_status['lastResult'] : array(); ?>
-					<?php $this->status_box( 'نتیجه آخر', ! empty( $auto_last['message'] ) ? $auto_last['message'] : '—' ); ?>
 				</div>
 
 				<?php $this->render_mobo_shipping_method_catalog( $remote_shipping_methods ); ?>
 
 				<?php
 				$this->guide_box(
-					'راهنمای ساخت کلاس حمل‌ونقل برای محصولات موبو',
+					'راهنمای نگاشت روش ارسال فروشگاه به موبو',
 					array(
-						array( 'title' => 'ساخت کلاس', 'text' => 'از مسیر ووکامرس ← پیکربندی ← حمل‌ونقل ← کلاس‌های حمل‌ونقل یک کلاس مانند «محصولات موبو» بسازید.' ),
-						array( 'title' => 'انتخاب کلاس در موبو', 'text' => 'پس از ساخت کلاس، همین صفحه را تازه کنید و کلاس را از فهرست بالا انتخاب کنید. کلاس به‌صورت مجازی فقط هنگام محاسبه نرخ ارسال به محصولات موبو اعمال می‌شود.' ),
-						array( 'title' => 'تعریف نرخ‌ها', 'text' => 'در Shipping Zoneهای ووکامرس روش‌های ارسال موردنیاز را ایجاد کنید. برای روش‌های rules، بازه‌های مبلغ نمایش‌داده‌شده در جزئیات موبو را در افزونه حمل‌ونقل یا شرط‌های روش ارسال WooCommerce بازسازی کنید.' ),
-						array( 'title' => 'مبنای مبلغ', 'text' => 'برای محصولات موبو، شرط‌های مبلغی Shipping Package از mobo_api_price استفاده می‌کنند؛ قیمت فروش محصول در سایت مبنای این شرط‌ها نیست.' ),
+						array( 'title' => 'روش‌های فروشگاه', 'text' => 'تمام Zoneها و روش‌های قابل مشاهده برای مشتری را فقط در WooCommerce یا افزونه حمل‌ونقل خودتان مدیریت کنید.' ),
+						array( 'title' => 'نگاشت', 'text' => 'برای هر روش فعال WooCommerce یک روش موبو انتخاب کنید. این انتخاب در Checkout نمایش داده نمی‌شود.' ),
+						array( 'title' => 'ثبت سفارش موبو', 'text' => 'وقتی وضعیت سفارش شرایط ارسال به موبو را پیدا کند، افزونه Shipping Method ذخیره‌شده روی همان سفارش WooCommerce را می‌خواند و shipping_id نگاشت‌شده را در درخواست موبو قرار می‌دهد.' ),
 					),
-					'برای سفارش ترکیبی، مبلغ محصولات غیرموبو همان مبلغ عادی WooCommerce باقی می‌ماند و فقط خطوط موبویی با مبلغ منبع محاسبه می‌شوند.'
+					'سفارش فقط موبو و سفارش ترکیبی از یک نگاشت مشترک استفاده می‌کنند؛ محصولات غیرموبویی همچنان به موبو ارسال نمی‌شوند.'
 				);
 				?>
 
@@ -1560,7 +1539,6 @@ class Mobo_Core_Admin {
 
 			<?php $this->save_button(); ?>
 		</form>
-		<?php $this->render_shipping_wizard_form( $remote_shipping_methods, $shipping_wizard_status ); ?>
 		<?php
 	}
 
@@ -1573,187 +1551,8 @@ class Mobo_Core_Admin {
 	 * @return void
 	 */
 	private function render_shipping_wizard_form( $methods, $status ) {
-		if ( ! class_exists( 'Mobo_Core_Shipping_Wizard' ) ) {
-			return;
-		}
-
-		$wizard   = new Mobo_Core_Shipping_Wizard();
-		$defaults = $wizard->get_defaults();
-		$completed = ! empty( $status['completed'] );
-		$profile = $completed && ! empty( $status['profile'] ) ? sanitize_key( (string) $status['profile'] ) : $defaults['profile'];
-		$location = $completed && ! empty( $status['storeLocation'] ) ? sanitize_key( (string) $status['storeLocation'] ) : $defaults['storeLocation'];
-		$fulfillment_id = $completed ? absint( isset( $status['fulfillmentId'] ) ? $status['fulfillmentId'] : 0 ) : absint( $defaults['fulfillmentId'] );
-		if ( $fulfillment_id <= 0 ) {
-			$fulfillment_id = $wizard->find_default_pickup_method_id( $methods );
-		}
-		$block_message = $completed && ! empty( $status['blockMessage'] ) ? (string) $status['blockMessage'] : $defaults['blockMessage'];
-		$store_rate_mode = $completed && ! empty( $status['storeRateMode'] ) ? sanitize_key( (string) $status['storeRateMode'] ) : $defaults['storeRateMode'];
-		$store_rate_title = $completed && isset( $status['storeRateTitle'] ) ? sanitize_text_field( (string) $status['storeRateTitle'] ) : $defaults['storeRateTitle'];
-		$store_rate_cost = $completed && isset( $status['storeRateCost'] ) ? (string) $status['storeRateCost'] : (string) $defaults['storeRateCost'];
-		$store_shipping = isset( $defaults['storeShipping'] ) && is_array( $defaults['storeShipping'] ) ? $defaults['storeShipping'] : array();
-		$store_shipping_ready = ! empty( $store_shipping['existingReady'] );
-		$store_method_count = isset( $store_shipping['existingMethodCount'] ) ? absint( $store_shipping['existingMethodCount'] ) : 0;
-		$store_source_method_count = isset( $store_shipping['existingSourceMethodCount'] ) ? absint( $store_shipping['existingSourceMethodCount'] ) : 0;
-		if ( $store_method_count <= 0 ) {
-			$store_method_count = $store_source_method_count;
-		}
-		$store_requires_mirror = ! empty( $store_shipping['existingRequiresMirror'] );
-		$store_missing_zones = array();
-		$store_detected_methods = array();
-		foreach ( isset( $store_shipping['existingMissingZones'] ) && is_array( $store_shipping['existingMissingZones'] ) ? $store_shipping['existingMissingZones'] : array() as $missing_zone ) {
-			if ( is_array( $missing_zone ) && ! empty( $missing_zone['zoneName'] ) ) {
-				$store_missing_zones[] = sanitize_text_field( (string) $missing_zone['zoneName'] );
-			}
-		}
-		foreach ( isset( $store_shipping['zones'] ) && is_array( $store_shipping['zones'] ) ? $store_shipping['zones'] : array() as $store_zone ) {
-			if ( ! is_array( $store_zone ) ) {
-				continue;
-			}
-			$zone_name = ! empty( $store_zone['zoneName'] ) ? sanitize_text_field( (string) $store_zone['zoneName'] ) : 'Zone';
-			foreach ( isset( $store_zone['methods'] ) && is_array( $store_zone['methods'] ) ? $store_zone['methods'] : array() as $store_method ) {
-				if ( ! is_array( $store_method ) ) {
-					continue;
-				}
-				$title = ! empty( $store_method['title'] ) ? sanitize_text_field( (string) $store_method['title'] ) : sanitize_key( isset( $store_method['methodId'] ) ? (string) $store_method['methodId'] : '' );
-				$instance_id = absint( isset( $store_method['instanceId'] ) ? $store_method['instanceId'] : 0 );
-				$store_detected_methods[] = $zone_name . ': ' . $title . ( $instance_id > 0 ? ' (#' . $instance_id . ')' : '' );
-			}
-		}
-		foreach ( isset( $store_shipping['existingSourceMethods'] ) && is_array( $store_shipping['existingSourceMethods'] ) ? $store_shipping['existingSourceMethods'] : array() as $source_method ) {
-			if ( ! is_array( $source_method ) ) {
-				continue;
-			}
-			$source_zone_name = ! empty( $source_method['sourceZoneName'] ) ? sanitize_text_field( (string) $source_method['sourceZoneName'] ) : 'Zone فروشگاه';
-			$title = ! empty( $source_method['title'] ) ? sanitize_text_field( (string) $source_method['title'] ) : sanitize_key( isset( $source_method['methodId'] ) ? (string) $source_method['methodId'] : '' );
-			$instance_id = absint( isset( $source_method['instanceId'] ) ? $source_method['instanceId'] : 0 );
-			$label = $source_zone_name . ': ' . $title . ( $instance_id > 0 ? ' (#' . $instance_id . ')' : '' );
-			if ( ! in_array( $label, $store_detected_methods, true ) ) {
-				$store_detected_methods[] = $label;
-			}
-		}
-		$currency_symbol = function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '';
-		?>
-		<div id="mobo-shipping-wizard" class="mobo-card mobo-card-wide" style="margin-top:18px;scroll-margin-top:40px;">
-			<div class="mobo-card-head">
-				<h2>ویزارد حمل‌ونقل موبو</h2>
-				<p>تصمیم‌های عملیاتی ارسال موبو و محصولات فروشگاه را مشخص کنید. تغییرات فقط بعد از مرحله نهایی روی WooCommerce اعمال می‌شوند و اجرای مجدد Duplicate ایجاد نمی‌کند.</p>
-			</div>
-
-			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" data-mobo-shipping-wizard-form>
-				<input type="hidden" name="action" value="mobo_core_apply_shipping_wizard">
-				<?php wp_nonce_field( 'mobo_core_apply_shipping_wizard', 'mobo_core_shipping_wizard_nonce' ); ?>
-
-				<style>
-					#mobo-shipping-wizard .mobo-wizard-step{display:none}
-					#mobo-shipping-wizard .mobo-wizard-step.is-active{display:block}
-					#mobo-shipping-wizard .mobo-wizard-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}
-					#mobo-shipping-wizard .mobo-wizard-option{display:block;border:1px solid #dcdcde;border-radius:10px;padding:14px;background:#fff;cursor:pointer}
-					#mobo-shipping-wizard .mobo-wizard-option:has(input:checked){border-color:#2271b1;box-shadow:0 0 0 1px #2271b1}
-					#mobo-shipping-wizard .mobo-wizard-option strong{display:block;margin-bottom:6px}
-					#mobo-shipping-wizard .mobo-wizard-option span{color:#50575e}
-					#mobo-shipping-wizard .mobo-wizard-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
-					#mobo-shipping-wizard .mobo-wizard-progress{display:flex;gap:8px;margin-bottom:14px}
-					#mobo-shipping-wizard .mobo-wizard-progress span{flex:1;height:6px;background:#dcdcde;border-radius:99px}
-					#mobo-shipping-wizard .mobo-wizard-progress span.is-active{background:#2271b1}
-					#mobo-shipping-wizard .mobo-wizard-summary{background:#f6f7f7;border:1px solid #dcdcde;border-radius:10px;padding:14px}
-					#mobo-shipping-wizard .mobo-wizard-subsection{margin-top:18px;padding-top:16px;border-top:1px solid #dcdcde}
-					#mobo-shipping-wizard .mobo-wizard-fields{display:grid;grid-template-columns:2fr 1fr;gap:12px;max-width:800px;margin-top:12px}
-					@media(max-width:782px){#mobo-shipping-wizard .mobo-wizard-fields{grid-template-columns:1fr}}
-				</style>
-
-				<div class="mobo-wizard-progress" aria-hidden="true"><span></span><span></span><span></span></div>
-
-				<section class="mobo-wizard-step" data-step="1">
-					<h3>۱. محل آماده‌سازی سفارش فروشگاه</h3>
-					<p>آدرس پایه WooCommerce بررسی شده و پیشنهاد فعلی: <strong><?php echo ! empty( $defaults['inferredTehran'] ) ? 'تهران' : 'خارج از تهران'; ?></strong>.</p>
-					<div class="mobo-wizard-options">
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_store_location" value="tehran" <?php checked( $location, 'tehran' ); ?>> <strong>فروشگاه یا انبار در تهران است</strong><span>امکان دریافت حضوری کالاهای موبو و تجمیع در یک بسته وجود دارد.</span></label>
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_store_location" value="outside_tehran" <?php checked( $location, 'outside_tehran' ); ?>> <strong>فروشگاه خارج از تهران است</strong><span>پیشنهاد امن: ارسال مستقیم اقلام موبو و ارسال جداگانه اقلام فروشگاه.</span></label>
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_store_location" value="multi_location" <?php checked( $location, 'multi_location' ); ?>> <strong>چند انبار یا محل ارسال دارم</strong><span>پیشنهاد امن تا تنظیم اختصاصی هر انبار: دو بسته مستقل.</span></label>
-					</div>
-					<div class="mobo-wizard-actions"><button type="button" class="button button-primary" data-wizard-next>مرحله بعد</button></div>
-				</section>
-
-				<section class="mobo-wizard-step" data-step="2">
-					<h3>۲. سفارش ترکیبی چگونه تحویل شود؟</h3>
-					<div class="mobo-wizard-options">
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_profile" value="tehran_consolidated" <?php checked( $profile, 'tehran_consolidated' ); ?>> <strong>تجمیع در فروشگاه تهران</strong><span>مشتری یک روش ارسال فروشگاه را انتخاب می‌کند؛ کالاهای موبو داخلی با تحویل حضوری دریافت می‌شوند.</span></label>
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_profile" value="split_shipments" <?php checked( $profile, 'split_shipments' ); ?>> <strong>ارسال در دو بسته مستقل</strong><span>Checkout یک بسته موبو و یک بسته فروشگاه می‌سازد و هزینه هر کدام جدا محاسبه می‌شود.</span></label>
-						<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_profile" value="block_mixed" <?php checked( $profile, 'block_mixed' ); ?>> <strong>جلوگیری از سفارش ترکیبی</strong><span>مشتری باید محصولات موبو و سایر محصولات را در دو سفارش جدا ثبت کند.</span></label>
-					</div>
-
-					<div data-wizard-consolidated-options>
-						<label for="mobo_shipping_fulfillment_id"><strong>روش داخلی دریافت کالاهای موبو</strong></label>
-						<select id="mobo_shipping_fulfillment_id" name="mobo_shipping_fulfillment_id" style="width:100%;max-width:680px;margin-top:6px;">
-							<option value="0">انتخاب خودکار «تحویل حضوری»</option>
-							<?php foreach ( is_array( $methods ) ? $methods : array() as $method ) : ?>
-								<?php $method_id = absint( isset( $method['id'] ) ? $method['id'] : 0 ); $method_title = isset( $method['title'] ) ? (string) $method['title'] : ''; if ( $method_id <= 0 || false === strpos( $method_title, 'تحویل حضوری' ) ) { continue; } ?>
-								<option value="<?php echo esc_attr( $method_id ); ?>" <?php selected( $fulfillment_id, $method_id ); ?>><?php echo esc_html( $method_title . ' — #' . $method_id ); ?></option>
-							<?php endforeach; ?>
-						</select>
-						<p class="description">برای پروفایل تهران، روش «تحویل حضوری در دفتر مجموعه» انتخاب شود. این روش به مشتری نشان داده نمی‌شود و فقط برای ثبت بخش موبویی سفارش استفاده می‌شود.</p>
-					</div>
-
-					<div data-wizard-block-options>
-						<label for="mobo_shipping_block_message"><strong>پیام جلوگیری از سفارش ترکیبی</strong></label>
-						<textarea id="mobo_shipping_block_message" name="mobo_shipping_block_message" rows="3" style="width:100%;max-width:800px;margin-top:6px;"><?php echo esc_textarea( $block_message ); ?></textarea>
-					</div>
-
-					<div class="mobo-wizard-subsection">
-						<h3>۳. ارسال محصولات غیرموبویی فروشگاه</h3>
-						<?php if ( $store_shipping_ready ) : ?>
-							<div class="notice notice-success inline"><p><?php echo esc_html( $store_method_count . ' روش ارسال واقعی فروشگاه پیدا شد.' . ( $store_requires_mirror ? ' هنگام ترمیم، این روش به Zone موبو متصل و Flat Rate پشتیبان غیرفعال می‌شود.' : '' ) ); ?></p>
-								<?php if ( ! empty( $store_detected_methods ) ) : ?>
-									<ul style="list-style:disc;margin:6px 22px 10px;"><?php foreach ( $store_detected_methods as $detected_method ) : ?><li><?php echo esc_html( $detected_method ); ?></li><?php endforeach; ?></ul>
-								<?php endif; ?>
-							</div>
-						<?php else : ?>
-							<div class="notice notice-warning inline"><p><?php echo esc_html( 'برای محصولات غیرموبویی روش ارسال کامل وجود ندارد' . ( ! empty( $store_missing_zones ) ? '؛ Zoneهای بدون روش: ' . implode( '، ', $store_missing_zones ) : '' ) . '. برای جلوگیری از خطای «هیچ روش حمل‌ونقلی وجود ندارد»، Flat Rate پشتیبان بسازید.' ); ?></p></div>
-						<?php endif; ?>
-						<div class="mobo-wizard-options">
-							<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_store_rate_mode" value="existing_methods" <?php checked( $store_rate_mode, 'existing_methods' ); ?> <?php disabled( ! $store_shipping_ready ); ?>> <strong>استفاده از روش‌های فعلی فروشگاه</strong><span>روش واقعی WooCommerce را استفاده می‌کند. Flat Rate پشتیبان قبلی غیرفعال می‌شود و در صورت نیاز روش فعلی به Zone موبو متصل می‌شود.</span></label>
-							<label class="mobo-wizard-option"><input type="radio" name="mobo_shipping_store_rate_mode" value="ensure_flat_rate" <?php checked( $store_rate_mode, 'ensure_flat_rate' ); ?>> <strong>ساخت Flat Rate پشتیبان</strong><span>در هر Zone ایران یک روش ثابت مدیریت‌شده می‌سازد یا ترمیم می‌کند. روش‌های دستی فعلی حذف نمی‌شوند.</span></label>
-						</div>
-						<div data-wizard-store-flat-rate-options>
-							<div class="mobo-wizard-fields">
-								<p><label for="mobo_shipping_store_rate_title"><strong>عنوان روش فروشگاه</strong></label><input id="mobo_shipping_store_rate_title" name="mobo_shipping_store_rate_title" type="text" class="regular-text" style="width:100%" value="<?php echo esc_attr( $store_rate_title ); ?>"></p>
-								<p><label for="mobo_shipping_store_rate_cost"><strong>هزینه ثابت <?php echo $currency_symbol ? '(' . esc_html( $currency_symbol ) . ')' : ''; ?></strong></label><input id="mobo_shipping_store_rate_cost" name="mobo_shipping_store_rate_cost" type="number" min="0" step="0.01" style="width:100%" value="<?php echo esc_attr( $store_rate_cost ); ?>"></p>
-							</div>
-							<p class="description">عدد صفر یعنی ارسال رایگان محصولات غیرموبویی. مبلغ را با واحد پول WooCommerce وارد کنید.</p>
-						</div>
-					</div>
-
-					<div class="mobo-wizard-actions"><button type="button" class="button" data-wizard-back>قبلی</button><button type="button" class="button button-primary" data-wizard-next>مرور نهایی</button></div>
-				</section>
-
-				<section class="mobo-wizard-step" data-step="3">
-					<h3>۴. مرور و اعمال</h3>
-					<div class="mobo-wizard-summary">
-						<p><strong>محل فروشگاه:</strong> <span data-summary-location>—</span></p>
-						<p><strong>رفتار سفارش ترکیبی:</strong> <span data-summary-profile>—</span></p>
-						<p><strong>ارسال محصولات غیرموبویی:</strong> <span data-summary-store-rate>—</span></p>
-						<p data-summary-detail>—</p>
-					</div>
-					<div class="mobo-note" style="margin-top:12px;">با اعمال تنظیمات، روش‌های ارسال موبو از Portal تازه می‌شوند، کلاس محصولات موبو و Instanceهای WooCommerce ساخته یا ترمیم می‌شوند و رفتار سبد ترکیبی فعال می‌شود. روش‌های نامرتبط فروشگاه حذف نمی‌شوند.</div>
-					<div class="mobo-wizard-actions"><button type="button" class="button" data-wizard-back>قبلی</button><button type="submit" class="button button-primary">اعمال و ترمیم کامل حمل‌ونقل</button></div>
-				</section>
-			</form>
-		</div>
-		<script>
-		(function(){
-			var form=document.querySelector('[data-mobo-shipping-wizard-form]'); if(!form){return;}
-			var step=1, steps=form.querySelectorAll('.mobo-wizard-step'), bars=form.querySelectorAll('.mobo-wizard-progress span');
-			function checked(name){var el=form.querySelector('input[name="'+name+'"]:checked'); return el?el.value:'';}
-			function labelOf(name){var el=form.querySelector('input[name="'+name+'"]:checked'); if(!el){return '—';} var strong=el.closest('label').querySelector('strong'); return strong?strong.textContent:'—';}
-			function refreshConditional(){var profile=checked('mobo_shipping_profile'); var storeMode=checked('mobo_shipping_store_rate_mode'); var a=form.querySelector('[data-wizard-consolidated-options]'); var b=form.querySelector('[data-wizard-block-options]'); var c=form.querySelector('[data-wizard-store-flat-rate-options]'); if(a){a.style.display=profile==='tehran_consolidated'?'block':'none';} if(b){b.style.display=profile==='block_mixed'?'block':'none';} if(c){c.style.display=storeMode==='ensure_flat_rate'?'block':'none';}}
-			function show(n){step=Math.max(1,Math.min(3,n)); steps.forEach(function(el){el.classList.toggle('is-active',parseInt(el.getAttribute('data-step'),10)===step);}); bars.forEach(function(el,i){el.classList.toggle('is-active',i<step);}); refreshConditional(); if(step===3){var loc=form.querySelector('[data-summary-location]'); var pro=form.querySelector('[data-summary-profile]'); var store=form.querySelector('[data-summary-store-rate]'); var det=form.querySelector('[data-summary-detail]'); if(loc){loc.textContent=labelOf('mobo_shipping_store_location');} if(pro){pro.textContent=labelOf('mobo_shipping_profile');} if(store){var sm=checked('mobo_shipping_store_rate_mode'); var title=form.querySelector('#mobo_shipping_store_rate_title'); var cost=form.querySelector('#mobo_shipping_store_rate_cost'); store.textContent=sm==='ensure_flat_rate'?'Flat Rate پشتیبان: '+(title?title.value:'')+' — هزینه '+(cost?cost.value:'0'):'روش‌های فعلی WooCommerce';} if(det){var p=checked('mobo_shipping_profile'); det.textContent=p==='tehran_consolidated'?'مشتری یک ارسال فروشگاه می‌بیند و بخش موبویی با روش داخلی تحویل حضوری ثبت می‌شود.':(p==='split_shipments'?'Checkout دو بسته و دو محاسبه مستقل ارسال ایجاد می‌کند؛ هر دو بسته اکنون روش ارسال معتبر خواهند داشت.':'سبد ترکیبی در سبد و Checkout مسدود می‌شود.');}}}
-			form.querySelectorAll('[data-wizard-next]').forEach(function(btn){btn.addEventListener('click',function(){show(step+1);});});
-			form.querySelectorAll('[data-wizard-back]').forEach(function(btn){btn.addEventListener('click',function(){show(step-1);});});
-			form.querySelectorAll('input[name="mobo_shipping_profile"],input[name="mobo_shipping_store_rate_mode"]').forEach(function(el){el.addEventListener('change',refreshConditional);});
-			show(1);
-		})();
-		</script>
-		<?php
+		unset( $methods, $status );
+		// Deprecated since 10.33.0. Shipping configuration belongs to WooCommerce.
 	}
 
 	/**
@@ -2040,7 +1839,7 @@ class Mobo_Core_Admin {
 						<span data-mobo-ui-group="mobo-login"><?php $this->admin_tool_button( 'mobo_core_tool_test_mobo_login', 'تست اتصال به موبو' ); ?></span>
 						<?php $this->admin_tool_button( 'mobo_core_tool_sync_address_mapping', 'بروزرسانی آدرس موبو و ساخت فایل شهرهای Checkout' ); ?>
 						<?php $this->admin_tool_button( 'mobo_core_tool_sync_remote_shipping_methods', 'بروزرسانی روش‌های ارسال از MoboCore' ); ?>
-						<?php $this->admin_tool_button( 'mobo_core_tool_install_automatic_shipping', 'ساخت و ترمیم خودکار حمل‌ونقل موبو', 'button button-primary', 'پیکربندی خودکار حمل‌ونقل موبو اجرا شود؟' ); ?>
+						<?php $this->admin_tool_button( 'mobo_core_tool_install_automatic_shipping', 'بروزرسانی و ترمیم نگاشت ارسال', 'button button-primary', 'روش‌های ارسال قدیمی ساخته‌شده توسط موبو غیرفعال و لیست روش‌های موبو بروزرسانی شود؟' ); ?>
 						<span data-mobo-ui-group="mobo-cart-debug"><?php $this->admin_tool_button( 'mobo_core_tool_clear_mobo_debug_log', 'پاک کردن گزارش سبد موبو', 'button button-secondary', 'گزارش‌های بررسی سبد موبو پاک شود؟' ); ?></span>
 						<?php $this->admin_tool_button( 'mobo_core_tool_clear_shipping_diagnostics', 'پاک کردن گزارش ارسال', 'button button-secondary', 'گزارش مشکل ارسال پاک شود؟' ); ?>
 					</div>
@@ -3992,86 +3791,51 @@ type:{mobo_order_type_label}</textarea>
 	private function render_mobo_shipping_rules( $methods ) {
 		$manager = class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ? new Mobo_Core_Remote_Shipping_Methods() : null;
 		$zones   = $this->get_woocommerce_shipping_zones_for_admin();
-
 		?>
-		<div class="mobo-note">
-			نمایش روش ارسال در checkout همچنان کاملا توسط WooCommerce انجام می‌شود. این بخش فقط مشخص می‌کند وقتی سفارش به صورت خودکار در موبو ساخته می‌شود، روش ارسال انتخاب‌شده در سفارش WooCommerce به کدام روش ارسال موبو تبدیل شود.
-		</div>
-
+		<div class="mobo-note">Checkout کاملاً در اختیار WooCommerce است. این نگاشت فقط هنگام ثبت سفارش در موبو خوانده می‌شود و هیچ Rate یا روش ارسالی به مشتری اضافه نمی‌کند.</div>
 		<?php if ( empty( $methods ) ) : ?>
-			<div class="mobo-alert mobo-alert-warning">هنوز روش ارسال موبو در cache پلاگین وجود ندارد. ابتدا از دکمه «بروزرسانی روش‌های ارسال از MoboCore» استفاده کنید.</div>
+			<div class="mobo-alert mobo-alert-warning">هنوز روش ارسال موبو در cache پلاگین وجود ندارد. ابتدا «بروزرسانی روش‌های ارسال از MoboCore» را اجرا کنید.</div>
 		<?php endif; ?>
-
 		<?php if ( empty( $zones ) ) : ?>
-			<div class="mobo-alert mobo-alert-warning"><strong>الزامی:</strong> هیچ روش حمل و نقل فعالی در Shipping Zone های WooCommerce پیدا نشد. اول از مسیر WooCommerce > Settings > Shipping حداقل یک منطقه و روش حمل و نقل فعال تعریف کنید.</div>
+			<div class="mobo-alert mobo-alert-warning"><strong>الزامی:</strong> هیچ روش حمل‌ونقل فعالی در Shipping Zoneهای WooCommerce پیدا نشد. ابتدا روش‌های واقعی فروشگاه را در WooCommerce تعریف کنید.</div>
 			<?php return; ?>
 		<?php endif; ?>
-
-		<?php $scenarios = $manager && method_exists( $manager, 'get_scenarios' ) ? $manager->get_scenarios() : array( 'mobo_only' => 'سفارش فقط محصولات موبو', 'mixed' => 'سفارش ترکیبی موبو و غیرموبو' ); ?>
-		<?php foreach ( $scenarios as $scenario_key => $scenario_label ) : ?>
-			<div class="mobo-card mobo-card-wide mobo-shipping-scenario-card">
-				<h3><?php echo esc_html( $scenario_label ); ?></h3>
-				<p class="mobo-help">
-					<?php if ( 'mixed' === $scenario_key ) : ?>
-						این نگاشت فقط وقتی استفاده می‌شود که سفارش هم محصول موبو و هم محصول غیرموبو داشته باشد. فقط آیتم‌های موبویی به موبو ارسال می‌شوند، اما shipping_id موبو از همین جدول انتخاب می‌شود.
-					<?php else : ?>
-						این نگاشت فقط برای سفارش‌هایی استفاده می‌شود که همه آیتم‌های سفارش محصول موبو باشند.
-					<?php endif; ?>
-				</p>
-
-				<?php foreach ( $zones as $zone ) : ?>
-					<?php $zone_id = absint( isset( $zone['id'] ) ? $zone['id'] : 0 ); ?>
-					<details class="mobo-shipping-accordion" data-mobo-shipping-scenario="<?php echo esc_attr( $scenario_key ); ?>" data-mobo-shipping-zone="<?php echo esc_attr( $zone_id ); ?>" open>
-						<summary class="mobo-shipping-accordion-summary">
-							<span>
-								<strong><?php echo esc_html( isset( $zone['name'] ) ? $zone['name'] : ( 'Shipping Zone #' . $zone_id ) ); ?></strong>
-								<small>تعداد روش‌های حمل و نقل فعال: <?php echo esc_html( isset( $zone['methods'] ) && is_array( $zone['methods'] ) ? count( $zone['methods'] ) : 0 ); ?></small>
-							</span>
-						</summary>
-						<div class="mobo-shipping-accordion-body">
-							<div class="mobo-shipping-zone-locations">
-								<strong>ناحیه‌های انتخاب شده در این منطقه:</strong>
-								<?php $locations = isset( $zone['locations'] ) && is_array( $zone['locations'] ) ? $zone['locations'] : array(); ?>
-								<?php if ( empty( $locations ) ) : ?>
-									<span class="mobo-shipping-location-badge">سایر ناحیه‌هایی که در منطقه‌های دیگر نیستند</span>
-								<?php else : ?>
-									<?php foreach ( $locations as $location_label ) : ?>
-										<span class="mobo-shipping-location-badge"><?php echo esc_html( $location_label ); ?></span>
-									<?php endforeach; ?>
-								<?php endif; ?>
+		<div class="mobo-card mobo-card-wide mobo-shipping-scenario-card">
+			<h3>نگاشت روش‌های ارسال فروشگاه به موبو</h3>
+			<p class="mobo-help">این نگاشت برای هر سفارشی که حداقل یک محصول موبو داشته باشد استفاده می‌شود؛ تفاوتی بین سفارش فقط موبو و سفارش ترکیبی وجود ندارد.</p>
+			<?php foreach ( $zones as $zone ) : ?>
+				<?php $zone_id = absint( isset( $zone['id'] ) ? $zone['id'] : 0 ); ?>
+				<details class="mobo-shipping-accordion" data-mobo-shipping-zone="<?php echo esc_attr( $zone_id ); ?>" open>
+					<summary class="mobo-shipping-accordion-summary"><span><strong><?php echo esc_html( isset( $zone['name'] ) ? $zone['name'] : ( 'Shipping Zone #' . $zone_id ) ); ?></strong><small>روش‌های فعال: <?php echo esc_html( isset( $zone['methods'] ) && is_array( $zone['methods'] ) ? count( $zone['methods'] ) : 0 ); ?></small></span></summary>
+					<div class="mobo-shipping-accordion-body">
+						<div class="mobo-shipping-method-map-list">
+						<?php foreach ( $zone['methods'] as $method ) : ?>
+							<?php
+							$method_id   = isset( $method['methodId'] ) ? sanitize_key( $method['methodId'] ) : '';
+							$instance_id = absint( isset( $method['instanceId'] ) ? $method['instanceId'] : 0 );
+							if ( '' === $method_id ) { continue; }
+							$ids_key = $manager && method_exists( $manager, 'build_legacy_wc_method_rule_option_key' ) ? $manager->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id ) : ( 'mobo_core_wc_shipping_method_map_zone_' . $zone_id . '_' . $method_id . '_' . $instance_id );
+							if ( empty( $this->get_shipping_selected_ids_for_admin( $ids_key ) ) && $manager && method_exists( $manager, 'build_wc_method_rule_option_key' ) ) {
+								$legacy_values = array();
+								foreach ( array( 'mobo_only', 'mixed' ) as $legacy_scenario ) {
+									$legacy_key = $manager->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $legacy_scenario );
+									$legacy_ids = $this->get_shipping_selected_ids_for_admin( $legacy_key );
+									if ( ! empty( $legacy_ids ) ) { $legacy_values[] = absint( $legacy_ids[0] ); }
+								}
+								$legacy_values = array_values( array_unique( array_filter( $legacy_values ) ) );
+								if ( 1 === count( $legacy_values ) ) { update_option( $ids_key, (string) $legacy_values[0], false ); }
+							}
+							?>
+							<div class="mobo-card mobo-shipping-method-map-card">
+								<div class="mobo-shipping-wc-method-info"><strong><?php echo esc_html( isset( $method['title'] ) && '' !== trim( (string) $method['title'] ) ? $method['title'] : 'روش حمل‌ونقل ووکامرس' ); ?></strong><span>نوع: <?php echo esc_html( isset( $method['methodTitle'] ) && '' !== trim( (string) $method['methodTitle'] ) ? $method['methodTitle'] : $method_id ); ?> | Instance #<?php echo esc_html( $instance_id ); ?></span></div>
+								<?php $this->render_shipping_method_single_select( 'روش ارسال موبو', $ids_key, $methods, 'اگر مشتری این روش WooCommerce را انتخاب کند، هنگام ثبت بخش موبویی سفارش همین shipping_id به موبو ارسال می‌شود.', array( 'required' => 'required', 'data-mobo-wc-shipping-zone-id' => $zone_id, 'data-mobo-wc-shipping-method-id' => $method_id, 'data-mobo-wc-shipping-instance-id' => $instance_id ) ); ?>
 							</div>
-
-							<div class="mobo-shipping-method-map-list">
-								<?php foreach ( $zone['methods'] as $method ) : ?>
-									<?php
-									$method_id   = isset( $method['methodId'] ) ? sanitize_key( $method['methodId'] ) : '';
-									$instance_id = absint( isset( $method['instanceId'] ) ? $method['instanceId'] : 0 );
-									if ( '' === $method_id ) {
-										continue;
-									}
-									$ids_key = $manager && method_exists( $manager, 'build_wc_method_rule_option_key' ) ? $manager->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $scenario_key ) : ( 'mobo_core_wc_shipping_method_map_' . $scenario_key . '_zone_' . $zone_id . '_' . $method_id . '_' . $instance_id );
-									if ( 'mobo_only' === $scenario_key && $manager && method_exists( $manager, 'build_legacy_wc_method_rule_option_key' ) && empty( $this->get_shipping_selected_ids_for_admin( $ids_key ) ) ) {
-										$legacy_key = $manager->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id );
-										$legacy_ids = $this->get_shipping_selected_ids_for_admin( $legacy_key );
-										if ( ! empty( $legacy_ids ) ) {
-											update_option( $ids_key, (string) absint( $legacy_ids[0] ), false );
-										}
-									}
-									?>
-									<div class="mobo-card mobo-shipping-method-map-card">
-										<div class="mobo-shipping-wc-method-info">
-											<strong><?php echo esc_html( isset( $method['title'] ) && '' !== trim( (string) $method['title'] ) ? $method['title'] : 'روش حمل و نقل ووکامرس' ); ?></strong>
-											<span>نوع روش: <?php echo esc_html( isset( $method['methodTitle'] ) && '' !== trim( (string) $method['methodTitle'] ) ? $method['methodTitle'] : 'روش ارسال' ); ?></span>
-										</div>
-										<?php $this->render_shipping_method_single_select( 'روش ارسال موبو برای ' . $scenario_label, $ids_key, $methods, 'وقتی این نوع سفارش با این روش حمل و نقل ووکامرس ثبت شود، همین روش ارسال در سفارش موبو استفاده می‌شود.', array( 'required' => 'required', 'data-mobo-wc-shipping-scenario' => $scenario_key, 'data-mobo-wc-shipping-zone-id' => $zone_id, 'data-mobo-wc-shipping-method-id' => $method_id, 'data-mobo-wc-shipping-instance-id' => $instance_id ) ); ?>
-									</div>
-								<?php endforeach; ?>
-							</div>
+						<?php endforeach; ?>
 						</div>
-					</details>
-				<?php endforeach; ?>
-			</div>
-		<?php endforeach; ?>
+					</div>
+				</details>
+			<?php endforeach; ?>
+		</div>
 		<?php
 	}
 
@@ -4352,35 +4116,25 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$missing = array();
-		$scenarios = method_exists( $manager, 'get_scenarios' ) ? $manager->get_scenarios() : array( 'mobo_only' => 'سفارش فقط محصولات موبو', 'mixed' => 'سفارش ترکیبی موبو و غیرموبو' );
-		foreach ( $scenarios as $scenario_key => $scenario_label ) {
-			foreach ( $zones as $zone ) {
-				$zone_id   = absint( isset( $zone['id'] ) ? $zone['id'] : 0 );
-				$zone_name = isset( $zone['name'] ) ? (string) $zone['name'] : ( 'Shipping Zone #' . $zone_id );
-				$methods   = isset( $zone['methods'] ) && is_array( $zone['methods'] ) ? $zone['methods'] : array();
-
-				foreach ( $methods as $method ) {
-					$method_id   = isset( $method['methodId'] ) ? sanitize_key( $method['methodId'] ) : '';
-					$instance_id = absint( isset( $method['instanceId'] ) ? $method['instanceId'] : 0 );
-					if ( '' === $method_id ) {
-						continue;
-					}
-
-					$key = method_exists( $manager, 'build_wc_method_rule_option_key' ) ? $manager->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $scenario_key ) : ( 'mobo_core_wc_shipping_method_map_' . $scenario_key . '_zone_' . $zone_id . '_' . $method_id . '_' . $instance_id );
-					if ( empty( $this->get_shipping_selected_ids_for_admin( $key ) ) ) {
-						$method_title = isset( $method['title'] ) && '' !== trim( (string) $method['title'] ) ? (string) $method['title'] : ( isset( $method['methodTitle'] ) && '' !== trim( (string) $method['methodTitle'] ) ? (string) $method['methodTitle'] : 'روش حمل و نقل ووکامرس' );
-						$missing[] = $scenario_label . ' / ' . $zone_name . ' / ' . $method_title;
-					}
+		foreach ( $zones as $zone ) {
+			$zone_id   = absint( isset( $zone['id'] ) ? $zone['id'] : 0 );
+			$zone_name = isset( $zone['name'] ) ? (string) $zone['name'] : ( 'Shipping Zone #' . $zone_id );
+			$methods   = isset( $zone['methods'] ) && is_array( $zone['methods'] ) ? $zone['methods'] : array();
+			foreach ( $methods as $method ) {
+				$method_id   = isset( $method['methodId'] ) ? sanitize_key( $method['methodId'] ) : '';
+				$instance_id = absint( isset( $method['instanceId'] ) ? $method['instanceId'] : 0 );
+				if ( '' === $method_id ) { continue; }
+				$key = method_exists( $manager, 'build_legacy_wc_method_rule_option_key' ) ? $manager->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id ) : ( 'mobo_core_wc_shipping_method_map_zone_' . $zone_id . '_' . $method_id . '_' . $instance_id );
+				if ( empty( $this->get_shipping_selected_ids_for_admin( $key ) ) ) {
+					$method_title = isset( $method['title'] ) && '' !== trim( (string) $method['title'] ) ? (string) $method['title'] : ( isset( $method['methodTitle'] ) ? (string) $method['methodTitle'] : $method_id );
+					$missing[] = $zone_name . ' / ' . $method_title;
 				}
 			}
 		}
-
 		if ( ! empty( $missing ) ) {
 			$preview = implode( '، ', array_slice( $missing, 0, 4 ) );
-			if ( count( $missing ) > 4 ) {
-				$preview .= ' و ' . ( count( $missing ) - 4 ) . ' مورد دیگر';
-			}
-			return new WP_Error( 'mobo_required_shipping_method_mapping_missing', 'برای ثبت سفارش خودکار در موبو، نگاشت همه روش‌های حمل و نقل فعال WooCommerce به روش ارسال موبو اجباری است. موارد ناقص: ' . $preview );
+			if ( count( $missing ) > 4 ) { $preview .= ' و ' . ( count( $missing ) - 4 ) . ' مورد دیگر'; }
+			return new WP_Error( 'mobo_required_shipping_method_mapping_missing', 'برای ثبت سفارش خودکار در موبو، هر روش حمل‌ونقل فعال WooCommerce باید به یک روش ارسال موبو نگاشت شود. موارد ناقص: ' . $preview );
 		}
 
 		return true;
@@ -6420,9 +6174,6 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_mobo_order_auto_complete_enabled',
 						'mobo_core_checkout_external_validation_enabled',
 						'mobo_core_address_mapping_show_all_countries',
-						'mobo_core_automatic_shipping_enabled',
-						'mobo_core_mobo_shipping_package_enabled',
-						'mobo_core_mobo_shipping_use_api_price',
 					)
 				);
 				$this->save_int_options_from_post(
@@ -6433,7 +6184,6 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_checkout_external_timeout_seconds' => array( 1, 10 ),
 						'mobo_core_address_mapping_sync_interval_days' => array( 1, 30 ),
 						'mobo_core_remote_shipping_sync_interval_hours' => array( 1, 168 ),
-						'mobo_core_mobo_shipping_class_id' => array( 0, PHP_INT_MAX ),
 					)
 				);
 				$old_mobo_username = (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_username', '' );
@@ -6494,34 +6244,7 @@ type:{mobo_order_type_label}</textarea>
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
-		check_admin_referer( 'mobo_core_apply_shipping_wizard', 'mobo_core_shipping_wizard_nonce' );
-
-		if ( ! class_exists( 'Mobo_Core_Shipping_Wizard' ) ) {
-			$this->redirect_with_message( 'کلاس ویزارد حمل‌ونقل در دسترس نیست.', 'error', 'checkout' );
-		}
-
-		$input = array(
-			'storeLocation' => isset( $_POST['mobo_shipping_store_location'] ) ? sanitize_key( wp_unslash( $_POST['mobo_shipping_store_location'] ) ) : '',
-			'profile'       => isset( $_POST['mobo_shipping_profile'] ) ? sanitize_key( wp_unslash( $_POST['mobo_shipping_profile'] ) ) : '',
-			'fulfillmentId' => isset( $_POST['mobo_shipping_fulfillment_id'] ) ? absint( wp_unslash( $_POST['mobo_shipping_fulfillment_id'] ) ) : 0,
-			'blockMessage'   => isset( $_POST['mobo_shipping_block_message'] ) ? sanitize_textarea_field( wp_unslash( $_POST['mobo_shipping_block_message'] ) ) : '',
-			'storeRateMode'  => isset( $_POST['mobo_shipping_store_rate_mode'] ) ? sanitize_key( wp_unslash( $_POST['mobo_shipping_store_rate_mode'] ) ) : '',
-			'storeRateTitle' => isset( $_POST['mobo_shipping_store_rate_title'] ) ? sanitize_text_field( wp_unslash( $_POST['mobo_shipping_store_rate_title'] ) ) : '',
-			'storeRateCost'  => isset( $_POST['mobo_shipping_store_rate_cost'] ) ? sanitize_text_field( wp_unslash( $_POST['mobo_shipping_store_rate_cost'] ) ) : '0',
-		);
-
-		$wizard = new Mobo_Core_Shipping_Wizard();
-		$result = $wizard->apply( $input, 'admin-wizard' );
-		if ( empty( $result['success'] ) ) {
-			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال ویزارد حمل‌ونقل ناموفق بود.';
-			$this->redirect_with_message( 'ویزارد حمل‌ونقل ناموفق بود: ' . $message, 'error', 'checkout' );
-		}
-
-		$message = isset( $result['message'] ) ? $result['message'] : 'ویزارد حمل‌ونقل اعمال شد.';
-		if ( ! empty( $result['warnings'] ) && is_array( $result['warnings'] ) ) {
-			$message .= ' هشدار: ' . implode( ' | ', array_slice( $result['warnings'], 0, 3 ) );
-		}
-		$this->redirect_with_message( $message, 'success', 'checkout' );
+		$this->redirect_with_message( 'ویزارد حمل‌ونقل از نسخه 10.33.0 حذف شده است. روش‌های ارسال را در WooCommerce مدیریت و فقط نگاشت روش ارسال به موبو را در همین تب تنظیم کنید.', 'warning', 'checkout' );
 	}
 
 	/**
@@ -6593,24 +6316,22 @@ type:{mobo_order_type_label}</textarea>
 				break;
 
 			case 'mobo_core_tool_install_automatic_shipping':
-				if ( class_exists( 'Mobo_Core_Shipping_Wizard' ) && ! ( new Mobo_Core_Shipping_Wizard() )->is_completed() ) {
-					$this->redirect_with_message( 'ابتدا ویزارد حمل‌ونقل را تکمیل کنید تا مدل سفارش ترکیبی مشخص شود.', 'warning', 'checkout' );
+				if ( ! class_exists( 'Mobo_Core_Automatic_Shipping' ) || ! class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
+					$this->redirect_with_message( 'ماژول نگاشت روش‌های ارسال در دسترس نیست.', 'error', 'checkout' );
 				}
-				if ( ! class_exists( 'Mobo_Core_Automatic_Shipping' ) ) {
-					$this->redirect_with_message( 'کلاس راه‌اندازی خودکار حمل‌ونقل در دسترس نیست.', 'error', 'checkout' );
+				$cleanup = ( new Mobo_Core_Automatic_Shipping() )->retire_legacy_runtime( 'admin-mapping-repair' );
+				$sync = ( new Mobo_Core_Remote_Shipping_Methods() )->sync_now( 'admin-mapping-repair', true );
+				if ( empty( $sync['success'] ) ) {
+					$message = isset( $sync['message'] ) ? $sync['message'] : 'بروزرسانی روش‌های ارسال موبو ناموفق بود.';
+					$this->redirect_with_message( 'ترمیم نگاشت ناموفق بود: ' . $message, 'error', 'checkout' );
 				}
-
-				$automatic_shipping = new Mobo_Core_Automatic_Shipping();
-				$result = $automatic_shipping->install_or_repair( 'admin-one-click' );
-				if ( empty( $result['success'] ) ) {
-					$message = isset( $result['message'] ) ? $result['message'] : 'راه‌اندازی خودکار حمل‌ونقل ناموفق بود.';
-					$this->redirect_with_message( 'راه‌اندازی خودکار حمل‌ونقل ناموفق بود: ' . $message, 'error', 'checkout' );
-				}
-
-				$message = isset( $result['message'] ) ? $result['message'] : 'پیکربندی حمل‌ونقل موبو ساخته و ترمیم شد.';
-				if ( ! empty( $result['warnings'] ) && is_array( $result['warnings'] ) ) {
-					$message .= ' هشدار: ' . implode( ' | ', array_slice( $result['warnings'], 0, 3 ) );
-				}
+				$message = sprintf(
+					'نگاشت آماده شد و روش‌های موبو بروزرسانی شدند. پاکسازی نسخه‌های قدیمی: %1$d روش موبو، %2$d Flat Rate پشتیبان، %3$d کپی روش فروشگاه غیرفعال و %4$d Zone خالی قدیمی موبو حذف شد.',
+					absint( isset( $cleanup['disabledMoboMethods'] ) ? $cleanup['disabledMoboMethods'] : 0 ),
+					absint( isset( $cleanup['disabledFallbackMethods'] ) ? $cleanup['disabledFallbackMethods'] : 0 ),
+					absint( isset( $cleanup['disabledMirrorMethods'] ) ? $cleanup['disabledMirrorMethods'] : 0 ),
+					absint( isset( $cleanup['deletedLegacyZones'] ) ? $cleanup['deletedLegacyZones'] : 0 )
+				);
 				$this->redirect_with_message( $message, 'success', 'checkout' );
 				break;
 
@@ -6791,7 +6512,7 @@ type:{mobo_order_type_label}</textarea>
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'cron' );
 		}
 
-		if ( 'checkout' === $tab && ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) || Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ) ) ) {
+		if ( 'checkout' === $tab && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
 			if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
 				$address_mapping = new Mobo_Core_Address_Mapping();
 				$address_status  = method_exists( $address_mapping, 'get_status' ) ? $address_mapping->get_status() : array();

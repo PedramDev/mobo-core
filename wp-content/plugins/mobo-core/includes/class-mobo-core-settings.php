@@ -188,7 +188,7 @@ class Mobo_Core_Settings {
 			'mobo_core_remote_shipping_sync_interval_hours'   => 1,
 			'mobo_core_mobo_shipping_package_enabled'       => '0',
 			'mobo_core_mobo_shipping_class_id'                => 0,
-			'mobo_core_mobo_shipping_use_api_price'           => '1',
+			'mobo_core_mobo_shipping_use_api_price'           => '0',
 			'mobo_core_automatic_shipping_enabled'          => '0',
 			'mobo_core_shipping_wizard_completed'          => '0',
 			'mobo_core_shipping_fulfillment_profile'        => '',

@@ -46,8 +46,153 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return void
 	 */
 	public function init() {
-		add_filter( 'woocommerce_shipping_methods', array( $this, 'register_shipping_method' ), 20, 1 );
-		add_action( 'woocommerce_checkout_create_order_shipping_item', array( $this, 'capture_order_shipping_id' ), 20, 4 );
+		// Mapping-only policy: Mobo never registers or injects a checkout shipping method.
+	}
+
+	/**
+	 * Disable shipping configuration created by legacy automatic-shipping builds.
+	 *
+	 * This does not touch merchant-owned WooCommerce methods. Only instances that
+	 * are recorded in Mobo Core's managed option maps are disabled. The cleanup is
+	 * idempotent and is also used by the admin repair action.
+	 *
+	 * @param string $source Cleanup source.
+	 * @return array
+	 */
+	public function retire_legacy_runtime( $source = 'mapping-only' ) {
+		$policy_version = '1';
+		$already_applied = (string) get_option( 'mobo_core_shipping_mapping_only_policy_version', '' ) === $policy_version;
+		$result = array(
+			'success' => true,
+			'source' => sanitize_key( (string) $source ),
+			'alreadyApplied' => $already_applied,
+			'disabledMoboMethods' => 0,
+			'disabledFallbackMethods' => 0,
+			'disabledMirrorMethods' => 0,
+			'deletedLegacyZones' => 0,
+		);
+		$force = 'admin-mapping-repair' === sanitize_key( (string) $source );
+		if ( $already_applied && ! $force ) {
+			return $result;
+		}
+
+		$managed = get_option( self::OPTION_MANAGED_RATES, array() );
+		foreach ( is_array( $managed ) ? $managed : array() as $entry ) {
+			$instance_id = is_array( $entry ) ? absint( isset( $entry['instanceId'] ) ? $entry['instanceId'] : 0 ) : 0;
+			if ( $instance_id > 0 && $this->disable_legacy_instance( self::METHOD_ID, $instance_id ) ) {
+				$result['disabledMoboMethods']++;
+			}
+		}
+
+		$fallbacks = get_option( self::OPTION_STORE_FALLBACKS, array() );
+		foreach ( is_array( $fallbacks ) ? $fallbacks : array() as $instance_id ) {
+			$instance_id = absint( $instance_id );
+			if ( $instance_id > 0 && $this->disable_legacy_instance( 'flat_rate', $instance_id ) ) {
+				$result['disabledFallbackMethods']++;
+			}
+		}
+
+		$mirrors = get_option( self::OPTION_STORE_EXISTING_MIRRORS, array() );
+		foreach ( is_array( $mirrors ) ? $mirrors : array() as $zone_map ) {
+			foreach ( is_array( $zone_map ) ? $zone_map : array() as $source_key => $instance_id ) {
+				$parts = explode( ':', (string) $source_key );
+				$method_id = isset( $parts[1] ) ? sanitize_key( $parts[1] ) : '';
+				$instance_id = absint( $instance_id );
+				if ( '' !== $method_id && $instance_id > 0 && $this->disable_legacy_instance( $method_id, $instance_id ) ) {
+					$result['disabledMirrorMethods']++;
+				}
+			}
+		}
+
+		$result['deletedLegacyZones'] = $this->delete_empty_legacy_mobo_zones( $managed, $fallbacks, $mirrors );
+
+		update_option( self::OPTION_ENABLED, '0', false );
+		update_option( 'mobo_core_mobo_shipping_package_enabled', '0', false );
+		update_option( 'mobo_core_mobo_shipping_use_api_price', '0', false );
+		update_option( 'mobo_core_shipping_wizard_completed', '0', false );
+		update_option( 'mobo_core_shipping_mapping_only_policy_version', $policy_version, false );
+		update_option( 'mobo_core_shipping_mapping_only_last_cleanup', array_merge( $result, array( 'at' => time() ) ), false );
+		return $result;
+	}
+
+	/**
+	 * Delete only the legacy default Mobo zone when every method inside it was
+	 * created/managed by Mobo Core. If a merchant-owned method exists, the zone is
+	 * preserved exactly as-is.
+	 *
+	 * @param array $managed Mobo custom method map.
+	 * @param array $fallbacks Managed fallback map.
+	 * @param array $mirrors Managed mirror map.
+	 * @return int
+	 */
+	private function delete_empty_legacy_mobo_zones( $managed, $fallbacks, $mirrors ) {
+		if ( ! class_exists( 'WC_Shipping_Zone' ) ) {
+			return 0;
+		}
+		$owned = array();
+		foreach ( is_array( $managed ) ? $managed : array() as $entry ) {
+			$id = is_array( $entry ) ? absint( isset( $entry['instanceId'] ) ? $entry['instanceId'] : 0 ) : 0;
+			if ( $id > 0 ) { $owned[ $id ] = true; }
+		}
+		foreach ( is_array( $fallbacks ) ? $fallbacks : array() as $id ) {
+			$id = absint( $id );
+			if ( $id > 0 ) { $owned[ $id ] = true; }
+		}
+		foreach ( is_array( $mirrors ) ? $mirrors : array() as $zone_map ) {
+			foreach ( is_array( $zone_map ) ? $zone_map : array() as $id ) {
+				$id = absint( $id );
+				if ( $id > 0 ) { $owned[ $id ] = true; }
+			}
+		}
+
+		$deleted = 0;
+		foreach ( (array) get_option( self::OPTION_MANAGED_ZONES, array() ) as $zone_id ) {
+			$zone_id = absint( $zone_id );
+			if ( $zone_id <= 0 ) { continue; }
+			try {
+				$zone = new WC_Shipping_Zone( $zone_id );
+				$name = method_exists( $zone, 'get_zone_name' ) ? trim( (string) $zone->get_zone_name() ) : '';
+				if ( self::DEFAULT_ZONE_NAME !== $name ) { continue; }
+				$has_merchant_method = false;
+				foreach ( $zone->get_shipping_methods( false, 'admin' ) as $method ) {
+					$instance_id = is_object( $method ) && isset( $method->instance_id ) ? absint( $method->instance_id ) : 0;
+					if ( $instance_id > 0 && empty( $owned[ $instance_id ] ) ) {
+						$has_merchant_method = true;
+						break;
+					}
+				}
+				if ( ! $has_merchant_method && method_exists( $zone, 'delete' ) ) {
+					$zone->delete();
+					$deleted++;
+				}
+			} catch ( Throwable $error ) {
+				continue;
+			}
+		}
+		return $deleted;
+	}
+
+	/**
+	 * Disable one legacy Mobo-managed WooCommerce shipping instance.
+	 *
+	 * @param string $method_id Method ID.
+	 * @param int    $instance_id Instance ID.
+	 * @return bool True when the instance had been enabled before cleanup.
+	 */
+	private function disable_legacy_instance( $method_id, $instance_id ) {
+		$method_id = sanitize_key( (string) $method_id );
+		$instance_id = absint( $instance_id );
+		if ( '' === $method_id || $instance_id <= 0 ) {
+			return false;
+		}
+		$option_key = 'woocommerce_' . $method_id . '_' . $instance_id . '_settings';
+		$settings = get_option( $option_key, array() );
+		$settings = is_array( $settings ) ? $settings : array();
+		$was_enabled = 'yes' === ( isset( $settings['enabled'] ) ? (string) $settings['enabled'] : 'yes' );
+		$settings['enabled'] = 'no';
+		update_option( $option_key, $settings, false );
+		$this->set_zone_method_state( $instance_id, false, null );
+		return $was_enabled;
 	}
 
 	/**
@@ -107,6 +252,16 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return array
 	 */
 	public function install_or_repair( $source = 'manual', $store_rate_config = array() ) {
+		unset( $store_rate_config );
+		$cleanup = $this->retire_legacy_runtime( 'admin-mapping-repair' === sanitize_key( (string) $source ) ? 'admin-mapping-repair' : 'legacy-install-blocked' );
+		return array(
+			'success' => true,
+			'status' => 'mapping-only',
+			'message' => 'سیاست حمل‌ونقل Mobo Core روی حالت فقط نگاشت است؛ هیچ روش یا Zone موبویی در WooCommerce ساخته نمی‌شود.',
+			'cleanup' => $cleanup,
+		);
+
+		/* Legacy installer code below is intentionally unreachable and retained only for downgrade/reference compatibility. */
 		$result = array(
 			'success'           => false,
 			'source'            => sanitize_key( (string) $source ),

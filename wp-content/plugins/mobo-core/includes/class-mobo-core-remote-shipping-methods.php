@@ -29,9 +29,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @return void
 	 */
 	public function init() {
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ) ) {
-			add_filter( 'woocommerce_cart_shipping_packages', array( $this, 'filter_cart_shipping_packages' ), 20, 1 );
-		}
+		// Mapping-only policy: the remote catalog never changes WooCommerce checkout packages or rates.
 	}
 
 	/**
@@ -281,30 +279,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 		if ( empty( $available ) ) {
 			return new WP_Error( 'mobo_core_shipping_methods_not_available', 'موبو برای این سبد خرید هیچ روش ارسالی برنگرداند.' );
 		}
-
 		$available_by_id = array();
 		foreach ( $available as $method ) {
 			$available_by_id[ absint( $method['id'] ) ] = $method;
-		}
-
-		/*
-		 * In the Tehran consolidated profile the customer selects the store's
-		 * final-mile WooCommerce method, while the Mobo part is fulfilled through
-		 * the internal pickup method chosen in the wizard. It must not depend on a
-		 * per-WooCommerce-method mapping.
-		 */
-		if ( 'mixed' === $scenario && class_exists( 'Mobo_Core_Shipping_Wizard' ) ) {
-			$wizard = new Mobo_Core_Shipping_Wizard();
-			if ( $wizard->uses_internal_mixed_fulfillment() ) {
-				$internal_id = $wizard->get_mixed_fulfillment_shipping_id();
-				if ( $internal_id > 0 && isset( $available_by_id[ $internal_id ] ) ) {
-					return $internal_id;
-				}
-				return new WP_Error(
-					'mobo_core_internal_fulfillment_not_available',
-					'روش تحویل داخلی انتخاب‌شده در ویزارد، در فهرست فعلی روش‌های ارسال موبو موجود نیست: ' . $internal_id
-				);
-			}
 		}
 
 		$wc_method = $this->get_order_wc_shipping_method_context( $order );
@@ -312,29 +289,26 @@ class Mobo_Core_Remote_Shipping_Methods {
 			return $wc_method;
 		}
 
+		// Backward compatibility for orders already created by 10.32.x: if the
+		// only stored shipping line is the retired Mobo custom method, honor its
+		// captured shipping_id. New orders can never enter this branch because the
+		// custom method is no longer registered.
+		$legacy_mobo_id = absint( isset( $wc_method['moboShippingId'] ) ? $wc_method['moboShippingId'] : 0 );
+		if ( 'mobo_core_shipping' === $wc_method['methodId'] && $legacy_mobo_id > 0 && isset( $available_by_id[ $legacy_mobo_id ] ) ) {
+			return $legacy_mobo_id;
+		}
+
 		$zone_id = $this->determine_order_shipping_zone_id( $order );
-		$id      = absint( isset( $wc_method['moboShippingId'] ) ? $wc_method['moboShippingId'] : 0 );
-		$mapped  = array( 'shippingId' => $id, 'zoneId' => $zone_id );
-
-		if ( $id <= 0 && 'mobo_core_shipping' === $wc_method['methodId'] && class_exists( 'Mobo_Core_Automatic_Shipping' ) ) {
-			$automatic = new Mobo_Core_Automatic_Shipping();
-			$id = $automatic->get_shipping_id_for_instance( $wc_method['instanceId'] );
-			$mapped['shippingId'] = $id;
-		}
-
-		if ( $id <= 0 ) {
-			$mapped = $this->get_mapped_mobo_shipping_id_for_wc_method( $scenario, $zone_id, $wc_method['methodId'], $wc_method['instanceId'] );
-			$id     = absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 );
-		}
+		$mapped  = $this->get_mapped_mobo_shipping_id_for_wc_method( $zone_id, $wc_method['methodId'], $wc_method['instanceId'] );
+		$id      = absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 );
 		$zone_id = absint( isset( $mapped['zoneId'] ) ? $mapped['zoneId'] : $zone_id );
 
 		if ( $id <= 0 ) {
 			return new WP_Error(
 				'mobo_core_shipping_method_mapping_missing',
 				sprintf(
-					'برای روش ارسال ووکامرس «%s» در سناریوی «%s» و منطقه ارسال #%s هیچ روش ارسال موبویی نگاشت نشده است.',
+					'برای روش ارسال ووکامرس «%s» در منطقه ارسال #%s هیچ روش ارسال موبویی نگاشت نشده است.',
 					isset( $wc_method['title'] ) ? $wc_method['title'] : $wc_method['methodId'],
-					isset( $this->get_scenarios()[ $scenario ] ) ? $this->get_scenarios()[ $scenario ] : $scenario,
 					$zone_id
 				)
 			);
@@ -343,7 +317,6 @@ class Mobo_Core_Remote_Shipping_Methods {
 		if ( isset( $available_by_id[ $id ] ) ) {
 			return $id;
 		}
-
 		return new WP_Error(
 			'mobo_core_shipping_config_not_available',
 			'روش ارسال موبوی نگاشت‌شده برای روش ارسال انتخابی ووکامرس، در لیست روش‌های ارسال فعلی موبو موجود نیست: ' . $id
@@ -369,6 +342,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @return array
 	 */
 	public function get_scenarios() {
+		// Kept only for reading legacy saved options from pre-10.33.0 builds.
 		return array(
 			'mobo_only' => 'سفارش فقط محصولات موبو',
 			'mixed'     => 'سفارش ترکیبی موبو و غیرموبو',
@@ -435,53 +409,47 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @param int    $instance_id WooCommerce method instance ID.
 	 * @return array
 	 */
-	private function get_mapped_mobo_shipping_id_for_wc_method( $scenario, $zone_id, $method_id, $instance_id ) {
-		$scenario    = $this->sanitize_scenario( $scenario );
+	private function get_mapped_mobo_shipping_id_for_wc_method( $zone_id, $method_id, $instance_id ) {
 		$zone_id     = absint( $zone_id );
 		$method_id   = sanitize_key( (string) $method_id );
 		$instance_id = absint( $instance_id );
 
-		$key = $this->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $scenario );
+		$key = $this->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id );
 		$id  = absint( get_option( $key, 0 ) );
 		if ( $id > 0 ) {
 			return array( 'shippingId' => $id, 'zoneId' => $zone_id );
 		}
 
-		// Backward compatibility: the previous build had one shared mapping and it
-		// semantically matched the Mobo-only flow. Do not reuse it for mixed orders,
-		// because mixed orders need an explicit separate decision.
-		if ( 'mobo_only' === $scenario ) {
-			$legacy_key = $this->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id );
-			$legacy_id  = absint( get_option( $legacy_key, 0 ) );
+		// Safe migration from 10.32.x: reuse old scenario mappings only when they
+		// agree (or only one side was configured). Conflicting mappings require an
+		// explicit administrator choice in the new single mapping UI.
+		$legacy_ids = array();
+		foreach ( array( 'mobo_only', 'mixed' ) as $legacy_scenario ) {
+			$legacy_id = absint( get_option( $this->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $legacy_scenario ), 0 ) );
 			if ( $legacy_id > 0 ) {
-				return array( 'shippingId' => $legacy_id, 'zoneId' => $zone_id );
+				$legacy_ids[] = $legacy_id;
 			}
 		}
+		$legacy_ids = array_values( array_unique( $legacy_ids ) );
+		if ( 1 === count( $legacy_ids ) ) {
+			$id = absint( $legacy_ids[0] );
+			update_option( $key, (string) $id, false );
+			return array( 'shippingId' => $id, 'zoneId' => $zone_id );
+		}
 
-		// Runtime fallback: WooCommerce orders do not store the zone ID. If zone
-		// detection differs from the checkout-time zone, the method instance ID is
-		// still globally unique in WooCommerce, so scan known zones for the same
-		// method instance mapping.
+		// WooCommerce order shipping items do not persist the matched Zone ID.
+		// Instance IDs are globally unique, so scan other known zones as fallback.
 		foreach ( $this->get_known_wc_shipping_zone_ids() as $candidate_zone_id ) {
 			$candidate_zone_id = absint( $candidate_zone_id );
 			if ( $candidate_zone_id === $zone_id ) {
 				continue;
 			}
-			$candidate_key = $this->build_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id, $scenario );
+			$candidate_key = $this->build_legacy_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id );
 			$candidate_id  = absint( get_option( $candidate_key, 0 ) );
 			if ( $candidate_id > 0 ) {
 				return array( 'shippingId' => $candidate_id, 'zoneId' => $candidate_zone_id );
 			}
-
-			if ( 'mobo_only' === $scenario ) {
-				$candidate_legacy_key = $this->build_legacy_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id );
-				$candidate_legacy_id  = absint( get_option( $candidate_legacy_key, 0 ) );
-				if ( $candidate_legacy_id > 0 ) {
-					return array( 'shippingId' => $candidate_legacy_id, 'zoneId' => $candidate_zone_id );
-				}
-			}
 		}
-
 		return array( 'shippingId' => 0, 'zoneId' => $zone_id );
 	}
 
@@ -686,6 +654,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		}
 
 		$fallback = null;
+		$legacy_mobo_fallback = null;
 		foreach ( $order->get_items( 'shipping' ) as $shipping_item ) {
 			$method_id   = method_exists( $shipping_item, 'get_method_id' ) ? sanitize_key( (string) $shipping_item->get_method_id() ) : '';
 			$instance_id = method_exists( $shipping_item, 'get_instance_id' ) ? absint( $shipping_item->get_instance_id() ) : 0;
@@ -703,10 +672,14 @@ class Mobo_Core_Remote_Shipping_Methods {
 				'moboShippingId' => $mobo_shipping_id,
 			);
 
-			/* Split-package orders can contain multiple shipping lines. Prefer the
-			 * Mobo package line, which carries an explicit shipping_id. */
-			if ( $mobo_shipping_id > 0 || 'mobo_core_shipping' === $method_id ) {
-				return $context;
+			/* Mapping-only policy: prefer the merchant's real WooCommerce shipping
+			 * line. A retired Mobo shipping line is kept only as a legacy fallback for
+			 * orders that were created before the upgrade. */
+			if ( 'mobo_core_shipping' === $method_id || $mobo_shipping_id > 0 ) {
+				if ( null === $legacy_mobo_fallback ) {
+					$legacy_mobo_fallback = $context;
+				}
+				continue;
 			}
 			if ( null === $fallback ) {
 				$fallback = $context;
@@ -715,6 +688,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 
 		if ( is_array( $fallback ) ) {
 			return $fallback;
+		}
+		if ( is_array( $legacy_mobo_fallback ) ) {
+			return $legacy_mobo_fallback;
 		}
 
 		return new WP_Error( 'mobo_core_wc_shipping_method_missing', 'در سفارش ووکامرس هیچ روش ارسالی ثبت نشده است؛ بنابراین shipping_id موبو قابل انتخاب نیست.' );

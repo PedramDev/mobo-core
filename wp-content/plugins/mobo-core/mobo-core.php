@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.32.11
+ * Version: 10.33.0
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.32.11' );
+define( 'MOBO_CORE_VERSION', '10.33.0' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -271,18 +271,20 @@ add_action(
 
 
 		/*
-		 * Native Mobo shipping methods and remote shipping contract.
-		 * The automatic manager registers one fixed WooCommerce method instance
-		 * per active Mobo shipping method after an explicit administrator setup.
+		 * Shipping mapping-only policy.
+		 * WooCommerce owns checkout packages, zones, methods and rates completely.
+		 * Mobo only caches its remote shipping catalog and maps the WooCommerce
+		 * method stored on the paid/eligible order to one Mobo shipping_id when the
+		 * order is submitted to Mobo.
 		 */
-		$automatic_shipping = new Mobo_Core_Automatic_Shipping();
-		$automatic_shipping->init();
-
-		$shipping_wizard = new Mobo_Core_Shipping_Wizard();
-		$shipping_wizard->init();
-
-		$remote_shipping_methods = new Mobo_Core_Remote_Shipping_Methods();
-		$remote_shipping_methods->init();
+		add_action(
+			'wp_loaded',
+			function () {
+				$automatic_shipping = new Mobo_Core_Automatic_Shipping();
+				$automatic_shipping->retire_legacy_runtime( 'policy-10.33.0' );
+			},
+			1
+		);
 
 		/*
 		 * Shipping diagnostics are opt-in only. They are useful for troubleshooting,
