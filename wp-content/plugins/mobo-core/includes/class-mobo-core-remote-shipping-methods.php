@@ -1,10 +1,10 @@
 <?php
 /**
- * Cached Mobo shipping methods for automatic Mobo order submission.
+ * Complete Mobo shipping contract and WooCommerce shipping context.
  *
- * WooCommerce remains the only owner of checkout shipping-rate display. Mobo
- * shipping methods are cached only so the plugin can choose a valid shipping_id
- * when it creates the order in Mobo.
+ * The contract is cached for native automatic rates, administrator visibility,
+ * and shipping_id mapping. A shipping-only package copy can use the Mobo API
+ * price/class without changing catalog, cart, checkout, or order totals.
  *
  * PHP 7.4 compatible.
  */
@@ -22,15 +22,16 @@ class Mobo_Core_Remote_Shipping_Methods {
 	const OPTION_LAST_ERROR     = 'mobo_core_remote_shipping_methods_last_error';
 
 	/**
-	 * Bootstrap hooks.
+	 * Bootstrap the optional shipping-only package context.
 	 *
-	 * Mobo shipping must not be exposed as WooCommerce checkout rates. The native
-	 * WooCommerce shipping configuration decides what the customer sees and pays.
+	 * Native Mobo rate registration is owned by Mobo_Core_Automatic_Shipping.
 	 *
 	 * @return void
 	 */
 	public function init() {
-		/* Intentionally empty. */
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ) ) {
+			add_filter( 'woocommerce_cart_shipping_packages', array( $this, 'filter_cart_shipping_packages' ), 20, 1 );
+		}
 	}
 
 	/**
@@ -41,8 +42,8 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @return array
 	 */
 	public function maybe_sync_if_due( $source = 'cron', $force = false ) {
-		if ( ! $this->is_order_submission_enabled() && ! $force ) {
-			return array( 'success' => true, 'status' => 'disabled', 'message' => 'Automatic Mobo order submission is disabled.' );
+		if ( ! $this->is_shipping_runtime_enabled() && ! $force ) {
+			return array( 'success' => true, 'status' => 'disabled', 'message' => 'Mobo shipping runtime is disabled.' );
 		}
 
 		$interval_hours = Mobo_Core_Settings::get_int( 'mobo_core_remote_shipping_sync_interval_hours', 1, 1, 168 );
@@ -157,8 +158,11 @@ class Mobo_Core_Remote_Shipping_Methods {
 	public function get_status() {
 		$methods = $this->get_methods();
 		return array(
-			'checkoutActive'       => false,
+			'checkoutActive'       => Mobo_Core_Settings::enabled( 'mobo_core_automatic_shipping_enabled', '0' ),
 			'orderSubmission'      => $this->is_order_submission_enabled(),
+			'shippingPackage'      => Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ),
+			'shippingClassId'      => Mobo_Core_Settings::get_int( 'mobo_core_mobo_shipping_class_id', 0, 0, PHP_INT_MAX ),
+			'usesMoboApiPrice'     => Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_use_api_price', '1' ),
 			'count'                => count( $methods ),
 			'lastAttemptAt'        => absint( get_option( self::OPTION_LAST_ATTEMPT, 0 ) ),
 			'lastSuccessAt'        => absint( get_option( self::OPTION_LAST_SUCCESS, 0 ) ),
@@ -167,6 +171,82 @@ class Mobo_Core_Remote_Shipping_Methods {
 			'rules'                => $this->get_rules(),
 			'wordpressTime'        => $this->get_wordpress_time_status(),
 		);
+	}
+
+	/**
+	 * Prepare a shipping-only copy of WooCommerce packages for Mobo products.
+	 *
+	 * Product/catalog/order prices are never changed. Only the package passed to
+	 * WooCommerce shipping methods is adjusted so class/subtotal rules can use
+	 * the original Mobo API price stored in mobo_api_price.
+	 *
+	 * @param array $packages Shipping packages.
+	 * @return array
+	 */
+	public function filter_cart_shipping_packages( $packages ) {
+		if ( ! is_array( $packages ) || ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ) ) {
+			return $packages;
+		}
+
+		$class_id     = Mobo_Core_Settings::get_int( 'mobo_core_mobo_shipping_class_id', 0, 0, PHP_INT_MAX );
+		$use_api_price = Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_use_api_price', '1' );
+
+		foreach ( $packages as $package_index => $package ) {
+			if ( ! is_array( $package ) || empty( $package['contents'] ) || ! is_array( $package['contents'] ) ) {
+				continue;
+			}
+
+			$contents_cost = 0.0;
+			$mobo_count    = 0;
+			foreach ( $package['contents'] as $item_key => $item ) {
+				if ( ! is_array( $item ) ) {
+					continue;
+				}
+
+				$product      = isset( $item['data'] ) && $item['data'] instanceof WC_Product ? $item['data'] : null;
+				$product_id   = isset( $item['product_id'] ) ? absint( $item['product_id'] ) : ( $product ? absint( $product->get_id() ) : 0 );
+				$variation_id = isset( $item['variation_id'] ) ? absint( $item['variation_id'] ) : 0;
+
+				if ( ! $this->is_mobo_product( $product, $product_id, $variation_id ) ) {
+					$contents_cost += isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
+					continue;
+				}
+
+				$mobo_count++;
+				$line_total = isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
+				$api_price  = $use_api_price ? $this->get_mobo_api_price( $variation_id, $product_id ) : null;
+
+				$shipping_api_price = null !== $api_price ? $this->source_amount_to_store_amount( $api_price ) : null;
+				if ( null !== $shipping_api_price ) {
+					$quantity   = isset( $item['quantity'] ) ? max( 0.0, (float) $item['quantity'] ) : 0.0;
+					$line_total = $shipping_api_price * $quantity;
+					$packages[ $package_index ]['contents'][ $item_key ]['line_subtotal'] = $line_total;
+					$packages[ $package_index ]['contents'][ $item_key ]['line_total']    = $line_total;
+				}
+
+				if ( $product ) {
+					$shipping_product = clone $product;
+					if ( $class_id > 0 && method_exists( $shipping_product, 'set_shipping_class_id' ) ) {
+						$shipping_product->set_shipping_class_id( $class_id );
+					}
+					if ( null !== $shipping_api_price && method_exists( $shipping_product, 'set_price' ) ) {
+						$shipping_product->set_price( $shipping_api_price );
+					}
+					$packages[ $package_index ]['contents'][ $item_key ]['data'] = $shipping_product;
+				}
+
+				$contents_cost += $line_total;
+			}
+
+			$packages[ $package_index ]['contents_cost'] = $contents_cost;
+			$packages[ $package_index ]['mobo_core_shipping_context'] = array(
+				'moboItemCount' => $mobo_count,
+				'classId'       => $class_id,
+				'usesApiPrice'  => $use_api_price,
+			);
+		}
+
+		return $packages;
 	}
 
 	/**
@@ -197,14 +277,55 @@ class Mobo_Core_Remote_Shipping_Methods {
 			return new WP_Error( 'mobo_core_shipping_not_needed', 'این سفارش محصول موبو ندارد و نیازی به روش ارسال موبو نیست.' );
 		}
 
+		$available = $this->normalize_methods( $available_shippings );
+		if ( empty( $available ) ) {
+			return new WP_Error( 'mobo_core_shipping_methods_not_available', 'موبو برای این سبد خرید هیچ روش ارسالی برنگرداند.' );
+		}
+
+		$available_by_id = array();
+		foreach ( $available as $method ) {
+			$available_by_id[ absint( $method['id'] ) ] = $method;
+		}
+
+		/*
+		 * In the Tehran consolidated profile the customer selects the store's
+		 * final-mile WooCommerce method, while the Mobo part is fulfilled through
+		 * the internal pickup method chosen in the wizard. It must not depend on a
+		 * per-WooCommerce-method mapping.
+		 */
+		if ( 'mixed' === $scenario && class_exists( 'Mobo_Core_Shipping_Wizard' ) ) {
+			$wizard = new Mobo_Core_Shipping_Wizard();
+			if ( $wizard->uses_internal_mixed_fulfillment() ) {
+				$internal_id = $wizard->get_mixed_fulfillment_shipping_id();
+				if ( $internal_id > 0 && isset( $available_by_id[ $internal_id ] ) ) {
+					return $internal_id;
+				}
+				return new WP_Error(
+					'mobo_core_internal_fulfillment_not_available',
+					'روش تحویل داخلی انتخاب‌شده در ویزارد، در فهرست فعلی روش‌های ارسال موبو موجود نیست: ' . $internal_id
+				);
+			}
+		}
+
 		$wc_method = $this->get_order_wc_shipping_method_context( $order );
 		if ( is_wp_error( $wc_method ) ) {
 			return $wc_method;
 		}
 
 		$zone_id = $this->determine_order_shipping_zone_id( $order );
-		$mapped = $this->get_mapped_mobo_shipping_id_for_wc_method( $scenario, $zone_id, $wc_method['methodId'], $wc_method['instanceId'] );
-		$id     = absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 );
+		$id      = absint( isset( $wc_method['moboShippingId'] ) ? $wc_method['moboShippingId'] : 0 );
+		$mapped  = array( 'shippingId' => $id, 'zoneId' => $zone_id );
+
+		if ( $id <= 0 && 'mobo_core_shipping' === $wc_method['methodId'] && class_exists( 'Mobo_Core_Automatic_Shipping' ) ) {
+			$automatic = new Mobo_Core_Automatic_Shipping();
+			$id = $automatic->get_shipping_id_for_instance( $wc_method['instanceId'] );
+			$mapped['shippingId'] = $id;
+		}
+
+		if ( $id <= 0 ) {
+			$mapped = $this->get_mapped_mobo_shipping_id_for_wc_method( $scenario, $zone_id, $wc_method['methodId'], $wc_method['instanceId'] );
+			$id     = absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 );
+		}
 		$zone_id = absint( isset( $mapped['zoneId'] ) ? $mapped['zoneId'] : $zone_id );
 
 		if ( $id <= 0 ) {
@@ -217,16 +338,6 @@ class Mobo_Core_Remote_Shipping_Methods {
 					$zone_id
 				)
 			);
-		}
-
-		$available = $this->normalize_methods( $available_shippings );
-		if ( empty( $available ) ) {
-			return new WP_Error( 'mobo_core_shipping_methods_not_available', 'موبو برای این سبد خرید هیچ روش ارسالی برنگرداند.' );
-		}
-
-		$available_by_id = array();
-		foreach ( $available as $method ) {
-			$available_by_id[ absint( $method['id'] ) ] = $method;
 		}
 
 		if ( isset( $available_by_id[ $id ] ) ) {
@@ -574,20 +685,36 @@ class Mobo_Core_Remote_Shipping_Methods {
 			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
 		}
 
+		$fallback = null;
 		foreach ( $order->get_items( 'shipping' ) as $shipping_item ) {
 			$method_id   = method_exists( $shipping_item, 'get_method_id' ) ? sanitize_key( (string) $shipping_item->get_method_id() ) : '';
 			$instance_id = method_exists( $shipping_item, 'get_instance_id' ) ? absint( $shipping_item->get_instance_id() ) : 0;
 			$title       = method_exists( $shipping_item, 'get_name' ) ? sanitize_text_field( (string) $shipping_item->get_name() ) : '';
+			$mobo_shipping_id = method_exists( $shipping_item, 'get_meta' ) ? absint( $shipping_item->get_meta( '_mobo_shipping_id', true ) ) : 0;
 
 			if ( '' === $method_id ) {
 				continue;
 			}
 
-			return array(
-				'methodId'   => $method_id,
-				'instanceId' => $instance_id,
-				'title'      => '' !== $title ? $title : $method_id,
+			$context = array(
+				'methodId'       => $method_id,
+				'instanceId'     => $instance_id,
+				'title'          => '' !== $title ? $title : $method_id,
+				'moboShippingId' => $mobo_shipping_id,
 			);
+
+			/* Split-package orders can contain multiple shipping lines. Prefer the
+			 * Mobo package line, which carries an explicit shipping_id. */
+			if ( $mobo_shipping_id > 0 || 'mobo_core_shipping' === $method_id ) {
+				return $context;
+			}
+			if ( null === $fallback ) {
+				$fallback = $context;
+			}
+		}
+
+		if ( is_array( $fallback ) ) {
+			return $fallback;
 		}
 
 		return new WP_Error( 'mobo_core_wc_shipping_method_missing', 'در سفارش ووکامرس هیچ روش ارسالی ثبت نشده است؛ بنابراین shipping_id موبو قابل انتخاب نیست.' );
@@ -706,32 +833,124 @@ class Mobo_Core_Remote_Shipping_Methods {
 			if ( ! is_array( $method ) ) {
 				continue;
 			}
+
 			$id = isset( $method['id'] ) ? absint( $method['id'] ) : ( isset( $method['Id'] ) ? absint( $method['Id'] ) : 0 );
 			if ( $id <= 0 ) {
 				continue;
 			}
-			$title = isset( $method['title'] ) ? (string) $method['title'] : ( isset( $method['Title'] ) ? (string) $method['Title'] : '' );
-			$type  = isset( $method['type'] ) ? (string) $method['type'] : ( isset( $method['Type'] ) ? (string) $method['Type'] : '' );
-			$desc  = isset( $method['description'] ) ? $method['description'] : ( isset( $method['Description'] ) ? $method['Description'] : null );
-			$cost  = isset( $method['cost'] ) ? $method['cost'] : ( isset( $method['Cost'] ) ? $method['Cost'] : 0 );
+
+			$title    = isset( $method['title'] ) ? (string) $method['title'] : ( isset( $method['Title'] ) ? (string) $method['Title'] : '' );
+			$type     = isset( $method['type'] ) ? (string) $method['type'] : ( isset( $method['Type'] ) ? (string) $method['Type'] : '' );
+			$desc     = isset( $method['description'] ) ? $method['description'] : ( isset( $method['Description'] ) ? $method['Description'] : null );
+			$cost     = array_key_exists( 'cost', $method ) ? $method['cost'] : ( array_key_exists( 'Cost', $method ) ? $method['Cost'] : null );
+			$status   = isset( $method['status'] ) && is_array( $method['status'] ) ? array_values( array_filter( array_map( 'sanitize_key', $method['status'] ) ) ) : array( 'approved' );
+			$rules    = isset( $method['rules'] ) && is_array( $method['rules'] ) ? $this->normalize_shipping_rules( $method['rules'] ) : array();
+
+			if ( in_array( 'suspended', $status, true ) || ( ! empty( $status ) && ! in_array( 'approved', $status, true ) ) ) {
+				continue;
+			}
 
 			$normalized[ $id ] = array(
-				'id'          => $id,
-				'type'        => sanitize_text_field( $type ),
-				'title'       => sanitize_text_field( '' !== $title ? $title : ( 'Mobo shipping #' . $id ) ),
-				'description' => is_null( $desc ) ? '' : sanitize_text_field( (string) $desc ),
-				'cost'        => is_numeric( $cost ) ? (float) $cost : 0.0,
+				'id'               => $id,
+				'type'             => sanitize_key( $type ),
+				'status'           => $status,
+				'title'            => sanitize_text_field( '' !== $title ? $title : ( 'Mobo shipping #' . $id ) ),
+				'description'      => is_null( $desc ) ? '' : sanitize_textarea_field( (string) $desc ),
+				'minimum_weight'   => $this->nullable_number( isset( $method['minimum_weight'] ) ? $method['minimum_weight'] : null ),
+				'maximum_weight'   => $this->nullable_number( isset( $method['maximum_weight'] ) ? $method['maximum_weight'] : null ),
+				'minimum_subtotal' => $this->nullable_number( isset( $method['minimum_subtotal'] ) ? $method['minimum_subtotal'] : null ),
+				'maximum_subtotal' => $this->nullable_number( isset( $method['maximum_subtotal'] ) ? $method['maximum_subtotal'] : null ),
+				'minimum_cost'     => $this->nullable_number( isset( $method['minimum_cost'] ) ? $method['minimum_cost'] : null ),
+				'maximum_cost'     => $this->nullable_number( isset( $method['maximum_cost'] ) ? $method['maximum_cost'] : null ),
+				'round_cost'       => $this->nullable_number( isset( $method['round_cost'] ) ? $method['round_cost'] : null ),
+				'cost'             => $this->nullable_number( $cost ),
+				'position'         => isset( $method['position'] ) ? intval( $method['position'] ) : PHP_INT_MAX,
+				'countries'        => $this->normalize_location_items( isset( $method['countries'] ) ? $method['countries'] : array() ),
+				'states'           => $this->normalize_location_items( isset( $method['states'] ) ? $method['states'] : array() ),
+				'cities'           => $this->normalize_location_items( isset( $method['cities'] ) ? $method['cities'] : array() ),
+				'rules'            => $rules,
+				'created'          => isset( $method['created'] ) && is_array( $method['created'] ) ? $method['created'] : array(),
 			);
 		}
 
 		uasort( $normalized, function( $a, $b ) {
-			if ( $a['cost'] === $b['cost'] ) {
+			if ( $a['position'] === $b['position'] ) {
 				return $a['id'] <=> $b['id'];
 			}
-			return $a['cost'] <=> $b['cost'];
+			return $a['position'] <=> $b['position'];
 		} );
 
 		return array_values( $normalized );
+	}
+
+	private function normalize_shipping_rules( $rules ) {
+		$normalized = array();
+		foreach ( $rules as $rule ) {
+			if ( ! is_array( $rule ) ) {
+				continue;
+			}
+			$normalized[] = array(
+				'minimum_weight'   => $this->nullable_number( isset( $rule['minimum_weight'] ) ? $rule['minimum_weight'] : null ),
+				'maximum_weight'   => $this->nullable_number( isset( $rule['maximum_weight'] ) ? $rule['maximum_weight'] : null ),
+				'minimum_subtotal' => $this->nullable_number( isset( $rule['minimum_subtotal'] ) ? $rule['minimum_subtotal'] : null ),
+				'maximum_subtotal' => $this->nullable_number( isset( $rule['maximum_subtotal'] ) ? $rule['maximum_subtotal'] : null ),
+				'cost'             => $this->nullable_number( isset( $rule['cost'] ) ? $rule['cost'] : null ),
+			);
+		}
+		return $normalized;
+	}
+
+	private function normalize_location_items( $items ) {
+		if ( ! is_array( $items ) ) {
+			return array();
+		}
+		$normalized = array();
+		foreach ( $items as $item ) {
+			if ( ! is_array( $item ) ) {
+				continue;
+			}
+			$normalized[] = array(
+				'id'        => isset( $item['id'] ) ? absint( $item['id'] ) : 0,
+				'name'      => isset( $item['name'] ) ? sanitize_text_field( (string) $item['name'] ) : '',
+				'latitude'  => $this->nullable_number( isset( $item['latitude'] ) ? $item['latitude'] : null ),
+				'longitude' => $this->nullable_number( isset( $item['longitude'] ) ? $item['longitude'] : null ),
+			);
+		}
+		return $normalized;
+	}
+
+	private function nullable_number( $value ) {
+		return is_numeric( $value ) ? (float) $value : null;
+	}
+
+	private function get_mobo_api_price( $variation_id, $product_id ) {
+		$ids = array_values( array_unique( array_filter( array( absint( $variation_id ), absint( $product_id ) ) ) ) );
+		foreach ( $ids as $id ) {
+			$value = get_post_meta( $id, 'mobo_api_price', true );
+			if ( is_numeric( $value ) && (float) $value >= 0 ) {
+				return (float) $value;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Convert a source/Mobo amount (Toman) to the WooCommerce store currency.
+	 *
+	 * @param float $amount Source amount.
+	 * @return float
+	 */
+	private function source_amount_to_store_amount( $amount ) {
+		$currency   = function_exists( 'get_woocommerce_currency' ) ? strtoupper( (string) get_woocommerce_currency() ) : '';
+		$multiplier = 'IRR' === $currency ? 10.0 : 1.0;
+		$multiplier = (float) apply_filters( 'mobo_core_shipping_source_to_store_multiplier', $multiplier, $currency );
+		return max( 0.0, (float) $amount * max( 0.0, $multiplier ) );
+	}
+
+	private function is_shipping_runtime_enabled() {
+		return $this->is_order_submission_enabled()
+			|| Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' )
+			|| Mobo_Core_Settings::enabled( 'mobo_core_automatic_shipping_enabled', '0' );
 	}
 
 	private function sanitize_scenario( $scenario ) {

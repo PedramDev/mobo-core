@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.32.2
+ * Version: 10.32.11
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.32.2' );
+define( 'MOBO_CORE_VERSION', '10.32.11' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -111,6 +111,7 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shared-media.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-queue.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-missing-image-recovery.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-service.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-orphan-image-cleanup.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-automation.php';
@@ -131,6 +132,8 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.ph
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-city-assets.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shipping-diagnostics.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-shipping-methods.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-automatic-shipping.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shipping-wizard.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sms-notifications.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.php';
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
@@ -268,11 +271,16 @@ add_action(
 
 
 		/*
-		 * Remote Mobo shipping methods.
-		 * WooCommerce remains the only owner of checkout shipping-rate display.
-		 * Cached Mobo shipping methods are used only to choose shipping_id when
-		 * creating an automatic order in Mobo.
+		 * Native Mobo shipping methods and remote shipping contract.
+		 * The automatic manager registers one fixed WooCommerce method instance
+		 * per active Mobo shipping method after an explicit administrator setup.
 		 */
+		$automatic_shipping = new Mobo_Core_Automatic_Shipping();
+		$automatic_shipping->init();
+
+		$shipping_wizard = new Mobo_Core_Shipping_Wizard();
+		$shipping_wizard->init();
+
 		$remote_shipping_methods = new Mobo_Core_Remote_Shipping_Methods();
 		$remote_shipping_methods->init();
 

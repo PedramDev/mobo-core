@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.32.2
+Stable tag: 10.32.11
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -26,7 +26,7 @@ Main features:
 * Step-based product, variation, category, price, and image synchronization.
 * Targeted WooCommerce object-cache and page-cache invalidation for updated Mobo products, including LiteSpeed Cache and WP Rocket integrations without Purge All.
 * Queue-based webhook processing to avoid timeout in WordPress requests.
-* Shipping method mapping between WooCommerce shipping zones/methods and Mobo shipping methods.
+* Complete Mobo shipping-method details, WooCommerce mapping, and optional shipping-only class/API-price context for Mobo products.
 * Separate shipping mapping for Mobo-only orders and mixed Mobo/non-Mobo orders.
 * Optional automatic order submission for Mobo-only and mixed WooCommerce orders.
 * Address mapping for checkout country, state, and city values used in Iran.
@@ -116,7 +116,11 @@ Yes, when checkout validation, cart checking, shipping method retrieval, or auto
 
 = Does it create WooCommerce shipping methods? =
 
-No. WooCommerce shipping methods are still managed in WooCommerce shipping zones. Mobo Core maps the selected WooCommerce shipping method to a Mobo shipping method for automatic order submission.
+Yes, after the store manager explicitly runs the one-click shipping installer. Mobo Core then creates or repairs the Mobo product shipping class, Iran-capable zone configuration, one managed WooCommerce method instance per active Mobo shipping method, rule/static/free rate calculation, order mappings, and the shipping-only Mobo price context. Unrelated WooCommerce zones and methods are not deleted. Operational methods that need a previous invoice, warehouse hold, or in-person handling remain disabled until the manager reviews them.
+
+= Does the Mobo API price replace the storefront product price? =
+
+No. When the shipping-package option is enabled, `mobo_api_price` is used only in a cloned package passed to WooCommerce shipping methods. Catalog, cart, checkout, discount, payment, and order item prices remain unchanged.
 
 = Does it send SMS directly? =
 
@@ -140,6 +144,63 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can separately enable archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. Archive invalidation is disabled by default on new installations to avoid making high-frequency archive caches ineffective. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge.
 
 == Changelog ==
+
+= 10.32.11 =
+* Choosing current store methods no longer keeps the Mobo-created fallback visible.
+* Real WooCommerce store methods from a broader or fallback Zone are connected into the Mobo Iran Zone when WooCommerce Zone precedence would otherwise hide them.
+* The old managed fallback is disabled only after a real store method is available, preventing checkout gaps.
+* Mirrored existing methods preserve their title, cost, and settings, synchronize on Repair, and remain idempotent.
+
+= 10.32.10 =
+* Fixed detection of existing WooCommerce store shipping methods in the shipping wizard.
+* Enabled non-Mobo Flat Rate instances created by an earlier Mobo repair are now valid current store methods.
+* Choosing current store methods no longer disables a detected managed Flat Rate and breaks the store package.
+* The wizard now lists the detected non-Mobo methods with their Zone and instance ID.
+
+= 10.32.9 =
+* The shipping wizard now validates ordinary store-product shipping before enabling mixed-cart or store-only checkout flows.
+* Stores can use their existing WooCommerce methods or create an idempotent managed Flat Rate fallback with a manager-defined title and cost.
+* Repair now recreates or updates the saved store fallback without duplicates and refuses to report success when non-Mobo packages would have no rate.
+* Mixed split carts keep Mobo rates on the Mobo package and ordinary WooCommerce rates on the store package.
+
+= 10.32.8 =
+* Repair now writes an explicit destination scope on every managed Mobo shipping instance.
+* All courier (پیک) methods are enforced as Tehran-only, including free/direct courier variants.
+* Mobo drop-shipping postal method 148395514 is enforced as nationwide Iran and remains available for Tehran and all provinces.
+* Re-running Repair updates existing instances without duplicates and reports Tehran-only versus nationwide method counts.
+
+= 10.32.7 =
+* Replaced blind one-click shipping setup with a three-step fulfillment wizard for mixed Mobo/store carts.
+* Added three safe profiles: Tehran store consolidation with internal Mobo pickup, two independent customer shipments, and mixed-cart blocking.
+* Split mode creates separate Mobo and store shipping packages and restricts each package to the correct rate providers.
+* Consolidated Tehran mode keeps one customer shipment, hides Mobo rates from the customer, and resolves the Mobo order with the wizard-selected internal pickup shipping ID.
+* Mixed-order shipping resolution now prefers the explicit Mobo shipping line in multi-package orders.
+* Added classic checkout and Checkout Block validation, operational order notes, idempotent reconfiguration, and a final review step before WooCommerce changes are applied.
+
+= 10.32.6 =
+* Added a one-click "build and repair Mobo shipping" action that synchronizes the latest Portal contract and creates or repairs the required WooCommerce shipping class, Iran zones, managed shipping instances, and Mobo shipping ID mappings.
+* Added a native Mobo WooCommerce shipping method; no separate table-rate extension is required for Mobo `free`, `static`, and `rules` methods.
+* Rules are calculated from Mobo-only `mobo_api_price × quantity`, with weight and destination constraints, without changing product, cart, checkout, payment, or order item prices.
+* Re-running the installer is idempotent: existing Mobo-managed instances are updated, stale managed instances are disabled, and unrelated WooCommerce methods are preserved.
+* Sensitive operational choices such as previous-invoice merging, warehouse holding, and in-person pickup are created disabled for store-manager review.
+* Added source-Toman to store-Rial conversion, fixed method-instance order mapping, Checkout Blocks-safe fixed rate IDs, and COD restriction merging without enabling COD automatically.
+
+= 10.32.5 =
+* Portal shipping synchronization now consumes the management shipping list and each shipping detail endpoint, preserving status, position, weight/subtotal/cost bounds, geographic scope, rules, and creation metadata.
+* Suspended methods remain stored in Portal history but are excluded from active customer API and webhook snapshots.
+* WordPress now stores the complete active shipping contract and displays rule/location details with a store-manager setup guide.
+* Added an optional shipping-only WooCommerce package context: Mobo products can use a selected virtual shipping class and `mobo_api_price` for shipping calculations without changing storefront, cart, checkout, or order prices.
+
+= 10.32.4 =
+* Repair now performs a final image-only recovery pass for existing local Mobo products that have no usable featured image, even when the remote product is excluded from the normal product list by the OnlyInStock setting.
+* Image Refresh now discovers local Mobo products without a valid featured image and sends only their remote image payload to the safe Image Queue.
+* Missing-image recovery uses the existing product GUID endpoint and never updates product fields, stock, price, status, categories, attributes, or variants.
+* The recovery path runs only when automatic image updates are enabled and remains resumable through the existing image queue and cron retry behavior.
+
+= 10.32.3 =
+* Shared Media now rewrites all responsive `srcset` candidates to `MOBO_CORE_SHARED_MEDIA_BASE_URL` instead of the site uploads URL.
+* Only attachments marked as Shared Media and validated `objects/...` files are rewritten; normal WordPress attachments are unchanged.
+* Unexpected URL parsing or filesystem validation failures fall back to the original `srcset` without causing a fatal error.
 
 = 10.32.2 =
 * Image Refresh now removes local JPG/JPEG files whose base filename matches the successfully validated replacement WebP, including same-base derivative files such as `name-300x300.jpg` and `name-scaled.jpeg`.

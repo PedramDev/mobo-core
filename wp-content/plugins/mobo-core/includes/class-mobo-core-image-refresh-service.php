@@ -23,6 +23,8 @@ class Mobo_Core_Image_Refresh_Service {
 
 	const SCAN_CURSOR_OPTION           = 'mobo_core_image_refresh_scan_cursor';
 	const ENQUEUE_CURSOR_OPTION        = 'mobo_core_image_refresh_enqueue_cursor';
+	const MISSING_SCAN_CURSOR_OPTION   = 'mobo_core_image_refresh_missing_scan_cursor';
+	const MISSING_ENQUEUE_CURSOR_OPTION = 'mobo_core_image_refresh_missing_enqueue_cursor';
 	const SUBSIZE_SCAN_CURSOR_OPTION   = 'mobo_core_image_subsize_scan_cursor';
 	const SUBSIZE_REPAIR_CURSOR_OPTION = 'mobo_core_image_subsize_repair_cursor';
 	const REPLACED_SCAN_CURSOR_OPTION  = 'mobo_core_image_replaced_scan_cursor';
@@ -94,12 +96,21 @@ class Mobo_Core_Image_Refresh_Service {
 			return $result;
 		}
 
-		$batch       = $this->get_mobo_attachment_batch( $limit, self::SCAN_CURSOR_OPTION );
-		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
-		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$previous     = get_option( 'mobo_core_image_refresh_last_scan', array() );
 		$previous     = is_array( $previous ) ? $previous : array();
-		$continue_cycle = $cursor_start > 0 && ! empty( $previous ) && empty( $previous['cycleComplete'] );
+		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
+		$batch = $legacy_already_complete
+			? array( 'ids' => array(), 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => absint( isset( $previous['legacyEstimatedTotal'] ) ? $previous['legacyEstimatedTotal'] : 0 ) )
+			: $this->get_mobo_attachment_batch( $limit, self::SCAN_CURSOR_OPTION );
+		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
+		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
+		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
+		$missing_cursor_start = absint( get_option( self::MISSING_SCAN_CURSOR_OPTION, 0 ) );
+		$missing_batch = $recovery instanceof Mobo_Core_Missing_Image_Recovery && $recovery->is_enabled()
+			? $recovery->get_candidate_batch( $limit, $missing_cursor_start )
+			: array( 'rows' => array(), 'scanned' => 0, 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => 0 );
+		$missing_rows = isset( $missing_batch['rows'] ) && is_array( $missing_batch['rows'] ) ? $missing_batch['rows'] : array();
+		$continue_cycle = ( $legacy_already_complete || $cursor_start > 0 || $missing_cursor_start > 0 ) && ! empty( $previous ) && empty( $previous['cycleComplete'] );
 		$cycle_id      = $continue_cycle && ! empty( $previous['cycleId'] )
 			? sanitize_text_field( (string) $previous['cycleId'] )
 			: wp_generate_uuid4();
@@ -113,10 +124,16 @@ class Mobo_Core_Image_Refresh_Service {
 			'withoutSourceUrl'    => $continue_cycle ? absint( isset( $previous['withoutSourceUrl'] ) ? $previous['withoutSourceUrl'] : 0 ) : 0,
 			'queueable'           => $continue_cycle ? absint( isset( $previous['queueable'] ) ? $previous['queueable'] : 0 ) : 0,
 			'totalLegacyBytes'    => $continue_cycle ? absint( isset( $previous['totalLegacyBytes'] ) ? $previous['totalLegacyBytes'] : 0 ) : 0,
+			'missingImageScanned'=> $continue_cycle ? absint( isset( $previous['missingImageScanned'] ) ? $previous['missingImageScanned'] : 0 ) : 0,
+			'missingImageProducts'=> $continue_cycle ? absint( isset( $previous['missingImageProducts'] ) ? $previous['missingImageProducts'] : 0 ) : 0,
 			'cursorStart'         => $cursor_start,
 			'cursorEnd'           => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
-			'cycleComplete'       => ! empty( $batch['cycleComplete'] ),
-			'estimatedTotal'       => isset( $batch['estimatedTotal'] ) ? absint( $batch['estimatedTotal'] ) : 0,
+			'missingCursorStart'  => $missing_cursor_start,
+			'missingCursorEnd'    => isset( $missing_batch['cursorEnd'] ) ? absint( $missing_batch['cursorEnd'] ) : 0,
+			'legacyComplete'      => $legacy_already_complete || ! empty( $batch['cycleComplete'] ),
+			'legacyEstimatedTotal'=> absint( isset( $batch['estimatedTotal'] ) ? $batch['estimatedTotal'] : 0 ),
+			'cycleComplete'       => ( $legacy_already_complete || ! empty( $batch['cycleComplete'] ) ) && ! empty( $missing_batch['cycleComplete'] ),
+			'estimatedTotal'       => absint( isset( $batch['estimatedTotal'] ) ? $batch['estimatedTotal'] : 0 ) + absint( isset( $missing_batch['estimatedTotal'] ) ? $missing_batch['estimatedTotal'] : 0 ),
 			'cycleId'             => $cycle_id,
 			'cycleStartedAt'      => $continue_cycle && ! empty( $previous['cycleStartedAt'] ) ? absint( $previous['cycleStartedAt'] ) : time(),
 			'checkedAt'           => time(),
@@ -168,6 +185,15 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 		}
 
+		$result['missingImageScanned'] += absint( isset( $missing_batch['scanned'] ) ? $missing_batch['scanned'] : 0 );
+		$result['missingImageProducts'] += count( $missing_rows );
+
+		if ( ! empty( $missing_batch['cycleComplete'] ) ) {
+			update_option( self::MISSING_SCAN_CURSOR_OPTION, 0, false );
+		} else {
+			update_option( self::MISSING_SCAN_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_start ), false );
+		}
+
 		update_option( 'mobo_core_image_refresh_last_scan', $result, false );
 
 		return $result;
@@ -198,12 +224,21 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		$queue       = new Mobo_Core_Image_Refresh_Queue();
-		$batch       = $this->get_mobo_attachment_batch( $limit, self::ENQUEUE_CURSOR_OPTION );
-		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
-		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$previous     = get_option( 'mobo_core_image_refresh_last_enqueue', array() );
 		$previous     = is_array( $previous ) ? $previous : array();
-		$continue_cycle = $cursor_start > 0 && ! empty( $previous ) && empty( $previous['cycleComplete'] );
+		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
+		$batch = $legacy_already_complete
+			? array( 'ids' => array(), 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => absint( isset( $previous['legacyEstimatedTotal'] ) ? $previous['legacyEstimatedTotal'] : 0 ) )
+			: $this->get_mobo_attachment_batch( $limit, self::ENQUEUE_CURSOR_OPTION );
+		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
+		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
+		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
+		$missing_cursor_start = absint( get_option( self::MISSING_ENQUEUE_CURSOR_OPTION, 0 ) );
+		$missing_batch = $recovery instanceof Mobo_Core_Missing_Image_Recovery && $recovery->is_enabled()
+			? $recovery->get_candidate_batch( $limit, $missing_cursor_start )
+			: array( 'rows' => array(), 'scanned' => 0, 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => 0 );
+		$missing_rows = isset( $missing_batch['rows'] ) && is_array( $missing_batch['rows'] ) ? $missing_batch['rows'] : array();
+		$continue_cycle = ( $legacy_already_complete || $cursor_start > 0 || $missing_cursor_start > 0 ) && ! empty( $previous ) && empty( $previous['cycleComplete'] );
 		$source_scan   = get_option( 'mobo_core_image_refresh_last_scan', array() );
 		$source_scan   = is_array( $source_scan ) ? $source_scan : array();
 		$source_scan_cycle_id = ! empty( $source_scan['cycleId'] )
@@ -225,10 +260,19 @@ class Mobo_Core_Image_Refresh_Service {
 			'skipped'          => $continue_cycle ? absint( isset( $previous['skipped'] ) ? $previous['skipped'] : 0 ) : 0,
 			'withoutProduct'   => $continue_cycle ? absint( isset( $previous['withoutProduct'] ) ? $previous['withoutProduct'] : 0 ) : 0,
 			'withoutSourceUrl' => $continue_cycle ? absint( isset( $previous['withoutSourceUrl'] ) ? $previous['withoutSourceUrl'] : 0 ) : 0,
+			'missingImageScanned' => $continue_cycle ? absint( isset( $previous['missingImageScanned'] ) ? $previous['missingImageScanned'] : 0 ) : 0,
+			'missingImageQueued'  => $continue_cycle ? absint( isset( $previous['missingImageQueued'] ) ? $previous['missingImageQueued'] : 0 ) : 0,
+			'missingImageSkipped' => $continue_cycle ? absint( isset( $previous['missingImageSkipped'] ) ? $previous['missingImageSkipped'] : 0 ) : 0,
+			'missingImageFailed'  => $continue_cycle ? absint( isset( $previous['missingImageFailed'] ) ? $previous['missingImageFailed'] : 0 ) : 0,
+			'missingImagePending' => $continue_cycle ? absint( isset( $previous['missingImagePending'] ) ? $previous['missingImagePending'] : 0 ) : 0,
 			'cursorStart'      => $cursor_start,
 			'cursorEnd'        => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
-			'cycleComplete'    => ! empty( $batch['cycleComplete'] ),
-			'estimatedTotal'    => isset( $batch['estimatedTotal'] ) ? absint( $batch['estimatedTotal'] ) : 0,
+			'missingCursorStart' => $missing_cursor_start,
+			'missingCursorEnd'   => isset( $missing_batch['cursorEnd'] ) ? absint( $missing_batch['cursorEnd'] ) : 0,
+			'legacyComplete'     => $legacy_already_complete || ! empty( $batch['cycleComplete'] ),
+			'legacyEstimatedTotal'=> absint( isset( $batch['estimatedTotal'] ) ? $batch['estimatedTotal'] : 0 ),
+			'cycleComplete'    => ( $legacy_already_complete || ! empty( $batch['cycleComplete'] ) ) && ! empty( $missing_batch['cycleComplete'] ),
+			'estimatedTotal'    => absint( isset( $batch['estimatedTotal'] ) ? $batch['estimatedTotal'] : 0 ) + absint( isset( $missing_batch['estimatedTotal'] ) ? $missing_batch['estimatedTotal'] : 0 ),
 			'sourceScanCycleId'=> $source_scan_cycle_id,
 			'cycleStartedAt'   => $continue_cycle && ! empty( $previous['cycleStartedAt'] ) ? absint( $previous['cycleStartedAt'] ) : time(),
 			'checkedAt'        => time(),
@@ -309,10 +353,45 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 		}
 
+		$result['missingImageScanned'] += absint( isset( $missing_batch['scanned'] ) ? $missing_batch['scanned'] : 0 );
+		$missing_cursor_end = $missing_cursor_start;
+		$missing_error      = false;
+
+		foreach ( $missing_rows as $missing_row ) {
+			$product_id   = absint( isset( $missing_row['product_id'] ) ? $missing_row['product_id'] : 0 );
+			$product_guid = sanitize_text_field( (string) ( isset( $missing_row['product_guid'] ) ? $missing_row['product_guid'] : '' ) );
+			$recover      = $recovery->recover_product( $product_id, $product_guid, 'image-refresh-missing-' . gmdate( 'YmdHis' ) );
+
+			if ( is_wp_error( $recover ) ) {
+				$result['missingImageFailed']++;
+				$result['lastError'] = sanitize_text_field( $recover->get_error_message() );
+				$missing_error = true;
+				break;
+			}
+
+			$missing_cursor_end = max( $missing_cursor_end, $product_id );
+			if ( ! empty( $recover['skipped'] ) ) {
+				$result['missingImageSkipped']++;
+			} else {
+				$result['missingImageQueued']++;
+				$result['missingImagePending'] += absint( isset( $recover['pending'] ) ? $recover['pending'] : 0 );
+			}
+		}
+
+		if ( $missing_error ) {
+			$result['cycleComplete'] = false;
+			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, $missing_cursor_end, false );
+		} elseif ( ! empty( $missing_batch['cycleComplete'] ) ) {
+			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, 0, false );
+		} else {
+			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_end ), false );
+		}
+
 		update_option( 'mobo_core_image_refresh_last_enqueue', $result, false );
 
-		/* Queue construction never processes media. It only invalidates older
-		 * downstream audit reports because they cannot certify a newly built queue. */
+		/* Queue construction normally only builds the replacement queue. Missing
+		 * product images are intentionally handed to the separate safe image queue,
+		 * which may process immediately or continue through cron retries. */
 		return $result;
 	}
 
@@ -1413,10 +1492,12 @@ class Mobo_Core_Image_Refresh_Service {
 	public function reset_workflow_state( $keep_legacy_scan = true ) {
 		if ( ! $keep_legacy_scan ) {
 			delete_option( self::SCAN_CURSOR_OPTION );
+			delete_option( self::MISSING_SCAN_CURSOR_OPTION );
 			delete_option( 'mobo_core_image_refresh_last_scan' );
 		}
 
 		delete_option( self::ENQUEUE_CURSOR_OPTION );
+		delete_option( self::MISSING_ENQUEUE_CURSOR_OPTION );
 		delete_option( self::SUBSIZE_SCAN_CURSOR_OPTION );
 		delete_option( self::SUBSIZE_REPAIR_CURSOR_OPTION );
 		delete_option( self::REPLACED_SCAN_CURSOR_OPTION );

@@ -31,6 +31,7 @@ class Mobo_Core_Shared_Media {
 		add_filter( 'wp_get_attachment_url', array( __CLASS__, 'filter_attachment_url' ), 20, 2 );
 		add_filter( 'get_attached_file', array( __CLASS__, 'filter_attached_file' ), 20, 2 );
 		add_filter( 'wp_get_attachment_metadata', array( __CLASS__, 'filter_attachment_metadata' ), 20, 2 );
+		add_filter( 'wp_calculate_image_srcset', array( __CLASS__, 'filter_image_srcset' ), 20, 5 );
 	}
 
 	/**
@@ -209,6 +210,53 @@ class Mobo_Core_Shared_Media {
 		}
 
 		return self::add_registered_size_aliases( $metadata );
+	}
+
+	/**
+	 * Rewrite responsive-image source URLs for shared attachments.
+	 *
+	 * WordPress builds srcset candidates from the uploads base URL and attachment
+	 * metadata. Shared attachments intentionally keep paths such as
+	 * objects/ab/cd/file--300x300.webp in that metadata, so without this filter
+	 * WordPress prefixes the site's wp-content/uploads URL. Replace only those
+	 * shared-media candidates with the configured public shared-media base URL.
+	 *
+	 * @param array|false $sources Responsive image sources keyed by width.
+	 * @param array       $size_array Requested image dimensions.
+	 * @param string      $image_src Selected image URL.
+	 * @param array       $image_meta Attachment metadata.
+	 * @param int         $attachment_id Attachment ID.
+	 * @return array|false
+	 */
+	public static function filter_image_srcset( $sources, $size_array, $image_src, $image_meta, $attachment_id ) {
+		if ( ! is_array( $sources ) ) {
+			return $sources;
+		}
+
+		$original_sources = $sources;
+
+		try {
+			if ( ! self::is_shared_attachment( $attachment_id ) ) {
+				return $sources;
+			}
+
+			foreach ( $sources as $width => $source ) {
+				if ( ! is_array( $source ) || empty( $source['url'] ) ) {
+					continue;
+				}
+
+				$relative = self::shared_relative_file_from_url( $source['url'] );
+				if ( '' === $relative ) {
+					continue;
+				}
+
+				$sources[ $width ]['url'] = self::url_for_file( $relative );
+			}
+		} catch ( Throwable $error ) {
+			return $original_sources;
+		}
+
+		return $sources;
 	}
 
 	/**
@@ -564,6 +612,29 @@ class Mobo_Core_Shared_Media {
 		}
 
 		return $file_real;
+	}
+
+	/**
+	 * Extract and validate an objects/... shared-media path from a generated URL.
+	 *
+	 * @param string $url Candidate image URL.
+	 * @return string
+	 */
+	private static function shared_relative_file_from_url( $url ) {
+		$path = wp_parse_url( (string) $url, PHP_URL_PATH );
+		if ( ! is_string( $path ) || '' === $path ) {
+			return '';
+		}
+
+		$path     = '/' . ltrim( str_replace( '\\', '/', rawurldecode( $path ) ), '/' );
+		$marker   = '/objects/';
+		$position = strpos( $path, $marker );
+		if ( false === $position ) {
+			return '';
+		}
+
+		$relative = ltrim( substr( $path, $position + 1 ), '/' );
+		return self::safe_relative_file( $relative );
 	}
 
 	private static function url_for_file( $relative ) {

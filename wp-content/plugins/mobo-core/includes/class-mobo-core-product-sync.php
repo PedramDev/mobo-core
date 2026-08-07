@@ -114,6 +114,14 @@ class Mobo_Core_Product_Sync {
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
+
+			'repairProductsComplete'         => false,
+			'missingImageRecoveryCursor'      => 0,
+			'missingImageRecoveryScanned'     => 0,
+			'missingImageRecoveryQueued'      => 0,
+			'missingImageRecoverySkipped'     => 0,
+			'missingImageRecoveryFailed'      => 0,
+			'missingImageRecoveryComplete'    => false,
 		);
 
 		update_option( self::STATE_OPTION, $state, false );
@@ -207,6 +215,14 @@ class Mobo_Core_Product_Sync {
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
+
+			'repairProductsComplete'         => false,
+			'missingImageRecoveryCursor'      => 0,
+			'missingImageRecoveryScanned'     => 0,
+			'missingImageRecoveryQueued'      => 0,
+			'missingImageRecoverySkipped'     => 0,
+			'missingImageRecoveryFailed'      => 0,
+			'missingImageRecoveryComplete'    => false,
 		);
 
 		$state = get_option( self::STATE_OPTION, array() );
@@ -265,6 +281,13 @@ class Mobo_Core_Product_Sync {
 			'isCancelled'                  => 'cancelled' === $current_status,
 
 			'categorySynced'               => (bool) $state['categorySynced'],
+			'repairProductsComplete'         => ! empty( $state['repairProductsComplete'] ),
+			'missingImageRecoveryCursor'      => absint( $state['missingImageRecoveryCursor'] ),
+			'missingImageRecoveryScanned'     => absint( $state['missingImageRecoveryScanned'] ),
+			'missingImageRecoveryQueued'      => absint( $state['missingImageRecoveryQueued'] ),
+			'missingImageRecoverySkipped'     => absint( $state['missingImageRecoverySkipped'] ),
+			'missingImageRecoveryFailed'      => absint( $state['missingImageRecoveryFailed'] ),
+			'missingImageRecoveryComplete'    => ! empty( $state['missingImageRecoveryComplete'] ),
 
 			'productPage'                  => absint( $state['productPage'] ),
 			'productCursor'                => absint( $state['productCursor'] ),
@@ -349,6 +372,16 @@ class Mobo_Core_Product_Sync {
 			$state['lastMessage']         = 'اتصال به MoboCore دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
 			$state['updatedAt']           = time();
 			$this->save_manual_sync_state( $state );
+		}
+
+		/*
+		 * Repair-only image recovery pass. The normal product list may exclude a
+		 * product that became out of stock mid-sync. Existing local products that
+		 * have no usable image are fetched individually by GUID and only their
+		 * image payload is applied. Stock, fields and variants are untouched.
+		 */
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && empty( $state['missingImageRecoveryComplete'] ) ) {
+			return $this->run_missing_image_repair_step( $state );
 		}
 
 		/*
@@ -1536,6 +1569,114 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
+	/**
+	 * Recover an image for one existing local product during Repair.
+	 *
+	 * @param array $state Manual sync state.
+	 * @return array
+	 */
+	private function run_missing_image_repair_step( &$state ) {
+		if ( ! class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ) {
+			$state['missingImageRecoveryComplete'] = true;
+			$state['status']                       = 'done';
+			$state['completedAt']                  = time();
+			$state['lastError']                    = '';
+			$state['lastMessage']                  = 'Repair کامل شد؛ سرویس بازیابی تصویر در دسترس نبود.';
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		$recovery = new Mobo_Core_Missing_Image_Recovery();
+		if ( ! $recovery->is_enabled() ) {
+			$state['missingImageRecoveryComplete'] = true;
+			$state['status']                       = 'done';
+			$state['completedAt']                  = time();
+			$state['lastError']                    = '';
+			$state['lastMessage']                  = 'Repair کامل شد؛ بازیابی تصویر محصولات بدون عکس به دلیل غیرفعال بودن بروزرسانی تصاویر رد شد.';
+			$this->save_manual_sync_state( $state );
+
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		$cursor = absint( $state['missingImageRecoveryCursor'] ?? 0 );
+		$batch  = $recovery->get_candidate_batch( 1, $cursor );
+		$rows   = isset( $batch['rows'] ) && is_array( $batch['rows'] ) ? $batch['rows'] : array();
+
+		$state['missingImageRecoveryScanned'] = absint( $state['missingImageRecoveryScanned'] ?? 0 ) + absint( $batch['scanned'] ?? 0 );
+
+		if ( empty( $rows ) ) {
+			$state['missingImageRecoveryCursor'] = absint( $batch['cursorEnd'] ?? $cursor );
+			$state['lastError']                  = '';
+
+			if ( ! empty( $batch['cycleComplete'] ) ) {
+				$state['missingImageRecoveryCursor']   = 0;
+				$state['missingImageRecoveryComplete'] = true;
+				$state['status']                       = 'done';
+				$state['completedAt']                  = time();
+				$state['lastMessage']                  = sprintf(
+					'Repair کامل شد. محصولات محلی بررسی‌شده برای تصویر: %d، صف‌شده: %d، ردشده: %d، ناموفق: %d.',
+					absint( $state['missingImageRecoveryScanned'] ?? 0 ),
+					absint( $state['missingImageRecoveryQueued'] ?? 0 ),
+					absint( $state['missingImageRecoverySkipped'] ?? 0 ),
+					absint( $state['missingImageRecoveryFailed'] ?? 0 )
+				);
+			} else {
+				$state['lastMessage'] = 'Repair محصولات اصلی کامل است؛ جست‌وجوی محصولات محلی بدون تصویر ادامه دارد.';
+			}
+
+			$this->save_manual_sync_state( $state );
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		$row          = $rows[0];
+		$product_id   = absint( $row['product_id'] ?? 0 );
+		$product_guid = sanitize_text_field( (string) ( $row['product_guid'] ?? '' ) );
+		$result       = $recovery->recover_product(
+			$product_id,
+			$product_guid,
+			'repair-missing-image-' . sanitize_text_field( (string) $state['syncId'] )
+		);
+
+		if ( is_wp_error( $result ) ) {
+			$state['missingImageRecoveryFailed'] = absint( $state['missingImageRecoveryFailed'] ?? 0 ) + 1;
+			return $this->handle_transient_request_error( $state, $result, 'خطا در دریافت تصویر محصول محلی بدون عکس.' );
+		}
+
+		$this->clear_transient_request_error( $state );
+		$state['missingImageRecoveryCursor'] = absint( $batch['cursorEnd'] ?? $product_id );
+
+		if ( ! empty( $result['skipped'] ) ) {
+			$state['missingImageRecoverySkipped'] = absint( $state['missingImageRecoverySkipped'] ?? 0 ) + 1;
+		} else {
+			$state['missingImageRecoveryQueued'] = absint( $state['missingImageRecoveryQueued'] ?? 0 ) + 1;
+		}
+
+		if ( ! empty( $batch['cycleComplete'] ) ) {
+			$state['missingImageRecoveryCursor']   = 0;
+			$state['missingImageRecoveryComplete'] = true;
+			$state['status']                       = 'done';
+			$state['completedAt']                  = time();
+			$state['lastMessage']                  = sprintf(
+				'Repair و بازیابی تصاویر کامل شد. محصولات بررسی‌شده: %d، صف‌شده: %d، ردشده: %d، ناموفق: %d.',
+				absint( $state['missingImageRecoveryScanned'] ?? 0 ),
+				absint( $state['missingImageRecoveryQueued'] ?? 0 ),
+				absint( $state['missingImageRecoverySkipped'] ?? 0 ),
+				absint( $state['missingImageRecoveryFailed'] ?? 0 )
+			);
+		} else {
+			$state['lastMessage'] = sprintf(
+				'تصویر محصول بدون عکس بررسی شد: %s. صف‌شده: %d، ردشده: %d.',
+				$product_guid,
+				absint( $state['missingImageRecoveryQueued'] ?? 0 ),
+				absint( $state['missingImageRecoverySkipped'] ?? 0 )
+			);
+		}
+
+		$this->save_manual_sync_state( $state );
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+	}
+
 	private function save_manual_sync_state( $state ) {
 		if ( ! is_array( $state ) ) {
 			return false;
@@ -1559,6 +1700,20 @@ class Mobo_Core_Product_Sync {
 			if ( 'cancelled' === $current_status && 'cancelled' !== $incoming_status && '' !== $incoming_sync_id && $incoming_sync_id === $current_sync_id ) {
 				return false;
 			}
+		}
+
+		/*
+		 * A normal Repair product pass may finish without ever seeing a product
+		 * that became out of stock while OnlyInStock is enabled. Before marking
+		 * Repair complete, switch to the local missing-image recovery pass.
+		 */
+		if ( ! empty( $state['repairMode'] ) && 'done' === $incoming_status && empty( $state['missingImageRecoveryComplete'] ) ) {
+			$state['repairProductsComplete'] = true;
+			$state['status']                 = 'running';
+			$state['completedAt']            = 0;
+			$state['lastError']              = '';
+			$state['lastMessage']            = 'Repair محصولات اصلی کامل شد؛ بازیابی تصاویر محصولات محلی بدون عکس شروع می‌شود.';
+			$incoming_status                 = 'running';
 		}
 
 		$state['updatedAt'] = time();
