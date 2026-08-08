@@ -402,6 +402,25 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return array
 	 */
 	public function process_queue( $limit = 0 ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $limit ) {
+					return $this->process_queue_guarded( $limit );
+				},
+				'image-refresh-queue'
+			);
+		}
+
+		return $this->process_queue_guarded( $limit );
+	}
+
+	/**
+	 * Process image refresh queue inside the cache mutation scope.
+	 *
+	 * @param int $limit Limit.
+	 * @return array
+	 */
+	private function process_queue_guarded( $limit = 0 ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-refresh-queue' ), array( 'processed' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => true ) );
 		}
@@ -2256,32 +2275,41 @@ class Mobo_Core_Image_Refresh_Service {
 			return true;
 		}
 
-		$meta_tables = array(
-			isset( $wpdb->termmeta ) ? $wpdb->termmeta : '',
-			isset( $wpdb->usermeta ) ? $wpdb->usermeta : '',
+		$termmeta_count = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->termmeta} WHERE meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s",
+				$value,
+				$serialized_int,
+				$serialized_string
+			)
 		);
 
-		foreach ( array_filter( $meta_tables ) as $table ) {
-			$column = $table === $wpdb->usermeta ? 'umeta_id' : 'meta_id';
-			$count  = $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT({$column}) FROM {$table} WHERE meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s",
-					$value,
-					$serialized_int,
-					$serialized_string
-				)
-			);
-
-			if ( absint( $count ) > 0 ) {
-				return true;
-			}
+		if ( absint( $termmeta_count ) > 0 ) {
+			return true;
 		}
 
-		$options_count = $wpdb->get_var(
+		$usermeta_count = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s",
+				$value,
+				$serialized_int,
+				$serialized_string
+			)
+		);
+
+		if ( absint( $usermeta_count ) > 0 ) {
+			return true;
+		}
+
+		$theme_mods_like = $wpdb->esc_like( 'theme_mods_' ) . '%';
+		$widget_like     = $wpdb->esc_like( 'widget_' ) . '%';
+		$options_count   = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT COUNT(*) FROM {$wpdb->options}
-				WHERE (option_name = 'site_icon' OR option_name LIKE 'theme_mods\_%' OR option_name LIKE 'widget\_%')
+				WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s)
 				AND (option_value = %s OR option_value LIKE %s OR option_value LIKE %s)",
+				$theme_mods_like,
+				$widget_like,
 				$value,
 				$serialized_int,
 				$serialized_string

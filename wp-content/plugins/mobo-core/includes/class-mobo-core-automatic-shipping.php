@@ -1398,6 +1398,7 @@ class Mobo_Core_Automatic_Shipping {
 			$format[]             = '%d';
 		}
 
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- WooCommerce stores enabled/order state in this zone table; WC shipping cache is invalidated immediately below.
 		$wpdb->update(
 			$wpdb->prefix . 'woocommerce_shipping_zone_methods',
 			$data,

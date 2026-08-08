@@ -334,6 +334,24 @@ class Mobo_Core_Product_Sync {
 	}
 
 	public function run_manual_sync_step() {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () {
+					return $this->run_manual_sync_step_guarded();
+				},
+				! empty( $this->get_manual_sync_state()['repairMode'] ) ? 'manual-repair' : 'manual-sync'
+			);
+		}
+
+		return $this->run_manual_sync_step_guarded();
+	}
+
+	/**
+	 * Execute one manual Sync/Repair step inside the cache mutation guard.
+	 *
+	 * @return array
+	 */
+	private function run_manual_sync_step_guarded() {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return $this->result( true, 'Sync در نقطه امن برای آپدیت افزونه Pause شده است.', array_merge( $this->get_manual_sync_status(), array( 'pausedForUpgrade' => true, 'upgradeBarrier' => Mobo_Core_Upgrade_Coordinator::get_status() ) ) );
 		}
@@ -955,6 +973,25 @@ class Mobo_Core_Product_Sync {
 	}
 
 	public function process_product_updated_payload( &$payload ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( &$payload ) {
+					return $this->process_product_updated_payload_guarded( $payload );
+				},
+				$this->is_repair_mode() ? 'repair-product' : 'webhook-product'
+			);
+		}
+
+		return $this->process_product_updated_payload_guarded( $payload );
+	}
+
+	/**
+	 * Process ProductUpdated after entering the Mobo cache mutation scope.
+	 *
+	 * @param array $payload Payload, by reference.
+	 * @return array
+	 */
+	private function process_product_updated_payload_guarded( &$payload ) {
 		$product_guid = $this->extract_current_product_guid_from_product_updated_payload( $payload );
 
 		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
@@ -1139,6 +1176,26 @@ class Mobo_Core_Product_Sync {
 	}
 
 	public function process_update_variant_payload( $payload, $from_manual_sync = false ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $payload, $from_manual_sync ) {
+					return $this->process_update_variant_payload_guarded( $payload, $from_manual_sync );
+				},
+				( $from_manual_sync || $this->is_repair_mode() ) ? 'repair-variant' : 'webhook-variant'
+			);
+		}
+
+		return $this->process_update_variant_payload_guarded( $payload, $from_manual_sync );
+	}
+
+	/**
+	 * Process UpdateVariant after entering the Mobo cache mutation scope.
+	 *
+	 * @param array $payload Payload.
+	 * @param bool  $from_manual_sync Whether called by manual Sync/Repair.
+	 * @return array
+	 */
+	private function process_update_variant_payload_guarded( $payload, $from_manual_sync = false ) {
 		$product_guid = $this->extract_product_guid_from_update_variant_payload( $payload );
 
 		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {

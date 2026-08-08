@@ -113,6 +113,9 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_category_placeholder_repair_at' );
 	delete_option( 'mobo_core_cache_purge_last_result' );
 	delete_option( 'mobo_core_cache_purge_archives_on_product_update' );
+	delete_option( 'mobo_core_cache_archive_purge_interval_minutes' );
+	delete_option( 'mobo_core_cache_archive_purge_queue' );
+	delete_option( 'mobo_core_cache_archive_purge_last_result' );
 	delete_option( 'mobo_core_auto_reconciliation_enabled' );
 	delete_option( 'mobo_core_reconciliation_fast_interval' );
 	delete_option( 'mobo_core_reconciliation_products_per_run' );

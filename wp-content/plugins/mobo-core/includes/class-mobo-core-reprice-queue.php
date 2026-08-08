@@ -108,6 +108,25 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	public function process_batch( $limit = null ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $limit ) {
+					return $this->process_batch_guarded( $limit );
+				},
+				'reprice-queue'
+			);
+		}
+
+		return $this->process_batch_guarded( $limit );
+	}
+
+	/**
+	 * Execute the mutation batch inside the cache mutation scope.
+	 *
+	 * @param int|null $limit Batch size.
+	 * @return array
+	 */
+	private function process_batch_guarded( $limit = null ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'reprice-queue' ), array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true ) );
 		}

@@ -53,6 +53,7 @@ class Mobo_Core_Migration {
 		self::apply_103194_health_pull_only( '' );
 		self::apply_103198_manual_initial_sync_safety( '' );
 		self::apply_103199_image_queue_recovery( '' );
+		self::apply_10333_archive_purge_interval_migration( '' );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -95,6 +96,7 @@ class Mobo_Core_Migration {
 		self::apply_103194_health_pull_only( $current );
 		self::apply_103198_manual_initial_sync_safety( $current );
 		self::apply_103199_image_queue_recovery( $current );
+		self::apply_10333_archive_purge_interval_migration( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -298,6 +300,31 @@ class Mobo_Core_Migration {
 		update_option( 'mobo_core_category_placeholder_repair_pending', '1', false );
 	}
 
+
+
+	/**
+	 * Replace the legacy immediate archive-purge boolean with a deferred interval.
+	 *
+	 * Legacy OFF remains disabled. Legacy ON migrates to the shortest supported
+	 * window (15 minutes), preserving freshness without reintroducing per-save
+	 * archive purges. New installs keep the normal default from Settings.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10333_archive_purge_interval_migration( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.3', '>=' ) ) {
+			return;
+		}
+
+		$legacy = get_option( 'mobo_core_cache_purge_archives_on_product_update', false );
+		if ( false !== $legacy ) {
+			$interval = in_array( strtolower( trim( (string) $legacy ) ), array( '1', 'yes', 'true', 'on' ), true ) ? 15 : 0;
+			update_option( 'mobo_core_cache_archive_purge_interval_minutes', (string) $interval, false );
+			delete_option( 'mobo_core_cache_purge_archives_on_product_update' );
+		}
+	}
 
 	/**
 	 * Run repairs that require taxonomies registered on WordPress init.

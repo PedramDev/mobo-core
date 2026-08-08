@@ -45,7 +45,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug'            => '1',
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
-			'mobo_core_cache_purge_archives_on_product_update' => '0',
+			'mobo_core_cache_archive_purge_interval_minutes' => '15',
 			'mobo_core_category_mapping_enabled'  => '1',
 			'mobo_core_category_mapping_required' => '0',
 			'mobo_core_address_mapping_show_all_countries' => '0',
@@ -477,7 +477,7 @@ class Mobo_Core_Settings {
 		self::save_int( $post, 'mobo_core_images_per_run', 1, 0, 10 );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_blocking' );
-		self::save_bool_if_present( $post, 'mobo_core_cache_purge_archives_on_product_update' );
+		self::save_cache_archive_purge_interval_if_present( $post );
 		self::save_int_if_present( $post, 'mobo_core_image_max_try', 5, 1, 20 );
 		self::save_int_if_present( $post, 'mobo_core_image_retry_base_seconds', 120, 30, 900 );
 		self::save_int_if_present( $post, 'mobo_core_image_long_retry_seconds', 21600, 3600, 604800 );
@@ -666,7 +666,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug' => 'بروزرسانی نامک محصول',
 			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
 			'global_update_images' => 'بروزرسانی تصاویر',
-			'mobo_core_cache_purge_archives_on_product_update' => 'پاک‌سازی کش آرشیوها پس از بروزرسانی محصول',
+			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی کش آرشیوهای محصول',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
 			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
 			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',
@@ -832,6 +832,57 @@ class Mobo_Core_Settings {
 		);
 	}
 
+
+
+	/**
+	 * Allowed deferred archive purge intervals in minutes.
+	 * Zero disables archive page-cache invalidation; there is intentionally no
+	 * immediate mode because Mobo batches archive invalidation by design.
+	 *
+	 * @return array
+	 */
+	public static function cache_archive_purge_intervals() {
+		return array( 0, 5, 10, 15, 20, 25, 30, 45, 60 );
+	}
+
+	/**
+	 * Normalize an archive purge interval to the supported enum.
+	 *
+	 * @param mixed $value Raw value.
+	 * @param int   $default Fallback value.
+	 * @return int
+	 */
+	public static function sanitize_cache_archive_purge_interval( $value, $default = 0 ) {
+		$value   = absint( $value );
+		$default = absint( $default );
+		$allowed = self::cache_archive_purge_intervals();
+
+		if ( in_array( $value, $allowed, true ) ) {
+			return $value;
+		}
+
+		return in_array( $default, $allowed, true ) ? $default : 0;
+	}
+
+	/**
+	 * Save the deferred archive purge interval when present in the submitted form.
+	 *
+	 * @param array $post Submitted values.
+	 * @return void
+	 */
+	private static function save_cache_archive_purge_interval_if_present( $post ) {
+		$key = 'mobo_core_cache_archive_purge_interval_minutes';
+		if ( ! isset( $post[ $key ] ) ) {
+			return;
+		}
+
+		$value = self::sanitize_cache_archive_purge_interval( wp_unslash( $post[ $key ] ), 15 );
+		update_option( $key, (string) $value, false );
+
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'handle_archive_interval_changed' ) ) {
+			Mobo_Core_Cache_Purger::handle_archive_interval_changed( $value );
+		}
+	}
 
 	/**
 	 * Save integer option only when the field belongs to the submitted tab/form.

@@ -106,6 +106,7 @@ class Mobo_Core_Remote_Updater {
 
 		ignore_user_abort( true );
 		if ( function_exists( 'set_time_limit' ) ) {
+			// phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged -- remote deployment must survive hosts with a short default execution limit.
 			@set_time_limit( 360 );
 		}
 
@@ -289,7 +290,7 @@ class Mobo_Core_Remote_Updater {
 			return new WP_Error( 'mobo_core_upgrade_failed', $message, array( 'status' => 500 ) );
 		} finally {
 			if ( is_string( $tmp_file ) && '' !== $tmp_file && is_file( $tmp_file ) ) {
-				@unlink( $tmp_file );
+				wp_delete_file( $tmp_file );
 			}
 			if ( '' !== $staging_dir && is_dir( $staging_dir ) ) {
 				self::delete_tree( $staging_dir );
@@ -352,19 +353,19 @@ class Mobo_Core_Remote_Updater {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			@unlink( $tmp );
+			wp_delete_file( $tmp );
 			return $response;
 		}
 
 		$code = (int) wp_remote_retrieve_response_code( $response );
 		if ( 200 !== $code ) {
-			@unlink( $tmp );
+			wp_delete_file( $tmp );
 			return new WP_Error( 'mobo_core_upgrade_download_http', 'Portal package endpoint returned HTTP ' . $code . '.' );
 		}
 
 		$size = is_file( $tmp ) ? filesize( $tmp ) : 0;
 		if ( ! $size || $size > self::MAX_PACKAGE_BYTES ) {
-			@unlink( $tmp );
+			wp_delete_file( $tmp );
 			return new WP_Error( 'mobo_core_upgrade_package_size', 'Downloaded package is empty or exceeds 50 MiB.' );
 		}
 
@@ -647,20 +648,16 @@ class Mobo_Core_Remote_Updater {
 		if ( '' === $path || '/' === $path || ! file_exists( $path ) ) {
 			return;
 		}
-		if ( is_link( $path ) || is_file( $path ) ) {
-			@unlink( $path );
+
+		$filesystem = self::initialize_direct_filesystem();
+		if ( is_wp_error( $filesystem ) ) {
 			return;
 		}
-		$items = scandir( $path );
-		if ( false !== $items ) {
-			foreach ( $items as $item ) {
-				if ( '.' === $item || '..' === $item ) {
-					continue;
-				}
-				self::delete_tree( $path . DIRECTORY_SEPARATOR . $item );
-			}
+
+		global $wp_filesystem;
+		if ( is_object( $wp_filesystem ) ) {
+			$wp_filesystem->delete( $path, true );
 		}
-		@rmdir( $path );
 	}
 
 	private static function verify_portal_signature( $deployment_id, $expected_current, $target_version, $package_url, $package_sha256, $download_token, $issued_at, $provided_signature ) {

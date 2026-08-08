@@ -313,6 +313,15 @@ class Mobo_Core_Cron_Runner {
 		$disabled_stages = array();
 		$aggregate       = $this->empty_aggregate_result( $source );
 
+		/* Deferred category/tag/shop/home page-cache invalidation is driven by the real Mobo runner. */
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'process_due_archive_purge' ) ) {
+			try {
+				$aggregate['archiveCachePurge'] = Mobo_Core_Cache_Purger::process_due_archive_purge( $source );
+			} catch ( Throwable $e ) {
+				$aggregate['archiveCachePurge'] = $this->exception_result( 'archive-cache-purge-exception', $e );
+			}
+		}
+
 		while ( $rounds < absint( $config['maxRounds'] ) ) {
 			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 				$upgrade_paused = true;

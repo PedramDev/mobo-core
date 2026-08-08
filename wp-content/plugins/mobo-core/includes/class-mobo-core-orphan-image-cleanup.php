@@ -850,13 +850,15 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return;
 		}
 
-		$key = $this->family_key_from_webp( $webp_file );
-		$wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM " . self::table_name() . " WHERE file_key = %s AND status IN ('candidate', 'skipped', 'failed')",
-				$key
-			)
-		);
+		$key   = $this->family_key_from_webp( $webp_file );
+		$table = self::table_name();
+		foreach ( array( 'candidate', 'skipped', 'failed' ) as $status ) {
+			$wpdb->delete(
+				$table,
+				array( 'file_key' => $key, 'status' => $status ),
+				array( '%s', '%s' )
+			);
+		}
 	}
 
 	/**

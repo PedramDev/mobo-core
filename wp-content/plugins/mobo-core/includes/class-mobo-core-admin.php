@@ -26,6 +26,7 @@ class Mobo_Core_Admin {
 		add_filter( 'display_post_states', array( $this, 'add_mobo_product_post_state' ), 10, 2 );
 
 		add_action( 'admin_post_mobo_core_save_settings', array( $this, 'handle_save_settings' ) );
+		add_action( 'admin_post_mobo_core_php_diagnostics', array( $this, 'handle_php_diagnostics' ) );
 		add_action( 'admin_post_mobo_core_tool_test_mobo_login', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_clear_mobo_debug_log', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_clear_shipping_diagnostics', array( $this, 'handle_admin_tool_action' ) );
@@ -1070,11 +1071,11 @@ class Mobo_Core_Admin {
 					<?php $this->bool_field( 'فقط محصولات موجود', 'mobo_core_only_in_stock' ); ?>
 					<?php $this->bool_field( 'اعمال تخفیف‌های موبو', 'global_product_auto_compare_price' ); ?>
 					<?php $this->bool_field( 'آپدیت اتوماتیک عکس‌های محصول', 'global_update_images' ); ?>
-					<?php $this->bool_field( 'پاک‌سازی کش آرشیوها هنگام بروزرسانی محصول', 'mobo_core_cache_purge_archives_on_product_update' ); ?>
+					<?php $this->cache_archive_purge_interval_field(); ?>
 				</div>
 
 				<div class="mobo-note">
-					اگر پاک‌سازی کش آرشیوها خاموش باشد، کش صفحه خود محصول و Object Cache همچنان پاک می‌شود؛ اما Mobo Core به‌صورت صریح Shop، دسته‌ها، برچسب‌ها و صفحه اصلی را purge نمی‌کند. افزونه کش ممکن است قوانین داخلی مستقل خودش را داشته باشد.
+					کش صفحه خود محصول و Object Cache بلافاصله invalidate می‌شود. کش دسته‌ها، برچسب‌ها، Shop و صفحه اصلی در یک صف persistent جمع می‌شود و فقط در فاصله انتخابی توسط mobo-cron.php به‌صورت تجمیعی purge می‌شود؛ حالت purge لحظه‌ای آرشیوها وجود ندارد.
 				</div>
 
 				<div class="mobo-note">
@@ -2005,6 +2006,48 @@ type:{mobo_order_type_label}</textarea>
 
 
 	/**
+	 * Render bounded administrator-only PHP diagnostics without exposing phpinfo().
+	 *
+	 * @return void
+	 */
+	public function handle_php_diagnostics() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ), '', array( 'response' => 403 ) );
+		}
+
+		check_admin_referer( 'mobo_core_php_diagnostics' );
+		nocache_headers();
+		header( 'X-Robots-Tag: noindex, nofollow, noarchive', true );
+		header( 'Content-Security-Policy: default-src \'none\'; style-src \'unsafe-inline\'; base-uri \'none\'; frame-ancestors \'self\'' );
+
+		$settings = array(
+			'PHP Version'        => PHP_VERSION,
+			'SAPI'               => PHP_SAPI,
+			'Memory Limit'       => (string) ini_get( 'memory_limit' ),
+			'Max Execution Time' => (string) ini_get( 'max_execution_time' ),
+			'Upload Max Filesize'=> (string) ini_get( 'upload_max_filesize' ),
+			'Post Max Size'      => (string) ini_get( 'post_max_size' ),
+			'Max Input Vars'     => (string) ini_get( 'max_input_vars' ),
+			'Default Socket Timeout' => (string) ini_get( 'default_socket_timeout' ),
+			'WordPress Version'  => get_bloginfo( 'version' ),
+			'WooCommerce Version'=> defined( 'WC_VERSION' ) ? WC_VERSION : 'not loaded',
+			'Mobo Core Version'  => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+		);
+		$extensions = get_loaded_extensions();
+		sort( $extensions, SORT_NATURAL | SORT_FLAG_CASE );
+
+		echo '<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+		echo '<title>جزئیات محیط PHP - موبو</title><style>body{font-family:Tahoma,Arial,sans-serif;margin:24px;line-height:1.8;color:#1d2327}table{border-collapse:collapse;width:100%;max-width:960px}th,td{border:1px solid #dcdcde;padding:8px 10px;text-align:right;vertical-align:top}th{width:260px;background:#f6f7f7}code{direction:ltr;unicode-bidi:embed}.wrap{max-width:1100px;margin:auto}.note{background:#f6f7f7;padding:12px 16px;border-right:4px solid #2271b1}</style></head><body><div class="wrap">';
+		echo '<h1>جزئیات امن محیط PHP</h1><p class="note">این صفحه عمداً phpinfo() کامل، مسیرهای فایل، Environment Variables، Headerها و مقادیر حساس را نمایش نمی‌دهد.</p><table>';
+		foreach ( $settings as $label => $value ) {
+			echo '<tr><th>' . esc_html( $label ) . '</th><td><code>' . esc_html( (string) $value ) . '</code></td></tr>';
+		}
+		echo '</table><h2>PHP Extensions</h2><p><code>' . esc_html( implode( ', ', $extensions ) ) . '</code></p></div></body></html>';
+		exit;
+	}
+
+
+	/**
 	 * Render health reporting tab.
 	 *
 	 * @return void
@@ -2014,6 +2057,7 @@ type:{mobo_order_type_label}</textarea>
 		$local          = $reporter->build_report();
 		$image          = isset( $local['imageProcessing'] ) && is_array( $local['imageProcessing'] ) ? $local['imageProcessing'] : array();
 		$cache_purge    = isset( $local['cachePurge'] ) && is_array( $local['cachePurge'] ) ? $local['cachePurge'] : array();
+		$archive_cache_queue = isset( $cache_purge['archiveQueue'] ) && is_array( $cache_purge['archiveQueue'] ) ? $cache_purge['archiveQueue'] : array();
 		$cache_purge_status_labels = array(
 			'success'   => 'موفق',
 			'partial'   => 'نیمه‌موفق؛ حداقل یک Integration خطا داشته',
@@ -2022,7 +2066,7 @@ type:{mobo_order_type_label}</textarea>
 		);
 		$cache_purge_status = isset( $cache_purge['status'] ) ? sanitize_key( (string) $cache_purge['status'] ) : 'never_run';
 		$wp_cron_ok     = $this->is_wp_cron_disabled();
-		$phpinfo_url    = wp_nonce_url( MOBO_CORE_PLUGIN_URL . 'mobo-phpinfo.php', 'mobo_core_phpinfo' );
+		$php_diagnostics_url = wp_nonce_url( admin_url( 'admin-post.php?action=mobo_core_php_diagnostics' ), 'mobo_core_php_diagnostics' );
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
 			<input type="hidden" name="action" value="mobo_core_save_settings">
@@ -2053,7 +2097,7 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card">
 					<div class="mobo-card-head">
 						<h2>PHP و پردازش تصویر</h2>
-						<p>خلاصه امن این اطلاعات در پاسخ endpoint سلامت قرار می‌گیرد. خروجی کامل phpinfo فقط برای مدیر واردشده قابل مشاهده است.</p>
+						<p>خلاصه امن این اطلاعات در پاسخ endpoint سلامت قرار می‌گیرد. جزئیات امن محیط PHP فقط برای مدیر واردشده قابل مشاهده است.</p>
 					</div>
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'نسخه PHP', isset( $local['phpVersion'] ) ? $local['phpVersion'] : '—' ); ?>
@@ -2062,8 +2106,8 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->status_box( 'پشتیبانی WebP وردپرس', ! empty( $image['wordpressWebp'] ) ? 'دارد' : 'ندارد' ); ?>
 						<?php $this->status_box( 'دسترسی نوشتن uploads', ! empty( $image['uploadsWritable'] ) ? 'دارد' : 'ندارد' ); ?>
 					</div>
-					<p><a class="button button-secondary" href="<?php echo esc_url( $phpinfo_url ); ?>" target="_blank" rel="noopener">مشاهده phpinfo کامل و محافظت‌شده</a></p>
-					<div class="mobo-help">لینک phpinfo دارای nonce کوتاه‌مدت است و فقط برای مدیر واردشده باز می‌شود. آن را عمومی منتشر نکنید.</div>
+					<p><a class="button button-secondary" href="<?php echo esc_url( $php_diagnostics_url ); ?>" target="_blank" rel="noopener">مشاهده جزئیات امن محیط PHP</a></p>
+					<div class="mobo-help">این صفحه دارای nonce کوتاه‌مدت است، فقط برای مدیر واردشده باز می‌شود و مسیرهای فایل/متغیرهای حساس phpinfo را نمایش نمی‌دهد.</div>
 				</div>
 
 				<div class="mobo-card mobo-card-wide">
@@ -2079,6 +2123,10 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->status_box( 'آخرین موفقیت کامل', ! empty( $cache_purge['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format_value( $cache_purge['lastSuccessAt'] ) : '—' ); ?>
 						<?php $this->status_box( 'محصول / URL', absint( isset( $cache_purge['productCount'] ) ? $cache_purge['productCount'] : 0 ) . ' / ' . absint( isset( $cache_purge['urlCount'] ) ? $cache_purge['urlCount'] : 0 ) ); ?>
 						<?php $this->status_box( 'خطاهای متوالی', absint( isset( $cache_purge['consecutiveFailures'] ) ? $cache_purge['consecutiveFailures'] : 0 ) ); ?>
+						<?php $this->status_box( 'فاصله Purge آرشیو', absint( isset( $archive_cache_queue['intervalMinutes'] ) ? $archive_cache_queue['intervalMinutes'] : 0 ) > 0 ? absint( $archive_cache_queue['intervalMinutes'] ) . ' دقیقه' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'صف آرشیو URL / Product', absint( isset( $archive_cache_queue['pendingUrlCount'] ) ? $archive_cache_queue['pendingUrlCount'] : 0 ) . ' / ' . absint( isset( $archive_cache_queue['pendingProductCount'] ) ? $archive_cache_queue['pendingProductCount'] : 0 ) ); ?>
+						<?php $this->status_box( 'موعد Purge آرشیو', ! empty( $archive_cache_queue['dueAt'] ) ? Mobo_Core_Iran_Date::format_value( $archive_cache_queue['dueAt'] ) : '—' ); ?>
+						<?php $this->status_box( 'آخرین Purge آرشیو', ! empty( $archive_cache_queue['lastCompletedAt'] ) ? Mobo_Core_Iran_Date::format_value( $archive_cache_queue['lastCompletedAt'] ) : '—' ); ?>
 					</div>
 
 					<?php if ( ! empty( $cache_purge['lastError'] ) ) : ?>
@@ -2122,7 +2170,7 @@ type:{mobo_order_type_label}</textarea>
 				'راهنمای سلامت سایت',
 				array(
 					array( 'title' => 'دریافت خودکار', 'text' => 'Portal endpoint سلامت را دوره‌ای با X-SEC فراخوانی می‌کند. افزونه هیچ گزارش دوره‌ای به بیرون Push نمی‌کند.' ),
-					array( 'title' => 'phpinfo', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP در پاسخ سلامت قرار می‌گیرد. خروجی کامل phpinfo فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
+					array( 'title' => 'PHP Diagnostics', 'text' => 'خلاصه غیرحساس PHP، افزونه‌های PHP و قابلیت WebP در پاسخ سلامت قرار می‌گیرد. جزئیات امن محیط PHP فقط از لینک محافظت‌شده مدیر قابل مشاهده است.' ),
 					array( 'title' => 'کران', 'text' => 'برای جلوگیری از اجرای همزمان WP-Cron داخلی و Cron واقعی، DISABLE_WP_CRON باید true باشد.' ),
 				),
 				'اگر WebP یا دسترسی نوشتن uploads در وضعیت خطا بود، قبل از نوسازی تصاویر آن را در هاست اصلاح کنید.'
@@ -4320,6 +4368,60 @@ type:{mobo_order_type_label}</textarea>
 		<?php
 	}
 
+
+	/**
+	 * Deferred archive page-cache purge interval.
+	 *
+	 * @return void
+	 */
+	private function cache_archive_purge_interval_field() {
+		$key     = 'mobo_core_cache_archive_purge_interval_minutes';
+		$value   = Mobo_Core_Settings::sanitize_cache_archive_purge_interval( Mobo_Core_Settings::get( $key, '15' ), 15 );
+		$options = array(
+			0  => 'غیرفعال',
+			5  => 'هر 5 دقیقه',
+			10 => 'هر 10 دقیقه',
+			15 => 'هر 15 دقیقه',
+			20 => 'هر 20 دقیقه',
+			25 => 'هر 25 دقیقه',
+			30 => 'هر 30 دقیقه',
+			45 => 'هر 45 دقیقه',
+			60 => 'هر 60 دقیقه',
+		);
+		?>
+		<div class="mobo-field">
+			<label for="<?php echo esc_attr( $key ); ?>">پاک‌سازی کش آرشیوهای مرتبط</label>
+			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
+				<?php foreach ( $options as $minutes => $label ) : ?>
+					<option value="<?php echo esc_attr( $minutes ); ?>" <?php selected( $value, $minutes ); ?>><?php echo esc_html( $label ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<div class="mobo-help">Product cache فوری پاک می‌شود؛ Category/Tag/Shop/Home در بازه انتخابی تجمیع و purge می‌شوند.</div>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Save the product-tab deferred archive purge interval.
+	 *
+	 * @return void
+	 */
+	private function save_cache_archive_purge_interval_from_post() {
+		$key = 'mobo_core_cache_archive_purge_interval_minutes';
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- handle_save_settings() verifies mobo_core_nonce before dispatching to this private helper.
+		if ( ! isset( $_POST[ $key ] ) ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- nonce is verified by the caller; the dedicated sanitizer validates the allowed interval set.
+		$value = Mobo_Core_Settings::sanitize_cache_archive_purge_interval( wp_unslash( $_POST[ $key ] ), 15 );
+		update_option( $key, (string) $value, false );
+
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'handle_archive_interval_changed' ) ) {
+			Mobo_Core_Cache_Purger::handle_archive_interval_changed( $value );
+		}
+	}
+
 	/**
 	 * Integer field.
 	 *
@@ -5325,9 +5427,7 @@ type:{mobo_order_type_label}</textarea>
 
 		$uploads = wp_upload_dir( null, false );
 		if ( empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) ) {
-			$uploads_writable = function_exists( 'wp_is_writable' )
-				? wp_is_writable( $uploads['basedir'] )
-				: is_writable( $uploads['basedir'] );
+			$uploads_writable = wp_is_writable( $uploads['basedir'] );
 		}
 
 		$image_engine_ready = $gd_webp || $imagick_webp;
@@ -6031,9 +6131,9 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_only_in_stock',
 						'global_product_auto_compare_price',
 						'global_update_images',
-						'mobo_core_cache_purge_archives_on_product_update',
 					)
 				);
+				$this->save_cache_archive_purge_interval_from_post();
 				break;
 
 			case 'categories':
@@ -6409,6 +6509,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		if ( 'connection' === $tab && isset( $_POST['mobo_core_security_code'] ) ) {
+			// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- security codes must preserve printable ASCII exactly; normalize_security_code() + is_valid_security_code() enforce the credential format.
 			$posted_security_code = Mobo_Core_Settings::normalize_security_code( wp_unslash( $_POST['mobo_core_security_code'] ) );
 
 			if ( '' !== $posted_security_code && ! Mobo_Core_Settings::is_valid_security_code( $posted_security_code ) ) {

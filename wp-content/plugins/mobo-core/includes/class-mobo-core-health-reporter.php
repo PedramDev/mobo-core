@@ -291,7 +291,7 @@ class Mobo_Core_Health_Reporter {
 		$probe   = $this->get_storage_write_probe();
 		$automation = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
 
-		$uploads_writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && is_writable( $uploads['basedir'] );
+		$uploads_writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && wp_is_writable( $uploads['basedir'] );
 		$uploads_error    = ! empty( $uploads['error'] ) ? (string) $uploads['error'] : '';
 		if ( $uploads_writable && isset( $probe['ok'] ) && false === (bool) $probe['ok'] ) {
 			$uploads_writable = false;
@@ -874,7 +874,6 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	private function get_storage_write_probe() {
-		$probe_handle   = null;
 		$probe_filename = '';
 
 		try {
@@ -909,52 +908,29 @@ class Mobo_Core_Health_Reporter {
 				return $result;
 			}
 
-			if ( ! is_writable( $basedir ) ) {
+			if ( ! wp_is_writable( $basedir ) ) {
 				$result['error'] = 'پوشه uploads بر اساس مجوزهای Filesystem قابل نوشتن نیست.';
 				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
 				return $result;
 			}
 
+			require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-base.php';
+			require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-direct.php';
+			$filesystem = new WP_Filesystem_Direct( null );
 			$filename       = trailingslashit( $basedir ) . '.mobo-core-write-probe-' . wp_generate_password( 12, false, false ) . '.tmp';
 			$probe_filename = $filename;
+			$payload        = str_repeat( 'M', $bytes );
+
 			if ( function_exists( 'error_clear_last' ) ) {
 				error_clear_last();
 			}
-			$handle       = @fopen( $filename, 'x+b' );
-			$probe_handle = $handle;
-			if ( false === $handle ) {
-				$result['error'] = $this->get_last_php_error_message( 'ایجاد فایل آزمایشی در uploads ناموفق بود؛ سهمیه دیسک یا inode ممکن است تمام شده باشد.' );
-				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
-				return $result;
-			}
 
-			$written = 0;
-			$chunk   = str_repeat( 'M', 4096 );
-			if ( function_exists( 'error_clear_last' ) ) {
-				error_clear_last();
-			}
-			while ( $written < $bytes ) {
-				$remaining = $bytes - $written;
-				$length    = min( strlen( $chunk ), $remaining );
-				$count     = @fwrite( $handle, substr( $chunk, 0, $length ) );
-				if ( false === $count || $count <= 0 ) {
-					break;
-				}
-				$written += $count;
-			}
-
-			$flushed = @fflush( $handle );
-			if ( function_exists( 'fsync' ) ) {
-				@fsync( $handle );
-			}
-			@fclose( $handle );
-			$probe_handle = null;
-			clearstatcache( true, $filename );
-			$actual_size = @filesize( $filename );
-			$deleted        = @unlink( $filename );
+			$written_ok = $filesystem->put_contents( $filename, $payload, FS_CHMOD_FILE );
+			$actual_size = $written_ok ? $filesystem->size( $filename ) : false;
+			$deleted     = $written_ok ? $filesystem->delete( $filename, false, 'f' ) : false;
 			$probe_filename = $deleted ? '' : $filename;
 
-			if ( $written === $bytes && false !== $flushed && false !== $actual_size && (int) $actual_size >= $bytes ) {
+			if ( $written_ok && false !== $actual_size && (int) $actual_size >= $bytes ) {
 				$result['ok']     = true;
 				$result['status'] = $deleted ? 'ok' : 'ok_cleanup_failed';
 				if ( ! $deleted ) {
@@ -968,16 +944,8 @@ class Mobo_Core_Health_Reporter {
 			return $result;
 		} catch ( Throwable $error ) {
 			try {
-				if ( is_resource( $probe_handle ) ) {
-					@fclose( $probe_handle );
-				}
-			} catch ( Throwable $cleanup_error ) {
-				// Cleanup must never make Site Health fail.
-			}
-
-			try {
 				if ( '' !== $probe_filename ) {
-					@unlink( $probe_filename );
+					wp_delete_file( $probe_filename );
 				}
 			} catch ( Throwable $cleanup_error ) {
 				// Cleanup must never make Site Health fail.

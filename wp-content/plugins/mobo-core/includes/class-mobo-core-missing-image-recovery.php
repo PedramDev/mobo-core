@@ -47,13 +47,6 @@ class Mobo_Core_Missing_Image_Recovery {
 		$after_id    = max( 0, absint( $after_id ) );
 		$fetch_limit = $limit + 1;
 
-		$candidate_where = "
-			( thumbnail.meta_value IS NULL
-			OR thumbnail.meta_value = ''
-			OR CAST(thumbnail.meta_value AS UNSIGNED) = 0
-			OR attachment.ID IS NULL
-			OR attached_file.meta_value IS NULL
-			OR attached_file.meta_value = '' )";
 
 		$estimated_total = absint(
 			$wpdb->get_var(
@@ -74,7 +67,12 @@ class Mobo_Core_Missing_Image_Recovery {
 					AND attached_file.meta_key = '_wp_attached_file'
 				WHERE p.post_type = 'product'
 				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND {$candidate_where}"
+				AND ( thumbnail.meta_value IS NULL
+				OR thumbnail.meta_value = ''
+				OR CAST(thumbnail.meta_value AS UNSIGNED) = 0
+				OR attachment.ID IS NULL
+				OR attached_file.meta_value IS NULL
+				OR attached_file.meta_value = '' )"
 			)
 		);
 
@@ -97,7 +95,12 @@ class Mobo_Core_Missing_Image_Recovery {
 					AND attached_file.meta_key = '_wp_attached_file'
 				WHERE p.post_type = 'product'
 				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND {$candidate_where}
+				AND ( thumbnail.meta_value IS NULL
+				OR thumbnail.meta_value = ''
+				OR CAST(thumbnail.meta_value AS UNSIGNED) = 0
+				OR attachment.ID IS NULL
+				OR attached_file.meta_value IS NULL
+				OR attached_file.meta_value = '' )
 				AND p.ID > %d
 				ORDER BY p.ID ASC
 				LIMIT %d",

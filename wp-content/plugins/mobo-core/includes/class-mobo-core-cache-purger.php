@@ -24,12 +24,18 @@ final class Mobo_Core_Cache_Purger {
 	private static $product_ids       = array();
 	private static $urls              = array();
 	private static $custom_urls       = array();
+	private static $archive_urls      = array();
 	private static $reasons           = array();
 	private static $collection_errors = array();
 	private static $native_registered = false;
 
 	const OPTION_LAST_RESULT = 'mobo_core_cache_purge_last_result';
-	const HEALTH_SCHEMA_VERSION = 1;
+	const OPTION_ARCHIVE_QUEUE = 'mobo_core_cache_archive_purge_queue';
+	const OPTION_ARCHIVE_LAST_RESULT = 'mobo_core_cache_archive_purge_last_result';
+	const ARCHIVE_QUEUE_SCHEMA_VERSION = 1;
+	const ARCHIVE_QUEUE_MAX_URLS = 5000;
+	const ARCHIVE_QUEUE_MAX_PRODUCTS = 5000;
+	const HEALTH_SCHEMA_VERSION = 2;
 	const ERROR_MAX_LENGTH = 1000;
 
 	/**
@@ -51,6 +57,7 @@ final class Mobo_Core_Cache_Purger {
 		add_action( 'set_object_terms', array( __CLASS__, 'handle_object_terms_set' ), 20, 6 );
 		add_action( 'post_updated', array( __CLASS__, 'handle_post_updated' ), 20, 3 );
 		add_action( 'shutdown', array( __CLASS__, 'flush' ), PHP_INT_MAX );
+		add_filter( 'rocket_disable_url_validation', array( __CLASS__, 'filter_rocket_disable_product_category_url_validation' ), PHP_INT_MAX, 1 );
 
 		/*
 		 * Direct cron runners load WordPress normally, but the native fallback also
@@ -60,6 +67,44 @@ final class Mobo_Core_Cache_Purger {
 			self::$native_registered = true;
 			register_shutdown_function( array( __CLASS__, 'flush' ) );
 		}
+	}
+
+
+	/**
+	 * Disable WP Rocket taxonomy URL validation only for WooCommerce product categories.
+	 *
+	 * Some stores intentionally serve hierarchical product-category URLs while SEO
+	 * canonical generation returns a flattened term URL. WP Rocket rejects that
+	 * mismatch and never creates index-https.html. Limiting the bypass to product_cat
+	 * preserves normal URL validation everywhere else.
+	 *
+	 * @param bool $disabled Existing decision.
+	 * @return bool
+	 */
+	public static function filter_rocket_disable_product_category_url_validation( $disabled ) {
+		if ( $disabled ) {
+			return true;
+		}
+
+		$product_cat = sanitize_title( (string) get_query_var( 'product_cat', '' ) );
+		if ( '' !== $product_cat ) {
+			return true;
+		}
+
+		$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+		if ( '' === $request_uri ) {
+			return false;
+		}
+
+		$path = wp_parse_url( $request_uri, PHP_URL_PATH );
+		if ( ! is_string( $path ) || '' === $path ) {
+			return false;
+		}
+
+		$base       = self::product_category_base();
+		$base_prefix = '/' . trim( $base, '/' ) . '/';
+
+		return '' !== $base && 0 === strpos( '/' . ltrim( $path, '/' ), $base_prefix );
 	}
 
 	/**
@@ -102,7 +147,7 @@ final class Mobo_Core_Cache_Purger {
 			return;
 		}
 
-		if ( self::archive_purge_enabled() && in_array( $taxonomy, array( 'product_cat', 'product_tag' ), true ) ) {
+		if ( self::archive_purge_interval_minutes() > 0 && in_array( $taxonomy, array( 'product_cat', 'product_tag' ), true ) ) {
 			try {
 				self::capture_term_taxonomy_urls( $old_tt_ids, $taxonomy );
 				self::capture_term_taxonomy_urls( $tt_ids, $taxonomy );
@@ -244,6 +289,7 @@ final class Mobo_Core_Cache_Purger {
 				'products'     => 0,
 				'objects'      => 0,
 				'urls'         => 0,
+				'archiveUrlsQueued' => 0,
 				'integrations' => array(),
 				'status'       => 'not-run',
 			);
@@ -257,16 +303,18 @@ final class Mobo_Core_Cache_Purger {
 		$object_ids       = array();
 		$urls             = array();
 		$custom_urls      = array();
+		$archive_urls     = array();
 		$reasons          = array();
-		$integration_data      = array();
-		$archive_purge_enabled = self::archive_purge_enabled();
+		$integration_data = array();
+		$archive_interval = self::archive_purge_interval_minutes();
+		$archive_queue    = array( 'queued' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => 0 );
 		$overall_status   = 'failed';
 		$last_error       = '';
 
 		try {
 			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', array_keys( self::$product_ids ) ) ) ) );
 			$object_ids  = array_values( array_unique( array_filter( array_map( 'absint', array_keys( self::$object_ids ) ) ) ) );
-			$reasons           = array_values( array_filter( array_map( 'sanitize_key', array_keys( self::$reasons ) ) ) );
+			$reasons     = array_values( array_filter( array_map( 'sanitize_key', array_keys( self::$reasons ) ) ) );
 			$collection_errors = array_values( array_filter( array_map( array( __CLASS__, 'sanitize_error' ), self::$collection_errors ) ) );
 
 			foreach ( $product_ids as $product_id ) {
@@ -278,11 +326,11 @@ final class Mobo_Core_Cache_Purger {
 				}
 			}
 
-			$urls               = array_values( array_filter( array_map( array( __CLASS__, 'normalize_url' ), array_keys( self::$urls ) ) ) );
-			$urls               = array_values( array_unique( $urls ) );
-			$base_urls          = $urls;
+			$urls = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), array_keys( self::$urls ) ) ) ) );
+			$base_urls = $urls;
 			$queued_custom_urls = array_values( array_filter( array_map( array( __CLASS__, 'normalize_url' ), array_keys( self::$custom_urls ) ) ) );
-			$custom_hook_error  = self::sanitize_error( implode( ' | ', array_slice( $collection_errors, 0, 5 ) ) );
+			$archive_urls = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), array_keys( self::$archive_urls ) ) ) ) );
+			$custom_hook_error = self::sanitize_error( implode( ' | ', array_slice( $collection_errors, 0, 5 ) ) );
 
 			try {
 				$filtered_urls = apply_filters( 'mobo_core_cache_purge_urls', $urls, $product_ids, $reasons );
@@ -292,17 +340,21 @@ final class Mobo_Core_Cache_Purger {
 			} catch ( Throwable $e ) {
 				$filter_error = self::sanitize_error( 'mobo_core_cache_purge_urls: ' . $e->getMessage() );
 				$custom_hook_error = '' !== $custom_hook_error ? self::sanitize_error( $custom_hook_error . ' | ' . $filter_error ) : $filter_error;
-				self::log_warning(
-					'Custom cache purge URL filter failed: ' . $custom_hook_error,
-					array( 'integration' => 'custom-hooks' )
-				);
+				self::log_warning( 'Custom cache purge URL filter failed: ' . $custom_hook_error, array( 'integration' => 'custom-hooks' ) );
 			}
 
-			/*
-			 * WP Rocket's post API may invalidate related archives. When archive purge
-			 * is disabled, use only the exact collected product URLs. When enabled, the
-			 * post API handles standard relationships and this list holds custom URLs.
-			 */
+			if ( $archive_interval > 0 && ! empty( $archive_urls ) ) {
+				try {
+					$filtered_archive_urls = apply_filters( 'mobo_core_cache_archive_purge_urls', $archive_urls, $product_ids, $reasons, $archive_interval );
+					if ( is_array( $filtered_archive_urls ) ) {
+						$archive_urls = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $filtered_archive_urls ) ) ) );
+					}
+				} catch ( Throwable $e ) {
+					$filter_error = self::sanitize_error( 'mobo_core_cache_archive_purge_urls: ' . $e->getMessage() );
+					$custom_hook_error = '' !== $custom_hook_error ? self::sanitize_error( $custom_hook_error . ' | ' . $filter_error ) : $filter_error;
+				}
+			}
+
 			$custom_urls = array_values(
 				array_unique(
 					array_merge(
@@ -312,7 +364,11 @@ final class Mobo_Core_Cache_Purger {
 				)
 			);
 
-			/* Clear the queue before integrations run, preventing recursive duplicate work. */
+			if ( $archive_interval > 0 && ! empty( $archive_urls ) ) {
+				$archive_queue = self::enqueue_deferred_archive_purge( $archive_urls, $product_ids, $reasons, $archive_interval );
+			}
+
+			/* Clear the request queue before integrations run, preventing recursive duplicate work. */
 			self::reset_queue();
 
 			$inventory = self::get_current_integration_inventory();
@@ -325,11 +381,12 @@ final class Mobo_Core_Cache_Purger {
 				}
 			);
 
+			/* Page-cache product URLs are always immediate. Related archives are deferred. */
 			$integration_data['wpRocket'] = self::run_integration(
 				'wpRocket',
 				$inventory['wpRocket'],
-				static function () use ( $product_ids, $urls, $custom_urls, $archive_purge_enabled ) {
-					if ( ! self::purge_wp_rocket( $product_ids, $urls, $custom_urls, $archive_purge_enabled ) ) {
+				static function () use ( $product_ids, $urls, $custom_urls ) {
+					if ( ! self::purge_wp_rocket( $product_ids, $urls, $custom_urls, false ) ) {
 						throw new RuntimeException( 'WP Rocket targeted purge API is unavailable.' );
 					}
 				}
@@ -338,8 +395,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['liteSpeedCache'] = self::run_integration(
 				'liteSpeedCache',
 				$inventory['liteSpeedCache'],
-				static function () use ( $product_ids, $urls, $archive_purge_enabled ) {
-					if ( ! self::purge_litespeed( $product_ids, $urls, $archive_purge_enabled ) ) {
+				static function () use ( $product_ids, $urls ) {
+					if ( ! self::purge_litespeed( $product_ids, $urls, false ) ) {
 						throw new RuntimeException( 'LiteSpeed targeted purge hooks are unavailable.' );
 					}
 				}
@@ -348,8 +405,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['w3TotalCache'] = self::run_integration(
 				'w3TotalCache',
 				$inventory['w3TotalCache'],
-				static function () use ( $product_ids, $urls, $archive_purge_enabled ) {
-					if ( ! self::purge_w3_total_cache( $product_ids, $urls, $archive_purge_enabled ) ) {
+				static function () use ( $product_ids, $urls ) {
+					if ( ! self::purge_w3_total_cache( $product_ids, $urls, false ) ) {
 						throw new RuntimeException( 'W3 Total Cache targeted purge API is unavailable.' );
 					}
 				}
@@ -358,29 +415,28 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['wpSuperCache'] = self::run_integration(
 				'wpSuperCache',
 				$inventory['wpSuperCache'],
-				static function () use ( $product_ids, $archive_purge_enabled ) {
-					if ( ! self::purge_wp_super_cache( $product_ids, $archive_purge_enabled ) ) {
+				static function () use ( $product_ids ) {
+					if ( ! self::purge_wp_super_cache( $product_ids, false ) ) {
 						throw new RuntimeException( 'WP Super Cache targeted purge API is unavailable.' );
 					}
 				}
 			);
 
 			$context = array(
-				'product_ids'        => $product_ids,
-				'object_ids'         => $object_ids,
-				'urls'               => $urls,
-				'custom_urls'        => $custom_urls,
-				'reasons'             => $reasons,
-				'archivePurgeEnabled' => $archive_purge_enabled,
-				'integrationResults'  => $integration_data,
+				'product_ids'                  => $product_ids,
+				'object_ids'                   => $object_ids,
+				'urls'                         => $urls,
+				'custom_urls'                  => $custom_urls,
+				'reasons'                      => $reasons,
+				'archivePurgeEnabled'          => $archive_interval > 0,
+				'archivePurgeDeferred'         => true,
+				'archivePurgeIntervalMinutes'  => $archive_interval,
+				'archiveUrlsQueued'            => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
+				'archivePurgeDueAt'            => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+				'integrationResults'           => $integration_data,
 			);
 
-			$integration_data['customHooks'] = self::run_custom_hooks_integration(
-				$inventory['customHooks'],
-				$context,
-				$custom_hook_error
-			);
-
+			$integration_data['customHooks'] = self::run_custom_hooks_integration( $inventory['customHooks'], $context, $custom_hook_error );
 			$overall_status = self::resolve_overall_status( $integration_data );
 			$last_error     = self::resolve_last_integration_error( $integration_data );
 		} catch ( Throwable $e ) {
@@ -395,29 +451,28 @@ final class Mobo_Core_Cache_Purger {
 				'error'      => $last_error,
 			);
 			$overall_status = 'failed';
-			self::log_warning(
-				'Targeted cache purge pipeline failed but product synchronization will continue: ' . $last_error,
-				array( 'integration' => 'mobo-core-purger' )
-			);
+			self::log_warning( 'Targeted cache purge pipeline failed but product synchronization will continue: ' . $last_error, array( 'integration' => 'mobo-core-purger' ) );
 		} finally {
 			$completed_at = time();
 			$record = array(
-				'schemaVersion'       => self::HEALTH_SCHEMA_VERSION,
-				'pluginVersion'       => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
-				'status'              => $overall_status,
-				'attemptedAt'         => $attempted_at,
-				'completedAt'         => $completed_at,
-				'productCount'        => count( $product_ids ),
-				'objectCount'         => count( $object_ids ),
-				'urlCount'            => count( $urls ),
-				'customUrlCount'      => count( $custom_urls ),
-				'durationMs'          => self::elapsed_ms( $started_at ),
-				'reasons'             => array_slice( $reasons, 0, 20 ),
-				'archivePurgeEnabled' => $archive_purge_enabled,
-				'lastError'           => $last_error,
-				'integrations'        => $integration_data,
+				'schemaVersion'                => self::HEALTH_SCHEMA_VERSION,
+				'pluginVersion'                => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+				'status'                       => $overall_status,
+				'attemptedAt'                  => $attempted_at,
+				'completedAt'                  => $completed_at,
+				'productCount'                 => count( $product_ids ),
+				'objectCount'                  => count( $object_ids ),
+				'urlCount'                     => count( $urls ),
+				'customUrlCount'               => count( $custom_urls ),
+				'archivePurgeIntervalMinutes'  => $archive_interval,
+				'archiveUrlsQueued'            => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
+				'archivePurgeDueAt'            => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+				'durationMs'                   => self::elapsed_ms( $started_at ),
+				'reasons'                      => array_slice( $reasons, 0, 20 ),
+				'archivePurgeEnabled'           => $archive_interval > 0,
+				'lastError'                    => $last_error,
+				'integrations'                 => $integration_data,
 			);
-
 			self::persist_health_record( $record );
 			self::$flushing = false;
 		}
@@ -430,14 +485,403 @@ final class Mobo_Core_Cache_Purger {
 		}
 
 		return array(
-			'flushed'      => true,
-			'products'     => count( $product_ids ),
-			'objects'      => count( $object_ids ),
-			'urls'         => count( $urls ),
-			'integrations' => $successful_integrations,
+			'flushed'           => true,
+			'products'          => count( $product_ids ),
+			'objects'           => count( $object_ids ),
+			'urls'              => count( $urls ),
+			'archiveUrlsQueued' => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
+			'archivePurgeDueAt' => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+			'integrations'      => $successful_integrations,
+			'status'            => $overall_status,
+			'lastError'         => $last_error,
+		);
+	}
+
+	/**
+	 * React immediately when the admin changes the deferred archive purge interval.
+	 * Disabling clears pending archive work so it cannot fire unexpectedly later.
+	 * Shortening an interval may move the current due time earlier; new changes never
+	 * push an existing batching window further into the future.
+	 *
+	 * @param int $minutes Interval in minutes.
+	 * @return void
+	 */
+	public static function handle_archive_interval_changed( $minutes ) {
+		$minutes = self::sanitize_archive_interval( $minutes );
+		if ( $minutes <= 0 ) {
+			delete_option( self::OPTION_ARCHIVE_QUEUE );
+			return;
+		}
+
+		$queue = self::read_archive_queue();
+		if ( empty( $queue['urls'] ) ) {
+			return;
+		}
+
+		$now          = time();
+		$new_due      = $now + ( $minutes * MINUTE_IN_SECONDS );
+		$current_due  = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
+		$queue['dueAt'] = $current_due > 0 ? min( $current_due, $new_due ) : $new_due;
+		$queue['intervalMinutes'] = $minutes;
+		$queue['updatedAt']       = $now;
+		self::write_archive_queue( $queue );
+	}
+
+	/**
+	 * Process deferred archive page-cache invalidation when its batching window is due.
+	 * This is called by the real Mobo cron runner, not WP-Cron.
+	 *
+	 * @param string $source Runner source.
+	 * @return array
+	 */
+	public static function process_due_archive_purge( $source = 'real-cron' ) {
+		$source   = sanitize_key( (string) $source );
+		$interval = self::archive_purge_interval_minutes();
+		$queue    = self::read_archive_queue();
+		$now      = time();
+
+		if ( $interval <= 0 ) {
+			if ( ! empty( $queue['urls'] ) ) {
+				delete_option( self::OPTION_ARCHIVE_QUEUE );
+			}
+			return array( 'success' => true, 'status' => 'disabled', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
+		}
+
+		if ( empty( $queue['urls'] ) ) {
+			return array( 'success' => true, 'status' => 'empty', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
+		}
+
+		$due_at = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
+		if ( $due_at <= 0 ) {
+			$due_at = $now + ( $interval * MINUTE_IN_SECONDS );
+			$queue['dueAt'] = $due_at;
+			$queue['intervalMinutes'] = $interval;
+			self::write_archive_queue( $queue );
+		}
+
+		if ( $now < $due_at ) {
+			return array(
+				'success'      => true,
+				'status'       => 'waiting',
+				'processed'    => false,
+				'urlCount'     => count( $queue['urls'] ),
+				'productCount' => count( $queue['productIds'] ),
+				'dueAt'        => $due_at,
+				'secondsUntilDue' => max( 0, $due_at - $now ),
+			);
+		}
+
+		$lock = self::acquire_archive_queue_lock();
+		if ( false === $lock ) {
+			return array(
+				'success'      => false,
+				'status'       => 'locked',
+				'processed'    => false,
+				'urlCount'     => count( $queue['urls'] ),
+				'productCount' => count( $queue['productIds'] ),
+				'dueAt'        => $due_at,
+			);
+		}
+
+		$started = microtime( true );
+		$integration_data = array();
+		$overall_status   = 'failed';
+		$last_error       = '';
+		$urls             = array();
+		$product_ids      = array();
+		$reasons          = array();
+
+		try {
+			/* Re-read after acquiring the lock because another runner may have completed it. */
+			$queue = self::read_archive_queue();
+			$due_at = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
+			if ( empty( $queue['urls'] ) || ( $due_at > 0 && time() < $due_at ) ) {
+				$overall_status = 'success';
+				return array( 'success' => true, 'status' => 'not-due-after-lock', 'processed' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => $due_at );
+			}
+
+			$urls        = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $queue['urls'] ) ) ) );
+			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', $queue['productIds'] ) ) ) );
+			$reasons     = array_values( array_unique( array_filter( array_map( 'sanitize_key', $queue['reasons'] ) ) ) );
+
+			$inventory = self::get_current_integration_inventory();
+			$integration_data['wpRocket'] = self::run_integration(
+				'wpRocket',
+				$inventory['wpRocket'],
+				static function () use ( $product_ids, $urls ) {
+					if ( ! self::purge_wp_rocket_archive_targets( $product_ids, $urls ) ) {
+						throw new RuntimeException( 'WP Rocket archive purge API is unavailable.' );
+					}
+				}
+			);
+			$integration_data['liteSpeedCache'] = self::run_integration(
+				'liteSpeedCache',
+				$inventory['liteSpeedCache'],
+				static function () use ( $product_ids, $urls ) {
+					if ( ! self::purge_litespeed_archive_targets( $product_ids, $urls ) ) {
+						throw new RuntimeException( 'LiteSpeed archive purge hooks are unavailable.' );
+					}
+				}
+			);
+			$integration_data['w3TotalCache'] = self::run_integration(
+				'w3TotalCache',
+				$inventory['w3TotalCache'],
+				static function () use ( $product_ids, $urls ) {
+					if ( ! self::purge_w3_total_cache_archive_targets( $product_ids, $urls ) ) {
+						throw new RuntimeException( 'W3 Total Cache archive purge API is unavailable.' );
+					}
+				}
+			);
+			$integration_data['wpSuperCache'] = self::run_integration(
+				'wpSuperCache',
+				$inventory['wpSuperCache'],
+				static function () use ( $product_ids ) {
+					if ( ! self::purge_wp_super_cache_archive_products( $product_ids ) ) {
+						throw new RuntimeException( 'WP Super Cache archive purge API is unavailable.' );
+					}
+				}
+			);
+
+			$context = array(
+				'source'                      => $source,
+				'urls'                        => $urls,
+				'product_ids'                 => $product_ids,
+				'reasons'                     => $reasons,
+				'archivePurgeIntervalMinutes' => $interval,
+				'dueAt'                       => $due_at,
+				'integrationResults'          => $integration_data,
+			);
+			try {
+				do_action( 'mobo_core_cache_purger_after_archive_flush', $context );
+			} catch ( Throwable $e ) {
+				self::log_warning( 'Deferred archive cache custom hook failed: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'custom-hooks' ) );
+			}
+
+			$overall_status = self::resolve_overall_status( $integration_data );
+			$last_error     = self::resolve_last_integration_error( $integration_data );
+
+			if ( 'failed' !== $overall_status && 'partial' !== $overall_status ) {
+				delete_option( self::OPTION_ARCHIVE_QUEUE );
+			} else {
+				/* Retry failures on the next normal batching window, never in a tight loop. */
+				$queue['dueAt']           = time() + ( $interval * MINUTE_IN_SECONDS );
+				$queue['updatedAt']       = time();
+				$queue['attempts']        = isset( $queue['attempts'] ) ? absint( $queue['attempts'] ) + 1 : 1;
+				$queue['intervalMinutes'] = $interval;
+				self::write_archive_queue( $queue );
+			}
+		} catch ( Throwable $e ) {
+			$last_error     = self::sanitize_error( $e->getMessage() );
+			$overall_status = 'failed';
+			if ( ! empty( $queue['urls'] ) ) {
+				$queue['dueAt']     = time() + ( $interval * MINUTE_IN_SECONDS );
+				$queue['updatedAt'] = time();
+				self::write_archive_queue( $queue );
+			}
+			self::log_warning( 'Deferred archive cache purge failed: ' . $last_error, array( 'integration' => 'mobo-core-archive-purger' ) );
+		} finally {
+			$record = array(
+				'schemaVersion'                => self::ARCHIVE_QUEUE_SCHEMA_VERSION,
+				'pluginVersion'                => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+				'source'                       => $source,
+				'status'                       => $overall_status,
+				'attemptedAt'                  => $now,
+				'completedAt'                  => time(),
+				'intervalMinutes'              => $interval,
+				'urlCount'                     => count( $urls ),
+				'productCount'                 => count( $product_ids ),
+				'durationMs'                   => self::elapsed_ms( $started ),
+				'lastError'                    => $last_error,
+				'integrations'                 => $integration_data,
+			);
+			update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false );
+			self::release_archive_queue_lock( $lock );
+		}
+
+		return array(
+			'success'      => 'failed' !== $overall_status && 'partial' !== $overall_status,
 			'status'       => $overall_status,
+			'processed'    => true,
+			'urlCount'     => count( $urls ),
+			'productCount' => count( $product_ids ),
+			'durationMs'   => self::elapsed_ms( $started ),
 			'lastError'    => $last_error,
 		);
+	}
+
+	/**
+	 * Compact persistent archive queue status for health/admin diagnostics.
+	 *
+	 * @return array
+	 */
+	public static function get_archive_queue_status() {
+		$queue = self::read_archive_queue();
+		$last  = get_option( self::OPTION_ARCHIVE_LAST_RESULT, array() );
+		$last  = is_array( $last ) ? $last : array();
+		return array(
+			'intervalMinutes' => self::archive_purge_interval_minutes(),
+			'pendingUrlCount' => isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? count( $queue['urls'] ) : 0,
+			'pendingProductCount' => isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? count( $queue['productIds'] ) : 0,
+			'queuedAt'        => self::format_timestamp( isset( $queue['queuedAt'] ) ? absint( $queue['queuedAt'] ) : 0 ),
+			'dueAt'           => self::format_timestamp( isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0 ),
+			'lastAttemptAt'   => self::format_timestamp( isset( $last['attemptedAt'] ) ? absint( $last['attemptedAt'] ) : 0 ),
+			'lastCompletedAt' => self::format_timestamp( isset( $last['completedAt'] ) ? absint( $last['completedAt'] ) : 0 ),
+			'lastStatus'      => isset( $last['status'] ) ? sanitize_key( (string) $last['status'] ) : 'never-run',
+			'lastError'       => isset( $last['lastError'] ) ? self::sanitize_error( $last['lastError'] ) : '',
+		);
+	}
+
+	private static function enqueue_deferred_archive_purge( $urls, $product_ids, $reasons, $interval ) {
+		$interval = self::sanitize_archive_interval( $interval );
+		$urls = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), (array) $urls ) ) ) );
+		if ( $interval <= 0 || empty( $urls ) ) {
+			return array( 'queued' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => 0 );
+		}
+
+		$lock = self::acquire_archive_queue_lock();
+		if ( false === $lock ) {
+			self::log_warning( 'Deferred archive purge targets could not acquire the queue lock; retrying on the next mutation.', array( 'integration' => 'mobo-core-archive-purger' ) );
+			return array( 'queued' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => 0 );
+		}
+
+		try {
+			$queue = self::read_archive_queue();
+			$now   = time();
+			$existing_urls = isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? $queue['urls'] : array();
+			$existing_products = isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? $queue['productIds'] : array();
+			$existing_reasons = isset( $queue['reasons'] ) && is_array( $queue['reasons'] ) ? $queue['reasons'] : array();
+
+			$merged_urls = array_values( array_unique( array_merge( $existing_urls, $urls ) ) );
+			$merged_products = array_values( array_unique( array_filter( array_map( 'absint', array_merge( $existing_products, (array) $product_ids ) ) ) ) );
+			$merged_reasons = array_values( array_unique( array_filter( array_map( 'sanitize_key', array_merge( $existing_reasons, (array) $reasons ) ) ) ) );
+
+			$merged_urls     = array_slice( $merged_urls, 0, self::ARCHIVE_QUEUE_MAX_URLS );
+			$merged_products = array_slice( $merged_products, 0, self::ARCHIVE_QUEUE_MAX_PRODUCTS );
+			$merged_reasons  = array_slice( $merged_reasons, 0, 50 );
+
+			$current_due = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
+			$new_due     = $now + ( $interval * MINUTE_IN_SECONDS );
+			$due_at      = $current_due > 0 ? min( $current_due, $new_due ) : $new_due;
+
+			$queue = array(
+				'schemaVersion'   => self::ARCHIVE_QUEUE_SCHEMA_VERSION,
+				'pluginVersion'   => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+				'queuedAt'        => isset( $queue['queuedAt'] ) && absint( $queue['queuedAt'] ) > 0 ? absint( $queue['queuedAt'] ) : $now,
+				'updatedAt'       => $now,
+				'dueAt'           => $due_at,
+				'intervalMinutes' => $interval,
+				'attempts'        => isset( $queue['attempts'] ) ? absint( $queue['attempts'] ) : 0,
+				'urls'            => $merged_urls,
+				'productIds'      => $merged_products,
+				'reasons'         => $merged_reasons,
+			);
+			self::write_archive_queue( $queue );
+			return array( 'queued' => true, 'urlCount' => count( $merged_urls ), 'productCount' => count( $merged_products ), 'dueAt' => $due_at );
+		} finally {
+			self::release_archive_queue_lock( $lock );
+		}
+	}
+
+	private static function purge_wp_rocket_archive_targets( $product_ids, $urls ) {
+		unset( $product_ids ); // Archive roots are purged directly; product pages were already invalidated immediately.
+		if ( ! function_exists( 'rocket_clean_files' ) && ! function_exists( 'rocket_clean_home' ) ) {
+			return false;
+		}
+		$home = trailingslashit( home_url( '/' ) );
+		$files = array();
+		$purge_home = false;
+		foreach ( (array) $urls as $url ) {
+			if ( trailingslashit( (string) $url ) === $home ) {
+				$purge_home = true;
+			} else {
+				$files[] = $url;
+			}
+		}
+		if ( ! empty( $files ) && function_exists( 'rocket_clean_files' ) ) {
+			rocket_clean_files( array_values( array_unique( $files ) ) );
+		}
+		if ( $purge_home && function_exists( 'rocket_clean_home' ) ) {
+			rocket_clean_home();
+		}
+		return true;
+	}
+
+	private static function purge_litespeed_archive_targets( $product_ids, $urls ) {
+		unset( $product_ids ); // Keep product page cache hot; purge only the queued archive URLs.
+		if ( false === has_action( 'litespeed_purge_url' ) ) {
+			return false;
+		}
+		foreach ( (array) $urls as $url ) {
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- third-party LiteSpeed hook.
+			do_action( 'litespeed_purge_url', $url );
+		}
+		return true;
+	}
+
+	private static function purge_w3_total_cache_archive_targets( $product_ids, $urls ) {
+		unset( $product_ids ); // Keep product page cache hot; purge only the queued archive URLs.
+		if ( ! function_exists( 'w3tc_flush_url' ) ) {
+			return false;
+		}
+		foreach ( (array) $urls as $url ) {
+			w3tc_flush_url( $url );
+		}
+		return true;
+	}
+
+	private static function purge_wp_super_cache_archive_products( $product_ids ) {
+		if ( ! function_exists( 'wp_cache_post_change' ) ) {
+			return false;
+		}
+		foreach ( (array) $product_ids as $product_id ) {
+			$product_id = absint( $product_id );
+			if ( $product_id > 0 ) {
+				wp_cache_post_change( $product_id );
+			}
+		}
+		return true;
+	}
+
+	private static function read_archive_queue() {
+		$queue = get_option( self::OPTION_ARCHIVE_QUEUE, array() );
+		if ( ! is_array( $queue ) ) {
+			$queue = array();
+		}
+		$queue['urls']       = isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? $queue['urls'] : array();
+		$queue['productIds'] = isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? $queue['productIds'] : array();
+		$queue['reasons']    = isset( $queue['reasons'] ) && is_array( $queue['reasons'] ) ? $queue['reasons'] : array();
+		return $queue;
+	}
+
+	private static function write_archive_queue( $queue ) {
+		if ( false === get_option( self::OPTION_ARCHIVE_QUEUE, false ) ) {
+			add_option( self::OPTION_ARCHIVE_QUEUE, $queue, '', false );
+		} else {
+			update_option( self::OPTION_ARCHIVE_QUEUE, $queue, false );
+		}
+	}
+
+	private static function acquire_archive_queue_lock() {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return '__mobo_no_lock__';
+		}
+		for ( $attempt = 0; $attempt < 5; $attempt++ ) {
+			$token = Mobo_Core_Lock::acquire( 'cache_archive_purge_queue', 60 );
+			if ( false !== $token ) {
+				return $token;
+			}
+			if ( function_exists( 'usleep' ) ) {
+				usleep( 50000 );
+			}
+		}
+		return false;
+	}
+
+	private static function release_archive_queue_lock( $token ) {
+		if ( '__mobo_no_lock__' === $token || false === $token || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return;
+		}
+		Mobo_Core_Lock::release( 'cache_archive_purge_queue', $token );
 	}
 
 	private static function purge_wordpress_and_woocommerce( $object_ids, $product_ids ) {
@@ -494,12 +938,14 @@ final class Mobo_Core_Cache_Purger {
 
 		if ( $archive_purge_enabled && $has_post_hook ) {
 			foreach ( $product_ids as $product_id ) {
+				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- third-party LiteSpeed hook.
 				do_action( 'litespeed_purge_post', $product_id );
 			}
 		}
 
 		if ( $has_url_hook ) {
 			foreach ( $urls as $url ) {
+				// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- third-party LiteSpeed hook.
 				do_action( 'litespeed_purge_url', $url );
 			}
 		}
@@ -569,6 +1015,7 @@ final class Mobo_Core_Cache_Purger {
 		$last_success = isset( $stored['lastSuccessAt'] ) ? absint( $stored['lastSuccessAt'] ) : 0;
 		$integrations = array();
 		$stored_integrations = isset( $stored['integrations'] ) && is_array( $stored['integrations'] ) ? $stored['integrations'] : array();
+		$archive_queue_status = self::get_archive_queue_status();
 
 		foreach ( $inventory as $key => $current ) {
 			$previous = isset( $stored_integrations[ $key ] ) && is_array( $stored_integrations[ $key ] ) ? $stored_integrations[ $key ] : array();
@@ -620,6 +1067,7 @@ final class Mobo_Core_Cache_Purger {
 			'consecutiveFailures' => isset( $stored['consecutiveFailures'] ) ? absint( $stored['consecutiveFailures'] ) : 0,
 			'reasons'             => isset( $stored['reasons'] ) && is_array( $stored['reasons'] ) ? array_values( array_slice( $stored['reasons'], 0, 20 ) ) : array(),
 			'lastError'           => isset( $stored['lastError'] ) ? self::sanitize_error( $stored['lastError'] ) : '',
+			'archiveQueue'        => $archive_queue_status,
 			'integrations'        => $integrations,
 		);
 	}
@@ -802,6 +1250,7 @@ final class Mobo_Core_Cache_Purger {
 		self::$product_ids = array();
 		self::$urls        = array();
 		self::$custom_urls = array();
+		self::$archive_urls = array();
 		self::$reasons           = array();
 		self::$collection_errors = array();
 	}
@@ -846,10 +1295,44 @@ final class Mobo_Core_Cache_Purger {
 		return $timestamp > 0 ? gmdate( 'c', $timestamp ) : null;
 	}
 
-	private static function archive_purge_enabled() {
-		return class_exists( 'Mobo_Core_Settings' )
-			? Mobo_Core_Settings::enabled( 'mobo_core_cache_purge_archives_on_product_update', '0' )
-			: '1' === (string) get_option( 'mobo_core_cache_purge_archives_on_product_update', '0' );
+	private static function archive_purge_interval_minutes() {
+		$value = get_option( 'mobo_core_cache_archive_purge_interval_minutes', '15' );
+		return self::sanitize_archive_interval( $value );
+	}
+
+	private static function sanitize_archive_interval( $value ) {
+		if ( class_exists( 'Mobo_Core_Settings' ) && method_exists( 'Mobo_Core_Settings', 'sanitize_cache_archive_purge_interval' ) ) {
+			return Mobo_Core_Settings::sanitize_cache_archive_purge_interval( $value, 15 );
+		}
+
+		$value = absint( $value );
+		return in_array( $value, array( 0, 5, 10, 15, 20, 25, 30, 45, 60 ), true ) ? $value : 15;
+	}
+
+	private static function product_category_base() {
+		$permalinks = get_option( 'woocommerce_permalinks', array() );
+		$permalinks = is_array( $permalinks ) ? $permalinks : array();
+		$base = isset( $permalinks['category_base'] ) ? trim( (string) $permalinks['category_base'], '/ ' ) : '';
+		return '' !== $base ? $base : 'product-category';
+	}
+
+	private static function build_hierarchical_product_category_url( $term ) {
+		if ( ! $term instanceof WP_Term || 'product_cat' !== $term->taxonomy ) {
+			return '';
+		}
+
+		$slugs = array();
+		$ancestors = get_ancestors( $term->term_id, 'product_cat', 'taxonomy' );
+		$ancestors = array_reverse( array_map( 'absint', (array) $ancestors ) );
+		foreach ( $ancestors as $ancestor_id ) {
+			$ancestor = get_term( $ancestor_id, 'product_cat' );
+			if ( $ancestor instanceof WP_Term && '' !== (string) $ancestor->slug ) {
+				$slugs[] = $ancestor->slug;
+			}
+		}
+		$slugs[] = $term->slug;
+		$path = self::product_category_base() . '/' . implode( '/', array_filter( $slugs ) );
+		return home_url( user_trailingslashit( $path, 'category' ) );
 	}
 
 	private static function capture_related_urls( $product_id ) {
@@ -863,7 +1346,7 @@ final class Mobo_Core_Cache_Purger {
 			self::store_url( $permalink );
 		}
 
-		if ( ! self::archive_purge_enabled() ) {
+		if ( self::archive_purge_interval_minutes() <= 0 ) {
 			return;
 		}
 
@@ -878,10 +1361,7 @@ final class Mobo_Core_Cache_Purger {
 					continue;
 				}
 
-				$link = get_term_link( $term, $taxonomy );
-				if ( ! is_wp_error( $link ) ) {
-					self::store_url( $link );
-				}
+				self::capture_term_archive_urls( $term, $taxonomy );
 			}
 		}
 
@@ -895,11 +1375,38 @@ final class Mobo_Core_Cache_Purger {
 		}
 
 		if ( is_string( $shop_url ) && '' !== $shop_url ) {
-			self::store_url( $shop_url );
+			self::store_archive_url( $shop_url );
 		}
 
 		if ( apply_filters( 'mobo_core_cache_purge_home_enabled', true, $product_id ) ) {
-			self::store_url( home_url( '/' ) );
+			self::store_archive_url( home_url( '/' ) );
+		}
+	}
+
+	private static function capture_term_archive_urls( $term, $taxonomy ) {
+		if ( ! $term instanceof WP_Term ) {
+			return;
+		}
+
+		$terms = array( $term );
+		if ( 'product_cat' === $taxonomy ) {
+			$ancestor_ids = array_reverse( array_map( 'absint', (array) get_ancestors( $term->term_id, 'product_cat', 'taxonomy' ) ) );
+			foreach ( $ancestor_ids as $ancestor_id ) {
+				$ancestor = get_term( $ancestor_id, 'product_cat' );
+				if ( $ancestor instanceof WP_Term ) {
+					$terms[] = $ancestor;
+				}
+			}
+		}
+
+		foreach ( $terms as $archive_term ) {
+			$link = get_term_link( $archive_term, $taxonomy );
+			if ( ! is_wp_error( $link ) ) {
+				self::store_archive_url( $link );
+			}
+			if ( 'product_cat' === $taxonomy ) {
+				self::store_archive_url( self::build_hierarchical_product_category_url( $archive_term ) );
+			}
 		}
 	}
 
@@ -912,10 +1419,7 @@ final class Mobo_Core_Cache_Purger {
 				continue;
 			}
 
-			$link = get_term_link( $term, $taxonomy );
-			if ( ! is_wp_error( $link ) ) {
-				self::store_url( $link );
-			}
+			self::capture_term_archive_urls( $term, $taxonomy );
 		}
 	}
 
@@ -963,6 +1467,13 @@ final class Mobo_Core_Cache_Purger {
 		$url = self::normalize_url( $url );
 		if ( '' !== $url ) {
 			self::$urls[ $url ] = true;
+		}
+	}
+
+	private static function store_archive_url( $url ) {
+		$url = self::normalize_url( $url );
+		if ( '' !== $url ) {
+			self::$archive_urls[ $url ] = true;
 		}
 	}
 

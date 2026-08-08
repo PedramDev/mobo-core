@@ -622,9 +622,11 @@ class Mobo_Core_Image_Queue {
 			return '';
 		}
 
+		$table = self::table_name();
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared -- table name is generated internally from $wpdb->prefix and contains no request data.
 		$value = $wpdb->get_var(
 			"SELECT MIN(next_retry_at)
-			FROM " . self::table_name() . "
+			FROM {$table}
 			WHERE status IN ('pending','attaching')
 				AND next_retry_at IS NOT NULL"
 		);
@@ -652,8 +654,9 @@ class Mobo_Core_Image_Queue {
 		}
 
 		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
-		$ids   = $wpdb->get_col(
+		$now            = current_time( 'mysql', true );
+		$permanent_like = $wpdb->esc_like( 'Permanent:' ) . '%';
+		$ids            = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT q.id
 				FROM {$table} q
@@ -666,9 +669,10 @@ class Mobo_Core_Image_Queue {
 					AND q.source_url IS NOT NULL
 					AND q.source_url <> ''
 					AND q.source_url REGEXP '^https?://'
-					AND (q.last_error IS NULL OR q.last_error NOT LIKE 'Permanent:%%')
+					AND (q.last_error IS NULL OR q.last_error NOT LIKE %s)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
+				$permanent_like,
 				$limit
 			)
 		);
@@ -688,6 +692,7 @@ class Mobo_Core_Image_Queue {
 					updated_at = %s
 				WHERE id IN ({$placeholders})";
 
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
 			$recovered = absint( false === $updated ? 0 : $updated );
 		}
@@ -790,6 +795,7 @@ class Mobo_Core_Image_Queue {
 				WHERE status = 'done'
 					AND id IN ({$placeholders})";
 
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
 			$scheduled = absint( false === $updated ? 0 : $updated );
 		}

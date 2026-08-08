@@ -10,6 +10,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( class_exists( 'WC_Shipping_Method' ) && ! class_exists( 'WC_Mobo_Core_Shipping_Method' ) ) {
+	// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedClassFound -- WooCommerce shipping-method class; WC_ prefix is intentional and retained for backward compatibility.
 	class WC_Mobo_Core_Shipping_Method extends WC_Shipping_Method {
 
 		public function __construct( $instance_id = 0 ) {

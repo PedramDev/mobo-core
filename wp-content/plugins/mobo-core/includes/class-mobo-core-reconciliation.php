@@ -78,6 +78,27 @@ class Mobo_Core_Reconciliation {
 	 * @return array
 	 */
 	public function run_tick( $source = 'real-cron', $force = false, $force_deep = false ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $source, $force, $force_deep ) {
+					return $this->run_tick_guarded( $source, $force, $force_deep );
+				},
+				$force_deep ? 'repair-deep' : 'repair-reconciliation'
+			);
+		}
+
+		return $this->run_tick_guarded( $source, $force, $force_deep );
+	}
+
+	/**
+	 * Run one reconciliation/repair slice inside the cache mutation scope.
+	 *
+	 * @param string $source Source label.
+	 * @param bool   $force Force fast check.
+	 * @param bool   $force_deep Force deep check.
+	 * @return array
+	 */
+	private function run_tick_guarded( $source = 'real-cron', $force = false, $force_deep = false ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'reconciliation' ), array( 'processedProducts' => 0, 'processedVariations' => 0, 'needsContinuation' => false ) );
 		}
@@ -693,22 +714,49 @@ class Mobo_Core_Reconciliation {
 			return 0;
 		}
 
-		$query = new WP_Query(
-			array(
-				'post_type'      => 'product',
-				'post_status'    => array( 'publish', 'draft', 'private', 'pending' ),
-				'posts_per_page' => 1,
-				'fields'         => 'ids',
-				'no_found_rows'  => true,
-				'meta_query'     => array(
-					'relation' => 'OR',
-					array( 'key' => 'portal_product_id', 'value' => $portal_id, 'compare' => '=' ),
-					array( 'key' => 'mobo_portal_product_id', 'value' => $portal_id, 'compare' => '=' ),
-					array( 'key' => '_mobo_portal_product_id', 'value' => $portal_id, 'compare' => '=' ),
-				),
-			)
+		/*
+		 * Legacy fallback only. Older installations may have Portal IDs in product
+		 * post meta but no GUID map row yet. Keep the historical key priority, make
+		 * each lookup bounded to one product, and repair the authoritative GUID map
+		 * immediately after a legacy hit so subsequent reconciliation stays fast.
+		 */
+		global $wpdb;
+
+		$legacy_keys = array(
+			'portal_product_id',
+			'mobo_portal_product_id',
+			'_mobo_portal_product_id',
 		);
-		return ! empty( $query->posts ) ? absint( $query->posts[0] ) : 0;
+
+		foreach ( $legacy_keys as $legacy_key ) {
+			$product_id = absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT p.ID
+						FROM {$wpdb->posts} AS p
+						INNER JOIN {$wpdb->postmeta} AS pm ON pm.post_id = p.ID
+						WHERE p.post_type = %s
+						  AND p.post_status IN ('publish','draft','private','pending')
+						  AND pm.meta_key = %s
+						  AND pm.meta_value = %s
+						ORDER BY p.ID ASC
+						LIMIT 1",
+						'product',
+						$legacy_key,
+						(string) $portal_id
+					)
+				)
+			);
+
+			if ( $product_id > 0 ) {
+				if ( '' !== $guid ) {
+					$map->upsert_product( $guid, $product_id );
+				}
+				return $product_id;
+			}
+		}
+
+		return 0;
 	}
 
 	/**

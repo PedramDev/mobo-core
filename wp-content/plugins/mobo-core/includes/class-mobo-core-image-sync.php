@@ -40,6 +40,28 @@ class Mobo_Core_Image_Sync {
 	 * @return array
 	 */
 	public function process_images( $product_id, $images, $offset, $blocking_override = null ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $product_id, $images, $offset, $blocking_override ) {
+					return $this->process_images_guarded( $product_id, $images, $offset, $blocking_override );
+				},
+				'image-sync'
+			);
+		}
+
+		return $this->process_images_guarded( $product_id, $images, $offset, $blocking_override );
+	}
+
+	/**
+	 * Process product images inside the cache mutation scope.
+	 *
+	 * @param int        $product_id Product ID.
+	 * @param array      $images Images.
+	 * @param int        $offset Offset.
+	 * @param bool|null  $blocking_override Blocking override.
+	 * @return array
+	 */
+	private function process_images_guarded( $product_id, $images, $offset, $blocking_override = null ) {
 		$product_id = absint( $product_id );
 		$offset     = max( 0, absint( $offset ) );
 		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
@@ -67,6 +89,25 @@ class Mobo_Core_Image_Sync {
 	 * @return array
 	 */
 	public function process_queue( $limit = 0 ) {
+		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+			return Mobo_Core_Cache_Mutation_Guard::run(
+				function () use ( $limit ) {
+					return $this->process_queue_guarded( $limit );
+				},
+				'image-queue'
+			);
+		}
+
+		return $this->process_queue_guarded( $limit );
+	}
+
+	/**
+	 * Process image queue inside the cache mutation scope.
+	 *
+	 * @param int $limit Limit.
+	 * @return array
+	 */
+	private function process_queue_guarded( $limit = 0 ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-queue' ), array( 'processed' => 0, 'failed' => 0, 'remaining' => true ) );
 		}

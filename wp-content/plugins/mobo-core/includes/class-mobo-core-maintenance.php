@@ -182,7 +182,8 @@ class Mobo_Core_Maintenance {
 		$limit       = self::DEFAULT_BATCH_LIMIT;
 		$fail_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_FAILED_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$orphan_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
-		$done_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$done_cutoff     = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$permanent_like = $wpdb->esc_like( 'Permanent:' ) . '%';
 
 		$legacy_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
 			? Mobo_Core_Image_Queue::recover_legacy_failed( min( 250, $limit ) )
@@ -199,10 +200,11 @@ class Mobo_Core_Maintenance {
 			$wpdb->prepare(
 				"DELETE FROM {$table}
 				WHERE status = 'failed'
-					AND last_error LIKE 'Permanent:%%'
+					AND last_error LIKE %s
 					AND updated_at < %s
 				ORDER BY id ASC
 				LIMIT %d",
+				$permanent_like,
 				$fail_cutoff,
 				$limit
 			)
@@ -266,6 +268,7 @@ class Mobo_Core_Maintenance {
 						updated_at = %s
 					WHERE id IN ({$placeholders})";
 
+				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 				$updated = $wpdb->query( $wpdb->prepare( $query, $args ) );
 				$requeued_missing_attachment = absint( false === $updated ? 0 : $updated );
 			}

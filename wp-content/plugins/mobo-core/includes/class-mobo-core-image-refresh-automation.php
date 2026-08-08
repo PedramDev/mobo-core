@@ -668,7 +668,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	 */
 	private function image_environment_ready() {
 		$uploads = wp_upload_dir();
-		$writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && is_writable( $uploads['basedir'] );
+		$writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && wp_is_writable( $uploads['basedir'] );
 		$wp_webp = false;
 		if ( function_exists( 'wp_image_editor_supports' ) ) {
 			$wp_webp = wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) );
