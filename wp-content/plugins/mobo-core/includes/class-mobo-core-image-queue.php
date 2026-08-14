@@ -163,7 +163,7 @@ class Mobo_Core_Image_Queue {
 		$keys         = array_values( array_unique( array_filter( array_map( 'strval', wp_list_pluck( $normalized, 'key' ) ) ) ) );
 		$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
 		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE queue_key IN ({$placeholders})";
-		$rows         = $wpdb->get_results( $wpdb->prepare( $query, $keys ), ARRAY_A );
+		$rows         = $wpdb->get_results( $wpdb->prepare( $query, $keys ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all values are bound by wpdb::prepare().
 		$existing_map = array();
 		$existing_attachment_ids = array();
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
@@ -490,19 +490,17 @@ class Mobo_Core_Image_Queue {
 			return array();
 		}
 
-		$id_sql       = implode( ',', $ids );
-		$locked_until = gmdate( 'Y-m-d H:i:s', time() + $ttl );
-		$updated      = $wpdb->query(
-			$wpdb->prepare(
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
+		$update_args     = array_merge( array( $locked_until, $now ), $ids, array( $now, $now ) );
+		$updated         = $wpdb->query(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, updated_at = %s
-				WHERE id IN ({$id_sql})
+				WHERE id IN ({$id_placeholders})
 					AND ((status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
-				$locked_until,
-				$now,
-				$now,
-				$now
+				$update_args
 			)
 		);
 
@@ -511,13 +509,14 @@ class Mobo_Core_Image_Queue {
 		}
 
 		self::invalidate_summary_cache();
+		$select_args = array_merge( $ids, array( $locked_until ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT id, product_id, product_guid, image_guid, source_url, position_index, attachment_id, try_count, updated_at
 				FROM {$table}
-				WHERE id IN ({$id_sql}) AND status = 'processing' AND locked_until = %s
+				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
 				ORDER BY updated_at ASC, id ASC",
-				$locked_until
+				$select_args
 			),
 			ARRAY_A
 		);
@@ -714,15 +713,16 @@ class Mobo_Core_Image_Queue {
 			return 0;
 		}
 
-		$table  = self::table_name();
-		$id_sql = implode( ',', $ids );
-		$now    = current_time( 'mysql', true );
-		$updated = $wpdb->query(
+		$table           = self::table_name();
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$now             = current_time( 'mysql', true );
+		$args            = array_merge( array( $now ), $ids );
+		$updated         = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'done', next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
-				WHERE id IN ({$id_sql}) AND status = 'attaching' AND attachment_id > 0",
-				$now
+				WHERE id IN ({$id_placeholders}) AND status = 'attaching' AND attachment_id > 0",
+				$args
 			)
 		);
 
@@ -1190,7 +1190,7 @@ class Mobo_Core_Image_Queue {
 		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
 		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
 
-		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) );
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
 	}
 
 	/**

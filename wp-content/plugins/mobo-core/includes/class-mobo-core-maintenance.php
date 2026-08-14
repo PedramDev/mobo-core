@@ -303,7 +303,7 @@ class Mobo_Core_Maintenance {
 						last_error = 'Completed image attachment was missing; source retry scheduled.',
 						updated_at = %s
 					WHERE id IN ({$placeholders})";
-				$updated = $wpdb->query( $wpdb->prepare( $query, $args ) );
+				$updated = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Internal table name and generated %d placeholder list; all values are bound by wpdb::prepare().
 				$requeued_missing_attachment = absint( false === $updated ? 0 : $updated );
 			}
 		}
@@ -440,7 +440,7 @@ class Mobo_Core_Maintenance {
 		$likely            = false;
 
 		if ( self::has_time( $deadline, 0.03 ) ) {
-			$ids = $wpdb->get_col(
+			$ids = $wpdb->get_col( // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- Action Scheduler table names are derived only from the trusted WordPress table prefix.
 				$wpdb->prepare(
 					"SELECT l.log_id FROM {$logs_table} l
 					INNER JOIN {$actions_table} a ON a.action_id = l.action_id
@@ -455,7 +455,7 @@ class Mobo_Core_Maintenance {
 		}
 
 		if ( self::has_time( $deadline, 0.03 ) ) {
-			$ids = $wpdb->get_col(
+			$ids = $wpdb->get_col( // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- Action Scheduler table names are derived only from the trusted WordPress table prefix.
 				$wpdb->prepare(
 					"SELECT l.log_id FROM {$logs_table} l
 					INNER JOIN {$actions_table} a ON a.action_id = l.action_id
@@ -470,7 +470,7 @@ class Mobo_Core_Maintenance {
 		}
 
 		if ( self::has_time( $deadline, 0.03 ) ) {
-			$ids = $wpdb->get_col(
+			$ids = $wpdb->get_col( // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- Action Scheduler table names are derived only from the trusted WordPress table prefix.
 				$wpdb->prepare(
 					"SELECT l.log_id FROM {$logs_table} l
 					LEFT JOIN {$actions_table} a ON a.action_id = l.action_id
@@ -550,12 +550,27 @@ class Mobo_Core_Maintenance {
 
 		$status   = sanitize_key( (string) $status );
 		$max_rows = max( 1, absint( $max_rows ) );
-		$total    = 0;
-		$likely   = false;
+
+		$allowed_tables = array();
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
+			$allowed_tables[] = Mobo_Core_Sync_Event_Store::table_name();
+		}
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) ) {
+			$allowed_tables[] = Mobo_Core_Image_Queue::table_name();
+		}
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ) {
+			$allowed_tables[] = Mobo_Core_Image_Refresh_Queue::table_name();
+		}
+		if ( ! in_array( (string) $table, $allowed_tables, true ) ) {
+			return array( 'status' => 'invalid-table', 'deleted' => 0, 'likelyRemaining' => false );
+		}
+
+		$total  = 0;
+		$likely = false;
 
 		while ( self::has_time( $deadline, 0.02 ) && $total < $max_rows ) {
 			$limit = min( self::DELETE_CHUNK_SIZE, $max_rows - $total );
-			$rows  = $wpdb->query(
+			$rows  = $wpdb->query( // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table is restricted to the private internal whitelist immediately above.
 				$wpdb->prepare(
 					"DELETE FROM {$table}
 					WHERE status = %s AND updated_at < %s
@@ -610,9 +625,10 @@ class Mobo_Core_Maintenance {
 			return 0;
 		}
 
-		$id_column = sanitize_key( (string) $id_column );
-		$id_sql     = implode( ',', $ids );
-		$deleted    = $wpdb->query( "DELETE FROM {$table} WHERE {$id_column} IN ({$id_sql})" );
+		$id_column       = sanitize_key( (string) $id_column );
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$sql             = "DELETE FROM {$table} WHERE {$id_column} IN ({$id_placeholders})";
+		$deleted         = $wpdb->query( $wpdb->prepare( $sql, $ids ) ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- Table/column pair is restricted by the strict whitelist above; IDs are %d-bound.
 		return absint( false === $deleted ? 0 : $deleted );
 	}
 

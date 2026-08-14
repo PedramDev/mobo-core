@@ -399,14 +399,17 @@ class Mobo_Core_Sync_Event_Store {
 			JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
 		);
 
-		$id_sql = implode( ',', $ids_to_supersede );
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids_to_supersede ), '%d' ) );
+		$update_args     = array_merge(
+			array( false === $progress ? '{"superseded":true}' : $progress, $now ),
+			$ids_to_supersede
+		);
 		$updated = $wpdb->query(
-			$wpdb->prepare(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains the two fixed %s values followed by dynamic %d ID replacements; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'done', locked_until = NULL, next_retry_at = NULL, last_error = NULL, progress_json = %s, updated_at = %s
-				WHERE status = 'pending' AND id IN ({$id_sql})",
-				false === $progress ? '{"superseded":true}' : $progress,
-				$now
+				WHERE status = 'pending' AND id IN ({$id_placeholders})",
+				$update_args
 			)
 		);
 
@@ -601,19 +604,17 @@ class Mobo_Core_Sync_Event_Store {
 			return array();
 		}
 
-		$id_sql       = implode( ',', $ids );
-		$locked_until = gmdate( 'Y-m-d H:i:s', time() + $ttl );
-		$updated      = $wpdb->query(
-			$wpdb->prepare(
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
+		$update_args     = array_merge( array( $locked_until, $now ), $ids, array( $now, $now ) );
+		$updated         = $wpdb->query(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, updated_at = %s
-				WHERE id IN ({$id_sql})
+				WHERE id IN ({$id_placeholders})
 					AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
-				$locked_until,
-				$now,
-				$now,
-				$now
+				$update_args
 			)
 		);
 
@@ -623,14 +624,15 @@ class Mobo_Core_Sync_Event_Store {
 
 		self::invalidate_summary_cache();
 
+		$select_args = array_merge( $ids, array( $locked_until ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT id, event_uuid, remote_event_id, event_type, entity_guid, sync_id,
 					try_count, expires_at, payload_json, created_at, updated_at
 				FROM {$table}
-				WHERE id IN ({$id_sql}) AND status = 'processing' AND locked_until = %s
+				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC",
-				$locked_until
+				$select_args
 			),
 			ARRAY_A
 		);
@@ -1098,7 +1100,7 @@ class Mobo_Core_Sync_Event_Store {
 		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
 		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
 
-		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) );
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
 	}
 
 	/**

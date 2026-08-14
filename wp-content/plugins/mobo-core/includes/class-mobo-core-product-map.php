@@ -230,7 +230,7 @@ class Mobo_Core_Product_Map {
 
 		$updated = $wpdb->query(
 			$wpdb->prepare(
-				$query,
+				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
 				$guid, $post_id, $object_type, $parent_guid, $last_hash, $incomplete, $now, $now,
 				$post_id, $parent_guid, $last_hash, $incomplete, $now
 			)
@@ -297,7 +297,7 @@ class Mobo_Core_Product_Map {
 			$sql          = "SELECT remote_guid, wp_post_id FROM {$table} WHERE object_type = %s AND remote_guid IN ({$placeholders})";
 			$args         = array_merge( array( self::TYPE_VARIATION ), $chunk );
 			$prepared     = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
-			$rows         = $wpdb->get_results( $prepared, ARRAY_A );
+			$rows         = $wpdb->get_results( $prepared, ARRAY_A ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced by wpdb::prepare() from internal table/placeholder structure.
 			if ( is_array( $rows ) ) {
 				foreach ( $rows as $row ) {
 					$guid    = sanitize_text_field( (string) ( $row['remote_guid'] ?? '' ) );

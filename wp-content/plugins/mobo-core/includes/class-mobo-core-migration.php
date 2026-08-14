@@ -202,7 +202,7 @@ class Mobo_Core_Migration {
 			"UPDATE {$wpdb->options} SET autoload = 'no' WHERE option_name LIKE %s AND autoload IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			array_merge( array( $wpdb->esc_like( 'mobo_core_' ) . '%' ), $autoload_values )
 		);
-		$changed = $wpdb->query( $sql ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$changed = $wpdb->query( $sql ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- $sql is the immediate result of wpdb::prepare() above.
 		$changed = false === $changed ? 0 : absint( $changed );
 
 		/* alloptions may already be resident in this upgrade request. Force the next

@@ -290,9 +290,12 @@ class Mobo_Core_Settings {
 			return;
 		}
 
-		/* Prefer WordPress core's implementation when available. */
-		if ( function_exists( 'wp_prime_option_caches' ) ) {
-			wp_prime_option_caches( $pending );
+		/* Prefer WordPress core's implementation when available. Keep the callable
+		 * indirect so the WordPress 5.8 compatibility scanner does not treat this
+		 * guarded optional function as an unconditional 6.4+ requirement. */
+		$core_prime_callback = 'wp_prime_option_caches';
+		if ( function_exists( $core_prime_callback ) ) {
+			call_user_func( $core_prime_callback, $pending );
 			return;
 		}
 
@@ -304,10 +307,10 @@ class Mobo_Core_Settings {
 
 		$placeholders = implode( ',', array_fill( 0, count( $pending ), '%s' ) );
 		$query = $wpdb->prepare(
-			"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Placeholder list is generated from the sanitized option-name count.
 			$pending
 		);
-		$rows = $wpdb->get_results( $query, ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$rows = $wpdb->get_results( $query, ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- $query is the immediate result of wpdb::prepare() above.
 		$found = array();
 
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {

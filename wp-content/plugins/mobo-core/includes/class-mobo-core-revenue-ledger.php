@@ -290,7 +290,7 @@ class Mobo_Core_Revenue_Ledger {
 					'return'     => 'ids',
 					'orderby'    => 'ID',
 					'order'      => 'ASC',
-					'meta_query' => array(
+					'meta_query' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded/paged WooCommerce CRUD query keeps CPT and HPOS compatibility; direct SQL would be less portable.
 						array(
 							'key'     => self::META_LEDGER_VERSION,
 							'value'   => (string) self::LEDGER_VERSION,

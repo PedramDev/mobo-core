@@ -1382,7 +1382,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$estimated_total = absint(
 			$wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT COUNT(DISTINCT p.ID) {$base_sql}",
+					"SELECT COUNT(DISTINCT p.ID) {$base_sql}", // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- $base_sql contains the three %s placeholders bound immediately below.
 					$jpg_like,
 					$jpeg_like,
 					$png_like
@@ -1391,7 +1391,7 @@ class Mobo_Core_Image_Refresh_Service {
 		);
 
 		$ids = $wpdb->get_col(
-			$wpdb->prepare(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $base_sql contributes three %s placeholders in addition to %d/%d below.
 				"SELECT DISTINCT p.ID {$base_sql}
 					AND p.ID > %d
 					ORDER BY p.ID ASC
@@ -3168,7 +3168,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$sql = "SELECT {$meta_id_column} AS meta_id, {$object_id_column} AS object_id, {$meta_key_column} AS meta_key, meta_value FROM {$table} WHERE (" . $where . $extra . ')';
 		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-		$rows = $wpdb->get_results( $prepared );
+		$rows = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() with internally generated SQL fragments.
 		if ( ! is_array( $rows ) ) {
 			return $result;
 		}
@@ -3246,7 +3246,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$where    = $this->build_attachment_reference_sql( 'post_content', $old_attachment_id, array_keys( $text_map ), $params );
 		$sql      = "SELECT ID, post_content FROM {$wpdb->posts} WHERE post_status NOT IN ('trash','auto-draft') AND {$where}";
 		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-		$posts    = $wpdb->get_results( $prepared );
+		$posts    = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() with internally generated SQL fragments.
 		foreach ( is_array( $posts ) ? $posts : array() as $post ) {
 			$old_content = isset( $post->post_content ) ? (string) $post->post_content : '';
 			$changes     = 0;
@@ -3284,7 +3284,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$params = array_merge( array( $wpdb->esc_like( 'theme_mods_' ) . '%', $wpdb->esc_like( 'widget_' ) . '%' ), $params );
 		$sql = "SELECT option_name, option_value FROM {$wpdb->options} WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s) AND {$where}";
 		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-		$options = $wpdb->get_results( $prepared );
+		$options = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() with internally generated SQL fragments.
 		foreach ( is_array( $options ) ? $options : array() as $option ) {
 			$name    = isset( $option->option_name ) ? (string) $option->option_name : '';
 			$value   = maybe_unserialize( isset( $option->option_value ) ? (string) $option->option_value : '' );
@@ -3389,7 +3389,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$where    = $this->build_attachment_reference_sql( 'post_content', $attachment_id, $tokens, $params );
 		$sql      = "SELECT ID, post_type, post_content FROM {$wpdb->posts} WHERE post_status NOT IN ('trash','auto-draft') AND {$where}";
 		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-		$rows     = $wpdb->get_results( $prepared );
+		$rows     = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() with internally generated SQL fragments.
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
 			if ( $this->candidate_value_has_attachment_reference( isset( $row->post_content ) ? (string) $row->post_content : '', 'post_content', $attachment_id, $new_attachment_id, $text_map ) ) {
 				$result['hasReferences'] = true;
@@ -3409,7 +3409,7 @@ class Mobo_Core_Image_Refresh_Service {
 			$params = array_merge( $prefix_params, $params );
 			$sql = "SELECT {$set[2]} AS object_id, {$set[3]} AS meta_key, meta_value FROM {$set[1]} WHERE {$set[4]} AND {$where}";
 			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-			$rows = $wpdb->get_results( $prepared );
+			$rows = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() from strict internal metadata table descriptors.
 			foreach ( is_array( $rows ) ? $rows : array() as $row ) {
 				$key = isset( $row->meta_key ) ? (string) $row->meta_key : '';
 				$raw = isset( $row->meta_value ) ? (string) $row->meta_value : '';
@@ -3426,7 +3426,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$params = array_merge( array( $wpdb->esc_like( 'theme_mods_' ) . '%', $wpdb->esc_like( 'widget_' ) . '%' ), $params );
 		$sql = "SELECT option_name, option_value FROM {$wpdb->options} WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s) AND {$where}";
 		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
-		$rows = $wpdb->get_results( $prepared );
+		$rows = $wpdb->get_results( $prepared ); // phpcs:ignore PluginCheck.Security.DirectDB.UnescapedDBParameter, WordPress.DB.PreparedSQL.NotPrepared -- $prepared is produced immediately above by wpdb::prepare() with internally generated SQL fragments.
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
 			$name = isset( $row->option_name ) ? (string) $row->option_name : '';
 			$raw  = isset( $row->option_value ) ? (string) $row->option_value : '';

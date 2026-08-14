@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.33.18
+ * Version: 10.33.19
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.33.18' );
+define( 'MOBO_CORE_VERSION', '10.33.19' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -111,11 +111,12 @@ function mobo_core_is_rest_request_early() {
 	}
 
 	/* Plain-permalink REST requests use ?rest_route=/... before REST_REQUEST exists. */
-	if ( isset( $_GET['rest_route'] ) && '' !== trim( (string) wp_unslash( $_GET['rest_route'] ) ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only request-context detection.
+	$rest_route = isset( $_GET['rest_route'] ) ? sanitize_text_field( wp_unslash( $_GET['rest_route'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only request-context detection.
+	if ( '' !== trim( $rest_route ) ) {
 		return true;
 	}
 
-	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
 	if ( '' === $request_uri ) {
 		return false;
 	}
