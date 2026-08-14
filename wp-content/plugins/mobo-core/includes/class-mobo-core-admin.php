@@ -26,6 +26,8 @@ class Mobo_Core_Admin {
 		add_filter( 'display_post_states', array( $this, 'add_mobo_product_post_state' ), 10, 2 );
 
 		add_action( 'admin_post_mobo_core_save_settings', array( $this, 'handle_save_settings' ) );
+		add_action( 'admin_post_mobo_core_rearm_wallet_alert', array( $this, 'handle_rearm_wallet_alert' ) );
+		add_action( 'admin_post_mobo_core_test_wallet_sms', array( $this, 'handle_test_wallet_sms' ) );
 		add_action( 'admin_post_mobo_core_php_diagnostics', array( $this, 'handle_php_diagnostics' ) );
 		add_action( 'admin_post_mobo_core_tool_test_mobo_login', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_clear_mobo_debug_log', array( $this, 'handle_admin_tool_action' ) );
@@ -149,7 +151,7 @@ class Mobo_Core_Admin {
 			'image-refresh' => 'نوسازی تصاویر',
 			'cron'          => 'زمان‌بندی و Cron',
 			'checkout'      => 'ثبت و اعتبارسنجی سفارش',
-			'sms'           => 'پیامک سفارش',
+			'sms'           => 'پیامک و هشدار موجودی',
 		);
 	}
 
@@ -464,6 +466,8 @@ class Mobo_Core_Admin {
 		<?php endif; ?>
 
 		<?php $this->render_webhook_auth_test_status(); ?>
+
+		<?php $this->render_wallet_alert_dashboard_card(); ?>
 
 		<div class="mobo-grid mobo-grid-dashboard">
 			<div class="mobo-card mobo-card-wide" id="mobo-sync-status-card" data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( wp_create_nonce( 'mobo_core_sync_status' ) ); ?>">
@@ -1071,11 +1075,12 @@ class Mobo_Core_Admin {
 					<?php $this->bool_field( 'فقط محصولات موجود', 'mobo_core_only_in_stock' ); ?>
 					<?php $this->bool_field( 'اعمال تخفیف‌های موبو', 'global_product_auto_compare_price' ); ?>
 					<?php $this->bool_field( 'آپدیت اتوماتیک عکس‌های محصول', 'global_update_images' ); ?>
+					<?php $this->bool_field( 'پیش‌بارگذاری خودکار صفحه همان محصول بعد از بروزرسانی', 'mobo_core_cache_warmup_enabled' ); ?>
 					<?php $this->cache_archive_purge_interval_field(); ?>
 				</div>
 
 				<div class="mobo-note">
-					کش صفحه خود محصول و Object Cache بلافاصله invalidate می‌شود. کش دسته‌ها، برچسب‌ها، Shop و صفحه اصلی در یک صف persistent جمع می‌شود و فقط در فاصله انتخابی توسط mobo-cron.php به‌صورت تجمیعی purge می‌شود؛ حالت purge لحظه‌ای آرشیوها وجود ندارد.
+					کش صفحه خود محصول و Object Cache بلافاصله invalidate می‌شود. اگر پیش‌بارگذاری فعال باشد، فقط permalink فعلی همان محصول در صف Warmup قرار می‌گیرد و با درخواست ناشناس توسط Real Cron/Self Runner دوباره cache می‌شود؛ Home، Shop، دسته، برچسب و permalink قدیمی Warmup نمی‌شوند. کش آرشیوها جداگانه و در فاصله انتخابی purge می‌شود.
 				</div>
 
 				<div class="mobo-note">
@@ -1876,17 +1881,89 @@ class Mobo_Core_Admin {
 	}
 
 	/**
+	 * Render Mobo wallet balance / low-balance reminder state on the dashboard.
+	 *
+	 * @return void
+	 */
+	private function render_wallet_alert_dashboard_card() {
+		$status = class_exists( 'Mobo_Core_Wallet_Alert' ) ? Mobo_Core_Wallet_Alert::get_status() : array();
+		$enabled = ! empty( $status['enabled'] );
+		$notified = ! empty( $status['notified'] );
+		$has_balance = ! empty( $status['hasBalance'] );
+		$last_balance = $has_balance ? number_format_i18n( (float) $status['lastBalance'], 0 ) : '—';
+		$threshold = isset( $status['threshold'] ) ? number_format_i18n( (float) $status['threshold'], 0 ) : '0';
+		$last_checked = ! empty( $status['lastCheckedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastCheckedAt'] ) ) : 'هنوز بررسی نشده';
+		$notified_at = ! empty( $status['notifiedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['notifiedAt'] ) ) : '—';
+		$sms_last_attempt = ! empty( $status['smsLastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['smsLastAttemptAt'] ) ) : '—';
+		$sms_last_success = ! empty( $status['smsLastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['smsLastSuccessAt'] ) ) : '—';
+		$sms_last_result  = isset( $status['smsLastResult'] ) ? sanitize_key( (string) $status['smsLastResult'] ) : '';
+		$sms_result_label = 'sent' === $sms_last_result ? 'موفق' : ( 'failed' === $sms_last_result ? 'ناموفق' : ( 'attempting' === $sms_last_result ? 'در حال تلاش' : 'هنوز تست/ارسال نشده' ) );
+		?>
+		<div class="mobo-card mobo-card-wide">
+			<div class="mobo-card-head">
+				<h2>موجودی کیف پول موبو</h2>
+				<p>بعد از هر ثبت و پرداخت موفق سفارش موبو، موجودی حساب موبو بررسی و ذخیره می‌شود. هشدار کمبود موجودی فقط یک بار ارسال می‌شود تا زمانی که مدیر آن را دوباره فعال کند.</p>
+			</div>
+
+			<div class="mobo-status-grid">
+				<?php $this->status_box( 'آخرین موجودی', $last_balance ); ?>
+				<?php $this->status_box( 'حد هشدار', $threshold ); ?>
+				<?php $this->status_box( 'آخرین بررسی', $last_checked ); ?>
+				<?php $this->status_box( 'هشدار پیامکی', $enabled ? ( $notified ? 'اطلاع داده شده' : 'آماده ارسال' ) : 'غیرفعال' ); ?>
+				<?php $this->status_box( 'آخرین تلاش SMS', $sms_last_attempt ); ?>
+				<?php $this->status_box( 'نتیجه Transport', $sms_result_label ); ?>
+				<?php $this->status_box( 'آخرین SMS موفق', $sms_last_success ); ?>
+			</div>
+
+			<?php if ( $notified ) : ?>
+				<div class="mobo-message mobo-message-warning">
+					هشدار کمبود موجودی قبلاً ارسال شده است<?php echo '—' !== $notified_at ? ' در ' . esc_html( $notified_at ) : ''; ?>. حتی اگر موجودی موبو افزایش پیدا کند، ارسال خودکار دوباره فعال نمی‌شود تا این دکمه را بزنید.
+				</div>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:12px;">
+					<input type="hidden" name="action" value="mobo_core_rearm_wallet_alert">
+					<?php wp_nonce_field( 'mobo_core_rearm_wallet_alert' ); ?>
+					<?php submit_button( 'فعال‌سازی مجدد یادآوری موجودی', 'secondary', 'submit', false ); ?>
+				</form>
+			<?php elseif ( $enabled ) : ?>
+				<div class="mobo-message mobo-message-success">یادآوری کمبود موجودی فعال است و اگر موجودی در بررسی بعد از خرید به حد تنظیم‌شده یا کمتر برسد، پیامک ارسال می‌شود.</div>
+			<?php else : ?>
+				<div class="mobo-message mobo-message-info">هشدار موجودی غیرفعال است. تنظیمات آن در بخش «پیامک و هشدار موجودی» در نمای پیشرفته قرار دارد.</div>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $status['lastError'] ) ) : ?>
+				<div class="mobo-message mobo-message-error"><strong>آخرین خطای دریافت موجودی کیف پول:</strong> <?php echo esc_html( $status['lastError'] ); ?></div>
+			<?php endif; ?>
+			<?php if ( ! empty( $status['smsLastError'] ) ) : ?>
+				<div class="mobo-message mobo-message-error"><strong>آخرین خطای ارسال SMS هشدار کیف پول:</strong> <?php echo esc_html( $status['smsLastError'] ); ?></div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
 	 * Render SMS notifications tab.
 	 *
 	 * @return void
 	 */
 	private function render_sms_tab() {
-		$sms_available = function_exists( 'PWSMS' ) && is_object( PWSMS() ) && method_exists( PWSMS(), 'send_sms' );
+		$sms_available = false;
+		$sms_client    = null;
 		$gateway_label = '—';
+		$wallet_status = class_exists( 'Mobo_Core_Wallet_Alert' ) ? Mobo_Core_Wallet_Alert::get_status() : array();
 
-		if ( $sms_available && method_exists( PWSMS(), 'get_sms_gateway' ) ) {
+		if ( function_exists( 'PWSMS' ) ) {
 			try {
-				$gateway = PWSMS()->get_sms_gateway();
+				$sms_client    = PWSMS();
+				$sms_available = is_object( $sms_client ) && method_exists( $sms_client, 'send_sms' );
+			} catch ( Throwable $e ) {
+				$sms_client    = null;
+				$gateway_label = 'خطا در بارگذاری افزونه پیامک';
+			}
+		}
+
+		if ( $sms_available && method_exists( $sms_client, 'get_sms_gateway' ) ) {
+			try {
+				$gateway = $sms_client->get_sms_gateway();
 				if ( is_object( $gateway ) && method_exists( $gateway, 'name' ) ) {
 					$gateway_label = $gateway::name();
 				}
@@ -1930,6 +2007,44 @@ class Mobo_Core_Admin {
 					</div>
 				</div>
 
+				<div class="mobo-card mobo-card-wide">
+					<div class="mobo-card-head">
+						<h2>هشدار موجودی کیف پول موبو</h2>
+						<p>این Template مستقل از پیامک‌های نوع سفارش است. موجودی بعد از هر خرید موفق موبو بررسی می‌شود و اگر به حد تعیین‌شده یا کمتر برسد، فقط یک بار پیامک ارسال می‌شود.</p>
+					</div>
+
+					<div class="mobo-field mobo-toggle-field">
+						<label for="mobo_core_wallet_alert_enabled">فعال‌سازی هشدار موجودی</label>
+						<select id="mobo_core_wallet_alert_enabled" name="mobo_core_wallet_alert_enabled" class="mobo-category-select2" data-placeholder="وضعیت">
+							<option value="1" <?php selected( (string) Mobo_Core_Settings::get( 'mobo_core_wallet_alert_enabled', '0' ), '1' ); ?>>فعال</option>
+							<option value="0" <?php selected( (string) Mobo_Core_Settings::get( 'mobo_core_wallet_alert_enabled', '0' ), '0' ); ?>>غیرفعال</option>
+						</select>
+					</div>
+
+					<div class="mobo-field">
+						<label for="mobo_core_wallet_alert_threshold">حد موجودی برای ارسال هشدار</label>
+						<input type="number" min="0" step="1" id="mobo_core_wallet_alert_threshold" name="mobo_core_wallet_alert_threshold" value="<?php echo esc_attr( (string) Mobo_Core_Settings::get_int( 'mobo_core_wallet_alert_threshold', 0, 0, PHP_INT_MAX ) ); ?>">
+						<div class="mobo-help">مقایسه با مقدار <code dir="ltr">amount</code> همان API موجودی موبو انجام می‌شود.</div>
+					</div>
+
+					<div class="mobo-field mobo-field-full">
+						<label for="mobo_core_wallet_alert_recipients">شماره گیرنده هشدار موجودی</label>
+						<textarea id="mobo_core_wallet_alert_recipients" name="mobo_core_wallet_alert_recipients" rows="3" dir="ltr" style="text-align:left;"><?php echo esc_textarea( (string) Mobo_Core_Settings::get( 'mobo_core_wallet_alert_recipients', '' ) ); ?></textarea>
+						<div class="mobo-help">یک یا چند شماره مدیر فروشگاه را با کاما یا خط جدید جدا کن.</div>
+					</div>
+
+					<div class="mobo-field mobo-field-full">
+						<label for="mobo_core_wallet_alert_template">Template اختصاصی هشدار موجودی</label>
+						<textarea id="mobo_core_wallet_alert_template" name="mobo_core_wallet_alert_template" rows="8" dir="rtl"><?php echo esc_textarea( (string) Mobo_Core_Settings::get( 'mobo_core_wallet_alert_template', '' ) ); ?></textarea>
+						<div class="mobo-help">متغیرها: <code dir="ltr">{mobo_wallet_balance}</code>، <code dir="ltr">{mobo_wallet_balance_formatted}</code>، <code dir="ltr">{mobo_wallet_threshold}</code>، <code dir="ltr">{site_name}</code> و <code dir="ltr">{site_url}</code>.</div>
+					</div>
+
+					<textarea rows="5" readonly dir="ltr" onclick="this.select();">pattern:67890
+balance:{mobo_wallet_balance}
+threshold:{mobo_wallet_threshold}
+site:{site_name}</textarea>
+				</div>
+
 				<?php foreach ( $scenarios as $scenario => $label ) : ?>
 					<?php $this->render_sms_scenario_box( $scenario, $label ); ?>
 				<?php endforeach; ?>
@@ -1956,6 +2071,34 @@ type:{mobo_order_type_label}</textarea>
 
 			<?php submit_button( 'ذخیره تنظیمات پیامک', 'primary' ); ?>
 		</form>
+
+		<div class="mobo-grid" style="margin-top:16px;">
+			<div class="mobo-card mobo-card-wide">
+				<div class="mobo-card-head">
+					<h2>تست مستقیم SMS هشدار کیف پول</h2>
+					<p>این تست فقط مسیر Mobo → Persian WooCommerce SMS → درگاه فعال را امتحان می‌کند. فلگ one-shot هشدار را مصرف نمی‌کند و سفارش یا موجودی کیف پول را تغییر نمی‌دهد.</p>
+				</div>
+				<?php
+				$test_result = isset( $wallet_status['smsLastResult'] ) ? sanitize_key( (string) $wallet_status['smsLastResult'] ) : '';
+				$test_attempt = ! empty( $wallet_status['smsLastAttemptAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $wallet_status['smsLastAttemptAt'] ) ) : '—';
+				$test_success = ! empty( $wallet_status['smsLastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $wallet_status['smsLastSuccessAt'] ) ) : '—';
+				?>
+				<div class="mobo-status-grid">
+					<?php $this->status_box( 'آخرین تلاش', $test_attempt ); ?>
+					<?php $this->status_box( 'نتیجه', 'sent' === $test_result ? 'موفق' : ( 'failed' === $test_result ? 'ناموفق' : '—' ) ); ?>
+					<?php $this->status_box( 'آخرین ارسال موفق', $test_success ); ?>
+				</div>
+				<?php if ( ! empty( $wallet_status['smsLastError'] ) ) : ?>
+					<div class="mobo-message mobo-message-error"><strong>خطای آخر:</strong> <?php echo esc_html( $wallet_status['smsLastError'] ); ?></div>
+				<?php endif; ?>
+				<div class="mobo-help">اگر تنظیمات شماره یا Template را تغییر داده‌ای، ابتدا «ذخیره تنظیمات پیامک» را بزن و بعد تست را اجرا کن. مقدار balance در تست از آخرین موجودی ثبت‌شده استفاده می‌شود؛ اگر هنوز موجودی خوانده نشده باشد، مقدار threshold جایگزین می‌شود.</div>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:12px;">
+					<input type="hidden" name="action" value="mobo_core_test_wallet_sms">
+					<?php wp_nonce_field( 'mobo_core_test_wallet_sms' ); ?>
+					<?php submit_button( 'ارسال SMS آزمایشی هشدار کیف پول', 'secondary', 'submit', false ); ?>
+				</form>
+			</div>
+		</div>
 		<?php
 	}
 
@@ -2058,6 +2201,7 @@ type:{mobo_order_type_label}</textarea>
 		$image          = isset( $local['imageProcessing'] ) && is_array( $local['imageProcessing'] ) ? $local['imageProcessing'] : array();
 		$cache_purge    = isset( $local['cachePurge'] ) && is_array( $local['cachePurge'] ) ? $local['cachePurge'] : array();
 		$archive_cache_queue = isset( $cache_purge['archiveQueue'] ) && is_array( $cache_purge['archiveQueue'] ) ? $cache_purge['archiveQueue'] : array();
+		$cache_warmup_queue = isset( $cache_purge['warmupQueue'] ) && is_array( $cache_purge['warmupQueue'] ) ? $cache_purge['warmupQueue'] : array();
 		$cache_purge_status_labels = array(
 			'success'   => 'موفق',
 			'partial'   => 'نیمه‌موفق؛ حداقل یک Integration خطا داشته',
@@ -2065,6 +2209,20 @@ type:{mobo_order_type_label}</textarea>
 			'never_run' => 'هنوز اجرا نشده',
 		);
 		$cache_purge_status = isset( $cache_purge['status'] ) ? sanitize_key( (string) $cache_purge['status'] ) : 'never_run';
+		$runtime_diagnostics = isset( $local['runtimeDiagnostics'] ) && is_array( $local['runtimeDiagnostics'] ) ? $local['runtimeDiagnostics'] : array();
+		$runtime_counters    = isset( $runtime_diagnostics['counters'] ) && is_array( $runtime_diagnostics['counters'] ) ? $runtime_diagnostics['counters'] : array();
+		$runtime_stages      = isset( $runtime_diagnostics['stages'] ) && is_array( $runtime_diagnostics['stages'] ) ? $runtime_diagnostics['stages'] : array();
+		$runtime_queue       = isset( $runtime_diagnostics['queueHealth'] ) && is_array( $runtime_diagnostics['queueHealth'] ) ? $runtime_diagnostics['queueHealth'] : array();
+		$runtime_recommendations = isset( $runtime_diagnostics['recommendations'] ) && is_array( $runtime_diagnostics['recommendations'] ) ? $runtime_diagnostics['recommendations'] : array();
+		$runtime_runner      = isset( $runtime_diagnostics['runner'] ) && is_array( $runtime_diagnostics['runner'] ) ? $runtime_diagnostics['runner'] : array();
+		$runtime_slow        = isset( $runtime_diagnostics['slowOperations'] ) && is_array( $runtime_diagnostics['slowOperations'] ) ? $runtime_diagnostics['slowOperations'] : array();
+		$runtime_adaptive    = isset( $runtime_diagnostics['adaptiveTuning'] ) && is_array( $runtime_diagnostics['adaptiveTuning'] ) ? $runtime_diagnostics['adaptiveTuning'] : array();
+		$runtime_adaptive_stability = isset( $runtime_adaptive['stability'] ) && is_array( $runtime_adaptive['stability'] ) ? $runtime_adaptive['stability'] : array();
+		$runtime_adaptive_decisions = isset( $runtime_adaptive['decisions'] ) && is_array( $runtime_adaptive['decisions'] ) ? $runtime_adaptive['decisions'] : array();
+		$runtime_budget      = isset( $runtime_diagnostics['adaptiveBudget'] ) && is_array( $runtime_diagnostics['adaptiveBudget'] ) ? $runtime_diagnostics['adaptiveBudget'] : array();
+		$runtime_circuits    = isset( $runtime_diagnostics['circuitBreakers'] ) && is_array( $runtime_diagnostics['circuitBreakers'] ) ? $runtime_diagnostics['circuitBreakers'] : array();
+		$runtime_scheduler   = isset( $runtime_diagnostics['lastDecision'] ) && is_array( $runtime_diagnostics['lastDecision'] ) ? $runtime_diagnostics['lastDecision'] : array();
+		$runtime_scheduler_stages = isset( $runtime_diagnostics['schedulerStages'] ) && is_array( $runtime_diagnostics['schedulerStages'] ) ? $runtime_diagnostics['schedulerStages'] : array();
 		$wp_cron_ok     = $this->is_wp_cron_disabled();
 		$php_diagnostics_url = wp_nonce_url( admin_url( 'admin-post.php?action=mobo_core_php_diagnostics' ), 'mobo_core_php_diagnostics' );
 		?>
@@ -2092,6 +2250,154 @@ type:{mobo_order_type_label}</textarea>
 						<input type="text" readonly dir="ltr" value="<?php echo esc_attr( rest_url( 'mobo-core/v1/health' ) ); ?>" onclick="this.select();">
 						<div class="mobo-help">Portal این endpoint را دوره‌ای با Header امنیتی X-SEC فراخوانی می‌کند. این درخواست علاوه بر ثبت وضعیت زنده، سایت را از حالت Sleep خارج نگه می‌دارد.</div>
 					</div>
+				</div>
+
+				<div class="mobo-card mobo-card-wide">
+					<div class="mobo-card-head">
+						<h2>کارایی Runtime و تشخیص خودکار</h2>
+						<p>این آمار سبک و تجمیعی است؛ برای هر Event رکورد جدا ساخته نمی‌شود. پنجره آماری حداکثر ۲۴ ساعت است و Front-end هزینه مستقیمی بابت آن ندارد.</p>
+					</div>
+					<div class="mobo-status-grid">
+						<?php $this->status_box( 'Product No-op', absint( isset( $runtime_counters['product_noop'] ) ? $runtime_counters['product_noop'] : 0 ) ); ?>
+						<?php $this->status_box( 'Product Save واقعی', absint( isset( $runtime_counters['product_save'] ) ? $runtime_counters['product_save'] : 0 ) ); ?>
+						<?php $this->status_box( 'Variation No-op', absint( isset( $runtime_counters['variation_noop'] ) ? $runtime_counters['variation_noop'] : 0 ) ); ?>
+						<?php $this->status_box( 'Variation Save واقعی', absint( isset( $runtime_counters['variation_save'] ) ? $runtime_counters['variation_save'] : 0 ) ); ?>
+						<?php $this->status_box( 'Runner Run', absint( isset( $runtime_runner['runs'] ) ? $runtime_runner['runs'] : 0 ) ); ?>
+						<?php $runtime_runner_avg = absint( isset( $runtime_runner['runs'] ) ? $runtime_runner['runs'] : 0 ) > 0 ? round( absint( isset( $runtime_runner['totalMs'] ) ? $runtime_runner['totalMs'] : 0 ) / absint( $runtime_runner['runs'] ) ) : 0; ?>
+						<?php $this->status_box( 'میانگین Runner', absint( $runtime_runner_avg ) . ' ms' ); ?>
+						<?php $runtime_webhook_health = isset( $runtime_queue['webhook'] ) && is_array( $runtime_queue['webhook'] ) ? $runtime_queue['webhook'] : array(); ?>
+						<?php $runtime_image_health = isset( $runtime_queue['image'] ) && is_array( $runtime_queue['image'] ) ? $runtime_queue['image'] : array(); ?>
+						<?php $runtime_parent_health = isset( $runtime_queue['parentFinalize'] ) && is_array( $runtime_queue['parentFinalize'] ) ? $runtime_queue['parentFinalize'] : array(); ?>
+						<?php $this->status_box( 'Webhook Pending / Due', absint( isset( $runtime_webhook_health['pendingCount'] ) ? $runtime_webhook_health['pendingCount'] : 0 ) . ' / ' . absint( isset( $runtime_webhook_health['dueCount'] ) ? $runtime_webhook_health['dueCount'] : 0 ) ); ?>
+						<?php $this->status_box( 'Image Pending / Due', absint( isset( $runtime_image_health['pending'] ) ? $runtime_image_health['pending'] : 0 ) . ' / ' . absint( isset( $runtime_image_health['due'] ) ? $runtime_image_health['due'] : 0 ) ); ?>
+						<?php $this->status_box( 'Parent Finalize Pending / Due', absint( isset( $runtime_parent_health['pendingCount'] ) ? $runtime_parent_health['pendingCount'] : 0 ) . ' / ' . absint( isset( $runtime_parent_health['dueCount'] ) ? $runtime_parent_health['dueCount'] : 0 ) ); ?>
+						<?php $this->status_box( 'Adaptive Tuning', ! empty( $runtime_adaptive['enabled'] ) ? ( isset( $runtime_adaptive['mode'] ) ? $runtime_adaptive['mode'] : 'active' ) : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'علت Profile تطبیقی', isset( $runtime_adaptive['reason'] ) ? $runtime_adaptive['reason'] : '—' ); ?>
+						<?php $this->status_box( 'Adaptive Hold', count( isset( $runtime_adaptive_stability['heldStages'] ) && is_array( $runtime_adaptive_stability['heldStages'] ) ? $runtime_adaptive_stability['heldStages'] : array() ) ); ?>
+						<?php $this->status_box( 'Adaptive Changed', count( isset( $runtime_adaptive_stability['changedStages'] ) && is_array( $runtime_adaptive_stability['changedStages'] ) ? $runtime_adaptive_stability['changedStages'] : array() ) ); ?>
+						<?php $this->status_box( 'Budget Pool', absint( isset( $runtime_budget['distributableMs'] ) ? $runtime_budget['distributableMs'] : 0 ) . ' ms' ); ?>
+						<?php $this->status_box( 'Fair Scheduler Slot', absint( isset( $runtime_scheduler['backgroundCapacity'] ) ? $runtime_scheduler['backgroundCapacity'] : 0 ) ); ?>
+						<?php $this->status_box( 'Circuit Open/Degraded', absint( isset( $runtime_circuits['openCount'] ) ? $runtime_circuits['openCount'] : 0 ) ); ?>
+						<?php $this->status_box( 'Circuit Half-open', absint( isset( $runtime_circuits['halfOpenCount'] ) ? $runtime_circuits['halfOpenCount'] : 0 ) ); ?>
+					</div>
+
+					<?php if ( ! empty( $runtime_adaptive['limits'] ) && is_array( $runtime_adaptive['limits'] ) ) : ?>
+						<div class="mobo-help" style="margin-top:16px"><strong>ظرفیت فعلی Adaptive:</strong> <code dir="ltr"><?php echo esc_html( wp_json_encode( $runtime_adaptive['limits'], JSON_UNESCAPED_SLASHES ) ); ?></code></div>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $runtime_adaptive_decisions ) ) : ?>
+						<table class="widefat striped" style="margin-top:16px">
+							<thead><tr><th>Adaptive Stage</th><th>Anchor</th><th>Ideal</th><th>Applied</th><th>Confidence</th><th>Cooldown</th><th>Decision</th></tr></thead>
+							<tbody>
+							<?php foreach ( $runtime_adaptive_decisions as $runtime_adaptive_stage => $runtime_adaptive_decision ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $runtime_adaptive_stage ); ?></code></td>
+									<td><?php echo esc_html( absint( isset( $runtime_adaptive_decision['anchor'] ) ? $runtime_adaptive_decision['anchor'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_adaptive_decision['ideal'] ) ? $runtime_adaptive_decision['ideal'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_adaptive_decision['applied'] ) ? $runtime_adaptive_decision['applied'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_adaptive_decision['confidencePermille'] ) ? $runtime_adaptive_decision['confidencePermille'] : 0 ) ); ?>/1000</td>
+									<td><?php echo ! empty( $runtime_adaptive_decision['cooldownActive'] ) ? 'فعال' : '—'; ?></td>
+									<td><code><?php echo esc_html( isset( $runtime_adaptive_decision['reason'] ) ? $runtime_adaptive_decision['reason'] : '—' ); ?></code></td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					<?php endif; ?>
+
+
+					<?php if ( ! empty( $runtime_budget['activeStages'] ) && is_array( $runtime_budget['activeStages'] ) ) : ?>
+						<table class="widefat striped" style="margin-top:16px">
+							<thead><tr><th>Budget Stage</th><th>Backlog</th><th>Trend</th><th>Pressure</th><th>Weight</th><th>Budget</th></tr></thead>
+							<tbody>
+							<?php foreach ( $runtime_budget['activeStages'] as $runtime_budget_stage ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $runtime_budget_stage ); ?></code></td>
+									<td><?php echo esc_html( absint( isset( $runtime_budget['backlog'][ $runtime_budget_stage ] ) ? $runtime_budget['backlog'][ $runtime_budget_stage ] : 0 ) ); ?></td>
+									<td><?php echo esc_html( (int) ( isset( $runtime_budget['backlogTrend'][ $runtime_budget_stage ] ) ? $runtime_budget['backlogTrend'][ $runtime_budget_stage ] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_budget['pressurePermille'][ $runtime_budget_stage ] ) ? $runtime_budget['pressurePermille'][ $runtime_budget_stage ] : 0 ) ); ?>/1000</td>
+									<td><?php echo esc_html( absint( isset( $runtime_budget['weights'][ $runtime_budget_stage ] ) ? $runtime_budget['weights'][ $runtime_budget_stage ] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_budget['stageBudgetMs'][ $runtime_budget_stage ] ) ? $runtime_budget['stageBudgetMs'][ $runtime_budget_stage ] : 0 ) ); ?> ms</td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					<?php endif; ?>
+
+					<?php $runtime_circuit_stages = isset( $runtime_circuits['stages'] ) && is_array( $runtime_circuits['stages'] ) ? $runtime_circuits['stages'] : array(); ?>
+					<?php if ( ! empty( $runtime_circuit_stages ) ) : ?>
+						<table class="widefat striped" style="margin-top:16px">
+							<thead><tr><th>Circuit Stage</th><th>State</th><th>Failure Streak</th><th>Fail EWMA</th><th>Open Until</th><th>Reason</th></tr></thead>
+							<tbody>
+							<?php foreach ( $runtime_circuit_stages as $runtime_circuit_stage => $runtime_circuit ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $runtime_circuit_stage ); ?></code></td>
+									<td><code><?php echo esc_html( isset( $runtime_circuit['state'] ) ? $runtime_circuit['state'] : 'closed' ); ?></code></td>
+									<td><?php echo esc_html( absint( isset( $runtime_circuit['failureStreak'] ) ? $runtime_circuit['failureStreak'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_circuit['failurePermille'] ) ? $runtime_circuit['failurePermille'] : 0 ) ); ?>/1000</td>
+									<td><?php echo esc_html( absint( isset( $runtime_circuit['openUntil'] ) ? $runtime_circuit['openUntil'] : 0 ) > 0 ? wp_date( 'Y-m-d H:i:s', absint( $runtime_circuit['openUntil'] ) ) : '—' ); ?></td>
+									<td><code><?php echo esc_html( isset( $runtime_circuit['reason'] ) ? $runtime_circuit['reason'] : '—' ); ?></code></td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $runtime_scheduler_stages ) ) : ?>
+						<table class="widefat striped" style="margin-top:16px">
+							<thead><tr><th>Fair Stage</th><th>Selected</th><th>Deferred</th><th>Last Selected</th></tr></thead>
+							<tbody>
+							<?php foreach ( $runtime_scheduler_stages as $runtime_scheduler_stage => $runtime_scheduler_stat ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $runtime_scheduler_stage ); ?></code></td>
+									<td><?php echo esc_html( absint( isset( $runtime_scheduler_stat['selected'] ) ? $runtime_scheduler_stat['selected'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_scheduler_stat['deferred'] ) ? $runtime_scheduler_stat['deferred'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_scheduler_stat['lastSelectedAt'] ) ? $runtime_scheduler_stat['lastSelectedAt'] : 0 ) > 0 ? wp_date( 'Y-m-d H:i:s', absint( $runtime_scheduler_stat['lastSelectedAt'] ) ) : '—' ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $runtime_stages ) ) : ?>
+						<table class="widefat striped" style="margin-top:16px">
+							<thead><tr><th>Stage</th><th>اجرا</th><th>میانگین</th><th>EWMA ms/item</th><th>P50/P95 Run</th><th>Latency Trend</th><th>Failure Streak</th><th>Processed</th><th>Deferred</th><th>Failed</th></tr></thead>
+							<tbody>
+							<?php foreach ( $runtime_stages as $runtime_stage_name => $runtime_stage ) : ?>
+								<?php $runtime_stage_runs = absint( isset( $runtime_stage['runs'] ) ? $runtime_stage['runs'] : 0 ); ?>
+								<tr>
+									<td><code><?php echo esc_html( $runtime_stage_name ); ?></code></td>
+									<td><?php echo esc_html( $runtime_stage_runs ); ?></td>
+									<td><?php echo esc_html( $runtime_stage_runs > 0 ? round( absint( isset( $runtime_stage['totalMs'] ) ? $runtime_stage['totalMs'] : 0 ) / $runtime_stage_runs ) : 0 ); ?> ms</td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['ewmaMsPerItem'] ) ? $runtime_stage['ewmaMsPerItem'] : ( isset( $runtime_stage['recentMsPerItem'] ) ? $runtime_stage['recentMsPerItem'] : 0 ) ) ); ?> ms</td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['p50Ms'] ) ? $runtime_stage['p50Ms'] : 0 ) ); ?> / <?php echo esc_html( absint( isset( $runtime_stage['p95Ms'] ) ? $runtime_stage['p95Ms'] : 0 ) ); ?> ms</td>
+									<td><?php echo esc_html( (int) ( isset( $runtime_stage['latencyTrendPermille'] ) ? $runtime_stage['latencyTrendPermille'] : 0 ) ); ?>/1000</td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['failureStreak'] ) ? $runtime_stage['failureStreak'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['processed'] ) ? $runtime_stage['processed'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['deferred'] ) ? $runtime_stage['deferred'] : 0 ) ); ?></td>
+									<td><?php echo esc_html( absint( isset( $runtime_stage['failed'] ) ? $runtime_stage['failed'] : 0 ) ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $runtime_slow ) ) : ?>
+						<details class="mobo-collapsible-log" style="margin-top:16px">
+							<summary>آخرین عملیات کند (آستانه پیش‌فرض ۲۰۰۰ms)</summary>
+							<div class="mobo-log-box"><pre dir="ltr"><?php echo esc_html( wp_json_encode( array_slice( $runtime_slow, 0, 8 ), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></pre></div>
+						</details>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $runtime_recommendations ) ) : ?>
+						<div class="mobo-help" style="margin-top:16px">
+							<strong>پیشنهادهای خودکار:</strong>
+							<ul style="margin:8px 18px 0">
+							<?php foreach ( $runtime_recommendations as $runtime_recommendation ) : ?>
+								<li><?php echo esc_html( isset( $runtime_recommendation['message'] ) ? $runtime_recommendation['message'] : '' ); ?></li>
+							<?php endforeach; ?>
+							</ul>
+						</div>
+					<?php endif; ?>
 				</div>
 
 				<div class="mobo-card">
@@ -2127,10 +2433,17 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->status_box( 'صف آرشیو URL / Product', absint( isset( $archive_cache_queue['pendingUrlCount'] ) ? $archive_cache_queue['pendingUrlCount'] : 0 ) . ' / ' . absint( isset( $archive_cache_queue['pendingProductCount'] ) ? $archive_cache_queue['pendingProductCount'] : 0 ) ); ?>
 						<?php $this->status_box( 'موعد Purge آرشیو', ! empty( $archive_cache_queue['dueAt'] ) ? Mobo_Core_Iran_Date::format_value( $archive_cache_queue['dueAt'] ) : '—' ); ?>
 						<?php $this->status_box( 'آخرین Purge آرشیو', ! empty( $archive_cache_queue['lastCompletedAt'] ) ? Mobo_Core_Iran_Date::format_value( $archive_cache_queue['lastCompletedAt'] ) : '—' ); ?>
+						<?php $this->status_box( 'Warmup صفحه محصول', ! empty( $cache_warmup_queue['enabled'] ) ? 'فعال' : 'غیرفعال' ); ?>
+						<?php $this->status_box( 'صف Warmup / آماده اجرا', absint( isset( $cache_warmup_queue['pendingCount'] ) ? $cache_warmup_queue['pendingCount'] : 0 ) . ' / ' . absint( isset( $cache_warmup_queue['dueCount'] ) ? $cache_warmup_queue['dueCount'] : 0 ) ); ?>
+						<?php $this->status_box( 'آخرین Warmup موفق', absint( isset( $cache_warmup_queue['lastWarmed'] ) ? $cache_warmup_queue['lastWarmed'] : 0 ) . ' URL — ' . ( ! empty( $cache_warmup_queue['lastCompletedAt'] ) ? Mobo_Core_Iran_Date::format_value( $cache_warmup_queue['lastCompletedAt'] ) : '—' ) ); ?>
 					</div>
 
 					<?php if ( ! empty( $cache_purge['lastError'] ) ) : ?>
 						<div class="mobo-alert mobo-alert-error"><strong>آخرین خطای Cache Purge:</strong> <?php echo esc_html( $cache_purge['lastError'] ); ?></div>
+					<?php endif; ?>
+
+					<?php if ( ! empty( $cache_warmup_queue['lastError'] ) ) : ?>
+						<div class="mobo-alert mobo-alert-error"><strong>آخرین خطای Product Cache Warmup:</strong> <?php echo esc_html( $cache_warmup_queue['lastError'] ); ?></div>
 					<?php endif; ?>
 
 					<?php if ( ! empty( $cache_purge['integrations'] ) && is_array( $cache_purge['integrations'] ) ) : ?>
@@ -2387,6 +2700,7 @@ type:{mobo_order_type_label}</textarea>
 						<?php $this->int_field( 'حداقل فاصله Kick / ثانیه', 'mobo_core_self_runner_min_interval_seconds', 0, 60 ); ?>
 						<?php $this->int_field( 'Timeout درخواست داخلی / ثانیه', 'mobo_core_self_runner_http_timeout_seconds', 1, 10 ); ?>
 						<?php $this->bool_field( 'پردازش صف وب‌هوک در Runner', 'mobo_core_real_cron_process_webhooks' ); ?>
+						<?php $this->bool_field( 'تنظیم تطبیقی ظرفیت Worker بر اساس سرعت/حافظه', 'mobo_core_adaptive_execution_enabled' ); ?>
 						<?php $this->bool_field( 'پردازش فوری وب‌هوک هنگام دریافت', 'mobo_core_process_webhook_on_receive' ); ?>
 						<?php $this->bool_field( 'دریافت payload اصلی از MoboCore', 'mobo_core_pull_payload_enabled' ); ?>
 						<?php $this->int_field( 'Timeout دریافت payload / ثانیه', 'mobo_core_payload_pull_timeout_seconds', 5, 180 ); ?>
@@ -2866,7 +3180,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 		$automation_labels    = array(
 			'idle' => 'شروع نشده', 'started' => 'در حال شروع', 'paused' => 'متوقف شده', 'completed' => 'کامل شده',
-			'waiting-delete-old-approval' => 'منتظر تایید حذف پیوست قدیمی', 'waiting-delete-orphan-approval' => 'منتظر تایید پاکسازی فایل ها',
+			'waiting-delete-old-setting' => 'منتظر فعال شدن تنظیم دائمی حذف پیوست قدیمی', 'delete-old-setting-enabled' => 'تنظیم دائمی حذف پیوست قدیمی فعال است', 'waiting-delete-orphan-approval' => 'منتظر تایید پاکسازی فایل ها',
 			'waiting-retry' => 'منتظر زمان تلاش مجدد', 'waiting-active-processor' => 'منتظر پایان پردازش فعال', 'locked' => 'در انتظار آزاد شدن قفل',
 		);
 		$automation_state_label = isset( $automation_labels[ $automation_state ] ) ? $automation_labels[ $automation_state ] : str_replace( '-', ' ', $automation_state );
@@ -2937,6 +3251,7 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->status_box( 'نتیجه آخر', ! empty( $last['status'] ) ? $this->image_refresh_status_label( $last['status'] ) : '—' ); ?>
 					<?php $this->status_box( 'پیشرفت ساخت صف', $this->format_scan_progress( $enqueue, 'scanned' ) ); ?>
 					<?php $this->status_box( 'تصاویر محصولات بدون عکس: صف شده / رد شده / ناموفق', absint( isset( $enqueue['missingImageQueued'] ) ? $enqueue['missingImageQueued'] : 0 ) . ' / ' . absint( isset( $enqueue['missingImageSkipped'] ) ? $enqueue['missingImageSkipped'] : 0 ) . ' / ' . absint( isset( $enqueue['missingImageFailed'] ) ? $enqueue['missingImageFailed'] : 0 ) ); ?>
+					<?php $this->status_box( 'هویت بازیابی شده هنگام ساخت صف / JPEG جداشده علامت گذاری شده', absint( isset( $enqueue['recoveredIdentity'] ) ? $enqueue['recoveredIdentity'] : 0 ) . ' / ' . absint( isset( $enqueue['detachedRecovered'] ) ? $enqueue['detachedRecovered'] : 0 ) ); ?>
 					<?php $this->status_box( 'اجرای تقریبی باقی مانده برای ساخت صف', ! empty( $workflow_flags['enqueueComplete'] ) ? '۰ - کامل شده' : ( isset( $workflow_flags['enqueueClicks'] ) ? absint( $workflow_flags['enqueueClicks'] ) . ' بار' : 'نامشخص' ) ); ?>
 				</div>
 			</div>
@@ -2954,6 +3269,8 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->status_box( 'محصولات محلی بدون تصویر', absint( isset( $scan['missingImageProducts'] ) ? $scan['missingImageProducts'] : 0 ) ); ?>
 					<?php $this->status_box( 'حجم تقریبی قدیمی', $this->format_bytes( isset( $scan['totalLegacyBytes'] ) ? $scan['totalLegacyBytes'] : 0 ) ); ?>
 					<?php $this->status_box( 'بدون محصول / بدون نشانی تصویر جدید', absint( isset( $scan['withoutProduct'] ) ? $scan['withoutProduct'] : 0 ) . ' / ' . absint( isset( $scan['withoutSourceUrl'] ) ? $scan['withoutSourceUrl'] : 0 ) ); ?>
+					<?php $this->status_box( 'هویت قدیمی بازیابی شده از کاتالوگ موبو', absint( isset( $scan['recoveredIdentity'] ) ? $scan['recoveredIdentity'] : 0 ) . ' / جداشده: ' . absint( isset( $scan['recoveredDetached'] ) ? $scan['recoveredDetached'] : 0 ) ); ?>
+					<?php $this->status_box( 'JPG/PNG غیرموبو نادیده گرفته شده', absint( isset( $scan['unrelatedRaster'] ) ? $scan['unrelatedRaster'] : 0 ) ); ?>
 					<?php $this->status_box( 'آخرین اسکن', ! empty( $scan['checkedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $scan['checkedAt'] ) ) : '—' ); ?>
 					<?php $this->status_box( 'پیشرفت اسکن تصاویر قدیمی', $this->format_scan_progress( $scan, 'scanned' ) ); ?>
 				</div>
@@ -2972,11 +3289,11 @@ type:{mobo_order_type_label}</textarea>
 				<li><strong>بررسی و ساخت صف:</strong> ابتدا مرحله ۱ را تا ۱۰۰٪ کامل کنید. سپس مرحله ۲ را جداگانه تکرار کنید؛ هر بار فقط یک batch ساخته می شود و دکمه تعداد تقریبی اجرای باقی مانده را نشان می دهد. بعد از نمایش «دوره کامل شد» دیگر مرحله ۲ را نزنید.</li>
 				<li><strong>پردازش:</strong> صف را مرحله ای اجرا کنید تا تعداد در انتظار، آماده پردازش و ناموفق صفر شود. ردیف های ناموفق را از ستون «نتیجه یا خطا» بررسی کنید.</li>
 				<li><strong>کنترل برش ها:</strong> اسکن سلامت برش های WebP را تا پایان یک دوره کامل اجرا کنید. اگر نقصی وجود داشت، بازسازی داخلی را اجرا و سپس دوباره اسکن کنید.</li>
-				<li><strong>حذف پیوست های جایگزین شده:</strong> بعد از سالم شدن صف و برش ها، ابتدا مرحله ۶ را با حذف خاموش تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، گزینه حذف پیوست قدیمی را فعال و سپس مرحله ۷ را تا پایان حذف امن اجرا کنید.</li>
+				<li><strong>حذف پیوست های جایگزین شده:</strong> بعد از سالم شدن صف و برش ها، مرحله ۶ را تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، گزینه حذف پیوست قدیمی را یک بار فعال کنید؛ Stage 7 از همان نقطه با Cron/Self Runner به صورت خودکار تا نقطه پایدار ادامه پیدا می کند و دیگر نیاز به کلیک batch به batch ندارد.</li>
 				<li><strong>پاکسازی فایل های بدون پیوست:</strong> در پایان، مرحله ۸ را با پاکسازی خاموش تا پایان اسکن اجرا کنید. اگر خانواده آماده حذف وجود داشت، پاکسازی را فعال و مرحله ۹ را محدود و مرحله ای اجرا کنید.</li>
 			</ol>
 			<div class="mobo-message mobo-message-warning" style="margin-top:14px;">
-				در ارتقا به این نسخه، گزینه حذف پیوست قدیمی و پاکسازی فایل های بدون پیوست به صورت خودکار خاموش می شوند و فقط پس از کنترل کامل باید دوباره توسط مدیر فعال شوند. اگر بازسازی برش ها ناموفق بود، فضای دیسک، مجوز نوشتن پوشه uploads و پشتیبانی GD یا Imagick از WebP را بررسی کنید. ابزار داخلی علت را در جدول پایین ثبت می کند و تا رفع خطا تصویر قدیمی را حذف نمی کند.
+				گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» یک انتخاب دائمی مدیر است و افزونه آن را هنگام شروع، توقف، خطا، تغییر مرحله یا پایان چرخه خاموش نمی کند. پاکسازی فایل های بدون پیوست همچنان تایید جداگانه خود را دارد. اگر بازسازی برش ها ناموفق بود، فضای دیسک، مجوز نوشتن پوشه uploads و پشتیبانی GD یا Imagick از WebP را بررسی کنید. ابزار داخلی علت را در جدول پایین ثبت می کند و تا رفع خطا تصویر قدیمی را حذف نمی کند.
 			</div>
 		</div>
 
@@ -2984,11 +3301,11 @@ type:{mobo_order_type_label}</textarea>
 		<div class="mobo-card mobo-card-wide">
 			<div class="mobo-card-head">
 				<h2>کنترل اجرای خودکار</h2>
-				<p>وضعیت اصلی و مرحله جاری در «مرکز وضعیت نوسازی» بالای صفحه نمایش داده می شود. این بخش فقط برای شروع، اجرای فوری، توقف یا تایید مرحله حذفی است.</p>
+				<p>وضعیت اصلی و مرحله جاری در «مرکز وضعیت نوسازی» بالای صفحه نمایش داده می شود. این بخش برای شروع، اجرای فوری و توقف است؛ فقط پاکسازی خانواده های بدون پیوست تایید یک باره جداگانه دارد.</p>
 			</div>
 
 			<div class="mobo-message mobo-message-info" style="margin-top:14px;">
-				<strong>رفتار ایمن:</strong> اسکن، ساخت صف، جایگزینی، کنترل و بازسازی برش ها و اسکن های بعدی خودکار هستند. حذف پیوست قدیمی و حذف خانواده های بدون پیوست هرکدام فقط پس از یک تایید جداگانه مدیر آغاز می شوند. در صورت خطای نهایی، اجرای خودکار خاموش می شود و فایل قدیمی باقی می ماند.
+				<strong>رفتار ایمن:</strong> اسکن، ساخت صف، جایگزینی، کنترل و بازسازی برش ها و اسکن های بعدی خودکار هستند. حذف پیوست قدیمی فقط به تنظیم دائمی «حذف پیوست قدیمی بعد از جایگزینی امن» وابسته است؛ وقتی یک بار روشن شد در ادامه و چرخه های بعدی حفظ می شود. پاکسازی خانواده های بدون پیوست همچنان تایید جداگانه مدیر می خواهد. در صورت خطای نهایی، اجرای خودکار متوقف می شود ولی تنظیم حذف پیوست قدیمی تغییر نمی کند.
 			</div>
 
 			<div class="mobo-actions" style="margin-top:14px;">
@@ -3021,13 +3338,7 @@ type:{mobo_order_type_label}</textarea>
 					</form>
 				<?php endif; ?>
 
-				<?php if ( 'delete-old' === $automation_waiting ) : ?>
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('پشتیبان دیتابیس و uploads را بررسی کرده اید و حذف امن پیوست های قدیمی جایگزین شده تایید می شود؟');">
-						<input type="hidden" name="action" value="mobo_core_approve_image_refresh_delete_old">
-						<?php wp_nonce_field( 'mobo_core_approve_image_refresh_delete_old', 'mobo_core_nonce' ); ?>
-						<button type="submit" class="mobo-btn mobo-btn-danger">تایید یک باره حذف پیوست های قدیمی و ادامه خودکار</button>
-					</form>
-				<?php elseif ( 'delete-orphan' === $automation_waiting ) : ?>
+				<?php if ( 'delete-orphan' === $automation_waiting ) : ?>
 					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('فهرست کاندیدها و پشتیبان uploads را بررسی کرده اید و حذف خانواده های بدون پیوست تایید می شود؟');">
 						<input type="hidden" name="action" value="mobo_core_approve_image_refresh_delete_orphans">
 						<?php wp_nonce_field( 'mobo_core_approve_image_refresh_delete_orphans', 'mobo_core_nonce' ); ?>
@@ -3062,7 +3373,7 @@ type:{mobo_order_type_label}</textarea>
 
 				<div class="mobo-fields-grid">
 					<?php $this->bool_field( 'فعال بودن نوسازی تصاویر قدیمی', 'mobo_core_image_refresh_enabled', $automation_active || ( empty( $status['enabled'] ) && empty( $workflow_flags['canEnableRefresh'] ) ), 'این کلید بعد از تکمیل مرحله ۲ و ساخته شدن حداقل یک ردیف صف فعال می شود.' ); ?>
-					<?php $this->bool_field( 'حذف پیوست قدیمی بعد از جایگزینی امن', 'mobo_core_image_refresh_delete_old', $automation_active || ( ! $delete_old_enabled && empty( $workflow_flags['canEnableDeleteOld'] ) ), 'این کلید فقط بعد از تکمیل مرحله ۶ و وجود پیوست آماده حذف فعال می شود.' ); ?>
+					<?php $this->bool_field( 'حذف پیوست قدیمی بعد از جایگزینی امن', 'mobo_core_image_refresh_delete_old', ( ! $delete_old_enabled && empty( $workflow_flags['canEnableDeleteOld'] ) ), 'این انتخاب دائمی است. پس از یک بار فعال سازی، افزونه آن را هنگام شروع/توقف/خطا/پایان چرخه خاموش نمی کند و مرحله ۷ در چرخه های بعدی نیز از همین تنظیم استفاده می کند.' ); ?>
 					<?php $this->bool_field( 'ساخت و تکمیل خودکار برش های استاندارد وردپرس برای تصویر WebP جدید؛ کنترل سلامت همیشه انجام می شود', 'mobo_core_image_refresh_generate_subsizes' ); ?>
 					<?php $this->bool_field( 'پاکسازی برش های قدیمی جا مانده بعد از حذف پیوست', 'mobo_core_image_refresh_cleanup_leftover_subsizes' ); ?>
 					<?php $this->int_field( 'تعداد پردازش در هر اجرا', 'mobo_core_image_refresh_per_run', 1, 20 ); ?>
@@ -3077,7 +3388,7 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-message mobo-message-info" style="margin-top:14px;">
 					<strong>وضعیت امن کلیدها:</strong>
 					در مراحل ۱ و ۲، «فعال بودن نوسازی» می تواند خاموش بماند. برای مرحله ۳ باید روشن باشد.
-					«حذف پیوست قدیمی» تا پایان مرحله ۶ و «پاکسازی فایل های بدون پیوست» تا پایان مرحله ۸ باید خاموش بمانند؛ افزونه تا رسیدن به پیش نیاز، امکان فعال کردن آن ها را قفل می کند.
+					برای اولین فعال سازی «حذف پیوست قدیمی»، ابتدا مرحله ۶ را کامل کنید. پس از فعال سازی، مقدار آن دائمی می ماند و در چرخه های بعدی خودکار خاموش نمی شود. «پاکسازی فایل های بدون پیوست» همچنان تا پایان مرحله ۸ قفل و تاییدمحور است.
 				</div>
 
 				<?php $this->save_button(); ?>
@@ -3258,35 +3569,40 @@ type:{mobo_order_type_label}</textarea>
 		<div class="mobo-card">
 			<div class="mobo-card-head">
 				<h2>پیوست های قدیمی که قبلا جایگزین شده اند</h2>
-				<p>این بخش مخصوص اجرای آزمایشی است: محصول به WebP منتقل شده، اما چون حذف قدیمی ها خاموش بوده، پیوست JPG/PNG هنوز در کتابخانه رسانه مانده است. ابتدا اسکن کنید و بعد از تایید، حذف امن را اجرا کنید.</p>
+				<p>این بخش پیوست های JPG/PNG جایگزین شده را بررسی می کند. مرحله ۶ فقط خواندنی است؛ مرحله ۷ پس از تایید، مراجع شناخته شده را به WebP منتقل می کند، دوباره ایمنی را می سنجد و فقط سپس پیوست قدیمی را حذف می کند.</p>
 			</div>
 
 			<div class="mobo-status-grid">
-				<?php $this->status_box( 'اسکن: بررسی شده / آماده حذف', absint( isset( $replaced_scan['scanned'] ) ? $replaced_scan['scanned'] : 0 ) . ' / ' . absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 ) ); ?>
-				<?php $this->status_box( 'هنوز در محصول / دارای مرجع دیگر', absint( isset( $replaced_scan['stillUsed'] ) ? $replaced_scan['stillUsed'] : 0 ) . ' / ' . absint( isset( $replaced_scan['externalReferences'] ) ? $replaced_scan['externalReferences'] : 0 ) ); ?>
+				<?php $this->status_box( 'مرحله ۶: بررسی شده / کاندید مرحله ۷', absint( isset( $replaced_scan['scanned'] ) ? $replaced_scan['scanned'] : 0 ) . ' / ' . absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 ) ); ?>
+				<?php $this->status_box( 'مرجع محصول شناسایی شده در مرحله ۶', absint( isset( $replaced_scan['stillUsed'] ) ? $replaced_scan['stillUsed'] : 0 ) ); ?>
+				<?php $this->status_box( 'Audit کامل مراجع', 'در مرحله ۷، قبل از حذف هر پیوست' ); ?>
 				<?php $this->status_box( 'جایگزین نامعتبر / برش ناقص', absint( isset( $replaced_scan['invalidReplacement'] ) ? $replaced_scan['invalidReplacement'] : 0 ) . ' / ' . absint( isset( $replaced_scan['invalidSubsizes'] ) ? $replaced_scan['invalidSubsizes'] : 0 ) ); ?>
 				<?php $this->status_box( 'پیشرفت اسکن پیوست های قدیمی', $this->format_scan_progress( $replaced_scan, 'scanned' ) ); ?>
-				<?php $this->status_box( 'حذف: آماده / حذف شده / ناموفق', absint( isset( $replaced_delete['ready'] ) ? $replaced_delete['ready'] : 0 ) . ' / ' . absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 ) . ' / ' . absint( isset( $replaced_delete['failed'] ) ? $replaced_delete['failed'] : 0 ) ); ?>
+				<?php $this->status_box( 'مرحله ۷: حذف / نگهداری ایمن / خطای عملیاتی', absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 ) . ' / ' . absint( isset( $replaced_delete['blocked'] ) ? $replaced_delete['blocked'] : 0 ) . ' / ' . absint( isset( $replaced_delete['errors'] ) ? $replaced_delete['errors'] : 0 ) ); ?>
+				<?php $this->status_box( 'انتقال مرجع: پیوست / ردیف', absint( isset( $replaced_delete['referencesMigrated'] ) ? $replaced_delete['referencesMigrated'] : 0 ) . ' / ' . absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) ); ?>
 				<?php $this->status_box( 'پیشرفت حذف پیوست های قدیمی', $this->format_scan_progress( $replaced_delete, 'scanned' ) ); ?>
 			</div>
 
 			<?php if ( ! empty( $replaced_scan['checkedAt'] ) && empty( $replaced_scan['cycleComplete'] ) ) : ?>
 				<div class="mobo-message mobo-message-info" style="margin-top:14px;">اسکن پیوست های جایگزین شده کامل نشده است. مرحله ۶ را دوباره اجرا کنید.</div>
-			<?php elseif ( ! empty( $replaced_scan['cycleComplete'] ) && empty( $replaced_scan['ready'] ) ) : ?>
-				<div class="mobo-message mobo-message-info" style="margin-top:14px;">اسکن کامل شد و فعلا پیوست قدیمی آماده حذف وجود ندارد.</div>
 			<?php elseif ( ! empty( $replaced_scan['cycleComplete'] ) ) : ?>
-				<div class="mobo-message mobo-message-warning" style="margin-top:14px;"><?php echo esc_html( absint( $replaced_scan['ready'] ) ); ?> پیوست قدیمی آماده حذف امن است. قبل از مرحله ۷، پشتیبان را کنترل و گزینه حذف پیوست قدیمی را فعال کنید.</div>
+				<?php $scan_actionable = absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 ) + absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 ); ?>
+				<?php if ( $scan_actionable <= 0 ) : ?>
+					<div class="mobo-message mobo-message-info" style="margin-top:14px;">اسکن کامل شد و فعلا پیوست قدیمی قابل پاکسازی وجود ندارد.</div>
+				<?php else : ?>
+					<div class="mobo-message mobo-message-warning" style="margin-top:14px;"><?php echo esc_html( $scan_actionable ); ?> پیوست قدیمی قابل پاکسازی است؛ <?php echo esc_html( absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 ) ); ?> مورد ابتدا نیاز به انتقال مرجع به WebP دارد. قبل از مرحله ۷ پشتیبان را کنترل کنید.</div>
+				<?php endif; ?>
 			<?php endif; ?>
 
 			<?php if ( ! empty( $replaced_delete['checkedAt'] ) ) : ?>
 				<?php if ( 'disabled' === ( isset( $replaced_delete['status'] ) ? $replaced_delete['status'] : '' ) ) : ?>
 					<div class="mobo-message mobo-message-warning" style="margin-top:10px;">حذف اجرا نشد؛ گزینه حذف پیوست قدیمی در تنظیمات ایمنی خاموش است.</div>
 				<?php elseif ( empty( $replaced_delete['cycleComplete'] ) ) : ?>
-					<div class="mobo-message mobo-message-info" style="margin-top:10px;">دوره حذف هنوز کامل نشده است. مرحله ۷ را دوباره اجرا کنید.</div>
-				<?php elseif ( ! empty( $replaced_delete['failed'] ) ) : ?>
-					<div class="mobo-message mobo-message-warning" style="margin-top:10px;">دوره حذف کامل شد، اما <?php echo esc_html( absint( $replaced_delete['failed'] ) ); ?> پیوست حذف نشد. دلیل در جدول پایین ثبت شده است.</div>
+					<div class="mobo-message mobo-message-info" style="margin-top:10px;">دوره انتقال مرجع و حذف هنوز کامل نشده است. مرحله ۷ را دوباره اجرا کنید.</div>
+				<?php elseif ( ! empty( $replaced_delete['blocked'] ) || ! empty( $replaced_delete['errors'] ) ) : ?>
+					<div class="mobo-message mobo-message-warning" style="margin-top:10px;">دوره انتقال مرجع و حذف کامل شد. <?php echo esc_html( absint( isset( $replaced_delete['blocked'] ) ? $replaced_delete['blocked'] : 0 ) ); ?> پیوست به دلیل Safety Audit نگه داشته شد و <?php echo esc_html( absint( isset( $replaced_delete['errors'] ) ? $replaced_delete['errors'] : 0 ) ); ?> خطای عملیاتی ثبت شد. این موارد کل اجرای خودکار را متوقف نمی کنند؛ جزئیات در جدول پایین است.</div>
 				<?php else : ?>
-					<div class="mobo-message mobo-message-success" style="margin-top:10px;">دوره حذف امن کامل شد و خطای حذف باقی نمانده است.</div>
+					<div class="mobo-message mobo-message-success" style="margin-top:10px;">دوره انتقال مرجع و حذف امن کامل شد و خطایی باقی نمانده است.</div>
 				<?php endif; ?>
 			<?php endif; ?>
 
@@ -3297,10 +3613,10 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->image_workflow_button( $workflow_steps, 6, 'mobo-btn mobo-btn-light', '۶) اسکن پیوست های قدیمی جایگزین شده' ); ?>
 				</form>
 
-				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('فقط پیوست های قدیمی که جایگزین WebP سالم دارند و هیچ مرجع دیگری ندارند حذف می شوند. ادامه می دهید؟');">
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('برای پیوست های دارای WebP سالم، ابتدا مراجع شناخته شده سایت از JPG/PNG قدیمی به WebP منتقل می شوند. حذف فقط پس از کنترل دوباره و صفر شدن مراجع انجام می شود. پشتیبان را بررسی کرده اید و ادامه می دهید؟');">
 					<input type="hidden" name="action" value="mobo_core_delete_replaced_images">
 					<?php wp_nonce_field( 'mobo_core_delete_replaced_images', 'mobo_core_nonce' ); ?>
-					<?php $this->image_workflow_button( $workflow_steps, 7, 'mobo-btn mobo-btn-danger', '۷) حذف امن پیوست های قدیمی جایگزین شده' ); ?>
+					<?php $this->image_workflow_button( $workflow_steps, 7, 'mobo-btn mobo-btn-danger', '۷) انتقال مراجع و حذف امن پیوست های قدیمی' ); ?>
 				</form>
 			</div>
 
@@ -5646,8 +5962,15 @@ type:{mobo_order_type_label}</textarea>
 
 		$replaced_scan_time   = absint( isset( $replaced_scan['checkedAt'] ) ? $replaced_scan['checkedAt'] : 0 );
 		$replaced_delete_time = absint( isset( $replaced_delete['checkedAt'] ) ? $replaced_delete['checkedAt'] : 0 );
-		if ( empty( $replaced_scan['cycleComplete'] ) || ( ! empty( $replaced_delete['cycleComplete'] ) && $replaced_delete_time >= $replaced_scan_time ) ) return 6;
-		if ( absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 ) > 0 ) return 7;
+		if ( empty( $replaced_scan['cycleComplete'] ) ) return 6;
+		$replaced_actionable = absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 )
+			+ absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 );
+		$delete_newer = ! empty( $replaced_delete['cycleComplete'] ) && $replaced_delete_time >= $replaced_scan_time;
+		$delete_progress = absint( isset( $replaced_delete['passProgress'] )
+			? $replaced_delete['passProgress']
+			: absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 )
+				+ absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) );
+		if ( $replaced_actionable > 0 && ( ! $delete_newer || $delete_progress > 0 ) ) return 7;
 
 		$orphan_scan_time   = absint( isset( $orphan_scan['checkedAt'] ) ? $orphan_scan['checkedAt'] : 0 );
 		$orphan_delete_time = absint( isset( $orphan_delete['executedAt'] ) ? $orphan_delete['executedAt'] : 0 );
@@ -5678,7 +6001,9 @@ type:{mobo_order_type_label}</textarea>
 			case 4: return $this->get_image_refresh_result_percent( $subsize_scan, 'scanned' );
 			case 5: return $this->get_image_refresh_result_percent( $subsize_repair, 'scanned' );
 			case 6: return $this->get_image_refresh_result_percent( $replaced_scan, 'scanned' );
-			case 7: return $this->get_image_refresh_result_percent( $replaced_delete, 'scanned' );
+			case 7:
+				if ( ! empty( $replaced_delete['cycleComplete'] ) && ! empty( $replaced_delete['needsAnotherPass'] ) ) return 99.9;
+				return $this->get_image_refresh_result_percent( $replaced_delete, 'scanned' );
 			case 8: return $this->get_image_refresh_result_percent( $orphan_scan, 'processedAttachments' );
 			case 9:
 				$remaining = absint( isset( $orphan_status['candidate'] ) ? $orphan_status['candidate'] : 0 );
@@ -5698,7 +6023,14 @@ type:{mobo_order_type_label}</textarea>
 			case 4: return $this->format_scan_progress( $subsize_scan, 'scanned' );
 			case 5: return $this->format_scan_progress( $subsize_repair, 'scanned' );
 			case 6: return $this->format_scan_progress( $replaced_scan, 'scanned' );
-			case 7: return $this->format_scan_progress( $replaced_delete, 'scanned' );
+			case 7:
+				if ( ! empty( $replaced_delete['cycleComplete'] ) && ! empty( $replaced_delete['needsAnotherPass'] ) ) {
+					return sprintf( 'این گذر کامل شد: %d حذف، %d ردیف مرجع منتقل شد؛ گذر بعدی خودکار اجرا می شود.', absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 ), absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) );
+				}
+				if ( ! empty( $replaced_delete['stableComplete'] ) ) {
+					return sprintf( 'Stage 7 به نقطه پایدار رسید؛ %d Safety Block و %d خطای عملیاتی در آخرین گذر باقی ماند.', absint( isset( $replaced_delete['blocked'] ) ? $replaced_delete['blocked'] : 0 ), absint( isset( $replaced_delete['errors'] ) ? $replaced_delete['errors'] : 0 ) );
+				}
+				return $this->format_scan_progress( $replaced_delete, 'scanned' );
 			case 8: return $this->format_scan_progress( $orphan_scan, 'processedAttachments' );
 			case 9: return sprintf( 'خانواده باقی مانده: %d، حذف شده: %d، ناموفق: %d', absint( isset( $orphan_status['candidate'] ) ? $orphan_status['candidate'] : 0 ), absint( isset( $orphan_status['deleted'] ) ? $orphan_status['deleted'] : 0 ), absint( isset( $orphan_status['failed'] ) ? $orphan_status['failed'] : 0 ) );
 		}
@@ -6076,7 +6408,22 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function save_sms_notification_settings_from_post() {
-		$this->save_bool_options_from_post( array( 'mobo_core_sms_notifications_enabled' ) );
+		$this->save_bool_options_from_post( array( 'mobo_core_sms_notifications_enabled', 'mobo_core_wallet_alert_enabled' ) );
+
+		if ( isset( $_POST['mobo_core_wallet_alert_threshold'] ) ) {
+			$threshold = max( 0, (int) wp_unslash( $_POST['mobo_core_wallet_alert_threshold'] ) );
+			update_option( 'mobo_core_wallet_alert_threshold', $threshold, false );
+		}
+
+		if ( isset( $_POST['mobo_core_wallet_alert_recipients'] ) ) {
+			$recipients = sanitize_textarea_field( wp_unslash( $_POST['mobo_core_wallet_alert_recipients'] ) );
+			update_option( 'mobo_core_wallet_alert_recipients', $recipients, false );
+		}
+
+		if ( isset( $_POST['mobo_core_wallet_alert_template'] ) ) {
+			$template = sanitize_textarea_field( wp_unslash( $_POST['mobo_core_wallet_alert_template'] ) );
+			update_option( 'mobo_core_wallet_alert_template', $template, false );
+		}
 
 		$scenarios = class_exists( 'Mobo_Core_SMS_Notifications' ) ? ( new Mobo_Core_SMS_Notifications() )->get_scenarios() : array(
 			'non_mobo'  => 'سفارش غیر موبو',
@@ -6131,6 +6478,7 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_only_in_stock',
 						'global_product_auto_compare_price',
 						'global_update_images',
+						'mobo_core_cache_warmup_enabled',
 					)
 				);
 				$this->save_cache_archive_purge_interval_from_post();
@@ -6225,11 +6573,21 @@ type:{mobo_order_type_label}</textarea>
 				if ( empty( $workflow['flags']['canEnableRefresh'] ) ) {
 					update_option( 'mobo_core_image_refresh_enabled', '0', false );
 				}
-				if ( empty( $workflow['flags']['canEnableDeleteOld'] ) ) {
-					update_option( 'mobo_core_image_refresh_delete_old', '0', false );
-				}
 				if ( empty( $workflow['flags']['canEnableOrphanDelete'] ) ) {
 					update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+				}
+
+				/* A persistent delete-old opt-in also converts a manual Stage 7 into the
+				 * bounded automatic drain. This removes the old one-click-per-batch
+				 * behavior while preserving every replacement/subsize/reference guard. */
+				if ( Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+					&& class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ) {
+					$automation = new Mobo_Core_Image_Refresh_Automation();
+					$resume     = $automation->arm_delete_old_autodrain();
+					$status     = Mobo_Core_Image_Refresh_Automation::get_status();
+					if ( ( ! empty( $resume['armed'] ) || ! empty( $status['enabled'] ) ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+						Mobo_Core_Self_Runner::kick( 'image-refresh-delete-old-setting', true );
+					}
 				}
 				break;
 
@@ -6239,6 +6597,7 @@ type:{mobo_order_type_label}</textarea>
 						'mobo_core_self_runner_enabled',
 						'mobo_core_self_runner_continue_enabled',
 						'mobo_core_real_cron_process_webhooks',
+						'mobo_core_adaptive_execution_enabled',
 						'mobo_core_process_webhook_on_receive',
 						'mobo_core_pull_payload_enabled',
 					)
@@ -6473,6 +6832,52 @@ type:{mobo_order_type_label}</textarea>
 				$this->redirect_with_message( 'عملیات پشتیبانی شناخته نشد.', 'error', $tab );
 				break;
 		}
+	}
+
+	/**
+	 * Explicitly re-arm the one-shot Mobo wallet reminder.
+	 *
+	 * @return void
+	 */
+	public function handle_rearm_wallet_alert() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_rearm_wallet_alert' );
+
+		if ( ! class_exists( 'Mobo_Core_Wallet_Alert' ) ) {
+			$this->redirect_with_message( 'سرویس یادآوری موجودی موبو در دسترس نیست.', 'error', 'dashboard' );
+		}
+
+		Mobo_Core_Wallet_Alert::rearm();
+		$this->redirect_with_message( 'یادآوری موجودی موبو دوباره فعال شد. در خرید موفق بعدی موجودی بررسی می‌شود.', 'success', 'dashboard' );
+	}
+
+
+	/**
+	 * Send an administrator-triggered wallet SMS transport test.
+	 *
+	 * @return void
+	 */
+	public function handle_test_wallet_sms() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_test_wallet_sms' );
+
+		if ( ! class_exists( 'Mobo_Core_Wallet_Alert' ) ) {
+			$this->redirect_with_message( 'سرویس هشدار کیف پول موبو در دسترس نیست.', 'error', 'sms' );
+		}
+
+		$wallet = new Mobo_Core_Wallet_Alert();
+		$result = $wallet->send_test_sms();
+		if ( is_wp_error( $result ) ) {
+			$this->redirect_with_message( 'SMS آزمایشی ارسال نشد: ' . $result->get_error_message(), 'error', 'sms' );
+		}
+
+		$this->redirect_with_message( 'درخواست SMS آزمایشی با موفقیت به درگاه فعال Persian WooCommerce SMS تحویل داده شد.', 'success', 'sms' );
 	}
 
 	/**
@@ -6805,8 +7210,42 @@ type:{mobo_order_type_label}</textarea>
 		check_ajax_referer( 'mobo_core_image_refresh_live_status', 'nonce' );
 
 		$automation_status = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
-		if ( ! empty( $automation_status['enabled'] ) && empty( $automation_status['waitingApproval'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
-			Mobo_Core_Self_Runner::kick( 'admin-image-refresh-live-status', false );
+		$rescue_result     = array();
+
+		if ( ! empty( $automation_status['enabled'] ) && empty( $automation_status['waitingApproval'] ) ) {
+			$status_key = isset( $automation_status['status'] ) ? sanitize_key( (string) $automation_status['status'] ) : '';
+			$passive_wait = in_array(
+				$status_key,
+				array( 'waiting-retry', 'waiting-active-processor', 'waiting-delete-old-setting', 'waiting-delete-orphan-approval' ),
+				true
+			);
+			$last_activity = max(
+				absint( isset( $automation_status['lastRunAt'] ) ? $automation_status['lastRunAt'] : 0 ),
+				absint( isset( $automation_status['lastTickFinishedAt'] ) ? $automation_status['lastTickFinishedAt'] : 0 )
+			);
+			$stale = $last_activity <= 0 || ( time() - $last_activity ) >= 12;
+
+			/*
+			 * A non-blocking loopback request can report "dispatched" even when the
+			 * hosting stack never executes that request. Product Sync already has an
+			 * authenticated admin-poll fallback for this class of host. Image Refresh
+			 * needs the same protection: when the workflow is enabled, not intentionally
+			 * waiting and no batch is currently running, a stale live-status poll runs
+			 * exactly one bounded automation tick directly. run_tick() still owns the
+			 * normal image_refresh_automation lock, so this cannot create a parallel
+			 * deletion worker beside real cron or a live Self Runner request.
+			 */
+			if ( $stale && empty( $automation_status['batchRunning'] ) && ! $passive_wait && class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ) {
+				$automation    = new Mobo_Core_Image_Refresh_Automation();
+				$rescue_result = $automation->run_tick( 'admin-live-rescue' );
+				$automation_status = Mobo_Core_Image_Refresh_Automation::get_status();
+
+				if ( ! empty( $rescue_result['success'] ) && ! empty( $rescue_result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+					Mobo_Core_Self_Runner::kick( 'admin-image-refresh-live-rescue', true );
+				}
+			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-image-refresh-live-status', false );
+			}
 		}
 
 		ob_start();
@@ -6815,8 +7254,9 @@ type:{mobo_order_type_label}</textarea>
 
 		wp_send_json_success(
 			array(
-				'html'       => $html,
-				'serverTime' => Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' ),
+				'html'         => $html,
+				'serverTime'   => Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' ),
+				'rescueResult' => $rescue_result,
 			)
 		);
 	}
@@ -7349,13 +7789,21 @@ type:{mobo_order_type_label}</textarea>
 		$replaced_delete_time = absint( isset( $replaced_delete['checkedAt'] ) ? $replaced_delete['checkedAt'] : 0 );
 		$replaced_scan_complete = $replaced_scan_time > 0 && ! empty( $replaced_scan['cycleComplete'] );
 		$replaced_ready         = absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 );
-		$replaced_delete_newer  = $replaced_delete_time > 0 && $replaced_delete_time >= $replaced_scan_time;
-		$replaced_delete_success = $replaced_delete_newer
+		$replaced_migration_candidates = absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 );
+		$replaced_actionable    = $replaced_ready + $replaced_migration_candidates;
+		$replaced_delete_newer = $replaced_delete_time > 0
 			&& ! empty( $replaced_delete['cycleComplete'] )
-			&& 0 === absint( isset( $replaced_delete['failed'] ) ? $replaced_delete['failed'] : 0 );
+			&& $replaced_delete_time >= $replaced_scan_time;
+		$replaced_delete_progress = absint( isset( $replaced_delete['passProgress'] )
+			? $replaced_delete['passProgress']
+			: absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 )
+				+ absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) );
+		$replaced_delete_needs_followup = $replaced_delete_newer && $replaced_delete_progress > 0;
+		$replaced_delete_stable = $replaced_delete_newer && 0 === $replaced_delete_progress;
+		/* "Resolved" means Stage 7 converged: either there was nothing to process or
+		 * a complete pass made no additional safe progress. Blocked items are kept. */
 		$replaced_verified_clean = $replaced_scan_complete
-			&& 0 === $replaced_ready
-			&& $replaced_scan_time >= $replaced_delete_time;
+			&& ( 0 === $replaced_actionable || $replaced_delete_stable );
 
 		$orphan_scan_time   = absint( isset( $orphan_scan['checkedAt'] ) ? $orphan_scan['checkedAt'] : 0 );
 		$orphan_delete_time = absint( isset( $orphan_delete['executedAt'] ) ? $orphan_delete['executedAt'] : 0 );
@@ -7428,34 +7876,36 @@ type:{mobo_order_type_label}</textarea>
 						: ( empty( $image_environment['ready'] ) ? 'موتور تصویر یا دسترسی uploads آماده نیست.' : 'بازسازی را تا پایان دوره ادامه دهید.' ) ) ),
 		);
 		$steps[6] = array(
-			'enabled' => $subsize_healthy && ( ! $replaced_scan_complete || $replaced_delete_success ),
-			'label'   => $replaced_delete_success ? '۶) اسکن مجدد و تایید پیوست های قدیمی' : ( $replaced_scan_time > 0 ? '۶) ادامه اسکن پیوست های قدیمی جایگزین شده' : '۶) شروع اسکن پیوست های قدیمی جایگزین شده' ),
+			'enabled' => $subsize_healthy && ! $replaced_scan_complete,
+			'label'   => $replaced_scan_time > 0 ? '۶) ادامه اسکن پیوست های قدیمی جایگزین شده' : '۶) شروع اسکن پیوست های قدیمی جایگزین شده',
 			'reason'  => ! $subsize_healthy
 				? 'ابتدا سلامت نهایی برش های WebP باید تایید شود.'
-				: ( $replaced_scan_complete && ! $replaced_delete_success ? 'اسکن پیوست های قدیمی کامل شده است.' : 'اسکن را تا پایان دوره ادامه دهید.' ),
+				: ( $replaced_scan_complete ? 'اسکن پیوست های قدیمی کامل شده است؛ Stage 7 نتیجه را تا نقطه پایدار ادامه می دهد.' : 'اسکن را تا پایان دوره ادامه دهید.' ),
 		);
 		$steps[7] = array(
 			'enabled' => $subsize_healthy
 				&& $replaced_scan_complete
-				&& $replaced_ready > 0
-				&& ! $replaced_delete_success
+				&& $replaced_actionable > 0
+				&& ! $replaced_delete_stable
 				&& $delete_old_enabled,
-			'label'   => ! empty( $replaced_delete['checkedAt'] ) && empty( $replaced_delete['cycleComplete'] )
-				? '۷) ادامه حذف امن پیوست های قدیمی'
-				: '۷) حذف امن پیوست های قدیمی جایگزین شده',
+			'label'   => ! empty( $replaced_delete['checkedAt'] ) && ( empty( $replaced_delete['cycleComplete'] ) || $replaced_delete_needs_followup )
+				? '۷) ادامه خودکار انتقال مراجع و حذف امن'
+				: '۷) انتقال مراجع و حذف امن پیوست های قدیمی',
 			'reason'  => ! $replaced_scan_complete
 				? 'ابتدا مرحله ۶ باید کامل شود.'
-				: ( $replaced_ready <= 0
-					? 'پیوست آماده حذف وجود ندارد.'
+				: ( $replaced_actionable <= 0
+					? 'پیوست آماده حذف یا نیازمند انتقال مرجع وجود ندارد.'
 					: ( ! $delete_old_enabled
 						? 'پس از کنترل پشتیبان، گزینه حذف پیوست قدیمی را روشن و ذخیره کنید.'
-						: ( $replaced_delete_success ? 'حذف تمام شده؛ مرحله ۶ باید دوباره نتیجه را تایید کند.' : 'حذف را تا پایان دوره ادامه دهید.' ) ) ),
+						: ( $replaced_delete_stable
+							? 'Stage 7 به نقطه پایدار رسیده است؛ موارد باقی مانده توسط Safety Audit نگه داشته شده اند.'
+							: 'Stage 7 با Cron/Self Runner به صورت چندگذری ادامه پیدا می کند و نیازی به کلیک تکراری ندارد.' ) ) ),
 		);
 		$steps[8] = array(
 			'enabled' => $subsize_healthy && $replaced_verified_clean && ( ! $orphan_scan_complete || $orphan_delete_success ),
 			'label'   => $orphan_delete_success ? '۸) اسکن مجدد و تایید خانواده های قدیمی' : ( $orphan_scan_time > 0 ? '۸) ادامه اسکن خانواده های قدیمی' : '۸) شروع اسکن خانواده های قدیمی' ),
 			'reason'  => ! $replaced_verified_clean
-				? 'مرحله ۶ باید تایید کند هیچ پیوست قدیمی آماده حذف باقی نمانده است.'
+				? 'Stage 7 باید به نقطه پایدار برسد؛ موارد Safety-Blocked می توانند بدون حذف باقی بمانند.'
 				: ( $orphan_scan_complete && ! $orphan_delete_success ? 'اسکن خانواده ها کامل شده است.' : 'اسکن را تا پایان دوره ادامه دهید.' ),
 		);
 		$steps[9] = array(
@@ -7510,9 +7960,9 @@ type:{mobo_order_type_label}</textarea>
 			$next = array( 'step' => 5, 'type' => 'warning', 'message' => $steps[5]['reason'] );
 		} elseif ( $subsize_hard_errors > 0 ) {
 			$next = array( 'step' => 4, 'type' => 'warning', 'message' => 'فایل اصلی مفقود یا موتور WebP ناسازگار است. مشکل محیط را رفع و مرحله ۴ را دوباره اجرا کنید.' );
-		} elseif ( ! $replaced_scan_complete || $replaced_delete_success ) {
-			$next = array( 'step' => 6, 'type' => 'info', 'message' => 'دکمه مرحله ۶ را تا پایان دوره اجرا کنید. این مرحله فقط پیوست های قدیمی قابل حذف را شناسایی می کند و چیزی حذف نمی کند.' );
-		} elseif ( $replaced_ready > 0 ) {
+		} elseif ( ! $replaced_scan_complete ) {
+			$next = array( 'step' => 6, 'type' => 'info', 'message' => 'دکمه مرحله ۶ را تا پایان دوره اجرا کنید. این مرحله فقط پیوست های قدیمی آماده حذف یا نیازمند انتقال مرجع را شناسایی می کند و چیزی تغییر نمی دهد.' );
+		} elseif ( $replaced_actionable > 0 && ! $replaced_delete_stable ) {
 			$next = array( 'step' => 7, 'type' => 'warning', 'message' => $steps[7]['reason'] );
 		} elseif ( ! $orphan_scan_complete || $orphan_delete_success ) {
 			$next = array( 'step' => 8, 'type' => 'info', 'message' => 'دکمه مرحله ۸ را تا پایان دوره اجرا کنید. این مرحله فقط خانواده های فایل بدون پیوست را شناسایی می کند.' );
@@ -7530,7 +7980,7 @@ type:{mobo_order_type_label}</textarea>
 			}
 
 			if ( 'delete-old' === $automation_waiting ) {
-				$next = array( 'step' => 7, 'type' => 'warning', 'message' => 'اجرای خودکار در نقطه امن متوقف شده است. فهرست پیوست های قدیمی و پشتیبان را بررسی و فقط یک بار دکمه تایید حذف پیوست های قدیمی را بزنید؛ ادامه batchها خودکار است.' );
+				$next = array( 'step' => 7, 'type' => 'warning', 'message' => 'اجرای خودکار به مرحله حذف امن رسیده است. اگر تنظیم دائمی حذف پیوست قدیمی روشن باشد، Stage 7 بدون تایید جداگانه ادامه پیدا می کند؛ در غیر این صورت همان تنظیم را روشن و ذخیره کنید.' );
 			} elseif ( 'delete-orphan' === $automation_waiting ) {
 				$next = array( 'step' => 9, 'type' => 'warning', 'message' => 'اجرای خودکار در نقطه امن پاکسازی متوقف شده است. فهرست خانواده های آماده حذف و پشتیبان را بررسی و فقط یک بار تایید پاکسازی را بزنید.' );
 			} else {
@@ -7568,6 +8018,8 @@ type:{mobo_order_type_label}</textarea>
 				'queueTerminal'         => $queue_terminal,
 				'subsizeHealthy'        => $subsize_healthy,
 				'replacedVerifiedClean' => $replaced_verified_clean,
+				'replacedDeleteStable'  => $replaced_delete_stable,
+				'replacedDeleteFollowup'=> $replaced_delete_needs_followup,
 				'orphanVerifiedClean'   => $orphan_verified_clean,
 				'activeProcessing'      => $active_processing,
 				'enqueueClicks'         => $enqueue_clicks,
@@ -7575,7 +8027,7 @@ type:{mobo_order_type_label}</textarea>
 				'canResetAll'           => ! $automation_active && 0 === $active_processing && $has_any_state,
 				'canRetryFailed'        => ! $automation_active && 0 === $active_processing && $failed > 0,
 				'canResetOrphan'        => ! $automation_active && 0 === $active_processing && ( $orphan_scan_time > 0 || $orphan_delete_time > 0 || ! empty( $orphan_status['candidate'] ) || ! empty( $orphan_status['failed'] ) ),
-				'canEnableDeleteOld'     => ! $automation_active && $subsize_healthy && $replaced_scan_complete && $replaced_ready > 0 && ! $replaced_delete_success,
+				'canEnableDeleteOld'     => ! $automation_active && $subsize_healthy && $replaced_scan_complete && $replaced_actionable > 0 && ! $replaced_delete_stable,
 				'canEnableOrphanDelete'  => ! $automation_active && $replaced_verified_clean && $orphan_scan_complete && $orphan_pending_candidates > 0 && ! $orphan_delete_success,
 				'canEnableRefresh'       => ! $automation_active && $enqueue_complete && ( $pending > 0 || $failed > 0 ),
 				'automationActive'       => $automation_active,
@@ -7927,18 +8379,31 @@ type:{mobo_order_type_label}</textarea>
 		$result  = $service->audit_replaced_legacy_attachments( $limit, false );
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
 
+		/* If Stage 6 just proved the replacements safe and the persistent delete-old
+		 * preference is already enabled, immediately hand Stage 7 to automation. */
+		if ( ! empty( $result['cycleComplete'] )
+			&& Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+			&& class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ) {
+			$automation = new Mobo_Core_Image_Refresh_Automation();
+			$resume     = $automation->arm_delete_old_autodrain();
+			if ( ! empty( $resume['armed'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'image-refresh-stage6-to-stage7', true );
+			}
+		}
+
 		$this->redirect_with_message(
 			sprintf(
-				'جمع اسکن پیوست های جایگزین شده در دوره جاری: %d بررسی شد، %d آماده حذف، %d هنوز در محصول، %d دارای مرجع دیگر، %d با جایگزین نامعتبر و %d با برش ناقص. %s',
+				'جمع اسکن پیوست های جایگزین شده در دوره جاری: %d بررسی شد، %d آماده حذف مستقیم، %d هنوز در محصول، %d دارای مرجع دیگر، %d کاندید انتقال مرجع، %d با جایگزین نامعتبر و %d با برش ناقص. %s',
 				absint( isset( $result['scanned'] ) ? $result['scanned'] : 0 ),
 				absint( isset( $result['ready'] ) ? $result['ready'] : 0 ),
 				absint( isset( $result['stillUsed'] ) ? $result['stillUsed'] : 0 ),
 				absint( isset( $result['externalReferences'] ) ? $result['externalReferences'] : 0 ),
+				absint( isset( $result['migrationCandidates'] ) ? $result['migrationCandidates'] : 0 ),
 				absint( isset( $result['invalidReplacement'] ) ? $result['invalidReplacement'] : 0 ),
 				absint( isset( $result['invalidSubsizes'] ) ? $result['invalidSubsizes'] : 0 ),
 				$progress
 			),
-			! empty( $result['ready'] ) || ! empty( $result['invalidReplacement'] ) || ! empty( $result['invalidSubsizes'] ) ? 'warning' : 'success',
+			! empty( $result['ready'] ) || ! empty( $result['migrationCandidates'] ) || ! empty( $result['invalidReplacement'] ) || ! empty( $result['invalidSubsizes'] ) ? 'warning' : 'success',
 			'image-refresh'
 		);
 	}
@@ -7971,16 +8436,29 @@ type:{mobo_order_type_label}</textarea>
 			return;
 		}
 
+		/* A manual Stage 7 click is now only the first bounded slice. When more safe
+		 * work remains, arm the same automatic coordinator and let it converge without
+		 * requiring another administrator click. */
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ) {
+			$automation = new Mobo_Core_Image_Refresh_Automation();
+			$resume     = $automation->arm_delete_old_autodrain();
+			if ( ! empty( $resume['armed'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'image-refresh-stage7-autodrain', true );
+			}
+		}
+
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
 		$this->redirect_with_message(
 			sprintf(
-				'جمع حذف امن در دوره جاری: %d پیوست آماده بود، %d حذف شد و %d ناموفق ماند. %s',
-				absint( isset( $result['ready'] ) ? $result['ready'] : 0 ),
+				'جمع مرحله ۷ در دوره جاری: %d پیوست حذف شد، مراجع %d پیوست در %d ردیف منتقل شد، %d مورد با Safety Audit نگه داشته شد و %d خطای عملیاتی ثبت شد. %s',
 				absint( isset( $result['deleted'] ) ? $result['deleted'] : 0 ),
-				absint( isset( $result['failed'] ) ? $result['failed'] : 0 ),
+				absint( isset( $result['referencesMigrated'] ) ? $result['referencesMigrated'] : 0 ),
+				absint( isset( $result['referenceRowsUpdated'] ) ? $result['referenceRowsUpdated'] : 0 ),
+				absint( isset( $result['blocked'] ) ? $result['blocked'] : 0 ),
+				absint( isset( $result['errors'] ) ? $result['errors'] : 0 ),
 				$progress
 			),
-			! empty( $result['failed'] ) ? 'warning' : 'success',
+			! empty( $result['blocked'] ) || ! empty( $result['errors'] ) ? 'warning' : 'success',
 			'image-refresh'
 		);
 	}
@@ -8051,7 +8529,6 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 		$this->reset_image_refresh_automation_tracking();
 
@@ -8100,7 +8577,6 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 		$this->reset_image_refresh_automation_tracking();
 
@@ -9257,6 +9733,7 @@ type:{mobo_order_type_label}</textarea>
 							mobo_core_self_runner_min_interval_seconds: 1,
 							mobo_core_self_runner_http_timeout_seconds: 2,
 							mobo_core_real_cron_process_webhooks: '1',
+							mobo_core_adaptive_execution_enabled: '1',
 							mobo_core_process_webhook_on_receive: '0',
 							mobo_core_pull_payload_enabled: '1',
 							mobo_core_payload_pull_timeout_seconds: 75,
@@ -9276,6 +9753,7 @@ type:{mobo_order_type_label}</textarea>
 							mobo_core_self_runner_min_interval_seconds: 2,
 							mobo_core_self_runner_http_timeout_seconds: 1,
 							mobo_core_real_cron_process_webhooks: '1',
+							mobo_core_adaptive_execution_enabled: '1',
 							mobo_core_process_webhook_on_receive: '0',
 							mobo_core_pull_payload_enabled: '1',
 							mobo_core_payload_pull_timeout_seconds: 60,
@@ -9295,6 +9773,7 @@ type:{mobo_order_type_label}</textarea>
 							mobo_core_self_runner_min_interval_seconds: 5,
 							mobo_core_self_runner_http_timeout_seconds: 1,
 							mobo_core_real_cron_process_webhooks: '1',
+							mobo_core_adaptive_execution_enabled: '1',
 							mobo_core_process_webhook_on_receive: '0',
 							mobo_core_pull_payload_enabled: '1',
 							mobo_core_payload_pull_timeout_seconds: 45,
@@ -9314,6 +9793,7 @@ type:{mobo_order_type_label}</textarea>
 							mobo_core_self_runner_min_interval_seconds: 10,
 							mobo_core_self_runner_http_timeout_seconds: 1,
 							mobo_core_real_cron_process_webhooks: '1',
+							mobo_core_adaptive_execution_enabled: '1',
 							mobo_core_process_webhook_on_receive: '0',
 							mobo_core_pull_payload_enabled: '1',
 							mobo_core_payload_pull_timeout_seconds: 30,

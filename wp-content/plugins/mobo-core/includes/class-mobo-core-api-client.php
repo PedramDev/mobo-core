@@ -18,6 +18,71 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_API_Client {
 
 	/**
+	 * Per-request runtime HTTP deadline supplied by the real cron runner.
+	 * Manual/admin requests keep their configured timeout unchanged.
+	 *
+	 * @var float
+	 */
+	private static $runtime_deadline = 0.0;
+
+	/**
+	 * Seconds reserved after a blocking API call so the runner can checkpoint.
+	 *
+	 * @var float
+	 */
+	private static $runtime_deadline_reserve = 1.0;
+
+	/**
+	 * Short request-local circuit breaker after transport/upstream failures.
+	 *
+	 * @var float
+	 */
+	private static $circuit_open_until = 0.0;
+
+	/**
+	 * Last request-local circuit error.
+	 *
+	 * @var WP_Error|null
+	 */
+	private static $circuit_error = null;
+
+	/**
+	 * Request-local cache for immutable/lightweight payload URLs.
+	 *
+	 * @var array
+	 */
+	private static $payload_cache = array();
+
+	/**
+	 * Request-local cached API connection context.
+	 *
+	 * @var array|null
+	 */
+	private static $request_context = null;
+
+	/**
+	 * Bound Portal API requests to the current runner deadline.
+	 *
+	 * @param float $deadline Absolute microtime deadline.
+	 * @param float $reserve Seconds kept for checkpoint/finalization.
+	 * @return void
+	 */
+	public static function set_runtime_deadline( $deadline, $reserve = 1.0 ) {
+		self::$runtime_deadline         = max( 0.0, (float) $deadline );
+		self::$runtime_deadline_reserve = max( 0.25, min( 5.0, (float) $reserve ) );
+	}
+
+	/**
+	 * Clear the runner-specific HTTP deadline.
+	 *
+	 * @return void
+	 */
+	public static function clear_runtime_deadline() {
+		self::$runtime_deadline = 0.0;
+	}
+
+
+	/**
 	 * Get categories from API.
 	 *
 	 * Expected payload:
@@ -93,12 +158,74 @@ class Mobo_Core_API_Client {
 			'limit'         => max( 1, min( 500, absint( $limit ) ) ),
 		);
 
-		$response = $this->get_json( add_query_arg( $args, 'sync/changes' ) );
-		if ( ! is_wp_error( $response ) ) {
+		$preference  = sanitize_key( (string) get_option( 'mobo_core_sync_changes_endpoint_preference', '' ) );
+		$retry_after = absint( get_option( 'mobo_core_sync_changes_endpoint_retry_after', 0 ) );
+		$base_url    = $this->get_base_url();
+		$fingerprint = '' !== $base_url ? md5( strtolower( $base_url ) ) : '';
+		$known_base  = sanitize_text_field( (string) get_option( 'mobo_core_sync_changes_endpoint_base_fingerprint', '' ) );
+
+		if ( '' !== $fingerprint && '' !== $known_base && ! hash_equals( $known_base, $fingerprint ) ) {
+			$preference  = '';
+			$retry_after = 0;
+			delete_option( 'mobo_core_sync_changes_endpoint_preference' );
+			delete_option( 'mobo_core_sync_changes_endpoint_retry_after' );
+		}
+
+		if ( '' !== $fingerprint && $fingerprint !== $known_base ) {
+			update_option( 'mobo_core_sync_changes_endpoint_base_fingerprint', $fingerprint, false );
+		}
+
+		if ( 'unsupported' === $preference && $retry_after > time() ) {
+			return new WP_Error(
+				'mobo_core_sync_changes_endpoint_unavailable_cached',
+				'Revision endpoint capability is temporarily cached as unavailable.',
+				array( 'retry_after' => $retry_after )
+			);
+		}
+
+		$primary = add_query_arg( $args, 'sync/changes' );
+		$compat  = add_query_arg( $args, 'api/sync/changes' );
+
+		if ( 'compat' === $preference ) {
+			$response = $this->get_json( $compat );
+			if ( ! is_wp_error( $response ) ) {
+				return $response;
+			}
+
+			if ( ! $this->is_missing_endpoint_error( $response ) ) {
+				return $response;
+			}
+
+			$response = $this->get_json( $primary );
+			if ( ! is_wp_error( $response ) ) {
+				$this->remember_sync_changes_endpoint( 'primary' );
+				return $response;
+			}
+
+			$this->remember_sync_changes_unavailable_if_missing( $response );
 			return $response;
 		}
 
-		return $this->get_json( add_query_arg( $args, 'api/sync/changes' ) );
+		$response = $this->get_json( $primary );
+		if ( ! is_wp_error( $response ) ) {
+			$this->remember_sync_changes_endpoint( 'primary' );
+			return $response;
+		}
+
+		/* A transport/5xx failure is not endpoint discovery. Do not double the
+		 * latency by probing the compatibility URL during the same outage. */
+		if ( ! $this->is_missing_endpoint_error( $response ) ) {
+			return $response;
+		}
+
+		$compat_response = $this->get_json( $compat );
+		if ( ! is_wp_error( $compat_response ) ) {
+			$this->remember_sync_changes_endpoint( 'compat' );
+			return $compat_response;
+		}
+
+		$this->remember_sync_changes_unavailable_if_missing( $compat_response );
+		return $compat_response;
 	}
 
 	/**
@@ -215,7 +342,7 @@ class Mobo_Core_API_Client {
 	 * @param string $payload_url Payload URL from lightweight notification.
 	 * @return array|WP_Error
 	 */
-	public function get_event_payload( $payload_url ) {
+	public function get_event_payload( $payload_url, $timeout = null ) {
 		$payload_url = trim( (string) $payload_url );
 
 		if ( '' === $payload_url ) {
@@ -228,7 +355,21 @@ class Mobo_Core_API_Client {
 			return $url;
 		}
 
-		return $this->get_json_url( $url, Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 ) );
+		$cache_key = md5( $url );
+		if ( isset( self::$payload_cache[ $cache_key ] ) && is_array( self::$payload_cache[ $cache_key ] ) ) {
+			return self::$payload_cache[ $cache_key ];
+		}
+
+		$configured_timeout = null === $timeout
+			? Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 )
+			: max( 2, min( 180, absint( $timeout ) ) );
+		$response = $this->get_json_url( $url, $configured_timeout );
+
+		if ( ! is_wp_error( $response ) && is_array( $response ) ) {
+			self::$payload_cache[ $cache_key ] = $response;
+		}
+
+		return $response;
 	}
 
 
@@ -336,6 +477,147 @@ class Mobo_Core_API_Client {
 	}
 
 	/**
+	 * Cache connection settings for the lifetime of the PHP request.
+	 *
+	 * @return array|WP_Error
+	 */
+	private function get_request_context() {
+		if ( is_array( self::$request_context ) ) {
+			return self::$request_context;
+		}
+
+		$license_token = $this->get_license_token();
+		if ( is_wp_error( $license_token ) ) {
+			return $license_token;
+		}
+
+		$headers = array(
+			'Accept' => 'application/json',
+			'Token'  => $license_token,
+		);
+
+		$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
+		if ( '' !== $security_code ) {
+			if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
+				return new WP_Error(
+					'mobo_core_invalid_security_code',
+					Mobo_Core_Settings::get_security_code_validation_error( $security_code )
+				);
+			}
+
+			$headers['X-SEC'] = $security_code;
+		}
+
+		self::$request_context = array(
+			'headers' => $headers,
+		);
+
+		return self::$request_context;
+	}
+
+	/**
+	 * Clamp a configured timeout to the current runner deadline.
+	 *
+	 * @param int $configured Configured timeout seconds.
+	 * @return int|WP_Error
+	 */
+	private function get_effective_timeout( $configured ) {
+		$configured = max( 2, absint( $configured ) );
+
+		if ( self::$runtime_deadline <= 0 ) {
+			return $configured;
+		}
+
+		$remaining = self::$runtime_deadline - microtime( true ) - self::$runtime_deadline_reserve;
+		if ( $remaining < 1.0 ) {
+			return new WP_Error(
+				'mobo_core_api_runtime_budget_exhausted',
+				'Portal API request skipped because the current runner slice is at its deadline.'
+			);
+		}
+
+		return max( 1, min( $configured, (int) floor( $remaining ) ) );
+	}
+
+	/**
+	 * Whether an API error means the route itself is absent rather than the host
+	 * being temporarily unavailable.
+	 *
+	 * @param WP_Error $error Error.
+	 * @return bool
+	 */
+	private function is_missing_endpoint_error( $error ) {
+		if ( ! is_wp_error( $error ) ) {
+			return false;
+		}
+
+		$data   = $error->get_error_data();
+		$status = is_array( $data ) && isset( $data['status'] ) ? absint( $data['status'] ) : 0;
+		return in_array( $status, array( 404, 405, 410, 501 ), true );
+	}
+
+	/**
+	 * Persist the working revision endpoint so future reconciliation runs avoid
+	 * a failed compatibility probe.
+	 *
+	 * @param string $preference primary|compat.
+	 * @return void
+	 */
+	private function remember_sync_changes_endpoint( $preference ) {
+		$preference = 'compat' === $preference ? 'compat' : 'primary';
+		update_option( 'mobo_core_sync_changes_endpoint_preference', $preference, false );
+		delete_option( 'mobo_core_sync_changes_endpoint_retry_after' );
+	}
+
+	/**
+	 * Cache a genuine route-missing result for a bounded period.
+	 *
+	 * @param WP_Error $error Error.
+	 * @return void
+	 */
+	private function remember_sync_changes_unavailable_if_missing( $error ) {
+		if ( ! $this->is_missing_endpoint_error( $error ) ) {
+			return;
+		}
+
+		$ttl = Mobo_Core_Settings::get_int( 'mobo_core_sync_changes_endpoint_probe_interval_seconds', 21600, 300, DAY_IN_SECONDS );
+		update_option( 'mobo_core_sync_changes_endpoint_preference', 'unsupported', false );
+		update_option( 'mobo_core_sync_changes_endpoint_retry_after', time() + $ttl, false );
+	}
+
+	/**
+	 * Open a short in-request circuit after a network/upstream failure.
+	 *
+	 * @param WP_Error $error Error to reuse.
+	 * @param int      $seconds Circuit lifetime.
+	 * @return void
+	 */
+	private function open_request_circuit( $error, $seconds = 5 ) {
+		self::$circuit_error      = is_wp_error( $error ) ? $error : null;
+		self::$circuit_open_until = microtime( true ) + max( 1, min( 15, absint( $seconds ) ) );
+	}
+
+	/**
+	 * Return an immediate error while the current PHP request knows the Portal is
+	 * temporarily unreachable. This prevents a claimed webhook batch from waiting
+	 * on the same dead host repeatedly.
+	 *
+	 * @return WP_Error|null
+	 */
+	private function get_open_circuit_error() {
+		if ( self::$circuit_open_until <= microtime( true ) ) {
+			return null;
+		}
+
+		$message = is_wp_error( self::$circuit_error )
+			? self::$circuit_error->get_error_message()
+			: 'Portal API is temporarily unavailable in this runner slice.';
+
+		return new WP_Error( 'mobo_core_api_request_circuit_open', $message );
+	}
+
+
+	/**
 	 * Normalize a payload URL.
 	 *
 	 * @param string $payload_url Payload URL.
@@ -382,36 +664,28 @@ class Mobo_Core_API_Client {
 			return new WP_Error( 'mobo_core_invalid_payload_url', 'Payload URL is invalid.' );
 		}
 
-		$license_token = $this->get_license_token();
-		if ( is_wp_error( $license_token ) ) {
-			return $license_token;
+		$circuit_error = $this->get_open_circuit_error();
+		if ( is_wp_error( $circuit_error ) ) {
+			return $circuit_error;
 		}
 
-		$headers = array(
-			'Accept' => 'application/json',
-			'Token'  => $license_token,
-		);
+		$context = $this->get_request_context();
+		if ( is_wp_error( $context ) ) {
+			return $context;
+		}
 
-		$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
-
-		if ( '' !== $security_code ) {
-			if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
-				return new WP_Error(
-					'mobo_core_invalid_security_code',
-					Mobo_Core_Settings::get_security_code_validation_error( $security_code )
-				);
-			}
-
-			$headers['X-SEC'] = $security_code;
+		$effective_timeout = $this->get_effective_timeout( $timeout );
+		if ( is_wp_error( $effective_timeout ) ) {
+			return $effective_timeout;
 		}
 
 		$response = wp_remote_get(
 			$url,
 			array(
-				'timeout'     => max( 5, absint( $timeout ) ),
+				'timeout'     => $effective_timeout,
 				'redirection' => 3,
 				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'api_client' ),
-				'headers'     => $headers,
+				'headers'     => $context['headers'],
 			)
 		);
 
@@ -422,7 +696,7 @@ class Mobo_Core_API_Client {
 				$response->get_error_message()
 			);
 
-			return new WP_Error(
+			$error = new WP_Error(
 				'mobo_core_payload_request_failed',
 				$error_message,
 				array(
@@ -431,6 +705,8 @@ class Mobo_Core_API_Client {
 					'error_message'  => $response->get_error_message(),
 				)
 			);
+			$this->open_request_circuit( $error, 5 );
+			return $error;
 		}
 
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
@@ -442,7 +718,7 @@ class Mobo_Core_API_Client {
 			$error_status  = is_array( $error_payload ) && isset( $error_payload['status'] ) ? sanitize_key( (string) $error_payload['status'] ) : '';
 			$error_message = is_array( $error_payload ) && isset( $error_payload['message'] ) ? sanitize_text_field( (string) $error_payload['message'] ) : '';
 
-			return new WP_Error(
+			$error = new WP_Error(
 				'mobo_core_payload_http_error',
 				'' !== $error_message ? $error_message : sprintf( 'Portal API HTTP error. URL=%s Status=%d', $url, $code ),
 				array(
@@ -452,6 +728,12 @@ class Mobo_Core_API_Client {
 					'body'          => function_exists( 'mb_substr' ) ? mb_substr( $body, 0, 1000 ) : substr( $body, 0, 1000 ),
 				)
 			);
+
+			if ( in_array( $code, array( 502, 503, 504 ), true ) ) {
+				$this->open_request_circuit( $error, 5 );
+			}
+
+			return $error;
 		}
 
 

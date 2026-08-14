@@ -69,6 +69,7 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_real_cron_last_hit_at' );
 	delete_option( 'mobo_core_real_cron_last_success_at' );
 	delete_option( 'mobo_core_real_cron_last_result' );
+	delete_option( 'mobo_core_runtime_diagnostics' );
 	delete_option( 'mobo_core_real_cron_time_budget_seconds' );
 	delete_option( 'mobo_core_real_cron_max_sync_steps' );
 	delete_option( 'mobo_core_real_cron_max_rounds' );
@@ -76,6 +77,7 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_real_cron_lock_ttl_seconds' );
 	delete_option( 'mobo_core_real_cron_expected_interval_seconds' );
 	delete_option( 'mobo_core_real_cron_process_webhooks' );
+	delete_option( 'mobo_core_adaptive_execution_enabled' );
 	delete_option( 'mobo_core_process_webhook_on_receive' );
 	delete_option( 'mobo_core_heartbeat_time_budget_seconds' );
 	delete_option( 'mobo_core_heartbeat_max_rounds' );
@@ -129,6 +131,9 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_reconciliation_last_deep_at' );
 	delete_option( 'mobo_core_reconciliation_last_result' );
 	delete_option( 'mobo_core_reconciliation_changes_endpoint' );
+	delete_option( 'mobo_core_sync_changes_endpoint_preference' );
+	delete_option( 'mobo_core_sync_changes_endpoint_retry_after' );
+	delete_option( 'mobo_core_sync_changes_endpoint_base_fingerprint' );
 	delete_transient( 'mobo_core_pw_options_enforced_notice' );
 
 	/*

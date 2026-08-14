@@ -21,6 +21,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Sync_Event_Store {
 
+	/** @var bool|null Request-local table existence cache. */
+	private static $table_exists_cache = null;
+
+	/** @var array|null Request-local queue summary cache. */
+	private static $summary_cache = null;
+
 	/**
 	 * Return table name.
 	 *
@@ -69,12 +75,18 @@ class Mobo_Core_Sync_Event_Store {
 			UNIQUE KEY event_uuid (event_uuid),
 			KEY remote_event_id (remote_event_id),
 			KEY status_retry (status, next_retry_at),
+			KEY status_retry_id (status, next_retry_at, id),
 			KEY locked_until (locked_until),
-			KEY entity_lookup (entity_type, entity_guid),
+			KEY status_locked_id (status, locked_until, id),
+			KEY status_updated_id (status, updated_at, id),
+			KEY event_entity_id (event_type, entity_guid(100), id),
+			KEY entity_lookup (entity_type, entity_guid(120)),
 			KEY created_at (created_at)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
+		self::$table_exists_cache = null;
+		self::$summary_cache      = null;
 	}
 
 	/**
@@ -85,9 +97,23 @@ class Mobo_Core_Sync_Event_Store {
 	public static function table_exists() {
 		global $wpdb;
 
-		$table = self::table_name();
+		if ( null !== self::$table_exists_cache ) {
+			return (bool) self::$table_exists_cache;
+		}
 
-		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		$table = self::table_name();
+		self::$table_exists_cache = $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+
+		return (bool) self::$table_exists_cache;
+	}
+
+	/**
+	 * Clear request-local aggregate cache after a queue mutation.
+	 *
+	 * @return void
+	 */
+	private static function invalidate_summary_cache() {
+		self::$summary_cache = null;
 	}
 
 	/**
@@ -173,10 +199,12 @@ class Mobo_Core_Sync_Event_Store {
 		$now     = current_time( 'mysql', true );
 		$expires = gmdate( 'Y-m-d H:i:s', time() + ( DAY_IN_SECONDS * Mobo_Core_Settings::get_int( 'mobo_core_webhook_expire_days', 2, 1, 30 ) ) );
 
+		$event_uuid = wp_generate_uuid4();
+
 		$inserted = $wpdb->insert(
 			$table,
 			array(
-				'event_uuid'       => wp_generate_uuid4(),
+				'event_uuid'       => $event_uuid,
 				'remote_event_id'  => $remote_event_id,
 				'event_type'       => $event_type,
 				'entity_type'      => $entity_type,
@@ -202,7 +230,457 @@ class Mobo_Core_Sync_Event_Store {
 			return new WP_Error( 'mobo_core_event_insert_failed', 'Could not store sync event.' );
 		}
 
-		return absint( $wpdb->insert_id );
+		$new_id = absint( $wpdb->insert_id );
+		self::invalidate_summary_cache();
+
+		/*
+		 * Last desired state wins for safe single-entity events that have not started
+		 * processing yet. Never collapse multi-product payloads or authoritative
+		 * multi-variation snapshots: their pages/variants carry independent state.
+		 */
+		if ( $new_id > 0 && $this->is_coalescible_entity_event( $event_type, $entity_type, $entity_guid, $payload ) ) {
+			$this->coalesce_older_pending_entity_events( $new_id, $event_uuid, sanitize_text_field( (string) $normalized['version'] ), $event_type, $entity_type, $entity_guid );
+		}
+
+		return $new_id;
+	}
+
+
+	/**
+	 * Whether an event may safely supersede older unprocessed events for the same
+	 * entity. ProductUpdated is coalesced only when it contains exactly one product;
+	 * UpdateVariant is coalesced only when the queue identity is one exact variant.
+	 *
+	 * @param string $event_type Event type.
+	 * @param string $entity_type Entity type.
+	 * @param string $entity_guid Entity GUID.
+	 * @param array  $payload Payload.
+	 * @return bool
+	 */
+	private function is_coalescible_entity_event( $event_type, $entity_type, $entity_guid, $payload ) {
+		$event_type = sanitize_text_field( (string) $event_type );
+		$entity_type = sanitize_key( (string) $entity_type );
+		$entity_guid = sanitize_text_field( (string) $entity_guid );
+
+		if ( '' === $entity_guid ) {
+			return false;
+		}
+
+		if ( 'UpdateVariant' === $event_type ) {
+			return 'variant' === $entity_type && 1 === count( $this->extract_update_variant_variant_guids( $payload ) );
+		}
+
+		if ( 'ProductUpdated' !== $event_type || 'product' !== $entity_type || ! is_array( $payload ) ) {
+			return false;
+		}
+
+		$data = $this->get_value( $payload, 'data', array() );
+		if ( is_array( $data ) && ! $this->is_list_array( $data ) ) {
+			$nested = $this->get_value( $data, 'data', null );
+			if ( is_array( $nested ) ) {
+				$data = $nested;
+			} else {
+				/* A single product object wrapped in data is safe to coalesce. */
+				return true;
+			}
+		}
+
+		return is_array( $data ) && $this->is_list_array( $data ) && 1 === count( $data );
+	}
+
+	/**
+	 * Mark older still-pending copies of one safe entity event as completed.
+	 * Processing rows are never touched, so a worker that already owns a row can
+	 * finish safely under the existing product lock.
+	 *
+	 * @param int    $new_id New event row ID.
+	 * @param string $new_uuid New event UUID.
+	 * @param string $new_version New event/entity version when supplied.
+	 * @param string $event_type Event type.
+	 * @param string $entity_type Entity type.
+	 * @param string $entity_guid Entity GUID.
+	 * @return int Number coalesced.
+	 */
+	private function coalesce_older_pending_entity_events( $new_id, $new_uuid, $new_version, $event_type, $entity_type, $entity_guid ) {
+		global $wpdb;
+
+		$new_id      = absint( $new_id );
+		$new_uuid    = sanitize_text_field( (string) $new_uuid );
+		$new_version = sanitize_text_field( (string) $new_version );
+		$event_type  = sanitize_text_field( (string) $event_type );
+		$entity_type = sanitize_key( (string) $entity_type );
+		$entity_guid = sanitize_text_field( (string) $entity_guid );
+
+		if ( $new_id <= 0 || '' === $event_type || '' === $entity_type || '' === $entity_guid || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+
+		/*
+		 * Arrival order is the fallback coalescing rule, but when both rows carry a
+		 * comparable entity/event version we refuse to let a late stale delivery
+		 * supersede a newer desired state that arrived earlier.
+		 */
+		$candidates = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, event_uuid, event_version FROM {$table}
+				WHERE id < %d
+					AND status = 'pending'
+					AND event_type = %s
+					AND entity_type = %s
+					AND entity_guid = %s
+				ORDER BY id DESC",
+				$new_id,
+				$event_type,
+				$entity_type,
+				$entity_guid
+			),
+			ARRAY_A
+		);
+
+		if ( empty( $candidates ) || ! is_array( $candidates ) ) {
+			return 0;
+		}
+
+		$ids_to_supersede = array();
+		foreach ( $candidates as $candidate ) {
+			$old_id      = absint( isset( $candidate['id'] ) ? $candidate['id'] : 0 );
+			$old_version = sanitize_text_field( (string) ( isset( $candidate['event_version'] ) ? $candidate['event_version'] : '' ) );
+			$comparison  = $this->compare_event_versions( $new_version, $old_version );
+
+			if ( null !== $comparison && $comparison < 0 ) {
+				/* The just-arrived row is stale. Retire it, preserving the newer pending row. */
+				$progress = wp_json_encode(
+					array(
+						'deleteFile'          => true,
+						'superseded'          => true,
+						'supersededByEventId' => sanitize_text_field( (string) ( isset( $candidate['event_uuid'] ) ? $candidate['event_uuid'] : '' ) ),
+						'reason'              => 'older-event-version',
+					),
+					JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+				);
+				$wpdb->update(
+					$table,
+					array(
+						'status'        => 'done',
+						'locked_until'  => null,
+						'next_retry_at' => null,
+						'last_error'    => null,
+						'progress_json' => false === $progress ? '{"superseded":true}' : $progress,
+						'updated_at'    => $now,
+					),
+					array( 'id' => $new_id, 'status' => 'pending' ),
+					array( '%s', '%s', '%s', '%s', '%s', '%s' ),
+					array( '%d', '%s' )
+				);
+				self::invalidate_summary_cache();
+				return 0;
+			}
+
+			if ( $old_id > 0 ) {
+				$ids_to_supersede[] = $old_id;
+			}
+		}
+
+		$ids_to_supersede = array_values( array_unique( array_filter( array_map( 'absint', $ids_to_supersede ) ) ) );
+		if ( empty( $ids_to_supersede ) ) {
+			return 0;
+		}
+
+		$progress = wp_json_encode(
+			array(
+				'deleteFile'          => true,
+				'superseded'          => true,
+				'supersededByEventId' => $new_uuid,
+				'reason'              => 'newer-desired-state',
+			),
+			JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+		);
+
+		$id_sql = implode( ',', $ids_to_supersede );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'done', locked_until = NULL, next_retry_at = NULL, last_error = NULL, progress_json = %s, updated_at = %s
+				WHERE status = 'pending' AND id IN ({$id_sql})",
+				false === $progress ? '{"superseded":true}' : $progress,
+				$now
+			)
+		);
+
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return false === $updated ? 0 : absint( $updated );
+	}
+
+	/**
+	 * Compare event/entity versions only when their format is safely comparable.
+	 *
+	 * @param string $left New version.
+	 * @param string $right Existing version.
+	 * @return int|null -1/0/1, or null when arrival order must be used.
+	 */
+	private function compare_event_versions( $left, $right ) {
+		$left  = trim( (string) $left );
+		$right = trim( (string) $right );
+
+		if ( '' === $left || '' === $right ) {
+			return null;
+		}
+		if ( $left === $right ) {
+			return 0;
+		}
+
+		if ( ctype_digit( $left ) && ctype_digit( $right ) ) {
+			$left_norm  = ltrim( $left, '0' );
+			$right_norm = ltrim( $right, '0' );
+			$left_norm  = '' === $left_norm ? '0' : $left_norm;
+			$right_norm = '' === $right_norm ? '0' : $right_norm;
+			if ( strlen( $left_norm ) !== strlen( $right_norm ) ) {
+				return strlen( $left_norm ) < strlen( $right_norm ) ? -1 : 1;
+			}
+			$numeric_compare = strcmp( $left_norm, $right_norm );
+			if ( 0 === $numeric_compare ) {
+				return 0;
+			}
+			return $numeric_compare < 0 ? -1 : 1;
+		}
+
+		if ( preg_match( '/^\\d{4}-\\d{2}-\\d{2}[T ]/', $left ) && preg_match( '/^\\d{4}-\\d{2}-\\d{2}[T ]/', $right ) ) {
+			$left_time  = strtotime( $left );
+			$right_time = strtotime( $right );
+			if ( false !== $left_time && false !== $right_time && $left_time !== $right_time ) {
+				return $left_time < $right_time ? -1 : 1;
+			}
+		}
+
+		return null;
+	}
+
+
+
+	/**
+	 * Fast existence check used by the real runner hot path.
+	 *
+	 * Unlike get_status(), this intentionally avoids COUNT/timing diagnostics and
+	 * only asks MySQL whether one runnable row exists.
+	 *
+	 * @return bool
+	 */
+	public function has_due_events() {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+
+		$id = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				LIMIT 1",
+				$now,
+				$now
+			)
+		);
+
+		return absint( $id ) > 0;
+	}
+
+	/**
+	 * Read queue counters/timing with one aggregate query.
+	 *
+	 * @param bool $force Force a fresh query after external/manual DB changes.
+	 * @return array
+	 */
+	public function get_summary( $force = false ) {
+		global $wpdb;
+
+		if ( ! $force && is_array( self::$summary_cache ) ) {
+			return self::$summary_cache;
+		}
+
+		$empty = array(
+			'pendingCount'         => 0,
+			'dueCount'             => 0,
+			'failedCount'          => 0,
+			'oldestPendingAt'      => '',
+			'newestPendingUpdateAt'=> '',
+			'nextDeferredAt'       => '',
+		);
+
+		if ( ! self::table_exists() ) {
+			self::$summary_cache = $empty;
+			return $empty;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$row   = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT
+					SUM(CASE WHEN status IN ('pending','processing') THEN 1 ELSE 0 END) AS pending_count,
+					SUM(CASE WHEN (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s) THEN 1 ELSE 0 END) AS due_count,
+					SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+					MIN(CASE WHEN status IN ('pending','processing') THEN created_at ELSE NULL END) AS oldest_pending_at,
+					MAX(CASE WHEN status IN ('pending','processing') THEN updated_at ELSE NULL END) AS newest_pending_update_at,
+					MIN(CASE WHEN status = 'pending' AND next_retry_at IS NOT NULL AND next_retry_at > %s THEN next_retry_at ELSE NULL END) AS next_deferred_at
+				FROM {$table}
+				WHERE status IN ('pending','processing','failed')",
+				$now,
+				$now,
+				$now
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $row ) ) {
+			self::$summary_cache = $empty;
+			return $empty;
+		}
+
+		self::$summary_cache = array(
+			'pendingCount'          => absint( isset( $row['pending_count'] ) ? $row['pending_count'] : 0 ),
+			'dueCount'              => absint( isset( $row['due_count'] ) ? $row['due_count'] : 0 ),
+			'failedCount'           => absint( isset( $row['failed_count'] ) ? $row['failed_count'] : 0 ),
+			'oldestPendingAt'       => isset( $row['oldest_pending_at'] ) ? (string) $row['oldest_pending_at'] : '',
+			'newestPendingUpdateAt' => isset( $row['newest_pending_update_at'] ) ? (string) $row['newest_pending_update_at'] : '',
+			'nextDeferredAt'        => isset( $row['next_deferred_at'] ) ? (string) $row['next_deferred_at'] : '',
+		);
+
+		return self::$summary_cache;
+	}
+
+	/**
+	 * Claim a bounded due batch with one SELECT + one bulk UPDATE + one row fetch.
+	 *
+	 * The webhook processor already owns the global webhook_queue lease, so doing a
+	 * per-row lock UPDATE only adds database round trips. Conditions are repeated on
+	 * the bulk UPDATE to remain safe if a custom integration races this method.
+	 *
+	 * @param int $limit Limit.
+	 * @param int $ttl Lock TTL seconds.
+	 * @return array
+	 */
+	public function claim_due_events( $limit, $ttl = 90 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 50, absint( $limit ) ) );
+		$ttl   = max( 30, min( 300, absint( $ttl ) ) );
+
+		if ( ! self::table_exists() ) {
+			return array();
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$ids   = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
+				LIMIT %d",
+				$now,
+				$now,
+				$limit
+			)
+		);
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) ) {
+			return array();
+		}
+
+		$id_sql       = implode( ',', $ids );
+		$locked_until = gmdate( 'Y-m-d H:i:s', time() + $ttl );
+		$updated      = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'processing', locked_until = %s, updated_at = %s
+				WHERE id IN ({$id_sql})
+					AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
+				$locked_until,
+				$now,
+				$now,
+				$now
+			)
+		);
+
+		if ( false === $updated || absint( $updated ) <= 0 ) {
+			return array();
+		}
+
+		self::invalidate_summary_cache();
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, event_uuid, remote_event_id, event_type, entity_guid, sync_id,
+					try_count, expires_at, payload_json, created_at, updated_at
+				FROM {$table}
+				WHERE id IN ({$id_sql}) AND status = 'processing' AND locked_until = %s
+				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC",
+				$locked_until
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+
+		foreach ( $rows as &$row ) {
+			$row['_mobo_bulk_claimed'] = 1;
+		}
+		unset( $row );
+
+		return $rows;
+	}
+
+	/**
+	 * Release any still-processing rows from a bulk claim.
+	 *
+	 * Completed/retried/failed rows are not affected because the status condition
+	 * only matches rows that were claimed but not handled before a time/upgrade stop.
+	 *
+	 * @param array $ids Claimed row IDs.
+	 * @return int
+	 */
+	public function release_claimed_events( $ids ) {
+		global $wpdb;
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table  = self::table_name();
+		$id_sql = implode( ',', $ids );
+		$now    = current_time( 'mysql', true );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', locked_until = NULL, updated_at = %s
+				WHERE status = 'processing' AND id IN ({$id_sql})",
+				$now
+			)
+		);
+
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return false === $updated ? 0 : absint( $updated );
 	}
 
 	/**
@@ -283,7 +761,12 @@ class Mobo_Core_Sync_Event_Store {
 			)
 		);
 
-		return 1 === absint( $updated );
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -515,26 +998,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return int
 	 */
 	public function count_due() {
-		global $wpdb;
-
-		if ( ! self::table_exists() ) {
-			return 0;
-		}
-
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
-
-		return absint(
-			$wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$table}
-					WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)",
-					$now,
-					$now
-				)
-			)
-		);
+		$summary = $this->get_summary();
+		return absint( isset( $summary['dueCount'] ) ? $summary['dueCount'] : 0 );
 	}
 
 	/**
@@ -543,7 +1008,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return int
 	 */
 	public function count_pending() {
-		return $this->count_by_statuses( array( 'pending', 'processing' ) );
+		$summary = $this->get_summary();
+		return absint( isset( $summary['pendingCount'] ) ? $summary['pendingCount'] : 0 );
 	}
 
 	/**
@@ -552,7 +1018,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return int
 	 */
 	public function count_failed() {
-		return $this->count_by_statuses( array( 'failed' ) );
+		$summary = $this->get_summary();
+		return absint( isset( $summary['failedCount'] ) ? $summary['failedCount'] : 0 );
 	}
 
 	/**
@@ -602,6 +1069,10 @@ class Mobo_Core_Sync_Event_Store {
 			)
 		);
 
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
 		return false === $updated ? 0 : absint( $updated );
 	}
 
@@ -619,26 +1090,15 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		$statuses = array_values( array_unique( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) ) );
-
 		if ( empty( $statuses ) ) {
 			return 0;
 		}
 
-		$table = self::table_name();
-		$total = 0;
+		$table        = self::table_name();
+		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
+		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
 
-		foreach ( $statuses as $status ) {
-			$total += absint(
-				$wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(*) FROM {$table} WHERE status = %s",
-						$status
-					)
-				)
-			);
-		}
-
-		return $total;
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) );
 	}
 
 	/**
@@ -676,7 +1136,10 @@ class Mobo_Core_Sync_Event_Store {
 			}
 		}
 
-		$wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		if ( false !== $updated ) {
+			self::invalidate_summary_cache();
+		}
 	}
 
 	private function build_local_dedupe_id( $event_type, $payload, $sync_id, $entity_type, $entity_guid ) {

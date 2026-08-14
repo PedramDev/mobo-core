@@ -13,6 +13,12 @@ class Mobo_Core_Category_Sync {
 
 	private $category_map;
 
+	/** @var array Request-local remote category GUID => WooCommerce term ID cache, including misses. */
+	private $term_id_by_guid_cache = array();
+
+	/** @var array Request-local product ID => sorted product_cat term IDs. */
+	private $product_category_ids_cache = array();
+
 	public function __construct() {
 		$this->category_map = class_exists( 'Mobo_Core_Category_Map' ) ? new Mobo_Core_Category_Map() : null;
 	}
@@ -179,27 +185,22 @@ class Mobo_Core_Category_Sync {
 			$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $manual_result['term_ids'] ) ) ) );
 
 			if ( ! empty( $term_ids ) ) {
-				wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
-				update_post_meta( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
-
-				if ( ! empty( $manual_result['missing_guids'] ) ) {
-					update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $manual_result['missing_guids'] ) ) );
-				} else {
-					delete_post_meta( $product_id, 'mobo_category_missing_guids' );
-				}
+				$changed = $this->set_product_categories_if_changed( $product_id, $term_ids );
+				$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
+				$this->store_missing_category_guids_if_changed( $product_id, $manual_result['missing_guids'] );
 
 				return array(
 					'assigned'     => count( $term_ids ),
 					'source'       => 'manual-mapping',
-					'changed'      => true,
+					'changed'      => $changed,
 					'missingGuids' => array_values( array_unique( $manual_result['missing_guids'] ) ),
 				);
 			}
 		}
 
 		if ( $mapping_required && ! empty( $manual_result['missing_guids'] ) ) {
-			update_post_meta( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
-			update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $manual_result['missing_guids'] ) ) );
+			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
+			$this->store_missing_category_guids_if_changed( $product_id, $manual_result['missing_guids'] );
 
 			return array(
 				'assigned'     => 0,
@@ -220,7 +221,7 @@ class Mobo_Core_Category_Sync {
 				$result = $this->assign_default_category( $product_id );
 				if ( ! empty( $result['changed'] ) ) {
 					$result['source'] = 'auto-disabled-new-default';
-					update_post_meta( $product_id, 'mobo_category_assign_source', 'auto-disabled-new-default' );
+					$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'auto-disabled-new-default' );
 				}
 				return $result;
 			}
@@ -292,26 +293,22 @@ class Mobo_Core_Category_Sync {
 		$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $term_ids ) ) ) );
 		$sources  = array_values( array_unique( array_filter( array_map( 'sanitize_key', $sources ) ) ) );
 
-		if ( ! empty( $missing_guids ) ) {
-			update_post_meta( $product_id, 'mobo_category_missing_guids', array_values( array_unique( $missing_guids ) ) );
-		} else {
-			delete_post_meta( $product_id, 'mobo_category_missing_guids' );
-		}
+		$this->store_missing_category_guids_if_changed( $product_id, $missing_guids );
 
 		if ( ! empty( $term_ids ) ) {
-			wp_set_object_terms( $product_id, $term_ids, 'product_cat', false );
-			update_post_meta( $product_id, 'mobo_category_assign_source', implode( ',', $sources ) );
+			$changed = $this->set_product_categories_if_changed( $product_id, $term_ids );
+			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', implode( ',', $sources ) );
 
 			return array(
 				'assigned'      => count( $term_ids ),
 				'source'        => ! empty( $sources ) ? implode( ',', $sources ) : 'mapped-or-synced',
-				'changed'       => true,
+				'changed'       => $changed,
 				'missingGuids'  => array_values( array_unique( $missing_guids ) ),
 			);
 		}
 
 		if ( $mapping_required && ! empty( $missing_guids ) ) {
-			update_post_meta( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
+			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
 
 			return array(
 				'assigned'     => 0,
@@ -330,13 +327,13 @@ class Mobo_Core_Category_Sync {
 
 			if ( ! empty( $result['changed'] ) ) {
 				$result['source'] = 'new-product-default';
-				update_post_meta( $product_id, 'mobo_category_assign_source', 'new-product-default' );
+				$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'new-product-default' );
 			}
 
 			return $result;
 		}
 
-		update_post_meta( $product_id, 'mobo_category_assign_source', 'existing-product-category-unchanged' );
+		$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'existing-product-category-unchanged' );
 
 		return array(
 			'assigned'     => 0,
@@ -570,6 +567,7 @@ class Mobo_Core_Category_Sync {
 			}
 
 			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
+			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 
 			return array(
 				'term_id'              => $term_id,
@@ -632,6 +630,7 @@ class Mobo_Core_Category_Sync {
 
 		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
 		$this->upsert_category_map( $category_guid, $term_id, $insert_name, $url, $parent_guid );
+		$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 		update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
 
 		return array(
@@ -647,11 +646,16 @@ class Mobo_Core_Category_Sync {
 			return 0;
 		}
 
+		if ( array_key_exists( $category_guid, $this->term_id_by_guid_cache ) ) {
+			return absint( $this->term_id_by_guid_cache[ $category_guid ] );
+		}
+
 		if ( $this->category_map instanceof Mobo_Core_Category_Map ) {
 			$term_id = $this->category_map->get_synced_term_id( $category_guid );
 
 			if ( $term_id > 0 ) {
-				return $term_id;
+				$this->term_id_by_guid_cache[ $category_guid ] = absint( $term_id );
+				return absint( $term_id );
 			}
 		}
 
@@ -671,12 +675,14 @@ class Mobo_Core_Category_Sync {
 		);
 
 		if ( is_wp_error( $terms ) || empty( $terms[0] ) ) {
+			$this->term_id_by_guid_cache[ $category_guid ] = 0;
 			return 0;
 		}
 
 		$term_id = absint( $terms[0]->term_id );
 
 		if ( $term_id > 0 ) {
+			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 			$this->upsert_category_map( $category_guid, $term_id, '', '', '' );
 		}
 
@@ -705,13 +711,96 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		wp_set_object_terms( $product_id, array( $default_category_id ), 'product_cat', false );
+		$changed = $this->set_product_categories_if_changed( $product_id, array( $default_category_id ) );
 
 		return array(
 			'assigned' => 1,
 			'source'   => 'default',
-			'changed'  => true,
+			'changed'  => $changed,
 		);
+	}
+
+	/**
+	 * Replace product categories only when the exact term set changed.
+	 * Avoids taxonomy hooks, term counting and cache churn on price/stock-only syncs.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $term_ids Desired product_cat IDs.
+	 * @return bool True only when WordPress taxonomy state changed.
+	 */
+	private function set_product_categories_if_changed( $product_id, $term_ids ) {
+		$product_id = absint( $product_id );
+		$desired    = array_values( array_unique( array_filter( array_map( 'absint', is_array( $term_ids ) ? $term_ids : array() ) ) ) );
+		sort( $desired, SORT_NUMERIC );
+
+		if ( $product_id <= 0 || empty( $desired ) ) {
+			return false;
+		}
+
+		$current = $this->get_product_category_ids( $product_id );
+		if ( $current === $desired ) {
+			return false;
+		}
+
+		$result = wp_set_object_terms( $product_id, $desired, 'product_cat', false );
+		if ( is_wp_error( $result ) ) {
+			return false;
+		}
+
+		$this->product_category_ids_cache[ $product_id ] = $desired;
+		return true;
+	}
+
+	/**
+	 * Return sorted product_cat IDs with request-local caching.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function get_product_category_ids( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return array();
+		}
+		if ( array_key_exists( $product_id, $this->product_category_ids_cache ) ) {
+			return $this->product_category_ids_cache[ $product_id ];
+		}
+
+		$ids = wp_get_object_terms( $product_id, 'product_cat', array( 'fields' => 'ids' ) );
+		if ( is_wp_error( $ids ) ) {
+			$ids = array();
+		}
+		$ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		sort( $ids, SORT_NUMERIC );
+		$this->product_category_ids_cache[ $product_id ] = $ids;
+		return $ids;
+	}
+
+	private function update_post_meta_if_changed( $post_id, $key, $value ) {
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+		$current = get_post_meta( $post_id, $key, true );
+		if ( $current == $value ) { // Intentional loose comparison for serialized/numeric metadata.
+			return false;
+		}
+		return false !== update_post_meta( $post_id, $key, $value );
+	}
+
+	private function store_missing_category_guids_if_changed( $product_id, $missing_guids ) {
+		$product_id = absint( $product_id );
+		$missing    = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', is_array( $missing_guids ) ? $missing_guids : array() ) ) ) );
+		if ( $product_id <= 0 ) {
+			return;
+		}
+		if ( empty( $missing ) ) {
+			if ( metadata_exists( 'post', $product_id, 'mobo_category_missing_guids' ) ) {
+				delete_post_meta( $product_id, 'mobo_category_missing_guids' );
+			}
+			return;
+		}
+		$this->update_post_meta_if_changed( $product_id, 'mobo_category_missing_guids', $missing );
 	}
 
 	private function get_category_guid( $category_data ) {

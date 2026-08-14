@@ -201,6 +201,16 @@ class Mobo_Core_Rest_Controller {
 
 		register_rest_route(
 			'mobo-core/v1',
+			'/portal/revenue-summary',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'get_revenue_summary' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
 			'/portal/settings',
 			array(
 				'methods'             => 'GET',
@@ -892,6 +902,31 @@ class Mobo_Core_Rest_Controller {
 		return rest_ensure_response( $sync->cancel_manual_sync() );
 	}
 
+
+	/**
+	 * Return immutable Mobo revenue summary for Portal Site Health.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return array|WP_Error
+	 */
+	public function get_revenue_summary( $request ) {
+		if ( ! class_exists( 'Mobo_Core_Revenue_Ledger' ) ) {
+			return new WP_Error(
+				'mobo_core_revenue_ledger_unavailable',
+				'Revenue ledger is unavailable.',
+				array( 'status' => 503 )
+			);
+		}
+
+		$ledger = new Mobo_Core_Revenue_Ledger();
+
+		return array(
+			'success' => true,
+			'status'  => 'ok',
+			'message' => 'Revenue summary generated from immutable completed-order ledger records.',
+			'data'    => $ledger->get_summary(),
+		);
+	}
 
 	/**
 	 * Return every non-secret configurable setting to Portal.

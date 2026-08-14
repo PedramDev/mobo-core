@@ -37,6 +37,7 @@ class Mobo_Core_Health_Reporter {
 		$wp_memory    = $this->get_wordpress_memory_stats();
 		$environment  = $this->get_environment_stats();
 		$webhook_auth = class_exists( 'Mobo_Core_Webhook_Auth_Status' ) ? Mobo_Core_Webhook_Auth_Status::get_status() : array();
+		$runtime_diagnostics = class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ? Mobo_Core_Runtime_Diagnostics::get_health_status() : array();
 
 		$last_self_run     = isset( $self_status['lastRunAt'] ) ? absint( $self_status['lastRunAt'] ) : 0;
 		$last_cron_hit     = isset( $cron_status['lastHitAt'] ) ? absint( $cron_status['lastHitAt'] ) : 0;
@@ -71,6 +72,7 @@ class Mobo_Core_Health_Reporter {
 			'cacheSystem'           => $cache['cache_system'],
 			'cachePlugins'          => $cache['cache_plugins'],
 			'cachePurge'            => $cache_purge,
+			'runtimeDiagnostics'     => $runtime_diagnostics,
 
 			'phpMemoryLimitRaw'     => (string) ini_get( 'memory_limit' ),
 			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( (string) ini_get( 'memory_limit' ) ),
@@ -135,9 +137,11 @@ class Mobo_Core_Health_Reporter {
 
 			'pendingWebhookJobs'    => $queue_stats['pending'],
 			'failedWebhookJobs'     => $queue_stats['failed'],
+			'oldestWebhookPendingAt'=> isset( $queue_stats['oldestPendingAt'] ) ? (string) $queue_stats['oldestPendingAt'] : '',
 			'pendingImageJobs'      => $image_stats['pending'],
 			'attachingImageJobs'    => isset( $image_stats['attaching'] ) ? absint( $image_stats['attaching'] ) : 0,
 			'failedImageJobs'       => $image_stats['failed'],
+			'oldestImagePendingAt'  => isset( $image_stats['oldestPendingAt'] ) ? (string) $image_stats['oldestPendingAt'] : '',
 			'nextImageRetryAt'      => isset( $image_stats['nextRetryAt'] ) ? (string) $image_stats['nextRetryAt'] : '',
 			'pendingSyncJobs'       => $this->get_pending_sync_jobs( $sync_status ),
 			'actionSchedulerPastDue'=> $this->get_action_scheduler_past_due_count(),
@@ -379,28 +383,32 @@ class Mobo_Core_Health_Reporter {
 	 */
 	private function get_image_queue_stats() {
 		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
-			return array( 'pending' => 0, 'attaching' => 0, 'failed' => 0, 'due' => 0, 'nextRetryAt' => '' );
+			return array( 'pending' => 0, 'attaching' => 0, 'failed' => 0, 'due' => 0, 'nextRetryAt' => '', 'oldestPendingAt' => '' );
 		}
 
-		$queue = new Mobo_Core_Image_Queue();
-
+		$queue   = new Mobo_Core_Image_Queue();
+		$summary = $queue->get_summary();
 		return array(
-			'pending'     => $queue->count_pending(),
-			'attaching'   => method_exists( $queue, 'count_attaching' ) ? $queue->count_attaching() : 0,
-			'failed'      => $queue->count_failed(),
-			'due'         => $queue->count_due(),
-			'nextRetryAt' => method_exists( $queue, 'get_next_retry_at' ) ? $queue->get_next_retry_at() : '',
+			'pending'         => absint( isset( $summary['pending'] ) ? $summary['pending'] : 0 ),
+			'attaching'       => absint( isset( $summary['attaching'] ) ? $summary['attaching'] : 0 ),
+			'failed'          => absint( isset( $summary['failed'] ) ? $summary['failed'] : 0 ),
+			'due'             => absint( isset( $summary['due'] ) ? $summary['due'] : 0 ),
+			'nextRetryAt'     => isset( $summary['nextRetryAt'] ) ? (string) $summary['nextRetryAt'] : '',
+			'oldestPendingAt' => isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '',
 		);
 	}
 
 	private function get_webhook_queue_stats() {
-		$pending = 0;
-		$failed  = 0;
+		$pending   = 0;
+		$failed    = 0;
+		$oldest_at = '';
 
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
 			$event_store = new Mobo_Core_Sync_Event_Store();
-			$pending += $event_store->count_pending();
-			$failed  += $event_store->count_failed();
+			$summary     = $event_store->get_summary();
+			$pending    += absint( isset( $summary['pendingCount'] ) ? $summary['pendingCount'] : 0 );
+			$failed     += absint( isset( $summary['failedCount'] ) ? $summary['failedCount'] : 0 );
+			$oldest_at   = isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '';
 		}
 
 		$pending_files = glob( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . '*.json' );
@@ -414,8 +422,9 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		return array(
-			'pending' => $pending,
-			'failed'  => $failed,
+			'pending'         => $pending,
+			'failed'          => $failed,
+			'oldestPendingAt' => $oldest_at,
 		);
 	}
 

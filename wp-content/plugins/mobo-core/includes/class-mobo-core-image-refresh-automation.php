@@ -4,8 +4,9 @@
  *
  * It advances one bounded workflow batch per cron/self-runner slice. Read-only
  * scans, queue creation, replacement, WebP subsize verification/repair and
- * post-replacement audits are automatic. Destructive stages pause until the
- * administrator gives one explicit approval for that stage.
+ * post-replacement audits are automatic. Replaced-attachment deletion follows
+ * the administrator's persistent delete-old setting; orphan-file deletion keeps
+ * its separate one-time approval gate.
  *
  * PHP 7.4 compatible.
  */
@@ -17,7 +18,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Image_Refresh_Automation {
 
 	const OPTION_ENABLED                 = 'mobo_core_image_refresh_automation_enabled';
-	const OPTION_DELETE_OLD_APPROVED     = 'mobo_core_image_refresh_auto_delete_old_approved';
 	const OPTION_DELETE_ORPHAN_APPROVED  = 'mobo_core_image_refresh_auto_delete_orphan_approved';
 	const OPTION_STARTED_AT              = 'mobo_core_image_refresh_automation_started_at';
 	const OPTION_COMPLETED_AT            = 'mobo_core_image_refresh_automation_completed_at';
@@ -44,7 +44,7 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		return array(
 			'enabled'              => Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ),
-			'deleteOldApproved'    => Mobo_Core_Settings::enabled( self::OPTION_DELETE_OLD_APPROVED, '0' ),
+			'deleteOldApproved'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ),
 			'deleteOrphanApproved' => Mobo_Core_Settings::enabled( self::OPTION_DELETE_ORPHAN_APPROVED, '0' ),
 			'startedAt'            => absint( get_option( self::OPTION_STARTED_AT, 0 ) ),
 			'completedAt'          => absint( get_option( self::OPTION_COMPLETED_AT, 0 ) ),
@@ -91,13 +91,11 @@ class Mobo_Core_Image_Refresh_Automation {
 			update_option( self::OPTION_STARTED_AT, time(), false );
 		}
 
-		/* Destructive approvals are one-time gates and are never inherited when
-		 * starting/resuming through the generic start action. Approval actions resume
-		 * their own stage directly. */
-		update_option( self::OPTION_DELETE_OLD_APPROVED, '0', false );
+		/* The old-attachment deletion switch is a persistent administrator preference.
+		 * Starting/resuming automation must never revoke it. Orphan-file cleanup keeps
+		 * its separate one-time approval gate. */
 		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 
 		return $this->save_result(
@@ -113,7 +111,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	}
 
 	/**
-	 * Pause automation and turn off all execution/deletion switches.
+	 * Pause automation while preserving the persistent delete-old preference.
 	 *
 	 * @param string $reason Pause reason.
 	 * @param string $status Status key.
@@ -121,10 +119,8 @@ class Mobo_Core_Image_Refresh_Automation {
 	 */
 	public function pause( $reason = 'اجرای خودکار توسط مدیر متوقف شد.', $status = 'paused' ) {
 		update_option( self::OPTION_ENABLED, '0', false );
-		update_option( self::OPTION_DELETE_OLD_APPROVED, '0', false );
 		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 
 		return $this->save_result(
@@ -138,33 +134,94 @@ class Mobo_Core_Image_Refresh_Automation {
 	}
 
 	/**
-	 * Approve and resume automatic deletion of replaced old attachments.
+	 * Legacy compatibility action: persistently enable replaced-old deletion.
 	 *
 	 * @return array
 	 */
 	public function approve_delete_old() {
-		$status = self::get_status();
-		if ( 'delete-old' !== ( isset( $status['waitingApproval'] ) ? $status['waitingApproval'] : '' ) ) {
-			return array(
-				'success' => false,
-				'status'  => 'approval-not-available',
-				'step'    => $this->detect_step(),
-				'message' => 'در وضعیت فعلی، مرحله حذف پیوست های قدیمی منتظر تایید مدیر نیست.',
-			);
-		}
-
-		update_option( self::OPTION_DELETE_OLD_APPROVED, '1', false );
-		update_option( self::OPTION_ENABLED, '1', false );
 		update_option( 'mobo_core_image_refresh_delete_old', '1', false );
+		update_option( self::OPTION_ENABLED, '1', false );
+		delete_option( 'mobo_core_image_refresh_auto_delete_old_approved' );
 
 		return $this->save_result(
 			array(
 				'success'           => true,
-				'status'            => 'delete-old-approved',
+				'status'            => 'delete-old-enabled',
 				'step'              => 7,
 				'needsContinuation' => true,
 				'progressed'        => true,
-				'message'           => 'حذف امن پیوست‌های قدیمی برای این مرحله تایید شد و به صورت batch ادامه پیدا می‌کند.',
+				'message'           => 'حذف امن پیوست‌های قدیمی به صورت دائمی فعال شد و تا زمانی که مدیر آن را خاموش نکند در چرخه‌های بعدی نیز فعال می‌ماند.',
+			)
+		);
+	}
+
+
+	/**
+	 * Arm Stage 7 automatic draining when the manual workflow has already reached
+	 * the safe replaced-attachment deletion stage.
+	 *
+	 * This does not reset cursors or earlier verification state. It only converts
+	 * an already-safe manual Stage 7 into the normal bounded Cron/Self Runner
+	 * automation so the administrator never has to click once per batch.
+	 *
+	 * @return array
+	 */
+	public function arm_delete_old_autodrain() {
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
+			return array(
+				'success'           => true,
+				'status'            => 'delete-old-disabled',
+				'step'              => $this->detect_step(),
+				'armed'             => false,
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'تنظیم حذف پیوست قدیمی خاموش است؛ Stage 7 خودکار فعال نشد.',
+			);
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Product_Sync' ) || ! Mobo_Core_Product_Sync::is_repair_completed() ) {
+			return array(
+				'success'           => false,
+				'status'            => 'locked-until-repair',
+				'step'              => 0,
+				'armed'             => false,
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'ترمیم محصولات کامل نیست؛ Stage 7 خودکار فعال نشد.',
+			);
+		}
+
+		$step = $this->detect_step();
+		if ( 7 !== $step ) {
+			$status = self::get_status();
+			return array(
+				'success'           => true,
+				'status'            => ! empty( $status['enabled'] ) ? 'automation-already-active' : 'stage7-not-ready',
+				'step'              => $step,
+				'armed'             => false,
+				'needsContinuation' => ! empty( $status['enabled'] ),
+				'progressed'        => false,
+				'message'           => 0 === $step
+					? 'Stage 7 به نقطه پایدار رسیده است و ادامه خودکار لازم نیست.'
+					: 'Workflow هنوز در Stage 7 امن قرار ندارد؛ وضعیت فعلی بدون تغییر حفظ شد.',
+			);
+		}
+
+		update_option( self::OPTION_ENABLED, '1', false );
+		update_option( self::OPTION_COMPLETED_AT, 0, false );
+		if ( absint( get_option( self::OPTION_STARTED_AT, 0 ) ) <= 0 ) {
+			update_option( self::OPTION_STARTED_AT, time(), false );
+		}
+
+		return $this->save_result(
+			array(
+				'success'           => true,
+				'status'            => 'stage7-autodrain-armed',
+				'step'              => 7,
+				'armed'             => true,
+				'needsContinuation' => true,
+				'progressed'        => false,
+				'message'           => 'Stage 7 خودکار فعال شد. Cursor فعلی حفظ می‌شود و Cron/Self Runner انتقال مرجع و حذف امن پیوست‌های قدیمی را batch به batch تا نقطه پایدار ادامه می‌دهد.',
 			)
 		);
 	}
@@ -238,12 +295,20 @@ class Mobo_Core_Image_Refresh_Automation {
 		}
 
 		$tick_started = time();
-		update_option( self::OPTION_LAST_TICK_STARTED_AT, $tick_started, false );
-		update_option( self::OPTION_LAST_TICK_FINISHED_AT, 0, false );
-		update_option( self::OPTION_LAST_TICK_SOURCE, sanitize_key( (string) $source ), false );
+		$last_tick_telemetry_at = absint( get_option( self::OPTION_LAST_RUN_AT, 0 ) );
+		$persist_tick_telemetry = 0 === $last_tick_telemetry_at || ( $tick_started - $last_tick_telemetry_at ) >= 5;
+
+		/* These options are UI telemetry, not workflow checkpoints. During a tight
+		 * self-runner continuation loop, persist them at most once every five
+		 * seconds instead of generating four option writes for every stage pass. */
+		if ( $persist_tick_telemetry ) {
+			update_option( self::OPTION_LAST_TICK_STARTED_AT, $tick_started, false );
+			update_option( self::OPTION_LAST_TICK_FINISHED_AT, 0, false );
+			update_option( self::OPTION_LAST_TICK_SOURCE, sanitize_key( (string) $source ), false );
+			update_option( self::OPTION_LAST_RUN_AT, $tick_started, false );
+		}
 
 		try {
-			update_option( self::OPTION_LAST_RUN_AT, $tick_started, false );
 			$result = $this->run_locked( sanitize_key( (string) $source ) );
 		} catch ( Throwable $e ) {
 			$result = $this->pause_for_error( 'اجرای خودکار به دلیل خطای غیرمنتظره متوقف شد: ' . $e->getMessage(), 0, 'automation-exception' );
@@ -252,7 +317,9 @@ class Mobo_Core_Image_Refresh_Automation {
 			$result['line']           = $e->getLine();
 		} finally {
 			$tick_finished = time();
-			update_option( self::OPTION_LAST_TICK_FINISHED_AT, $tick_finished, false );
+			if ( $persist_tick_telemetry ) {
+				update_option( self::OPTION_LAST_TICK_FINISHED_AT, $tick_finished, false );
+			}
 			Mobo_Core_Lock::release( 'image_refresh_automation', $lock );
 		}
 
@@ -380,37 +447,55 @@ class Mobo_Core_Image_Refresh_Automation {
 		$replaced_delete_time = absint( isset( $replaced_delete['checkedAt'] ) ? $replaced_delete['checkedAt'] : 0 );
 		$delete_complete      = $replaced_delete_time > 0 && ! empty( $replaced_delete['cycleComplete'] );
 		$delete_newer         = $delete_complete && $replaced_delete_time >= $replaced_scan_time;
+		$delete_pass_progress = absint( isset( $replaced_delete['passProgress'] )
+			? $replaced_delete['passProgress']
+			: absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 )
+				+ absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) );
+		$delete_needs_followup = $delete_newer && $delete_pass_progress > 0;
+		$delete_stable         = $delete_newer && 0 === $delete_pass_progress;
 
-		if ( empty( $replaced_scan['cycleComplete'] ) || $delete_newer ) {
+		if ( empty( $replaced_scan['cycleComplete'] ) ) {
 			$operation = $service->audit_replaced_legacy_attachments( $scan_limit, false );
 			return $this->operation_result( 6, 'scan-replaced-old', $operation, 'اسکن خودکار پیوست‌های قدیمی جایگزین‌شده', empty( $operation['cycleComplete'] ) );
 		}
 
-		$replaced_ready = absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 );
-		if ( $replaced_ready > 0 ) {
-			if ( ! Mobo_Core_Settings::enabled( self::OPTION_DELETE_OLD_APPROVED, '0' ) ) {
-				update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		$replaced_ready       = absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 );
+		$migration_candidates = absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 );
+		$replaced_actionable  = $replaced_ready + $migration_candidates;
+		/* Stage 7 is a convergence loop, not a single pass. A full pass that deletes
+		 * attachments or migrates references must be followed by another automatic
+		 * pass. Only a complete pass with zero new progress is considered stable.
+		 * Safety-blocked items remain reported but no longer force manual clicking. */
+		if ( $replaced_actionable > 0 && ( ! $delete_newer || $delete_needs_followup ) ) {
+			if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
 				return array(
 					'success'           => true,
-					'status'            => 'waiting-delete-old-approval',
+					'status'            => 'waiting-delete-old-setting',
 					'step'              => 7,
-					'waitingApproval'   => 'delete-old',
 					'needsContinuation' => false,
 					'progressed'        => false,
-					'message'           => sprintf( '%d پیوست قدیمی شرایط حذف امن دارد. پس از بررسی بکاپ، یک بار حذف این مرحله را تایید کنید.', $replaced_ready ),
+					'message'           => sprintf( '%d پیوست آماده پاکسازی است؛ %d مورد قبل از حذف نیاز به انتقال مرجع به WebP دارد. گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» را یک بار فعال کنید؛ این انتخاب تا زمانی که خودتان خاموشش نکنید حفظ می‌شود.', $replaced_actionable, $migration_candidates ),
 				);
 			}
 
-			update_option( 'mobo_core_image_refresh_delete_old', '1', false );
 			$operation = $service->audit_replaced_legacy_attachments( $scan_limit, true );
-			if ( absint( isset( $operation['failed'] ) ? $operation['failed'] : 0 ) > 0 ) {
-				return $this->pause_for_error( 'حذف یک یا چند پیوست قدیمی ناموفق بود. جزئیات مرحله ۷ را بررسی کنید.', 7, 'delete-old-failed' );
+			/* Stage 7 is best-effort per attachment. A blocked/failed legacy attachment
+			 * must never stop thousands of independent images. When a complete pass made
+			 * progress, the next Cron/Self Runner round automatically starts another pass. */
+			$result = $this->operation_result( 7, 'delete-replaced-old', $operation, 'انتقال مراجع و حذف خودکار و امن پیوست‌های قدیمی', true );
+			if ( ! empty( $operation['cycleComplete'] ) && ! empty( $operation['needsAnotherPass'] ) ) {
+				$result['message'] = sprintf(
+					'یک گذر کامل Stage 7 انجام شد: %d پیوست حذف و %d ردیف مرجع منتقل شد. چون این گذر پیشرفت داشت، گذر بعدی به صورت خودکار با Cron/Self Runner ادامه پیدا می کند.',
+					absint( isset( $operation['deleted'] ) ? $operation['deleted'] : 0 ),
+					absint( isset( $operation['referenceRowsUpdated'] ) ? $operation['referenceRowsUpdated'] : 0 )
+				);
 			}
-			if ( ! empty( $operation['cycleComplete'] ) ) {
-				update_option( self::OPTION_DELETE_OLD_APPROVED, '0', false );
-				update_option( 'mobo_core_image_refresh_delete_old', '0', false );
-			}
-			return $this->operation_result( 7, 'delete-replaced-old', $operation, 'حذف خودکار و امن پیوست‌های قدیمی', true );
+			return $result;
+		}
+
+		if ( $replaced_actionable > 0 && $delete_stable ) {
+			/* No further automatic progress is possible in this refresh cycle. Remaining
+			 * items are genuine safety blocks or operational errors and are retained. */
 		}
 
 		/* 8 and 9. Scan orphan raster families; delete only after approval. */
@@ -537,10 +622,16 @@ class Mobo_Core_Image_Refresh_Automation {
 		$replaced_delete = $state['replacedDelete'];
 		$rs_time         = absint( isset( $replaced_scan['checkedAt'] ) ? $replaced_scan['checkedAt'] : 0 );
 		$rd_time         = absint( isset( $replaced_delete['checkedAt'] ) ? $replaced_delete['checkedAt'] : 0 );
-		if ( empty( $replaced_scan['cycleComplete'] ) || ( ! empty( $replaced_delete['cycleComplete'] ) && $rd_time >= $rs_time ) ) {
+		$delete_newer    = ! empty( $replaced_delete['cycleComplete'] ) && $rd_time >= $rs_time;
+		$delete_progress = absint( isset( $replaced_delete['passProgress'] )
+			? $replaced_delete['passProgress']
+			: absint( isset( $replaced_delete['deleted'] ) ? $replaced_delete['deleted'] : 0 )
+				+ absint( isset( $replaced_delete['referenceRowsUpdated'] ) ? $replaced_delete['referenceRowsUpdated'] : 0 ) );
+		if ( empty( $replaced_scan['cycleComplete'] ) ) {
 			return 6;
 		}
-		if ( absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 ) > 0 ) {
+		if ( absint( isset( $replaced_scan['ready'] ) ? $replaced_scan['ready'] : 0 ) + absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 ) > 0
+			&& ( ! $delete_newer || $delete_progress > 0 ) ) {
 			return 7;
 		}
 
@@ -596,10 +687,8 @@ class Mobo_Core_Image_Refresh_Automation {
 	 */
 	private function pause_for_error( $message, $step, $status ) {
 		update_option( self::OPTION_ENABLED, '0', false );
-		update_option( self::OPTION_DELETE_OLD_APPROVED, '0', false );
 		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 
 		return array(
@@ -613,18 +702,25 @@ class Mobo_Core_Image_Refresh_Automation {
 	}
 
 	/**
-	 * Mark a full verified workflow complete and turn every execution switch off.
+	 * Mark a full verified workflow complete while preserving delete-old preference.
 	 *
 	 * @return array
 	 */
 	private function complete() {
 		update_option( self::OPTION_ENABLED, '0', false );
-		update_option( self::OPTION_DELETE_OLD_APPROVED, '0', false );
 		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( self::OPTION_COMPLETED_AT, time(), false );
 		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+
+		$stage7  = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		$stage7  = is_array( $stage7 ) ? $stage7 : array();
+		$blocked = absint( isset( $stage7['blocked'] ) ? $stage7['blocked'] : 0 );
+		$errors  = absint( isset( $stage7['errors'] ) ? $stage7['errors'] : 0 );
+		$message = 'تمام مراحل خودکار نوسازی، کنترل برش ها و پاکسازی تا نقطه پایدار کامل شد. اجرای خودکار متوقف شد؛ تنظیم دائمی حذف پیوست قدیمی بدون تغییر حفظ شده است.';
+		if ( $blocked > 0 || $errors > 0 ) {
+			$message .= sprintf( ' در آخرین گذر Stage 7، %d پیوست به دلیل Safety Audit نگه داشته شد و %d خطای عملیاتی ثبت شد؛ این موارد عمدا بدون حذف باقی مانده اند.', $blocked, $errors );
+		}
 
 		return array(
 			'success'           => true,
@@ -632,7 +728,7 @@ class Mobo_Core_Image_Refresh_Automation {
 			'step'              => 0,
 			'needsContinuation' => false,
 			'progressed'        => true,
-			'message'           => 'تمام مراحل نوسازی، کنترل برش‌ها و اسکن‌های تاییدی کامل شد. همه کلیدهای اجرایی و حذفی خاموش شدند.',
+			'message'           => $message,
 		);
 	}
 

@@ -8,6 +8,19 @@
  * @package MoboCore
  */
 
+/*
+ * Expose cron context before wp-load.php so Mobo Core's lazy bootstrap loads
+ * mutation listeners and worker-only components for both CLI and direct HTTP
+ * invocations of this file.
+ */
+if ( ! defined( 'DOING_CRON' ) ) {
+	define( 'DOING_CRON', true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound -- WordPress core cron context constant.
+}
+
+if ( ! defined( 'MOBO_CORE_LOCAL_PHP_CRON' ) ) {
+	define( 'MOBO_CORE_LOCAL_PHP_CRON', true );
+}
+
 /**
  * Locate and load WordPress when this script is invoked directly by PHP CLI.
  *
@@ -50,14 +63,6 @@ mobo_core_cron_bootstrap_wordpress();
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
-}
-
-if ( ! defined( 'DOING_CRON' ) ) {
-	define( 'DOING_CRON', true ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound -- WordPress core cron context constant.
-}
-
-if ( ! defined( 'MOBO_CORE_LOCAL_PHP_CRON' ) ) {
-	define( 'MOBO_CORE_LOCAL_PHP_CRON', true );
 }
 
 /**

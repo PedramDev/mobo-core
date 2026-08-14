@@ -2,9 +2,11 @@
 /**
  * Periodic bounded database maintenance.
  *
- * This class is intentionally invisible in the admin UI. It runs from the real
- * cron runner with conservative fixed retention windows and small batches so it
- * cannot block normal webhook/product/order processing.
+ * Mobo Core keeps its active queues intentionally durable. This component only
+ * removes terminal/orphaned rows after conservative retention windows and uses
+ * short, indexed chunks so housekeeping can never monopolize the real-cron
+ * runner. When a large historical backlog exists, maintenance temporarily
+ * switches to a five-minute catch-up cadence until the old rows are drained.
  *
  * PHP 7.4 compatible.
  */
@@ -13,25 +15,26 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-
-/*
- * This component operates on Mobo Core's internal queue/map tables. Direct
- * database access is required for atomic batching and cursor updates; table
- * identifiers are generated internally and all external values are prepared.
- */
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Maintenance {
 
-	const RUN_INTERVAL_SECONDS = 21600; // 6 hours.
-	const SYNC_DONE_RETENTION_DAYS = 7;
-	const SYNC_FAILED_RETENTION_DAYS = 30;
-	const IMAGE_FAILED_RETENTION_DAYS = 30;
-	const IMAGE_ORPHAN_RETENTION_DAYS = 30;
-	const IMAGE_DONE_RETENTION_DAYS = 180;
+	const RUN_INTERVAL_SECONDS              = 21600; // 6 hours.
+	const CATCHUP_INTERVAL_SECONDS          = 300;   // 5 minutes while old rows remain.
+	const EXECUTION_BUDGET_SECONDS          = 3.0;
+	const DELETE_CHUNK_SIZE                 = 500;
+	const SYNC_DONE_RETENTION_DAYS          = 7;
+	const SYNC_FAILED_RETENTION_DAYS        = 30;
+	const IMAGE_FAILED_RETENTION_DAYS       = 30;
+	const IMAGE_ORPHAN_RETENTION_DAYS       = 30;
+	const IMAGE_DONE_RETENTION_DAYS         = 180;
+	const IMAGE_REFRESH_DONE_RETENTION_DAYS = 45;
+	const PRODUCT_MAP_ORPHAN_RETENTION_DAYS = 30;
 	const ACTION_COMPLETED_LOG_RETENTION_DAYS = 14;
-	const ACTION_FAILED_LOG_RETENTION_DAYS = 30;
-	const ACTION_ORPHAN_LOG_RETENTION_DAYS = 7;
-	const DEFAULT_BATCH_LIMIT = 500;
+	const ACTION_FAILED_LOG_RETENTION_DAYS    = 30;
+	const ACTION_ORPHAN_LOG_RETENTION_DAYS    = 7;
+
+	/** @var array<string,bool> Request-local table existence cache. */
+	private static $table_exists_cache = array();
 
 	/**
 	 * Run maintenance when due.
@@ -42,14 +45,19 @@ class Mobo_Core_Maintenance {
 	public static function maybe_run( $source = 'real-cron' ) {
 		$now      = time();
 		$last_run = absint( get_option( 'mobo_core_maintenance_last_run_at', 0 ) );
+		$next_due = absint( get_option( 'mobo_core_maintenance_next_due_at', 0 ) );
 
-		if ( $last_run > 0 && ( $now - $last_run ) < self::RUN_INTERVAL_SECONDS ) {
+		if ( $next_due <= 0 && $last_run > 0 ) {
+			$next_due = $last_run + self::RUN_INTERVAL_SECONDS;
+		}
+
+		if ( $next_due > $now ) {
 			return array(
 				'success'      => true,
 				'status'       => 'skipped-not-due',
 				'lastRunAt'    => $last_run,
-				'nextDueAt'    => $last_run + self::RUN_INTERVAL_SECONDS,
-				'intervalSecs' => self::RUN_INTERVAL_SECONDS,
+				'nextDueAt'    => $next_due,
+				'intervalSecs' => max( 0, $next_due - $now ),
 			);
 		}
 
@@ -61,7 +69,6 @@ class Mobo_Core_Maintenance {
 		}
 
 		$lock = Mobo_Core_Lock::acquire( 'maintenance_cleanup', 300 );
-
 		if ( false === $lock ) {
 			return array(
 				'success' => true,
@@ -85,350 +92,437 @@ class Mobo_Core_Maintenance {
 			Mobo_Core_Lock::release( 'maintenance_cleanup', $lock );
 		}
 
-		update_option( 'mobo_core_maintenance_last_run_at', time(), false );
+		$finished_at = time();
+		$catchup     = empty( $result['success'] ) || ! empty( $result['needsContinuation'] );
+		$interval    = $catchup ? self::CATCHUP_INTERVAL_SECONDS : self::RUN_INTERVAL_SECONDS;
+		$next_due    = $finished_at + $interval;
+
+		$result['lastRunAt']    = $finished_at;
+		$result['nextDueAt']    = $next_due;
+		$result['intervalSecs'] = $interval;
+
+		update_option( 'mobo_core_maintenance_last_run_at', $finished_at, false );
+		update_option( 'mobo_core_maintenance_next_due_at', $next_due, false );
 		update_option( 'mobo_core_maintenance_last_result', $result, false );
 
 		return $result;
 	}
 
 	/**
-	 * Run a bounded cleanup pass immediately.
+	 * Run one short housekeeping slice.
+	 *
+	 * Each subsystem receives a fair sub-budget. A large sync-event backlog cannot
+	 * starve image/map maintenance, while unused time from fast stages remains
+	 * available to later stages up to the overall deadline.
 	 *
 	 * @param string $source Source label.
 	 * @return array
 	 */
 	private static function run_now( $source ) {
+		$started  = microtime( true );
+		$deadline = $started + self::EXECUTION_BUDGET_SECONDS;
+
+		$sync_deadline    = self::slice_deadline( $deadline, 0.85 );
+		$sync_events      = self::cleanup_sync_events( $sync_deadline );
+		$image_deadline   = self::slice_deadline( $deadline, 0.85 );
+		$image_queue      = self::cleanup_image_queue( $image_deadline );
+		$refresh_deadline = self::slice_deadline( $deadline, 0.40 );
+		$image_refresh    = self::cleanup_image_refresh_queue( $refresh_deadline );
+		$map_deadline     = self::slice_deadline( $deadline, 0.40 );
+		$product_map      = self::cleanup_product_map( $map_deadline );
+
+		$action_scheduler = self::has_time( $deadline, 0.12 )
+			? self::cleanup_action_scheduler_logs( self::slice_deadline( $deadline, 0.30 ) )
+			: array( 'status' => 'skipped-budget', 'deleted' => 0, 'likelyRemaining' => false );
+
+		$wp_cron = self::has_time( $deadline, 0.03 )
+			? self::cleanup_wp_cron_option()
+			: array( 'status' => 'skipped-budget', 'removed' => 0 );
+
+		$continuation = false;
+		/* Catch-up cadence is driven only by Mobo-owned tables. A third-party
+		 * Action Scheduler backlog must not make Mobo wake every five minutes. */
+		foreach ( array( $sync_events, $image_queue, $image_refresh, $product_map ) as $stage ) {
+			if ( is_array( $stage ) && ! empty( $stage['likelyRemaining'] ) ) {
+				$continuation = true;
+				break;
+			}
+		}
+
 		return array(
-			'success'         => true,
-			'status'          => 'ok',
-			'source'          => sanitize_key( (string) $source ),
-			'executedAt'      => time(),
-			'syncEvents'      => self::cleanup_sync_events(),
-			'imageQueue'      => self::cleanup_image_queue(),
-			'actionScheduler' => self::cleanup_action_scheduler_logs(),
-			'wpCron'          => self::cleanup_wp_cron_option(),
+			'success'             => true,
+			'status'              => $continuation ? 'catchup' : 'ok',
+			'source'              => sanitize_key( (string) $source ),
+			'executedAt'          => time(),
+			'elapsedMs'           => (int) round( ( microtime( true ) - $started ) * 1000 ),
+			'budgetMs'            => (int) round( self::EXECUTION_BUDGET_SECONDS * 1000 ),
+			'needsContinuation'   => $continuation,
+			'syncEvents'          => $sync_events,
+			'imageQueue'          => $image_queue,
+			'imageRefreshQueue'   => $image_refresh,
+			'productMap'          => $product_map,
+			'actionScheduler'     => $action_scheduler,
+			'wpCron'              => $wp_cron,
 		);
 	}
 
 	/**
-	 * Cleanup terminal webhook/sync event rows only.
+	 * Delete terminal webhook rows in indexed chunks.
 	 *
+	 * @param float $deadline Monotonic wall-clock deadline.
 	 * @return array
 	 */
-	private static function cleanup_sync_events() {
-		global $wpdb;
-
+	private static function cleanup_sync_events( $deadline ) {
 		if ( ! class_exists( 'Mobo_Core_Sync_Event_Store' ) || ! Mobo_Core_Sync_Event_Store::table_exists() ) {
-			return array( 'status' => 'missing-table', 'deleted' => 0 );
+			return array( 'status' => 'missing-table', 'deleted' => 0, 'likelyRemaining' => false );
 		}
 
 		$table       = Mobo_Core_Sync_Event_Store::table_name();
 		$done_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::SYNC_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$fail_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::SYNC_FAILED_RETENTION_DAYS * DAY_IN_SECONDS ) );
-		$limit       = self::DEFAULT_BATCH_LIMIT;
 
-		$deleted_done = $wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM {$table}
-				WHERE status = 'done'
-				AND updated_at < %s
-				ORDER BY id ASC
-				LIMIT %d",
-				$done_cutoff,
-				$limit
-			)
-		);
-
-		$remaining = max( 0, $limit - absint( false === $deleted_done ? 0 : $deleted_done ) );
-		$deleted_failed = 0;
-
-		if ( $remaining > 0 ) {
-			$deleted_failed = $wpdb->query(
-				$wpdb->prepare(
-					"DELETE FROM {$table}
-					WHERE status = 'failed'
-					AND updated_at < %s
-					ORDER BY id ASC
-					LIMIT %d",
-					$fail_cutoff,
-					$remaining
-				)
-			);
-		}
+		$done   = self::delete_status_before( $table, 'done', $done_cutoff, 3500, $deadline );
+		$failed = self::has_time( $deadline, 0.03 )
+			? self::delete_status_before( $table, 'failed', $fail_cutoff, 1500, $deadline )
+			: array( 'deleted' => 0, 'likelyRemaining' => false, 'status' => 'skipped-budget' );
 
 		return array(
-			'status'             => 'ok',
-			'deletedDone'        => absint( false === $deleted_done ? 0 : $deleted_done ),
-			'deletedFailed'      => absint( false === $deleted_failed ? 0 : $deleted_failed ),
-			'doneRetentionDays'  => self::SYNC_DONE_RETENTION_DAYS,
-			'failedRetentionDays'=> self::SYNC_FAILED_RETENTION_DAYS,
+			'status'              => 'ok',
+			'deletedDone'         => absint( $done['deleted'] ),
+			'deletedFailed'       => absint( $failed['deleted'] ),
+			'doneRetentionDays'   => self::SYNC_DONE_RETENTION_DAYS,
+			'failedRetentionDays' => self::SYNC_FAILED_RETENTION_DAYS,
+			'likelyRemaining'     => ! empty( $done['likelyRemaining'] ) || ! empty( $failed['likelyRemaining'] ),
 		);
 	}
 
 	/**
 	 * Cleanup stale image queue rows without deleting media attachments.
 	 *
+	 * @param float $deadline Deadline.
 	 * @return array
 	 */
-	private static function cleanup_image_queue() {
+	private static function cleanup_image_queue( $deadline ) {
 		global $wpdb;
 
 		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
-			return array( 'status' => 'missing-table', 'deleted' => 0 );
+			return array( 'status' => 'missing-table', 'deleted' => 0, 'likelyRemaining' => false );
 		}
 
-		$table       = Mobo_Core_Image_Queue::table_name();
-		$posts_table = $wpdb->posts;
-		$limit       = self::DEFAULT_BATCH_LIMIT;
-		$fail_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_FAILED_RETENTION_DAYS * DAY_IN_SECONDS ) );
-		$orphan_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
-		$done_cutoff     = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$table          = Mobo_Core_Image_Queue::table_name();
+		$posts_table    = $wpdb->posts;
+		$fail_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_FAILED_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$orphan_cutoff  = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$done_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$permanent_like = $wpdb->esc_like( 'Permanent:' ) . '%';
 
-		$legacy_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
-			? Mobo_Core_Image_Queue::recover_legacy_failed( min( 250, $limit ) )
-			: array( 'status' => 'unavailable', 'recovered' => 0, 'remaining' => 0 );
-		$linkage_recovery = method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
-			? Mobo_Core_Image_Queue::schedule_linkage_repairs( min( 100, $limit ) )
-			: array( 'status' => 'unavailable', 'scheduled' => 0 );
+		$legacy_recovery = self::has_time( $deadline, 0.12 ) && method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
+			? Mobo_Core_Image_Queue::recover_legacy_failed( 150 )
+			: array( 'status' => 'skipped-budget', 'recovered' => 0, 'remaining' => 0 );
+		$linkage_recovery = self::has_time( $deadline, 0.12 ) && method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
+			? Mobo_Core_Image_Queue::schedule_linkage_repairs( 75 )
+			: array( 'status' => 'skipped-budget', 'scheduled' => 0 );
 
-		/*
-		 * Only structurally permanent failures are deleted. Recoverable network,
-		 * source-readiness and old terminal failures are reopened above.
-		 */
-		$deleted_failed = $wpdb->query(
-			$wpdb->prepare(
-				"DELETE FROM {$table}
-				WHERE status = 'failed'
-					AND last_error LIKE %s
-					AND updated_at < %s
-				ORDER BY id ASC
-				LIMIT %d",
-				$permanent_like,
-				$fail_cutoff,
-				$limit
-			)
-		);
+		$deleted_failed = 0;
+		$failed_likely  = false;
+		while ( self::has_time( $deadline, 0.03 ) && $deleted_failed < 500 ) {
+			$limit = min( self::DELETE_CHUNK_SIZE, 500 - $deleted_failed );
+			$rows  = $wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM {$table}
+					WHERE status = 'failed'
+						AND updated_at < %s
+						AND last_error LIKE %s
+					ORDER BY id ASC
+					LIMIT %d",
+					$fail_cutoff,
+					$permanent_like,
+					$limit
+				)
+			);
+			if ( false === $rows ) {
+				break;
+			}
+			$rows = absint( $rows );
+			$deleted_failed += $rows;
+			$failed_likely = $rows >= $limit;
+			if ( $rows < $limit ) {
+				break;
+			}
+		}
 
-		$used = absint( false === $deleted_failed ? 0 : $deleted_failed );
 		$deleted_missing_product = 0;
-		$requeued_missing_attachment = 0;
-		$deleted_old_done = 0;
-
-		if ( $used < $limit ) {
+		$missing_product_likely  = false;
+		if ( self::has_time( $deadline, 0.06 ) ) {
 			$ids = $wpdb->get_col(
 				$wpdb->prepare(
 					"SELECT q.id
 					FROM {$table} q
 					LEFT JOIN {$posts_table} p ON p.ID = q.product_id
 					WHERE q.updated_at < %s
-					AND q.product_id > 0
-					AND p.ID IS NULL
-					ORDER BY q.id ASC
+						AND q.product_id > 0
+						AND (p.ID IS NULL OR p.post_type <> 'product' OR p.post_status IN ('trash','auto-draft'))
+					ORDER BY q.updated_at ASC, q.id ASC
 					LIMIT %d",
 					$orphan_cutoff,
-					$limit - $used
+					500
 				)
 			);
-
+			$ids = self::normalize_ids( $ids );
+			$missing_product_likely  = count( $ids ) >= 500;
 			$deleted_missing_product = self::delete_ids( $table, $ids );
-			$used += $deleted_missing_product;
 		}
 
-		if ( $used < $limit ) {
+		$requeued_missing_attachment = 0;
+		$missing_attachment_likely   = false;
+		if ( self::has_time( $deadline, 0.06 ) ) {
 			$ids = $wpdb->get_col(
 				$wpdb->prepare(
 					"SELECT q.id
 					FROM {$table} q
 					LEFT JOIN {$posts_table} a ON a.ID = q.attachment_id AND a.post_type = 'attachment'
 					WHERE q.status = 'done'
-					AND q.updated_at < %s
-					AND q.attachment_id > 0
-					AND a.ID IS NULL
-					ORDER BY q.id ASC
+						AND q.updated_at < %s
+						AND q.attachment_id > 0
+						AND a.ID IS NULL
+					ORDER BY q.updated_at ASC, q.id ASC
 					LIMIT %d",
 					$orphan_cutoff,
-					$limit - $used
+					500
 				)
 			);
-
-			$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
-
+			$ids = self::normalize_ids( $ids );
+			$missing_attachment_likely = count( $ids ) >= 500;
 			if ( ! empty( $ids ) ) {
 				$now          = current_time( 'mysql', true );
 				$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 				$args         = array_merge( array( $now, $now ), $ids );
 				$query        = "UPDATE {$table}
-					SET status = 'pending',
-						attachment_id = 0,
-						try_count = 0,
-						next_retry_at = %s,
-						locked_until = NULL,
+					SET status = 'pending', attachment_id = 0, try_count = 0,
+						next_retry_at = %s, locked_until = NULL,
 						last_error = 'Completed image attachment was missing; source retry scheduled.',
 						updated_at = %s
 					WHERE id IN ({$placeholders})";
-
-				// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 				$updated = $wpdb->query( $wpdb->prepare( $query, $args ) );
 				$requeued_missing_attachment = absint( false === $updated ? 0 : $updated );
 			}
-
-			$used += $requeued_missing_attachment;
 		}
 
-		if ( $used < $limit ) {
-			$deleted_old_done = $wpdb->query(
-				$wpdb->prepare(
-					"DELETE FROM {$table}
-					WHERE status = 'done'
-					AND updated_at < %s
-					ORDER BY id ASC
-					LIMIT %d",
-					$done_cutoff,
-					$limit - $used
-				)
-			);
-		}
+		$done = self::has_time( $deadline, 0.03 )
+			? self::delete_status_before( $table, 'done', $done_cutoff, 2000, $deadline )
+			: array( 'deleted' => 0, 'likelyRemaining' => false );
 
 		return array(
-			'status'                   => 'ok',
+			'status'                    => 'ok',
 			'recoveredLegacyFailed'     => isset( $legacy_recovery['recovered'] ) ? absint( $legacy_recovery['recovered'] ) : 0,
 			'remainingLegacyFailed'     => isset( $legacy_recovery['remaining'] ) ? absint( $legacy_recovery['remaining'] ) : 0,
 			'scheduledLinkageRepairs'   => isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0,
-			'deletedPermanentFailed'    => absint( false === $deleted_failed ? 0 : $deleted_failed ),
-			'deletedFailed'             => absint( false === $deleted_failed ? 0 : $deleted_failed ),
-			'deletedMissingProduct'     => absint( $deleted_missing_product ),
-			'requeuedMissingAttachment'=> absint( $requeued_missing_attachment ),
-			'deletedMissingAttachment'  => 0,
-			'deletedOldDone'            => absint( false === $deleted_old_done ? 0 : $deleted_old_done ),
-			'failedRetentionDays'      => self::IMAGE_FAILED_RETENTION_DAYS,
-			'orphanRetentionDays'      => self::IMAGE_ORPHAN_RETENTION_DAYS,
-			'doneRetentionDays'        => self::IMAGE_DONE_RETENTION_DAYS,
+			'deletedPermanentFailed'    => $deleted_failed,
+			'deletedMissingProduct'     => $deleted_missing_product,
+			'requeuedMissingAttachment' => $requeued_missing_attachment,
+			'deletedOldDone'            => absint( $done['deleted'] ),
+			'failedRetentionDays'       => self::IMAGE_FAILED_RETENTION_DAYS,
+			'orphanRetentionDays'       => self::IMAGE_ORPHAN_RETENTION_DAYS,
+			'doneRetentionDays'         => self::IMAGE_DONE_RETENTION_DAYS,
+			'likelyRemaining'           => $failed_likely || $missing_product_likely || $missing_attachment_likely || ! empty( $done['likelyRemaining'] ) || ! empty( $legacy_recovery['remaining'] ),
 		);
 	}
 
 	/**
-	 * Cleanup Action Scheduler log rows. Mobo does not write these logs, but large
-	 * WooCommerce installs can grow this table quickly.
+	 * Remove old completed/skipped image-refresh bookkeeping rows.
 	 *
+	 * Failed rows are intentionally preserved for manual retry/diagnostics. Active
+	 * pending/processing rows are never touched.
+	 *
+	 * @param float $deadline Deadline.
 	 * @return array
 	 */
-	private static function cleanup_action_scheduler_logs() {
-		global $wpdb;
-
-		$actions_table = esc_sql( $wpdb->prefix . 'actionscheduler_actions' );
-		$logs_table    = esc_sql( $wpdb->prefix . 'actionscheduler_logs' );
-
-		if ( ! self::table_exists( $actions_table ) || ! self::table_exists( $logs_table ) ) {
-			return array( 'status' => 'missing-table', 'deleted' => 0 );
+	private static function cleanup_image_refresh_queue( $deadline ) {
+		if ( ! class_exists( 'Mobo_Core_Image_Refresh_Queue' ) || ! Mobo_Core_Image_Refresh_Queue::table_exists() ) {
+			return array( 'status' => 'missing-table', 'deleted' => 0, 'likelyRemaining' => false );
 		}
 
-		$limit = self::DEFAULT_BATCH_LIMIT;
+		$table  = Mobo_Core_Image_Refresh_Queue::table_name();
+		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_REFRESH_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$done   = self::delete_status_before( $table, 'done', $cutoff, 750, $deadline );
+		$skip   = self::has_time( $deadline, 0.02 )
+			? self::delete_status_before( $table, 'skipped', $cutoff, 750, $deadline )
+			: array( 'deleted' => 0, 'likelyRemaining' => false );
+
+		return array(
+			'status'            => 'ok',
+			'deletedDone'       => absint( $done['deleted'] ),
+			'deletedSkipped'    => absint( $skip['deleted'] ),
+			'retentionDays'     => self::IMAGE_REFRESH_DONE_RETENTION_DAYS,
+			'likelyRemaining'   => ! empty( $done['likelyRemaining'] ) || ! empty( $skip['likelyRemaining'] ),
+		);
+	}
+
+	/**
+	 * Remove remote->local map rows only when the local post has been physically
+	 * deleted for at least the retention window. Trashed posts still exist and are
+	 * therefore retained.
+	 *
+	 * @param float $deadline Deadline.
+	 * @return array
+	 */
+	private static function cleanup_product_map( $deadline ) {
+		global $wpdb;
+
+		if ( ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
+			return array( 'status' => 'missing-table', 'deleted' => 0, 'likelyRemaining' => false );
+		}
+
+		$table  = Mobo_Core_Product_Map::table_name();
+		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::PRODUCT_MAP_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$total  = 0;
+		$likely = false;
+
+		while ( self::has_time( $deadline, 0.03 ) && $total < 1000 ) {
+			$limit = min( self::DELETE_CHUNK_SIZE, 1000 - $total );
+			$ids   = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT m.id
+					FROM {$table} m
+					LEFT JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
+					WHERE m.wp_post_id > 0
+						AND m.updated_at < %s
+						AND p.ID IS NULL
+					ORDER BY m.updated_at ASC, m.id ASC
+					LIMIT %d",
+					$cutoff,
+					$limit
+				)
+			);
+			$ids = self::normalize_ids( $ids );
+			if ( empty( $ids ) ) {
+				$likely = false;
+				break;
+			}
+			$deleted = self::delete_ids( $table, $ids );
+			$total   += $deleted;
+			$likely   = count( $ids ) >= $limit;
+			if ( count( $ids ) < $limit || $deleted <= 0 ) {
+				break;
+			}
+		}
+
+		return array(
+			'status'          => 'ok',
+			'deletedOrphans'  => $total,
+			'retentionDays'   => self::PRODUCT_MAP_ORPHAN_RETENTION_DAYS,
+			'likelyRemaining' => $likely,
+		);
+	}
+
+	/**
+	 * Cleanup old Action Scheduler log rows in bulk. Actions themselves are never
+	 * deleted here; only old log text is pruned.
+	 *
+	 * @param float $deadline Deadline.
+	 * @return array
+	 */
+	private static function cleanup_action_scheduler_logs( $deadline ) {
+		global $wpdb;
+
+		$actions_table = $wpdb->prefix . 'actionscheduler_actions';
+		$logs_table    = $wpdb->prefix . 'actionscheduler_logs';
+		if ( ! self::table_exists( $actions_table ) || ! self::table_exists( $logs_table ) ) {
+			return array( 'status' => 'missing-table', 'deleted' => 0, 'likelyRemaining' => false );
+		}
+
 		$completed_cutoff = gmdate( 'Y-m-d H:i:s', time() - ( self::ACTION_COMPLETED_LOG_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$failed_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::ACTION_FAILED_LOG_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$orphan_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::ACTION_ORPHAN_LOG_RETENTION_DAYS * DAY_IN_SECONDS ) );
+		$deleted_completed = 0;
+		$deleted_failed    = 0;
+		$deleted_orphan    = 0;
+		$likely            = false;
 
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT l.log_id
-				FROM {$logs_table} l
-				INNER JOIN {$actions_table} a ON a.action_id = l.action_id
-				WHERE a.status IN ('complete', 'canceled')
-				AND l.log_date_gmt < %s
-				ORDER BY l.log_id ASC
-				LIMIT %d",
-				$completed_cutoff,
-				$limit
-			)
-		);
-
-		$deleted_completed = self::delete_ids( $logs_table, $ids, 'log_id' );
-		$used = $deleted_completed;
-		$deleted_failed = 0;
-		$deleted_orphan = 0;
-
-		if ( $used < $limit ) {
+		if ( self::has_time( $deadline, 0.03 ) ) {
 			$ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT l.log_id
-					FROM {$logs_table} l
+					"SELECT l.log_id FROM {$logs_table} l
 					INNER JOIN {$actions_table} a ON a.action_id = l.action_id
-					WHERE a.status = 'failed'
-					AND l.log_date_gmt < %s
-					ORDER BY l.log_id ASC
-					LIMIT %d",
-					$failed_cutoff,
-					$limit - $used
+					WHERE a.status IN ('complete','canceled') AND l.log_date_gmt < %s
+					ORDER BY l.log_id ASC LIMIT 500",
+					$completed_cutoff
 				)
 			);
-
-			$deleted_failed = self::delete_ids( $logs_table, $ids, 'log_id' );
-			$used += $deleted_failed;
+			$ids = self::normalize_ids( $ids );
+			$likely = $likely || count( $ids ) >= 500;
+			$deleted_completed = self::delete_ids( $logs_table, $ids, 'log_id' );
 		}
 
-		if ( $used < $limit ) {
+		if ( self::has_time( $deadline, 0.03 ) ) {
 			$ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT l.log_id
-					FROM {$logs_table} l
-					LEFT JOIN {$actions_table} a ON a.action_id = l.action_id
-					WHERE a.action_id IS NULL
-					AND l.log_date_gmt < %s
-					ORDER BY l.log_id ASC
-					LIMIT %d",
-					$orphan_cutoff,
-					$limit - $used
+					"SELECT l.log_id FROM {$logs_table} l
+					INNER JOIN {$actions_table} a ON a.action_id = l.action_id
+					WHERE a.status = 'failed' AND l.log_date_gmt < %s
+					ORDER BY l.log_id ASC LIMIT 500",
+					$failed_cutoff
 				)
 			);
+			$ids = self::normalize_ids( $ids );
+			$likely = $likely || count( $ids ) >= 500;
+			$deleted_failed = self::delete_ids( $logs_table, $ids, 'log_id' );
+		}
 
+		if ( self::has_time( $deadline, 0.03 ) ) {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT l.log_id FROM {$logs_table} l
+					LEFT JOIN {$actions_table} a ON a.action_id = l.action_id
+					WHERE a.action_id IS NULL AND l.log_date_gmt < %s
+					ORDER BY l.log_id ASC LIMIT 500",
+					$orphan_cutoff
+				)
+			);
+			$ids = self::normalize_ids( $ids );
+			$likely = $likely || count( $ids ) >= 500;
 			$deleted_orphan = self::delete_ids( $logs_table, $ids, 'log_id' );
 		}
 
 		return array(
 			'status'                     => 'ok',
-			'deletedCompletedOrCanceled' => absint( $deleted_completed ),
-			'deletedFailed'              => absint( $deleted_failed ),
-			'deletedOrphan'              => absint( $deleted_orphan ),
+			'deletedCompletedOrCanceled' => $deleted_completed,
+			'deletedFailed'              => $deleted_failed,
+			'deletedOrphan'              => $deleted_orphan,
 			'completedRetentionDays'     => self::ACTION_COMPLETED_LOG_RETENTION_DAYS,
 			'failedRetentionDays'        => self::ACTION_FAILED_LOG_RETENTION_DAYS,
 			'orphanRetentionDays'        => self::ACTION_ORPHAN_LOG_RETENTION_DAYS,
+			'likelyRemaining'            => $likely,
 		);
 	}
 
 	/**
-	 * Cleanup leftover Mobo WP-Cron hooks from the wp_options cron array.
+	 * Cleanup leftover legacy Mobo WP-Cron hooks with one cron-option write.
+	 *
+	 * Calling wp_clear_scheduled_hook() once per legacy hook can repeatedly read and
+	 * rewrite the large cron option. Mobo's architecture no longer uses WP-Cron, so
+	 * a single deterministic pass is both safer for performance and equivalent.
 	 *
 	 * @return array
 	 */
 	private static function cleanup_wp_cron_option() {
 		$hooks = self::mobo_cron_hooks();
-
-		if ( function_exists( 'wp_clear_scheduled_hook' ) ) {
-			foreach ( $hooks as $hook ) {
-				wp_clear_scheduled_hook( $hook );
-			}
-		}
-
-		$cron = get_option( 'cron', array() );
-
+		$cron  = get_option( 'cron', array() );
 		if ( ! is_array( $cron ) ) {
 			return array( 'status' => 'invalid-cron-option', 'removed' => 0 );
 		}
 
 		$removed = 0;
-
 		foreach ( $cron as $timestamp => $events ) {
 			if ( 'version' === $timestamp || ! is_array( $events ) ) {
 				continue;
 			}
-
 			foreach ( $hooks as $hook ) {
 				if ( isset( $cron[ $timestamp ][ $hook ] ) ) {
 					$removed += is_array( $cron[ $timestamp ][ $hook ] ) ? count( $cron[ $timestamp ][ $hook ] ) : 1;
 					unset( $cron[ $timestamp ][ $hook ] );
 				}
 			}
-
 			if ( isset( $cron[ $timestamp ] ) && is_array( $cron[ $timestamp ] ) && empty( $cron[ $timestamp ] ) ) {
 				unset( $cron[ $timestamp ] );
 			}
@@ -438,11 +532,109 @@ class Mobo_Core_Maintenance {
 			update_option( 'cron', $cron );
 		}
 
-		return array(
-			'status'  => 'ok',
-			'removed' => absint( $removed ),
-			'hooks'   => $hooks,
-		);
+		return array( 'status' => 'ok', 'removed' => absint( $removed ), 'hooks' => $hooks );
+	}
+
+	/**
+	 * Delete terminal rows by status/age in short indexed chunks.
+	 *
+	 * @param string $table Table name.
+	 * @param string $status Terminal status.
+	 * @param string $cutoff UTC datetime.
+	 * @param int    $max_rows Maximum rows this pass.
+	 * @param float  $deadline Deadline.
+	 * @return array
+	 */
+	private static function delete_status_before( $table, $status, $cutoff, $max_rows, $deadline ) {
+		global $wpdb;
+
+		$status   = sanitize_key( (string) $status );
+		$max_rows = max( 1, absint( $max_rows ) );
+		$total    = 0;
+		$likely   = false;
+
+		while ( self::has_time( $deadline, 0.02 ) && $total < $max_rows ) {
+			$limit = min( self::DELETE_CHUNK_SIZE, $max_rows - $total );
+			$rows  = $wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM {$table}
+					WHERE status = %s AND updated_at < %s
+					ORDER BY id ASC
+					LIMIT %d",
+					$status,
+					$cutoff,
+					$limit
+				)
+			);
+			if ( false === $rows ) {
+				return array( 'status' => 'db-error', 'deleted' => $total, 'likelyRemaining' => $likely );
+			}
+			$rows  = absint( $rows );
+			$total += $rows;
+			$likely = $rows >= $limit;
+			if ( $rows < $limit ) {
+				break;
+			}
+		}
+
+		return array( 'status' => 'ok', 'deleted' => $total, 'likelyRemaining' => $likely );
+	}
+
+	/**
+	 * Delete an ID list in one SQL statement from a strict internal whitelist.
+	 *
+	 * @param string $table Table name.
+	 * @param array  $ids IDs.
+	 * @param string $id_column ID column.
+	 * @return int
+	 */
+	private static function delete_ids( $table, $ids, $id_column = 'id' ) {
+		global $wpdb;
+
+		$ids = self::normalize_ids( $ids );
+		if ( empty( $ids ) ) {
+			return 0;
+		}
+
+		$allowed = array();
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) ) {
+			$allowed[ Mobo_Core_Image_Queue::table_name() . '|id' ] = true;
+		}
+		if ( class_exists( 'Mobo_Core_Product_Map' ) ) {
+			$allowed[ Mobo_Core_Product_Map::table_name() . '|id' ] = true;
+		}
+		$allowed[ $wpdb->prefix . 'actionscheduler_logs|log_id' ] = true;
+
+		$key = (string) $table . '|' . sanitize_key( (string) $id_column );
+		if ( empty( $allowed[ $key ] ) ) {
+			return 0;
+		}
+
+		$id_column = sanitize_key( (string) $id_column );
+		$id_sql     = implode( ',', $ids );
+		$deleted    = $wpdb->query( "DELETE FROM {$table} WHERE {$id_column} IN ({$id_sql})" );
+		return absint( false === $deleted ? 0 : $deleted );
+	}
+
+	/** @return array<int,int> */
+	private static function normalize_ids( $ids ) {
+		return array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+	}
+
+	/**
+	 * Return a fair stage deadline without exceeding the global maintenance budget.
+	 *
+	 * @param float $overall_deadline Overall deadline.
+	 * @param float $seconds Stage budget.
+	 * @return float
+	 */
+	private static function slice_deadline( $overall_deadline, $seconds ) {
+		return min( (float) $overall_deadline, microtime( true ) + max( 0.05, (float) $seconds ) );
+	}
+
+	/** @return bool */
+	private static function has_time( $deadline, $reserve = 0.0 ) {
+		return microtime( true ) + max( 0.0, (float) $reserve ) < (float) $deadline;
 	}
 
 	/**
@@ -475,65 +667,6 @@ class Mobo_Core_Maintenance {
 	}
 
 	/**
-	 * Delete rows by ID list.
-	 *
-	 * @param string $table Table name.
-	 * @param array  $ids IDs.
-	 * @param string $id_column ID column name.
-	 * @return int
-	 */
-	private static function delete_ids( $table, $ids, $id_column = 'id' ) {
-		global $wpdb;
-
-		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
-
-		if ( empty( $ids ) ) {
-			return 0;
-		}
-
-		$id_column = sanitize_key( (string) $id_column );
-		$deleted   = 0;
-
-		if ( 'log_id' === $id_column ) {
-			$logs_table = $wpdb->prefix . 'actionscheduler_logs';
-
-			if ( $table !== $logs_table ) {
-				return 0;
-			}
-
-			foreach ( $ids as $id ) {
-				$result = $wpdb->delete( $logs_table, array( 'log_id' => $id ), array( '%d' ) );
-
-				if ( false !== $result ) {
-					$deleted += absint( $result );
-				}
-			}
-
-			return $deleted;
-		}
-
-		if ( 'id' !== $id_column || ! class_exists( 'Mobo_Core_Image_Queue' ) ) {
-			return 0;
-		}
-
-		$image_queue_table = Mobo_Core_Image_Queue::table_name();
-
-		if ( $table !== $image_queue_table ) {
-			return 0;
-		}
-
-		foreach ( $ids as $id ) {
-			$result = $wpdb->delete( $image_queue_table, array( 'id' => $id ), array( '%d' ) );
-
-			if ( false !== $result ) {
-				$deleted += absint( $result );
-			}
-		}
-
-		return $deleted;
-	}
-
-	/**
 	 * Check whether a DB table exists.
 	 *
 	 * @param string $table Table name.
@@ -546,7 +679,11 @@ class Mobo_Core_Maintenance {
 		if ( '' === $table ) {
 			return false;
 		}
+		if ( array_key_exists( $table, self::$table_exists_cache ) ) {
+			return (bool) self::$table_exists_cache[ $table ];
+		}
 
-		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		self::$table_exists_cache[ $table ] = $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		return (bool) self::$table_exists_cache[ $table ];
 	}
 }

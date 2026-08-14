@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.33.7
+ * Version: 10.33.18
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.33.7' );
+define( 'MOBO_CORE_VERSION', '10.33.18' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -89,66 +89,151 @@ add_action( 'admin_init', function() {
 } );
 
 /*
- * Core classes.
+ * Lazy class loading.
+ *
+ * Older builds eagerly required every runtime/admin/migration/image class on
+ * every WordPress request. Keep one tiny autoloader eager and load the actual
+ * component only when that request reaches its code path.
  */
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-dependencies.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-logger.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cache-mutation-guard.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-wp-rocket-import-guard.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cache-purger.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-iran-date.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-settings.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-auth-status.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-legacy-rules.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-price-calculator.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reprice-queue.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-lock.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-upgrade-coordinator.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-concurrency.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-api-client.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-map.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-event-store.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-map.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-queue.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shared-media.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-queue.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-sync.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-missing-image-recovery.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-service.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-orphan-image-cleanup.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-image-refresh-automation.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-category-sync.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-recategorize-queue.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-product-sync.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-reconciliation.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sync-settings-guard.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-webhook-queue.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-maintenance.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-cron-runner.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-self-runner.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-control.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-health-reporter.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-updater.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-checkout-validator.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-address-mapping.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-city-assets.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shipping-diagnostics.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-remote-shipping-methods.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-automatic-shipping.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shipping-wizard.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-sms-notifications.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-rest-controller.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-admin.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-variation-fields.php';
-require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-migration.php';
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-autoloader.php';
+Mobo_Core_Autoloader::register();
+
+/**
+ * Detect a REST request early enough for plugins_loaded gating.
+ * REST_REQUEST itself is defined later during parse_request, so the URI fallback
+ * is needed for lazy bootstrap decisions.
+ *
+ * @return bool
+ */
+function mobo_core_is_rest_request_early() {
+	if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+		return true;
+	}
+
+	/* Plain-permalink REST requests use ?rest_route=/... before REST_REQUEST exists. */
+	if ( isset( $_GET['rest_route'] ) && '' !== trim( (string) wp_unslash( $_GET['rest_route'] ) ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only request-context detection.
+		return true;
+	}
+
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+	if ( '' === $request_uri ) {
+		return false;
+	}
+
+	$path = wp_parse_url( $request_uri, PHP_URL_PATH );
+	if ( ! is_string( $path ) || '' === $path ) {
+		return false;
+	}
+
+	$prefix = function_exists( 'rest_get_url_prefix' ) ? trim( (string) rest_get_url_prefix(), '/' ) : 'wp-json';
+	return false !== strpos( '/' . ltrim( $path, '/' ), '/' . $prefix . '/' );
+}
+
+/**
+ * Whether this request may mutate products/options and therefore needs the full
+ * cache mutation listeners instead of the read-only frontend fast path.
+ *
+ * @return bool
+ */
+function mobo_core_request_may_mutate() {
+	$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
+
+	if ( is_admin() || mobo_core_is_rest_request_early() || ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) ) {
+		return true;
+	}
+
+	if ( defined( 'DOING_CRON' ) && DOING_CRON ) {
+		return true;
+	}
+
+	if ( ( defined( 'WP_CLI' ) && WP_CLI ) || 'cli' === PHP_SAPI ) {
+		return true;
+	}
+
+	return '' !== $method && 'GET' !== $method && 'HEAD' !== $method;
+}
+
+/**
+ * Read a boolean option without loading the full settings helper during the
+ * ordinary frontend bootstrap.
+ *
+ * @param string $name Option name.
+ * @param string $default Default value.
+ * @return bool
+ */
+function mobo_core_bootstrap_enabled( $name, $default = '0' ) {
+	$value = get_option( sanitize_key( (string) $name ), $default );
+	return in_array( strtolower( trim( (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+}
+
+/**
+ * Whether private shared media was explicitly enabled by server configuration.
+ * This inexpensive pre-check avoids loading the adapter on normal public sites.
+ *
+ * @return bool
+ */
+function mobo_core_shared_media_configured() {
+	$name = 'MOBO_CORE_SHARED_MEDIA_ENABLED';
+	$value = defined( $name ) ? constant( $name ) : getenv( $name );
+	return in_array( strtolower( trim( false === $value || null === $value ? '' : (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
+}
+
+/**
+ * Whether a migration repair that must run on init is currently pending.
+ *
+ * @return bool
+ */
+function mobo_core_has_deferred_repair() {
+	foreach ( array(
+		'mobo_core_stage7_resume_kick_pending',
+		'mobo_core_category_placeholder_repair_pending',
+		'mobo_core_image_queue_recovery_pending',
+	) as $option_name ) {
+		if ( '1' === (string) get_option( $option_name, '0' ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Preserve the WP Rocket hierarchical product-category URL validation exception
+ * on read-only frontend requests without loading the full cache purger class.
+ *
+ * @param bool $disabled Existing decision.
+ * @return bool
+ */
+function mobo_core_lightweight_rocket_category_validation( $disabled ) {
+	if ( $disabled ) {
+		return true;
+	}
+
+	$product_cat = sanitize_title( (string) get_query_var( 'product_cat', '' ) );
+	if ( '' !== $product_cat ) {
+		return true;
+	}
+
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+	$path = '' !== $request_uri ? wp_parse_url( $request_uri, PHP_URL_PATH ) : '';
+	if ( ! is_string( $path ) || '' === $path ) {
+		return false;
+	}
+
+	$permalinks = get_option( 'woocommerce_permalinks', array() );
+	$permalinks = is_array( $permalinks ) ? $permalinks : array();
+	$base = isset( $permalinks['category_base'] ) ? trim( (string) $permalinks['category_base'], '/ ' ) : '';
+	$base = '' !== $base ? $base : 'product-category';
+
+	return 0 === strpos( '/' . ltrim( $path, '/' ), '/' . trim( $base, '/' ) . '/' );
+}
 
 
 /**
  * WooCommerce HPOS compatibility declaration.
  *
- * Mobo Core syncs products, variations, categories and media. It does not read
- * or write WooCommerce orders directly, so it is compatible with custom order
- * tables. Future checkout/order code must use WooCommerce CRUD APIs.
+ * Mobo Core uses WooCommerce CRUD APIs for order validation, Mobo submission,
+ * immutable revenue metadata and diagnostics, so it remains compatible with
+ * custom order tables (HPOS).
  */
 add_action(
 	'before_woocommerce_init',
@@ -211,109 +296,158 @@ add_action(
 			return;
 		}
 
-		Mobo_Core_Migration::maybe_run();
-		add_action( 'init', array( 'Mobo_Core_Migration', 'run_deferred_repairs' ), 20 );
+		/*
+		 * Do not parse the large migration component on every frontend request.
+		 * It is loaded only after an actual plugin-version change or while one of
+		 * the init-dependent recovery flags is still pending.
+		 */
+		$current_db_version = (string) get_option( 'mobo_core_db_version', '' );
+		if ( MOBO_CORE_VERSION !== $current_db_version ) {
+			Mobo_Core_Migration::maybe_run();
+		}
+		if ( mobo_core_has_deferred_repair() ) {
+			add_action( 'init', array( 'Mobo_Core_Migration', 'run_deferred_repairs' ), 20 );
+		}
 
-		/* Private-server shared media is enabled only by server environment/constants. */
-		Mobo_Core_Shared_Media::init();
-
-		/* Targeted product/object/page-cache invalidation for Mobo-linked products. */
-		Mobo_Core_Cache_Purger::init();
+		/* Private shared media is loaded only on servers that explicitly enable it. */
+		if ( mobo_core_shared_media_configured() ) {
+			Mobo_Core_Shared_Media::init();
+		}
 
 		/*
-		 * Queue/pagination settings must remain immutable while a resumable
-		 * Sync or Repair run is active. The guard protects direct option writes
-		 * in addition to the disabled admin form.
+		 * Full cache mutation listeners are unnecessary on ordinary read-only GETs.
+		 * Keep only WP Rocket's product-category validation exception there; REST,
+		 * admin, cron, CLI, AJAX and write requests retain the complete purger.
 		 */
-		$sync_settings_guard = new Mobo_Core_Sync_Settings_Guard();
-		$sync_settings_guard->init();
+		if ( mobo_core_request_may_mutate() ) {
+			Mobo_Core_Cache_Purger::init();
+		} else {
+			add_filter( 'rocket_disable_url_validation', 'mobo_core_lightweight_rocket_category_validation', PHP_INT_MAX, 1 );
+		}
+
+		/* Settings writes happen through admin/REST/AJAX/CLI paths, not storefront reads. */
+		if ( is_admin() || mobo_core_is_rest_request_early() || ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+			$sync_settings_guard = new Mobo_Core_Sync_Settings_Guard();
+			$sync_settings_guard->init();
+		}
+
+		/* Variation editor fields are wp-admin only. */
+		if ( is_admin() ) {
+			$variation_fields = new Mobo_Core_Variation_Fields();
+			$variation_fields->init();
+		}
 
 		/*
-		 * Variation custom field:
-		 * mobo_additional_price
+		 * Checkout/pre-purchase validation stays completely absent from storefront
+		 * requests when every Mobo checkout feature is disabled.
 		 */
-		$variation_fields = new Mobo_Core_Variation_Fields();
-		$variation_fields->init();
-
-		/*
-		 * Checkout/pre-purchase validation.
-		 *
-		 * Important: when automatic Mobo order submission, Mobo-cart validation,
-		 * local stock validation and external validation are all disabled, Mobo must
-		 * stay completely out of the customer checkout runtime. In that mode
-		 * WooCommerce/Persian-WooCommerce/shipping plugins own address fields,
-		 * packages and shipping-rate calculation.
-		 */
-		$checkout_validation_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
-		$checkout_runtime_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' )
-			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' ) )
-			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' ) )
-			|| ( $checkout_validation_master_enabled && Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' ) );
+		$checkout_validation_master_enabled = mobo_core_bootstrap_enabled( 'mobo_core_checkout_validation_enabled', '0' );
+		$order_submission_enabled = mobo_core_bootstrap_enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$checkout_runtime_enabled = $order_submission_enabled
+			|| ( $checkout_validation_master_enabled && mobo_core_bootstrap_enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' ) )
+			|| ( $checkout_validation_master_enabled && mobo_core_bootstrap_enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' ) )
+			|| ( $checkout_validation_master_enabled && mobo_core_bootstrap_enabled( 'mobo_core_checkout_external_validation_enabled', '0' ) );
 
 		if ( is_admin() || $checkout_runtime_enabled ) {
 			$checkout_validator = new Mobo_Core_Checkout_Validator();
 			$checkout_validator->init();
-		} else {
-			delete_option( 'mobo_core_shared_mobo_cart_lock' );
 		}
 
-		/*
-		 * Mobo address mapping for checkout country/state/city selects.
-		 * The class itself gates checkout hooks behind automatic order submission.
-		 */
-		$address_mapping = new Mobo_Core_Address_Mapping();
-		$address_mapping->init();
+		/* Address/city runtime is relevant only when Mobo order submission is enabled. */
+		if ( $order_submission_enabled ) {
+			$address_mapping = new Mobo_Core_Address_Mapping();
+			$address_mapping->init();
 
-		/*
-		 * Persian WooCommerce-compatible city asset generated from Mobo IDs.
-		 * This replaces pw-iran-cities only when a complete generated asset exists.
-		 */
-		$city_assets = new Mobo_Core_City_Assets();
-		$city_assets->init();
+			$city_assets = new Mobo_Core_City_Assets();
+			$city_assets->init();
+		}
 
+		/* Legacy shipping cleanup is a one-time policy migration, not a per-request job. */
+		if ( '1' !== (string) get_option( 'mobo_core_shipping_mapping_only_policy_version', '' ) ) {
+			add_action(
+				'wp_loaded',
+				function () {
+					$automatic_shipping = new Mobo_Core_Automatic_Shipping();
+					$automatic_shipping->retire_legacy_runtime( 'policy-10.33.0' );
+				},
+				1
+			);
+		}
 
-		/*
-		 * Shipping mapping-only policy.
-		 * WooCommerce owns checkout packages, zones, methods and rates completely.
-		 * Mobo only caches its remote shipping catalog and maps the WooCommerce
-		 * method stored on the paid/eligible order to one Mobo shipping_id when the
-		 * order is submitted to Mobo.
-		 */
-		add_action(
-			'wp_loaded',
-			function () {
-				$automatic_shipping = new Mobo_Core_Automatic_Shipping();
-				$automatic_shipping->retire_legacy_runtime( 'policy-10.33.0' );
-			},
-			1
-		);
-
-		/*
-		 * Shipping diagnostics are opt-in only. They are useful for troubleshooting,
-		 * but normal checkout must not carry any extra shipping hooks from Mobo when
-		 * Mobo is not responsible for automatic order submission.
-		 */
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_shipping_diagnostics_enabled', '0' ) ) {
+		if ( mobo_core_bootstrap_enabled( 'mobo_core_shipping_diagnostics_enabled', '0' ) ) {
 			$shipping_diagnostics = new Mobo_Core_Shipping_Diagnostics();
 			$shipping_diagnostics->init();
 		}
 
 		/*
-		 * Optional SMS notifications for Mobo/non-Mobo/mixed orders.
-		 * Actual gateway delivery is delegated to Persian WooCommerce SMS.
+		 * Lazy order hooks: keep SMS and wallet classes off catalogue/product page
+		 * requests and instantiate them only when the corresponding order event fires.
 		 */
-		$sms_notifications = new Mobo_Core_SMS_Notifications();
-		$sms_notifications->init();
+		add_action(
+			'woocommerce_checkout_order_processed',
+			function ( $order_id, $posted_data = array(), $order = null ) {
+				$notifications = new Mobo_Core_SMS_Notifications();
+				$notifications->handle_checkout_order_processed( $order_id, $posted_data, $order );
+			},
+			99,
+			3
+		);
+		add_action(
+			'woocommerce_store_api_checkout_order_processed',
+			function ( $order ) {
+				$notifications = new Mobo_Core_SMS_Notifications();
+				$notifications->handle_store_api_checkout_order_processed( $order );
+			},
+			99,
+			1
+		);
+		add_action(
+			'mobo_core_mobo_order_submission_success',
+			function ( $order_id, $mobo_order_id = 0, $payment_json = array() ) {
+				$wallet = new Mobo_Core_Wallet_Alert();
+				$wallet->handle_mobo_order_submission_success( $order_id, $mobo_order_id, $payment_json );
+			},
+			10,
+			3
+		);
 
-		/*
-		 * REST endpoints for C# runner and webhooks.
-		 */
-		$rest = new Mobo_Core_Rest_Controller();
-		$rest->init();
+		add_action(
+			'woocommerce_checkout_create_order_line_item',
+			function ( $item, $cart_item_key, $values, $order ) {
+				$ledger = new Mobo_Core_Revenue_Ledger();
+				$ledger->capture_checkout_line_item_source_cost( $item, $cart_item_key, $values, $order );
+			},
+			20,
+			4
+		);
+		add_action(
+			'mobo_core_mobo_order_submission_success',
+			function ( $order_id, $mobo_order_id = 0, $payment_json = array() ) {
+				$ledger = new Mobo_Core_Revenue_Ledger();
+				$ledger->handle_mobo_order_submission_success( $order_id, $mobo_order_id, $payment_json );
+			},
+			20,
+			3
+		);
+		add_action(
+			'woocommerce_order_status_completed',
+			function ( $order_id, $order = null ) {
+				$ledger = new Mobo_Core_Revenue_Ledger();
+				$ledger->handle_order_completed( $order_id, $order );
+			},
+			20,
+			2
+		);
 
-		/*
-		 * Admin UI.
-		 */
+		/* REST controller is parsed only on actual REST requests. */
+		add_action(
+			'rest_api_init',
+			function () {
+				$rest = new Mobo_Core_Rest_Controller();
+				$rest->register_routes();
+			}
+		);
+
 		if ( is_admin() ) {
 			$admin = new Mobo_Core_Admin();
 			$admin->init();

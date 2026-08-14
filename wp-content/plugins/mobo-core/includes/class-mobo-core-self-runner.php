@@ -45,6 +45,21 @@ class Mobo_Core_Self_Runner {
 	 * @return array
 	 */
 	public static function kick( $reason = 'webhook', $force = false ) {
+		/*
+		 * rest_url() depends on WordPress rewrite globals that are not guaranteed
+		 * to exist during early plugins_loaded migrations. Never attempt a
+		 * loopback kick before init; callers that need an automatic bootstrap
+		 * continuation should defer the kick until init/wp_loaded.
+		 */
+		if ( ! did_action( 'init' ) ) {
+			return self::save_kick_result(
+				array(
+					'success' => true,
+					'status'  => 'deferred-until-init',
+					'message' => 'Self runner kick was deferred until WordPress init.',
+				)
+			);
+		}
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_self_runner_enabled', '1' ) ) {
 			return self::save_kick_result(
 				array(
@@ -282,7 +297,30 @@ class Mobo_Core_Self_Runner {
 	 * @return array
 	 */
 	private static function save_kick_result( $result ) {
-		$result['updatedAt'] = time();
+		$now = time();
+		$result['updatedAt'] = $now;
+
+		/* High webhook/admin traffic can legitimately hit the throttle/lock path many
+		 * times inside a few seconds. Persisting the same diagnostic result for every
+		 * rejected kick turns a protection mechanism into an option-write storm. Keep
+		 * actual dispatch/failure transitions durable, but rate-limit identical noisy
+		 * statuses to one write per 30 seconds. */
+		$status = isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
+		$noisy  = in_array( $status, array( 'throttled', 'kick-locked', 'deferred-until-init', 'disabled' ), true );
+
+		if ( $noisy ) {
+			$previous = get_option( 'mobo_core_self_runner_last_kick_result', array() );
+			if ( is_array( $previous ) ) {
+				$previous_status = isset( $previous['status'] ) ? sanitize_key( (string) $previous['status'] ) : '';
+				$previous_at     = isset( $previous['updatedAt'] ) ? absint( $previous['updatedAt'] ) : 0;
+				if ( $status === $previous_status && $previous_at > 0 && ( $now - $previous_at ) < 30 ) {
+					$result['persisted'] = false;
+					return $result;
+				}
+			}
+		}
+
+		$result['persisted'] = true;
 		update_option( 'mobo_core_self_runner_last_kick_result', $result, false );
 
 		return $result;

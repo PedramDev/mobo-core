@@ -20,6 +20,23 @@ class Mobo_Core_Settings {
 	private static $runtime_overrides = array();
 
 	/**
+	 * Request-local immutable defaults map.
+	 *
+	 * Building the several-hundred-entry defaults array on every settings read
+	 * wastes CPU and memory in sync/cron hot paths. Cache it once per request.
+	 *
+	 * @var array|null
+	 */
+	private static $defaults_cache = null;
+
+	/**
+	 * Option names already bulk-primed during this request.
+	 *
+	 * @var array<string,bool>
+	 */
+	private static $primed_options = array();
+
+	/**
 	 * Webhook security code must be safe for an HTTP header value.
 	 *
 	 * Visible ASCII is 0x21 (!) through 0x7E (~). Spaces, tabs, line breaks,
@@ -33,7 +50,11 @@ class Mobo_Core_Settings {
 	 * @return array
 	 */
 	public static function defaults() {
-		return array(
+		if ( null !== self::$defaults_cache ) {
+			return self::$defaults_cache;
+		}
+
+		self::$defaults_cache = array(
 			'mobo_core_security_code'             => '',
 			'mobo_core_api_base_url'              => '',
 			'mobo_core_only_in_stock'             => '0',
@@ -46,6 +67,12 @@ class Mobo_Core_Settings {
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
 			'mobo_core_cache_archive_purge_interval_minutes' => '15',
+			// Exact product-page cache warmup after successful targeted purge.
+			'mobo_core_cache_warmup_enabled'             => '1',
+			'mobo_core_cache_warmup_batch_size'          => 2,
+			'mobo_core_cache_warmup_debounce_seconds'    => 15,
+			'mobo_core_cache_warmup_timeout_seconds'     => 8,
+			'mobo_core_cache_warmup_max_attempts'        => 5,
 			'mobo_core_category_mapping_enabled'  => '1',
 			'mobo_core_category_mapping_required' => '0',
 			'mobo_core_address_mapping_show_all_countries' => '0',
@@ -59,6 +86,10 @@ class Mobo_Core_Settings {
 
 			'mobo_core_sync_time_budget_seconds'  => 8,
 			'mobo_core_webhook_files_per_run'     => 4,
+			'mobo_core_webhook_adaptive_batch_enabled' => '1',
+			'mobo_core_webhook_adaptive_batch_max'     => 10,
+			'mobo_core_webhook_high_pressure_threshold' => 25,
+			'mobo_core_parent_finalize_batch_size'       => 10,
 			'mobo_core_webhook_max_try'           => 5,
 			'mobo_core_webhook_expire_days'       => 2,
 			'mobo_core_variant_parent_wait_timeout_seconds' => 600,
@@ -68,6 +99,7 @@ class Mobo_Core_Settings {
 			'mobo_core_transient_retry_max_try'        => 10,
 			'mobo_core_waiting_for_portal_retry_delay_seconds' => 60,
 			'mobo_core_reprice_batch_size'       => 20,
+			'mobo_core_recategorize_batch_size'    => 20,
 			'mobo_core_products_per_page'         => 1,
 			'mobo_core_product_cursor_sync_enabled' => '1',
 			'mobo_core_variants_per_page'         => 5,
@@ -87,7 +119,6 @@ class Mobo_Core_Settings {
 			'mobo_core_image_refresh_max_try'     => 5,
 			'mobo_core_image_refresh_retry_base_seconds' => 120,
 			'mobo_core_image_refresh_automation_enabled' => '0',
-			'mobo_core_image_refresh_auto_delete_old_approved' => '0',
 			'mobo_core_image_refresh_auto_delete_orphan_approved' => '0',
 			'mobo_core_image_refresh_automation_started_at' => 0,
 			'mobo_core_image_refresh_automation_completed_at' => 0,
@@ -128,6 +159,8 @@ class Mobo_Core_Settings {
 			'mobo_core_real_cron_lock_ttl_seconds'     => 120,
 			'mobo_core_real_cron_expected_interval_seconds' => 60,
 			'mobo_core_real_cron_process_webhooks'     => '1',
+			'mobo_core_real_cron_background_escape_rounds' => 4,
+			'mobo_core_adaptive_execution_enabled'     => '1',
 			'mobo_core_process_webhook_on_receive'     => '0',
 
 			// Customer-side self runner. This replaces central runner/WP-Cron dependency.
@@ -217,6 +250,143 @@ class Mobo_Core_Settings {
 			'mobo_core_sms_mixed_enabled'                   => '0',
 			'mobo_core_sms_mixed_recipients'                => '',
 			'mobo_core_sms_mixed_template'                  => '',
+
+			// Mobo wallet low-balance monitoring / one-shot SMS alert.
+			'mobo_core_wallet_alert_enabled'                => '0',
+			'mobo_core_wallet_alert_threshold'              => 0,
+			'mobo_core_wallet_alert_recipients'             => '',
+			'mobo_core_wallet_alert_template'               => '',
+		);
+
+		return self::$defaults_cache;
+	}
+
+	/**
+	 * Bulk-prime non-autoloaded options into WordPress' normal option cache.
+	 *
+	 * New Mobo Core installs intentionally store plugin options with autoload=no
+	 * so storefront requests do not carry worker state. Cold cron/REST requests,
+	 * however, can otherwise issue many one-row option SELECTs. Prime the options
+	 * needed by a hot path in one operation while continuing to use get_option()
+	 * as the source of truth afterwards.
+	 *
+	 * @param array $keys Option names.
+	 * @return void
+	 */
+	public static function prime_options( $keys ) {
+		$keys = is_array( $keys ) ? $keys : array();
+		$pending = array();
+
+		foreach ( $keys as $key ) {
+			$key = is_string( $key ) ? trim( $key ) : '';
+			if ( '' === $key || isset( self::$primed_options[ $key ] ) ) {
+				continue;
+			}
+			self::$primed_options[ $key ] = true;
+			$pending[] = $key;
+		}
+
+		if ( empty( $pending ) ) {
+			return;
+		}
+
+		/* Prefer WordPress core's implementation when available. */
+		if ( function_exists( 'wp_prime_option_caches' ) ) {
+			wp_prime_option_caches( $pending );
+			return;
+		}
+
+		/* PHP/WP 5.8 compatibility fallback. */
+		global $wpdb;
+		if ( ! isset( $wpdb->options ) ) {
+			return;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $pending ), '%s' ) );
+		$query = $wpdb->prepare(
+			"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$pending
+		);
+		$rows = $wpdb->get_results( $query, ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$found = array();
+
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$name = isset( $row['option_name'] ) ? (string) $row['option_name'] : '';
+			if ( '' === $name ) {
+				continue;
+			}
+			$found[ $name ] = true;
+			wp_cache_set( $name, maybe_unserialize( $row['option_value'] ), 'options' );
+		}
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+		$notoptions = is_array( $notoptions ) ? $notoptions : array();
+		$changed = false;
+		foreach ( $pending as $name ) {
+			if ( ! isset( $found[ $name ] ) && ! isset( $notoptions[ $name ] ) ) {
+				$notoptions[ $name ] = true;
+				$changed = true;
+			}
+		}
+		if ( $changed ) {
+			wp_cache_set( 'notoptions', $notoptions, 'options' );
+		}
+	}
+
+	/**
+	 * Prime settings commonly read by the bounded worker and its queue stages.
+	 *
+	 * @return void
+	 */
+	public static function prime_runtime_options() {
+		self::prime_options(
+			array(
+				'mobo_core_real_cron_time_budget_seconds',
+				'mobo_core_real_cron_max_sync_steps',
+				'mobo_core_real_cron_max_rounds',
+				'mobo_core_real_cron_safety_margin_seconds',
+				'mobo_core_real_cron_lock_ttl_seconds',
+				'mobo_core_real_cron_expected_interval_seconds',
+				'mobo_core_real_cron_process_webhooks',
+				'mobo_core_real_cron_background_escape_rounds',
+				'mobo_core_adaptive_execution_enabled',
+				'mobo_core_real_cron_memory_reserve_mb',
+				'mobo_core_sync_time_budget_seconds',
+				'mobo_core_webhook_files_per_run',
+				'mobo_core_webhook_adaptive_batch_enabled',
+				'mobo_core_webhook_adaptive_batch_max',
+				'mobo_core_webhook_high_pressure_threshold',
+				'mobo_core_webhook_max_try',
+				'mobo_core_webhook_expire_days',
+				'mobo_core_pull_payload_enabled',
+				'mobo_core_payload_pull_timeout_seconds',
+				'mobo_core_api_request_timeout_seconds',
+				'mobo_core_parent_finalize_batch_size',
+				'mobo_core_images_per_run',
+				'mobo_core_image_queue_enabled',
+				'mobo_core_image_queue_blocking',
+				'mobo_core_image_max_try',
+				'mobo_core_image_retry_base_seconds',
+				'mobo_core_image_long_retry_seconds',
+				'mobo_core_image_refresh_automation_enabled',
+				'mobo_core_image_refresh_per_run',
+				'mobo_core_reprice_batch_size',
+				'mobo_core_recategorize_batch_size',
+				'mobo_core_cache_warmup_enabled',
+				'mobo_core_cache_warmup_batch_size',
+				'mobo_core_cache_warmup_timeout_seconds',
+				'mobo_core_cache_warmup_max_attempts',
+				'mobo_core_self_runner_enabled',
+				'mobo_core_self_runner_continue_enabled',
+				'mobo_core_self_runner_min_interval_seconds',
+				'mobo_core_self_runner_http_timeout_seconds',
+				'mobo_core_checkout_mobo_timeout_seconds',
+				'mobo_core_auto_reconciliation_enabled',
+				'mobo_core_reconciliation_fast_interval',
+				'mobo_core_reconciliation_products_per_run',
+				'mobo_core_reconciliation_variation_batch',
+				'mobo_core_reconciliation_deep_schedule',
+			)
 		);
 	}
 
@@ -470,6 +640,7 @@ class Mobo_Core_Settings {
 		self::save_int_if_present( $post, 'mobo_core_transient_retry_max_try', 10, 1, 50 );
 		self::save_int_if_present( $post, 'mobo_core_waiting_for_portal_retry_delay_seconds', 60, 10, 3600 );
 		self::save_int_if_present( $post, 'mobo_core_reprice_batch_size', 20, 1, 200 );
+		self::save_int_if_present( $post, 'mobo_core_recategorize_batch_size', 20, 1, 200 );
 		self::save_int( $post, 'mobo_core_products_per_page', 1, 1, 20 );
 		self::save_bool_if_present( $post, 'mobo_core_product_cursor_sync_enabled' );
 		self::save_int( $post, 'mobo_core_variants_per_page', 5, 1, 100 );
@@ -488,6 +659,7 @@ class Mobo_Core_Settings {
 		self::save_int( $post, 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
 		self::save_int( $post, 'mobo_core_real_cron_expected_interval_seconds', 60, 60, 3600 );
 		self::save_bool( $post, 'mobo_core_real_cron_process_webhooks' );
+		self::save_bool_if_present( $post, 'mobo_core_adaptive_execution_enabled' );
 		self::save_bool( $post, 'mobo_core_process_webhook_on_receive' );
 		self::save_bool_if_present( $post, 'mobo_core_self_runner_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_self_runner_continue_enabled' );
@@ -548,6 +720,7 @@ class Mobo_Core_Settings {
 	 */
 	public static function get_portal_settings_snapshot() {
 		$defaults = self::defaults();
+		self::prime_options( array_keys( $defaults ) );
 		$items = array();
 		$excluded = array();
 
@@ -667,6 +840,7 @@ class Mobo_Core_Settings {
 			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
 			'global_update_images' => 'بروزرسانی تصاویر',
 			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی کش آرشیوهای محصول',
+			'mobo_core_cache_warmup_enabled' => 'پیش‌بارگذاری خودکار صفحه همان محصول',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
 			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
 			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',
@@ -720,16 +894,68 @@ class Mobo_Core_Settings {
 	}
 
 	private static function get_portal_setting_type( $key, $default, $value ) {
-		if ( is_array( $default ) || is_array( $value ) ) return 'object';
-		if ( is_bool( $default ) || ( is_scalar( $default ) && in_array( (string) $default, array( '0', '1' ), true ) ) ) return 'boolean';
-		if ( is_int( $default ) ) return 'integer';
-		if ( is_float( $default ) ) return 'decimal';
+		$key = strtolower( (string) $key );
+
+		if ( is_array( $default ) || is_array( $value ) ) {
+			return 'object';
+		}
+
+		/*
+		 * A numeric default of 0/1 is not enough to identify a boolean. Several
+		 * integer settings legitimately default to 0 or 1 (product page size,
+		 * wallet threshold, shipping IDs, etc.). Keep boolean detection semantic
+		 * so Portal metadata stays stable regardless of the current option value.
+		 */
+		$boolean_exact = array(
+			'mobo_core_only_in_stock',
+			'mobo_core_real_cron_process_webhooks',
+			'mobo_core_process_webhook_on_receive',
+			'mobo_core_checkout_validate_only_mobo_products',
+			'mobo_core_checkout_require_remote_guid',
+			'mobo_core_checkout_block_incomplete_sync',
+			'mobo_core_address_mapping_show_all_countries',
+			'mobo_core_mobo_shipping_use_api_price',
+			'mobo_core_image_refresh_cleanup_leftover_subsizes',
+			'mobo_core_image_refresh_generate_subsizes',
+		);
+		$is_boolean_key = in_array( $key, $boolean_exact, true )
+			|| 0 === strpos( $key, 'global_product_auto_' )
+			|| 0 === strpos( $key, 'global_update_' )
+			|| (bool) preg_match( '/_(enabled|required|blocking|approved|completed)$/', $key );
+
+		if ( is_bool( $default ) || $is_boolean_key ) {
+			return 'boolean';
+		}
+		if ( is_int( $default ) ) {
+			return 'integer';
+		}
+		if ( is_float( $default ) ) {
+			return 'decimal';
+		}
+
+		if ( in_array( $key, array( 'global_additional_price', 'global_additional_percentage' ), true ) ) {
+			return 'decimal';
+		}
+
 		if ( is_string( $value ) ) {
 			$trimmed = trim( $value );
-			if ( ( '' !== $trimmed && ( '[' === $trimmed[0] || '{' === $trimmed[0] ) ) && null !== json_decode( $trimmed, true ) ) return 'json';
-			if ( false !== strpos( strtolower( (string) $key ), 'url' ) ) return 'url';
-			if ( is_numeric( $value ) ) return false !== strpos( (string) $value, '.' ) ? 'decimal' : 'integer';
+			if ( ( '' !== $trimmed && ( '[' === $trimmed[0] || '{' === $trimmed[0] ) ) && null !== json_decode( $trimmed, true ) ) {
+				return 'json';
+			}
+			if ( false !== strpos( $key, 'url' ) ) {
+				return 'url';
+			}
 		}
+
+		/*
+		 * Prefer the declared default for scalar numeric typing. This prevents a
+		 * numeric-looking username/mobile value from changing type from text to
+		 * integer between sites.
+		 */
+		if ( is_string( $default ) && is_numeric( $default ) ) {
+			return false !== strpos( $default, '.' ) ? 'decimal' : 'integer';
+		}
+
 		return 'text';
 	}
 
@@ -942,8 +1168,9 @@ class Mobo_Core_Settings {
 	private static function save_decimal( $post, $key ) {
 		$value = isset( $post[ $key ] ) ? wp_unslash( $post[ $key ] ) : '0';
 		$value = wc_format_decimal( $value );
+		$value = is_numeric( $value ) ? max( 0, (float) $value ) : 0;
 
-		update_option( $key, $value, false );
+		update_option( $key, wc_format_decimal( $value ), false );
 	}
 
 	/**

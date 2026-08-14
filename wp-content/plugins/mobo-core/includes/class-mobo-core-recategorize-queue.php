@@ -107,26 +107,27 @@ class Mobo_Core_Recategorize_Queue {
 	 * @param int|null $limit Batch size.
 	 * @return array
 	 */
-	public function process_batch( $limit = null ) {
+	public function process_batch( $limit = null, $time_budget_seconds = null ) {
 		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
 			return Mobo_Core_Cache_Mutation_Guard::run(
-				function () use ( $limit ) {
-					return $this->process_batch_guarded( $limit );
+				function () use ( $limit, $time_budget_seconds ) {
+					return $this->process_batch_guarded( $limit, $time_budget_seconds );
 				},
 				'recategorize-queue'
 			);
 		}
 
-		return $this->process_batch_guarded( $limit );
+		return $this->process_batch_guarded( $limit, $time_budget_seconds );
 	}
 
 	/**
 	 * Execute the mutation batch inside the cache mutation scope.
 	 *
 	 * @param int|null $limit Batch size.
+	 * @param int|null $time_budget_seconds Cooperative execution budget.
 	 * @return array
 	 */
-	private function process_batch_guarded( $limit = null ) {
+	private function process_batch_guarded( $limit = null, $time_budget_seconds = null ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'recategorize-queue' ), array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'remaining' => true ) );
 		}
@@ -162,6 +163,9 @@ class Mobo_Core_Recategorize_Queue {
 			$limit = 20;
 		}
 
+		$time_budget_seconds = null === $time_budget_seconds ? 0 : max( 1, min( 20, (int) $time_budget_seconds ) );
+		$deadline = $time_budget_seconds > 0 ? microtime( true ) + $time_budget_seconds : 0.0;
+
 		$ids = $this->get_next_item_ids( absint( $state['lastPostId'] ), $limit );
 
 		if ( empty( $ids ) ) {
@@ -188,10 +192,19 @@ class Mobo_Core_Recategorize_Queue {
 		$failed    = 0;
 
 		$paused_for_upgrade = false;
+		$budget_exhausted   = false;
+		$last_checkpoint_at = microtime( true );
+		$checkpoint_every   = 5;
+		$checkpoint_seconds = 2.0;
 
 		foreach ( $ids as $post_id ) {
 			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 				$paused_for_upgrade = true;
+				break;
+			}
+
+			if ( $deadline > 0 && microtime( true ) >= ( $deadline - 0.15 ) ) {
+				$budget_exhausted = true;
 				break;
 			}
 
@@ -213,14 +226,19 @@ class Mobo_Core_Recategorize_Queue {
 				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': ' . $e->getMessage() );
 			}
 
-			$checkpoint = $state;
-			$checkpoint['processed']   = absint( $state['processed'] ) + $processed;
-			$checkpoint['updated']     = absint( $state['updated'] ) + $updated;
-			$checkpoint['skipped']     = absint( $state['skipped'] ) + $skipped;
-			$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
-			$checkpoint['updatedAt']   = time();
-			$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد دسته‌بندی؛ آخرین محصول بررسی‌شده: %d', $post_id );
-			update_option( self::STATE_OPTION, $checkpoint, false );
+			/* Recategorization is idempotent; checkpoint every few objects/seconds
+			 * instead of serializing the full state option after every product. */
+			if ( 0 === ( $processed % $checkpoint_every ) || ( microtime( true ) - $last_checkpoint_at ) >= $checkpoint_seconds ) {
+				$checkpoint = $state;
+				$checkpoint['processed']   = absint( $state['processed'] ) + $processed;
+				$checkpoint['updated']     = absint( $state['updated'] ) + $updated;
+				$checkpoint['skipped']     = absint( $state['skipped'] ) + $skipped;
+				$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
+				$checkpoint['updatedAt']   = time();
+				$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد دسته‌بندی؛ آخرین محصول بررسی‌شده: %d', $post_id );
+				update_option( self::STATE_OPTION, $checkpoint, false );
+				$last_checkpoint_at = microtime( true );
+			}
 		}
 
 		$state['processed']   = absint( $state['processed'] ) + $processed;
@@ -230,7 +248,7 @@ class Mobo_Core_Recategorize_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d محصول بررسی شد؛ %d محصول تغییر کرد، %d محصول رد شد.', $processed, $updated, $skipped );
 
-		$remaining = $paused_for_upgrade || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -246,7 +264,8 @@ class Mobo_Core_Recategorize_Queue {
 			'skipped'   => $skipped,
 			'failed'    => $failed,
 			'remaining' => $remaining,
-			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : $state['status'],
+			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ),
+			'budgetExhausted' => $budget_exhausted,
 			'state'     => $state,
 		);
 	
@@ -530,19 +549,52 @@ class Mobo_Core_Recategorize_Queue {
 		}
 
 		$table = Mobo_Core_Sync_Event_Store::table_name();
+
+		/*
+		 * Fast path: current ProductUpdated rows carry entity_guid and are covered by
+		 * an indexed event_type/entity_guid/id lookup. The old LONGTEXT LIKE search is
+		 * retained only for legacy rows where entity_guid was not populated.
+		 */
+		$rows = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT payload_json FROM {$table}
+				WHERE event_type = 'ProductUpdated'
+					AND entity_guid = %s
+				ORDER BY id DESC
+				LIMIT 10",
+				$product_guid
+			)
+		);
+
+		$refs = $this->extract_category_refs_from_event_rows( $rows, $product_guid );
+		if ( ! empty( $refs ) ) {
+			return $refs;
+		}
+
 		$like = '%' . $wpdb->esc_like( $product_guid ) . '%';
 		$rows = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT payload_json FROM {$table}
 				WHERE event_type = 'ProductUpdated'
-				AND (entity_guid = %s OR payload_json LIKE %s)
+					AND entity_guid = ''
+					AND payload_json LIKE %s
 				ORDER BY id DESC
 				LIMIT 10",
-				$product_guid,
 				$like
 			)
 		);
 
+		return $this->extract_category_refs_from_event_rows( $rows, $product_guid );
+	}
+
+	/**
+	 * Extract normalized category refs from stored event JSON rows.
+	 *
+	 * @param array  $rows Stored payload JSON rows.
+	 * @param string $product_guid Product GUID.
+	 * @return array
+	 */
+	private function extract_category_refs_from_event_rows( $rows, $product_guid ) {
 		if ( empty( $rows ) || ! is_array( $rows ) ) {
 			return array();
 		}
@@ -553,20 +605,17 @@ class Mobo_Core_Recategorize_Queue {
 			}
 
 			$payload = json_decode( $json, true );
-
 			if ( ! is_array( $payload ) ) {
 				continue;
 			}
 
-		$refs = $this->get_product_category_refs_from_payload( $payload );
+			$refs = $this->get_product_category_refs_from_payload( $payload );
+			if ( empty( $refs ) ) {
+				$product_payload = $this->find_product_payload_in_event( $payload, $product_guid );
+				$refs = is_array( $product_payload ) ? $this->get_product_category_refs_from_payload( $product_payload ) : array();
+			}
 
-		if ( empty( $refs ) ) {
-			$product_payload = $this->find_product_payload_in_event( $payload, $product_guid );
-			$refs = is_array( $product_payload ) ? $this->get_product_category_refs_from_payload( $product_payload ) : array();
-		}
-
-		$normalized = is_array( $refs ) ? $this->normalize_category_refs( $refs ) : array();
-
+			$normalized = is_array( $refs ) ? $this->normalize_category_refs( $refs ) : array();
 			if ( ! empty( $normalized ) ) {
 				return $normalized;
 			}

@@ -23,6 +23,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Category_Map {
 
+	/** @var bool|null Request-local table existence cache. */
+	private static $table_exists_cache = null;
+
+	/** @var array Request-local GUID/column lookup cache, including misses. */
+	private $term_lookup_cache = array();
+
+	/** @var array Request-local product_cat existence cache by term ID. */
+	private $term_exists_cache = array();
+
 	/**
 	 * Return table name.
 	 *
@@ -66,6 +75,7 @@ class Mobo_Core_Category_Map {
 		) {$charset_collate};";
 
 		dbDelta( $sql );
+		self::$table_exists_cache = true;
 	}
 
 	/**
@@ -76,9 +86,13 @@ class Mobo_Core_Category_Map {
 	public static function table_exists() {
 		global $wpdb;
 
-		$table = self::table_name();
+		if ( null !== self::$table_exists_cache ) {
+			return (bool) self::$table_exists_cache;
+		}
 
-		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		$table = self::table_name();
+		self::$table_exists_cache = ( $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) );
+		return (bool) self::$table_exists_cache;
 	}
 
 	/**
@@ -355,15 +369,19 @@ class Mobo_Core_Category_Map {
 		$formats = array( '%s', '%d', '%s', '%s', '%s', '%s', '%s' );
 
 		if ( is_array( $existing ) && ! empty( $existing['id'] ) ) {
-			return false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
+			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
+		} else {
+			$data['manual_term_id'] = 0;
+			$data['created_at']     = $now;
+			$formats[]              = '%d';
+			$formats[]              = '%s';
+			$success                = false !== $wpdb->insert( $table, $data, $formats );
 		}
 
-		$data['manual_term_id'] = 0;
-		$data['created_at']     = $now;
-		$formats[]              = '%d';
-		$formats[]              = '%s';
-
-		return false !== $wpdb->insert( $table, $data, $formats );
+		if ( $success ) {
+			$this->term_lookup_cache[ 'synced_term_id|' . $guid ] = $synced_term_id;
+		}
+		return $success;
 	}
 
 	/**
@@ -398,7 +416,7 @@ class Mobo_Core_Category_Map {
 		);
 
 		if ( $existing_id ) {
-			return false !== $wpdb->update(
+			$success = false !== $wpdb->update(
 				$table,
 				array(
 					'manual_term_id' => $term_id,
@@ -408,19 +426,24 @@ class Mobo_Core_Category_Map {
 				array( '%d', '%s' ),
 				array( '%d' )
 			);
+		} else {
+			$success = false !== $wpdb->insert(
+				$table,
+				array(
+					'remote_guid'    => $guid,
+					'manual_term_id' => $term_id,
+					'synced_term_id' => 0,
+					'created_at'     => $now,
+					'updated_at'     => $now,
+				),
+				array( '%s', '%d', '%d', '%s', '%s' )
+			);
 		}
 
-		return false !== $wpdb->insert(
-			$table,
-			array(
-				'remote_guid'    => $guid,
-				'manual_term_id' => $term_id,
-				'synced_term_id' => 0,
-				'created_at'     => $now,
-				'updated_at'     => $now,
-			),
-			array( '%s', '%d', '%d', '%s', '%s' )
-		);
+		if ( $success ) {
+			$this->term_lookup_cache[ 'manual_term_id|' . $guid ] = $term_id;
+		}
+		return $success;
 	}
 
 	/**
@@ -574,6 +597,7 @@ class Mobo_Core_Category_Map {
 		global $wpdb;
 
 		if ( ! is_array( $row ) || empty( $row['term_id'] ) ) {
+			$this->term_lookup_cache[ $cache_key ] = 0;
 			return 0;
 		}
 
@@ -673,6 +697,11 @@ class Mobo_Core_Category_Map {
 			return 0;
 		}
 
+		$cache_key = $column . '|' . $guid;
+		if ( array_key_exists( $cache_key, $this->term_lookup_cache ) ) {
+			return absint( $this->term_lookup_cache[ $cache_key ] );
+		}
+
 		$table = self::table_name();
 		$sql   = 'manual_term_id' === $column
 			? "SELECT id, manual_term_id AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1"
@@ -689,6 +718,7 @@ class Mobo_Core_Category_Map {
 		$term_id = absint( $row['term_id'] );
 
 		if ( $term_id <= 0 ) {
+			$this->term_lookup_cache[ $cache_key ] = 0;
 			return 0;
 		}
 
@@ -703,9 +733,11 @@ class Mobo_Core_Category_Map {
 				);
 			}
 
+			$this->term_lookup_cache[ $cache_key ] = 0;
 			return 0;
 		}
 
+		$this->term_lookup_cache[ $cache_key ] = $term_id;
 		return $term_id;
 	}
 
@@ -721,10 +753,13 @@ class Mobo_Core_Category_Map {
 		if ( $term_id <= 0 ) {
 			return false;
 		}
+		if ( array_key_exists( $term_id, $this->term_exists_cache ) ) {
+			return (bool) $this->term_exists_cache[ $term_id ];
+		}
 
 		$term = get_term( $term_id, 'product_cat' );
-
-		return $term instanceof WP_Term && ! is_wp_error( $term );
+		$this->term_exists_cache[ $term_id ] = ( $term instanceof WP_Term && ! is_wp_error( $term ) );
+		return (bool) $this->term_exists_cache[ $term_id ];
 	}
 
 	/**

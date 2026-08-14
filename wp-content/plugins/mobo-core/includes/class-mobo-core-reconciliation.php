@@ -15,6 +15,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Reconciliation {
 
+	/** @var bool|null Request-local health table existence cache. */
+	private static $health_table_exists_cache = null;
+
 	const STATE_OPTION             = 'mobo_core_reconciliation_state';
 	const REVISION_OPTION          = 'mobo_core_reconciliation_revision';
 	const FALLBACK_CURSOR_OPTION   = 'mobo_core_reconciliation_fallback_cursor';
@@ -67,6 +70,7 @@ class Mobo_Core_Reconciliation {
 		) {$charset_collate};";
 
 		dbDelta( $sql );
+		self::$health_table_exists_cache = null;
 	}
 
 	/**
@@ -700,34 +704,83 @@ class Mobo_Core_Reconciliation {
 	 * @return int
 	 */
 	private function find_local_product_id( $guid, $portal_id ) {
-		$guid = sanitize_text_field( (string) $guid );
+		global $wpdb;
+
+		$guid      = sanitize_text_field( (string) $guid );
+		$portal_id = absint( $portal_id );
+		$map       = new Mobo_Core_Product_Map();
+
 		if ( '' !== $guid ) {
-			$map = new Mobo_Core_Product_Map();
-			$id  = $map->get_product_id( $guid );
+			$id = $map->get_product_id( $guid );
 			if ( $id > 0 ) {
 				return $id;
 			}
 		}
 
-		$portal_id = absint( $portal_id );
+		/*
+		 * Indexed recovery path. A missing product-map row can still be recovered
+		 * from reconciliation health without scanning wp_postmeta. Prefer the unique
+		 * product_guid index when a GUID is known; otherwise use portal_product_id.
+		 * A valid hit immediately self-heals the authoritative GUID map.
+		 */
+		if ( self::health_table_exists() && ( '' !== $guid || $portal_id > 0 ) ) {
+			$health_table = self::table_name();
+			if ( '' !== $guid ) {
+				$health_row = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT product_guid, wp_product_id, portal_product_id FROM {$health_table} WHERE product_guid = %s LIMIT 1",
+						$guid
+					),
+					ARRAY_A
+				);
+			} else {
+				$health_row = $wpdb->get_row(
+					$wpdb->prepare(
+						"SELECT product_guid, wp_product_id, portal_product_id FROM {$health_table} WHERE portal_product_id = %d AND wp_product_id > 0 ORDER BY updated_at DESC, id DESC LIMIT 1",
+						$portal_id
+					),
+					ARRAY_A
+				);
+			}
+
+			if ( is_array( $health_row ) ) {
+				$health_guid       = sanitize_text_field( (string) ( $health_row['product_guid'] ?? '' ) );
+				$health_product_id = absint( $health_row['wp_product_id'] ?? 0 );
+				$health_portal_id  = absint( $health_row['portal_product_id'] ?? 0 );
+				$guid_matches      = '' === $guid || '' === $health_guid || hash_equals( $guid, $health_guid );
+				$portal_matches    = $portal_id <= 0 || $health_portal_id <= 0 || $portal_id === $health_portal_id;
+
+				if (
+					$health_product_id > 0
+					&& $guid_matches
+					&& $portal_matches
+					&& 'product' === get_post_type( $health_product_id )
+					&& ! in_array( get_post_status( $health_product_id ), array( 'trash', 'auto-draft' ), true )
+				) {
+					if ( '' !== $guid ) {
+						$map->upsert_product( $guid, $health_product_id );
+					}
+					return $health_product_id;
+				}
+			}
+		}
+
 		if ( $portal_id <= 0 ) {
 			return 0;
 		}
 
 		/*
-		 * Legacy fallback only. Older installations may have Portal IDs in product
-		 * post meta but no GUID map row yet. Keep the historical key priority, make
-		 * each lookup bounded to one product, and repair the authoritative GUID map
-		 * immediately after a legacy hit so subsequent reconciliation stays fast.
+		 * Last-resort compatibility path for installations predating both indexed
+		 * maps. Each lookup is bounded to one product and a hit repairs the GUID map,
+		 * so this expensive metadata path is not repeated for the same product.
 		 */
-		global $wpdb;
-
 		$legacy_keys = array(
 			'portal_product_id',
 			'mobo_portal_product_id',
 			'_mobo_portal_product_id',
 		);
 
+		// phpcs:disable WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 		foreach ( $legacy_keys as $legacy_key ) {
 			$product_id = absint(
 				$wpdb->get_var(
@@ -755,6 +808,7 @@ class Mobo_Core_Reconciliation {
 				return $product_id;
 			}
 		}
+		// phpcs:enable WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value
 
 		return 0;
 	}
@@ -1052,8 +1106,14 @@ class Mobo_Core_Reconciliation {
 	 */
 	private static function health_table_exists() {
 		global $wpdb;
+
+		if ( null !== self::$health_table_exists_cache ) {
+			return (bool) self::$health_table_exists_cache;
+		}
+
 		$table = self::table_name();
-		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		self::$health_table_exists_cache = $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		return (bool) self::$health_table_exists_cache;
 	}
 
 	private function complete_state( &$state, $success, $message ) {

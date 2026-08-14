@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Version `10.31.76` · Compatible with Portal `v25 / .NET 10`**
+**Version `10.33.16.18` · Compatible with Portal `v25 / .NET 10`**
 
 [فارسی](#fa) · [English](#en) · [راهنمای کامل](README_FULL.MD) · [مرجع توابع](FUNCTIONS.MD) · [نمودارها](DIAGRAMS.MD)
 
@@ -21,17 +21,22 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 اجزای اصلی:
 
 1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
-2. **Mobo Core 10.31.76**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
+2. **Mobo Core 10.33.16.18**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
 4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
 نمودارهای کامل در [`DIAGRAMS.MD`](DIAGRAMS.MD#fa) قرار دارند.
 
+
+### Adaptive Self-Tuning (10.33.16.18)
+
+Runner از آمار سبک ۲۴ساعته `runtimeDiagnostics` برای محاسبه ظرفیت موقت همان اجرای Cron استفاده می‌کند. تنظیمات ذخیره‌شده baseline باقی می‌مانند و افزونه هیچ batch sizeای را خودکار در دیتابیس تغییر نمی‌دهد. Parent Finalize، Image Queue، Reprice، Recategorize، Cache Warmup و از 10.33.16.18 خود Product Sync می‌توانند بر اساس `recentMsPerItem` در محدوده‌های امن حرکت کنند. Product Sync زمان هر step را فقط در buffer همان request ثبت می‌کند و پس از حداقل چهار نمونه می‌تواند `productStepsPerRound` را بین 1 تا حداکثر 2 برابر baseline (با سقف 20) تنظیم کند؛ Memory Pressure، Time Budget Exhaustion و failureها همچنان باعث downshift/cap محافظه‌کارانه می‌شوند. این قابلیت از تب Real Cron قابل غیرفعال‌سازی است.
+
 ## 2. سازگاری نسخه
 
 | جزء | نسخه / وضعیت |
 |---|---|
-| Mobo Core | `10.31.76` |
+| Mobo Core | `10.33.16.18` |
 | Portal | `v25` |
 | Target Framework پرتال | `net10.0` |
 | WordPress | `5.8+` |
@@ -224,12 +229,12 @@ Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync 
 
 1. از دیتابیس و `wp-content/uploads` پشتیبان کامل بگیرید.
 2. ترمیم محصولات را یک بار کامل کنید؛ تا قبل از آن این بخش قفل است.
-3. در اولین ارتقا از نسخه های قدیمی به 10.31.65 یا جدیدتر، گزینه حذف پیوست قدیمی و پاک سازی فایل های بدون پیوست خودکار خاموش می شوند. در اجرای آزمایشی اول آن ها را خاموش نگه دارید و ساخت برش های WebP را روشن کنید.
+3. در اولین اجرای آزمایشی حذف پیوست قدیمی را خاموش نگه دارید و ساخت برش های WebP را روشن کنید. پس از تکمیل مرحله ۶، اگر گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» را فعال کردید، این انتخاب از نسخه 10.33.13 دائمی است و افزونه در چرخه های بعدی آن را خودکار خاموش نمی کند.
 4. «۱) بررسی تصاویر قدیمی» و «۲) ساخت صف نوسازی» را تا پایان یک دوره کامل اجرا کنید.
 5. «۳) پردازش مرحله ای صف» را تا صفر شدن ردیف های در انتظار، آماده پردازش و ناموفق ادامه دهید.
 6. «۴) اسکن سلامت برش های WebP» را تا پایان یک دوره کامل اجرا کنید.
 7. در صورت وجود نقص، «۵) بازسازی برش های ناقص WebP» را تا پایان دوره اجرا و دوباره مرحله ۴ را تکرار کنید.
-8. پس از سلامت صف و برش ها، ابتدا مرحله ۶ را با حذف خاموش تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، حذف پیوست قدیمی را فعال کنید و مرحله ۷ همان پیوست های جایگزین شده را با کنترل دوباره حذف می کند.
+8. پس از سلامت صف و برش ها، مرحله ۶ را تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» را یک بار فعال کنید. از آن پس مرحله ۷ در همین چرخه و چرخه های بعدی بدون تایید مجدد، با انتقال مرجع و کنترل نهایی، حذف امن را ادامه می دهد تا زمانی که خود مدیر این گزینه را خاموش کند.
 9. در پایان، مرحله ۸ را با پاک سازی خاموش تا پایان اسکن خانواده های فیزیکی اجرا کنید. اگر خانواده آماده حذف وجود داشت، پاک سازی فایل های بدون پیوست را فعال کنید و مرحله ۹ را محدود و مرحله ای انجام دهید.
 
 ساخت صف، پردازش را همان لحظه شروع نمی کند. پردازش فقط با مرحله ۳ یا اجرای زمان بندی شده انجام می شود. اگر اجرای آزمایشی با حذف خاموش انجام شود، پیوست های قدیمی ثبت شده گم نمی شوند؛ متادیتای جایگزینی روی آن ها ذخیره می شود و مرحله های ۶ و ۷ دقیقا برای اسکن و حذف امن همین پیوست ها هستند.
@@ -457,6 +462,8 @@ Mobo Core `10.31.73` ذخیره‌های تکراری یک محصول/Variation 
 
 از نسخه `10.31.74` آخرین نتیجه این عملیات در option غیرautoload با نام `mobo_core_cache_purge_last_result` نگهداری و در فیلد `cachePurge` گزارش سلامت ارسال می‌شود. گزارش شامل نسخه Mobo هنگام اجرا، زمان تلاش/موفقیت، تعداد هدف‌ها، مدت اجرا، خطای محدودشده و نتیجه و نسخه هر Integration است؛ Product ID و URL واقعی در گزارش ذخیره یا ارسال نمی‌شوند. خطای Cache همچنان non-blocking است و Sync محصول ادامه پیدا می‌کند.
 
+از نسخه `10.33.16.2`، بعد از موفقیت Purge هدفمند، فقط permalink فعلی محصول در صف non-autoload `mobo_core_cache_warmup_queue` قرار می‌گیرد. این صف توسط Real Cron/Self Runner با batch محدود پردازش می‌شود و برای هر آیتم یک درخواست GET ناشناس same-origin می‌فرستد. هدف فقط گرم‌کردن صفحه همان محصول است؛ Home، Shop، category/tag archive و URL قبلی محصول warm نمی‌شوند. خطاهای موقت با backoff retry می‌شوند و وضعیت صف بدون افشای URL/Product ID داخل Site Health قابل مشاهده است.
+
 <a id="en"></a>
 
 # Full English documentation
@@ -467,6 +474,8 @@ Mobo Core `10.31.73` batches repeated saves for the same product/variation and i
 
 Since `10.31.74`, the last result is persisted in the non-autoloaded `mobo_core_cache_purge_last_result` option and sent in the health payload as `cachePurge`. It contains Mobo/plugin versions, attempt/full-success times, target counts, duration, bounded errors, and per-integration status without storing or transmitting the target product-ID or URL lists. Cache failures remain non-blocking for product synchronization.
 
+Since `10.33.16.2`, a successful targeted purge queues only the product's current permalink in the non-autoloaded `mobo_core_cache_warmup_queue`. Real Cron/Self Runner drains the queue in bounded batches and sends one anonymous same-origin GET per item. Home, Shop, category/tag archives, and previous product permalinks are not warmed. Transient failures use retry backoff, while Site Health exposes only queue counts/status and never the queued URL or product-ID list.
+
 
 
 ## 1. Product purpose and architecture
@@ -476,17 +485,21 @@ Mobo Core is the integration layer between WooCommerce and MoboCore. It retrieve
 Primary components:
 
 1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
-2. **Mobo Core 10.31.76**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
+2. **Mobo Core 10.33.16.18**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
 4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
 See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
+### Adaptive Self-Tuning (10.33.16.18)
+
+The runner uses the lightweight 24-hour `runtimeDiagnostics` history to calculate request-local worker limits. Saved settings remain the immutable baseline; Mobo Core does not write automatic batch-size changes back to the database. Webhook ceiling, Parent Finalize, Image Queue, Reprice, Recategorize, Cache Warmup and, starting in 10.33.16.18, Product Sync can move within safe bounds based on recent milliseconds per item. Product Sync records exact per-step timing only in the request-local diagnostics buffer and, after at least four measured steps, may tune `productStepsPerRound` from 1 up to 2x baseline with a hard cap of 20. Recent failures, memory pressure or repeated time-budget exhaustion retain conservative caps/downshifts. The feature can be disabled from the Real Cron tab.
+
 ## 2. Version compatibility
 
 | Component | Version / status |
 |---|---|
-| Mobo Core | `10.31.76` |
+| Mobo Core | `10.33.16.18` |
 | Portal | `v25` |
 | Portal target framework | `net10.0` |
 | WordPress | `5.8+` |

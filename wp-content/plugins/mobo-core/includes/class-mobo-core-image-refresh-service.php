@@ -30,6 +30,9 @@ class Mobo_Core_Image_Refresh_Service {
 	const REPLACED_SCAN_CURSOR_OPTION  = 'mobo_core_image_replaced_scan_cursor';
 	const REPLACED_DELETE_CURSOR_OPTION = 'mobo_core_image_replaced_delete_cursor';
 
+	/** Cached authoritative image identities from the local image queue. @var array|null */
+	private $current_image_identity_map = null;
+
 	/**
 	 * Get combined status.
 	 *
@@ -101,7 +104,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
 		$batch = $legacy_already_complete
 			? array( 'ids' => array(), 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => absint( isset( $previous['legacyEstimatedTotal'] ) ? $previous['legacyEstimatedTotal'] : 0 ) )
-			: $this->get_mobo_attachment_batch( $limit, self::SCAN_CURSOR_OPTION );
+			: $this->get_legacy_refresh_attachment_batch( $limit, self::SCAN_CURSOR_OPTION );
 		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
@@ -126,6 +129,9 @@ class Mobo_Core_Image_Refresh_Service {
 			'totalLegacyBytes'    => $continue_cycle ? absint( isset( $previous['totalLegacyBytes'] ) ? $previous['totalLegacyBytes'] : 0 ) : 0,
 			'missingImageScanned'=> $continue_cycle ? absint( isset( $previous['missingImageScanned'] ) ? $previous['missingImageScanned'] : 0 ) : 0,
 			'missingImageProducts'=> $continue_cycle ? absint( isset( $previous['missingImageProducts'] ) ? $previous['missingImageProducts'] : 0 ) : 0,
+			'recoveredIdentity'   => $continue_cycle ? absint( isset( $previous['recoveredIdentity'] ) ? $previous['recoveredIdentity'] : 0 ) : 0,
+			'recoveredDetached'   => $continue_cycle ? absint( isset( $previous['recoveredDetached'] ) ? $previous['recoveredDetached'] : 0 ) : 0,
+			'unrelatedRaster'     => $continue_cycle ? absint( isset( $previous['unrelatedRaster'] ) ? $previous['unrelatedRaster'] : 0 ) : 0,
 			'cursorStart'         => $cursor_start,
 			'cursorEnd'           => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
 			'missingCursorStart'  => $missing_cursor_start,
@@ -142,6 +148,27 @@ class Mobo_Core_Image_Refresh_Service {
 		foreach ( $attachments as $attachment_id ) {
 			$attachment_id = absint( $attachment_id );
 			$result['scanned']++;
+
+			$is_marked      = $this->is_mobo_attachment( $attachment_id );
+			$is_legacy      = $this->is_legacy_raster_attachment( $attachment_id );
+			$product_ids    = $is_legacy ? $this->find_products_using_attachment( $attachment_id ) : array();
+
+			if ( ! $is_marked && $is_legacy && empty( $product_ids ) ) {
+				$detached_match = $this->recover_detached_legacy_identity( $attachment_id, false );
+				if ( ! empty( $detached_match['recovered'] ) ) {
+					$is_marked = true;
+					$result['recoveredDetached'] = absint( isset( $result['recoveredDetached'] ) ? $result['recoveredDetached'] : 0 ) + 1;
+				}
+			}
+
+			/* The bounded discovery pass can see unrelated site JPG/PNG files. They
+			 * are never modified unless ownership is proven from a Mobo product or a
+			 * unique current Portal image identity in the local image queue. */
+			if ( ! $is_marked && empty( $product_ids ) ) {
+				$result['unrelatedRaster'] = absint( isset( $result['unrelatedRaster'] ) ? $result['unrelatedRaster'] : 0 ) + 1;
+				continue;
+			}
+
 			$result['moboAttachments']++;
 
 			if ( $this->is_webp_attachment( $attachment_id ) ) {
@@ -149,7 +176,7 @@ class Mobo_Core_Image_Refresh_Service {
 				continue;
 			}
 
-			if ( ! $this->is_legacy_raster_attachment( $attachment_id ) ) {
+			if ( ! $is_legacy ) {
 				continue;
 			}
 
@@ -162,21 +189,20 @@ class Mobo_Core_Image_Refresh_Service {
 				$result['totalLegacyBytes'] += $this->get_attachment_family_size( $attachment_id );
 			}
 
-			$product_ids = $this->find_products_using_attachment( $attachment_id );
 			if ( empty( $product_ids ) ) {
 				$result['withoutProduct']++;
 				continue;
 			}
 
-			$image_guid = $this->get_image_guid_from_attachment( $attachment_id );
-			$old_url    = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
 			$has_source = false;
-
 			foreach ( $product_ids as $product_id ) {
-				$new_url = $this->find_new_source_url( $product_id, $image_guid, $old_url );
-				if ( '' !== $new_url ) {
+				$identity = $this->resolve_refresh_identity( $attachment_id, $product_id, false );
+				if ( ! empty( $identity['image_guid'] ) && ! empty( $identity['new_source_url'] ) ) {
 					$has_source = true;
 					$result['queueable']++;
+					if ( ! empty( $identity['recovered'] ) ) {
+						$result['recoveredIdentity'] = absint( isset( $result['recoveredIdentity'] ) ? $result['recoveredIdentity'] : 0 ) + 1;
+					}
 				}
 			}
 
@@ -229,7 +255,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
 		$batch = $legacy_already_complete
 			? array( 'ids' => array(), 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => absint( isset( $previous['legacyEstimatedTotal'] ) ? $previous['legacyEstimatedTotal'] : 0 ) )
-			: $this->get_mobo_attachment_batch( $limit, self::ENQUEUE_CURSOR_OPTION );
+			: $this->get_legacy_refresh_attachment_batch( $limit, self::ENQUEUE_CURSOR_OPTION );
 		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
@@ -265,6 +291,8 @@ class Mobo_Core_Image_Refresh_Service {
 			'missingImageSkipped' => $continue_cycle ? absint( isset( $previous['missingImageSkipped'] ) ? $previous['missingImageSkipped'] : 0 ) : 0,
 			'missingImageFailed'  => $continue_cycle ? absint( isset( $previous['missingImageFailed'] ) ? $previous['missingImageFailed'] : 0 ) : 0,
 			'missingImagePending' => $continue_cycle ? absint( isset( $previous['missingImagePending'] ) ? $previous['missingImagePending'] : 0 ) : 0,
+			'recoveredIdentity'  => $continue_cycle ? absint( isset( $previous['recoveredIdentity'] ) ? $previous['recoveredIdentity'] : 0 ) : 0,
+			'detachedRecovered'  => $continue_cycle ? absint( isset( $previous['detachedRecovered'] ) ? $previous['detachedRecovered'] : 0 ) : 0,
 			'cursorStart'      => $cursor_start,
 			'cursorEnd'        => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
 			'missingCursorStart' => $missing_cursor_start,
@@ -288,30 +316,33 @@ class Mobo_Core_Image_Refresh_Service {
 				continue;
 			}
 
-			$image_guid = $this->get_image_guid_from_attachment( $attachment_id );
-			if ( '' === $image_guid ) {
-				$result['skipped']++;
-				continue;
-			}
-
 			$product_ids = $this->find_products_using_attachment( $attachment_id );
 			if ( empty( $product_ids ) ) {
+				$detached = $this->recover_detached_legacy_identity( $attachment_id );
+				if ( ! empty( $detached['recovered'] ) ) {
+					$result['detachedRecovered'] = absint( isset( $result['detachedRecovered'] ) ? $result['detachedRecovered'] : 0 ) + 1;
+				}
 				$result['withoutProduct']++;
 				continue;
 			}
 
-			$old_url = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
-			$file    = get_attached_file( $attachment_id );
-			$mime    = (string) get_post_mime_type( $attachment_id );
-			$size    = $this->get_attachment_family_size( $attachment_id );
+			$file = get_attached_file( $attachment_id );
+			$mime = (string) get_post_mime_type( $attachment_id );
+			$size = $this->get_attachment_family_size( $attachment_id );
 
 			foreach ( $product_ids as $product_id ) {
 				$product_id = absint( $product_id );
-				$new_url    = $this->find_new_source_url( $product_id, $image_guid, $old_url );
+				$identity   = $this->resolve_refresh_identity( $attachment_id, $product_id );
+				$image_guid = isset( $identity['image_guid'] ) ? sanitize_text_field( (string) $identity['image_guid'] ) : '';
+				$new_url    = isset( $identity['new_source_url'] ) ? esc_url_raw( (string) $identity['new_source_url'] ) : '';
 
-				if ( '' === $new_url ) {
+				if ( '' === $image_guid || '' === $new_url ) {
 					$result['withoutSourceUrl']++;
 					continue;
+				}
+
+				if ( ! empty( $identity['recovered'] ) ) {
+					$result['recoveredIdentity'] = absint( isset( $result['recoveredIdentity'] ) ? $result['recoveredIdentity'] : 0 ) + 1;
 				}
 
 				$enqueue_result = method_exists( $queue, 'enqueue_with_result' )
@@ -638,20 +669,12 @@ class Mobo_Core_Image_Refresh_Service {
 		$this->replace_product_attachment( $product, $old_attachment_id, $new_attachment_id );
 		$this->mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
 
-		$jpeg_cleanup = $this->cleanup_same_basename_jpeg_files( $new_attachment_id, $old_attachment_id );
-		$note         = 'تصویر قدیمی نگه داشته شد.';
+		$note       = 'تصویر قدیمی نگه داشته شد.';
 		$delete_old = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
 			|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() );
 		if ( $delete_old ) {
 			$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
 			$note         = ! empty( $delete_check['deleted'] ) ? ( isset( $delete_check['message'] ) ? (string) $delete_check['message'] : 'تصویر قدیمی با موفقیت و به صورت امن حذف شد.' ) : ( isset( $delete_check['message'] ) ? $delete_check['message'] : 'تصویر قدیمی نگه داشته شد.' );
-		}
-
-		if ( ! empty( $jpeg_cleanup['deletedFiles'] ) ) {
-			$note .= ' فایل های JPG/JPEG هم نام حذف شده: ' . absint( $jpeg_cleanup['deletedFiles'] ) . '، فضای آزاد شده: ' . size_format( absint( isset( $jpeg_cleanup['bytes'] ) ? $jpeg_cleanup['bytes'] : 0 ) ) . '.';
-		}
-		if ( ! empty( $jpeg_cleanup['failedFiles'] ) ) {
-			$note .= ' حذف ' . absint( $jpeg_cleanup['failedFiles'] ) . ' فایل JPG/JPEG هم نام ناموفق بود و نوسازی بدون Fatal ادامه یافت.';
 		}
 
 		$note .= ' برش های WebP کنترل نهایی شدند؛ تعداد برش های ثبت شده: ' . absint( isset( $subsize_result['registered'] ) ? $subsize_result['registered'] : 0 ) . '، فایل جدید ساخته شده: ' . absint( isset( $subsize_result['generated'] ) ? $subsize_result['generated'] : 0 ) . '.';
@@ -728,94 +751,8 @@ class Mobo_Core_Image_Refresh_Service {
 	}
 
 	/**
-	 * Remove local JPG/JPEG files that share the new WebP base filename.
-	 *
-	 * This intentionally uses filename similarity only. It runs after the WebP
-	 * attachment has passed validation and has replaced the product image. Any
-	 * filesystem error is contained so image refresh cannot fail fatally.
-	 *
-	 * @param int $new_attachment_id New WebP attachment ID.
-	 * @param int $old_attachment_id Previous attachment ID.
-	 * @return array
-	 */
-	private function cleanup_same_basename_jpeg_files( $new_attachment_id, $old_attachment_id = 0 ) {
-		$result = array(
-			'deletedFiles' => 0,
-			'failedFiles'  => 0,
-			'bytes'        => 0,
-		);
-
-		try {
-			$new_file = get_attached_file( absint( $new_attachment_id ) );
-			$new_file = is_string( $new_file ) ? $this->normalize_file_path( $new_file ) : '';
-
-			if ( '' === $new_file || 'webp' !== strtolower( pathinfo( $new_file, PATHINFO_EXTENSION ) ) ) {
-				return $result;
-			}
-
-			$base_name = pathinfo( basename( $new_file ), PATHINFO_FILENAME );
-			if ( '' === $base_name ) {
-				return $result;
-			}
-
-			$directories = array( dirname( $new_file ) );
-			$old_file    = get_attached_file( absint( $old_attachment_id ) );
-			$old_file    = is_string( $old_file ) ? $this->normalize_file_path( $old_file ) : '';
-			if ( '' !== $old_file ) {
-				$directories[] = dirname( $old_file );
-			}
-
-			$pattern = '/^' . preg_quote( $base_name, '/' ) . '(?:-[^.]+)?\.jpe?g$/i';
-			$seen    = array();
-
-			foreach ( array_values( array_unique( array_filter( array_map( array( $this, 'normalize_file_path' ), $directories ) ) ) ) as $directory ) {
-				if ( ! is_dir( $directory ) || ! $this->is_inside_uploads_path( $directory ) ) {
-					continue;
-				}
-
-				$entries = @scandir( $directory );
-				if ( ! is_array( $entries ) ) {
-					continue;
-				}
-
-				foreach ( $entries as $entry ) {
-					if ( '.' === $entry || '..' === $entry || ! preg_match( $pattern, (string) $entry ) ) {
-						continue;
-					}
-
-					$path = $this->normalize_file_path( trailingslashit( $directory ) . basename( (string) $entry ) );
-					if ( isset( $seen[ $path ] ) || ! is_file( $path ) || ! $this->is_inside_uploads_path( $path ) ) {
-						continue;
-					}
-					$seen[ $path ] = true;
-
-					$size = @filesize( $path );
-					$size = false === $size ? 0 : absint( $size );
-
-					try {
-						wp_delete_file( $path );
-					} catch ( Throwable $error ) {
-						$result['failedFiles']++;
-						continue;
-					}
-
-					if ( ! is_file( $path ) ) {
-						$result['deletedFiles']++;
-						$result['bytes'] += $size;
-					} else {
-						$result['failedFiles']++;
-					}
-				}
-			}
-		} catch ( Throwable $error ) {
-			$result['failedFiles']++;
-		}
-
-		return $result;
-	}
-
-	/**
-	 * Safely delete old attachment if unused.
+	 * Safely migrate every known reference to the verified WebP replacement and
+	 * delete the old attachment only when no reference remains.
 	 *
 	 * @param int $attachment_id Old attachment ID.
 	 * @param int $new_attachment_id Replacement attachment ID.
@@ -824,32 +761,65 @@ class Mobo_Core_Image_Refresh_Service {
 	private function safe_delete_old_attachment( $attachment_id, $new_attachment_id = 0 ) {
 		$attachment_id     = absint( $attachment_id );
 		$new_attachment_id = absint( $new_attachment_id );
+		$migration_result  = array(
+			'attempted'   => false,
+			'updatedRows' => 0,
+			'errors'      => 0,
+		);
 
 		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
-			return array( 'deleted' => false, 'message' => 'تصویر قدیمی وجود ندارد.' );
+			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر قدیمی وجود ندارد.', 'referenceMigration' => $migration_result );
 		}
 
 		if ( ! $this->is_mobo_attachment( $attachment_id ) ) {
-			return array( 'deleted' => false, 'message' => 'تصویر قدیمی به عنوان تصویر موبو ثبت نشده است.' );
+			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر قدیمی به عنوان تصویر موبو ثبت نشده است.', 'referenceMigration' => $migration_result );
 		}
 
-		if ( $this->count_all_products_using_attachment( $attachment_id ) > 0 ) {
-			return array( 'deleted' => false, 'message' => 'تصویر قدیمی هنوز توسط یک یا چند محصول استفاده می شود.' );
+		if ( $new_attachment_id <= 0 || ! $this->is_valid_new_attachment( $new_attachment_id ) || ! $this->is_webp_attachment( $new_attachment_id ) ) {
+			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر WebP جایگزین معتبر نیست؛ انتقال مراجع و حذف انجام نشد.', 'referenceMigration' => $migration_result );
 		}
 
-		if ( $this->attachment_has_external_references( $attachment_id ) ) {
-			return array( 'deleted' => false, 'message' => 'تصویر قدیمی هنوز در محتوا، متادیتا، دسته بندی یا تنظیمات سایت مرجع دارد.' );
+		$registered_replacement = absint( get_post_meta( $attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) );
+		if ( $registered_replacement !== $new_attachment_id ) {
+			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'ارتباط پیوست قدیمی با WebP جایگزین در سابقه نوسازی تایید نشد.', 'referenceMigration' => $migration_result );
+		}
+
+		/* Migration is safe and idempotent for this verified old -> new pair.
+		 * Migrate first, then perform one authoritative reference audit. */
+		$migration_result   = $this->migrate_attachment_references( $attachment_id, $new_attachment_id );
+		$product_references = $this->count_all_products_using_attachment( $attachment_id );
+		if ( $product_references > 0 ) {
+			return array(
+				'deleted'             => false,
+				'outcome'             => 'blocked',
+				'message'             => 'انتقال مراجع اجرا شد، اما این پیوست قدیمی هنوز توسط یک یا چند محصول استفاده می شود و برای جلوگیری از خرابی نگه داشته شد.',
+				'referenceMigration'  => $migration_result,
+				'remainingReferences' => true,
+				'referenceLocations'  => array( 'product×' . absint( $product_references ) ),
+			);
+		}
+
+		$external = $this->get_external_reference_diagnostics( $attachment_id, $new_attachment_id );
+		if ( ! empty( $external['hasReferences'] ) ) {
+			return array(
+				'deleted'             => false,
+				'outcome'             => 'blocked',
+				'message'             => 'انتقال مراجع امن اجرا شد، اما هنوز مرجع ساختاری یا داده سریالایز ناشناخته ای باقی مانده است؛ این مورد رد شد و بقیه مرحله ۷ ادامه پیدا می کند.',
+				'referenceMigration'  => $migration_result,
+				'remainingReferences' => true,
+				'referenceLocations'  => isset( $external['locations'] ) && is_array( $external['locations'] ) ? $external['locations'] : array(),
+			);
 		}
 
 		$old_file          = get_attached_file( $attachment_id );
 		$old_file          = is_string( $old_file ) ? $this->normalize_file_path( $old_file ) : '';
 		$family_snapshot   = $this->get_legacy_attachment_family_paths( $attachment_id );
-		$new_file          = $new_attachment_id > 0 ? get_attached_file( $new_attachment_id ) : '';
+		$new_file          = get_attached_file( $new_attachment_id );
 		$new_file          = is_string( $new_file ) ? $this->normalize_file_path( $new_file ) : '';
 		$deleted           = wp_delete_attachment( $attachment_id, true );
 
 		if ( ! $deleted ) {
-			return array( 'deleted' => false, 'message' => 'حذف پیوست قدیمی توسط وردپرس ناموفق بود.' );
+			return array( 'deleted' => false, 'outcome' => 'error', 'message' => 'حذف پیوست قدیمی توسط وردپرس ناموفق بود.', 'referenceMigration' => $migration_result );
 		}
 
 		$leftover_result = array( 'deletedFiles' => 0, 'bytes' => 0, 'keptFiles' => 0 );
@@ -858,6 +828,9 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		$message = 'تصویر قدیمی و برش های ثبت شده آن با موفقیت و به صورت امن حذف شدند.';
+		if ( ! empty( $migration_result['updatedRows'] ) ) {
+			$message .= ' مراجع سایت پیش از حذف به WebP منتقل شد؛ تعداد ردیف های به روز شده: ' . absint( $migration_result['updatedRows'] ) . '.';
+		}
 		if ( ! empty( $leftover_result['deletedFiles'] ) ) {
 			$message .= ' تعداد برش های جا مانده و ثبت نشده که حذف شد: ' . absint( $leftover_result['deletedFiles'] ) . '.';
 		}
@@ -867,9 +840,12 @@ class Mobo_Core_Image_Refresh_Service {
 
 		return array(
 			'deleted'              => true,
+			'outcome'              => 'deleted',
 			'message'              => $message,
 			'leftoverDeletedFiles' => isset( $leftover_result['deletedFiles'] ) ? absint( $leftover_result['deletedFiles'] ) : 0,
 			'leftoverBytes'        => isset( $leftover_result['bytes'] ) ? absint( $leftover_result['bytes'] ) : 0,
+			'referenceMigration'   => $migration_result,
+			'remainingReferences'  => false,
 		);
 	}
 
@@ -934,6 +910,338 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		return '';
+	}
+
+	/**
+	 * Resolve the current Portal identity for a legacy attachment.
+	 *
+	 * @param int $attachment_id Legacy attachment ID.
+	 * @param int  $product_id Product/variation ID using it.
+	 * @param bool $persist Whether recovered identity metadata may be written.
+	 * @return array
+	 */
+	private function resolve_refresh_identity( $attachment_id, $product_id, $persist = true ) {
+		$attachment_id = absint( $attachment_id );
+		$product_id    = absint( $product_id );
+		$image_guid    = $this->get_image_guid_from_attachment( $attachment_id );
+		$old_url       = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+
+		if ( $attachment_id <= 0 || $product_id <= 0 ) {
+			return array( 'image_guid' => '', 'new_source_url' => '', 'recovered' => false );
+		}
+
+		if ( '' !== $image_guid ) {
+			$new_url = $this->find_new_source_url( $product_id, $image_guid, $old_url );
+			if ( '' !== $new_url ) {
+				return array( 'image_guid' => $image_guid, 'new_source_url' => $new_url, 'recovered' => false );
+			}
+		}
+
+		$rows = $this->get_current_product_image_rows( $product_id );
+		if ( empty( $rows ) ) {
+			return array( 'image_guid' => '', 'new_source_url' => '', 'recovered' => false );
+		}
+
+		if ( '' !== $image_guid ) {
+			$guid_matches = array();
+			foreach ( $rows as $row ) {
+				$row_guid = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+				$row_url  = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+				if ( '' !== $row_guid && hash_equals( $image_guid, $row_guid ) && $this->is_webp_url( $row_url ) ) {
+					$guid_matches[] = $row;
+				}
+			}
+			$guid_matches = $this->unique_identity_rows( $guid_matches );
+			if ( 1 === count( $guid_matches ) ) {
+				return array( 'image_guid' => $image_guid, 'new_source_url' => esc_url_raw( (string) $guid_matches[0]['source_url'] ), 'recovered' => false );
+			}
+		}
+
+		$legacy_key = $this->attachment_basename_key( $attachment_id );
+		if ( '' !== $legacy_key ) {
+			$basename_matches = array();
+			foreach ( $rows as $row ) {
+				$row_url = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+				if ( $this->is_webp_url( $row_url ) && $legacy_key === $this->source_basename_key( $row_url ) ) {
+					$basename_matches[] = $row;
+				}
+			}
+			$basename_matches = $this->unique_identity_rows( $basename_matches );
+			if ( 1 === count( $basename_matches ) ) {
+				return $persist ? $this->mark_recovered_attachment_identity( $attachment_id, $basename_matches[0] ) : $this->preview_recovered_attachment_identity( $basename_matches[0] );
+			}
+		}
+
+		$positions = $this->attachment_product_positions( $product_id, $attachment_id );
+		if ( ! empty( $positions ) ) {
+			$position_matches = array();
+			foreach ( $rows as $row ) {
+				$position = isset( $row['position_index'] ) ? absint( $row['position_index'] ) : -1;
+				$row_url  = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+				if ( in_array( $position, $positions, true ) && $this->is_webp_url( $row_url ) ) {
+					$position_matches[] = $row;
+				}
+			}
+			$position_matches = $this->unique_identity_rows( $position_matches );
+			if ( 1 === count( $position_matches ) ) {
+				return $persist ? $this->mark_recovered_attachment_identity( $attachment_id, $position_matches[0] ) : $this->preview_recovered_attachment_identity( $position_matches[0] );
+			}
+		}
+
+		return array( 'image_guid' => '', 'new_source_url' => '', 'recovered' => false );
+	}
+
+	/**
+	 * Recover an old registered JPG/PNG that is no longer linked to a product but
+	 * has one unique current WebP identity in the local authoritative image queue.
+	 *
+	 * @param int  $attachment_id Legacy attachment ID.
+	 * @param bool $persist Whether replacement metadata may be written.
+	 * @return array
+	 */
+	private function recover_detached_legacy_identity( $attachment_id, $persist = true ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || ! $this->is_legacy_raster_attachment( $attachment_id ) ) {
+			return array( 'recovered' => false );
+		}
+
+		$existing_replacement = absint( get_post_meta( $attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) );
+		if ( $existing_replacement > 0 && $this->is_valid_new_attachment( $existing_replacement ) && $this->is_webp_attachment( $existing_replacement ) ) {
+			return array( 'recovered' => false, 'replacement_attachment_id' => $existing_replacement );
+		}
+
+		$key = $this->attachment_basename_key( $attachment_id );
+		$map = $this->get_current_image_identity_map();
+		if ( '' === $key || empty( $map['byBasename'][ $key ] ) || ! is_array( $map['byBasename'][ $key ] ) || ! empty( $map['byBasename'][ $key ]['ambiguous'] ) ) {
+			return array( 'recovered' => false );
+		}
+
+		$row               = $map['byBasename'][ $key ];
+		$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+		$new_source_url    = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+		$new_attachment_id = $this->find_valid_webp_attachment_for_identity(
+			$image_guid,
+			$new_source_url,
+			absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 )
+		);
+
+		if ( '' === $image_guid || ! $this->is_webp_url( $new_source_url ) || $new_attachment_id <= 0 ) {
+			return array( 'recovered' => false );
+		}
+		$row['attachment_id'] = $new_attachment_id;
+
+		$identity = $persist ? $this->mark_recovered_attachment_identity( $attachment_id, $row ) : $this->preview_recovered_attachment_identity( $row );
+		if ( $persist ) {
+			update_post_meta( $attachment_id, 'mobo_image_refresh_replaced_at', time() );
+			update_post_meta( $attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', $new_attachment_id );
+			update_post_meta( $new_attachment_id, 'mobo_refreshed_from_attachment_id', $attachment_id );
+		}
+		$identity['replacement_attachment_id'] = $new_attachment_id;
+
+		return $identity;
+	}
+
+	/**
+	 * Find a real local WebP attachment for one current Mobo image identity.
+	 *
+	 * The main image queue can temporarily have attachment_id=0 (or a stale ID)
+	 * even when Image Refresh already imported the WebP, so detached cleanup must
+	 * not rely on that column alone.
+	 *
+	 * @param string $image_guid Image GUID.
+	 * @param string $source_url Current WebP source URL.
+	 * @param int    $preferred_id Preferred attachment from the image queue.
+	 * @return int
+	 */
+	private function find_valid_webp_attachment_for_identity( $image_guid, $source_url, $preferred_id = 0 ) {
+		global $wpdb;
+
+		$image_guid  = sanitize_text_field( (string) $image_guid );
+		$source_url  = esc_url_raw( (string) $source_url );
+		$preferred_id = absint( $preferred_id );
+		if ( $preferred_id > 0 && $this->is_valid_new_attachment( $preferred_id ) && $this->is_webp_attachment( $preferred_id ) ) {
+			return $preferred_id;
+		}
+
+		if ( '' === $image_guid || ! $this->is_webp_url( $source_url ) ) {
+			return 0;
+		}
+
+		$candidates = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT DISTINCT p.ID
+				FROM {$wpdb->posts} p
+				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+				WHERE p.post_type = 'attachment'
+					AND p.post_status IN ('inherit', 'private')
+					AND (
+						(pm.meta_key IN ('image_guid', 'img_guid') AND pm.meta_value = %s)
+						OR (pm.meta_key = 'mobo_source_url' AND pm.meta_value = %s)
+					)
+				ORDER BY p.ID DESC
+				LIMIT %d",
+				$image_guid,
+				$source_url,
+				20
+			)
+		);
+
+		foreach ( is_array( $candidates ) ? $candidates : array() as $candidate_id ) {
+			$candidate_id = absint( $candidate_id );
+			if ( $candidate_id > 0 && $this->is_valid_new_attachment( $candidate_id ) && $this->is_webp_attachment( $candidate_id ) ) {
+				return $candidate_id;
+			}
+		}
+
+		return 0;
+	}
+
+	/** @return array */
+	private function get_current_product_image_rows( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
+			return array();
+		}
+		$queue = new Mobo_Core_Image_Queue();
+		$rows  = method_exists( $queue, 'get_ordered_rows_for_product' ) ? $queue->get_ordered_rows_for_product( $product_id ) : array();
+		if ( empty( $rows ) && 'product_variation' === get_post_type( $product_id ) ) {
+			$parent_id = wp_get_post_parent_id( $product_id );
+			if ( $parent_id > 0 ) {
+				$rows = $queue->get_ordered_rows_for_product( $parent_id );
+			}
+		}
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/** @return array */
+	private function get_current_image_identity_map() {
+		global $wpdb;
+		if ( is_array( $this->current_image_identity_map ) ) {
+			return $this->current_image_identity_map;
+		}
+		$this->current_image_identity_map = array( 'byBasename' => array() );
+		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
+			return $this->current_image_identity_map;
+		}
+
+		$table = Mobo_Core_Image_Queue::table_name();
+		$rows  = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT image_guid, source_url, attachment_id, product_id, position_index, status
+				FROM {$table}
+				WHERE image_guid <> '' AND source_url <> ''
+				ORDER BY updated_at DESC, id DESC
+				LIMIT %d",
+				50000
+			),
+			ARRAY_A
+		);
+
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$url  = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+			$guid = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+			$key  = $this->source_basename_key( $url );
+			if ( '' === $key || '' === $guid || ! $this->is_webp_url( $url ) ) {
+				continue;
+			}
+
+			if ( ! isset( $this->current_image_identity_map['byBasename'][ $key ] ) ) {
+				$row['ambiguous'] = false;
+				$this->current_image_identity_map['byBasename'][ $key ] = $row;
+				continue;
+			}
+
+			$existing      = $this->current_image_identity_map['byBasename'][ $key ];
+			$existing_guid = sanitize_text_field( (string) ( isset( $existing['image_guid'] ) ? $existing['image_guid'] : '' ) );
+			if ( ! empty( $existing['ambiguous'] ) ) {
+				continue;
+			}
+			if ( '' !== $existing_guid && ! hash_equals( $existing_guid, $guid ) ) {
+				$this->current_image_identity_map['byBasename'][ $key ]['ambiguous'] = true;
+				continue;
+			}
+
+			$existing_attachment = absint( isset( $existing['attachment_id'] ) ? $existing['attachment_id'] : 0 );
+			$row_attachment      = absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
+			if ( $existing_attachment <= 0 && $row_attachment > 0 ) {
+				$row['ambiguous'] = false;
+				$this->current_image_identity_map['byBasename'][ $key ] = $row;
+			}
+		}
+
+		return $this->current_image_identity_map;
+	}
+
+	/** @return array */
+	private function preview_recovered_attachment_identity( $row ) {
+		$image_guid = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+		$url        = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+		if ( '' === $image_guid || ! $this->is_webp_url( $url ) ) {
+			return array( 'image_guid' => '', 'new_source_url' => '', 'recovered' => false );
+		}
+		return array( 'image_guid' => $image_guid, 'new_source_url' => $url, 'recovered' => true );
+	}
+
+	/** @return array */
+	private function mark_recovered_attachment_identity( $attachment_id, $row ) {
+		$attachment_id = absint( $attachment_id );
+		$image_guid    = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+		$url           = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+		if ( $attachment_id <= 0 || '' === $image_guid || ! $this->is_webp_url( $url ) ) {
+			return array( 'image_guid' => '', 'new_source_url' => '', 'recovered' => false );
+		}
+		update_post_meta( $attachment_id, 'image_guid', $image_guid );
+		update_post_meta( $attachment_id, 'img_guid', $image_guid );
+		update_post_meta( $attachment_id, 'mobo_image_refresh_identity_recovered_at', time() );
+		update_post_meta( $attachment_id, 'mobo_image_refresh_identity_source', 'image-queue' );
+		return array( 'image_guid' => $image_guid, 'new_source_url' => $url, 'recovered' => true );
+	}
+
+	/** @return array */
+	private function unique_identity_rows( $rows ) {
+		$unique = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$guid = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+			$url  = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+			if ( '' !== $guid && '' !== $url ) {
+				$unique[ $guid . '|' . $url ] = $row;
+			}
+		}
+		return array_values( $unique );
+	}
+
+	/** @return array */
+	private function attachment_product_positions( $product_id, $attachment_id ) {
+		$product = wc_get_product( absint( $product_id ) );
+		if ( ! $product instanceof WC_Product ) {
+			return array();
+		}
+		$attachment_id = absint( $attachment_id );
+		$positions     = array();
+		if ( absint( $product->get_image_id() ) === $attachment_id ) {
+			return array( 0 );
+		}
+		$gallery_ids = method_exists( $product, 'get_gallery_image_ids' ) ? $product->get_gallery_image_ids() : array();
+		$gallery_ids = array_values( array_map( 'absint', is_array( $gallery_ids ) ? $gallery_ids : array() ) );
+		foreach ( $gallery_ids as $index => $gallery_id ) {
+			if ( $gallery_id === $attachment_id ) {
+				$positions[] = absint( $index );
+				$positions[] = absint( $index + 1 );
+			}
+		}
+		return array_values( array_unique( $positions ) );
+	}
+
+	/** @return string */
+	private function attachment_basename_key( $attachment_id ) {
+		$file = get_attached_file( absint( $attachment_id ) );
+		return is_string( $file ) && '' !== $file ? strtolower( rawurldecode( (string) pathinfo( basename( $file ), PATHINFO_FILENAME ) ) ) : '';
+	}
+
+	/** @return string */
+	private function source_basename_key( $url ) {
+		$path = (string) wp_parse_url( (string) $url, PHP_URL_PATH );
+		return '' !== $path ? strtolower( rawurldecode( (string) pathinfo( basename( $path ), PATHINFO_FILENAME ) ) ) : '';
 	}
 
 	/**
@@ -1021,21 +1329,97 @@ class Mobo_Core_Image_Refresh_Service {
 		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
 		$cycle_complete = ! $has_more;
 
-		if ( $cycle_complete ) {
-			update_option( $cursor_option, 0, false );
-		} else {
-			update_option( $cursor_option, $cursor_end, false );
-		}
+		update_option( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
 
 		return array(
-			'ids'           => $ids,
-			'cursorStart'   => $cursor_start,
-			'cursorEnd'     => $cursor_end,
-			'cycleComplete' => $cycle_complete,
+			'ids'            => $ids,
+			'cursorStart'    => $cursor_start,
+			'cursorEnd'      => $cursor_end,
+			'cycleComplete'  => $cycle_complete,
 			'estimatedTotal' => $estimated_total,
 		);
 	}
 
+	/**
+	 * Discover legacy raster candidates for refresh, including very old Mobo
+	 * attachments that predate attachment-level image identity metadata.
+	 * Ownership is resolved later from Mobo product references or the current
+	 * image queue catalog; unrelated site images are ignored.
+	 *
+	 * @param int    $limit Limit.
+	 * @param string $cursor_option Cursor option.
+	 * @return array
+	 */
+	private function get_legacy_refresh_attachment_batch( $limit, $cursor_option ) {
+		global $wpdb;
+
+		$limit         = max( 1, min( 5000, absint( $limit ) ) );
+		$cursor_option = sanitize_key( (string) $cursor_option );
+		$cursor_start  = absint( get_option( $cursor_option, 0 ) );
+		$fetch_limit   = $limit + 1;
+		$jpg_like      = '%.jpg';
+		$jpeg_like     = '%.jpeg';
+		$png_like      = '%.png';
+
+		$base_sql = "FROM {$wpdb->posts} p
+			LEFT JOIN {$wpdb->postmeta} attached
+				ON attached.post_id = p.ID
+				AND attached.meta_key = '_wp_attached_file'
+			WHERE p.post_type = 'attachment'
+				AND p.post_status IN ('inherit', 'private')
+				AND (
+					p.post_mime_type IN ('image/jpeg', 'image/png')
+					OR LOWER(attached.meta_value) LIKE %s
+					OR LOWER(attached.meta_value) LIKE %s
+					OR LOWER(attached.meta_value) LIKE %s
+					OR EXISTS (
+						SELECT 1 FROM {$wpdb->postmeta} marker
+						WHERE marker.post_id = p.ID
+							AND marker.meta_key IN ('image_guid', 'img_guid', 'mobo_source_url')
+					)
+				)";
+
+		$estimated_total = absint(
+			$wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) {$base_sql}",
+					$jpg_like,
+					$jpeg_like,
+					$png_like
+				)
+			)
+		);
+
+		$ids = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT DISTINCT p.ID {$base_sql}
+					AND p.ID > %d
+					ORDER BY p.ID ASC
+					LIMIT %d",
+				$jpg_like,
+				$jpeg_like,
+				$png_like,
+				$cursor_start,
+				$fetch_limit
+			)
+		);
+
+		$ids            = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		$has_more       = count( $ids ) > $limit;
+		$ids            = array_slice( $ids, 0, $limit );
+		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
+		$cycle_complete = ! $has_more;
+
+		update_option( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
+
+		return array(
+			'ids'            => $ids,
+			'cursorStart'    => $cursor_start,
+			'cursorEnd'      => $cursor_end,
+			'cycleComplete'  => $cycle_complete,
+			'estimatedTotal' => $estimated_total,
+		);
+	}
 
 
 	/**
@@ -1086,15 +1470,17 @@ class Mobo_Core_Image_Refresh_Service {
 		$has_more       = count( $ids ) > $limit;
 		$ids            = array_slice( $ids, 0, $limit );
 		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
-		$cycle_complete = ! $has_more;
+		$cycle_complete = empty( $ids ) && ! $has_more;
 
-		update_option( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
-
+		/* Do not advance the durable cursor here. Stage 6/7 can contain expensive
+		 * reference work and PHP may be interrupted mid-batch. The caller advances
+		 * the cursor only after each attachment was actually processed. */
 		return array(
-			'ids'           => $ids,
-			'cursorStart'   => $cursor_start,
-			'cursorEnd'     => $cursor_end,
-			'cycleComplete' => $cycle_complete,
+			'ids'            => $ids,
+			'cursorStart'    => $cursor_start,
+			'cursorEnd'      => $cursor_end,
+			'cycleComplete'  => $cycle_complete,
+			'hasMore'        => $has_more,
 			'estimatedTotal' => $estimated_total,
 		);
 	}
@@ -1240,14 +1626,12 @@ class Mobo_Core_Image_Refresh_Service {
 	/**
 	 * Audit or delete legacy attachments that were already replaced successfully.
 	 *
-	 * This handles the safe dry-run workflow where product replacement was allowed
-	 * while old-attachment deletion was disabled. It never treats a registered old
-	 * attachment as an orphan; instead it follows the durable replacement metadata,
-	 * verifies the replacement WebP and its cuts, then reuses the same conservative
-	 * deletion checks as normal queue processing.
+	 * Scan mode is strictly read-only. Delete mode first migrates known references
+	 * from the old attachment/URLs to the verified WebP replacement and only then
+	 * performs the final conservative reference audit and attachment deletion.
 	 *
 	 * @param int  $limit Limit.
-	 * @param bool $delete Whether safe deletion should be attempted.
+	 * @param bool $delete Whether reference migration + safe deletion should be attempted.
 	 * @return array
 	 */
 	public function audit_replaced_legacy_attachments( $limit = 500, $delete = false ) {
@@ -1255,48 +1639,44 @@ class Mobo_Core_Image_Refresh_Service {
 		$cursor_option = $delete ? self::REPLACED_DELETE_CURSOR_OPTION : self::REPLACED_SCAN_CURSOR_OPTION;
 		$option_name   = $delete ? 'mobo_core_image_refresh_last_replaced_delete' : 'mobo_core_image_refresh_last_replaced_scan';
 
+		/* Reference cleanup is intentionally much smaller than the generic image
+		 * scan batch. Large metadata tables can make one old attachment expensive. */
+		$limit = max( 1, min( $delete ? 5 : 50, absint( $limit ) ) );
+
+		$empty_result = array(
+			'mode'                     => $delete ? 'delete' : 'scan',
+			'scanned'                  => 0,
+			'ready'                    => 0,
+			'deleted'                  => 0,
+			'failed'                   => 0,
+			'blocked'                  => 0,
+			'errors'                   => 0,
+			'stillUsed'                => 0,
+			'externalReferences'       => 0,
+			'migrationCandidates'      => 0,
+			'referencesMigrated'       => 0,
+			'referenceRowsUpdated'     => 0,
+			'referenceMigrationErrors' => 0,
+			'remainingReferences'      => 0,
+			'invalidReplacement'       => 0,
+			'invalidSubsizes'          => 0,
+			'issues'                   => array(),
+			'cursorStart'              => absint( get_option( $cursor_option, 0 ) ),
+			'cursorEnd'                => absint( get_option( $cursor_option, 0 ) ),
+			'cycleComplete'            => false,
+			'checkedAt'                => time(),
+		);
+
 		if ( ! $this->is_unlocked() ) {
-			$result = $this->locked_result(
-				array(
-					'mode'               => $delete ? 'delete' : 'scan',
-					'scanned'            => 0,
-					'ready'              => 0,
-					'deleted'            => 0,
-					'failed'             => 0,
-					'stillUsed'          => 0,
-					'externalReferences' => 0,
-					'invalidReplacement' => 0,
-					'invalidSubsizes'    => 0,
-					'issues'             => array(),
-					'cursorStart'        => absint( get_option( $cursor_option, 0 ) ),
-					'cursorEnd'          => absint( get_option( $cursor_option, 0 ) ),
-					'cycleComplete'      => false,
-					'checkedAt'          => time(),
-				)
-			);
+			$result = $this->locked_result( $empty_result );
 			update_option( $option_name, $result, false );
 			return $result;
 		}
 
 		if ( $delete && ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
-			$result = array(
-				'mode'               => 'delete',
-				'status'             => 'disabled',
-				'message'            => 'ابتدا گزینه حذف پیوست قدیمی بعد از جایگزینی امن را فعال و تنظیمات را ذخیره کنید.',
-				'scanned'            => 0,
-				'ready'              => 0,
-				'deleted'            => 0,
-				'failed'             => 0,
-				'stillUsed'          => 0,
-				'externalReferences' => 0,
-				'invalidReplacement' => 0,
-				'invalidSubsizes'    => 0,
-				'issues'             => array(),
-				'cursorStart'        => absint( get_option( $cursor_option, 0 ) ),
-				'cursorEnd'          => absint( get_option( $cursor_option, 0 ) ),
-				'cycleComplete'      => false,
-				'checkedAt'          => time(),
-			);
+			$result            = $empty_result;
+			$result['status']  = 'disabled';
+			$result['message'] = 'ابتدا گزینه حذف پیوست قدیمی بعد از جایگزینی امن را فعال و تنظیمات را ذخیره کنید.';
 			update_option( $option_name, $result, false );
 			return $result;
 		}
@@ -1311,29 +1691,45 @@ class Mobo_Core_Image_Refresh_Service {
 			&& empty( $previous['cycleComplete'] )
 			&& ( isset( $previous['mode'] ) ? (string) $previous['mode'] : '' ) === ( $delete ? 'delete' : 'scan' );
 
-		$result = array(
-			'mode'               => $delete ? 'delete' : 'scan',
-			'status'             => 'processed',
-			'scanned'            => $continue_cycle ? absint( isset( $previous['scanned'] ) ? $previous['scanned'] : 0 ) : 0,
-			'ready'              => $continue_cycle ? absint( isset( $previous['ready'] ) ? $previous['ready'] : 0 ) : 0,
-			'deleted'            => $continue_cycle ? absint( isset( $previous['deleted'] ) ? $previous['deleted'] : 0 ) : 0,
-			'failed'             => $continue_cycle ? absint( isset( $previous['failed'] ) ? $previous['failed'] : 0 ) : 0,
-			'stillUsed'          => $continue_cycle ? absint( isset( $previous['stillUsed'] ) ? $previous['stillUsed'] : 0 ) : 0,
-			'externalReferences' => $continue_cycle ? absint( isset( $previous['externalReferences'] ) ? $previous['externalReferences'] : 0 ) : 0,
-			'invalidReplacement' => $continue_cycle ? absint( isset( $previous['invalidReplacement'] ) ? $previous['invalidReplacement'] : 0 ) : 0,
-			'invalidSubsizes'    => $continue_cycle ? absint( isset( $previous['invalidSubsizes'] ) ? $previous['invalidSubsizes'] : 0 ) : 0,
-			'issues'             => $continue_cycle && ! empty( $previous['issues'] ) && is_array( $previous['issues'] ) ? array_slice( $previous['issues'], 0, 20 ) : array(),
-			'cursorStart'        => $cursor_start,
-			'cursorEnd'          => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
-			'cycleComplete'      => ! empty( $batch['cycleComplete'] ),
-			'estimatedTotal'      => isset( $batch['estimatedTotal'] ) ? absint( $batch['estimatedTotal'] ) : 0,
-			'cycleStartedAt'     => $continue_cycle && ! empty( $previous['cycleStartedAt'] ) ? absint( $previous['cycleStartedAt'] ) : time(),
-			'checkedAt'          => time(),
-		);
+		$result = $empty_result;
+		$result['status']         = 'processing';
+		$result['cursorStart']    = $cursor_start;
+		$result['cursorEnd']      = $cursor_start;
+		$result['cycleComplete']  = false;
+		$result['estimatedTotal'] = isset( $batch['estimatedTotal'] ) ? absint( $batch['estimatedTotal'] ) : 0;
+		$result['cycleStartedAt'] = $continue_cycle && ! empty( $previous['cycleStartedAt'] ) ? absint( $previous['cycleStartedAt'] ) : time();
+		$result['checkedAt']      = time();
+
+		if ( $continue_cycle ) {
+			foreach ( array( 'scanned', 'ready', 'deleted', 'failed', 'blocked', 'errors', 'stillUsed', 'externalReferences', 'migrationCandidates', 'referencesMigrated', 'referenceRowsUpdated', 'referenceMigrationErrors', 'remainingReferences', 'invalidReplacement', 'invalidSubsizes' ) as $counter ) {
+				$result[ $counter ] = absint( isset( $previous[ $counter ] ) ? $previous[ $counter ] : 0 );
+			}
+			$result['issues'] = ! empty( $previous['issues'] ) && is_array( $previous['issues'] ) ? array_slice( $previous['issues'], 0, 20 ) : array();
+		}
+
+		/* Expose a running heartbeat before expensive work starts. */
+		update_option( $option_name, $result, false );
+
+		if ( empty( $attachment_ids ) ) {
+			$result['status']           = 'processed';
+			$result['cycleComplete']    = true;
+			$result['passProgress']     = 0;
+			$result['stableComplete']   = $delete;
+			$result['needsAnotherPass'] = false;
+			$result['checkedAt']        = time();
+			update_option( $cursor_option, 0, false );
+			update_option( $option_name, $result, false );
+			return $result;
+		}
+
+		$processed_in_batch = 0;
+		$batch_started      = microtime( true );
+		$time_budget        = $delete ? 8.0 : 12.0;
 
 		foreach ( $attachment_ids as $old_attachment_id ) {
 			$old_attachment_id = absint( $old_attachment_id );
 			$result['scanned']++;
+			$processed_in_batch++;
 			$new_attachment_id = absint( get_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) );
 			$reason            = '';
 
@@ -1345,29 +1741,49 @@ class Mobo_Core_Image_Refresh_Service {
 				if ( empty( $health['healthy'] ) ) {
 					$result['invalidSubsizes']++;
 					$reason = 'برش های تصویر WebP جایگزین کامل نیست: ' . ( isset( $health['message'] ) ? (string) $health['message'] : 'خطای نامشخص' );
-				} elseif ( $this->count_all_products_using_attachment( $old_attachment_id ) > 0 ) {
-					$result['stillUsed']++;
-					$reason = 'این پیوست قدیمی هنوز توسط یک یا چند محصول استفاده می شود.';
-				} elseif ( $this->attachment_has_external_references( $old_attachment_id ) ) {
-					$result['externalReferences']++;
-					$reason = 'این پیوست قدیمی هنوز در محتوا، متادیتا، دسته بندی یا تنظیمات سایت مرجع دارد.';
+				} elseif ( ! $delete ) {
+					/* Stage 6 verifies replacement health only. The expensive global
+					 * reference migration/audit belongs to Stage 7 and runs once. */
+					$product_refs = $this->count_all_products_using_attachment( $old_attachment_id );
+					if ( $product_refs > 0 ) {
+						$result['stillUsed']++;
+					}
+					$result['migrationCandidates']++;
+					$reason = $product_refs > 0
+						? 'پیوست قدیمی هنوز در محصول مرجع دارد؛ مرحله ۷ ابتدا مرجع را به WebP منتقل و سپس ایمنی حذف را بررسی می کند.'
+						: 'WebP جایگزین معتبر است؛ مرحله ۷ انتقال مراجع ساختاری و Audit نهایی را انجام می دهد و فقط در صورت صفر شدن مراجع حذف می کند.';
 				} else {
-					$result['ready']++;
-					if ( $delete ) {
-						$delete_result = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
-						if ( ! empty( $delete_result['deleted'] ) ) {
-							$result['deleted']++;
-							continue;
-						}
-						$result['failed']++;
-						$reason = isset( $delete_result['message'] ) ? (string) $delete_result['message'] : 'حذف پیوست قدیمی ناموفق بود.';
+					$delete_result = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
+					$migration     = isset( $delete_result['referenceMigration'] ) && is_array( $delete_result['referenceMigration'] ) ? $delete_result['referenceMigration'] : array();
+					if ( ! empty( $migration['attempted'] ) && absint( isset( $migration['updatedRows'] ) ? $migration['updatedRows'] : 0 ) > 0 ) {
+						$result['referencesMigrated']++;
+					}
+					$result['referenceRowsUpdated'] += absint( isset( $migration['updatedRows'] ) ? $migration['updatedRows'] : 0 );
+					$result['referenceMigrationErrors'] += absint( isset( $migration['errors'] ) ? $migration['errors'] : 0 );
+
+					if ( ! empty( $delete_result['deleted'] ) ) {
+						$result['ready']++;
+						$result['deleted']++;
 					} else {
-						continue;
+						$result['failed']++; // Backward-compatible aggregate: blocked + operational errors.
+						$outcome = isset( $delete_result['outcome'] ) ? sanitize_key( (string) $delete_result['outcome'] ) : 'blocked';
+						if ( 'error' === $outcome ) {
+							$result['errors']++;
+						} else {
+							$result['blocked']++;
+						}
+						if ( ! empty( $delete_result['remainingReferences'] ) ) {
+							$result['remainingReferences']++;
+						}
+						$reason = isset( $delete_result['message'] ) ? (string) $delete_result['message'] : 'پیوست قدیمی برای بررسی بعدی نگه داشته شد.';
+						if ( ! empty( $delete_result['referenceLocations'] ) && is_array( $delete_result['referenceLocations'] ) ) {
+							$reason .= ' محل مرجع: ' . implode( '، ', array_slice( array_map( 'sanitize_text_field', $delete_result['referenceLocations'] ), 0, 5 ) );
+						}
 					}
 				}
 			}
 
-			if ( count( $result['issues'] ) < 20 ) {
+			if ( '' !== $reason && count( $result['issues'] ) < 20 ) {
 				$old_file = get_attached_file( $old_attachment_id );
 				$result['issues'][] = array(
 					'oldAttachmentId' => $old_attachment_id,
@@ -1376,7 +1792,43 @@ class Mobo_Core_Image_Refresh_Service {
 					'reason'          => sanitize_text_field( $reason ),
 				);
 			}
+
+			/* Advance only after this attachment completed. */
+			$result['cursorEnd'] = $old_attachment_id;
+			$result['checkedAt'] = time();
+			update_option( $cursor_option, $old_attachment_id, false );
+			update_option( $option_name, $result, false );
+
+			if ( ( microtime( true ) - $batch_started ) >= $time_budget ) {
+				break;
+			}
 		}
+
+		$processed_all_fetched   = $processed_in_batch >= count( $attachment_ids );
+		$has_more                = ! empty( $batch['hasMore'] );
+		$result['cycleComplete'] = $processed_all_fetched && ! $has_more;
+		$result['status']        = 'processed';
+		$result['checkedAt']     = time();
+
+		if ( $result['cycleComplete'] ) {
+			update_option( $cursor_option, 0, false );
+		} elseif ( $processed_in_batch <= 0 ) {
+			update_option( $cursor_option, $cursor_start, false );
+		}
+
+		/* A Stage 7 pass is final only when a full pass makes no new progress.
+		 * If references were migrated or attachments were deleted, another pass can
+		 * expose newly-deletable attachments and must be scheduled automatically. */
+		$result['passProgress'] = $delete
+			? absint( isset( $result['deleted'] ) ? $result['deleted'] : 0 )
+				+ absint( isset( $result['referenceRowsUpdated'] ) ? $result['referenceRowsUpdated'] : 0 )
+			: 0;
+		$result['stableComplete'] = $delete
+			&& ! empty( $result['cycleComplete'] )
+			&& 0 === absint( $result['passProgress'] );
+		$result['needsAnotherPass'] = $delete
+			&& ! empty( $result['cycleComplete'] )
+			&& absint( $result['passProgress'] ) > 0;
 
 		update_option( $option_name, $result, false );
 		return $result;
@@ -1546,7 +1998,7 @@ class Mobo_Core_Image_Refresh_Service {
 		delete_option( 'mobo_core_image_refresh_last_replaced_scan' );
 		delete_option( 'mobo_core_image_refresh_last_replaced_delete' );
 
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		/* Keep the administrator's persistent old-attachment deletion preference. */
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 
 		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
@@ -2193,130 +2645,799 @@ class Mobo_Core_Image_Refresh_Service {
 	}
 
 	/**
-	 * Check if attachment is used in post content.
+	 * Build exact text replacements for one verified old -> new attachment pair.
+	 * Original URLs, registered WordPress subsize URLs, relative URL paths,
+	 * basenames and the wp-image-* class are included.
+	 *
+	 * @param int $old_attachment_id Old attachment.
+	 * @param int $new_attachment_id New attachment.
+	 * @return array
+	 */
+	private function build_attachment_text_replacement_map( $old_attachment_id, $new_attachment_id ) {
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		$map               = array();
+
+		if ( $old_attachment_id <= 0 || $new_attachment_id <= 0 ) {
+			return $map;
+		}
+
+		$map[ 'wp-image-' . $old_attachment_id ] = 'wp-image-' . $new_attachment_id;
+		$map[ 'attachment_' . $old_attachment_id ] = 'attachment_' . $new_attachment_id;
+		$old_url = wp_get_attachment_url( $old_attachment_id );
+		$new_url = wp_get_attachment_url( $new_attachment_id );
+		$this->append_attachment_url_replacement( $map, $old_url, $new_url );
+
+		$old_meta = wp_get_attachment_metadata( $old_attachment_id );
+		$new_meta = wp_get_attachment_metadata( $new_attachment_id );
+		$old_meta = is_array( $old_meta ) ? $old_meta : array();
+		$new_meta = is_array( $new_meta ) ? $new_meta : array();
+
+		$old_sizes = isset( $old_meta['sizes'] ) && is_array( $old_meta['sizes'] ) ? $old_meta['sizes'] : array();
+		$new_sizes = isset( $new_meta['sizes'] ) && is_array( $new_meta['sizes'] ) ? $new_meta['sizes'] : array();
+		if ( is_string( $old_url ) && '' !== $old_url && is_string( $new_url ) && '' !== $new_url ) {
+			$old_dir = trailingslashit( dirname( $old_url ) );
+			$new_dir = trailingslashit( dirname( $new_url ) );
+			foreach ( $old_sizes as $size_name => $old_size ) {
+				if ( empty( $old_size['file'] ) || empty( $new_sizes[ $size_name ]['file'] ) ) {
+					continue;
+				}
+				$this->append_attachment_url_replacement(
+					$map,
+					$old_dir . ltrim( (string) $old_size['file'], '/' ),
+					$new_dir . ltrim( (string) $new_sizes[ $size_name ]['file'], '/' )
+				);
+			}
+		}
+
+		uksort(
+			$map,
+			static function ( $left, $right ) {
+				return strlen( (string) $right ) <=> strlen( (string) $left );
+			}
+		);
+
+		return $map;
+	}
+
+	/**
+	 * Add URL, URL-path and basename forms to a replacement map.
+	 *
+	 * @param array  $map Map by reference.
+	 * @param string $old_url Old URL.
+	 * @param string $new_url New URL.
+	 * @return void
+	 */
+	private function append_attachment_url_replacement( &$map, $old_url, $new_url ) {
+		$old_url = is_string( $old_url ) ? trim( $old_url ) : '';
+		$new_url = is_string( $new_url ) ? trim( $new_url ) : '';
+		if ( '' === $old_url || '' === $new_url || $old_url === $new_url ) {
+			return;
+		}
+
+		$map[ $old_url ] = $new_url;
+		$old_path = (string) wp_parse_url( $old_url, PHP_URL_PATH );
+		$new_path = (string) wp_parse_url( $new_url, PHP_URL_PATH );
+		if ( '' !== $old_path && '' !== $new_path && $old_path !== $new_path ) {
+			$map[ $old_path ] = $new_path;
+		}
+
+		$old_base = basename( $old_path );
+		$new_base = basename( $new_path );
+		if ( '' !== $old_base && '' !== $new_base && $old_base !== $new_base ) {
+			$map[ $old_base ] = $new_base;
+		}
+	}
+
+	/**
+	 * Return searchable tokens that prove an attachment is still referenced.
 	 *
 	 * @param int $attachment_id Attachment ID.
-	 * @return bool
+	 * @return array
 	 */
-	private function attachment_used_in_content( $attachment_id ) {
-		global $wpdb;
-
+	private function get_attachment_reference_tokens( $attachment_id ) {
 		$attachment_id = absint( $attachment_id );
 		if ( $attachment_id <= 0 ) {
+			return array();
+		}
+
+		$tokens = array( 'wp-image-' . $attachment_id, 'attachment_' . $attachment_id );
+		$url    = wp_get_attachment_url( $attachment_id );
+		$meta   = wp_get_attachment_metadata( $attachment_id );
+		$meta   = is_array( $meta ) ? $meta : array();
+
+		if ( is_string( $url ) && '' !== $url ) {
+			$tokens[] = $url;
+			$path     = (string) wp_parse_url( $url, PHP_URL_PATH );
+			if ( '' !== $path ) {
+				$tokens[] = $path;
+				$tokens[] = basename( $path );
+			}
+			$dir   = trailingslashit( dirname( $url ) );
+			$sizes = isset( $meta['sizes'] ) && is_array( $meta['sizes'] ) ? $meta['sizes'] : array();
+			foreach ( $sizes as $size ) {
+				if ( empty( $size['file'] ) ) {
+					continue;
+				}
+				$size_url = $dir . ltrim( (string) $size['file'], '/' );
+				$tokens[] = $size_url;
+				$size_path = (string) wp_parse_url( $size_url, PHP_URL_PATH );
+				if ( '' !== $size_path ) {
+					$tokens[] = $size_path;
+					$tokens[] = basename( $size_path );
+				}
+			}
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'strval', $tokens ) ) ) );
+	}
+
+	/**
+	 * Prepare a SQL fragment for scalar/serialized attachment IDs and known URL tokens.
+	 *
+	 * @param string $column SQL column name generated internally.
+	 * @param int    $attachment_id Attachment ID.
+	 * @param array  $tokens Search tokens.
+	 * @param array  $params Prepared-query parameters by reference.
+	 * @return string
+	 */
+	private function build_attachment_reference_sql( $column, $attachment_id, $tokens, &$params ) {
+		global $wpdb;
+		$value      = (string) absint( $attachment_id );
+		$conditions = array( $column . ' = %s', $column . ' LIKE %s', $column . ' LIKE %s' );
+		$params[]   = $value;
+		$params[]   = '%i:' . $wpdb->esc_like( $value ) . ';%';
+		$params[]   = '%s:' . strlen( $value ) . ':"' . $wpdb->esc_like( $value ) . '";%';
+
+		/* Common JSON/block representations. These are guard patterns only; a generic
+		 * "id" value is migrated automatically only when the same value also contains
+		 * an old image URL/token. Otherwise deletion remains blocked conservatively. */
+		foreach ( array( '"id":' . $value, '"id":"' . $value . '"', '"attachment_id":' . $value, '"attachmentId":' . $value, '"image_id":' . $value, '"imageId":' . $value, '"media_id":' . $value, '"mediaId":' . $value, '"thumbnail_id":' . $value, '"thumbnailId":' . $value, '"featured_image_id":' . $value, '"featuredImageId":' . $value, '"custom_logo":' . $value, '"site_icon":' . $value ) as $json_token ) {
+			$conditions[] = $column . ' LIKE %s';
+			$params[]     = '%' . $wpdb->esc_like( $json_token ) . '%';
+		}
+		foreach ( array( '"id"', '"attachment_id"', '"attachmentId"', '"image_id"', '"imageId"', '"media_id"', '"mediaId"', '"thumbnail_id"', '"thumbnailId"', '"featured_image_id"', '"featuredImageId"', '"custom_logo"', '"site_icon"', '"image"', '"images"', '"gallery"', '"media"', '"thumbnail"', '"featured_image"', '"background_image"', '"logo"' ) as $json_key ) {
+			$conditions[] = $column . ' LIKE %s';
+			$params[]     = '%' . $wpdb->esc_like( $json_key ) . '%' . $wpdb->esc_like( $value ) . '%';
+		}
+
+		foreach ( is_array( $tokens ) ? $tokens : array() as $token ) {
+			$token = (string) $token;
+			if ( strlen( $token ) < 4 ) {
+				continue;
+			}
+			$conditions[] = $column . ' LIKE %s';
+			$params[]     = '%' . $wpdb->esc_like( $token ) . '%';
+		}
+
+		return '(' . implode( ' OR ', $conditions ) . ')';
+	}
+
+	/**
+	 * Normalize one reference-structure key for conservative media matching.
+	 *
+	 * @param mixed $key Array/object key.
+	 * @return string
+	 */
+	private function normalize_reference_key( $key ) {
+		$key = strtolower( trim( (string) $key ) );
+		$key = str_replace( array( '-', ' ', '.' ), '_', $key );
+		return preg_replace( '/_+/', '_', $key );
+	}
+
+	/**
+	 * Whether a key explicitly represents an attachment/media ID.
+	 * Generic "id" is intentionally excluded and requires local image evidence.
+	 *
+	 * @param mixed $key Array/object key.
+	 * @return bool
+	 */
+	private function is_explicit_media_id_key( $key ) {
+		$key = $this->normalize_reference_key( $key );
+		return in_array(
+			$key,
+			array(
+				'attachment_id',
+				'attachmentid',
+				'image_id',
+				'imageid',
+				'media_id',
+				'mediaid',
+				'thumbnail_id',
+				'thumbnailid',
+				'_thumbnail_id',
+				'featured_image_id',
+				'featuredimageid',
+				'custom_logo',
+				'site_icon',
+			),
+			true
+		);
+	}
+
+	/**
+	 * Whether a key denotes a container that is expected to hold media data.
+	 * This lets JSON/serialized lists such as gallery/image structures migrate
+	 * their numeric attachment IDs without treating every generic ID as media.
+	 *
+	 * @param mixed $key Array/object key.
+	 * @return bool
+	 */
+	private function is_media_container_key( $key ) {
+		$key = $this->normalize_reference_key( $key );
+		if ( '' === $key ) {
 			return false;
 		}
 
-		$url      = wp_get_attachment_url( $attachment_id );
-		$patterns = array( 'wp-image-' . $attachment_id );
-
-		if ( is_string( $url ) && '' !== $url ) {
-			$patterns[] = $url;
-			$patterns[] = basename( wp_parse_url( $url, PHP_URL_PATH ) );
+		if ( in_array( $key, array( 'image', 'images', 'gallery', 'media', 'thumbnail', 'featured_image', 'background_image', 'background_overlay_image', 'logo' ), true ) ) {
+			return true;
 		}
 
-		foreach ( array_filter( $patterns ) as $pattern ) {
-			$count = $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status NOT IN ('trash', 'auto-draft') AND post_content LIKE %s",
-					'%' . $wpdb->esc_like( (string) $pattern ) . '%'
-				)
-			);
+		return (bool) preg_match( '/(?:^|_)(?:image|images|gallery|media|thumbnail|logo)$/', $key );
+	}
 
-			if ( absint( $count ) > 0 ) {
-				return true;
+	/**
+	 * Check a decoded JSON/serialized node for a verified old-image text token.
+	 * Object inspection is limited to public properties; inaccessible properties
+	 * remain untouched and the final database audit will keep deletion blocked.
+	 *
+	 * @param mixed $value Decoded value.
+	 * @param array $text_map Old => new text replacements.
+	 * @param int   $depth Recursion depth.
+	 * @return bool
+	 */
+	private function reference_value_has_old_image_evidence( $value, $text_map, $depth = 0 ) {
+		if ( $depth > 32 ) {
+			return false;
+		}
+
+		$contains_token = static function ( $candidate ) use ( $text_map ) {
+			if ( ! is_string( $candidate ) ) {
+				return false;
+			}
+			foreach ( array_keys( is_array( $text_map ) ? $text_map : array() ) as $old_token ) {
+				$old_token = (string) $old_token;
+				if ( strlen( $old_token ) >= 4 && false !== strpos( $candidate, $old_token ) ) {
+					return true;
+				}
+			}
+			return false;
+		};
+
+		if ( is_string( $value ) ) {
+			return $contains_token( $value );
+		}
+
+		/* Evidence is intentionally local to direct scalar properties. Deep
+		 * descendants are evaluated when recursion reaches their own node, which
+		 * prevents one old image URL from authorizing unrelated generic IDs in a
+		 * large Elementor/page-builder document. */
+		if ( is_array( $value ) ) {
+			foreach ( $value as $item ) {
+				if ( $contains_token( $item ) ) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		if ( is_object( $value ) ) {
+			foreach ( get_object_vars( $value ) as $item ) {
+				if ( $contains_token( $item ) ) {
+					return true;
+				}
 			}
 		}
 
 		return false;
 	}
 
-
 	/**
-	 * Protect attachment IDs referenced outside WooCommerce image fields.
+	 * Decode a JSON object/array string without changing scalar strings.
+	 * Decoding to objects (rather than associative arrays) preserves the JSON
+	 * distinction between {} and [] when it is encoded again.
 	 *
-	 * Deletion is intentionally conservative. Exact scalar IDs and common
-	 * serialized integer/string representations are checked in post, term and
-	 * user metadata plus options. False positives keep a legacy attachment; they
-	 * never cause data loss.
-	 *
-	 * @param int $attachment_id Attachment ID.
+	 * @param string $value Raw string.
+	 * @param mixed  $decoded Decoded value by reference.
 	 * @return bool
 	 */
-	private function attachment_has_external_references( $attachment_id ) {
+	private function decode_reference_json( $value, &$decoded ) {
+		$value = trim( (string) $value );
+		if ( strlen( $value ) < 2 || ! in_array( $value[0], array( '{', '[' ), true ) ) {
+			return false;
+		}
+
+		$decoded = json_decode( $value, false, 512, JSON_BIGINT_AS_STRING );
+		return JSON_ERROR_NONE === json_last_error() && ( is_array( $decoded ) || is_object( $decoded ) );
+	}
+
+	/**
+	 * Replace an attachment reference inside plain text, JSON, PHP-serialized
+	 * arrays/objects and nested combinations of those formats.
+	 *
+	 * JSON is decoded and encoded structurally. PHP serialized values are opened
+	 * with WordPress maybe_unserialize()/is_serialized() and reserialized after
+	 * recursive mutation, so string-length markers are never edited manually.
+	 *
+	 * Generic keys named "id" are migrated only when their local structure also
+	 * contains a verified old image URL/token, or when the containing key is an
+	 * explicit media container. Unknown/private object state remains unchanged and
+	 * therefore continues to block deletion during the final reference audit.
+	 *
+	 * @param mixed  $value Value.
+	 * @param int    $old_attachment_id Old attachment.
+	 * @param int    $new_attachment_id New attachment.
+	 * @param array  $text_map Text replacements.
+	 * @param string $context_key Metadata/option/structure key.
+	 * @param int    $changes Change counter by reference.
+	 * @param int    $depth Recursion depth.
+	 * @param bool   $parent_evidence Parent node contains verified old-image text.
+	 * @param bool   $parent_media_context Parent node is explicitly media-shaped.
+	 * @return mixed
+	 */
+	private function migrate_reference_value( $value, $old_attachment_id, $new_attachment_id, $text_map, $context_key, &$changes, $depth = 0, $parent_evidence = false, $parent_media_context = false ) {
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		if ( $depth > 32 ) {
+			return $value;
+		}
+
+		$normalized_key = $this->normalize_reference_key( $context_key );
+		$allow_exact_id = 0 === $depth
+			|| $this->is_explicit_media_id_key( $context_key )
+			|| ( 'id' === $normalized_key && $parent_evidence )
+			|| ( $parent_media_context && ( 'id' === $normalized_key || ctype_digit( (string) $context_key ) ) );
+
+		if ( is_int( $value ) && $value === $old_attachment_id && $allow_exact_id ) {
+			$changes++;
+			return $new_attachment_id;
+		}
+
+		if ( is_string( $value ) ) {
+			/* Nested serialized strings must be decoded and serialized again; direct
+			 * text replacement would corrupt PHP serialization length markers. */
+			if ( function_exists( 'is_serialized' ) && is_serialized( $value ) ) {
+				$decoded_serialized = maybe_unserialize( $value );
+				$nested_changes     = 0;
+				$decoded_serialized = $this->migrate_reference_value( $decoded_serialized, $old_attachment_id, $new_attachment_id, $text_map, $context_key, $nested_changes, $depth + 1, $parent_evidence, $parent_media_context );
+				if ( $nested_changes > 0 ) {
+					$changes += $nested_changes;
+					return serialize( $decoded_serialized );
+				}
+			}
+
+			/* Elementor and many builders store JSON directly in metadata. Parse the
+			 * complete structure first; regex is only a fallback for mixed HTML/text. */
+			$decoded_json = null;
+			if ( $this->decode_reference_json( $value, $decoded_json ) ) {
+				$json_changes = 0;
+				$decoded_json = $this->migrate_reference_value( $decoded_json, $old_attachment_id, $new_attachment_id, $text_map, $context_key, $json_changes, $depth + 1, false, $this->is_media_container_key( $context_key ) );
+				if ( $json_changes > 0 ) {
+					$encoded_json = wp_json_encode( $decoded_json, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+					if ( false !== $encoded_json ) {
+						$changes += $json_changes;
+						return $encoded_json;
+					}
+				}
+			}
+
+			if ( $value === (string) $old_attachment_id && $allow_exact_id ) {
+				$changes++;
+				return (string) $new_attachment_id;
+			}
+
+			$has_old_text_token = $parent_evidence || $this->reference_value_has_old_image_evidence( $value, $text_map );
+
+			/* Explicit media-ID keys in mixed HTML/JSON fragments are safe to migrate. */
+			$explicit_pattern = '/((?:["\']?(?:attachment_id|attachmentId|image_id|imageId|media_id|mediaId|thumbnail_id|thumbnailId)["\']?\\s*[:=]\\s*["\']?))' . preg_quote( (string) $old_attachment_id, '/' ) . '(["\']?)/';
+			$value = preg_replace( $explicit_pattern, '${1}' . $new_attachment_id . '${2}', $value, -1, $explicit_count );
+			if ( $explicit_count > 0 ) {
+				$changes += $explicit_count;
+			}
+
+			$html_pattern = '/((?:data-attachment-id|data-image-id|data-media-id)\\s*=\\s*["\'])' . preg_quote( (string) $old_attachment_id, '/' ) . '(["\'])/i';
+			$value = preg_replace( $html_pattern, '${1}' . $new_attachment_id . '${2}', $value, -1, $html_count );
+			if ( $html_count > 0 ) {
+				$changes += $html_count;
+			}
+
+			/* Generic JSON/block id is changed only when the same fragment also proves
+			 * the old image through URL/basename/wp-image evidence. */
+			if ( $has_old_text_token ) {
+				$generic_id_pattern = '/((["\']id["\']\\s*:\\s*["\']?))' . preg_quote( (string) $old_attachment_id, '/' ) . '(["\']?)/';
+				$value = preg_replace( $generic_id_pattern, '${1}' . $new_attachment_id . '${3}', $value, -1, $generic_id_count );
+				if ( $generic_id_count > 0 ) {
+					$changes += $generic_id_count;
+				}
+			}
+
+			$gallery_shortcode_count = 0;
+			$value = preg_replace_callback(
+				'/((?:ids|include)\\s*=\\s*["\'])([^"\']*)(["\'])/i',
+				static function ( $matches ) use ( $old_attachment_id, $new_attachment_id, &$gallery_shortcode_count ) {
+					$ids = array_map( 'trim', explode( ',', isset( $matches[2] ) ? (string) $matches[2] : '' ) );
+					foreach ( $ids as &$id ) {
+						if ( $id === (string) $old_attachment_id ) {
+							$id = (string) $new_attachment_id;
+							$gallery_shortcode_count++;
+						}
+					}
+					unset( $id );
+					return $matches[1] . implode( ',', $ids ) . $matches[3];
+				},
+				$value
+			);
+			if ( $gallery_shortcode_count > 0 ) {
+				$changes += $gallery_shortcode_count;
+			}
+
+			if ( '_product_image_gallery' === $context_key && false !== strpos( ',' . $value . ',', ',' . $old_attachment_id . ',' ) ) {
+				$ids = array_map( 'trim', explode( ',', $value ) );
+				foreach ( $ids as &$id ) {
+					if ( $id === (string) $old_attachment_id ) {
+						$id = (string) $new_attachment_id;
+						$changes++;
+					}
+				}
+				unset( $id );
+				$value = implode( ',', $ids );
+			}
+
+			if ( ! empty( $text_map ) ) {
+				$replaced = strtr( $value, $text_map );
+				if ( $replaced !== $value ) {
+					$changes++;
+					$value = $replaced;
+				}
+			}
+			return $value;
+		}
+
+		if ( is_array( $value ) ) {
+			$node_evidence      = $this->reference_value_has_old_image_evidence( $value, $text_map );
+			$node_media_context = $parent_media_context || $this->is_media_container_key( $context_key );
+			foreach ( $value as $key => $item ) {
+				$value[ $key ] = $this->migrate_reference_value( $item, $old_attachment_id, $new_attachment_id, $text_map, (string) $key, $changes, $depth + 1, $node_evidence, $node_media_context );
+			}
+			return $value;
+		}
+
+		if ( is_object( $value ) ) {
+			$node_evidence      = $this->reference_value_has_old_image_evidence( $value, $text_map );
+			$node_media_context = $parent_media_context || $this->is_media_container_key( $context_key );
+			foreach ( get_object_vars( $value ) as $key => $item ) {
+				$child_changes = 0;
+				$new_item = $this->migrate_reference_value( $item, $old_attachment_id, $new_attachment_id, $text_map, (string) $key, $child_changes, $depth + 1, $node_evidence, $node_media_context );
+				if ( $child_changes <= 0 ) {
+					continue;
+				}
+
+				/* Nested objects are mutated in place, so identity can remain equal even
+				 * though public descendants changed. In that case only propagate the
+				 * verified child change count to the parent. */
+				if ( is_object( $item ) && $new_item === $item ) {
+					$changes += $child_changes;
+					continue;
+				}
+
+				try {
+					$value->{$key} = $new_item;
+					$changes += $child_changes;
+				} catch ( Throwable $throwable ) {
+					/* Leave inaccessible/typed object state unchanged. The final reference
+					 * audit will detect it and prevent deleting the old attachment. */
+				}
+			}
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Migrate reference rows in one WordPress metadata table.
+	 *
+	 * @param string $meta_type Metadata type: post, term or user.
+	 * @param string $table Internal table name.
+	 * @param string $meta_id_column Meta-ID column.
+	 * @param string $object_id_column Object-ID column.
+	 * @param string $meta_key_column Meta-key column.
+	 * @param int    $old_attachment_id Old attachment.
+	 * @param int    $new_attachment_id New attachment.
+	 * @param array  $text_map Text replacements.
+	 * @param bool   $exclude_old_attachment Whether old attachment's own postmeta must be skipped.
+	 * @return array
+	 */
+	private function migrate_metadata_reference_rows( $meta_type, $table, $meta_id_column, $object_id_column, $meta_key_column, $old_attachment_id, $new_attachment_id, $text_map, $exclude_old_attachment = false ) {
 		global $wpdb;
+		$result = array( 'updatedRows' => 0, 'updatedValues' => 0, 'errors' => 0 );
+		$params = array();
+		$tokens = array_keys( is_array( $text_map ) ? $text_map : array() );
+		$where  = $this->build_attachment_reference_sql( 'meta_value', $old_attachment_id, $tokens, $params );
 
-		$attachment_id = absint( $attachment_id );
-		if ( $attachment_id <= 0 ) {
-			return true;
+		$extra = '';
+		if ( 'post' === $meta_type ) {
+			$extra = " AND {$meta_key_column} NOT LIKE %s AND {$meta_key_column} NOT IN ('mobo_refreshed_from_attachment_id','mobo_replaces_attachment_id')";
+			$params[] = $wpdb->esc_like( 'mobo_image_refresh_' ) . '%';
+			if ( $exclude_old_attachment ) {
+				$extra .= " AND {$object_id_column} <> %d";
+				$params[] = absint( $old_attachment_id );
+			}
+			$extra .= " OR ({$meta_key_column} = '_product_image_gallery' AND CONCAT(',', meta_value, ',') LIKE %s)";
+			$params[] = '%,' . $wpdb->esc_like( (string) absint( $old_attachment_id ) ) . ',%';
 		}
 
-		if ( $this->attachment_used_in_content( $attachment_id ) ) {
-			return true;
+		$sql = "SELECT {$meta_id_column} AS meta_id, {$object_id_column} AS object_id, {$meta_key_column} AS meta_key, meta_value FROM {$table} WHERE (" . $where . $extra . ')';
+		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+		$rows = $wpdb->get_results( $prepared );
+		if ( ! is_array( $rows ) ) {
+			return $result;
 		}
 
-		$value             = (string) $attachment_id;
-		$serialized_int    = '%i:' . $wpdb->esc_like( $value ) . ';%';
-		$serialized_string = '%s:' . strlen( $value ) . ':\"' . $wpdb->esc_like( $value ) . '\";%';
+		foreach ( $rows as $row ) {
+			$raw     = isset( $row->meta_value ) ? (string) $row->meta_value : '';
+			$value   = maybe_unserialize( $raw );
+			$changes = 0;
+			$key     = isset( $row->meta_key ) ? (string) $row->meta_key : '';
+			$value   = $this->migrate_reference_value( $value, $old_attachment_id, $new_attachment_id, $text_map, $key, $changes );
+			if ( $changes <= 0 ) {
+				continue;
+			}
 
-		$postmeta_count = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->postmeta}
-				WHERE post_id <> %d
-				AND meta_key NOT IN ('_edit_lock', '_edit_last', 'mobo_image_refresh_last_old_attachment_id', 'mobo_refreshed_from_attachment_id', 'mobo_replaces_attachment_id')
-				AND (meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s)",
-				$attachment_id,
-				$value,
-				$serialized_int,
-				$serialized_string
-			)
+			/* Metadata APIs unslash scalar strings before storage. Re-slash JSON/plain
+			 * strings here so decoded/re-encoded builder data is persisted byte-safe. */
+			$update_value = is_string( $value ) ? wp_slash( $value ) : $value;
+			$updated = update_metadata_by_mid( $meta_type, absint( $row->meta_id ), $update_value );
+			if ( false === $updated ) {
+				$result['errors']++;
+				continue;
+			}
+			$result['updatedRows']++;
+			$result['updatedValues'] += $changes;
+
+			if ( 'post' === $meta_type ) {
+				$object_id = absint( isset( $row->object_id ) ? $row->object_id : 0 );
+				if ( $object_id > 0 ) {
+					clean_post_cache( $object_id );
+					if ( function_exists( 'wc_delete_product_transients' ) && in_array( get_post_type( $object_id ), array( 'product', 'product_variation' ), true ) ) {
+						wc_delete_product_transients( $object_id );
+					}
+				}
+			}
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Move safe references from the old attachment to its verified WebP replacement.
+	 *
+	 * @param int $old_attachment_id Old attachment.
+	 * @param int $new_attachment_id New attachment.
+	 * @return array
+	 */
+	private function migrate_attachment_references( $old_attachment_id, $new_attachment_id ) {
+		global $wpdb;
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		$result = array(
+			'attempted'     => true,
+			'updatedRows'   => 0,
+			'updatedValues' => 0,
+			'contentRows'   => 0,
+			'postmetaRows'  => 0,
+			'termmetaRows'  => 0,
+			'usermetaRows'  => 0,
+			'optionRows'    => 0,
+			'errors'        => 0,
 		);
 
-		if ( absint( $postmeta_count ) > 0 ) {
+		if ( $old_attachment_id <= 0 || $new_attachment_id <= 0 || 'attachment' !== get_post_type( $old_attachment_id ) || 'attachment' !== get_post_type( $new_attachment_id ) || ! $this->is_webp_attachment( $new_attachment_id ) ) {
+			$result['errors']++;
+			return $result;
+		}
+
+		if ( absint( get_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) ) !== $new_attachment_id ) {
+			$result['errors']++;
+			return $result;
+		}
+
+		$text_map = $this->build_attachment_text_replacement_map( $old_attachment_id, $new_attachment_id );
+		$params   = array();
+		$where    = $this->build_attachment_reference_sql( 'post_content', $old_attachment_id, array_keys( $text_map ), $params );
+		$sql      = "SELECT ID, post_content FROM {$wpdb->posts} WHERE post_status NOT IN ('trash','auto-draft') AND {$where}";
+		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+		$posts    = $wpdb->get_results( $prepared );
+		foreach ( is_array( $posts ) ? $posts : array() as $post ) {
+			$old_content = isset( $post->post_content ) ? (string) $post->post_content : '';
+			$changes     = 0;
+			$new_content = $this->migrate_reference_value( $old_content, $old_attachment_id, $new_attachment_id, $text_map, 'post_content', $changes );
+			if ( $changes <= 0 || $new_content === $old_content ) {
+				continue;
+			}
+			$updated = $wpdb->update( $wpdb->posts, array( 'post_content' => $new_content ), array( 'ID' => absint( $post->ID ) ), array( '%s' ), array( '%d' ) );
+			if ( false === $updated ) {
+				$result['errors']++;
+				continue;
+			}
+			$result['contentRows']++;
+			$result['updatedRows']++;
+			$result['updatedValues'] += $changes;
+			clean_post_cache( absint( $post->ID ) );
+		}
+
+		$meta_sets = array(
+			array( 'post', $wpdb->postmeta, 'meta_id', 'post_id', 'meta_key', true, 'postmetaRows' ),
+			array( 'term', $wpdb->termmeta, 'meta_id', 'term_id', 'meta_key', false, 'termmetaRows' ),
+			array( 'user', $wpdb->usermeta, 'umeta_id', 'user_id', 'meta_key', false, 'usermetaRows' ),
+		);
+		foreach ( $meta_sets as $set ) {
+			$part = $this->migrate_metadata_reference_rows( $set[0], $set[1], $set[2], $set[3], $set[4], $old_attachment_id, $new_attachment_id, $text_map, $set[5] );
+			$result[ $set[6] ] += absint( isset( $part['updatedRows'] ) ? $part['updatedRows'] : 0 );
+			$result['updatedRows'] += absint( isset( $part['updatedRows'] ) ? $part['updatedRows'] : 0 );
+			$result['updatedValues'] += absint( isset( $part['updatedValues'] ) ? $part['updatedValues'] : 0 );
+			$result['errors'] += absint( isset( $part['errors'] ) ? $part['errors'] : 0 );
+		}
+
+		$params = array();
+		$tokens = array_keys( $text_map );
+		$where  = $this->build_attachment_reference_sql( 'option_value', $old_attachment_id, $tokens, $params );
+		$params = array_merge( array( $wpdb->esc_like( 'theme_mods_' ) . '%', $wpdb->esc_like( 'widget_' ) . '%' ), $params );
+		$sql = "SELECT option_name, option_value FROM {$wpdb->options} WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s) AND {$where}";
+		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+		$options = $wpdb->get_results( $prepared );
+		foreach ( is_array( $options ) ? $options : array() as $option ) {
+			$name    = isset( $option->option_name ) ? (string) $option->option_name : '';
+			$value   = maybe_unserialize( isset( $option->option_value ) ? (string) $option->option_value : '' );
+			$changes = 0;
+			$value   = $this->migrate_reference_value( $value, $old_attachment_id, $new_attachment_id, $text_map, $name, $changes );
+			if ( $changes <= 0 ) {
+				continue;
+			}
+			if ( ! update_option( $name, $value ) ) {
+				/* update_option(false) can also mean identical value; verify before calling it an error. */
+				if ( get_option( $name ) !== $value ) {
+					$result['errors']++;
+					continue;
+				}
+			}
+			$result['optionRows']++;
+			$result['updatedRows']++;
+			$result['updatedValues'] += $changes;
+		}
+
+		return $result;
+	}
+
+
+	/**
+	 * Verify whether one candidate metadata/option row still contains a real
+	 * attachment reference after structural migration. The SQL prefilter is broad
+	 * by design; this second pass prevents unrelated generic JSON IDs from blocking
+	 * deletion forever.
+	 *
+	 * @param string $raw Raw stored value.
+	 * @param string $context_key Metadata/option key.
+	 * @param int    $old_attachment_id Old attachment.
+	 * @param int    $new_attachment_id Replacement attachment.
+	 * @param array  $text_map Old => new text map.
+	 * @return bool
+	 */
+	private function candidate_value_has_attachment_reference( $raw, $context_key, $old_attachment_id, $new_attachment_id, $text_map ) {
+		$raw               = (string) $raw;
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		if ( '' === $raw || $old_attachment_id <= 0 || $new_attachment_id <= 0 ) {
+			return false;
+		}
+
+		$value   = maybe_unserialize( $raw );
+		$changes = 0;
+		$this->migrate_reference_value( $value, $old_attachment_id, $new_attachment_id, $text_map, (string) $context_key, $changes );
+		if ( $changes > 0 ) {
 			return true;
 		}
 
-		$termmeta_count = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->termmeta} WHERE meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s",
-				$value,
-				$serialized_int,
-				$serialized_string
-			)
-		);
-
-		if ( absint( $termmeta_count ) > 0 ) {
-			return true;
+		/* Serialized objects can contain private/inaccessible state that WordPress can
+		 * deserialize but this migrator intentionally cannot mutate safely. Preserve
+		 * those attachments when the raw serialized payload still proves the old ID
+		 * or an old image token is present. */
+		if ( function_exists( 'is_serialized' ) && is_serialized( $raw ) ) {
+			$id = (string) $old_attachment_id;
+			if ( false !== strpos( $raw, 'i:' . $id . ';' ) || false !== strpos( $raw, 's:' . strlen( $id ) . ':"' . $id . '";' ) ) {
+				return true;
+			}
+			foreach ( array_keys( is_array( $text_map ) ? $text_map : array() ) as $token ) {
+				$token = (string) $token;
+				if ( strlen( $token ) >= 4 && false !== strpos( $raw, $token ) ) {
+					return true;
+				}
+			}
 		}
 
-		$usermeta_count = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s",
-				$value,
-				$serialized_int,
-				$serialized_string
-			)
-		);
+		return false;
+	}
 
-		if ( absint( $usermeta_count ) > 0 ) {
-			return true;
+	/**
+	 * Return exact remaining-reference locations outside products. Candidate SQL
+	 * matches are structurally verified before they are treated as blockers.
+	 *
+	 * @param int $attachment_id Old attachment ID.
+	 * @param int $new_attachment_id Replacement attachment ID.
+	 * @return array
+	 */
+	private function get_external_reference_diagnostics( $attachment_id, $new_attachment_id ) {
+		global $wpdb;
+		$attachment_id     = absint( $attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		$result            = array( 'hasReferences' => false, 'locations' => array() );
+		if ( $attachment_id <= 0 || $new_attachment_id <= 0 ) {
+			$result['hasReferences'] = true;
+			$result['locations'][]    = 'invalid-reference-audit';
+			return $result;
 		}
 
-		$theme_mods_like = $wpdb->esc_like( 'theme_mods_' ) . '%';
-		$widget_like     = $wpdb->esc_like( 'widget_' ) . '%';
-		$options_count   = $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->options}
-				WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s)
-				AND (option_value = %s OR option_value LIKE %s OR option_value LIKE %s)",
-				$theme_mods_like,
-				$widget_like,
-				$value,
-				$serialized_int,
-				$serialized_string
-			)
-		);
+		$tokens   = $this->get_attachment_reference_tokens( $attachment_id );
+		$text_map = $this->build_attachment_text_replacement_map( $attachment_id, $new_attachment_id );
+		$add      = static function ( &$locations, $value ) {
+			$value = sanitize_text_field( (string) $value );
+			if ( '' !== $value && ! in_array( $value, $locations, true ) && count( $locations ) < 12 ) {
+				$locations[] = $value;
+			}
+		};
 
-		return absint( $options_count ) > 0;
+		$params   = array();
+		$where    = $this->build_attachment_reference_sql( 'post_content', $attachment_id, $tokens, $params );
+		$sql      = "SELECT ID, post_type, post_content FROM {$wpdb->posts} WHERE post_status NOT IN ('trash','auto-draft') AND {$where}";
+		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+		$rows     = $wpdb->get_results( $prepared );
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			if ( $this->candidate_value_has_attachment_reference( isset( $row->post_content ) ? (string) $row->post_content : '', 'post_content', $attachment_id, $new_attachment_id, $text_map ) ) {
+				$result['hasReferences'] = true;
+				$add( $result['locations'], 'post_content#' . absint( isset( $row->ID ) ? $row->ID : 0 ) . ':' . sanitize_key( isset( $row->post_type ) ? (string) $row->post_type : 'post' ) );
+			}
+		}
+
+		$meta_sets = array(
+			array( 'postmeta', $wpdb->postmeta, 'post_id', 'meta_key', "post_id <> %d AND meta_key NOT LIKE %s AND meta_key NOT IN ('mobo_refreshed_from_attachment_id','mobo_replaces_attachment_id')", array( $attachment_id, $wpdb->esc_like( 'mobo_image_refresh_' ) . '%' ) ),
+			array( 'termmeta', $wpdb->termmeta, 'term_id', 'meta_key', '1=1', array() ),
+			array( 'usermeta', $wpdb->usermeta, 'user_id', 'meta_key', '1=1', array() ),
+		);
+		foreach ( $meta_sets as $set ) {
+			$params = array();
+			$where  = $this->build_attachment_reference_sql( 'meta_value', $attachment_id, $tokens, $params );
+			$prefix_params = isset( $set[5] ) && is_array( $set[5] ) ? $set[5] : array();
+			$params = array_merge( $prefix_params, $params );
+			$sql = "SELECT {$set[2]} AS object_id, {$set[3]} AS meta_key, meta_value FROM {$set[1]} WHERE {$set[4]} AND {$where}";
+			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+			$rows = $wpdb->get_results( $prepared );
+			foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+				$key = isset( $row->meta_key ) ? (string) $row->meta_key : '';
+				$raw = isset( $row->meta_value ) ? (string) $row->meta_value : '';
+				if ( ! $this->candidate_value_has_attachment_reference( $raw, $key, $attachment_id, $new_attachment_id, $text_map ) ) {
+					continue;
+				}
+				$result['hasReferences'] = true;
+				$add( $result['locations'], $set[0] . '#' . absint( isset( $row->object_id ) ? $row->object_id : 0 ) . ':' . $key );
+			}
+		}
+
+		$params = array();
+		$where  = $this->build_attachment_reference_sql( 'option_value', $attachment_id, $tokens, $params );
+		$params = array_merge( array( $wpdb->esc_like( 'theme_mods_' ) . '%', $wpdb->esc_like( 'widget_' ) . '%' ), $params );
+		$sql = "SELECT option_name, option_value FROM {$wpdb->options} WHERE (option_name = 'site_icon' OR option_name LIKE %s OR option_name LIKE %s) AND {$where}";
+		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $params ) );
+		$rows = $wpdb->get_results( $prepared );
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$name = isset( $row->option_name ) ? (string) $row->option_name : '';
+			$raw  = isset( $row->option_value ) ? (string) $row->option_value : '';
+			if ( ! $this->candidate_value_has_attachment_reference( $raw, $name, $attachment_id, $new_attachment_id, $text_map ) ) {
+				continue;
+			}
+			$result['hasReferences'] = true;
+			$add( $result['locations'], 'option:' . $name );
+		}
+
+		return $result;
 	}
 
 	/**

@@ -22,6 +22,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Image_Queue {
 
+	/** @var bool|null Request-local table existence cache. */
+	private static $table_exists_cache = null;
+
+	/** @var array|null Request-local queue summary cache. */
+	private static $summary_cache = null;
+
 	/**
 	 * Return table name.
 	 *
@@ -67,11 +73,17 @@ class Mobo_Core_Image_Queue {
 			KEY product_status (product_id, status, next_retry_at),
 			KEY image_guid (image_guid),
 			KEY status_retry (status, next_retry_at),
+			KEY status_retry_id (status, next_retry_at, id),
 			KEY locked_until (locked_until),
+			KEY status_locked_id (status, locked_until, id),
+			KEY status_updated_id (status, updated_at, id),
+			KEY updated_id (updated_at, id),
 			KEY attachment_id (attachment_id)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
+		self::$table_exists_cache = null;
+		self::$summary_cache      = null;
 	}
 
 	/**
@@ -82,9 +94,19 @@ class Mobo_Core_Image_Queue {
 	public static function table_exists() {
 		global $wpdb;
 
-		$table = self::table_name();
+		if ( null !== self::$table_exists_cache ) {
+			return (bool) self::$table_exists_cache;
+		}
 
-		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		$table = self::table_name();
+		self::$table_exists_cache = $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+
+		return (bool) self::$table_exists_cache;
+	}
+
+	/** @return void */
+	private static function invalidate_summary_cache() {
+		self::$summary_cache = null;
 	}
 
 	/**
@@ -105,10 +127,11 @@ class Mobo_Core_Image_Queue {
 			return array( 'enqueued' => 0, 'skipped' => 0 );
 		}
 
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
-		$count = 0;
-		$skip  = 0;
+		$table      = self::table_name();
+		$now        = current_time( 'mysql', true );
+		$count      = 0;
+		$skip       = 0;
+		$normalized = array();
 
 		foreach ( array_values( $images ) as $position => $image ) {
 			if ( ! is_array( $image ) ) {
@@ -118,25 +141,56 @@ class Mobo_Core_Image_Queue {
 
 			$image_guid = $this->get_image_guid( $image );
 			$url        = $this->get_image_url( $image );
-
 			if ( '' === $image_guid || '' === $url ) {
 				$skip++;
 				continue;
 			}
 
 			$key = $this->queue_key( $product_id, $image_guid );
-
-			$existing = $wpdb->get_row(
-				$wpdb->prepare(
-					"SELECT id, status, attachment_id, source_url FROM {$table} WHERE queue_key = %s LIMIT 1",
-					$key
-				),
-				ARRAY_A
+			$normalized[] = array(
+				'key'       => $key,
+				'position'  => absint( $position ),
+				'imageGuid' => $image_guid,
+				'url'       => $url,
 			);
+		}
 
-			$attachment_id        = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
-			$existing_url         = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
-			$status               = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
+		if ( empty( $normalized ) ) {
+			return array( 'enqueued' => 0, 'skipped' => $skip );
+		}
+
+		/* One lookup for the full product image set instead of one SELECT per image. */
+		$keys         = array_values( array_unique( array_filter( array_map( 'strval', wp_list_pluck( $normalized, 'key' ) ) ) ) );
+		$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE queue_key IN ({$placeholders})";
+		$rows         = $wpdb->get_results( $wpdb->prepare( $query, $keys ), ARRAY_A );
+		$existing_map = array();
+		$existing_attachment_ids = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			if ( is_array( $row ) && ! empty( $row['queue_key'] ) ) {
+				$existing_map[ (string) $row['queue_key'] ] = $row;
+				$existing_attachment_id = absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
+				if ( $existing_attachment_id > 0 ) {
+					$existing_attachment_ids[] = $existing_attachment_id;
+				}
+			}
+		}
+
+		$existing_attachment_ids = array_values( array_unique( $existing_attachment_ids ) );
+		if ( ! empty( $existing_attachment_ids ) && function_exists( '_prime_post_caches' ) ) {
+			_prime_post_caches( $existing_attachment_ids, false, true );
+		}
+
+		foreach ( $normalized as $item ) {
+			$key        = isset( $item['key'] ) ? (string) $item['key'] : '';
+			$image_guid = sanitize_text_field( (string) $item['imageGuid'] );
+			$url        = esc_url_raw( (string) $item['url'] );
+			$position   = absint( $item['position'] );
+			$existing   = isset( $existing_map[ $key ] ) && is_array( $existing_map[ $key ] ) ? $existing_map[ $key ] : null;
+
+			$attachment_id         = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
+			$existing_url          = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
+			$status                = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
 			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_source( $attachment_id, $url );
 
 			if ( 'done' === $status && $attachment_compatible && $existing_url === $url ) {
@@ -145,14 +199,13 @@ class Mobo_Core_Image_Queue {
 					array(
 						'product_id'     => $product_id,
 						'product_guid'   => $product_guid,
-						'position_index' => absint( $position ),
+						'position_index' => $position,
 						'updated_at'     => $now,
 					),
 					array( 'id' => absint( $existing['id'] ) ),
 					array( '%d', '%s', '%d', '%s' ),
 					array( '%d' )
 				);
-
 				$count++;
 				continue;
 			}
@@ -163,18 +216,11 @@ class Mobo_Core_Image_Queue {
 				'product_guid'   => $product_guid,
 				'image_guid'     => $image_guid,
 				'source_url'     => $url,
-				'position_index' => absint( $position ),
+				'position_index' => $position,
 				'updated_at'     => $now,
 			);
 
 			if ( is_array( $existing ) ) {
-				/*
-				 * Do not re-open the same pending/processing/failed image on every
-				 * product-sync step. Re-enqueueing used to reset next_retry_at and
-				 * locked_until, which could keep manual sync stuck forever on the same
-				 * three bad/slow images. Only reset the queue row when the source URL
-				 * actually changed.
-				 */
 				if ( $existing_url !== $url || ! $attachment_compatible ) {
 					$data['status']        = 'pending';
 					$data['try_count']     = 0;
@@ -184,13 +230,7 @@ class Mobo_Core_Image_Queue {
 					$data['attachment_id'] = 0;
 				}
 
-				$wpdb->update(
-					$table,
-					$data,
-					array( 'id' => absint( $existing['id'] ) ),
-					null,
-					array( '%d' )
-				);
+				$wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), null, array( '%d' ) );
 			} else {
 				$data['attachment_id'] = 0;
 				$data['try_count']     = 0;
@@ -199,13 +239,13 @@ class Mobo_Core_Image_Queue {
 				$data['locked_until']  = null;
 				$data['last_error']    = null;
 				$data['created_at']    = $now;
-
 				$wpdb->insert( $table, $data );
 			}
 
 			$count++;
 		}
 
+		self::invalidate_summary_cache();
 		return array( 'enqueued' => $count, 'skipped' => $skip );
 	}
 
@@ -286,6 +326,248 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Return pending/due counters for one product with a single query.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	public function get_product_summary( $product_id ) {
+		global $wpdb;
+
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || ! self::table_exists() ) {
+			return array( 'pending' => 0, 'due' => 0 );
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$row   = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT
+					SUM(CASE WHEN status IN ('pending','processing','attaching') THEN 1 ELSE 0 END) AS pending_count,
+					SUM(CASE WHEN (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s) THEN 1 ELSE 0 END) AS due_count
+				FROM {$table}
+				WHERE product_id = %d",
+				$now,
+				$now,
+				$product_id
+			),
+			ARRAY_A
+		);
+
+		return array(
+			'pending' => absint( is_array( $row ) && isset( $row['pending_count'] ) ? $row['pending_count'] : 0 ),
+			'due'     => absint( is_array( $row ) && isset( $row['due_count'] ) ? $row['due_count'] : 0 ),
+		);
+	}
+
+	/**
+	 * Fast boolean due check for runner pressure decisions.
+	 *
+	 * @return bool
+	 */
+	public function has_due() {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$id    = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				LIMIT 1",
+				$now,
+				$now
+			)
+		);
+
+		return absint( $id ) > 0;
+	}
+
+	/**
+	 * Aggregate queue counters in one query.
+	 *
+	 * @param bool $force Force a fresh query.
+	 * @return array
+	 */
+	public function get_summary( $force = false ) {
+		global $wpdb;
+
+		if ( ! $force && is_array( self::$summary_cache ) ) {
+			return self::$summary_cache;
+		}
+
+		$empty = array(
+			'pending'         => 0,
+			'due'             => 0,
+			'failed'          => 0,
+			'attaching'       => 0,
+			'nextRetryAt'     => '',
+			'oldestPendingAt' => '',
+		);
+
+		if ( ! self::table_exists() ) {
+			self::$summary_cache = $empty;
+			return $empty;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$row   = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT
+					SUM(CASE WHEN status IN ('pending','processing','attaching') THEN 1 ELSE 0 END) AS pending_count,
+					SUM(CASE WHEN (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s) THEN 1 ELSE 0 END) AS due_count,
+					SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+					SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END) AS attaching_count,
+					MIN(CASE WHEN status IN ('pending','processing','attaching') THEN created_at ELSE NULL END) AS oldest_pending_at,
+					MIN(CASE WHEN status IN ('pending','attaching') AND next_retry_at IS NOT NULL THEN next_retry_at ELSE NULL END) AS next_retry_at
+				FROM {$table}
+				WHERE status IN ('pending','processing','attaching','failed')",
+				$now,
+				$now
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $row ) ) {
+			self::$summary_cache = $empty;
+			return $empty;
+		}
+
+		self::$summary_cache = array(
+			'pending'         => absint( isset( $row['pending_count'] ) ? $row['pending_count'] : 0 ),
+			'due'             => absint( isset( $row['due_count'] ) ? $row['due_count'] : 0 ),
+			'failed'          => absint( isset( $row['failed_count'] ) ? $row['failed_count'] : 0 ),
+			'attaching'       => absint( isset( $row['attaching_count'] ) ? $row['attaching_count'] : 0 ),
+			'nextRetryAt'     => isset( $row['next_retry_at'] ) ? (string) $row['next_retry_at'] : '',
+			'oldestPendingAt' => isset( $row['oldest_pending_at'] ) ? (string) $row['oldest_pending_at'] : '',
+		);
+
+		return self::$summary_cache;
+	}
+
+	/**
+	 * Bulk-claim due image rows for the dedicated image worker.
+	 *
+	 * @param int $limit Limit.
+	 * @param int $ttl Claim TTL.
+	 * @return array
+	 */
+	public function claim_due_images( $limit, $ttl = 120 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 50, absint( $limit ) ) );
+		$ttl   = max( 30, min( 300, absint( $ttl ) ) );
+		if ( ! self::table_exists() ) {
+			return array();
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$ids   = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				ORDER BY updated_at ASC, id ASC
+				LIMIT %d",
+				$now,
+				$now,
+				$limit
+			)
+		);
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) ) {
+			return array();
+		}
+
+		$id_sql       = implode( ',', $ids );
+		$locked_until = gmdate( 'Y-m-d H:i:s', time() + $ttl );
+		$updated      = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'processing', locked_until = %s, updated_at = %s
+				WHERE id IN ({$id_sql})
+					AND ((status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
+				$locked_until,
+				$now,
+				$now,
+				$now
+			)
+		);
+
+		if ( false === $updated || absint( $updated ) <= 0 ) {
+			return array();
+		}
+
+		self::invalidate_summary_cache();
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, product_id, product_guid, image_guid, source_url, position_index, attachment_id, try_count, updated_at
+				FROM {$table}
+				WHERE id IN ({$id_sql}) AND status = 'processing' AND locked_until = %s
+				ORDER BY updated_at ASC, id ASC",
+				$locked_until
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+
+		foreach ( $rows as &$row ) {
+			$row['_mobo_bulk_claimed'] = 1;
+		}
+		unset( $row );
+
+		return $rows;
+	}
+
+	/**
+	 * Release rows that were bulk-claimed but not handled before a safe stop.
+	 *
+	 * @param array $ids Row IDs.
+	 * @return int
+	 */
+	public function release_claimed_images( $ids ) {
+		global $wpdb;
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table   = self::table_name();
+		$id_sql  = implode( ',', $ids );
+		$now     = current_time( 'mysql', true );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', locked_until = NULL, updated_at = %s
+				WHERE status = 'processing' AND id IN ({$id_sql})",
+				$now
+			)
+		);
+
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return false === $updated ? 0 : absint( $updated );
+	}
+
+	/**
 	 * Get due rows across all products.
 	 *
 	 * @param int $limit Limit.
@@ -358,7 +640,12 @@ class Mobo_Core_Image_Queue {
 			)
 		);
 
-		return 1 === absint( $updated );
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -371,15 +658,17 @@ class Mobo_Core_Image_Queue {
 	 *
 	 * @param int $id Row ID.
 	 * @param int $attachment_id Attachment ID.
+	 * @param int $retry_delay Optional linkage retry delay while the current batch coalesces product saves.
 	 * @return void
 	 */
-	public function mark_attaching( $id, $attachment_id ) {
+	public function mark_attaching( $id, $attachment_id, $retry_delay = 0 ) {
+		$retry_delay = max( 0, min( 300, absint( $retry_delay ) ) );
 		$this->update_status(
 			$id,
 			'attaching',
 			array(
 				'attachment_id' => absint( $attachment_id ),
-				'next_retry_at' => null,
+				'next_retry_at' => $retry_delay > 0 ? gmdate( 'Y-m-d H:i:s', time() + $retry_delay ) : null,
 				'locked_until'  => null,
 				'last_error'    => null,
 			)
@@ -404,6 +693,44 @@ class Mobo_Core_Image_Queue {
 				'last_error'    => null,
 			)
 		);
+	}
+
+
+	/**
+	 * Mark multiple successfully linked queue rows done in one database write.
+	 *
+	 * Rows must already contain a valid attachment_id from mark_attaching(). The
+	 * status predicate keeps unrelated/retried rows from being completed by a
+	 * stale batch.
+	 *
+	 * @param array $ids Queue row IDs.
+	 * @return int Updated row count.
+	 */
+	public function mark_done_many( $ids ) {
+		global $wpdb;
+
+		$ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		if ( empty( $ids ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table  = self::table_name();
+		$id_sql = implode( ',', $ids );
+		$now    = current_time( 'mysql', true );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'done', next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
+				WHERE id IN ({$id_sql}) AND status = 'attaching' AND attachment_id > 0",
+				$now
+			)
+		);
+
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return false === $updated ? 0 : absint( $updated );
 	}
 
 	/**
@@ -561,26 +888,8 @@ class Mobo_Core_Image_Queue {
 	 * @return int
 	 */
 	public function count_due() {
-		global $wpdb;
-
-		if ( ! self::table_exists() ) {
-			return 0;
-		}
-
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
-
-		return absint(
-			$wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(*) FROM {$table}
-					WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)",
-					$now,
-					$now
-				)
-			)
-		);
+		$summary = $this->get_summary();
+		return absint( isset( $summary['due'] ) ? $summary['due'] : 0 );
 	}
 
 	/**
@@ -589,7 +898,8 @@ class Mobo_Core_Image_Queue {
 	 * @return int
 	 */
 	public function count_pending() {
-		return $this->count_by_statuses( array( 'pending', 'processing', 'attaching' ) );
+		$summary = $this->get_summary();
+		return absint( isset( $summary['pending'] ) ? $summary['pending'] : 0 );
 	}
 
 	/**
@@ -598,7 +908,8 @@ class Mobo_Core_Image_Queue {
 	 * @return int
 	 */
 	public function count_failed() {
-		return $this->count_by_statuses( array( 'failed' ) );
+		$summary = $this->get_summary();
+		return absint( isset( $summary['failed'] ) ? $summary['failed'] : 0 );
 	}
 
 	/**
@@ -607,7 +918,8 @@ class Mobo_Core_Image_Queue {
 	 * @return int
 	 */
 	public function count_attaching() {
-		return $this->count_by_statuses( array( 'attaching' ) );
+		$summary = $this->get_summary();
+		return absint( isset( $summary['attaching'] ) ? $summary['attaching'] : 0 );
 	}
 
 	/**
@@ -616,22 +928,8 @@ class Mobo_Core_Image_Queue {
 	 * @return string
 	 */
 	public function get_next_retry_at() {
-		global $wpdb;
-
-		if ( ! self::table_exists() ) {
-			return '';
-		}
-
-		$table = self::table_name();
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared -- table name is generated internally from $wpdb->prefix and contains no request data.
-		$value = $wpdb->get_var(
-			"SELECT MIN(next_retry_at)
-			FROM {$table}
-			WHERE status IN ('pending','attaching')
-				AND next_retry_at IS NOT NULL"
-		);
-
-		return is_string( $value ) ? $value : '';
+		$summary = $this->get_summary();
+		return isset( $summary['nextRetryAt'] ) ? (string) $summary['nextRetryAt'] : '';
 	}
 
 	/**
@@ -695,6 +993,9 @@ class Mobo_Core_Image_Queue {
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
 			$recovered = absint( false === $updated ? 0 : $updated );
+			if ( $recovered > 0 ) {
+				self::invalidate_summary_cache();
+			}
 		}
 
 		$remaining = absint(
@@ -798,6 +1099,9 @@ class Mobo_Core_Image_Queue {
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
 			$scheduled = absint( false === $updated ? 0 : $updated );
+			if ( $scheduled > 0 ) {
+				self::invalidate_summary_cache();
+			}
 		}
 
 		return array(
@@ -812,13 +1116,14 @@ class Mobo_Core_Image_Queue {
 	 * @return array
 	 */
 	public function get_status() {
+		$summary = $this->get_summary();
 		return array(
-			'enabled' => Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ),
-			'pending'     => $this->count_pending(),
-			'attaching'   => $this->count_attaching(),
-			'due'         => $this->count_due(),
-			'failed'      => $this->count_failed(),
-			'nextRetryAt' => $this->get_next_retry_at(),
+			'enabled'     => Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ),
+			'pending'     => absint( isset( $summary['pending'] ) ? $summary['pending'] : 0 ),
+			'attaching'   => absint( isset( $summary['attaching'] ) ? $summary['attaching'] : 0 ),
+			'due'         => absint( isset( $summary['due'] ) ? $summary['due'] : 0 ),
+			'failed'      => absint( isset( $summary['failed'] ) ? $summary['failed'] : 0 ),
+			'nextRetryAt' => isset( $summary['nextRetryAt'] ) ? (string) $summary['nextRetryAt'] : '',
 		);
 	}
 
@@ -857,7 +1162,10 @@ class Mobo_Core_Image_Queue {
 			}
 		}
 
-		$wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		if ( false !== $updated ) {
+			self::invalidate_summary_cache();
+		}
 	}
 
 	/**
@@ -874,26 +1182,15 @@ class Mobo_Core_Image_Queue {
 		}
 
 		$statuses = array_values( array_unique( array_filter( array_map( 'sanitize_key', (array) $statuses ) ) ) );
-
 		if ( empty( $statuses ) ) {
 			return 0;
 		}
 
-		$table = self::table_name();
-		$total = 0;
+		$table        = self::table_name();
+		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
+		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
 
-		foreach ( $statuses as $status ) {
-			$total += absint(
-				$wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(*) FROM {$table} WHERE status = %s",
-						$status
-					)
-				)
-			);
-		}
-
-		return $total;
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) );
 	}
 
 	/**

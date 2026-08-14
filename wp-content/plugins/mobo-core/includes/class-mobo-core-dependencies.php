@@ -81,17 +81,22 @@ class Mobo_Core_Dependencies {
 	 * @return bool
 	 */
 	public static function is_persian_woocommerce_active() {
-		if ( self::is_plugin_active_safe( self::PERSIAN_WOOCOMMERCE_PLUGIN_FILE )
-			|| self::is_plugin_slug_active( self::PERSIAN_WOOCOMMERCE_SLUG ) ) {
-			return true;
-		}
-
+		/*
+		 * plugins_loaded runs after active plugins were included. Prefer runtime
+		 * signals first so normal storefront requests do not load wp-admin's
+		 * plugin.php merely to confirm an already-loaded dependency.
+		 */
 		if ( class_exists( 'PersianWooommercePlugin' ) ) {
 			return true;
 		}
 
 		global $woocommerce_persian;
-		return is_object( $woocommerce_persian );
+		if ( is_object( $woocommerce_persian ) ) {
+			return true;
+		}
+
+		return self::is_plugin_active_safe( self::PERSIAN_WOOCOMMERCE_PLUGIN_FILE )
+			|| self::is_plugin_slug_active( self::PERSIAN_WOOCOMMERCE_SLUG );
 	}
 
 	/**

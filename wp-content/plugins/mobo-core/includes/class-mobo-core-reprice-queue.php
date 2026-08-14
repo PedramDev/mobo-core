@@ -104,29 +104,31 @@ class Mobo_Core_Reprice_Queue {
 	/**
 	 * Process one bounded batch.
 	 *
-	 * @param int $limit Batch size.
+	 * @param int|null $limit Batch size.
+	 * @param int|null $time_budget_seconds Cooperative execution budget.
 	 * @return array
 	 */
-	public function process_batch( $limit = null ) {
+	public function process_batch( $limit = null, $time_budget_seconds = null ) {
 		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
 			return Mobo_Core_Cache_Mutation_Guard::run(
-				function () use ( $limit ) {
-					return $this->process_batch_guarded( $limit );
+				function () use ( $limit, $time_budget_seconds ) {
+					return $this->process_batch_guarded( $limit, $time_budget_seconds );
 				},
 				'reprice-queue'
 			);
 		}
 
-		return $this->process_batch_guarded( $limit );
+		return $this->process_batch_guarded( $limit, $time_budget_seconds );
 	}
 
 	/**
 	 * Execute the mutation batch inside the cache mutation scope.
 	 *
 	 * @param int|null $limit Batch size.
+	 * @param int|null $time_budget_seconds Cooperative execution budget.
 	 * @return array
 	 */
-	private function process_batch_guarded( $limit = null ) {
+	private function process_batch_guarded( $limit = null, $time_budget_seconds = null ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'reprice-queue' ), array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true ) );
 		}
@@ -161,6 +163,9 @@ class Mobo_Core_Reprice_Queue {
 			$limit = 20;
 		}
 
+		$time_budget_seconds = null === $time_budget_seconds ? 0 : max( 1, min( 20, (int) $time_budget_seconds ) );
+		$deadline = $time_budget_seconds > 0 ? microtime( true ) + $time_budget_seconds : 0.0;
+
 		$ids = $this->get_next_item_ids( absint( $state['lastPostId'] ), $limit );
 
 		if ( empty( $ids ) ) {
@@ -186,10 +191,19 @@ class Mobo_Core_Reprice_Queue {
 		$parents_to_sync = array();
 
 		$paused_for_upgrade = false;
+		$budget_exhausted   = false;
+		$last_checkpoint_at = microtime( true );
+		$checkpoint_every   = 5;
+		$checkpoint_seconds = 2.0;
 
 		foreach ( $ids as $post_id ) {
 			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 				$paused_for_upgrade = true;
+				break;
+			}
+
+			if ( $deadline > 0 && microtime( true ) >= ( $deadline - 0.15 ) ) {
+				$budget_exhausted = true;
 				break;
 			}
 
@@ -213,19 +227,21 @@ class Mobo_Core_Reprice_Queue {
 			}
 
 			/*
-			 * Persist cursor after each object. If PHP max_execution_time,
-			 * web server shutdown, or app shutdown happens mid-batch, the next
-			 * worker run resumes after the last successfully attempted post ID
-			 * instead of replaying the whole batch. Repricing is idempotent, but
-			 * this keeps large stores moving predictably.
+			 * Durable cursor checkpoints are bounded rather than written after every
+			 * object. Repricing is idempotent, so after an abrupt crash at most four
+			 * already-attempted rows are replayed, while large batches avoid dozens of
+			 * serialized wp_options writes.
 			 */
-			$checkpoint = $state;
-			$checkpoint['processed']   = absint( $state['processed'] ) + $processed;
-			$checkpoint['updated']     = absint( $state['updated'] ) + $updated;
-			$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
-			$checkpoint['updatedAt']   = time();
-			$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد قیمت؛ آخرین شناسه بررسی‌شده: %d', $post_id );
-			update_option( self::STATE_OPTION, $checkpoint, false );
+			if ( 0 === ( $processed % $checkpoint_every ) || ( microtime( true ) - $last_checkpoint_at ) >= $checkpoint_seconds ) {
+				$checkpoint = $state;
+				$checkpoint['processed']   = absint( $state['processed'] ) + $processed;
+				$checkpoint['updated']     = absint( $state['updated'] ) + $updated;
+				$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
+				$checkpoint['updatedAt']   = time();
+				$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد قیمت؛ آخرین شناسه بررسی‌شده: %d', $post_id );
+				update_option( self::STATE_OPTION, $checkpoint, false );
+				$last_checkpoint_at = microtime( true );
+			}
 		}
 
 		foreach ( array_keys( $parents_to_sync ) as $parent_id ) {
@@ -247,7 +263,7 @@ class Mobo_Core_Reprice_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d مورد بررسی شد؛ %d مورد به‌روزرسانی شد.', $processed, $updated );
 
-		$remaining = $paused_for_upgrade || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -262,7 +278,8 @@ class Mobo_Core_Reprice_Queue {
 			'updated'   => $updated,
 			'failed'    => $failed,
 			'remaining' => $remaining,
-			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : $state['status'],
+			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ),
+			'budgetExhausted' => $budget_exhausted,
 			'state'     => $state,
 		);
 	
@@ -370,32 +387,64 @@ class Mobo_Core_Reprice_Queue {
 			$context
 		);
 
-		$changed = false;
+		$frontend_changed = false;
+		$desired_regular  = null !== $pair['regular_price'] && '' !== $pair['regular_price'] ? wc_format_decimal( $pair['regular_price'] ) : null;
+		$desired_sale     = isset( $pair['sale_price'] ) ? wc_format_decimal( $pair['sale_price'] ) : '';
 
-		if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ) {
-			if ( (string) $product->get_regular_price( 'edit' ) !== (string) $pair['regular_price'] ) {
-				$product->set_regular_price( $pair['regular_price'] );
-				$changed = true;
+		if ( null !== $desired_regular && wc_format_decimal( $product->get_regular_price( 'edit' ) ) !== $desired_regular ) {
+			$product->set_regular_price( $pair['regular_price'] );
+			$frontend_changed = true;
+		}
+
+		if ( wc_format_decimal( $product->get_sale_price( 'edit' ) ) !== $desired_sale ) {
+			$product->set_sale_price( isset( $pair['sale_price'] ) ? $pair['sale_price'] : '' );
+			$frontend_changed = true;
+		}
+
+		$policy_type = (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+		$meta_values = array(
+			'mobo_calculated_regular_price' => null !== $desired_regular ? $pair['regular_price'] : '',
+			'mobo_calculated_sale_price'    => isset( $pair['sale_price'] ) ? $pair['sale_price'] : '',
+			'mobo_price_policy_type'         => $policy_type,
+		);
+
+		$meta_changed = false;
+
+		if ( $frontend_changed ) {
+			foreach ( $meta_values as $key => $value ) {
+				$current = $product->get_meta( $key, true, 'edit' );
+				if ( $current != $value ) { // Numeric metadata is stored as strings by WordPress.
+					$product->update_meta_data( $key, $value );
+					$meta_changed = true;
+				}
 			}
-			$product->update_meta_data( 'mobo_calculated_regular_price', $pair['regular_price'] );
-		}
+			if ( $meta_changed ) {
+				$product->update_meta_data( 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+			}
 
-		$sale_price = isset( $pair['sale_price'] ) ? $pair['sale_price'] : '';
-		if ( (string) $product->get_sale_price( 'edit' ) !== (string) $sale_price ) {
-			$product->set_sale_price( $sale_price );
-			$changed = true;
+			$product->save();
+			wc_delete_product_transients( $post_id );
+		} else {
+			/*
+			 * The rendered price is already correct. Refresh Mobo bookkeeping directly
+			 * without firing WooCommerce product-save hooks or lookup/transient churn.
+			 */
+			foreach ( $meta_values as $key => $value ) {
+				$current = get_post_meta( $post_id, $key, true );
+				if ( $current != $value ) {
+					update_post_meta( $post_id, $key, $value );
+					$meta_changed = true;
+				}
+			}
+			if ( $meta_changed ) {
+				update_post_meta( $post_id, 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+			}
 		}
-		$product->update_meta_data( 'mobo_calculated_sale_price', $sale_price );
-		$product->update_meta_data( 'mobo_price_policy_type', (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ) );
-		$product->update_meta_data( 'mobo_price_policy_updated_at', gmdate( 'c' ) );
-
-		$product->save();
-		wc_delete_product_transients( $post_id );
 
 		return array(
-			'updated'  => true,
-			'changed'  => $changed,
-			'parentId' => $product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : 0,
+			'updated'  => $frontend_changed || $meta_changed,
+			'changed'  => $frontend_changed,
+			'parentId' => $frontend_changed && $product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : 0,
 		);
 	}
 

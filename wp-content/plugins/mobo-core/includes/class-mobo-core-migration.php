@@ -37,12 +37,14 @@ class Mobo_Core_Migration {
 	 */
 	public static function activate() {
 		self::ensure_defaults();
+		self::apply_10331613_runtime_option_autoload_cleanup( '' );
 		self::apply_10307_default_adjustments( '' );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_10331614_table_housekeeping_fast_path( '' );
 		self::apply_103171_runtime_lock_recovery( '' );
 		self::apply_103164_image_family_migration( '' );
 		self::apply_103165_image_refresh_safety( '' );
@@ -54,6 +56,15 @@ class Mobo_Core_Migration {
 		self::apply_103198_manual_initial_sync_safety( '' );
 		self::apply_103199_image_queue_recovery( '' );
 		self::apply_10333_archive_purge_interval_migration( '' );
+		self::apply_10338_legacy_image_catalog_rescan( '' );
+		self::apply_10339_image_reference_migration( '' );
+		self::apply_103310_structured_image_reference_migration( '' );
+		self::apply_103311_replaced_attachment_scan_runtime_safety( '' );
+		self::apply_103313_persistent_delete_old_preference( '' );
+		self::apply_103315_nonblocking_stage7( '' );
+		self::apply_103316_automatic_stage7_convergence( '' );
+		self::apply_1033161_install_bootstrap_safety( '' );
+		self::apply_1033171_stage7_autodrain( '' );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -80,12 +91,14 @@ class Mobo_Core_Migration {
 		}
 
 		self::ensure_defaults();
+		self::apply_10331613_runtime_option_autoload_cleanup( $current );
 		self::apply_10307_default_adjustments( $current );
 		self::ensure_cron_token();
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		self::create_database_tables();
+		self::apply_10331614_table_housekeeping_fast_path( $current );
 		self::apply_103171_runtime_lock_recovery( $current );
 		self::apply_103164_image_family_migration( $current );
 		self::apply_103165_image_refresh_safety( $current );
@@ -97,6 +110,15 @@ class Mobo_Core_Migration {
 		self::apply_103198_manual_initial_sync_safety( $current );
 		self::apply_103199_image_queue_recovery( $current );
 		self::apply_10333_archive_purge_interval_migration( $current );
+		self::apply_10338_legacy_image_catalog_rescan( $current );
+		self::apply_10339_image_reference_migration( $current );
+		self::apply_103310_structured_image_reference_migration( $current );
+		self::apply_103311_replaced_attachment_scan_runtime_safety( $current );
+		self::apply_103313_persistent_delete_old_preference( $current );
+		self::apply_103315_nonblocking_stage7( $current );
+		self::apply_103316_automatic_stage7_convergence( $current );
+		self::apply_1033161_install_bootstrap_safety( $current );
+		self::apply_1033171_stage7_autodrain( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -120,11 +142,74 @@ class Mobo_Core_Migration {
 	 * @return void
 	 */
 	private static function ensure_defaults() {
-		foreach ( Mobo_Core_Settings::defaults() as $key => $value ) {
+		$defaults = Mobo_Core_Settings::defaults();
+		if ( method_exists( 'Mobo_Core_Settings', 'prime_options' ) ) {
+			Mobo_Core_Settings::prime_options( array_keys( $defaults ) );
+		}
+
+		foreach ( $defaults as $key => $value ) {
 			if ( false === get_option( $key, false ) ) {
 				add_option( $key, $value, '', false );
 			}
 		}
+	}
+
+
+	/**
+	 * Schedule an early bounded housekeeping pass after the 10.33.16.14 indexes
+	 * have been created by dbDelta. No active queue rows are modified here; the
+	 * real-cron maintenance worker applies the normal conservative retention rules.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10331614_table_housekeeping_fast_path( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.16.14', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_maintenance_next_due_at', time() + 60, false );
+		update_option( 'mobo_core_10331614_housekeeping_scheduled_at', time(), false );
+	}
+
+	/**
+	 * Normalize Mobo runtime/settings options to non-autoloaded storage.
+	 *
+	 * Current installs already create every Mobo option with autoload=false. Very
+	 * old installations can still carry queue/state/history rows in alloptions,
+	 * making every storefront request deserialize worker data it never uses. Keep
+	 * the intended architecture consistent by moving legacy mobo_core_* rows out
+	 * of the global autoload payload without changing their values.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10331613_runtime_option_autoload_cleanup( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.16.13', '>=' ) ) {
+			return;
+		}
+
+		global $wpdb;
+		if ( ! isset( $wpdb->options ) ) {
+			return;
+		}
+
+		$autoload_values = array( 'yes', 'on', 'auto-on', 'auto' );
+		$placeholders     = implode( ',', array_fill( 0, count( $autoload_values ), '%s' ) );
+		$sql = $wpdb->prepare(
+			"UPDATE {$wpdb->options} SET autoload = 'no' WHERE option_name LIKE %s AND autoload IN ($placeholders)", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			array_merge( array( $wpdb->esc_like( 'mobo_core_' ) . '%' ), $autoload_values )
+		);
+		$changed = $wpdb->query( $sql ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$changed = false === $changed ? 0 : absint( $changed );
+
+		/* alloptions may already be resident in this upgrade request. Force the next
+		 * read to rebuild it without the rows moved above. */
+		wp_cache_delete( 'alloptions', 'options' );
+		update_option( 'mobo_core_10331613_autoload_cleanup_count', $changed, false );
+		update_option( 'mobo_core_10331613_autoload_cleanup_at', time(), false );
 	}
 
 	/**
@@ -327,11 +412,441 @@ class Mobo_Core_Migration {
 	}
 
 	/**
+	 * Force one safe legacy-image discovery pass after 10.33.8 introduced
+	 * catalog-based recovery for old JPEG/PNG attachments without Mobo markers.
+	 *
+	 * Existing refresh/image queue rows are preserved. Only cached scan and
+	 * verification state is invalidated so an in-progress or previously paused
+	 * automation cannot skip the new discovery logic. Destructive switches are
+	 * turned off and still require the normal explicit approval gate.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10338_legacy_image_catalog_rescan( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.8', '>=' ) ) {
+			return;
+		}
+
+		$options_to_delete = array(
+			'mobo_core_image_refresh_scan_cursor',
+			'mobo_core_image_refresh_missing_scan_cursor',
+			'mobo_core_image_refresh_enqueue_cursor',
+			'mobo_core_image_refresh_missing_enqueue_cursor',
+			'mobo_core_image_subsize_scan_cursor',
+			'mobo_core_image_subsize_repair_cursor',
+			'mobo_core_image_replaced_scan_cursor',
+			'mobo_core_image_replaced_delete_cursor',
+			'mobo_core_image_refresh_last_scan',
+			'mobo_core_image_refresh_last_enqueue',
+			'mobo_core_image_refresh_last_result',
+			'mobo_core_image_refresh_last_subsize_scan',
+			'mobo_core_image_refresh_last_subsize_repair',
+			'mobo_core_image_refresh_last_replaced_scan',
+			'mobo_core_image_refresh_last_replaced_delete',
+			'mobo_core_image_refresh_automation_last_result',
+			'mobo_core_image_refresh_automation_completed_at',
+			'mobo_core_image_refresh_auto_delete_old_approved',
+			'mobo_core_image_refresh_auto_delete_orphan_approved',
+			'mobo_core_orphan_image_scan_cursor',
+			'mobo_core_orphan_image_cleanup_last_scan',
+			'mobo_core_orphan_image_cleanup_last_delete',
+		);
+
+		foreach ( $options_to_delete as $option_name ) {
+			delete_option( $option_name );
+		}
+
+		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
+			$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
+			$cleanup->reset( true );
+		}
+
+		update_option( 'mobo_core_image_refresh_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_catalog_rescan_migrated_at', time(), false );
+	}
+
+
+	/**
+	 * Re-open only the replaced-attachment cleanup stages after 10.33.9 added
+	 * global old-attachment reference migration before safe deletion.
+	 *
+	 * Existing image refresh queue rows, downloaded WebP files and completed
+	 * product replacements are preserved. Destructive approval is revoked so the
+	 * administrator must explicitly review the new migration-aware cleanup step.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_10339_image_reference_migration( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.9', '>=' ) ) {
+			return;
+		}
+
+		foreach ( array(
+			'mobo_core_image_replaced_scan_cursor',
+			'mobo_core_image_replaced_delete_cursor',
+			'mobo_core_image_refresh_last_replaced_scan',
+			'mobo_core_image_refresh_last_replaced_delete',
+			'mobo_core_image_refresh_automation_last_result',
+			'mobo_core_image_refresh_automation_completed_at',
+			'mobo_core_image_refresh_auto_delete_old_approved',
+		) as $option_name ) {
+			delete_option( $option_name );
+		}
+
+		update_option( 'mobo_core_image_refresh_automation_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_image_reference_migration_enabled_at', time(), false );
+	}
+
+
+	/**
+	 * Re-open replaced-attachment cleanup after 10.33.10 introduced structured
+	 * JSON and PHP-serialized reference migration.
+	 *
+	 * Existing queue rows, downloaded WebP files and completed replacements are
+	 * preserved. Only Stages 6/7 and destructive approval are reset so retained
+	 * legacy images are retried with the safer structured migrator.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103310_structured_image_reference_migration( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.10', '>=' ) ) {
+			return;
+		}
+
+		foreach ( array(
+			'mobo_core_image_replaced_scan_cursor',
+			'mobo_core_image_replaced_delete_cursor',
+			'mobo_core_image_refresh_last_replaced_scan',
+			'mobo_core_image_refresh_last_replaced_delete',
+			'mobo_core_image_refresh_automation_last_result',
+			'mobo_core_image_refresh_automation_completed_at',
+			'mobo_core_image_refresh_auto_delete_old_approved',
+		) as $option_name ) {
+			delete_option( $option_name );
+		}
+
+		update_option( 'mobo_core_image_refresh_automation_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_structured_image_reference_migration_enabled_at', time(), false );
+	}
+
+
+	/**
+	 * Re-open Stages 6/7 after 10.33.11 made replaced-attachment scanning
+	 * timeout-safe and moved the expensive global reference audit to Stage 7.
+	 *
+	 * 10.33.10 advanced the Stage 6/7 cursor when a batch was fetched, before all
+	 * rows were processed. If PHP was interrupted, part of that batch could be
+	 * skipped on the next request. Reset only these verification cursors/results;
+	 * existing WebP files, queue rows and completed product replacements remain.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103311_replaced_attachment_scan_runtime_safety( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.11', '>=' ) ) {
+			return;
+		}
+
+		foreach ( array(
+			'mobo_core_image_replaced_scan_cursor',
+			'mobo_core_image_replaced_delete_cursor',
+			'mobo_core_image_refresh_last_replaced_scan',
+			'mobo_core_image_refresh_last_replaced_delete',
+			'mobo_core_image_refresh_automation_last_result',
+			'mobo_core_image_refresh_automation_completed_at',
+			'mobo_core_image_refresh_auto_delete_old_approved',
+		) as $option_name ) {
+			delete_option( $option_name );
+		}
+
+		update_option( 'mobo_core_image_refresh_automation_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		update_option( 'mobo_core_replaced_attachment_scan_runtime_safety_at', time(), false );
+	}
+
+
+	/**
+	 * Make replaced-old-attachment deletion a persistent administrator preference.
+	 *
+	 * 10.33.12 and earlier used a separate one-time approval option and could
+	 * automatically switch mobo_core_image_refresh_delete_old back to 0 while
+	 * starting, pausing, invalidating verification state or completing a cycle.
+	 * From 10.33.13 the actual setting is authoritative and is never changed by
+	 * workflow state transitions. This migration only removes stale approval state;
+	 * it deliberately preserves the administrator's current delete-old setting.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103313_persistent_delete_old_preference( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.13', '>=' ) ) {
+			return;
+		}
+
+		delete_option( 'mobo_core_image_refresh_auto_delete_old_approved' );
+
+		$last = get_option( 'mobo_core_image_refresh_automation_last_result', array() );
+		if ( is_array( $last ) && isset( $last['waitingApproval'] ) && 'delete-old' === sanitize_key( (string) $last['waitingApproval'] ) ) {
+			unset( $last['waitingApproval'] );
+			$delete_enabled = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' );
+			$last['status'] = $delete_enabled ? 'delete-old-setting-enabled' : 'waiting-delete-old-setting';
+			$last['needsContinuation'] = $delete_enabled;
+			$last['message'] = $delete_enabled
+				? 'تنظیم دائمی حذف پیوست قدیمی فعال است و مرحله ۷ بدون تایید مجدد ادامه پیدا می کند.'
+				: 'برای مرحله ۷، گزینه حذف پیوست قدیمی بعد از جایگزینی امن را یک بار فعال کنید؛ این انتخاب در ادامه حفظ می شود.';
+			update_option( 'mobo_core_image_refresh_automation_last_result', $last, false );
+		}
+
+		update_option( 'mobo_core_persistent_delete_old_preference_migrated_at', time(), false );
+	}
+
+
+	/**
+	 * 10.33.15: Stage 7 is non-blocking per attachment.
+	 *
+	 * 10.33.14 could disable the whole automation when one old attachment was
+	 * retained by the safety audit. If an installation was paused specifically by
+	 * that status, resume the existing Stage 7 cursor after upgrade. User-initiated
+	 * pauses and unrelated errors are intentionally left untouched.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103315_nonblocking_stage7( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.15', '>=' ) ) {
+			return;
+		}
+
+		$delete_state = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		if ( is_array( $delete_state ) && 'delete' === ( isset( $delete_state['mode'] ) ? (string) $delete_state['mode'] : '' ) ) {
+			$legacy_failed = absint( isset( $delete_state['failed'] ) ? $delete_state['failed'] : 0 );
+			if ( $legacy_failed > 0 && ! isset( $delete_state['blocked'] ) ) {
+				/* 10.33.14 did not distinguish safety blocks from operational errors.
+				 * Preserve them conservatively as blocked legacy items for reporting. */
+				$delete_state['blocked'] = $legacy_failed;
+				$delete_state['errors']  = 0;
+				update_option( 'mobo_core_image_refresh_last_replaced_delete', $delete_state, false );
+			}
+		}
+
+		$last = get_option( 'mobo_core_image_refresh_automation_last_result', array() );
+		if ( is_array( $last ) && 'delete-old-failed' === sanitize_key( isset( $last['status'] ) ? (string) $last['status'] : '' ) ) {
+			update_option( 'mobo_core_image_refresh_automation_enabled', '1', false );
+			$last['success']           = true;
+			$last['status']            = 'stage7-resumed-after-upgrade';
+			$last['step']              = 7;
+			$last['needsContinuation'] = true;
+			$last['progressed']        = false;
+			$last['message']           = 'مرحله ۷ پس از ارتقا با منطق غیرمسدودکننده ادامه پیدا می کند؛ پیوست های دارای Safety Block ثبت و رد می شوند و کل چرخه را متوقف نمی کنند.';
+			update_option( 'mobo_core_image_refresh_automation_last_result', $last, false );
+		}
+
+		update_option( 'mobo_core_stage7_nonblocking_migrated_at', time(), false );
+	}
+
+
+	/**
+	 * 10.33.16: make Stage 7 a fully automatic convergence loop.
+	 *
+	 * 10.33.15 treated one complete delete pass as authoritative. A site could
+	 * therefore report the full image-refresh cycle as completed even though a
+	 * later manual Stage 7 pass was still able to migrate references and delete
+	 * more legacy attachments. The new workflow repeats full Stage 7 passes while
+	 * each pass makes progress and stops only after a zero-progress safety pass.
+	 *
+	 * Existing Stage 1-6 state, WebP replacements and the Stage 7 cursor are
+	 * preserved. If an installation was incorrectly marked completed while Stage 7
+	 * still has work, automation is re-enabled directly at Stage 7.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103316_automatic_stage7_convergence( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.16', '>=' ) ) {
+			return;
+		}
+
+		$scan = get_option( 'mobo_core_image_refresh_last_replaced_scan', array() );
+		$scan = is_array( $scan ) ? $scan : array();
+		$delete = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		$delete = is_array( $delete ) ? $delete : array();
+
+		$actionable = ! empty( $scan['cycleComplete'] )
+			? absint( isset( $scan['ready'] ) ? $scan['ready'] : 0 ) + absint( isset( $scan['migrationCandidates'] ) ? $scan['migrationCandidates'] : 0 )
+			: 0;
+		$delete_progress = absint( isset( $delete['passProgress'] )
+			? $delete['passProgress']
+			: absint( isset( $delete['deleted'] ) ? $delete['deleted'] : 0 )
+				+ absint( isset( $delete['referenceRowsUpdated'] ) ? $delete['referenceRowsUpdated'] : 0 ) );
+
+		if ( ! empty( $delete['cycleComplete'] ) ) {
+			$delete['passProgress']     = $delete_progress;
+			$delete['needsAnotherPass'] = $delete_progress > 0;
+			$delete['stableComplete']   = 0 === $delete_progress;
+			update_option( 'mobo_core_image_refresh_last_replaced_delete', $delete, false );
+		}
+
+		$last = get_option( 'mobo_core_image_refresh_automation_last_result', array() );
+		$last = is_array( $last ) ? $last : array();
+		$last_status = sanitize_key( isset( $last['status'] ) ? (string) $last['status'] : '' );
+		$delete_in_progress = ! empty( $delete ) && empty( $delete['cycleComplete'] );
+		$needs_followup = ! empty( $delete['cycleComplete'] ) && $delete_progress > 0;
+		$was_false_complete = 'completed' === $last_status && $actionable > 0;
+
+		if ( $actionable > 0
+			&& Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+			&& ( $delete_in_progress || $needs_followup || $was_false_complete ) ) {
+			update_option( 'mobo_core_image_refresh_automation_enabled', '1', false );
+			update_option( 'mobo_core_image_refresh_automation_completed_at', 0, false );
+			$last['success']           = true;
+			$last['status']            = 'stage7-auto-resumed-after-upgrade';
+			$last['step']              = 7;
+			$last['needsContinuation'] = true;
+			$last['progressed']        = true;
+			$last['message']           = 'Stage 7 با منطق چندگذری خودکار دوباره فعال شد. Cursor فعلی حفظ شده و Cron/Self Runner تا رسیدن به یک گذر کامل بدون پیشرفت جدید، انتقال مراجع و حذف امن را ادامه می دهد.';
+			update_option( 'mobo_core_image_refresh_automation_last_result', $last, false );
+			/*
+			 * maybe_run() executes on plugins_loaded, before rest_url() is safe on
+			 * all WordPress installations. Queue a one-shot kick and dispatch it
+			 * from run_deferred_repairs() after init instead of performing HTTP
+			 * during the migration transaction/bootstrap.
+			 */
+			update_option( 'mobo_core_stage7_resume_kick_pending', '1', false );
+		}
+
+		update_option( 'mobo_core_stage7_automatic_convergence_migrated_at', time(), false );
+	}
+
+
+	/**
+	 * 10.33.16.1: installation/bootstrap safety hotfix.
+	 *
+	 * - Re-arms the deferred Stage 7 self-runner kick for installations that
+	 *   upgraded from 10.33.16 or were interrupted during the previous migration.
+	 * - The sync-event table schema itself is recreated/updated by dbDelta before
+	 *   this method, using an index prefix compatible with older 1000-byte limits.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_1033161_install_bootstrap_safety( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.16.1', '>=' ) ) {
+			return;
+		}
+
+		$scan = get_option( 'mobo_core_image_refresh_last_replaced_scan', array() );
+		$scan = is_array( $scan ) ? $scan : array();
+		$delete = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		$delete = is_array( $delete ) ? $delete : array();
+
+		$actionable = ! empty( $scan['cycleComplete'] )
+			? absint( isset( $scan['ready'] ) ? $scan['ready'] : 0 ) + absint( isset( $scan['migrationCandidates'] ) ? $scan['migrationCandidates'] : 0 )
+			: 0;
+		$delete_in_progress = ! empty( $delete ) && empty( $delete['cycleComplete'] );
+		$needs_followup = ! empty( $delete['needsAnotherPass'] );
+
+		if ( $actionable > 0
+			&& Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+			&& ( $delete_in_progress || $needs_followup || '1' === (string) get_option( 'mobo_core_image_refresh_automation_enabled', '0' ) ) ) {
+			update_option( 'mobo_core_stage7_resume_kick_pending', '1', false );
+		}
+
+		update_option( 'mobo_core_1033161_install_bootstrap_safety_at', time(), false );
+	}
+
+
+	/**
+	 * 10.33.17.1: automatically arm a safe manual Stage 7 after upgrade.
+	 *
+	 * Older versions only re-armed Stage 7 when a delete pass had already started.
+	 * A store that completed Stage 6 manually, enabled the persistent delete-old
+	 * preference and had not yet completed the first delete pass could therefore
+	 * still require one administrator click per batch. Preserve all cursors and
+	 * simply hand that already-verified Stage 7 to the existing automation runner.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_1033171_stage7_autodrain( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.17.1', '>=' ) ) {
+			return;
+		}
+
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
+			update_option( 'mobo_core_1033171_stage7_autodrain_migrated_at', time(), false );
+			return;
+		}
+
+		$scan   = get_option( 'mobo_core_image_refresh_last_replaced_scan', array() );
+		$delete = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		$scan   = is_array( $scan ) ? $scan : array();
+		$delete = is_array( $delete ) ? $delete : array();
+
+		$actionable = ! empty( $scan['cycleComplete'] )
+			? absint( isset( $scan['ready'] ) ? $scan['ready'] : 0 ) + absint( isset( $scan['migrationCandidates'] ) ? $scan['migrationCandidates'] : 0 )
+			: 0;
+		$delete_newer = ! empty( $delete['cycleComplete'] )
+			&& absint( isset( $delete['checkedAt'] ) ? $delete['checkedAt'] : 0 ) >= absint( isset( $scan['checkedAt'] ) ? $scan['checkedAt'] : 0 );
+		$delete_progress = absint( isset( $delete['passProgress'] )
+			? $delete['passProgress']
+			: absint( isset( $delete['deleted'] ) ? $delete['deleted'] : 0 )
+				+ absint( isset( $delete['referenceRowsUpdated'] ) ? $delete['referenceRowsUpdated'] : 0 ) );
+		$stable = $delete_newer && 0 === $delete_progress;
+
+		if ( $actionable > 0 && ! $stable ) {
+			update_option( 'mobo_core_image_refresh_automation_enabled', '1', false );
+			update_option( 'mobo_core_image_refresh_automation_completed_at', 0, false );
+			update_option( 'mobo_core_stage7_resume_kick_pending', '1', false );
+
+			$last = get_option( 'mobo_core_image_refresh_automation_last_result', array() );
+			$last = is_array( $last ) ? $last : array();
+			$last['success']           = true;
+			$last['status']            = 'stage7-autodrain-armed-after-upgrade';
+			$last['step']              = 7;
+			$last['needsContinuation'] = true;
+			$last['progressed']        = false;
+			$last['message']           = 'Stage 7 پس از ارتقا برای ادامه خودکار فعال شد. Cursor و Safety Audit فعلی بدون ریست حفظ شده اند.';
+			update_option( 'mobo_core_image_refresh_automation_last_result', $last, false );
+		}
+
+		update_option( 'mobo_core_1033171_stage7_autodrain_migrated_at', time(), false );
+	}
+
+	/**
 	 * Run repairs that require taxonomies registered on WordPress init.
 	 *
 	 * @return void
 	 */
 	public static function run_deferred_repairs() {
+		/*
+		 * Stage 7 resume kicks are intentionally dispatched only after init.
+		 * This avoids rest_url()/rewrite access during plugins_loaded migrations.
+		 */
+		if ( '1' === (string) get_option( 'mobo_core_stage7_resume_kick_pending', '0' )
+			&& class_exists( 'Mobo_Core_Self_Runner' )
+			&& method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+			delete_option( 'mobo_core_stage7_resume_kick_pending' );
+			$kick = Mobo_Core_Self_Runner::kick( 'stage7-auto-resume-upgrade', true );
+			update_option( 'mobo_core_stage7_resume_deferred_kick_result', $kick, false );
+			update_option( 'mobo_core_stage7_resume_deferred_kick_at', time(), false );
+		}
+
 		if ( '1' === (string) get_option( 'mobo_core_category_placeholder_repair_pending', '0' )
 			&& taxonomy_exists( 'product_cat' ) ) {
 			$result = self::repair_placeholder_category_titles_from_map();

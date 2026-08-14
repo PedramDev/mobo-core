@@ -28,6 +28,7 @@ final class Mobo_Core_Cache_Purger {
 	private static $reasons           = array();
 	private static $collection_errors = array();
 	private static $native_registered = false;
+	private static $suppressed_product_ids = array();
 
 	const OPTION_LAST_RESULT = 'mobo_core_cache_purge_last_result';
 	const OPTION_ARCHIVE_QUEUE = 'mobo_core_cache_archive_purge_queue';
@@ -35,7 +36,7 @@ final class Mobo_Core_Cache_Purger {
 	const ARCHIVE_QUEUE_SCHEMA_VERSION = 1;
 	const ARCHIVE_QUEUE_MAX_URLS = 5000;
 	const ARCHIVE_QUEUE_MAX_PRODUCTS = 5000;
-	const HEALTH_SCHEMA_VERSION = 2;
+	const HEALTH_SCHEMA_VERSION = 3;
 	const ERROR_MAX_LENGTH = 1000;
 
 	/**
@@ -220,6 +221,40 @@ final class Mobo_Core_Cache_Purger {
 	}
 
 	/**
+	 * Suppress targeted page-cache invalidation for one parent product until the
+	 * current request ends. Used by intermediate pages of an authoritative Mobo
+	 * variants snapshot; the final page performs one converged purge/warmup.
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return void
+	 */
+	public static function suppress_product_for_request( $product_id ) {
+		self::init();
+		$resolved = self::resolve_product_ids( $product_id );
+		if ( $resolved['product_id'] > 0 ) {
+			self::$suppressed_product_ids[ $resolved['product_id'] ] = true;
+		}
+	}
+
+	/**
+	 * Remove request-local suppression for one parent product.
+	 *
+	 * Variation delta bursts suppress CRUD-triggered purges while individual
+	 * variations are saved. The deferred parent finalizer calls this immediately
+	 * before queuing the single converged purge for the parent.
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return void
+	 */
+	public static function unsuppress_product_for_request( $product_id ) {
+		self::init();
+		$resolved = self::resolve_product_ids( $product_id );
+		if ( $resolved['product_id'] > 0 ) {
+			unset( self::$suppressed_product_ids[ $resolved['product_id'] ] );
+		}
+	}
+
+	/**
 	 * Queue targeted invalidation for a product or variation.
 	 *
 	 * @param int    $product_id Product or variation ID.
@@ -231,6 +266,10 @@ final class Mobo_Core_Cache_Purger {
 		$resolved = self::resolve_product_ids( $product_id );
 
 		if ( $resolved['product_id'] <= 0 ) {
+			return;
+		}
+
+		if ( isset( self::$suppressed_product_ids[ $resolved['product_id'] ] ) ) {
 			return;
 		}
 
@@ -308,6 +347,7 @@ final class Mobo_Core_Cache_Purger {
 		$integration_data = array();
 		$archive_interval = self::archive_purge_interval_minutes();
 		$archive_queue    = array( 'queued' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => 0 );
+		$warmup_queue     = array( 'queued' => false, 'queuedCount' => 0, 'pendingCount' => 0, 'status' => 'not-run' );
 		$overall_status   = 'failed';
 		$last_error       = '';
 
@@ -437,6 +477,14 @@ final class Mobo_Core_Cache_Purger {
 			);
 
 			$integration_data['customHooks'] = self::run_custom_hooks_integration( $inventory['customHooks'], $context, $custom_hook_error );
+
+			/*
+			 * Warm only the current product permalink after at least one detected
+			 * page-cache integration was purged successfully. The warmup itself is
+			 * deferred to the real cron so sync/shutdown never waits for page render.
+			 */
+			$warmup_queue = self::queue_product_warmups( $product_ids, $inventory, $integration_data, $reasons );
+
 			$overall_status = self::resolve_overall_status( $integration_data );
 			$last_error     = self::resolve_last_integration_error( $integration_data );
 		} catch ( Throwable $e ) {
@@ -467,6 +515,9 @@ final class Mobo_Core_Cache_Purger {
 				'archivePurgeIntervalMinutes'  => $archive_interval,
 				'archiveUrlsQueued'            => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
 				'archivePurgeDueAt'            => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+				'warmupQueuedCount'             => isset( $warmup_queue['queuedCount'] ) ? absint( $warmup_queue['queuedCount'] ) : 0,
+				'warmupPendingCount'            => isset( $warmup_queue['pendingCount'] ) ? absint( $warmup_queue['pendingCount'] ) : 0,
+				'warmupQueueStatus'             => isset( $warmup_queue['status'] ) ? sanitize_key( (string) $warmup_queue['status'] ) : 'not-run',
 				'durationMs'                   => self::elapsed_ms( $started_at ),
 				'reasons'                      => array_slice( $reasons, 0, 20 ),
 				'archivePurgeEnabled'           => $archive_interval > 0,
@@ -491,6 +542,8 @@ final class Mobo_Core_Cache_Purger {
 			'urls'              => count( $urls ),
 			'archiveUrlsQueued' => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
 			'archivePurgeDueAt' => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+			'warmupQueued'      => isset( $warmup_queue['queuedCount'] ) ? absint( $warmup_queue['queuedCount'] ) : 0,
+			'warmupPending'     => isset( $warmup_queue['pendingCount'] ) ? absint( $warmup_queue['pendingCount'] ) : 0,
 			'integrations'      => $successful_integrations,
 			'status'            => $overall_status,
 			'lastError'         => $last_error,
@@ -1002,6 +1055,85 @@ final class Mobo_Core_Cache_Purger {
 
 
 	/**
+	 * Queue exact current product pages for deferred warmup.
+	 *
+	 * @param array $product_ids Product IDs.
+	 * @param array $inventory Current cache-plugin inventory.
+	 * @param array $integration_data Purge results.
+	 * @param array $reasons Mutation reasons.
+	 * @return array
+	 */
+	private static function queue_product_warmups( $product_ids, $inventory, $integration_data, $reasons ) {
+		$result = array(
+			'queued'       => false,
+			'queuedCount'  => 0,
+			'pendingCount' => 0,
+			'status'       => 'not-needed',
+		);
+
+		if ( empty( $product_ids ) || ! class_exists( 'Mobo_Core_Cache_Warmer' ) || ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) ) {
+			return $result;
+		}
+
+		$cache_keys = array( 'wpRocket', 'liteSpeedCache', 'w3TotalCache', 'wpSuperCache' );
+		$detected   = false;
+		$purged     = false;
+		foreach ( $cache_keys as $key ) {
+			if ( ! empty( $inventory[ $key ]['detected'] ) ) {
+				$detected = true;
+			}
+			if ( ! empty( $integration_data[ $key ]['detected'] ) && isset( $integration_data[ $key ]['status'] ) && 'success' === $integration_data[ $key ]['status'] ) {
+				$purged = true;
+			}
+		}
+
+		$enabled = apply_filters(
+			'mobo_core_cache_warmup_product_enabled',
+			$detected && $purged,
+			$product_ids,
+			$integration_data,
+			$reasons
+		);
+		if ( ! $enabled ) {
+			$result['status'] = $detected ? 'purge-not-successful' : 'no-page-cache-plugin';
+			return $result;
+		}
+
+		$queued = 0;
+		$pending = 0;
+		foreach ( array_values( array_unique( array_filter( array_map( 'absint', (array) $product_ids ) ) ) ) as $product_id ) {
+			$enqueue = Mobo_Core_Cache_Warmer::enqueue_product( $product_id, '', 'targeted-product-purge' );
+			if ( ! empty( $enqueue['queued'] ) ) {
+				$queued++;
+			}
+			if ( isset( $enqueue['pendingCount'] ) ) {
+				$pending = max( $pending, absint( $enqueue['pendingCount'] ) );
+			}
+		}
+
+		$result['queued']       = $queued > 0;
+		$result['queuedCount']  = $queued;
+		$result['pendingCount'] = $pending;
+		$result['status']       = $queued > 0 ? 'queued' : 'nothing-queued';
+
+		/*
+		 * Wake the local bounded runner once for the whole batch. This happens at
+		 * shutdown after WordPress init, so it is safe to build the REST worker URL.
+		 * If the self runner is disabled/throttled, the site's real cron will drain
+		 * the same persistent queue on its next normal hit.
+		 */
+		if ( $queued > 0 && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			try {
+				Mobo_Core_Self_Runner::kick( 'cache-warmup-queued', false );
+			} catch ( Throwable $e ) {
+				self::log_warning( 'Product cache warmup was queued but the self-runner wake-up failed: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'cache-warmup' ) );
+			}
+		}
+
+		return $result;
+	}
+
+	/**
 	 * Return the last targeted purge result formatted for the health payload.
 	 * No product IDs or URLs are exposed; only counts, versions and bounded errors.
 	 *
@@ -1016,6 +1148,7 @@ final class Mobo_Core_Cache_Purger {
 		$integrations = array();
 		$stored_integrations = isset( $stored['integrations'] ) && is_array( $stored['integrations'] ) ? $stored['integrations'] : array();
 		$archive_queue_status = self::get_archive_queue_status();
+		$warmup_queue_status  = class_exists( 'Mobo_Core_Cache_Warmer' ) ? Mobo_Core_Cache_Warmer::get_status() : array();
 
 		foreach ( $inventory as $key => $current ) {
 			$previous = isset( $stored_integrations[ $key ] ) && is_array( $stored_integrations[ $key ] ) ? $stored_integrations[ $key ] : array();
@@ -1068,6 +1201,7 @@ final class Mobo_Core_Cache_Purger {
 			'reasons'             => isset( $stored['reasons'] ) && is_array( $stored['reasons'] ) ? array_values( array_slice( $stored['reasons'], 0, 20 ) ) : array(),
 			'lastError'           => isset( $stored['lastError'] ) ? self::sanitize_error( $stored['lastError'] ) : '',
 			'archiveQueue'        => $archive_queue_status,
+			'warmupQueue'         => $warmup_queue_status,
 			'integrations'        => $integrations,
 		);
 	}
@@ -1245,6 +1379,7 @@ final class Mobo_Core_Cache_Purger {
 	}
 
 	private static function reset_queue() {
+		self::$suppressed_product_ids = array();
 		self::$has_change  = false;
 		self::$object_ids  = array();
 		self::$product_ids = array();

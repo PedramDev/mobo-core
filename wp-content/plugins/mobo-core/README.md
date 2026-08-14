@@ -5,7 +5,7 @@
 **اتصال کنترل شده فروشگاه ووکامرس به MoboCore و جریان کاری mobomobo.ir**  
 **Controlled WooCommerce integration with MoboCore and the mobomobo.ir workflow**
 
-![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.31.76-1f6feb)
+![Plugin Version](https://img.shields.io/badge/Mobo_Core-10.33.16.18-1f6feb)
 ![Portal](https://img.shields.io/badge/Portal-v25%20%2F%20.NET%2010-512bd4)
 ![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b?logo=wordpress&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php&logoColor=white)
@@ -40,6 +40,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 - اعتبارسنجی واقعی افزودن به سبد موبو؛ اجباری هنگام ثبت خودکار سفارش
 - پیامک بر اساس نوع سفارش از طریق افزونه «پیامک حرفه ای ووکامرس»
 - Real Cron، Self Runner، گزارش سلامت و ابزارهای عیب یابی
+- Adaptive Self-Tuning برای تنظیم موقت ظرفیت Worker بر اساس سرعت واقعی Stageها، فشار حافظه و بودجه اجرا بدون تغییر تنظیمات ذخیره‌شده
 - اعلام سازگاری با WooCommerce HPOS
 
 ### نیازمندی ها
@@ -51,7 +52,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 | WooCommerce | `8.2+` |
 | ووکامرس فارسی | نصب و فعال، slug: `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.76` |
+| Mobo Core | `10.33.16.18` |
 | Portal سازگار | `v25 / .NET 10` |
 | دسترسی خروجی HTTP | به MoboCore و در صورت فعال بودن، `mobomobo.ir` |
 
@@ -69,7 +70,7 @@ Mobo Core افزونه تخصصی ووکامرس برای فروشگاه های 
 
 ```php
 // wp-config.php
-// مقدار فعلی پیش فرض افزونه در نسخه 10.31.76:
+// مقدار فعلی پیش فرض افزونه در نسخه 10.33.16.18:
 define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
 ```
 
@@ -130,7 +131,7 @@ GPLv2 or later. فایل [`LICENSE`](LICENSE) را ببینید.
 
 ### اجرای خودکار امن نوسازی تصاویر
 
-در تب «نوسازی تصاویر»، دکمه «شروع یا ادامه اجرای خودکار امن» تمام مراحل اسکن، ساخت صف، جایگزینی، بررسی و بازسازی برش های WebP و اسکن های تاییدی را با batch محدود از طریق Cron واقعی یا Self Runner پیش می برد. اجرای خودکار در خطا متوقف می شود و برای دو مرحله حذفی، یعنی حذف پیوست قدیمی جایگزین شده و حذف خانواده فایل بدون پیوست، هر بار یک تایید صریح مدیر لازم است.
+در تب «نوسازی تصاویر»، دکمه «شروع یا ادامه اجرای خودکار امن» تمام مراحل اسکن، ساخت صف، جایگزینی، بررسی و بازسازی برش های WebP و اسکن های تاییدی را با batch محدود از طریق Cron واقعی یا Self Runner پیش می برد. اجرای خودکار در خطا متوقف می شود. حذف پیوست قدیمی جایگزین شده از تنظیم دائمی «حذف پیوست قدیمی بعد از جایگزینی امن» پیروی می کند و پس از یک بار فعال سازی دیگر در شروع، توقف، خطا یا پایان چرخه خاموش نمی شود؛ فقط پاکسازی خانواده فایل بدون پیوست تایید جداگانه خود را نگه می دارد.
 
 وضعیت همین تب بدون بازخوانی صفحه به صورت خودکار تازه می شود. هنگام اجرای Automation فاصله بررسی ۴ ثانیه و در حالت عادی ۱۲ ثانیه است. اگر مدیر یکی از تنظیمات فرم را تغییر دهد، به روزرسانی موقتا متوقف می شود تا مقدار ذخیره نشده از بین نرود.
 
@@ -150,6 +151,8 @@ GPLv2 or later. فایل [`LICENSE`](LICENSE) را ببینید.
 برای صفحات سفارشی Elementor/Block که فهرست محصولات را خارج از Shop/Home نمایش می‌دهند، URLهای اضافی را با filter `mobo_core_cache_purge_urls` اضافه کنید. پاک‌سازی Home نیز با `mobo_core_cache_purge_home_enabled` قابل کنترل است.
 
 از نسخه `10.31.74` نتیجه آخرین Purge نیز داخل `cachePurge` گزارش سلامت ارسال می‌شود: وضعیت کلی، زمان آخرین تلاش و موفقیت کامل، نسخه Mobo، تعداد محصول/Object/URL، مدت اجرا، خطاهای متوالی و آخرین خطای محدودشده. برای WordPress/WooCommerce، WP Rocket، LiteSpeed Cache، W3 Total Cache، WP Super Cache و hookهای سفارشی، نسخه تست‌شده، نسخه فعلی و وضعیت `success`، `failed`، `not_detected` یا `not_tested` ثبت می‌شود.
+
+از نسخه `10.33.16.2` بعد از Purge موفق، فقط permalink فعلی همان محصول وارد صف `Product Cache Warmup` می‌شود. Real Cron یک GET ناشناس و same-origin برای همان URL انجام می‌دهد تا Cache صفحه محصول دوباره ساخته شود. این Warmup هیچ URL مربوط به Home، Shop، دسته، برچسب یا permalink قدیمی را preload نمی‌کند و اجرای Sync را منتظر render صفحه نگه نمی‌دارد.
 
 <a id="en"></a>
 
@@ -172,6 +175,7 @@ This repository contains the WordPress plugin. The current compatible backend is
 - Optional cart validation and asynchronous Mobo order submission
 - Order-type SMS notifications through Persian WooCommerce SMS
 - Real cron, loopback self-runner, health reporting, and diagnostics
+- Adaptive self-tuning of request-local worker capacity from recent stage speed, memory headroom, and runner budget without overwriting saved settings
 - WooCommerce HPOS compatibility declaration
 
 
@@ -191,6 +195,8 @@ Custom Elementor/Block listing pages can be appended through `mobo_core_cache_pu
 
 Since `10.31.74`, the health payload includes structured `cachePurge` telemetry: overall status, last attempt/full-success times, Mobo version, affected counts, duration, consecutive failures, and a bounded last error. Each supported integration reports its tested/current version and `success`, `failed`, `not_detected`, or `not_tested` state.
 
+Since `10.33.16.2`, a successful targeted purge queues only the product's current permalink for deferred cache warmup. The Real Cron performs one anonymous same-origin GET for that URL so the product page cache can be regenerated without preloading Home, Shop, category/tag archives, or old permalinks, and without making product synchronization wait for the front-end render.
+
 ### Requirements
 
 | Component | Minimum / status |
@@ -200,7 +206,7 @@ Since `10.31.74`, the health payload includes structured `cachePurge` telemetry:
 | WooCommerce | `8.2+` |
 | Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
 | WooCommerce tested up to | `10.9` |
-| Mobo Core | `10.31.76` |
+| Mobo Core | `10.33.16.18` |
 | Compatible Portal | `v25 / .NET 10` |
 | Outbound HTTP access | MoboCore and, when enabled, `mobomobo.ir` |
 

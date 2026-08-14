@@ -196,6 +196,65 @@ class Mobo_Core_Checkout_Validator {
 		return true;
 	}
 
+
+	/**
+	 * Read the authenticated Mobo wallet balance.
+	 *
+	 * Uses the same option-backed userauth cookie jar as checkout/order submission,
+	 * so no browser cookie is stored or hard-coded in Mobo Core.
+	 *
+	 * Expected payload: {"success":true,"amount":1564009}
+	 *
+	 * @return int|float|WP_Error
+	 */
+	public function get_mobo_wallet_balance() {
+		$auth = $this->ensure_mobo_authenticated( false );
+		if ( is_wp_error( $auth ) ) {
+			return $auth;
+		}
+
+		$path     = '/site/api/v1/user/billing/transactions/balance';
+		$response = $this->mobo_request( 'GET', $path, null );
+
+		if ( $this->is_auth_error_response( $response ) ) {
+			$auth = $this->ensure_mobo_authenticated( true );
+			if ( is_wp_error( $auth ) ) {
+				return $auth;
+			}
+			$response = $this->mobo_request( 'GET', $path, null );
+		}
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$code = absint( wp_remote_retrieve_response_code( $response ) );
+		if ( $code < 200 || $code >= 300 ) {
+			return new WP_Error( 'mobo_core_wallet_balance_http_error', 'Mobo wallet balance returned HTTP ' . $code . '.' );
+		}
+
+		$json = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $json ) ) {
+			return new WP_Error( 'mobo_core_wallet_balance_json_error', 'Mobo wallet balance response was not valid JSON.' );
+		}
+
+		if ( isset( $json['success'] ) && ! $this->to_bool( $json['success'] ) ) {
+			$message = isset( $json['description'] ) ? sanitize_text_field( (string) $json['description'] ) : 'Mobo wallet balance response was not successful.';
+			return new WP_Error( 'mobo_core_wallet_balance_not_success', $message );
+		}
+
+		if ( ! array_key_exists( 'amount', $json ) || ! is_numeric( $json['amount'] ) ) {
+			return new WP_Error( 'mobo_core_wallet_balance_missing_amount', 'Mobo wallet balance response did not include a numeric amount.' );
+		}
+
+		$amount = (float) $json['amount'];
+		if ( $amount >= 0 && floor( $amount ) === $amount && $amount <= PHP_INT_MAX ) {
+			return (int) $amount;
+		}
+
+		return $amount;
+	}
+
 	/**
 	 * Validate the active cart.
 	 *
@@ -3059,6 +3118,13 @@ class Mobo_Core_Checkout_Validator {
 
 			$mobo_order_id = isset( $payment_details['id'] ) ? absint( $payment_details['id'] ) : ( isset( $details['id'] ) ? absint( $details['id'] ) : 0 );
 			$this->mark_mobo_order_submission_success( $order, $mobo_order_id, $token, $shipping_id, $payment_json );
+
+			/*
+			 * Wallet monitoring is best-effort and must never turn an already successful
+			 * Mobo purchase into a failed WooCommerce order. Listeners fetch the balance
+			 * through this authenticated client and persist/send alerts independently.
+			 */
+			do_action( 'mobo_core_mobo_order_submission_success', $order_id, $mobo_order_id, $payment_json );
 
 			return true;
 		} finally {

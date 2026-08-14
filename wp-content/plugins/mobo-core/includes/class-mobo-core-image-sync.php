@@ -24,6 +24,24 @@ class Mobo_Core_Image_Sync {
 	 */
 	private $last_image_error = '';
 
+	/**
+	 * Request-local attachment resolution cache.
+	 *
+	 * Image resolution can ask for the same GUID/source several times while a row
+	 * moves from queue lookup to reuse/import validation. Cache both hits and misses
+	 * for the lifetime of the PHP request so repeated WP_Query/meta lookups disappear.
+	 *
+	 * @var array<string,int>
+	 */
+	private $attachment_lookup_cache = array();
+
+	/**
+	 * Request-local attachment meta-query cache.
+	 *
+	 * @var array<string,array{limit:int,ids:array}>
+	 */
+	private $attachment_meta_lookup_cache = array();
+
 
 	/**
 	 * Process images for a product.
@@ -147,7 +165,7 @@ class Mobo_Core_Image_Sync {
 					'status'    => 'disabled-by-limit',
 					'processed' => 0,
 					'failed'    => 0,
-					'remaining' => $queue->count_due() > 0,
+					'remaining' => method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0,
 				);
 			}
 
@@ -199,17 +217,39 @@ class Mobo_Core_Image_Sync {
 		$queue        = new Mobo_Core_Image_Queue();
 		$product_guid = $this->get_product_guid( $product_id );
 
-		$enqueue = $queue->enqueue_product_images( $product_id, $product_guid, $images );
-		$rows    = $queue->get_due_product_images( $product_id, $limit );
-		$result  = $this->process_queue_rows( $queue, $rows, $limit );
+		$enqueue  = $queue->enqueue_product_images( $product_id, $product_guid, $images );
+		$blocking = is_bool( $queue_blocking_override ) ? $queue_blocking_override : Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '0' );
 
+		/*
+		 * A non-blocking Product Sync must truly be non-blocking: enqueue desired
+		 * images and leave network/media import to the real runner. Older versions
+		 * still downloaded a bounded set here even when the caller explicitly passed
+		 * false, which made product throughput depend on remote image latency.
+		 */
+		if ( false === $blocking ) {
+			$result = array(
+				'processed' => 0,
+				'failed'    => 0,
+				'status'    => 'queued-async',
+			);
+		} else {
+			$rows   = $queue->get_due_product_images( $product_id, $limit );
+			$result = $this->process_queue_rows( $queue, $rows, $limit );
+		}
+
+		/* Attach any rows that had already completed in an earlier runner pass. */
 		$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
 
-		$pending       = $queue->count_pending_by_product( $product_id, false );
-		$due_by_product = method_exists( $queue, 'count_due_by_product' ) ? $queue->count_due_by_product( $product_id ) : $pending;
+		if ( method_exists( $queue, 'get_product_summary' ) ) {
+			$product_queue_summary = $queue->get_product_summary( $product_id );
+			$pending        = absint( isset( $product_queue_summary['pending'] ) ? $product_queue_summary['pending'] : 0 );
+			$due_by_product = absint( isset( $product_queue_summary['due'] ) ? $product_queue_summary['due'] : 0 );
+		} else {
+			$pending        = $queue->count_pending_by_product( $product_id, false );
+			$due_by_product = method_exists( $queue, 'count_due_by_product' ) ? $queue->count_due_by_product( $product_id ) : $pending;
+		}
 		$processed      = isset( $result['processed'] ) ? absint( $result['processed'] ) : 0;
 		$failed         = isset( $result['failed'] ) ? absint( $result['failed'] ) : 0;
-		$blocking       = is_bool( $queue_blocking_override ) ? $queue_blocking_override : Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '0' );
 
 		/*
 		 * Never keep product sync stuck on image rows that are waiting for a
@@ -233,6 +273,7 @@ class Mobo_Core_Image_Sync {
 			'pending'    => $pending,
 			'due'        => $due_by_product,
 			'blocking'   => $blocking,
+			'queuedAsync'=> ! $blocking,
 		);
 	}
 
@@ -306,7 +347,9 @@ class Mobo_Core_Image_Sync {
 		$limit     = max( 1, min( 50, absint( $limit ) ) );
 		$processed = 0;
 		$failed    = 0;
+		$deferred  = 0;
 		$touched   = array();
+		$link_rows = array();
 		$paused_for_upgrade = false;
 
 		if ( ! is_array( $rows ) || empty( $rows ) ) {
@@ -315,103 +358,173 @@ class Mobo_Core_Image_Sync {
 				'status'    => 'empty',
 				'processed' => 0,
 				'failed'    => 0,
-				'remaining' => $queue->count_due() > 0,
+				'deferred'  => 0,
+				'remaining' => method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0,
 			);
 		}
 
 		$this->load_media_dependencies();
 
-		foreach ( $rows as $row ) {
-			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
-				$paused_for_upgrade = true;
-				break;
-			}
-
-			if ( $processed >= $limit ) {
-				break;
-			}
-
-			$id            = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
-			$product_id    = isset( $row['product_id'] ) ? absint( $row['product_id'] ) : 0;
-			$image_guid    = isset( $row['image_guid'] ) ? sanitize_text_field( (string) $row['image_guid'] ) : '';
-			$url           = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
-			$attachment_id = isset( $row['attachment_id'] ) ? absint( $row['attachment_id'] ) : 0;
-			$try_count     = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
-
-			if ( $id <= 0 ) {
-				$failed++;
+		/*
+		 * Prime posts/meta once for the full claimed batch. get_post_type(),
+		 * get_post_mime_type(), get_attached_file() and WC hydration can otherwise
+		 * fan out into repeated point queries while processing several images.
+		 */
+		$prime_ids = array();
+		foreach ( $rows as $prime_row ) {
+			if ( ! is_array( $prime_row ) ) {
 				continue;
 			}
-
-			if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
-				$queue->mark_failure( $id, 'Product does not exist.', $try_count, true );
-				$failed++;
-				continue;
+			$product_id = isset( $prime_row['product_id'] ) ? absint( $prime_row['product_id'] ) : 0;
+			$attachment_id = isset( $prime_row['attachment_id'] ) ? absint( $prime_row['attachment_id'] ) : 0;
+			if ( $product_id > 0 ) {
+				$prime_ids[] = $product_id;
 			}
-
-			if ( '' === $image_guid || ! $this->is_valid_image_source_url( $url ) ) {
-				$queue->mark_failure( $id, 'Image GUID or HTTP(S) source URL is invalid.', $try_count, true );
-				$failed++;
-				continue;
-			}
-
-			if ( ! $queue->lock( $id, 120 ) ) {
-				continue;
-			}
-
-			/*
-			 * An attachment may already exist when a previous PHP request stopped
-			 * between import and WooCommerce product linkage. Reuse it and finish
-			 * the state transition without downloading again. In Shared Media mode
-			 * only a real shared attachment may bypass import/conversion.
-			 */
-			$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
-			$can_reuse_queued_attachment = $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
-
-			if ( $can_reuse_queued_attachment && $shared_mode
-				&& method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
-				&& ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
-				$can_reuse_queued_attachment = false;
-			}
-
-			if ( $can_reuse_queued_attachment ) {
-				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
-				$queue->mark_attaching( $id, $attachment_id );
-				$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
-				$queue->mark_done( $id, $attachment_id );
-				$touched[ $product_id ] = true;
-				$processed++;
-				continue;
-			}
-
-			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
-
 			if ( $attachment_id > 0 ) {
-				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
-				$queue->mark_attaching( $id, $attachment_id );
-				$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
-				$queue->mark_done( $id, $attachment_id );
-				$touched[ $product_id ] = true;
-				$processed++;
-				continue;
+				$prime_ids[] = $attachment_id;
 			}
-
-			$message = $this->get_last_image_error();
-			if ( '' === $message ) {
-				$message = 'Image source is not ready or the download/import failed.';
-			}
-
-			/*
-			 * Network errors, timeouts, HTTP 404/5xx responses and a not-yet-ready
-			 * shared-media manifest are recoverable. They remain pending forever
-			 * with a bounded long-term backoff instead of becoming terminal.
-			 */
-			$queue->mark_failure( $id, $message, $try_count, false );
-			$failed++;
+		}
+		$prime_ids = array_values( array_unique( array_filter( array_map( 'absint', $prime_ids ) ) ) );
+		if ( ! empty( $prime_ids ) && function_exists( '_prime_post_caches' ) ) {
+			_prime_post_caches( $prime_ids, false, true );
 		}
 
-		foreach ( array_keys( $touched ) as $product_id ) {
-			$this->sync_woocommerce_product_image_objects_from_queue( absint( $product_id ), $queue );
+		$claimed_ids = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
+		$bulk_claim  = ! empty( $claimed_ids ) && ! empty( $rows[0]['_mobo_bulk_claimed'] ) && method_exists( $queue, 'release_claimed_images' );
+
+		try {
+			foreach ( $rows as $row ) {
+				if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+					$paused_for_upgrade = true;
+					break;
+				}
+
+				if ( $processed >= $limit ) {
+					break;
+				}
+
+				$id            = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+				$product_id    = isset( $row['product_id'] ) ? absint( $row['product_id'] ) : 0;
+				$image_guid    = isset( $row['image_guid'] ) ? sanitize_text_field( (string) $row['image_guid'] ) : '';
+				$url           = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
+				$attachment_id = isset( $row['attachment_id'] ) ? absint( $row['attachment_id'] ) : 0;
+				$try_count     = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
+
+				if ( $id <= 0 ) {
+					$failed++;
+					continue;
+				}
+
+				if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
+					$queue->mark_failure( $id, 'Product does not exist.', $try_count, true );
+					$failed++;
+					continue;
+				}
+
+				if ( '' === $image_guid || ! $this->is_valid_image_source_url( $url ) ) {
+					$queue->mark_failure( $id, 'Image GUID or HTTP(S) source URL is invalid.', $try_count, true );
+					$failed++;
+					continue;
+				}
+
+				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $queue->lock( $id, 120 ) ) {
+					continue;
+				}
+
+				/*
+				 * An attachment may already exist when a previous PHP request stopped
+				 * between import and WooCommerce product linkage. Reuse it and finish
+				 * the state transition without downloading again. In Shared Media mode
+				 * only a real shared attachment may bypass import/conversion.
+				 */
+				$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
+				$can_reuse_queued_attachment = $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
+
+				if ( $can_reuse_queued_attachment && $shared_mode
+					&& method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
+					&& ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+					$can_reuse_queued_attachment = false;
+				}
+
+				if ( ! $can_reuse_queued_attachment ) {
+					$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+				}
+
+				if ( $attachment_id > 0 ) {
+					$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+					/*
+					 * Keep the durable intermediate state until the product has been linked.
+					 * Do not save the WooCommerce product per image; all successful images
+					 * for the same product are linked once after the batch loop.
+					 */
+					$queue->mark_attaching( $id, $attachment_id, 90 );
+					$touched[ $product_id ] = true;
+					if ( ! isset( $link_rows[ $product_id ] ) ) {
+						$link_rows[ $product_id ] = array();
+					}
+					$link_rows[ $product_id ][] = $id;
+					$processed++;
+					continue;
+				}
+
+				$message = $this->get_last_image_error();
+				if ( '' === $message ) {
+					$message = 'Image source is not ready or the download/import failed.';
+				}
+
+				/*
+				 * Network errors, timeouts, HTTP 404/5xx responses and a not-yet-ready
+				 * shared-media manifest are recoverable. They remain pending forever
+				 * with a bounded long-term backoff instead of becoming terminal.
+				 *
+				 * A shared-media manifest that is merely not ready is expected
+				 * backpressure from the single media writer, not an image-worker
+				 * failure. Count it as deferred so Runtime Diagnostics/Circuit Breaker
+				 * do not isolate the image stage while it is correctly waiting.
+				 */
+				$queue->mark_failure( $id, $message, $try_count, false );
+				if ( 0 === strpos( $message, 'Shared-media manifest is not ready or is incompatible.' ) ) {
+					$deferred++;
+				} else {
+					$failed++;
+				}
+			}
+
+			/* One WooCommerce image linkage/save per touched product, not per image. */
+			foreach ( array_keys( $touched ) as $product_id ) {
+				$product_id = absint( $product_id );
+				$row_ids    = isset( $link_rows[ $product_id ] ) ? array_values( array_unique( array_filter( array_map( 'absint', $link_rows[ $product_id ] ) ) ) ) : array();
+				if ( $product_id <= 0 || empty( $row_ids ) ) {
+					continue;
+				}
+
+				try {
+					$link_ok = $this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
+				} catch ( \Throwable $e ) {
+					$link_ok = false;
+					$failed++;
+					if ( class_exists( 'Mobo_Core_Logger' ) ) {
+						Mobo_Core_Logger::error( 'Image product linkage failed for product ' . $product_id . ': ' . $e->getMessage() );
+					}
+				}
+
+				if ( $link_ok ) {
+					if ( method_exists( $queue, 'mark_done_many' ) ) {
+						$queue->mark_done_many( $row_ids );
+					} else {
+						foreach ( $row_ids as $row_id ) {
+							$attachment_id = absint( $this->attachment_id_for_queue_row( $rows, $row_id ) );
+							if ( $attachment_id > 0 ) {
+								$queue->mark_done( $row_id, $attachment_id );
+							}
+						}
+					}
+				}
+			}
+		} finally {
+			if ( $bulk_claim ) {
+				$queue->release_claimed_images( $claimed_ids );
+			}
 		}
 
 		return array(
@@ -419,8 +532,28 @@ class Mobo_Core_Image_Sync {
 			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : 'processed',
 			'processed' => $processed,
 			'failed'    => $failed,
-			'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
+			'deferred'  => $deferred,
+			'remaining' => $paused_for_upgrade || ( method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0 ),
 		);
+	}
+
+	/**
+	 * Resolve an attachment ID from the original claimed row array for old queue
+	 * implementations that do not expose bulk completion. New releases use
+	 * mark_done_many(), so this is only a compatibility fallback.
+	 *
+	 * @param array $rows Queue rows.
+	 * @param int   $row_id Row ID.
+	 * @return int
+	 */
+	private function attachment_id_for_queue_row( $rows, $row_id ) {
+		$row_id = absint( $row_id );
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			if ( is_array( $row ) && absint( isset( $row['id'] ) ? $row['id'] : 0 ) === $row_id ) {
+				return absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
+			}
+		}
+		return 0;
 	}
 
 	/**
@@ -852,22 +985,57 @@ class Mobo_Core_Image_Sync {
 		}
 
 		if ( '' !== $image_guid ) {
-			update_post_meta( $attachment_id, 'image_guid', $image_guid );
-			update_post_meta( $attachment_id, 'img_guid', $image_guid );
+			$this->update_attachment_meta_if_changed( $attachment_id, 'image_guid', $image_guid );
+			$this->update_attachment_meta_if_changed( $attachment_id, 'img_guid', $image_guid );
 		}
 
 		if ( '' !== $url ) {
-			update_post_meta( $attachment_id, 'mobo_source_url', $url );
+			$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_source_url', $url );
 		}
 
-		update_post_meta( $attachment_id, 'mobo_sync_incomplete', '0' );
+		$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_sync_incomplete', '0' );
+
+		/* Seed request-local lookup caches with the newly confirmed identity. */
+		if ( '' !== $image_guid || '' !== $url ) {
+			$this->attachment_lookup_cache[ $this->attachment_lookup_key( $image_guid, $url ) ] = $attachment_id;
+		}
+		if ( '' !== $image_guid ) {
+			$this->prime_attachment_meta_lookup_cache( 'image_guid', $image_guid, $attachment_id );
+			$this->prime_attachment_meta_lookup_cache( 'img_guid', $image_guid, $attachment_id );
+		}
+		if ( '' !== $url ) {
+			$this->prime_attachment_meta_lookup_cache( 'mobo_source_url', $url, $attachment_id );
+		}
+	}
+
+	/**
+	 * Update attachment metadata only when its scalar value actually changed.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $meta_key Meta key.
+	 * @param mixed  $value Value.
+	 * @return void
+	 */
+	private function update_attachment_meta_if_changed( $attachment_id, $meta_key, $value ) {
+		$attachment_id = absint( $attachment_id );
+		$meta_key      = sanitize_key( (string) $meta_key );
+		if ( $attachment_id <= 0 || '' === $meta_key ) {
+			return;
+		}
+
+		$current = get_post_meta( $attachment_id, $meta_key, true );
+		if ( (string) $current === (string) $value ) {
+			return;
+		}
+
+		update_post_meta( $attachment_id, $meta_key, $value );
 	}
 
 	private function sync_woocommerce_product_image_objects_from_queue( $product_id, Mobo_Core_Image_Queue $queue ) {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
 
 		$rows = method_exists( $queue, 'get_ordered_rows_for_product' ) ? $queue->get_ordered_rows_for_product( $product_id ) : array();
@@ -876,11 +1044,10 @@ class Mobo_Core_Image_Sync {
 			$ids = $queue->get_done_attachment_ids_for_product( $product_id );
 
 			if ( empty( $ids ) ) {
-				return;
+				return false;
 			}
 
-			$this->sync_woocommerce_product_image_objects( $product_id, $ids );
-			return;
+			return $this->sync_woocommerce_product_image_objects( $product_id, $ids );
 		}
 
 		$ids            = array();
@@ -910,12 +1077,11 @@ class Mobo_Core_Image_Sync {
 		$ids = array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) );
 
 		if ( empty( $ids ) ) {
-			return;
+			return false;
 		}
 
 		if ( $first_done_id > 0 ) {
-			$this->sync_woocommerce_product_image_objects( $product_id, $ids );
-			return;
+			return $this->sync_woocommerce_product_image_objects( $product_id, $ids );
 		}
 
 		/*
@@ -923,7 +1089,7 @@ class Mobo_Core_Image_Sync {
 		 * image to featured image. Updating only the gallery is safer and avoids a
 		 * visible first-image flip on old/new products.
 		 */
-		$this->sync_woocommerce_product_gallery_only( $product_id, $ids );
+		return $this->sync_woocommerce_product_gallery_only( $product_id, $ids );
 	}
 
 	/**
@@ -992,25 +1158,30 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * @param int   $product_id Product ID.
 	 * @param array $gallery_ids Attachment IDs.
-	 * @return void
+	 * @return bool
 	 */
 	private function sync_woocommerce_product_gallery_only( $product_id, $gallery_ids ) {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
 
 		$product = wc_get_product( $product_id );
 
 		if ( ! $product instanceof WC_Product ) {
-			return;
+			return false;
 		}
 
 		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
 
 		if ( empty( $gallery_ids ) ) {
-			return;
+			return false;
+		}
+
+		$current_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
+		if ( $current_gallery === $gallery_ids ) {
+			return true;
 		}
 
 		$product->set_gallery_image_ids( $gallery_ids );
@@ -1018,40 +1189,47 @@ class Mobo_Core_Image_Sync {
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
+		return true;
 	}
 
 	private function sync_woocommerce_product_image_objects( $product_id, $gallery_ids ) {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
 
 		$product = wc_get_product( $product_id );
 
 		if ( ! $product instanceof WC_Product ) {
-			return;
+			return false;
 		}
 
 		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+		$desired_image_id = ! empty( $gallery_ids ) ? absint( $gallery_ids[0] ) : 0;
+		$current_gallery  = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
 
-		if ( ! empty( $gallery_ids ) ) {
-			$product->set_image_id( absint( $gallery_ids[0] ) );
-			$product->set_gallery_image_ids( $gallery_ids );
-		} else {
-			$product->set_image_id( 0 );
-			$product->set_gallery_image_ids( array() );
+		if ( absint( $product->get_image_id() ) === $desired_image_id && $current_gallery === $gallery_ids ) {
+			return true;
 		}
 
+		$product->set_image_id( $desired_image_id );
+		$product->set_gallery_image_ids( $gallery_ids );
 		$product->save();
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
+		return true;
 	}
 
 	private function find_existing_attachment( $image_guid, $url ) {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$url        = esc_url_raw( (string) $url );
+		$cache_key  = $this->attachment_lookup_key( $image_guid, $url );
+
+		if ( array_key_exists( $cache_key, $this->attachment_lookup_cache ) ) {
+			return absint( $this->attachment_lookup_cache[ $cache_key ] );
+		}
 
 		$candidates = array();
 
@@ -1068,11 +1246,17 @@ class Mobo_Core_Image_Sync {
 
 		foreach ( $candidates as $attachment_id ) {
 			if ( $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
-				return $attachment_id;
+				$this->attachment_lookup_cache[ $cache_key ] = absint( $attachment_id );
+				return absint( $attachment_id );
 			}
 		}
 
+		$this->attachment_lookup_cache[ $cache_key ] = 0;
 		return 0;
+	}
+
+	private function attachment_lookup_key( $image_guid, $url ) {
+		return md5( sanitize_text_field( (string) $image_guid ) . '|' . esc_url_raw( (string) $url ) );
 	}
 
 	private function find_attachment_by_guid( $guid ) {
@@ -1109,6 +1293,14 @@ class Mobo_Core_Image_Sync {
 			return array();
 		}
 
+		$cache_key = $meta_key . '|' . md5( $meta_value );
+		if ( isset( $this->attachment_meta_lookup_cache[ $cache_key ] )
+			&& is_array( $this->attachment_meta_lookup_cache[ $cache_key ] )
+			&& absint( isset( $this->attachment_meta_lookup_cache[ $cache_key ]['limit'] ) ? $this->attachment_meta_lookup_cache[ $cache_key ]['limit'] : 0 ) >= $limit ) {
+			$cached_ids = isset( $this->attachment_meta_lookup_cache[ $cache_key ]['ids'] ) ? (array) $this->attachment_meta_lookup_cache[ $cache_key ]['ids'] : array();
+			return array_slice( array_values( array_filter( array_map( 'absint', $cached_ids ) ) ), 0, $limit );
+		}
+
 		$query = new WP_Query(
 			array(
 				'post_type'              => 'attachment',
@@ -1130,7 +1322,32 @@ class Mobo_Core_Image_Sync {
 			)
 		);
 
-		return array_values( array_filter( array_map( 'absint', is_array( $query->posts ) ? $query->posts : array() ) ) );
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $query->posts ) ? $query->posts : array() ) ) );
+		$this->attachment_meta_lookup_cache[ $cache_key ] = array(
+			'limit' => $limit,
+			'ids'   => $ids,
+		);
+
+		return $ids;
+	}
+
+	private function prime_attachment_meta_lookup_cache( $meta_key, $meta_value, $attachment_id ) {
+		$meta_key      = sanitize_key( (string) $meta_key );
+		$meta_value    = sanitize_text_field( (string) $meta_value );
+		$attachment_id = absint( $attachment_id );
+		if ( '' === $meta_key || '' === $meta_value || $attachment_id <= 0 ) {
+			return;
+		}
+
+		$cache_key = $meta_key . '|' . md5( $meta_value );
+		$current   = isset( $this->attachment_meta_lookup_cache[ $cache_key ] ) && is_array( $this->attachment_meta_lookup_cache[ $cache_key ] )
+			? $this->attachment_meta_lookup_cache[ $cache_key ]
+			: array( 'limit' => 10, 'ids' => array() );
+		$ids = isset( $current['ids'] ) ? (array) $current['ids'] : array();
+		array_unshift( $ids, $attachment_id );
+		$current['ids']   = array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) );
+		$current['limit'] = max( 10, absint( isset( $current['limit'] ) ? $current['limit'] : 0 ) );
+		$this->attachment_meta_lookup_cache[ $cache_key ] = $current;
 	}
 
 	private function is_attachment_reusable_for_source( $attachment_id, $url ) {

@@ -62,7 +62,14 @@ class Mobo_Core_Product_Concurrency {
 
 		if ( $wpdb instanceof wpdb ) {
 			$previous_suppress = $wpdb->suppress_errors( true );
-			$result = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $mysql_name, $wait_seconds ) );
+
+			/*
+			 * The atomic runtime lease above already serializes current Mobo writers.
+			 * Waiting again inside GET_LOCK only burns the bounded runner budget when
+			 * a stale/long-lived connection still owns the named lock. Fail fast and
+			 * let the queue defer instead of blocking this PHP worker for up to 5s.
+			 */
+			$result = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $mysql_name ) );
 			$wpdb->suppress_errors( $previous_suppress );
 
 			if ( '1' === (string) $result ) {
@@ -114,6 +121,26 @@ class Mobo_Core_Product_Concurrency {
 				: sanitize_key( (string) $lock['name'] );
 			Mobo_Core_Lock::release( $runtime_name, sanitize_text_field( (string) $lock['token'] ) );
 		}
+	}
+
+	/**
+	 * Whether another request currently owns the observable product runtime lease.
+	 *
+	 * This is a non-owning preflight used by webhook workers before pulling a
+	 * remote payload. It never replaces acquire_product_lock(); it only avoids
+	 * network work that would immediately be deferred afterwards.
+	 *
+	 * @param string $product_guid Product GUID.
+	 * @return bool
+	 */
+	public static function is_product_lock_busy( $product_guid ) {
+		$product_guid = sanitize_text_field( (string) $product_guid );
+
+		if ( '' === $product_guid || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return false;
+		}
+
+		return Mobo_Core_Lock::is_locked( self::fallback_lock_name( $product_guid ) );
 	}
 
 	/**

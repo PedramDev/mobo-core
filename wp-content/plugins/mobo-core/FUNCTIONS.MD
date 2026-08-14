@@ -88,6 +88,7 @@ Base: `/wp-json/mobo-core/v1`
 | `mobo_core_calculated_price_pair` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_cache_purge_urls` | افزودن URLهای listing سفارشی به purge هدفمند محصول. | Add custom listing URLs to targeted product purge. |
 | `mobo_core_cache_purge_home_enabled` | فعال یا غیرفعال کردن purge صفحه اصلی برای هر محصول. | Enable or disable homepage purge per product. |
+| `mobo_core_cache_warmup_product_enabled` | اجازه یا جلوگیری از صف شدن Warmup همان صفحه محصول پس از Purge موفق. | Allow or suppress exact-product warmup queueing after a successful targeted purge. |
 | `mobo_core_checkout_validation_errors` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_checkout_validation_external_response` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
 | `mobo_core_checkout_validation_external_url` | نقطه توسعه افزونه برای override یا مشاهده داده در runtime. | Extension point for runtime override or observation. |
@@ -252,6 +253,7 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_real_cron_lock_ttl_seconds` | `120` |
 | `mobo_core_real_cron_expected_interval_seconds` | `60` |
 | `mobo_core_real_cron_process_webhooks` | `'1'` |
+| `mobo_core_real_cron_background_escape_rounds` | `4` |
 | `mobo_core_process_webhook_on_receive` | `'0'` |
 | `mobo_core_self_runner_enabled` | `'1'` |
 | `mobo_core_self_runner_continue_enabled` | `'1'` |
@@ -502,6 +504,16 @@ Public methods: **21** · Internal non-public methods: **91**
 | `public function add_hpos_order_column($columns)` | افزودن hpos order column در بخش اعتبارسنجی سبد، اتصال موبو و صف ثبت سفارش. | Executes `add_hpos_order_column` for this component. |
 | `public function render_hpos_order_column($column, $order)` | رندر hpos order column در بخش اعتبارسنجی سبد، اتصال موبو و صف ثبت سفارش. | Executes `render_hpos_order_column` for this component. |
 
+### `Mobo_Core_Adaptive_Tuner`
+
+Source: [`includes/class-mobo-core-adaptive-tuner.php`](includes/class-mobo-core-adaptive-tuner.php)  
+تنظیم موقت ظرفیت Worker بر اساس Runtime Diagnostics، بودجه اجرا و حاشیه حافظه؛ هیچ تنظیم ذخیره‌شده‌ای را تغییر نمی‌دهد. / Builds request-local worker limits from runtime diagnostics, execution budget and memory headroom without overwriting saved settings.  
+Public methods: **1** · Internal non-public methods: **2**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function build_profile($config)` | ساخت Profile تطبیقی شامل mode، reason، baseline، limits، sampleهای stage و وضعیت حافظه برای همان اجرای Runner. | Build an immutable adaptive execution profile for the current runner invocation. |
+
 ### `Mobo_Core_Cron_Runner`
 
 Source: [`includes/class-mobo-core-cron-runner.php`](includes/class-mobo-core-cron-runner.php)  
@@ -584,7 +596,7 @@ Public methods: **17** · Internal non-public methods: **3**
 
 Source: [`includes/class-mobo-core-image-refresh-service.php`](includes/class-mobo-core-image-refresh-service.php)  
 اسکن و پردازش نوسازی تصاویر قدیمی. / Scans and processes legacy image refresh work.  
-Public methods: **9** · Internal non-public methods: **37**
+Public methods: **9** · Internal non-public methods: **58**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
@@ -593,7 +605,7 @@ Public methods: **9** · Internal non-public methods: **37**
 | `public function enqueue_legacy_images($limit = 500)` | اجرای عملیات `enqueue_legacy_images` در بخش اسکن و پردازش نوسازی تصاویر قدیمی. | Build refresh queue from legacy Mobo attachments. |
 | `public function process_queue($limit = 0)` | پردازش queue در بخش اسکن و پردازش نوسازی تصاویر قدیمی. | Process bounded refresh jobs. |
 | `public function audit_webp_subsizes($limit = 500, $repair = false)` | اسکن خواندنی یا بازسازی کنترل شده برش های ناقص WebP همراه با تایید نهایی فایل و متادیتا. | Audit or repair WebP attachment subsizes and verify the result. |
-| `public function audit_replaced_legacy_attachments($limit = 500, $delete = false)` | اسکن یا حذف امن پیوست های قدیمی ثبت شده که در اجرای آزمایشی پس از جایگزینی نگه داشته شده اند. | Audit or safely delete registered legacy attachments retained after replacement. |
+| `public function audit_replaced_legacy_attachments($limit = 500, $delete = false)` | مرحله ۶ پیوست های قدیمی جایگزین شده را فقط اسکن می کند؛ مرحله ۷ مراجع امن را به WebP منتقل، دوباره audit و فقط در صورت صفر شدن مراجع حذف می کند. | Scan replaced legacy attachments read-only, or migrate safe references to WebP, re-audit, and delete only when unreferenced. |
 | `public function reset_cursors()` | ریست cursor مستقل اسکن و ساخت صف و گزارش های آخر. | Reset independent scan/enqueue cursors and their last reports. |
 | `public function reset_workflow_state($keep_legacy_scan = true)` | ریست ساخت صف و مراحل وابسته، با امکان حفظ نتیجه مرحله ۱. | Reset queue construction and dependent workflow stages. |
 | `public function invalidate_post_queue_verification_state()` | بی اعتبار کردن اسکن های سلامت و حذف پس از تغییر خروجی صف. | Invalidate downstream verification after queue output changes. |
@@ -602,14 +614,15 @@ Public methods: **9** · Internal non-public methods: **37**
 
 Source: [`includes/class-mobo-core-image-refresh-automation.php`](includes/class-mobo-core-image-refresh-automation.php)  
 هماهنگ کننده اجرای خودکار امن نوسازی تصاویر. / Coordinates safe automated legacy-image refresh work.  
-Public methods: **6** · Internal non-public methods: **10**
+Public methods: **7** · Internal non-public methods: **10**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function get_status()` | وضعیت اجرا، مرحله، زمان شروع و پایان tick، قفل فعال و تاییدهای در انتظار را برمی گرداند. | Return automation state, tick diagnostics, active-lock state, stage, timestamps, and pending approvals. |
 | `public function start()` | چرخه را بدون از بین بردن پیشرفت امن شروع یا ادامه می دهد. | Start or resume the safe workflow. |
-| `public function pause($reason = ..., $status = 'paused')` | اجرا و تمام کلیدهای حذفی را خاموش می کند و پیشرفت را نگه می دارد. | Pause safely while preserving progress. |
-| `public function approve_delete_old()` | تایید یک باره مرحله حذف پیوست های قدیمی جایگزین شده را ثبت می کند. | Approve replaced-old-attachment deletion for the current gate. |
+| `public function pause($reason = ..., $status = 'paused')` | اجرای خودکار را متوقف و پیشرفت را نگه می دارد؛ تنظیم دائمی حذف پیوست قدیمی تغییر نمی کند. | Pause safely while preserving progress and the persistent delete-old preference. |
+| `public function approve_delete_old()` | مسیر سازگاری قدیمی است که تنظیم دائمی حذف پیوست قدیمی را فعال و اجرا را ادامه می دهد. | Legacy compatibility action that enables the persistent delete-old setting and resumes automation. |
+| `public function arm_delete_old_autodrain()` | اگر workflow دستی به Stage 7 امن رسیده باشد، ادامه حذف را بدون ریست cursor به Cron/Self Runner می سپارد تا batchها خودکار تا نقطه پایدار تمام شوند. | Arm automatic Stage 7 draining for an already-safe manual workflow without resetting cursors. |
 | `public function approve_delete_orphans()` | تایید یک باره پاکسازی خانواده های بدون پیوست را ثبت می کند. | Approve orphan-family deletion for the current gate. |
 | `public function run_tick($source = 'real-cron')` | فقط یک عملیات batch محدود را اجرا و نتیجه ادامه یا توقف را ثبت می کند. | Execute one bounded Cron/Self Runner automation slice. |
 
@@ -682,6 +695,20 @@ Public methods: **9** · Internal non-public methods: **25**
 | `public static function flush()` | پاک‌سازی هدفمند WordPress/WooCommerce و adapterهای Cache در shutdown. | Flush targeted core and page-cache integrations at shutdown. |
 | `public static function get_health_status()` | دریافت نتیجه ساختاری آخرین Purge برای REST، UI و گزارش سلامت مرکزی، بدون شناسه یا URL واقعی. | Return structured last-purge telemetry for REST, UI, and the central health report without exposing IDs or URLs. |
 
+### `Mobo_Core_Cache_Warmer`
+
+Source: [`includes/class-mobo-core-cache-warmer.php`](includes/class-mobo-core-cache-warmer.php)  
+صف پایدار برای گرم‌سازی فقط permalink فعلی محصول پس از Purge هدفمند موفق. / Persistent exact-product page-cache warmup queue after successful targeted purge.  
+Public methods: **5** · Internal non-public methods: **11**
+
+| Signature | توضیح فارسی | English summary |
+|---|---|---|
+| `public static function enqueue_product($product_id, $url = '', $reason = 'product-updated')` | صف‌کردن permalink فعلی یک محصول با dedup و reset retry برای آخرین mutation. | Queue one product's current permalink with deduplication and fresh retry state. |
+| `public static function enqueue_url($url, $product_id = 0, $reason = 'product-updated')` | صف‌کردن URL دقیق same-origin؛ برای integrationهای داخلی و توسعه سفارشی. | Queue one exact same-origin front-end URL. |
+| `public static function process_batch($limit = 2, $time_budget_seconds = 10, $source = 'real-cron')` | پردازش batch محدود با GET ناشناس، retry backoff و حذف خطاهای terminal. | Process a bounded anonymous-GET warmup batch with retry backoff. |
+| `public static function has_due_work()` | بررسی وجود Warmup آماده اجرا برای تصمیم continuation در Cron Runner. | Whether immediately runnable warmup work exists. |
+| `public static function get_status()` | وضعیت بدون URL/Product ID برای Site Health شامل pending/due و نتیجه آخر. | Return URL/ID-free queue telemetry for Site Health. |
+
 ### `Mobo_Core_Dependencies`
 
 Source: [`includes/class-mobo-core-dependencies.php`](includes/class-mobo-core-dependencies.php)  
@@ -723,7 +750,7 @@ Public methods: **2** · Internal non-public methods: **7**
 
 Source: [`includes/class-mobo-core-migration.php`](includes/class-mobo-core-migration.php)  
 Migration گزینه ها، جدول ها، lockها و داده های legacy. / Migrates options, tables, runtime locks, and legacy data.  
-Public methods: **3** · Internal non-public methods: **22**
+Public methods: **3** · Internal non-public methods: **29**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|

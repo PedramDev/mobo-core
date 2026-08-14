@@ -73,7 +73,10 @@ class Mobo_Core_Image_Refresh_Queue {
 			KEY old_attachment_id (old_attachment_id),
 			KEY new_attachment_id (new_attachment_id),
 			KEY status_retry (status, next_retry_at),
-			KEY locked_until (locked_until)
+			KEY status_retry_id (status, next_retry_at, id),
+			KEY locked_until (locked_until),
+			KEY status_locked_id (status, locked_until, id),
+			KEY status_updated_id (status, updated_at, id)
 		) {$charset_collate};";
 
 		dbDelta( $sql );

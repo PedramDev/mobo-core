@@ -104,10 +104,11 @@ class Mobo_Core_Webhook_Queue {
 
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
 			$store = new Mobo_Core_Sync_Event_Store();
-			$table_pending = $store->count_pending();
-			$table_due = method_exists( $store, 'count_due' ) ? $store->count_due() : $table_pending;
-			$table_failed = $store->count_failed();
-			$table_timing = $this->get_table_timing_stats();
+			$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
+			$table_pending = isset( $summary['pendingCount'] ) ? absint( $summary['pendingCount'] ) : $store->count_pending();
+			$table_due = isset( $summary['dueCount'] ) ? absint( $summary['dueCount'] ) : ( method_exists( $store, 'count_due' ) ? $store->count_due() : $table_pending );
+			$table_failed = isset( $summary['failedCount'] ) ? absint( $summary['failedCount'] ) : $store->count_failed();
+			$table_timing = $this->get_table_timing_stats( $summary );
 		}
 
 		$last_result = get_option( 'mobo_core_webhook_queue_last_result', array() );
@@ -137,9 +138,30 @@ class Mobo_Core_Webhook_Queue {
 	 * @return bool
 	 */
 	public function has_due_work() {
-		$status = $this->get_status();
+		/*
+		 * Runner hot path: do not build the full admin status (counts, timing stats,
+		 * legacy-file timing) just to answer a boolean question.
+		 */
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$store = new Mobo_Core_Sync_Event_Store();
+			if ( method_exists( $store, 'has_due_events' ) && $store->has_due_events() ) {
+				return true;
+			}
+		}
 
-		return ! empty( $status['hasDue'] );
+		$this->ensure_dirs();
+		return ! empty( $this->get_queue_files() );
+	}
+
+	/**
+	 * Fast legacy-file pressure check used after a table-backed process pass.
+	 * This deliberately performs no database query.
+	 *
+	 * @return bool
+	 */
+	public function has_legacy_files() {
+		$this->ensure_dirs();
+		return ! empty( $this->get_queue_files() );
 	}
 
 	/**
@@ -147,9 +169,10 @@ class Mobo_Core_Webhook_Queue {
 	 *
 	 * @param int|null $time_budget Optional bounded time budget override.
 	 * @param int|null $max_items Optional item limit override.
+	 * @param int|null $adaptive_ceiling Optional ceiling for the existing pressure-based adaptive batch.
 	 * @return array
 	 */
-	public function process( $time_budget = null, $max_items = null ) {
+	public function process( $time_budget = null, $max_items = null, $adaptive_ceiling = null ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'webhook-queue' ), array( 'processed' => 0, 'failed' => 0, 'remainingFile' => true, 'remainingTable' => true, 'remainingDueTable' => false ) );
 		}
@@ -183,7 +206,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		try {
-			$result = $this->process_locked( $configured_budget, $max_items );
+			$result = $this->process_locked( $configured_budget, $max_items, $adaptive_ceiling );
 		} finally {
 			Mobo_Core_Lock::release( 'webhook_queue', $lock );
 		}
@@ -222,7 +245,7 @@ class Mobo_Core_Webhook_Queue {
 	 *
 	 * @return array
 	 */
-	private function get_table_timing_stats() {
+	private function get_table_timing_stats( $summary = array() ) {
 		global $wpdb;
 
 		if ( ! class_exists( 'Mobo_Core_Sync_Event_Store' ) || ! Mobo_Core_Sync_Event_Store::table_exists() ) {
@@ -230,20 +253,11 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$table = Mobo_Core_Sync_Event_Store::table_name();
-		$now   = current_time( 'mysql', true );
 
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT
-					MIN(created_at) AS oldest_pending_at,
-					MAX(updated_at) AS newest_pending_update_at,
-					MIN(CASE WHEN status = 'pending' AND next_retry_at IS NOT NULL AND next_retry_at > %s THEN next_retry_at ELSE NULL END) AS next_deferred_at
-				FROM {$table}
-				WHERE status IN ('pending', 'processing')",
-				$now
-			),
-			ARRAY_A
-		);
+		if ( ! is_array( $summary ) || empty( $summary ) ) {
+			$store   = new Mobo_Core_Sync_Event_Store();
+			$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
+		}
 
 		$last = $wpdb->get_row(
 			"SELECT event_type, status, try_count, updated_at, last_error
@@ -255,9 +269,9 @@ class Mobo_Core_Webhook_Queue {
 		);
 
 		return array(
-			'oldestPendingAt'      => $this->mysql_gmt_to_timestamp( isset( $row['oldest_pending_at'] ) ? $row['oldest_pending_at'] : '' ),
-			'newestPendingUpdateAt'=> $this->mysql_gmt_to_timestamp( isset( $row['newest_pending_update_at'] ) ? $row['newest_pending_update_at'] : '' ),
-			'nextDeferredAt'       => $this->mysql_gmt_to_timestamp( isset( $row['next_deferred_at'] ) ? $row['next_deferred_at'] : '' ),
+			'oldestPendingAt'      => $this->mysql_gmt_to_timestamp( isset( $summary['oldestPendingAt'] ) ? $summary['oldestPendingAt'] : '' ),
+			'newestPendingUpdateAt'=> $this->mysql_gmt_to_timestamp( isset( $summary['newestPendingUpdateAt'] ) ? $summary['newestPendingUpdateAt'] : '' ),
+			'nextDeferredAt'       => $this->mysql_gmt_to_timestamp( isset( $summary['nextDeferredAt'] ) ? $summary['nextDeferredAt'] : '' ),
 			'lastEventType'        => isset( $last['event_type'] ) ? sanitize_text_field( (string) $last['event_type'] ) : '',
 			'lastStatus'           => isset( $last['status'] ) ? sanitize_key( (string) $last['status'] ) : '',
 			'lastTryCount'         => isset( $last['try_count'] ) ? absint( $last['try_count'] ) : 0,
@@ -330,6 +344,60 @@ class Mobo_Core_Webhook_Queue {
 		return false === $timestamp ? 0 : absint( $timestamp );
 	}
 
+
+	/**
+	 * Choose a bounded webhook batch from current queue pressure and the available
+	 * time slice. This remains intentionally conservative: expensive payload pulls
+	 * can still stop on the existing time budget, while a large local backlog gets
+	 * more useful work per lock acquisition on capable hosts.
+	 *
+	 * @param int $base Base configured item limit.
+	 * @param int $budget Current time budget.
+	 * @return int
+	 */
+	private function resolve_adaptive_max_items( $base, $budget, $ceiling = null ) {
+		$base   = max( 1, min( 10, absint( $base ) ) );
+		$budget = max( 1, absint( $budget ) );
+
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_webhook_adaptive_batch_enabled', '1' ) ) {
+			return $base;
+		}
+
+		$pressure = count( $this->get_queue_files() );
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$store = new Mobo_Core_Sync_Event_Store();
+			$pressure += $store->count_due();
+		}
+
+		$high = Mobo_Core_Settings::get_int( 'mobo_core_webhook_high_pressure_threshold', 25, 5, 5000 );
+		$max  = Mobo_Core_Settings::get_int( 'mobo_core_webhook_adaptive_batch_max', 10, 1, 10 );
+		if ( null !== $ceiling ) {
+			$max = min( $max, max( 1, min( 10, absint( $ceiling ) ) ) );
+			$base = min( $base, $max );
+		}
+		$target = $base;
+
+		if ( $pressure >= max( 100, $high * 4 ) ) {
+			$target = $max;
+		} elseif ( $pressure >= $high ) {
+			$target = min( $max, max( $base, 8 ) );
+		} elseif ( $pressure >= 10 ) {
+			$target = min( $max, max( $base, 6 ) );
+		} elseif ( $pressure <= 2 ) {
+			$target = min( $base, 2 );
+		}
+
+		/* Small heartbeat slices must stay cooperative even under queue pressure. */
+		if ( $budget <= 4 ) {
+			$target = min( $target, 3 );
+		} elseif ( $budget <= 6 ) {
+			$target = min( $target, 5 );
+		}
+
+		return max( 1, min( 10, $target ) );
+	}
+
+
 	/**
 	 * Process queue while lock is held.
 	 *
@@ -337,13 +405,14 @@ class Mobo_Core_Webhook_Queue {
 	 * @param int|null $max_items Optional item limit override.
 	 * @return array
 	 */
-	private function process_locked( $time_budget = null, $max_items = null ) {
+	private function process_locked( $time_budget = null, $max_items = null, $adaptive_ceiling = null ) {
 		$started_at = time();
 		$budget     = null === $time_budget
 			? Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 )
 			: max( 1, min( 25, absint( $time_budget ) ) );
-		$max_files  = null === $max_items
-			? Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 )
+		$base_max_files = Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 );
+		$max_files      = null === $max_items
+			? $this->resolve_adaptive_max_items( $base_max_files, $budget, $adaptive_ceiling )
 			: max( 1, min( 10, absint( $max_items ) ) );
 
 		$processed = 0;
@@ -690,11 +759,18 @@ class Mobo_Core_Webhook_Queue {
 		$processed = 0;
 		$failed    = 0;
 		$messages  = array();
+		$busy_products = array();
 
+		/*
+		 * The old implementation scanned progress_json LIKE '%waitingForParent%' on
+		 * every webhook pass. Deferred rows already self-retire when they become due,
+		 * so this safety sweep only needs to run occasionally.
+		 */
 		$parent_wait_timeout = $this->get_parent_wait_timeout_seconds();
-		$retired_waiting = 0;
-
-		if ( method_exists( $store, 'retire_stale_parent_waiting_events' ) ) {
+		$retired_waiting     = 0;
+		$last_retire_scan    = absint( get_option( 'mobo_core_parent_wait_retirement_scan_at', 0 ) );
+		if ( method_exists( $store, 'retire_stale_parent_waiting_events' ) && ( $last_retire_scan <= 0 || ( time() - $last_retire_scan ) >= 300 ) ) {
+			update_option( 'mobo_core_parent_wait_retirement_scan_at', time(), false );
 			$retired_waiting = $store->retire_stale_parent_waiting_events( $parent_wait_timeout, max( 50, absint( $max_items ) * 20 ) );
 
 			if ( $retired_waiting > 0 ) {
@@ -704,152 +780,218 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$remaining_slots = max( 0, absint( $max_items ) - $processed );
-		$scan_limit = $remaining_slots > 0 ? max( $remaining_slots, min( 50, $remaining_slots * 10 ) ) : 0;
-		$rows = $scan_limit > 0 ? $store->get_due_events( $scan_limit ) : array();
+		$bulk_claim      = $remaining_slots > 0 && method_exists( $store, 'claim_due_events' );
+		$rows            = array();
+
+		if ( $remaining_slots > 0 ) {
+			if ( $bulk_claim ) {
+				/* Global webhook_queue lease means no over-scan is needed. */
+				$rows = $store->claim_due_events( $remaining_slots, max( 60, $budget + 30 ) );
+			} else {
+				$scan_limit = max( $remaining_slots, min( 50, $remaining_slots * 10 ) );
+				$rows       = $store->get_due_events( $scan_limit );
+			}
+		}
 
 		if ( empty( $rows ) ) {
+			$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
+			$pending = isset( $summary['pendingCount'] ) ? absint( $summary['pendingCount'] ) : $store->count_pending();
+			$due     = isset( $summary['dueCount'] ) ? absint( $summary['dueCount'] ) : ( method_exists( $store, 'count_due' ) ? $store->count_due() : $pending );
+
 			return array(
-				'processed'         => 0,
+				'processed'         => $retired_waiting,
 				'failed'            => 0,
-				'remainingTable'    => $store->count_pending() > 0,
-				'remainingDueTable' => method_exists( $store, 'count_due' ) ? $store->count_due() > 0 : $store->count_pending() > 0,
-				'messages'          => array(),
+				'remainingTable'    => $pending > 0,
+				'remainingDueTable' => $due > 0,
+				'messages'          => $messages,
 			);
 		}
 
-		foreach ( $rows as $row ) {
-			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
-				$messages[] = 'پردازش جدول وب‌هوک برای آپدیت امن افزونه در مرز امن متوقف شد.';
-				break;
-			}
+		$claimed_ids = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
 
-			if ( $processed >= $max_items ) {
-				break;
-			}
+		try {
+			foreach ( $rows as $row ) {
+				if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+					$messages[] = 'پردازش جدول وب‌هوک برای آپدیت امن افزونه در مرز امن متوقف شد.';
+					break;
+				}
 
-			if ( ( time() - $started_at ) >= $budget ) {
-				$messages[] = 'بودجه زمانی پردازش جدول وب‌هوک به پایان رسید.';
-				break;
-			}
+				if ( $processed >= $max_items ) {
+					break;
+				}
 
-			$event_id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+				if ( ( time() - $started_at ) >= $budget ) {
+					$messages[] = 'بودجه زمانی پردازش جدول وب‌هوک به پایان رسید.';
+					break;
+				}
 
-			if ( $event_id <= 0 ) {
-				continue;
-			}
+				$event_id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+				if ( $event_id <= 0 ) {
+					continue;
+				}
 
-			$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
+				$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
+				if ( $expires_at > 0 && time() > $expires_at ) {
+					$store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true );
+					$failed++;
+					$messages[] = 'یک event وب‌هوک منقضی شد و failed شد.';
+					continue;
+				}
 
-			if ( $expires_at > 0 && time() > $expires_at ) {
-				$store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true );
-				$failed++;
-				$messages[] = 'یک event وب‌هوک منقضی شد و failed شد.';
-				continue;
-			}
+				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $store->lock_event( $event_id, max( 60, $budget + 30 ) ) ) {
+					continue;
+				}
 
-			if ( ! $store->lock_event( $event_id, max( 60, $budget + 30 ) ) ) {
-				continue;
-			}
+				$item = $store->row_to_item( $row );
+				if ( is_wp_error( $item ) ) {
+					$store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true );
+					$failed++;
+					$messages[] = 'payload یک event وب‌هوک نامعتبر بود و failed شد.';
+					continue;
+				}
 
-			$item = $store->row_to_item( $row );
+				/*
+				 * Product-level contention preflight. For rows whose queue identity is
+				 * already the parent product, do not pull a remote lightweight payload
+				 * when manual/repair/another worker owns that product. The actual write
+				 * path still acquires the authoritative product lock afterwards.
+				 */
+				$event_type  = isset( $row['event_type'] ) ? sanitize_text_field( (string) $row['event_type'] ) : '';
+				$entity_type = isset( $row['entity_type'] ) ? sanitize_key( (string) $row['entity_type'] ) : '';
+				$product_guid = 'product' === $entity_type && in_array( $event_type, array( 'ProductUpdated', 'UpdateVariant' ), true )
+					? sanitize_text_field( (string) ( isset( $row['entity_guid'] ) ? $row['entity_guid'] : '' ) )
+					: '';
 
-			if ( is_wp_error( $item ) ) {
-				$store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true );
-				$failed++;
-				$messages[] = 'payload یک event وب‌هوک نامعتبر بود و failed شد.';
-				continue;
-			}
+				if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+					$is_busy = isset( $busy_products[ $product_guid ] )
+						? (bool) $busy_products[ $product_guid ]
+						: ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid )
+							|| Mobo_Core_Product_Concurrency::is_product_lock_busy( $product_guid ) );
+					$busy_products[ $product_guid ] = $is_busy;
 
-			$result = $this->process_item( $item );
+					if ( $is_busy ) {
+						$store->mark_pending_progress(
+							$event_id,
+							isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array(),
+							array(
+								'deleteFile'        => false,
+								'deferSeconds'      => 15,
+								'waitingForProduct' => true,
+								'waitingReason'     => 'product_preflight_busy',
+								'productGuid'       => $product_guid,
+							)
+						);
+						$messages[] = 'محصول در مسیر دیگری در حال پردازش است؛ event پیش از payload pull برای ۱۵ ثانیه defer شد.';
+						continue;
+					}
+				}
 
-			if ( ! is_array( $result ) ) {
-				$result = array(
-					'success' => false,
-					'message' => 'Invalid processor result.',
-					'data'    => array(),
+				$remaining_seconds = max( 0, $budget - ( time() - $started_at ) );
+				if ( $remaining_seconds <= 2 ) {
+					$messages[] = 'بودجه زمانی قبل از شروع payload pull بعدی به حاشیه امن رسید.';
+					break;
+				}
+
+				$payload_timeout = max(
+					2,
+					min(
+						Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 ),
+						$remaining_seconds - 1
+					)
 				);
-			}
+				$result = $this->process_item( $item, $payload_timeout );
+				if ( ! is_array( $result ) ) {
+					$result = array(
+						'success' => false,
+						'message' => 'Invalid processor result.',
+						'data'    => array(),
+					);
+				}
 
-			if ( ! empty( $result['success'] ) ) {
-				$data        = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
-				$delete_file = array_key_exists( 'deleteFile', $data ) ? (bool) $data['deleteFile'] : true;
+				if ( ! empty( $result['success'] ) ) {
+					$data        = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+					$delete_file = array_key_exists( 'deleteFile', $data ) ? (bool) $data['deleteFile'] : true;
 
-				if ( ! $delete_file && $this->should_retire_waiting_for_parent( $item, $data ) ) {
-					$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
-					$data = $this->build_waiting_parent_retired_data( $item, $data );
+					if ( ! $delete_file && $this->should_retire_waiting_for_parent( $item, $data ) ) {
+						$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
+						$data            = $this->build_waiting_parent_retired_data( $item, $data );
 
-					if ( method_exists( $store, 'mark_done_with_progress' ) ) {
-						$store->mark_done_with_progress( $event_id, $updated_payload, $data );
-					} else {
+						if ( method_exists( $store, 'mark_done_with_progress' ) ) {
+							$store->mark_done_with_progress( $event_id, $updated_payload, $data );
+						} else {
+							$store->mark_done( $event_id );
+						}
+
+						$processed++;
+						$messages[] = 'UpdateVariant بیش از مهلت مجاز منتظر محصول مادر ماند و از صف خارج شد.';
+						continue;
+					}
+
+					if ( ! $delete_file && ! empty( $data['waitingForParent'] ) ) {
+						$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
+						$store->mark_pending_progress( $event_id, $updated_payload, $data );
+						$messages[] = 'UpdateVariant منتظر محصول مادر است؛ این event defer شد و runner سراغ event بعدی رفت.';
+						continue;
+					}
+
+					if ( $delete_file ) {
 						$store->mark_done( $event_id );
+					} else {
+						$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
+						$store->mark_pending_progress( $event_id, $updated_payload, $data );
 					}
 
 					$processed++;
-					$messages[] = 'UpdateVariant بیش از مهلت مجاز منتظر محصول مادر ماند و از صف خارج شد.';
-
+					$messages[] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'event وب‌هوک پردازش شد.';
 					continue;
 				}
 
-				if ( ! $delete_file && ! empty( $data['waitingForParent'] ) ) {
-					$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
-					$store->mark_pending_progress( $event_id, $updated_payload, $data );
-					$messages[] = 'UpdateVariant منتظر محصول مادر است؛ این event defer شد و runner سراغ event بعدی رفت.';
+				$try_count = absint( $row['try_count'] ) + 1;
+				$message   = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'Webhook event processing failed.';
+				$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 );
+				$data      = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+				$is_payload_pull_failure = ! empty( $data['payloadPullFailed'] );
 
-					continue;
-				}
+				if ( $is_payload_pull_failure ) {
+					update_option( 'mobo_core_last_payload_pull_error', $message, false );
+					update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
 
-				if ( $delete_file ) {
-					$store->mark_done( $event_id );
-				} else {
-					$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
-					$store->mark_pending_progress( $event_id, $updated_payload, $data );
-				}
+					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+						Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
+					}
 
-				$processed++;
-				$messages[] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'event وب‌هوک پردازش شد.';
-
-				continue;
-			}
-
-			$try_count = absint( $row['try_count'] ) + 1;
-			$message   = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'Webhook event processing failed.';
-			$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 );
-			$data      = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
-			$is_payload_pull_failure = ! empty( $data['payloadPullFailed'] );
-
-			if ( $is_payload_pull_failure ) {
-				update_option( 'mobo_core_last_payload_pull_error', $message, false );
-				update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
-
-				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-					Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
-				}
-
-				if ( method_exists( $store, 'mark_retry_now' ) ) {
-					$store->mark_retry_now( $event_id, $message, $try_count, $try_count >= $max_try );
+					if ( method_exists( $store, 'mark_retry_now' ) ) {
+						$store->mark_retry_now( $event_id, $message, $try_count, $try_count >= $max_try );
+					} else {
+						$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+					}
 				} else {
 					$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
 				}
-			} else {
-				$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+
+				$failed++;
+				if ( $try_count >= $max_try ) {
+					$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
+				} else {
+					$messages[] = 'پردازش event وب‌هوک ناموفق بود و برای retry در صف ماند. پردازش در این اجرا متوقف شد.';
+				}
+				break;
 			}
-
-			$failed++;
-
-			if ( $try_count >= $max_try ) {
-				$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
-			} else {
-				$messages[] = 'پردازش event وب‌هوک ناموفق بود و برای retry در صف ماند. پردازش در این اجرا متوقف شد.';
+		} finally {
+			if ( $bulk_claim && ! empty( $claimed_ids ) && method_exists( $store, 'release_claimed_events' ) ) {
+				$store->release_claimed_events( $claimed_ids );
 			}
-
-			break;
 		}
+
+		$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
+		$pending = isset( $summary['pendingCount'] ) ? absint( $summary['pendingCount'] ) : $store->count_pending();
+		$due     = isset( $summary['dueCount'] ) ? absint( $summary['dueCount'] ) : ( method_exists( $store, 'count_due' ) ? $store->count_due() : $pending );
 
 		return array(
 			'processed'         => $processed,
 			'failed'            => $failed,
-			'remainingTable'    => $store->count_pending() > 0,
-			'remainingDueTable' => method_exists( $store, 'count_due' ) ? $store->count_due() > 0 : $store->count_pending() > 0,
+			'remainingTable'    => $pending > 0,
+			'remainingDueTable' => $due > 0,
 			'messages'          => $messages,
 		);
 	}
@@ -860,11 +1002,11 @@ class Mobo_Core_Webhook_Queue {
 	 * @param array $item Queue item.
 	 * @return array
 	 */
-	private function process_item( $item ) {
+	private function process_item( $item, $payload_timeout = null ) {
 		$event   = sanitize_text_field( (string) $item['event'] );
 		$payload = isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array();
 
-		$payload_result = $this->resolve_lightweight_payload( $event, $payload );
+		$payload_result = $this->resolve_lightweight_payload( $event, $payload, $payload_timeout );
 
 		if ( is_wp_error( $payload_result ) ) {
 			$message = $payload_result->get_error_message();
@@ -937,7 +1079,7 @@ class Mobo_Core_Webhook_Queue {
 	 * @param array  $payload Current payload/notification.
 	 * @return array|WP_Error
 	 */
-	private function resolve_lightweight_payload( $event, $payload ) {
+	private function resolve_lightweight_payload( $event, $payload, $payload_timeout = null ) {
 		if ( ! is_array( $payload ) ) {
 			return $payload;
 		}
@@ -968,7 +1110,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$api      = new Mobo_Core_API_Client();
-		$fetched  = $api->get_event_payload( $payload_url );
+		$fetched  = $api->get_event_payload( $payload_url, $payload_timeout );
 
 		if ( is_wp_error( $fetched ) ) {
 			return $fetched;
@@ -1048,8 +1190,8 @@ class Mobo_Core_Webhook_Queue {
 
 		$product_guid = $this->first_non_empty(
 			array(
-				$this->get_value( $normalized, 'product_guid',
-				'productId', '' ),
+				$this->get_value( $normalized, 'product_guid', '' ),
+				$this->get_value( $normalized, 'productId', '' ),
 				$this->get_value( $normalized, 'productGuid', '' ),
 				$this->get_value( $normalized, 'parentProductId', '' ),
 				$this->get_value( $normalized, 'parentGuid', '' ),
@@ -1060,8 +1202,8 @@ class Mobo_Core_Webhook_Queue {
 		if ( '' === $product_guid && is_array( $data ) && isset( $data[0] ) && is_array( $data[0] ) ) {
 			$product_guid = $this->first_non_empty(
 				array(
-					$this->get_value( $data[0], 'product_guid',
-				'productId', '' ),
+					$this->get_value( $data[0], 'product_guid', '' ),
+					$this->get_value( $data[0], 'productId', '' ),
 					$this->get_value( $data[0], 'productGuid', '' ),
 					$this->get_value( $data[0], 'parentProductId', '' ),
 					$this->get_value( $data[0], 'parentGuid', '' ),
@@ -1072,8 +1214,8 @@ class Mobo_Core_Webhook_Queue {
 		if ( '' === $product_guid ) {
 			$product_guid = $this->first_non_empty(
 				array(
-					$this->get_value( $notification_payload, 'product_guid',
-				'productId', '' ),
+					$this->get_value( $notification_payload, 'product_guid', '' ),
+					$this->get_value( $notification_payload, 'productId', '' ),
 					$this->get_value( $notification_payload, 'productGuid', '' ),
 					$this->get_value( $notification_payload, 'entityGuid', '' ),
 					$this->get_value( $notification_payload, 'entityId', '' ),
@@ -1093,8 +1235,8 @@ class Mobo_Core_Webhook_Queue {
 					if ( is_array( $variant_data ) ) {
 						$variant_product_guid = $this->first_non_empty(
 							array(
-								$this->get_value( $variant_data, 'product_guid',
-				'productId', '' ),
+								$this->get_value( $variant_data, 'product_guid', '' ),
+								$this->get_value( $variant_data, 'productId', '' ),
 								$this->get_value( $variant_data, 'productGuid', '' ),
 								$this->get_value( $variant_data, 'parentProductId', '' ),
 								$this->get_value( $variant_data, 'parentGuid', '' ),
