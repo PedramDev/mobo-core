@@ -86,6 +86,7 @@ class Mobo_Core_Migration {
 		self::apply_103336_recovery_state_selfheal( $previous_version );
 		self::apply_103337_variation_integrity_reason_selfheal( $previous_version );
 		self::apply_1033443_nullable_stock_webhook_recovery( $previous_version );
+		self::apply_1033446_disable_reconciliation( $previous_version );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -148,8 +149,9 @@ class Mobo_Core_Migration {
 		self::apply_103333_product_recovery_reaudit( $current );
 		self::apply_103335_variation_integrity_reaudit( $current );
 		self::apply_103336_recovery_state_selfheal( $current );
-		self::apply_103337_variation_integrity_reason_selfheal( $current );
-		self::apply_1033443_nullable_stock_webhook_recovery( $current );
+			self::apply_103337_variation_integrity_reason_selfheal( $current );
+			self::apply_1033443_nullable_stock_webhook_recovery( $current );
+			self::apply_1033446_disable_reconciliation( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -1940,6 +1942,61 @@ class Mobo_Core_Migration {
 		if ( $recovered > 0 ) {
 			update_option( 'mobo_core_worker_dispatch_pending', '1', false );
 		}
+	}
+
+	/**
+	 * Disable product-mutating reconciliation until its API snapshots carry the
+	 * same post-lock webhook ordering protection as manual Repair.
+	 *
+	 * Any persisted in-flight state is made idle and its cached pending snapshots
+	 * are discarded. Product data and webhook health rows are not changed.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_1033446_disable_reconciliation( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.44.6', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_auto_reconciliation_enabled', '0', false );
+
+		$state = get_option( 'mobo_core_reconciliation_state', array() );
+		if ( is_array( $state ) && ! empty( $state ) ) {
+			$state['status']                     = 'idle';
+			$state['mode']                       = '';
+			$state['phase']                      = '';
+			$state['source']                     = 'disabled-by-build';
+			$state['pending']                    = array();
+			$state['deepSeen']                   = array();
+			$state['catalogValidatedPages']      = 0;
+			$state['catalogCompletionValidated'] = false;
+			$state['scanCursor']                 = 0;
+			$state['nextScanCursor']             = 0;
+			$state['scanHasMore']                = false;
+			$state['sweepCursor']                = 0;
+			$state['moreChanges']                = false;
+			$state['revisionFailed']             = false;
+			$state['updatedAt']                  = time();
+			$state['completedAt']                = time();
+			$state['lastMessage']                = 'Reconciliation is disabled by this Mobo Core build.';
+			$state['lastError']                  = '';
+			update_option( 'mobo_core_reconciliation_state', $state, false );
+		}
+
+		update_option(
+			'mobo_core_reconciliation_last_result',
+			array(
+				'success'             => true,
+				'status'              => 'disabled-by-build',
+				'processedProducts'   => 0,
+				'processedVariations' => 0,
+				'needsContinuation'   => false,
+				'executedAt'          => time(),
+			),
+			false
+		);
 	}
 
 	/**

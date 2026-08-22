@@ -191,13 +191,23 @@ class Mobo_Core_Self_Runner {
 			),
 		);
 
+		/*
+		 * Publish the handoff marker before starting the HTTP request. On fast local
+		 * loopbacks, /worker/run may claim the transferred lease before
+		 * wp_remote_post() returns. Writing OPTION_DISPATCHED_AT afterwards would then
+		 * resurrect a handoff the worker had already claimed; a later request would
+		 * misclassify that successful dispatch as timed out and put the queue into
+		 * backoff. The worker is now the only success path that clears this marker.
+		 */
+		update_option( self::OPTION_DISPATCHED_AT, $now, false );
 		$response = wp_remote_post( $url, $args );
 		if ( is_wp_error( $response ) ) {
-			Mobo_Core_Lock::release( self::DISPATCH_LOCK_NAME, $dispatch_token );
+			update_option( self::OPTION_DISPATCHED_AT, 0, false );
 			$attempts = absint( get_option( self::OPTION_DISPATCH_ATTEMPTS, 0 ) ) + 1;
 			$delay    = self::dispatch_backoff_seconds( $attempts );
 			update_option( self::OPTION_DISPATCH_ATTEMPTS, $attempts, false );
 			update_option( self::OPTION_DISPATCH_RETRY_AT, time() + $delay, false );
+			Mobo_Core_Lock::release( self::DISPATCH_LOCK_NAME, $dispatch_token );
 			return self::save_kick_result(
 				array(
 					'success'     => false,
@@ -210,7 +220,6 @@ class Mobo_Core_Self_Runner {
 		}
 
 		/* Ownership intentionally transfers to /worker/run. Do not release here. */
-		update_option( self::OPTION_DISPATCHED_AT, time(), false );
 		update_option( 'mobo_core_self_runner_last_kick_success_at', time(), false );
 
 		return self::save_kick_result(

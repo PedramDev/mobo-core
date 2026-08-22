@@ -874,7 +874,7 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return bool
 	 */
 	public function mark_done( $id, $claim_token = '' ) {
-		return $this->update_status( $id, 'done', array( 'locked_until' => null, 'claim_token' => '', 'next_retry_at' => null, 'last_error' => null ), $claim_token );
+		return $this->update_status( $id, 'done', array( 'locked_until' => null, 'claim_token' => '', 'next_retry_at' => null, 'last_error' => null, 'progress_json' => '{}' ), $claim_token );
 	}
 
 	/**
@@ -891,6 +891,7 @@ class Mobo_Core_Sync_Event_Store {
 			'claim_token'   => '',
 			'next_retry_at' => null,
 			'last_error'    => null,
+			'progress_json' => '{}',
 		);
 
 		if ( is_array( $payload ) && ! empty( $payload ) ) {
@@ -1055,6 +1056,7 @@ class Mobo_Core_Sync_Event_Store {
 				'locked_until'  => null,
 				'claim_token'   => '',
 				'last_error'    => sanitize_text_field( (string) $message ),
+				'progress_json' => '{}',
 			),
 			$claim_token
 		);
@@ -1082,6 +1084,7 @@ class Mobo_Core_Sync_Event_Store {
 				'locked_until'  => null,
 				'claim_token'   => '',
 				'last_error'    => sanitize_text_field( (string) $message ),
+				'progress_json' => '{}',
 			),
 			$claim_token
 		);

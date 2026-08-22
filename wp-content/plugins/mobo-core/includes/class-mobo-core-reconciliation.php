@@ -15,6 +15,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Reconciliation {
 
+	/**
+	 * Reconciliation mutates products from API snapshots and is intentionally
+	 * disabled until snapshot ordering is protected against newer webhooks.
+	 *
+	 * Keep webhook health bookkeeping available; this switch only disables the
+	 * automatic/manual repair runner that can write product desired state.
+	 */
+	const RUNTIME_ENABLED = false;
+
 	/** @var bool|null Request-local health table existence cache. */
 	private static $health_table_exists_cache = null;
 
@@ -26,6 +35,15 @@ class Mobo_Core_Reconciliation {
 	const LAST_DEEP_OPTION         = 'mobo_core_reconciliation_last_deep_at';
 	const LAST_RESULT_OPTION       = 'mobo_core_reconciliation_last_result';
 	const ENDPOINT_SUPPORT_OPTION  = 'mobo_core_reconciliation_changes_endpoint';
+
+	/**
+	 * Whether product-mutating reconciliation is enabled in this plugin build.
+	 *
+	 * @return bool
+	 */
+	public static function runtime_enabled() {
+		return self::RUNTIME_ENABLED;
+	}
 
 	/**
 	 * Health table name.
@@ -82,6 +100,17 @@ class Mobo_Core_Reconciliation {
 	 * @return array
 	 */
 	public function run_tick( $source = 'real-cron', $force = false, $force_deep = false ) {
+		if ( ! self::runtime_enabled() ) {
+			return array(
+				'success'             => true,
+				'status'              => 'disabled-by-build',
+				'source'              => sanitize_key( (string) $source ),
+				'processedProducts'   => 0,
+				'processedVariations' => 0,
+				'needsContinuation'   => false,
+			);
+		}
+
 		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
 			return Mobo_Core_Cache_Mutation_Guard::run(
 				function () use ( $source, $force, $force_deep ) {

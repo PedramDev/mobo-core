@@ -4719,12 +4719,13 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function normalize_api_stock_quantity( $stock ) {
-		/* Portal's stock contract is nullable integer. Never coerce fractional,
-		 * scientific-notation, boolean, or partially numeric values into a different
-		 * WooCommerce quantity. JSON integers decode as int; digit-only strings are
-		 * accepted for compatibility with older payload serializers. */
+		/* Portal's stock contract is nullable integer. A negative source balance means
+		 * there is no sellable stock and converges to WooCommerce quantity zero instead
+		 * of poisoning the entire Product/Variation event. Never coerce fractional,
+		 * scientific-notation, boolean, or partially numeric values. JSON integers
+		 * decode as int; integer strings are accepted for older serializers. */
 		if ( is_int( $stock ) ) {
-			return $stock >= 0 ? $stock : null;
+			return max( 0, $stock );
 		}
 
 		if ( ! is_string( $stock ) ) {
@@ -4732,8 +4733,12 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$raw_stock = trim( $stock );
-		if ( '' === $raw_stock || ! preg_match( '/^[0-9]+$/D', $raw_stock ) ) {
+		if ( '' === $raw_stock || ! preg_match( '/^-?[0-9]+$/D', $raw_stock ) ) {
 			return null;
+		}
+
+		if ( '-' === substr( $raw_stock, 0, 1 ) ) {
+			return 0;
 		}
 
 		$digits = ltrim( $raw_stock, '0' );

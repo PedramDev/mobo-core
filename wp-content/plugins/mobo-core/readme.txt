@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.44.3
+Stable tag: 10.33.44.6
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -144,6 +144,18 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.33.44.6 =
+* Disables product-mutating Reconciliation at build level across Cron, direct/manual execution, fair-scheduler pressure reporting, and the admin UI while keeping webhook health bookkeeping available.
+* Forces the stored reconciliation toggle off and safely retires cached in-flight reconciliation snapshots during upgrade; product data and webhook rows are not changed.
+
+= 10.33.44.5 =
+* Treats negative integer stock balances as zero/out-of-stock so one oversold Variation cannot fail an otherwise valid authoritative UpdateVariant event.
+* Clears stale waiting/progress diagnostics whenever a table webhook attempt is committed as done, retry, or failed, keeping `progress_json` consistent with the terminal/retry state.
+
+= 10.33.44.4 =
+* Records a self-runner HTTP handoff before dispatch, preventing a fast loopback worker from clearing the marker only for the sender to recreate it and later enter false timeout backoff.
+* Keeps continuation wake-up state aligned with the worker lease so large webhook backlogs continue draining instead of waiting for the next external cron hit.
 
 = 10.33.44.3 =
 * Keeps nullable stock as unlimited (`manage_stock=false`, quantity `null`, status `instock`) while clearing stale `_mobo_stock_payload_missing` and `_mobo_last_api_stock_quantity` diagnostics on both normal and no-op convergence paths.

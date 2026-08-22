@@ -3040,6 +3040,7 @@ type:{mobo_order_type_label}</textarea>
 		$status = class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array();
 		$counts = isset( $status['counts'] ) && is_array( $status['counts'] ) ? $status['counts'] : array();
 		$state  = isset( $status['state'] ) && is_array( $status['state'] ) ? $status['state'] : array();
+		$reconciliation_runtime_enabled = class_exists( 'Mobo_Core_Reconciliation' ) && Mobo_Core_Reconciliation::runtime_enabled();
 		$interval = Mobo_Core_Settings::get_int( 'mobo_core_reconciliation_fast_interval', 3600, 900, 86400 );
 		$deep_schedule = (string) Mobo_Core_Settings::get( 'mobo_core_reconciliation_deep_schedule', 'weekly' );
 		?>
@@ -3052,7 +3053,7 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>سلامت همگام‌سازی</h2>
-						<p>بازبینی و ترمیم خودکار از همان موتور وضعیت مطلوب وب‌هوک استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدودی از کاتالوگ را بررسی می‌کند.</p>
+						<p><?php echo $reconciliation_runtime_enabled ? 'بازبینی و ترمیم خودکار از همان موتور وضعیت مطلوب وب‌هوک استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدودی از کاتالوگ را بررسی می‌کند.' : 'ثبت نتیجه Webhook برای گزارش سلامت فعال است؛ اجرای ترمیم خودکار Reconciliation در این نسخه متوقف شده است.'; ?></p>
 					</div>
 					<div class="mobo-status-grid">
 						<?php $this->status_box( 'محصولات هماهنگ', absint( isset( $counts['synced'] ) ? $counts['synced'] : 0 ) ); ?>
@@ -3069,9 +3070,14 @@ type:{mobo_order_type_label}</textarea>
 				<div class="mobo-card mobo-card-wide">
 					<div class="mobo-card-head">
 						<h2>تنظیمات بازبینی و ترمیم خودکار</h2>
-						<p>در حالت Revision endpoint فقط شناسه محصولات تغییرکرده دریافت می‌شود. اگر Portal endpoint را نداشته باشد، Rolling Fallback در هر اجرا فقط Batch تنظیم‌شده را بررسی می‌کند.</p>
+						<?php if ( $reconciliation_runtime_enabled ) : ?>
+							<p>در حالت Revision endpoint فقط شناسه محصولات تغییرکرده دریافت می‌شود. اگر Portal endpoint را نداشته باشد، Rolling Fallback در هر اجرا فقط Batch تنظیم‌شده را بررسی می‌کند.</p>
+						<?php else : ?>
+							<p>Reconciliation در این نسخه از داخل افزونه غیرفعال است. Webhook، Sync و گزارش سلامت مستقل از این مکانیزم ادامه می‌یابند.</p>
+						<?php endif; ?>
 					</div>
-					<div class="mobo-fields-grid">
+					<?php if ( $reconciliation_runtime_enabled ) : ?>
+						<div class="mobo-fields-grid">
 						<?php $this->bool_field( 'فعال‌سازی بازبینی و ترمیم خودکار', 'mobo_core_auto_reconciliation_enabled' ); ?>
 						<div class="mobo-field">
 							<label for="mobo_core_reconciliation_fast_interval">فاصله بررسی سریع</label>
@@ -3090,14 +3096,19 @@ type:{mobo_order_type_label}</textarea>
 								<option value="weekly" <?php selected( $deep_schedule, 'weekly' ); ?>>هفتگی</option>
 							</select>
 						</div>
-					</div>
-					<div class="mobo-help">Default: یک ساعت، ۱۰۰ محصول، ۱۰۰۰ Variation و Deep Check هفتگی.</div>
+						</div>
+						<div class="mobo-help">Default: یک ساعت، ۱۰۰ محصول، ۱۰۰۰ Variation و Deep Check هفتگی.</div>
+					<?php else : ?>
+						<input type="hidden" name="mobo_core_auto_reconciliation_enabled" value="0">
+						<div class="mobo-help">اجرای زمان‌بندی‌شده، اجرای دستی و ادامه state نیمه‌کاره همگی متوقف شده‌اند.</div>
+					<?php endif; ?>
 				</div>
 			</div>
-			<?php $this->save_button(); ?>
+			<?php if ( $reconciliation_runtime_enabled ) { $this->save_button(); } ?>
 		</form>
 
-		<div class="mobo-inline-actions">
+		<?php if ( $reconciliation_runtime_enabled ) : ?>
+			<div class="mobo-inline-actions">
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
 				<input type="hidden" name="action" value="mobo_core_run_auto_reconciliation">
 				<?php wp_nonce_field( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' ); ?>
@@ -3108,7 +3119,8 @@ type:{mobo_order_type_label}</textarea>
 				<?php wp_nonce_field( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' ); ?>
 				<button type="submit" class="button button-secondary">اجرای بازبینی عمیق</button>
 			</form>
-		</div>
+			</div>
+		<?php endif; ?>
 		<?php
 	}
 
@@ -6006,6 +6018,12 @@ type:{mobo_order_type_label}</textarea>
 
 
 			case 'sync-health':
+				/* Reconciliation is intentionally disabled at build level. Cached/old
+				 * admin forms must not be able to turn its stored option back on. */
+				if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
+					update_option( 'mobo_core_auto_reconciliation_enabled', '0', false );
+					break;
+				}
 				$this->save_bool_options_from_post( array( 'mobo_core_auto_reconciliation_enabled' ) );
 				$this->save_int_options_from_post(
 					array(
@@ -6875,6 +6893,9 @@ type:{mobo_order_type_label}</textarea>
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
 		check_admin_referer( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' );
+		if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
+			$this->redirect_with_message( 'Reconciliation در این نسخه از داخل افزونه غیرفعال است.', 'warning', 'sync-health' );
+		}
 		$service = new Mobo_Core_Reconciliation();
 		$result  = $service->run_tick( 'admin-fast-repair', true, false );
 		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
@@ -6893,6 +6914,9 @@ type:{mobo_order_type_label}</textarea>
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
 		check_admin_referer( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' );
+		if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
+			$this->redirect_with_message( 'بازبینی عمیق Reconciliation در این نسخه غیرفعال است.', 'warning', 'sync-health' );
+		}
 		$service = new Mobo_Core_Reconciliation();
 		$result  = $service->run_tick( 'admin-deep-integrity', true, true );
 		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {

@@ -903,7 +903,7 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		/* Adaptive reconciliation / sync health. */
-		if ( 1 === absint( $round_number ) && ! $webhook_due_pressure && $allow_reconciliation && ! $this->stage_circuit_open( $config, 'reconciliation' ) && Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) && class_exists( 'Mobo_Core_Reconciliation' ) && ! isset( $disabled_stages['reconciliation'] ) ) {
+		if ( 1 === absint( $round_number ) && ! $webhook_due_pressure && $allow_reconciliation && ! $this->stage_circuit_open( $config, 'reconciliation' ) && class_exists( 'Mobo_Core_Reconciliation' ) && Mobo_Core_Reconciliation::runtime_enabled() && Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) && ! isset( $disabled_stages['reconciliation'] ) ) {
 			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
 				return $round;
 			}
@@ -1291,7 +1291,9 @@ class Mobo_Core_Cron_Runner {
 		}
 		$snapshot['cacheWarmup'] = array( 'active' => ! empty( $warm_items ), 'backlog' => max( $warm_due, count( $warm_items ) ) );
 
-		$reconciliation_active = Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' );
+		$reconciliation_active = class_exists( 'Mobo_Core_Reconciliation' )
+			&& Mobo_Core_Reconciliation::runtime_enabled()
+			&& Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' );
 		$snapshot['reconciliation'] = array( 'active' => $reconciliation_active, 'backlog' => $reconciliation_active ? 1 : 0 );
 		$snapshot['maintenance']    = array( 'active' => true, 'backlog' => 1 );
 
