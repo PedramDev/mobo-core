@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.44
+Stable tag: 10.33.44.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -144,6 +144,11 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.33.44.3 =
+* Keeps nullable stock as unlimited (`manage_stock=false`, quantity `null`, status `instock`) while clearing stale `_mobo_stock_payload_missing` and `_mobo_last_api_stock_quantity` diagnostics on both normal and no-op convergence paths.
+* Re-arms active webhook rows stranded by the legacy nullable-stock exception path and immediately schedules the queue worker after upgrade.
+* Contains all webhook processor exceptions inside durable retry accounting so one poison Product/Variant event cannot remain forever in `processing` and block later Variant work.
 
 = 10.33.44 =
 * Webhook remains the foreground freshness lane while a long Sync or Repair is active: after every durable product-sync step, the runner now yields immediately when genuinely runnable webhook work has arrived, so the next round starts with webhook processing instead of consuming the remaining Repair/Sync budget.

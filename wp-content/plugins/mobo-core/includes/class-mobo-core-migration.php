@@ -85,6 +85,7 @@ class Mobo_Core_Migration {
 		self::apply_103335_variation_integrity_reaudit( $previous_version );
 		self::apply_103336_recovery_state_selfheal( $previous_version );
 		self::apply_103337_variation_integrity_reason_selfheal( $previous_version );
+		self::apply_1033443_nullable_stock_webhook_recovery( $previous_version );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -148,6 +149,7 @@ class Mobo_Core_Migration {
 		self::apply_103335_variation_integrity_reaudit( $current );
 		self::apply_103336_recovery_state_selfheal( $current );
 		self::apply_103337_variation_integrity_reason_selfheal( $current );
+		self::apply_1033443_nullable_stock_webhook_recovery( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -1904,6 +1906,39 @@ class Mobo_Core_Migration {
 			update_option( 'mobo_core_103337_variation_integrity_reason_selfheal_scheduled_at', time(), false );
 			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
 			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+	/**
+	 * Re-arm active webhook rows stranded by the old nullable-stock exception path.
+	 *
+	 * Terminal failed history is deliberately left untouched: replaying an old
+	 * desired state after a newer event completed could regress stock. Only active
+	 * retry rows and expired processing leases are reset, then the normal ordered
+	 * queue worker applies them with the current nullable-stock contract.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_1033443_nullable_stock_webhook_recovery( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.44.3', '>=' ) ) {
+			return;
+		}
+
+		$recovered = 0;
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$store = new Mobo_Core_Sync_Event_Store();
+			if ( method_exists( $store, 'recover_legacy_nullable_stock_blockers' ) ) {
+				$recovered = $store->recover_legacy_nullable_stock_blockers( 1000 );
+			}
+		}
+
+		update_option( 'mobo_core_1033443_nullable_stock_webhook_recovered', absint( $recovered ), false );
+		update_option( 'mobo_core_1033443_nullable_stock_webhook_recovery_at', time(), false );
+
+		if ( $recovered > 0 ) {
+			update_option( 'mobo_core_worker_dispatch_pending', '1', false );
 		}
 	}
 

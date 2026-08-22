@@ -1118,6 +1118,66 @@ class Mobo_Core_Sync_Event_Store {
 	}
 
 	/**
+	 * Re-arm queue rows stranded by pre-10.33.44.3 processor exceptions.
+	 *
+	 * Older nullable-stock failures could escape before mark_failure(), leaving a
+	 * stale processing lease with try_count=0 forever from the operator's point of
+	 * view. Rows that did reach the retry path can also retain the old stock error
+	 * and a deferred next_retry_at. Failed/terminal history is intentionally not
+	 * replayed because a newer desired-state event may already have superseded it.
+	 *
+	 * @param int $limit Maximum active rows to recover.
+	 * @return int Number of rows re-armed.
+	 */
+	public function recover_legacy_nullable_stock_blockers( $limit = 500 ) {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+
+		$limit            = max( 1, min( 1000, absint( $limit ) ) );
+		$table            = self::table_name();
+		$now              = current_time( 'mysql', true );
+		$stock_error_like = '%' . $wpdb->esc_like( 'stock' ) . '%';
+
+		$ids = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE (status = 'processing' AND (locked_until IS NULL OR locked_until < %s))
+					OR (status = 'pending' AND try_count > 0 AND last_error LIKE %s)
+				ORDER BY id ASC
+				LIMIT %d",
+				$now,
+				$stock_error_like,
+				$limit
+			)
+		);
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) ) {
+			return 0;
+		}
+
+		$id_sql  = implode( ',', $ids );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', try_count = 0, next_retry_at = NULL,
+					locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
+				WHERE id IN ({$id_sql})",
+				$now
+			)
+		);
+
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return false === $updated ? 0 : absint( $updated );
+	}
+
+	/**
 	 * Re-queue failed events for another attempt.
 	 *
 	 * @param int $limit Maximum events to re-queue.

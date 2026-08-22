@@ -594,7 +594,7 @@ class Mobo_Core_Webhook_Queue {
 				continue;
 			}
 
-			$result = $this->process_item( $item );
+			$result = $this->process_item_safely( $item );
 
 			if ( ! is_array( $result ) ) {
 				$result = array(
@@ -1025,7 +1025,7 @@ class Mobo_Core_Webhook_Queue {
 						$remaining_seconds - 1
 					)
 				);
-				$result = $this->process_item( $item, $payload_timeout );
+				$result = $this->process_item_safely( $item, $payload_timeout );
 				if ( ! is_array( $result ) ) {
 					$result = array(
 						'success' => false,
@@ -1218,6 +1218,48 @@ class Mobo_Core_Webhook_Queue {
 					'data'    => array(),
 				);
 		}
+	}
+
+	/**
+	 * Keep one malformed/legacy webhook payload from terminating the worker before
+	 * its durable retry counter is updated. After max-try the existing queue policy
+	 * retires the poison event and later Variant events can continue.
+	 *
+	 * @param array    $item Queue item.
+	 * @param int|null $payload_timeout Optional payload pull timeout.
+	 * @return array
+	 */
+	private function process_item_safely( $item, $payload_timeout = null ) {
+		try {
+			$result = $this->process_item( $item, $payload_timeout );
+		} catch ( Throwable $throwable ) {
+			$message = sanitize_text_field( (string) $throwable->getMessage() );
+			if ( '' === $message ) {
+				$message = 'Unhandled webhook processor exception.';
+			}
+
+			try {
+				Mobo_Core_Logger::error( 'Mobo Core webhook processor exception: ' . $message );
+			} catch ( Throwable $logging_error ) {
+				/* Retry accounting is more important than an optional diagnostic write. */
+			}
+
+			return array(
+				'success' => false,
+				'message' => $message,
+				'data'    => array(
+					'processorException' => true,
+				),
+			);
+		}
+
+		return is_array( $result )
+			? $result
+			: array(
+				'success' => false,
+				'message' => 'Invalid processor result.',
+				'data'    => array(),
+			);
 	}
 
 

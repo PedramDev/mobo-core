@@ -2532,6 +2532,7 @@ class Mobo_Core_Product_Sync {
 			if ( '1' !== $old_incomplete && $this->product_frontend_state_matches_payload( $product, $data ) ) {
 				$this->sync_product_identity_meta_fast( $product_id, $data, $product_guid );
 				$this->sync_price_source_meta_fast( $product_id, $data );
+				$this->cleanup_stock_diagnostic_meta_fast( $product_id, $data );
 				$this->store_product_attribute_guids_if_changed( $product_id, $this->get_value( $data, 'attributes', array() ) );
 				$this->store_product_category_refs_if_changed( $product_id, $this->get_product_category_refs_from_payload( $data ) );
 				$this->update_post_meta_if_changed( $product_id, '_mobo_product_source_hash', $incoming_hash );
@@ -2822,6 +2823,7 @@ class Mobo_Core_Product_Sync {
 				$this->update_post_meta_if_changed( $variation_id, 'variant_guid', $variant_guid );
 				$this->store_portal_ids_on_variation_post( $variation_id, $data, $product_guid, $parent_id );
 				$this->sync_price_source_meta_fast( $variation_id, $data );
+				$this->cleanup_stock_diagnostic_meta_fast( $variation_id, $data );
 				$this->update_post_meta_if_changed( $variation_id, '_mobo_variant_source_hash', $incoming_hash );
 				if ( $old_hash !== $incoming_hash ) {
 					$this->update_post_meta_if_changed( $variation_id, '_mobo_variant_source_hash_updated_at', gmdate( 'c' ) );
@@ -2895,9 +2897,11 @@ class Mobo_Core_Product_Sync {
 			$stock_value   = $this->get_stock_value_from_payload( $data, $stock_present );
 
 			if ( $stock_present ) {
-				if ( ! $this->apply_api_stock( $variation, $stock_value ) ) {
+				if ( ! $this->is_valid_api_stock_payload_value( $stock_value ) ) {
 					throw new RuntimeException( 'Invalid Mobo stock payload for variation.' );
 				}
+
+				$this->apply_api_stock( $variation, $stock_value );
 			} elseif ( $is_new_variation ) {
 				$this->apply_api_stock( $variation, null );
 			} else {
@@ -3545,6 +3549,14 @@ class Mobo_Core_Product_Sync {
 		return false !== update_post_meta( $post_id, $key, $value );
 	}
 
+	private function delete_post_meta_if_present( $post_id, $key ) {
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! metadata_exists( 'post', $post_id, $key ) ) {
+			return false;
+		}
+		return (bool) delete_post_meta( $post_id, $key );
+	}
+
 	/**
 	 * Queue WooCommerce object metadata only when the persisted/edit value changed.
 	 * This keeps WC_Data::save_meta_data() from issuing UPDATEs for identical Mobo
@@ -3567,6 +3579,53 @@ class Mobo_Core_Product_Sync {
 
 		$product->update_meta_data( $key, $value );
 		return true;
+	}
+
+	private function delete_product_meta_if_present( $product, $key ) {
+		if ( ! $product instanceof WC_Product ) {
+			return false;
+		}
+
+		$product_id = absint( $product->get_id() );
+		$exists     = $product_id > 0
+			? metadata_exists( 'post', $product_id, $key )
+			: '' !== (string) $product->get_meta( $key, true, 'edit' );
+
+		if ( ! $exists ) {
+			return false;
+		}
+
+		$product->delete_meta_data( $key );
+		return true;
+	}
+
+	/**
+	 * Remove obsolete stock diagnostics even when storefront state is already
+	 * converged and the WooCommerce CRUD no-op path is taken.
+	 *
+	 * @param int   $post_id Product/variation ID.
+	 * @param array $data Source payload.
+	 * @return void
+	 */
+	private function cleanup_stock_diagnostic_meta_fast( $post_id, $data ) {
+		if ( ! $this->rules->should_update_stock() || ! is_array( $data ) ) {
+			return;
+		}
+
+		$present = false;
+		$stock   = $this->get_stock_value_from_payload( $data, $present );
+		if ( ! $present ) {
+			return;
+		}
+
+		$changed = $this->delete_post_meta_if_present( $post_id, '_mobo_stock_payload_missing' );
+		if ( null === $stock || '' === $stock ) {
+			$changed = $this->delete_post_meta_if_present( $post_id, '_mobo_last_api_stock_quantity' ) || $changed;
+		}
+
+		if ( $changed ) {
+			$this->update_post_meta_if_changed( $post_id, '_mobo_last_api_stock_applied_at', gmdate( 'c' ) );
+		}
 	}
 
 	private function store_product_attribute_guids_if_changed( $product_id, $attributes ) {
@@ -4709,6 +4768,8 @@ class Mobo_Core_Product_Sync {
 				$product->set_stock_status( 'instock' );
 				$changed = true;
 			}
+			$changed = $this->delete_product_meta_if_present( $product, '_mobo_stock_payload_missing' ) || $changed;
+			$changed = $this->delete_product_meta_if_present( $product, '_mobo_last_api_stock_quantity' ) || $changed;
 			$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', '' ) || $changed;
 			$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-empty-stock' ) || $changed;
 			if ( $changed ) {
@@ -4747,6 +4808,7 @@ class Mobo_Core_Product_Sync {
 			$changed = true;
 		}
 
+		$changed = $this->delete_product_meta_if_present( $product, '_mobo_stock_payload_missing' ) || $changed;
 		$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', $sanitized_stock ) || $changed;
 		$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_quantity', $stock_quantity ) || $changed;
 		$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-stock' ) || $changed;
