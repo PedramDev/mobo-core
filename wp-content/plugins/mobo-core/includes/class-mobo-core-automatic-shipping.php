@@ -71,24 +71,40 @@ class Mobo_Core_Automatic_Shipping {
 			'disabledMirrorMethods' => 0,
 			'deletedLegacyZones' => 0,
 		);
-		$force = 'admin-mapping-repair' === sanitize_key( (string) $source );
+		$source_key = sanitize_key( (string) $source );
+		$force = in_array( $source_key, array( 'admin-mapping-repair', 'repair-integrity' ), true );
 		if ( $already_applied && ! $force ) {
 			return $result;
 		}
 
+		$failures = array();
 		$managed = get_option( self::OPTION_MANAGED_RATES, array() );
 		foreach ( is_array( $managed ) ? $managed : array() as $entry ) {
 			$instance_id = is_array( $entry ) ? absint( isset( $entry['instanceId'] ) ? $entry['instanceId'] : 0 ) : 0;
-			if ( $instance_id > 0 && $this->disable_legacy_instance( self::METHOD_ID, $instance_id ) ) {
+			if ( $instance_id <= 0 ) {
+				continue;
+			}
+			$disabled = $this->disable_legacy_instance_result( self::METHOD_ID, $instance_id );
+			if ( ! empty( $disabled['wasEnabled'] ) ) {
 				$result['disabledMoboMethods']++;
+			}
+			if ( empty( $disabled['success'] ) ) {
+				$failures[] = array( 'methodId' => self::METHOD_ID, 'instanceId' => $instance_id, 'reason' => isset( $disabled['reason'] ) ? $disabled['reason'] : 'disable-failed' );
 			}
 		}
 
 		$fallbacks = get_option( self::OPTION_STORE_FALLBACKS, array() );
 		foreach ( is_array( $fallbacks ) ? $fallbacks : array() as $instance_id ) {
 			$instance_id = absint( $instance_id );
-			if ( $instance_id > 0 && $this->disable_legacy_instance( 'flat_rate', $instance_id ) ) {
+			if ( $instance_id <= 0 ) {
+				continue;
+			}
+			$disabled = $this->disable_legacy_instance_result( 'flat_rate', $instance_id );
+			if ( ! empty( $disabled['wasEnabled'] ) ) {
 				$result['disabledFallbackMethods']++;
+			}
+			if ( empty( $disabled['success'] ) ) {
+				$failures[] = array( 'methodId' => 'flat_rate', 'instanceId' => $instance_id, 'reason' => isset( $disabled['reason'] ) ? $disabled['reason'] : 'disable-failed' );
 			}
 		}
 
@@ -98,19 +114,34 @@ class Mobo_Core_Automatic_Shipping {
 				$parts = explode( ':', (string) $source_key );
 				$method_id = isset( $parts[1] ) ? sanitize_key( $parts[1] ) : '';
 				$instance_id = absint( $instance_id );
-				if ( '' !== $method_id && $instance_id > 0 && $this->disable_legacy_instance( $method_id, $instance_id ) ) {
+				if ( '' === $method_id || $instance_id <= 0 ) {
+					continue;
+				}
+				$disabled = $this->disable_legacy_instance_result( $method_id, $instance_id );
+				if ( ! empty( $disabled['wasEnabled'] ) ) {
 					$result['disabledMirrorMethods']++;
+				}
+				if ( empty( $disabled['success'] ) ) {
+					$failures[] = array( 'methodId' => $method_id, 'instanceId' => $instance_id, 'reason' => isset( $disabled['reason'] ) ? $disabled['reason'] : 'disable-failed' );
 				}
 			}
 		}
 
 		$result['deletedLegacyZones'] = $this->delete_empty_legacy_mobo_zones( $managed, $fallbacks, $mirrors );
+		$result['failures'] = $failures;
+		$result['success'] = empty( $failures );
 
 		update_option( self::OPTION_ENABLED, '0', false );
 		update_option( 'mobo_core_mobo_shipping_package_enabled', '0', false );
 		update_option( 'mobo_core_mobo_shipping_use_api_price', '0', false );
 		update_option( 'mobo_core_shipping_wizard_completed', '0', false );
-		update_option( 'mobo_core_shipping_mapping_only_policy_version', $policy_version, false );
+		if ( $result['success'] ) {
+			update_option( 'mobo_core_shipping_mapping_only_policy_version', $policy_version, false );
+			if ( (string) get_option( 'mobo_core_shipping_mapping_only_policy_version', '' ) !== $policy_version ) {
+				$result['success'] = false;
+				$result['failures'][] = array( 'reason' => 'policy-version-not-persisted' );
+			}
+		}
 		update_option( 'mobo_core_shipping_mapping_only_last_cleanup', array_merge( $result, array( 'at' => time() ) ), false );
 		return $result;
 	}
@@ -180,19 +211,45 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return bool True when the instance had been enabled before cleanup.
 	 */
 	private function disable_legacy_instance( $method_id, $instance_id ) {
+		$result = $this->disable_legacy_instance_result( $method_id, $instance_id );
+		return ! empty( $result['success'] ) && ! empty( $result['wasEnabled'] );
+	}
+
+	/**
+	 * Disable one legacy instance and prove the durable option/zone state.
+	 *
+	 * @param string $method_id Method ID.
+	 * @param int    $instance_id Instance ID.
+	 * @return array
+	 */
+	private function disable_legacy_instance_result( $method_id, $instance_id ) {
 		$method_id = sanitize_key( (string) $method_id );
 		$instance_id = absint( $instance_id );
+		$result = array( 'success' => false, 'wasEnabled' => false, 'reason' => '' );
 		if ( '' === $method_id || $instance_id <= 0 ) {
-			return false;
+			$result['reason'] = 'invalid-instance';
+			return $result;
 		}
+
 		$option_key = 'woocommerce_' . $method_id . '_' . $instance_id . '_settings';
 		$settings = get_option( $option_key, array() );
 		$settings = is_array( $settings ) ? $settings : array();
-		$was_enabled = 'yes' === ( isset( $settings['enabled'] ) ? (string) $settings['enabled'] : 'yes' );
+		$result['wasEnabled'] = 'yes' === ( isset( $settings['enabled'] ) ? (string) $settings['enabled'] : 'yes' );
 		$settings['enabled'] = 'no';
 		update_option( $option_key, $settings, false );
-		$this->set_zone_method_state( $instance_id, false, null );
-		return $was_enabled;
+		$stored = get_option( $option_key, array() );
+		if ( ! is_array( $stored ) || 'no' !== ( isset( $stored['enabled'] ) ? (string) $stored['enabled'] : '' ) ) {
+			$result['reason'] = 'instance-option-not-persisted';
+			return $result;
+		}
+
+		if ( ! $this->set_zone_method_state( $instance_id, false, null ) ) {
+			$result['reason'] = 'zone-state-not-persisted';
+			return $result;
+		}
+
+		$result['success'] = true;
+		return $result;
 	}
 
 	/**
@@ -255,9 +312,11 @@ class Mobo_Core_Automatic_Shipping {
 		unset( $store_rate_config );
 		$cleanup = $this->retire_legacy_runtime( 'admin-mapping-repair' === sanitize_key( (string) $source ) ? 'admin-mapping-repair' : 'legacy-install-blocked' );
 		return array(
-			'success' => true,
-			'status' => 'mapping-only',
-			'message' => 'سیاست حمل‌ونقل Mobo Core روی حالت فقط نگاشت است؛ هیچ روش یا Zone موبویی در WooCommerce ساخته نمی‌شود.',
+			'success' => ! empty( $cleanup['success'] ),
+			'status' => ! empty( $cleanup['success'] ) ? 'mapping-only' : 'mapping-only-cleanup-failed',
+			'message' => ! empty( $cleanup['success'] )
+				? 'سیاست حمل‌ونقل Mobo Core روی حالت فقط نگاشت است؛ هیچ روش یا Zone موبویی در WooCommerce ساخته نمی‌شود.'
+				: 'پاکسازی روش‌های حمل‌ونقل قدیمی موبو کامل نشد و برای جلوگیری از ثبت وضعیت اشتباه باید دوباره تلاش شود.',
 			'cleanup' => $cleanup,
 		);
 
@@ -1383,12 +1442,12 @@ class Mobo_Core_Automatic_Shipping {
 	 * @param int      $instance_id Instance ID.
 	 * @param bool     $enabled Enabled state.
 	 * @param int|null $method_order Optional order.
-	 * @return void
+	 * @return bool True when the authoritative zone row was updated/already correct or no longer exists.
 	 */
 	private function set_zone_method_state( $instance_id, $enabled, $method_order = null ) {
 		global $wpdb;
 		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'update' ) || empty( $wpdb->prefix ) ) {
-			return;
+			return false;
 		}
 
 		$data   = array( 'is_enabled' => $enabled ? 1 : 0 );
@@ -1399,17 +1458,42 @@ class Mobo_Core_Automatic_Shipping {
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- WooCommerce stores enabled/order state in this zone table; WC shipping cache is invalidated immediately below.
-		$wpdb->update(
+		$updated = $wpdb->update(
 			$wpdb->prefix . 'woocommerce_shipping_zone_methods',
 			$data,
 			array( 'instance_id' => absint( $instance_id ) ),
 			$format,
 			array( '%d' )
 		);
+		if ( false === $updated ) {
+			return false;
+		}
+
+		// Verify the durable row because a zero affected-row result can mean either
+		// "already correct" or "instance no longer exists"; both are safe.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Same authoritative WooCommerce table as the write above.
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT is_enabled, method_order FROM {$wpdb->prefix}woocommerce_shipping_zone_methods WHERE instance_id = %d LIMIT 1",
+				absint( $instance_id )
+			)
+		);
+		if ( ! empty( $wpdb->last_error ) ) {
+			return false;
+		}
+		if ( is_object( $row ) ) {
+			if ( (int) $row->is_enabled !== ( $enabled ? 1 : 0 ) ) {
+				return false;
+			}
+			if ( null !== $method_order && (int) $row->method_order !== absint( $method_order ) ) {
+				return false;
+			}
+		}
 
 		if ( class_exists( 'WC_Cache_Helper' ) && method_exists( 'WC_Cache_Helper', 'get_transient_version' ) ) {
 			WC_Cache_Helper::get_transient_version( 'shipping', true );
 		}
+		return true;
 	}
 
 	/**

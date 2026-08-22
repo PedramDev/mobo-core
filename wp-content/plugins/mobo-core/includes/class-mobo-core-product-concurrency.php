@@ -97,6 +97,38 @@ class Mobo_Core_Product_Concurrency {
 	}
 
 	/**
+	 * Renew the observable runtime lease for a product lock.
+	 *
+	 * MySQL GET_LOCK keeps write serialization even for long operations, but the
+	 * plugin upgrade barrier observes the runtime lease. Long variant pages must
+	 * therefore heartbeat that lease so an upgrade never mistakes live product
+	 * mutation for a drained site.
+	 *
+	 * @param array|false $lock Lock token array.
+	 * @param int         $ttl_seconds Lease TTL from now.
+	 * @return bool
+	 */
+	public static function renew_product_lock( $lock, $ttl_seconds = 180 ) {
+		if ( ! is_array( $lock ) || empty( $lock['type'] ) || empty( $lock['name'] ) || empty( $lock['token'] ) || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return false;
+		}
+
+		$runtime_name = 'mysql-runtime' === $lock['type'] && ! empty( $lock['runtimeName'] )
+			? sanitize_key( (string) $lock['runtimeName'] )
+			: sanitize_key( (string) $lock['name'] );
+
+		if ( '' === $runtime_name ) {
+			return false;
+		}
+
+		return Mobo_Core_Lock::renew(
+			$runtime_name,
+			sanitize_text_field( (string) $lock['token'] ),
+			max( 30, absint( $ttl_seconds ) )
+		);
+	}
+
+	/**
 	 * Release a product GUID lock.
 	 *
 	 * @param array|false $lock Lock token.
@@ -418,7 +450,7 @@ class Mobo_Core_Product_Concurrency {
 					true
 				);
 
-				if ( is_wp_error( $updated ) ) {
+				if ( is_wp_error( $updated ) || absint( $updated ) !== $product_id || 'draft' !== (string) get_post_status( $product_id ) ) {
 					$result['skipped']++;
 					continue;
 				}

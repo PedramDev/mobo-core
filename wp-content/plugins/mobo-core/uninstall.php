@@ -70,6 +70,14 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_real_cron_last_success_at' );
 	delete_option( 'mobo_core_real_cron_last_result' );
 	delete_option( 'mobo_core_runtime_diagnostics' );
+	delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
+	delete_option( 'mobo_core_checkout_mobo_cookie_reset_pending' );
+	delete_option( 'mobo_core_checkout_mobo_debug_log' );
+	delete_option( 'mobo_core_mobo_order_submission_queue' );
+	delete_option( 'mobo_core_cache_warmup_queue' );
+	delete_option( 'mobo_core_parent_finalize_queue' );
+	delete_option( 'mobo_core_reprice_state' );
+	delete_option( 'mobo_core_recategorize_state' );
 	delete_option( 'mobo_core_real_cron_time_budget_seconds' );
 	delete_option( 'mobo_core_real_cron_max_sync_steps' );
 	delete_option( 'mobo_core_real_cron_max_rounds' );
@@ -174,12 +182,14 @@ function mobo_core_uninstall_runtime_state() {
 	 */
 	global $wpdb;
 
-	$prefix = $wpdb->esc_like( 'mobo_seen_variants_' ) . '%';
+	$prefix          = $wpdb->esc_like( 'mobo_seen_variants_' ) . '%';
+	$recovery_prefix = $wpdb->esc_like( 'mobo_core_mobo_order_recovery_' ) . '%';
 
 	$option_names = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
-			$prefix
+			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+			$prefix,
+			$recovery_prefix
 		)
 	);
 

@@ -131,6 +131,10 @@ class Mobo_Core_Maintenance {
 		$map_deadline     = self::slice_deadline( $deadline, 0.40 );
 		$product_map      = self::cleanup_product_map( $map_deadline );
 
+		$legacy_map_seed = self::has_time( $deadline, 0.10 )
+			? self::continue_legacy_map_seed()
+			: array( 'status' => 'skipped-budget', 'likelyRemaining' => self::legacy_map_seed_is_pending() );
+
 		$action_scheduler = self::has_time( $deadline, 0.12 )
 			? self::cleanup_action_scheduler_logs( self::slice_deadline( $deadline, 0.30 ) )
 			: array( 'status' => 'skipped-budget', 'deleted' => 0, 'likelyRemaining' => false );
@@ -142,7 +146,7 @@ class Mobo_Core_Maintenance {
 		$continuation = false;
 		/* Catch-up cadence is driven only by Mobo-owned tables. A third-party
 		 * Action Scheduler backlog must not make Mobo wake every five minutes. */
-		foreach ( array( $sync_events, $image_queue, $image_refresh, $product_map ) as $stage ) {
+		foreach ( array( $sync_events, $image_queue, $image_refresh, $product_map, $legacy_map_seed ) as $stage ) {
 			if ( is_array( $stage ) && ! empty( $stage['likelyRemaining'] ) ) {
 				$continuation = true;
 				break;
@@ -161,9 +165,78 @@ class Mobo_Core_Maintenance {
 			'imageQueue'          => $image_queue,
 			'imageRefreshQueue'   => $image_refresh,
 			'productMap'          => $product_map,
+			'legacyMapSeed'        => $legacy_map_seed,
 			'actionScheduler'     => $action_scheduler,
 			'wpCron'              => $wp_cron,
 		);
+	}
+
+
+	/**
+	 * Whether the one-time 10.33.28 legacy identity-map re-audit is still pending.
+	 *
+	 * @return bool
+	 */
+	private static function legacy_map_seed_is_pending() {
+		$product_pending  = false === get_option( 'mobo_core_product_map_seed_completed_at', false );
+		$category_pending = false === get_option( 'mobo_core_category_map_seed_completed_at', false );
+		return $product_pending || $category_pending;
+	}
+
+	/**
+	 * Continue legacy Product/Variation/Category map seeding in bounded batches.
+	 * Existing mappings are preserved; every seed method performs idempotent upserts.
+	 *
+	 * @return array
+	 */
+	private static function continue_legacy_map_seed() {
+		$result = array(
+			'status'          => 'ok',
+			'products'        => 0,
+			'variations'      => 0,
+			'categories'      => 0,
+			'stalled'         => false,
+			'likelyRemaining' => false,
+		);
+
+		if ( false === get_option( 'mobo_core_product_map_seed_completed_at', false ) ) {
+			if ( ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
+				$result['status']  = 'product-map-missing';
+				$result['stalled'] = true;
+			} else {
+				$map = new Mobo_Core_Product_Map();
+				$seed = $map->seed_from_legacy_meta( 250 );
+				$result['products']   = absint( isset( $seed['products'] ) ? $seed['products'] : 0 );
+				$result['variations'] = absint( isset( $seed['variations'] ) ? $seed['variations'] : 0 );
+				if ( ! empty( $seed['stalled'] ) ) {
+					$result['stalled'] = true;
+					$result['status']  = 'stalled';
+				}
+			}
+		}
+
+		if ( false === get_option( 'mobo_core_category_map_seed_completed_at', false ) ) {
+			if ( ! class_exists( 'Mobo_Core_Category_Map' ) || ! Mobo_Core_Category_Map::table_exists() ) {
+				$result['status']  = 'category-map-missing';
+				$result['stalled'] = true;
+			} else {
+				$map = new Mobo_Core_Category_Map();
+				$seed = $map->seed_from_legacy_term_meta( 250 );
+				$result['categories'] = absint( isset( $seed['categories'] ) ? $seed['categories'] : 0 );
+				if ( ! empty( $seed['stalled'] ) ) {
+					$result['stalled'] = true;
+					$result['status']  = 'stalled';
+				}
+			}
+		}
+
+		$result['likelyRemaining'] = self::legacy_map_seed_is_pending();
+		if ( ! $result['likelyRemaining'] && ! $result['stalled'] ) {
+			$result['status'] = 'complete';
+			update_option( 'mobo_core_103328_legacy_map_reseed_completed_at', time(), false );
+		}
+
+		return $result;
 	}
 
 	/**
@@ -213,12 +286,14 @@ class Mobo_Core_Maintenance {
 		$posts_table    = $wpdb->posts;
 		$fail_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_FAILED_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$orphan_cutoff  = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_ORPHAN_RETENTION_DAYS * DAY_IN_SECONDS ) );
-		$done_cutoff    = gmdate( 'Y-m-d H:i:s', time() - ( self::IMAGE_DONE_RETENTION_DAYS * DAY_IN_SECONDS ) );
 		$permanent_like = $wpdb->esc_like( 'Permanent:' ) . '%';
 
 		$legacy_recovery = self::has_time( $deadline, 0.12 ) && method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
 			? Mobo_Core_Image_Queue::recover_legacy_failed( 150 )
 			: array( 'status' => 'skipped-budget', 'recovered' => 0, 'remaining' => 0 );
+		$file_recovery = self::has_time( $deadline, 0.12 ) && method_exists( 'Mobo_Core_Image_Queue', 'schedule_file_repairs' )
+			? Mobo_Core_Image_Queue::schedule_file_repairs( 75 )
+			: array( 'status' => 'skipped-budget', 'scheduled' => 0, 'scanned' => 0, 'cycleComplete' => false );
 		$linkage_recovery = self::has_time( $deadline, 0.12 ) && method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
 			? Mobo_Core_Image_Queue::schedule_linkage_repairs( 75 )
 			: array( 'status' => 'skipped-budget', 'scheduled' => 0 );
@@ -308,14 +383,22 @@ class Mobo_Core_Maintenance {
 			}
 		}
 
-		$done = self::has_time( $deadline, 0.03 )
-			? self::delete_status_before( $table, 'done', $done_cutoff, 2000, $deadline )
-			: array( 'deleted' => 0, 'likelyRemaining' => false );
+		/*
+		 * Completed image rows are durable desired-state records, not disposable logs.
+		 * They drive image order, file-health repair and linkage recovery even when a
+		 * product has not changed for many months. Stale rows are pruned when a new
+		 * explicit image payload arrives, and rows for deleted products are removed
+		 * above, so age alone must never delete a valid done row.
+		 */
+		$done = array( 'deleted' => 0, 'likelyRemaining' => false );
 
 		return array(
 			'status'                    => 'ok',
 			'recoveredLegacyFailed'     => isset( $legacy_recovery['recovered'] ) ? absint( $legacy_recovery['recovered'] ) : 0,
 			'remainingLegacyFailed'     => isset( $legacy_recovery['remaining'] ) ? absint( $legacy_recovery['remaining'] ) : 0,
+			'scheduledFileRepairs'      => isset( $file_recovery['scheduled'] ) ? absint( $file_recovery['scheduled'] ) : 0,
+			'scannedFileRepairs'        => isset( $file_recovery['scanned'] ) ? absint( $file_recovery['scanned'] ) : 0,
+			'fileRepairCycleComplete'   => ! empty( $file_recovery['cycleComplete'] ),
 			'scheduledLinkageRepairs'   => isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0,
 			'deletedPermanentFailed'    => $deleted_failed,
 			'deletedMissingProduct'     => $deleted_missing_product,
@@ -323,8 +406,9 @@ class Mobo_Core_Maintenance {
 			'deletedOldDone'            => absint( $done['deleted'] ),
 			'failedRetentionDays'       => self::IMAGE_FAILED_RETENTION_DAYS,
 			'orphanRetentionDays'       => self::IMAGE_ORPHAN_RETENTION_DAYS,
-			'doneRetentionDays'         => self::IMAGE_DONE_RETENTION_DAYS,
-			'likelyRemaining'           => $failed_likely || $missing_product_likely || $missing_attachment_likely || ! empty( $done['likelyRemaining'] ) || ! empty( $legacy_recovery['remaining'] ),
+			'doneRetentionDays'         => 0,
+			'doneRowsRetained'           => true,
+			'likelyRemaining'           => $failed_likely || $missing_product_likely || $missing_attachment_likely || ! empty( $done['likelyRemaining'] ) || ! empty( $legacy_recovery['remaining'] ) || ( 'ok' === ( isset( $file_recovery['status'] ) ? $file_recovery['status'] : '' ) && empty( $file_recovery['cycleComplete'] ) ),
 		);
 	}
 

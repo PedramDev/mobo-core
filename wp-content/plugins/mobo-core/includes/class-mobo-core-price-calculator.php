@@ -64,7 +64,21 @@ class Mobo_Core_Price_Calculator {
 			return array(
 				'regular_price' => null,
 				'sale_price'    => '',
+				'error'         => '',
 			);
+		}
+
+		$normalized_price = $this->normalize_source_number( $price );
+		if ( null === $normalized_price || $normalized_price < 0 || $normalized_price > PHP_INT_MAX ) {
+			return $this->invalid_price_pair( 'API price is present but is not a valid numeric value.' );
+		}
+
+		$normalized_compare_price = null;
+		if ( null !== $compare_price && '' !== $compare_price ) {
+			$normalized_compare_price = $this->normalize_source_number( $compare_price );
+			if ( null === $normalized_compare_price || $normalized_compare_price < 0 || $normalized_compare_price > PHP_INT_MAX ) {
+				return $this->invalid_price_pair( 'API comparePrice is present but is not a valid numeric value.' );
+			}
 		}
 
 		$options = $this->rules->get_options();
@@ -73,12 +87,12 @@ class Mobo_Core_Price_Calculator {
 			? (string) $options['global_product_auto_compare_price']
 			: '0';
 
-		$base_price   = intval( $price );
+		$base_price   = intval( $normalized_price );
 		$regular_base = $base_price;
 		$sale_base    = '';
 
 		if ( null !== $compare_price && '' !== $compare_price && '1' === $auto_compare ) {
-			$regular_base = intval( $compare_price );
+			$regular_base = intval( $normalized_compare_price );
 			$sale_base    = $base_price;
 		}
 
@@ -408,6 +422,7 @@ class Mobo_Core_Price_Calculator {
 		$pair = array(
 			'regular_price' => null === $regular_price ? null : wc_format_decimal( $regular_price ),
 			'sale_price'    => '' === $sale_price ? '' : wc_format_decimal( $sale_price ),
+			'error'         => '',
 		);
 
 		/**
@@ -437,6 +452,64 @@ class Mobo_Core_Price_Calculator {
 		return array(
 			'regular_price' => array_key_exists( 'regular_price', $filtered_pair ) ? $filtered_pair['regular_price'] : $pair['regular_price'],
 			'sale_price'    => array_key_exists( 'sale_price', $filtered_pair ) ? $filtered_pair['sale_price'] : $pair['sale_price'],
+			'error'         => isset( $filtered_pair['error'] ) ? sanitize_text_field( (string) $filtered_pair['error'] ) : '',
+		);
+	}
+
+	/**
+	 * Normalize a source numeric field without allowing arbitrary text to become 0.
+	 *
+	 * @param mixed $value Source numeric value.
+	 * @return float|null
+	 */
+	private function normalize_source_number( $value ) {
+		if ( ! is_scalar( $value ) ) {
+			return null;
+		}
+
+		$raw = trim( (string) $value );
+		if ( '' === $raw ) {
+			return null;
+		}
+
+		// API numeric fields must be numbers, not human-formatted or partially numeric strings.
+		// wc_format_decimal() is intentionally not used as the first validator because
+		// it can strip arbitrary characters (for example, "12abc" -> "12").
+		$canonical = str_replace( array( "\xC2\xA0", ' ' ), '', $raw );
+
+		/*
+		 * Source prices are decimal values, never scientific notation. is_numeric()
+		 * accepts strings such as "1e999999"; passing those through
+		 * wc_format_decimal() can strip the exponent marker and silently turn a
+		 * malformed source value into an unrelated finite price. Validate the raw
+		 * grammar first, then normalize a single decimal comma when present.
+		 */
+		if ( 1 === preg_match( '/^[+-]?[0-9]+(?:\.[0-9]+)?$/D', $canonical ) ) {
+			$normalized = $canonical;
+		} elseif ( 1 === preg_match( '/^[+-]?[0-9]+(?:,[0-9]+)?$/D', $canonical ) ) {
+			// Accept a single decimal comma, but reject thousands/mixed separators.
+			$normalized = str_replace( ',', '.', $canonical );
+		} else {
+			return null;
+		}
+
+		if ( function_exists( 'wc_format_decimal' ) ) {
+			$normalized = wc_format_decimal( $normalized, false );
+		}
+		if ( '' === (string) $normalized || ! is_numeric( $normalized ) ) {
+			return null;
+		}
+
+		$number = (float) $normalized;
+		return is_finite( $number ) ? $number : null;
+	}
+
+	/** @return array */
+	private function invalid_price_pair( $message ) {
+		return array(
+			'regular_price' => null,
+			'sale_price'    => '',
+			'error'         => sanitize_text_field( (string) $message ),
 		);
 	}
 }

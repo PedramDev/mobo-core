@@ -480,9 +480,39 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_real_cron( $request ) {
-		$runner = new Mobo_Core_Cron_Runner();
+		$claim = class_exists( 'Mobo_Core_Self_Runner' )
+			? Mobo_Core_Self_Runner::claim_worker_request( '' )
+			: array( 'success' => true, 'token' => '' );
 
-		return rest_ensure_response( $runner->run( 'real-cron' ) );
+		if ( empty( $claim['success'] ) ) {
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					'status'  => isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked',
+					'message' => 'Another Mobo worker request is already active for this site.',
+				),
+				isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423
+			);
+		}
+
+		$token  = isset( $claim['token'] ) ? (string) $claim['token'] : '';
+		$runner = new Mobo_Core_Cron_Runner();
+		try {
+			$result = $runner->run( 'real-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $token ) );
+		} finally {
+			if ( '' !== $token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::release_worker_request( $token );
+			}
+		}
+
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			$pending = Mobo_Core_Self_Runner::consume_pending_dispatch();
+			if ( $pending || Mobo_Core_Self_Runner::should_continue_after_result( $result ) ) {
+				$result['continuationKick'] = Mobo_Core_Self_Runner::kick( 'cron-continuation', true );
+			}
+		}
+
+		return rest_ensure_response( $result );
 	}
 
 	/**
@@ -513,20 +543,45 @@ class Mobo_Core_Rest_Controller {
 	 */
 	public function run_self_worker( $request ) {
 		$source = sanitize_key( (string) $request->get_param( 'source' ) );
-
 		if ( '' === $source ) {
 			$source = 'self-worker';
 		}
 
+		$transferred = sanitize_text_field( (string) $request->get_header( 'x-mobo-dispatch-token' ) );
+		$claim = class_exists( 'Mobo_Core_Self_Runner' )
+			? Mobo_Core_Self_Runner::claim_worker_request( $transferred )
+			: array( 'success' => true, 'token' => '' );
+
+		if ( empty( $claim['success'] ) ) {
+			$status = isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked';
+			$http   = isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423;
+			return new WP_REST_Response(
+				array(
+					'success' => false,
+					'status'  => $status,
+					'message' => 409 === $http
+						? 'The transferred worker lease is stale or no longer owned by this request.'
+						: 'Another Mobo worker request is already active for this site.',
+				),
+				$http
+			);
+		}
+
+		$token  = isset( $claim['token'] ) ? (string) $claim['token'] : '';
 		$runner = new Mobo_Core_Cron_Runner();
-		$result = $runner->run( $source );
+		try {
+			$result = $runner->run( $source, false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $token ) );
+		} finally {
+			if ( '' !== $token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::release_worker_request( $token );
+			}
+		}
 
 		if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
-			/*
-			 * Continuation dispatch is centralized inside Mobo_Core_Cron_Runner so
-			 * direct PHP cron, /cron/run and the self worker behave identically and
-			 * cannot dispatch duplicate continuation requests.
-			 */
+			$pending = Mobo_Core_Self_Runner::consume_pending_dispatch();
+			if ( $pending || Mobo_Core_Self_Runner::should_continue_after_result( $result ) ) {
+				$result['continuationKick'] = Mobo_Core_Self_Runner::kick( 'worker-continuation', true );
+			}
 			Mobo_Core_Self_Runner::record_run_result( $result );
 		}
 
@@ -602,17 +657,33 @@ class Mobo_Core_Rest_Controller {
 			Mobo_Core_Settings::set_runtime_override( $key, $value );
 		}
 
+		$dispatch_claim = class_exists( 'Mobo_Core_Self_Runner' )
+			? Mobo_Core_Self_Runner::claim_worker_request( '' )
+			: array( 'success' => true, 'token' => '' );
+		$dispatch_token = ! empty( $dispatch_claim['success'] ) && isset( $dispatch_claim['token'] ) ? (string) $dispatch_claim['token'] : '';
+
 		try {
-			$runner = new Mobo_Core_Cron_Runner();
-			$work   = $runner->run(
-				'portal-heartbeat',
-				false,
-				array(
-					'maxTimeBudgetSeconds' => $heartbeat_budget,
-					'maxRounds'             => Mobo_Core_Settings::get_int( 'mobo_core_heartbeat_max_rounds', 2, 1, 10 ),
-					'productStepsPerRound'  => 1,
-				)
-			);
+			if ( empty( $dispatch_claim['success'] ) ) {
+				$work = array(
+					'success'    => false,
+					'status'     => isset( $dispatch_claim['status'] ) ? sanitize_key( (string) $dispatch_claim['status'] ) : 'dispatcher-locked',
+					'httpStatus' => isset( $dispatch_claim['httpStatus'] ) ? absint( $dispatch_claim['httpStatus'] ) : 423,
+					'message'    => 'Heartbeat skipped worker execution because another site worker owns the dispatcher.',
+				);
+			} else {
+				$runner = new Mobo_Core_Cron_Runner();
+				$work   = $runner->run(
+					'portal-heartbeat',
+					false,
+					array(
+						'maxTimeBudgetSeconds'    => $heartbeat_budget,
+						'maxRounds'                => Mobo_Core_Settings::get_int( 'mobo_core_heartbeat_max_rounds', 2, 1, 10 ),
+						'productStepsPerRound'     => 1,
+						'suppressContinuationKick' => true,
+						'dispatcherToken'          => $dispatch_token,
+					)
+				);
+			}
 		} catch ( Throwable $e ) {
 			$work = array(
 				'success'        => false,
@@ -621,8 +692,18 @@ class Mobo_Core_Rest_Controller {
 				'exceptionClass' => get_class( $e ),
 			);
 		} finally {
+			if ( '' !== $dispatch_token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::release_worker_request( $dispatch_token );
+			}
 			foreach ( array_keys( $overrides ) as $key ) {
 				Mobo_Core_Settings::clear_runtime_override( $key );
+			}
+		}
+
+		if ( ! empty( $dispatch_claim['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			$pending = Mobo_Core_Self_Runner::consume_pending_dispatch();
+			if ( $pending || Mobo_Core_Self_Runner::should_continue_after_result( $work ) ) {
+				$work['continuationKick'] = Mobo_Core_Self_Runner::kick( 'heartbeat-continuation', true );
 			}
 		}
 
@@ -786,46 +867,15 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function start_product_sync( $request ) {
-		$lock = Mobo_Core_Lock::acquire( 'manual_sync_start', 20 );
+		$params  = $request->get_json_params();
+		$sync_id = '';
 
-		if ( false === $lock ) {
-			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
-				return rest_ensure_response( Mobo_Core_Upgrade_Coordinator::paused_result( 'sync-start' ) );
-			}
-
-			return rest_ensure_response(
-				array(
-					'success' => false,
-				'status'  => 'locked',
-				'message' => 'Sync start is locked.',
-				)
-			);
+		if ( is_array( $params ) && isset( $params['syncId'] ) ) {
+			$sync_id = sanitize_text_field( (string) $params['syncId'] );
 		}
 
-		try {
-			$sync          = new Mobo_Core_Product_Sync();
-			$current_state = $sync->get_manual_sync_status();
-
-			if ( ! empty( $current_state['isRunning'] ) ) {
-				$result = array(
-					'success' => false,
-				'status'  => 'running',
-				'message' => 'Product sync is already running.',
-				'data'    => $current_state,
-				);
-			} else {
-				$params  = $request->get_json_params();
-				$sync_id = '';
-
-				if ( is_array( $params ) && isset( $params['syncId'] ) ) {
-					$sync_id = sanitize_text_field( (string) $params['syncId'] );
-				}
-
-				$result = $sync->start_manual_sync( $sync_id, 'external' );
-			}
-		} finally {
-			Mobo_Core_Lock::release( 'manual_sync_start', $lock );
-		}
+		$sync   = new Mobo_Core_Product_Sync();
+		$result = $sync->start_manual_sync( $sync_id, 'external' );
 
 		if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			$result['selfKick'] = Mobo_Core_Self_Runner::kick( 'sync-start', false );
@@ -833,6 +883,7 @@ class Mobo_Core_Rest_Controller {
 
 		return rest_ensure_response( $result );
 	}
+
 
 	/**
 	 * Run one product sync step.
@@ -843,52 +894,29 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_product_sync( $request ) {
-		$lock = Mobo_Core_Lock::acquire( 'manual_sync', 30 );
-
-		if ( false === $lock ) {
-			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
-				return rest_ensure_response( Mobo_Core_Upgrade_Coordinator::paused_result( 'sync-run' ) );
-			}
-
-			$sync = new Mobo_Core_Product_Sync();
-
-			return rest_ensure_response(
-				array(
-					'success' => false,
-				'status'  => 'locked',
-				'message' => 'Product sync is locked.',
-				'data'    => $sync->get_manual_sync_status(),
-				)
-			);
-		}
-
-		try {
-			$sync   = new Mobo_Core_Product_Sync();
-			$result = $sync->run_manual_sync_step();
-		} finally {
-			Mobo_Core_Lock::release( 'manual_sync', $lock );
-		}
+		$sync   = new Mobo_Core_Product_Sync();
+		$result = $sync->run_manual_sync_step();
 
 		return rest_ensure_response( $result );
 	}
 
+
 	/**
-	 * Get product sync status.
+	 * Return current product Sync/Repair status.
+	 *
+	 * This route has existed in the public contract for years; 10.33.38
+	 * registered the callback but accidentally omitted the method itself.
+	 * Keep the response as the status object at the root because external
+	 * runners poll isDone/isRunning directly.
 	 *
 	 * @param WP_REST_Request $request Request.
 	 * @return WP_REST_Response
 	 */
 	public function get_product_sync_status( $request ) {
 		$sync = new Mobo_Core_Product_Sync();
-
-		return rest_ensure_response(
-			array(
-				'success' => true,
-				'status'  => 'ok',
-				'data'    => $sync->get_manual_sync_status(),
-			)
-		);
+		return rest_ensure_response( $sync->get_manual_sync_status() );
 	}
+
 
 	/**
 	 * Cancel product sync.

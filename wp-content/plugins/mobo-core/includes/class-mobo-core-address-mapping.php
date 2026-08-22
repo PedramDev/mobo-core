@@ -111,51 +111,115 @@ class Mobo_Core_Address_Mapping {
 	public function sync_now( $source = 'manual', $force = true ) {
 		update_option( 'mobo_core_address_mapping_last_attempt_at', time(), false );
 
-		$api    = new Mobo_Core_API_Client();
-		$result = $api->get_address_mapping();
+		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'address_mapping_sync', 180 ) : 'legacy-unlocked';
+		if ( false === $lock_token ) {
+			$cached = $this->get_mapping();
+			if ( $this->mapping_is_complete( $cached ) ) {
+				return array(
+					'success' => true,
+					'status'  => 'busy-cache-kept',
+					'counts'  => $this->get_counts_from_mapping( $cached ),
+					'message' => 'Address mapping sync is already running; existing complete cache was kept.',
+				);
+			}
 
-		if ( is_wp_error( $result ) ) {
-			update_option( 'mobo_core_address_mapping_last_error', $result->get_error_message(), false );
 			return array(
 				'success' => false,
-				'status'  => 'failed',
-				'message' => $result->get_error_message(),
+				'status'  => 'busy',
+				'message' => 'Address mapping sync is already running and no complete cache is available.',
 			);
 		}
 
-		$normalized = $this->normalize_mapping_payload( $result );
+		try {
+			$api    = new Mobo_Core_API_Client();
+			$result = $api->get_address_mapping();
 
-		if ( empty( $normalized['countries'] ) || empty( $normalized['states'] ) || empty( $normalized['cities'] ) ) {
-			$message = 'MoboCore address mapping payload is empty or incomplete.';
-			update_option( 'mobo_core_address_mapping_last_error', $message, false );
+			if ( is_wp_error( $result ) ) {
+				update_option( 'mobo_core_address_mapping_last_error', $result->get_error_message(), false );
+				return array(
+					'success' => false,
+					'status'  => 'failed',
+					'message' => $result->get_error_message(),
+				);
+			}
+
+			$shape = $this->validate_mapping_payload_shape( $result );
+			if ( is_wp_error( $shape ) ) {
+				update_option( 'mobo_core_address_mapping_last_error', $shape->get_error_message(), false );
+				return array(
+					'success' => false,
+					'status'  => 'invalid',
+					'message' => $shape->get_error_message(),
+				);
+			}
+
+			$normalized = $this->normalize_mapping_payload( $result );
+			if ( ! $this->mapping_is_complete( $normalized ) || ! $this->mapping_references_are_valid( $normalized ) ) {
+				$message = 'MoboCore address mapping payload is empty, incomplete, or contains invalid parent references.';
+				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				return array(
+					'success' => false,
+					'status'  => 'invalid',
+					'message' => $message,
+					'counts'  => $this->get_counts_from_mapping( $normalized ),
+				);
+			}
+
+			$normalized['syncedAt'] = time();
+			$normalized['source']   = sanitize_key( (string) $source );
+
+			update_option( 'mobo_core_address_mapping_data', $normalized, false );
+			$stored_mapping = get_option( 'mobo_core_address_mapping_data', array() );
+			if ( ! is_array( $stored_mapping ) || $stored_mapping !== $normalized ) {
+				$message = 'Could not persist the Mobo address mapping snapshot.';
+				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				return array(
+					'success' => false,
+					'status'  => 'storage-failed',
+					'message' => $message,
+					'counts'  => $this->get_counts_from_mapping( $normalized ),
+				);
+			}
+
+			$city_assets = null;
+			if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
+				$generator   = new Mobo_Core_City_Assets();
+				$city_assets = $generator->generate( $normalized, $this->get_manual_mapping(), $source );
+			}
+
+			if ( is_wp_error( $city_assets ) ) {
+				$message = 'Address mapping synced, but Mobo city assets could not be generated: ' . $city_assets->get_error_message();
+				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				return array(
+					'success'    => false,
+					'status'     => 'mapping-ok-city-assets-failed',
+					'counts'     => $this->get_counts_from_mapping( $normalized ),
+					'cityAssets' => array( 'success' => false, 'message' => $city_assets->get_error_message() ),
+					'message'    => $message,
+				);
+			}
+
+			$success_at = time();
+			update_option( 'mobo_core_address_mapping_last_success_at', $success_at, false );
+			if ( absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ) !== $success_at ) {
+				$message = 'Address mapping was stored but its success checkpoint could not be persisted.';
+				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => $message, 'counts' => $this->get_counts_from_mapping( $normalized ) );
+			}
+			delete_option( 'mobo_core_address_mapping_last_error' );
+
 			return array(
-				'success' => false,
-				'status'  => 'invalid',
-				'message' => $message,
-				'counts'  => $this->get_counts_from_mapping( $normalized ),
+				'success'    => true,
+				'status'     => 'ok',
+				'counts'     => $this->get_counts_from_mapping( $normalized ),
+				'cityAssets' => $city_assets,
+				'message'    => 'Address mapping and Mobo city assets synced from MoboCore.',
 			);
+		} finally {
+			if ( 'legacy-unlocked' !== $lock_token && class_exists( 'Mobo_Core_Lock' ) ) {
+				Mobo_Core_Lock::release( 'address_mapping_sync', $lock_token );
+			}
 		}
-
-		$normalized['syncedAt'] = time();
-		$normalized['source']   = sanitize_key( (string) $source );
-
-		update_option( 'mobo_core_address_mapping_data', $normalized, false );
-		update_option( 'mobo_core_address_mapping_last_success_at', time(), false );
-		delete_option( 'mobo_core_address_mapping_last_error' );
-
-		$city_assets = null;
-		if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
-			$generator = new Mobo_Core_City_Assets();
-			$city_assets = $generator->generate( $normalized, $this->get_manual_mapping(), $source );
-		}
-
-		return array(
-			'success'    => ! is_wp_error( $city_assets ),
-			'status'     => is_wp_error( $city_assets ) ? 'mapping-ok-city-assets-failed' : 'ok',
-			'counts'     => $this->get_counts_from_mapping( $normalized ),
-			'cityAssets' => is_wp_error( $city_assets ) ? array( 'success' => false, 'message' => $city_assets->get_error_message() ) : $city_assets,
-			'message'    => is_wp_error( $city_assets ) ? 'Address mapping synced, but Mobo city assets could not be generated: ' . $city_assets->get_error_message() : 'Address mapping and Mobo city assets synced from MoboCore.',
-		);
 	}
 
 	/**
@@ -1780,6 +1844,94 @@ class Mobo_Core_Address_Mapping {
 	private function get_mapping() {
 		$mapping = get_option( 'mobo_core_address_mapping_data', array() );
 		return is_array( $mapping ) ? $mapping : array();
+	}
+
+	/**
+	 * Validate the authoritative location payload before replacing a good cache.
+	 *
+	 * @param mixed $payload Payload.
+	 * @return true|WP_Error
+	 */
+	private function validate_mapping_payload_shape( $payload ) {
+		if ( ! is_array( $payload ) ) {
+			return new WP_Error( 'mobo_core_address_mapping_invalid_payload', 'MoboCore address mapping payload is not an object/array.' );
+		}
+
+		if ( array_key_exists( 'data', $payload ) ) {
+			if ( ! is_array( $payload['data'] ) ) {
+				return new WP_Error( 'mobo_core_address_mapping_invalid_data', 'MoboCore address mapping data field is malformed.' );
+			}
+			$payload = $payload['data'];
+		}
+
+		$seen = array( 'countries' => array(), 'states' => array(), 'cities' => array() );
+		foreach ( array( 'countries', 'states', 'cities' ) as $type ) {
+			if ( ! array_key_exists( $type, $payload ) || ! is_array( $payload[ $type ] ) ) {
+				return new WP_Error( 'mobo_core_address_mapping_missing_collection', 'MoboCore address mapping is missing a required location collection: ' . $type );
+			}
+
+			foreach ( $payload[ $type ] as $row ) {
+				if ( ! is_array( $row ) ) {
+					return new WP_Error( 'mobo_core_address_mapping_invalid_row', 'MoboCore address mapping contains a malformed ' . $type . ' row.' );
+				}
+				$id   = $this->first_int( $row, array( 'id', 'moboId', 'mobo_id', 'value' ) );
+				$name = $this->first_string( $row, array( 'name', 'title', 'label', 'text' ) );
+				if ( $id <= 0 || '' === $name || isset( $seen[ $type ][ $id ] ) ) {
+					return new WP_Error( 'mobo_core_address_mapping_invalid_identity', 'MoboCore address mapping contains a missing or duplicate ' . $type . ' identity.' );
+				}
+				$seen[ $type ][ $id ] = true;
+				if ( 'states' === $type && $this->first_int( $row, array( 'countryId', 'country_id', 'parentId', 'parent_id' ) ) <= 0 ) {
+					return new WP_Error( 'mobo_core_address_mapping_invalid_state_parent', 'MoboCore address mapping contains a state without a country parent.' );
+				}
+				if ( 'cities' === $type && $this->first_int( $row, array( 'stateId', 'state_id', 'parentId', 'parent_id' ) ) <= 0 ) {
+					return new WP_Error( 'mobo_core_address_mapping_invalid_city_parent', 'MoboCore address mapping contains a city without a state parent.' );
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether a normalized cache is complete enough to replace the active cache.
+	 *
+	 * @param array $mapping Mapping.
+	 * @return bool
+	 */
+	private function mapping_is_complete( $mapping ) {
+		return is_array( $mapping )
+			&& ! empty( $mapping['countries'] )
+			&& ! empty( $mapping['states'] )
+			&& ! empty( $mapping['cities'] );
+	}
+
+	/**
+	 * Verify state/city parent references against the same normalized snapshot.
+	 *
+	 * @param array $mapping Mapping.
+	 * @return bool
+	 */
+	private function mapping_references_are_valid( $mapping ) {
+		$country_ids = array();
+		$state_ids   = array();
+		foreach ( isset( $mapping['countries'] ) && is_array( $mapping['countries'] ) ? $mapping['countries'] : array() as $row ) {
+			$country_ids[ absint( isset( $row['id'] ) ? $row['id'] : 0 ) ] = true;
+		}
+		foreach ( isset( $mapping['states'] ) && is_array( $mapping['states'] ) ? $mapping['states'] : array() as $row ) {
+			$id        = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+			$parent_id = absint( isset( $row['countryId'] ) ? $row['countryId'] : 0 );
+			if ( $id <= 0 || $parent_id <= 0 || ! isset( $country_ids[ $parent_id ] ) ) {
+				return false;
+			}
+			$state_ids[ $id ] = true;
+		}
+		foreach ( isset( $mapping['cities'] ) && is_array( $mapping['cities'] ) ? $mapping['cities'] : array() as $row ) {
+			$parent_id = absint( isset( $row['stateId'] ) ? $row['stateId'] : 0 );
+			if ( $parent_id <= 0 || ! isset( $state_ids[ $parent_id ] ) ) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private function normalize_mapping_payload( $payload ) {

@@ -150,10 +150,39 @@ function mobo_core_cron_run() {
 		mobo_core_cron_emit_json( array( 'success' => false, 'status' => 'plugin-not-loaded', 'message' => 'Mobo Core is inactive or unavailable.' ), 1, '', $base_ob_level, 503 );
 	}
 
+	$dispatch_claim = class_exists( 'Mobo_Core_Self_Runner' )
+		? Mobo_Core_Self_Runner::claim_worker_request( '' )
+		: array( 'success' => true, 'token' => '' );
+	if ( empty( $dispatch_claim['success'] ) ) {
+		$http = isset( $dispatch_claim['httpStatus'] ) ? absint( $dispatch_claim['httpStatus'] ) : 423;
+		mobo_core_cron_emit_json(
+			array(
+				'success' => false,
+				'status'  => isset( $dispatch_claim['status'] ) ? sanitize_key( (string) $dispatch_claim['status'] ) : 'dispatcher-locked',
+				'message' => 'Another Mobo worker request is already active for this site.',
+			),
+			0,
+			'',
+			$base_ob_level,
+			$http
+		);
+	}
+
+	$dispatch_token = isset( $dispatch_claim['token'] ) ? (string) $dispatch_claim['token'] : '';
 	$runner = new Mobo_Core_Cron_Runner();
-	$result = $runner->run( 'cpanel-local-php-cron' );
+	try {
+		$result = $runner->run( 'cpanel-local-php-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $dispatch_token ) );
+	} finally {
+		if ( '' !== $dispatch_token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			Mobo_Core_Self_Runner::release_worker_request( $dispatch_token );
+		}
+	}
 
 	if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+		$pending = Mobo_Core_Self_Runner::consume_pending_dispatch();
+		if ( $pending || Mobo_Core_Self_Runner::should_continue_after_result( $result ) ) {
+			$result['continuationKick'] = Mobo_Core_Self_Runner::kick( 'php-cron-continuation', true );
+		}
 		try {
 			Mobo_Core_Self_Runner::record_run_result( $result );
 		} catch ( Throwable $exception ) {

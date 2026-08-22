@@ -491,6 +491,24 @@ class Mobo_Core_Settings {
 	}
 
 	/**
+	 * Normalize an opaque credential without text sanitizers that alter valid bytes.
+	 *
+	 * @param mixed $value Secret value.
+	 * @param int   $max_length Maximum byte length.
+	 * @return string
+	 */
+	public static function normalize_opaque_secret( $value, $max_length = 4096 ) {
+		if ( is_array( $value ) || is_object( $value ) || is_resource( $value ) ) {
+			return '';
+		}
+		$value = (string) $value;
+		if ( false !== strpos( $value, "\0" ) || strlen( $value ) > max( 1, absint( $max_length ) ) ) {
+			return '';
+		}
+		return $value;
+	}
+
+	/**
 	 * Determine whether a security code is a safe visible-ASCII header value.
 	 *
 	 * Symbols such as @, #, $, %, &, *, _, [, ] and - are valid. Whitespace,
@@ -566,13 +584,20 @@ class Mobo_Core_Settings {
 		update_option( 'mobo_core_health_report_enabled', '0', false );
 		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
 		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
+		$previous_mobo_username = (string) get_option( 'mobo_core_checkout_mobo_username', '' );
 		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
+		$current_mobo_username = (string) get_option( 'mobo_core_checkout_mobo_username', '' );
+		if ( ! hash_equals( $previous_mobo_username, $current_mobo_username ) ) {
+			/* Username-only account switches must not keep a cookie authenticated for
+			 * the previous Mobo account. The reset is applied under the shared-cart lock. */
+			update_option( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
+		}
 		if ( isset( $post['mobo_core_checkout_mobo_password'] ) ) {
-			$password = sanitize_text_field( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
+			$password = self::normalize_opaque_secret( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
 
 			if ( '' !== $password ) {
 				update_option( 'mobo_core_checkout_mobo_password', $password, false );
-				delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
+				update_option( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
 			}
 		}
 

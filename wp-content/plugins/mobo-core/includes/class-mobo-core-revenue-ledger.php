@@ -25,6 +25,72 @@ class Mobo_Core_Revenue_Ledger {
 	const OPTION_REVISION = 'mobo_core_revenue_ledger_revision';
 	const OPTION_CACHE    = 'mobo_core_revenue_summary_cache';
 
+	/**
+	 * Internal line-item metadata must remain stored for immutable revenue
+	 * calculations, but it must never leak into order screens, customer order
+	 * details, emails, or invoice plugins that use WooCommerce formatted meta.
+	 *
+	 * @return string[]
+	 */
+	public static function get_hidden_item_meta_keys() {
+		return array(
+			self::ITEM_META_SOURCE_UNIT_COST,
+			self::ITEM_META_SOURCE_SNAPSHOT_AT,
+			'_mobo_identity_captured',
+			'_mobo_identity_is_mobo',
+			'_mobo_identity_product_guid',
+			'_mobo_identity_variant_guid',
+			'_mobo_identity_portal_product_id',
+			'_mobo_identity_portal_variant_id',
+			'_mobo_identity_sku',
+			'_mobo_identity_captured_at',
+		);
+	}
+
+	/**
+	 * Hide the revenue snapshot fields in WooCommerce's admin order-item meta UI.
+	 * Raw metadata remains available to the ledger through WC_Order_Item::get_meta().
+	 *
+	 * @param string[] $hidden_meta Existing hidden item-meta keys.
+	 * @return string[]
+	 */
+	public static function hide_internal_order_item_meta( $hidden_meta ) {
+		$hidden_meta = is_array( $hidden_meta ) ? $hidden_meta : array();
+		return array_values( array_unique( array_merge( $hidden_meta, self::get_hidden_item_meta_keys() ) ) );
+	}
+
+	/**
+	 * Remove internal revenue fields from display-oriented formatted item meta.
+	 * This covers storefront order details, emails, and invoice/PDF integrations
+	 * that consume WC_Order_Item::get_formatted_meta_data().
+	 *
+	 * @param array         $formatted_meta Formatted WC_Meta_Data objects.
+	 * @param WC_Order_Item $item           Order item being formatted.
+	 * @return array
+	 */
+	public static function filter_internal_formatted_item_meta( $formatted_meta, $item = null ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.FoundAfterLastUsed -- Required by WooCommerce filter signature.
+		if ( ! is_array( $formatted_meta ) || empty( $formatted_meta ) ) {
+			return $formatted_meta;
+		}
+
+		$hidden = array_fill_keys( self::get_hidden_item_meta_keys(), true );
+
+		foreach ( $formatted_meta as $index => $meta ) {
+			$key = '';
+			if ( is_object( $meta ) && isset( $meta->key ) ) {
+				$key = (string) $meta->key;
+			} elseif ( is_array( $meta ) && isset( $meta['key'] ) ) {
+				$key = (string) $meta['key'];
+			}
+
+			if ( '' !== $key && isset( $hidden[ $key ] ) ) {
+				unset( $formatted_meta[ $index ] );
+			}
+		}
+
+		return array_values( $formatted_meta );
+	}
+
 	public function capture_checkout_line_item_source_cost( $item, $cart_item_key, $values, $order ) {
 		if ( ! $item instanceof WC_Order_Item_Product ) {
 			return;
@@ -91,13 +157,22 @@ class Mobo_Core_Revenue_Ledger {
 			}
 
 			$product = $item->get_product();
-			if ( ! $product instanceof WC_Product || ! $this->is_mobo_product( $product ) ) {
+			$identity_captured = 'yes' === (string) $item->get_meta( '_mobo_identity_captured', true );
+			$is_mobo_item = $identity_captured
+				? 'yes' === (string) $item->get_meta( '_mobo_identity_is_mobo', true )
+				: ( $product instanceof WC_Product && $this->is_mobo_product( $product ) );
+			if ( ! $is_mobo_item ) {
 				continue;
 			}
 
 			$result['moboItems']++;
 
 			if ( null !== $this->get_item_cost_snapshot( $item ) ) {
+				continue;
+			}
+
+			if ( ! $product instanceof WC_Product ) {
+				$result['missing']++;
 				continue;
 			}
 
@@ -113,7 +188,17 @@ class Mobo_Core_Revenue_Ledger {
 			}
 
 			$this->persist_item_cost_snapshot( $item, $cost );
-			$item->save();
+			$item_id = absint( $item->save() );
+			$stored_cost = $item_id > 0 && function_exists( 'wc_get_order_item_meta' )
+				? wc_get_order_item_meta( $item_id, self::ITEM_META_SOURCE_UNIT_COST, true )
+				: '';
+			$stored_at = $item_id > 0 && function_exists( 'wc_get_order_item_meta' )
+				? wc_get_order_item_meta( $item_id, self::ITEM_META_SOURCE_SNAPSHOT_AT, true )
+				: '';
+			if ( $item_id <= 0 || '' === (string) $stored_cost || ! is_numeric( $stored_cost ) || absint( $stored_at ) <= 0 ) {
+				$result['missing']++;
+				continue;
+			}
 			$result['snapshotted']++;
 			$changed = true;
 		}
@@ -189,7 +274,11 @@ class Mobo_Core_Revenue_Ledger {
 				}
 
 				$product = $item->get_product();
-				if ( ! $product instanceof WC_Product || ! $this->is_mobo_product( $product ) ) {
+				$identity_captured = 'yes' === (string) $item->get_meta( '_mobo_identity_captured', true );
+				$is_mobo_item = $identity_captured
+					? 'yes' === (string) $item->get_meta( '_mobo_identity_is_mobo', true )
+					: ( $product instanceof WC_Product && $this->is_mobo_product( $product ) );
+				if ( ! $is_mobo_item ) {
 					continue;
 				}
 
@@ -234,12 +323,26 @@ class Mobo_Core_Revenue_Ledger {
 			$order->update_meta_data( self::META_LEDGER_VERSION, (string) self::LEDGER_VERSION );
 			$order->update_meta_data( self::META_LEDGER_RECORD, $record );
 			$order->update_meta_data( self::META_CALCULATED_AT, $calculated_at );
-			$order->save();
+			$saved_order_id = absint( $order->save() );
+			if ( $saved_order_id !== $order_id ) {
+				return new WP_Error( 'mobo_core_revenue_ledger_persist_failed', 'Revenue ledger could not be persisted on the WooCommerce order.' );
+			}
+
+			$fresh_order = wc_get_order( $order_id );
+			$fresh_record = $fresh_order instanceof WC_Order ? $fresh_order->get_meta( self::META_LEDGER_RECORD, true ) : null;
+			if ( ! $fresh_order instanceof WC_Order
+				|| ! is_array( $fresh_record )
+				|| absint( isset( $fresh_record['orderId'] ) ? $fresh_record['orderId'] : 0 ) !== $order_id
+				|| absint( $fresh_order->get_meta( self::META_LEDGER_VERSION, true ) ) !== self::LEDGER_VERSION
+				|| absint( $fresh_order->get_meta( self::META_CALCULATED_AT, true ) ) !== $calculated_at
+			) {
+				return new WP_Error( 'mobo_core_revenue_ledger_postcondition_failed', 'Revenue ledger save failed its durable post-write verification.' );
+			}
 
 			$this->invalidate_summary_cache();
-			do_action( 'mobo_core_revenue_ledger_recorded', $order_id, $record );
+			do_action( 'mobo_core_revenue_ledger_recorded', $order_id, $fresh_record );
 
-			return $record;
+			return $fresh_record;
 		} finally {
 			if ( class_exists( 'Mobo_Core_Lock' ) && false !== $lock ) {
 				Mobo_Core_Lock::release( 'revenue_order_' . $order_id, $lock );

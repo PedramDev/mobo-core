@@ -75,6 +75,7 @@ final class Mobo_Core_Parent_Finalize_Queue {
 			}
 
 			self::write_queue( $queue );
+			update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
 
 			return array(
 				'success'      => true,
@@ -105,6 +106,7 @@ final class Mobo_Core_Parent_Finalize_Queue {
 			'finalized'    => 0,
 			'dropped'      => 0,
 			'failed'       => 0,
+			'deferred'     => 0,
 			'remaining'    => false,
 			'remainingDue' => false,
 			'pendingCount' => 0,
@@ -118,82 +120,130 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		}
 
 		try {
-			$queue = self::read_queue();
-			if ( empty( $queue ) ) {
-				return $result;
-			}
-
-			/* Oldest parents first, while repeated mutations remain coalesced by ID. */
-			uasort(
-				$queue,
-				static function ( $a, $b ) {
-					return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
-				}
-			);
-
-			foreach ( $queue as $key => $item ) {
-				if ( $result['processed'] >= $limit || microtime( true ) >= ( $deadline - 0.1 ) ) {
+			while ( $result['processed'] < $limit && microtime( true ) < ( $deadline - 0.1 ) ) {
+				$queue = self::read_queue();
+				if ( empty( $queue ) ) {
 					break;
 				}
 
-				$next_attempt_at = absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 );
-				if ( $next_attempt_at > time() ) {
-					continue;
+				/* Oldest due parent first; live claims are not due. */
+				$due = array();
+				$now = time();
+				foreach ( $queue as $key => $item ) {
+					if ( self::item_is_due( $item, $now ) ) {
+						$due[ $key ] = $item;
+					}
+				}
+				if ( empty( $due ) ) {
+					break;
 				}
 
+				uasort(
+					$due,
+					static function ( $a, $b ) {
+						return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
+					}
+				);
+
+				$key        = (string) array_key_first( $due );
+				$item       = $due[ $key ];
 				$product_id = absint( isset( $item['productId'] ) ? $item['productId'] : 0 );
-				$result['processed']++;
 
 				if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
 					unset( $queue[ $key ] );
+					self::write_queue( $queue );
+					$result['processed']++;
 					$result['dropped']++;
 					continue;
 				}
 
+				$claim_token = wp_generate_uuid4();
+				$queue[ $key ]['processingToken'] = $claim_token;
+				$queue[ $key ]['processingUntil'] = time() + 120;
+				$queue[ $key ]['updatedAt']       = time();
+				self::write_queue( $queue );
+
+				/*
+				 * Do the potentially expensive WC variable sync with the queue mutex
+				 * released. enqueue() can therefore record a newer product mutation.
+				 */
+				self::release_lock( $lock );
+				$lock = false;
+				$failure = null;
+
 				try {
 					$product = wc_get_product( $product_id );
 					if ( ! $product instanceof WC_Product ) {
-						unset( $queue[ $key ] );
-						$result['dropped']++;
-						continue;
-					}
-
-					$has_children = method_exists( $product, 'get_children' ) && ! empty( $product->get_children() );
-					$finalize_callback = static function () use ( $product_id, $product, $has_children ) {
-						if ( is_callable( array( 'WC_Product_Variable', 'sync' ) ) && ( $product instanceof WC_Product_Variable || $has_children ) ) {
-							WC_Product_Variable::sync( $product_id );
-						}
-						delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
-						wc_delete_product_transients( $product_id );
-					};
-
-					if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
-						Mobo_Core_Cache_Mutation_Guard::run( $finalize_callback, 'variant-parent-finalize' );
+						$failure = new RuntimeException( 'WooCommerce product could not be loaded.' );
 					} else {
-						call_user_func( $finalize_callback );
-					}
+						$has_children = method_exists( $product, 'get_children' ) && ! empty( $product->get_children() );
+						$finalize_callback = static function () use ( $product_id, $product, $has_children ) {
+							if ( is_callable( array( 'WC_Product_Variable', 'sync' ) ) && ( $product instanceof WC_Product_Variable || $has_children ) ) {
+								WC_Product_Variable::sync( $product_id );
+							}
+							delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
+							wc_delete_product_transients( $product_id );
+						};
 
-					if ( class_exists( 'Mobo_Core_Cache_Purger' ) ) {
-						if ( method_exists( 'Mobo_Core_Cache_Purger', 'unsuppress_product_for_request' ) ) {
-							Mobo_Core_Cache_Purger::unsuppress_product_for_request( $product_id );
+						if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+							Mobo_Core_Cache_Mutation_Guard::run( $finalize_callback, 'variant-parent-finalize' );
+						} else {
+							call_user_func( $finalize_callback );
 						}
-						Mobo_Core_Cache_Purger::queue_product( $product_id, 'variant-delta-converged' );
-					}
 
-					unset( $queue[ $key ] );
-					$result['finalized']++;
+						if ( class_exists( 'Mobo_Core_Cache_Purger' ) ) {
+							if ( method_exists( 'Mobo_Core_Cache_Purger', 'unsuppress_product_for_request' ) ) {
+								Mobo_Core_Cache_Purger::unsuppress_product_for_request( $product_id );
+							}
+							Mobo_Core_Cache_Purger::queue_product( $product_id, 'variant-delta-converged' );
+						}
+					}
 				} catch ( Throwable $e ) {
-					$result['failed']++;
-					$attempts = 1 + absint( isset( $item['attempts'] ) ? $item['attempts'] : 0 );
-					$delay    = min( 600, 30 * (int) pow( 2, min( 4, $attempts - 1 ) ) );
-					$queue[ $key ]['attempts']      = $attempts;
-					$queue[ $key ]['nextAttemptAt'] = time() + $delay;
-					$queue[ $key ]['updatedAt']     = time();
-					$queue[ $key ]['lastError']     = substr( sanitize_text_field( $e->getMessage() ), 0, 500 );
+					$failure = $e;
 				}
+				$result['processed']++;
+
+				$lock = self::acquire_lock();
+				if ( false === $lock ) {
+					/* The persisted claim expires and becomes retryable after a crash/lock miss. */
+					update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+					$result['success']   = false;
+					$result['status']    = 'commit-lock-lost';
+					$result['remaining'] = true;
+					return $result;
+				}
+
+				$queue   = self::read_queue();
+				$current = isset( $queue[ $key ] ) && is_array( $queue[ $key ] ) ? $queue[ $key ] : array();
+				$current_token = isset( $current['processingToken'] ) ? (string) $current['processingToken'] : '';
+
+				if ( '' === $current_token || ! hash_equals( $claim_token, $current_token ) ) {
+					/* A newer enqueue superseded this finalization; preserve its pending marker. */
+					update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+					$result['deferred']++;
+					continue;
+				}
+
+				if ( null === $failure ) {
+					unset( $queue[ $key ] );
+					self::write_queue( $queue );
+					$result['finalized']++;
+					continue;
+				}
+
+				$result['failed']++;
+				$attempts = 1 + absint( isset( $current['attempts'] ) ? $current['attempts'] : 0 );
+				$delay    = min( 600, 30 * (int) pow( 2, min( 4, $attempts - 1 ) ) );
+				$queue[ $key ]['attempts']      = $attempts;
+				$queue[ $key ]['nextAttemptAt'] = time() + $delay;
+				$queue[ $key ]['updatedAt']     = time();
+				$queue[ $key ]['lastError']     = substr( sanitize_text_field( $failure->getMessage() ), 0, 500 );
+				unset( $queue[ $key ]['processingToken'], $queue[ $key ]['processingUntil'] );
+				update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+				self::write_queue( $queue );
 			}
 
-			self::write_queue( $queue );
+			$queue = self::read_queue();
 			$result['pendingCount'] = count( $queue );
 			$result['remaining']    = ! empty( $queue );
 			$result['remainingDue'] = self::queue_has_due_items( $queue );
@@ -228,7 +278,7 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		$oldest_at = 0;
 		$now       = time();
 		foreach ( $queue as $item ) {
-			if ( ! is_array( $item ) || absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= $now ) {
+			if ( self::item_is_due( $item, $now ) ) {
 				$due++;
 			}
 			$queued_at = is_array( $item ) ? absint( isset( $item['queuedAt'] ) ? $item['queuedAt'] : 0 ) : 0;
@@ -257,11 +307,42 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		}
 		$now = time();
 		foreach ( $queue as $item ) {
-			if ( ! is_array( $item ) || absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= $now ) {
+			if ( self::item_is_due( $item, $now ) ) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+
+	/**
+	 * Whether a parent queue item has a live processing claim.
+	 *
+	 * @param array $item Queue item.
+	 * @param int   $now Current epoch.
+	 * @return bool
+	 */
+	private static function item_is_actively_processing( $item, $now ) {
+		if ( ! is_array( $item ) ) {
+			return false;
+		}
+		$token = isset( $item['processingToken'] ) ? trim( (string) $item['processingToken'] ) : '';
+		$until = absint( isset( $item['processingUntil'] ) ? $item['processingUntil'] : 0 );
+		return '' !== $token && $until > absint( $now );
+	}
+
+	/**
+	 * Whether a parent item can be claimed now.
+	 *
+	 * @param array $item Queue item.
+	 * @param int   $now Current epoch.
+	 * @return bool
+	 */
+	private static function item_is_due( $item, $now ) {
+		if ( ! is_array( $item ) || self::item_is_actively_processing( $item, $now ) ) {
+			return false;
+		}
+		return absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= absint( $now );
 	}
 
 	private static function read_queue() {

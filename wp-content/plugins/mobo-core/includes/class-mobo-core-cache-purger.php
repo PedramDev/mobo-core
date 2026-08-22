@@ -561,23 +561,34 @@ final class Mobo_Core_Cache_Purger {
 	 */
 	public static function handle_archive_interval_changed( $minutes ) {
 		$minutes = self::sanitize_archive_interval( $minutes );
-		if ( $minutes <= 0 ) {
-			delete_option( self::OPTION_ARCHIVE_QUEUE );
+		$lock    = self::acquire_archive_queue_lock();
+		if ( false === $lock ) {
+			/* The setting itself is already durable; the next queue pass will reconcile it. */
 			return;
 		}
 
-		$queue = self::read_archive_queue();
-		if ( empty( $queue['urls'] ) ) {
-			return;
-		}
+		try {
+			if ( $minutes <= 0 ) {
+				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				return;
+			}
 
-		$now          = time();
-		$new_due      = $now + ( $minutes * MINUTE_IN_SECONDS );
-		$current_due  = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
-		$queue['dueAt'] = $current_due > 0 ? min( $current_due, $new_due ) : $new_due;
-		$queue['intervalMinutes'] = $minutes;
-		$queue['updatedAt']       = $now;
-		self::write_archive_queue( $queue );
+			$queue = self::read_archive_queue();
+			if ( empty( $queue['urls'] ) ) {
+				return;
+			}
+
+			$now            = time();
+			$new_due        = $now + ( $minutes * MINUTE_IN_SECONDS );
+			$current_due    = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
+			$queue['dueAt'] = $current_due > 0 ? min( $current_due, $new_due ) : $new_due;
+			$queue['intervalMinutes'] = $minutes;
+			$queue['updatedAt']       = $now;
+			unset( $queue['processingToken'], $queue['processingUntil'] );
+			self::write_archive_queue( $queue );
+		} finally {
+			self::release_archive_queue_lock( $lock );
+		}
 	}
 
 	/**
@@ -605,21 +616,14 @@ final class Mobo_Core_Cache_Purger {
 		}
 
 		$due_at = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
-		if ( $due_at <= 0 ) {
-			$due_at = $now + ( $interval * MINUTE_IN_SECONDS );
-			$queue['dueAt'] = $due_at;
-			$queue['intervalMinutes'] = $interval;
-			self::write_archive_queue( $queue );
-		}
-
-		if ( $now < $due_at ) {
+		if ( $due_at > 0 && $now < $due_at ) {
 			return array(
-				'success'      => true,
-				'status'       => 'waiting',
-				'processed'    => false,
-				'urlCount'     => count( $queue['urls'] ),
-				'productCount' => count( $queue['productIds'] ),
-				'dueAt'        => $due_at,
+				'success'         => true,
+				'status'          => 'waiting',
+				'processed'       => false,
+				'urlCount'        => count( $queue['urls'] ),
+				'productCount'    => count( $queue['productIds'] ),
+				'dueAt'           => $due_at,
 				'secondsUntilDue' => max( 0, $due_at - $now ),
 			);
 		}
@@ -636,26 +640,75 @@ final class Mobo_Core_Cache_Purger {
 			);
 		}
 
-		$started = microtime( true );
+		$started          = microtime( true );
 		$integration_data = array();
 		$overall_status   = 'failed';
 		$last_error       = '';
 		$urls             = array();
 		$product_ids      = array();
 		$reasons          = array();
+		$claim_token      = '';
 
 		try {
-			/* Re-read after acquiring the lock because another runner may have completed it. */
+			/* Re-read after acquiring the mutex; another request may have changed the generation. */
 			$queue = self::read_archive_queue();
+			$now   = time();
 			$due_at = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
-			if ( empty( $queue['urls'] ) || ( $due_at > 0 && time() < $due_at ) ) {
-				$overall_status = 'success';
+			if ( empty( $queue['urls'] ) ) {
+				self::release_archive_queue_lock( $lock );
+				$lock = false;
 				return array( 'success' => true, 'status' => 'not-due-after-lock', 'processed' => false, 'urlCount' => 0, 'productCount' => 0, 'dueAt' => $due_at );
+			}
+			if ( $due_at <= 0 ) {
+				$due_at = $now + ( $interval * MINUTE_IN_SECONDS );
+				$queue['dueAt']           = $due_at;
+				$queue['intervalMinutes'] = $interval;
+				$queue['updatedAt']       = $now;
+				self::write_archive_queue( $queue );
+				self::release_archive_queue_lock( $lock );
+				$lock = false;
+				return array( 'success' => true, 'status' => 'waiting', 'processed' => false, 'urlCount' => count( $queue['urls'] ), 'productCount' => count( $queue['productIds'] ), 'dueAt' => $due_at );
+			}
+			if ( $now < $due_at ) {
+				self::release_archive_queue_lock( $lock );
+				$lock = false;
+				return array( 'success' => true, 'status' => 'not-due-after-lock', 'processed' => false, 'urlCount' => count( $queue['urls'] ), 'productCount' => count( $queue['productIds'] ), 'dueAt' => $due_at );
+			}
+
+			$processing_token = isset( $queue['processingToken'] ) ? trim( (string) $queue['processingToken'] ) : '';
+			$processing_until = absint( isset( $queue['processingUntil'] ) ? $queue['processingUntil'] : 0 );
+			if ( '' !== $processing_token && $processing_until > $now ) {
+				self::release_archive_queue_lock( $lock );
+				$lock = false;
+				return array(
+					'success'      => true,
+					'status'       => 'processing',
+					'processed'    => false,
+					'urlCount'     => count( $queue['urls'] ),
+					'productCount' => count( $queue['productIds'] ),
+					'dueAt'        => $due_at,
+				);
 			}
 
 			$urls        = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $queue['urls'] ) ) ) );
 			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', $queue['productIds'] ) ) ) );
 			$reasons     = array_values( array_unique( array_filter( array_map( 'sanitize_key', $queue['reasons'] ) ) ) );
+			if ( empty( $urls ) ) {
+				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				self::release_archive_queue_lock( $lock );
+				$lock = false;
+				return array( 'success' => true, 'status' => 'empty-normalized', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
+			}
+
+			$claim_token = wp_generate_uuid4();
+			$queue['processingToken'] = $claim_token;
+			$queue['processingUntil'] = time() + 180;
+			$queue['updatedAt']       = time();
+			self::write_archive_queue( $queue );
+
+			/* Third-party purge APIs/hooks may be slow. Never hold the queue mutex here. */
+			self::release_archive_queue_lock( $lock );
+			$lock = false;
 
 			$inventory = self::get_current_integration_inventory();
 			$integration_data['wpRocket'] = self::run_integration(
@@ -712,47 +765,73 @@ final class Mobo_Core_Cache_Purger {
 
 			$overall_status = self::resolve_overall_status( $integration_data );
 			$last_error     = self::resolve_last_integration_error( $integration_data );
-
-			if ( 'failed' !== $overall_status && 'partial' !== $overall_status ) {
-				delete_option( self::OPTION_ARCHIVE_QUEUE );
-			} else {
-				/* Retry failures on the next normal batching window, never in a tight loop. */
-				$queue['dueAt']           = time() + ( $interval * MINUTE_IN_SECONDS );
-				$queue['updatedAt']       = time();
-				$queue['attempts']        = isset( $queue['attempts'] ) ? absint( $queue['attempts'] ) + 1 : 1;
-				$queue['intervalMinutes'] = $interval;
-				self::write_archive_queue( $queue );
-			}
 		} catch ( Throwable $e ) {
 			$last_error     = self::sanitize_error( $e->getMessage() );
 			$overall_status = 'failed';
-			if ( ! empty( $queue['urls'] ) ) {
-				$queue['dueAt']     = time() + ( $interval * MINUTE_IN_SECONDS );
-				$queue['updatedAt'] = time();
-				self::write_archive_queue( $queue );
-			}
 			self::log_warning( 'Deferred archive cache purge failed: ' . $last_error, array( 'integration' => 'mobo-core-archive-purger' ) );
-		} finally {
+		}
+
+		/* Re-enter the short critical section only to commit the claimed generation. */
+		if ( false === $lock ) {
+			$lock = self::acquire_archive_queue_lock();
+		}
+		if ( false === $lock ) {
 			$record = array(
-				'schemaVersion'                => self::ARCHIVE_QUEUE_SCHEMA_VERSION,
-				'pluginVersion'                => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
-				'source'                       => $source,
-				'status'                       => $overall_status,
-				'attemptedAt'                  => $now,
-				'completedAt'                  => time(),
-				'intervalMinutes'              => $interval,
-				'urlCount'                     => count( $urls ),
-				'productCount'                 => count( $product_ids ),
-				'durationMs'                   => self::elapsed_ms( $started ),
-				'lastError'                    => $last_error,
-				'integrations'                 => $integration_data,
+				'schemaVersion'   => self::ARCHIVE_QUEUE_SCHEMA_VERSION,
+				'pluginVersion'   => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+				'source'          => $source,
+				'status'          => 'commit-lock-lost',
+				'attemptedAt'     => $now,
+				'completedAt'     => time(),
+				'intervalMinutes' => $interval,
+				'urlCount'        => count( $urls ),
+				'productCount'    => count( $product_ids ),
+				'durationMs'      => self::elapsed_ms( $started ),
+				'lastError'       => $last_error,
+				'integrations'    => $integration_data,
 			);
 			update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false );
+			return array( 'success' => false, 'status' => 'commit-lock-lost', 'processed' => true, 'urlCount' => count( $urls ), 'productCount' => count( $product_ids ), 'lastError' => $last_error );
+		}
+
+		try {
+			$current       = self::read_archive_queue();
+			$current_token = isset( $current['processingToken'] ) ? (string) $current['processingToken'] : '';
+			if ( '' === $claim_token || '' === $current_token || ! hash_equals( $claim_token, $current_token ) ) {
+				/* A newer enqueue/settings mutation owns the durable snapshot now. */
+				$overall_status = 'superseded';
+			} elseif ( 'failed' !== $overall_status && 'partial' !== $overall_status ) {
+				delete_option( self::OPTION_ARCHIVE_QUEUE );
+			} else {
+				$current['dueAt']           = time() + ( $interval * MINUTE_IN_SECONDS );
+				$current['updatedAt']       = time();
+				$current['attempts']        = isset( $current['attempts'] ) ? absint( $current['attempts'] ) + 1 : 1;
+				$current['intervalMinutes'] = $interval;
+				unset( $current['processingToken'], $current['processingUntil'] );
+				self::write_archive_queue( $current );
+			}
+
+			$record = array(
+				'schemaVersion'   => self::ARCHIVE_QUEUE_SCHEMA_VERSION,
+				'pluginVersion'   => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+				'source'          => $source,
+				'status'          => $overall_status,
+				'attemptedAt'     => $now,
+				'completedAt'     => time(),
+				'intervalMinutes' => $interval,
+				'urlCount'        => count( $urls ),
+				'productCount'    => count( $product_ids ),
+				'durationMs'      => self::elapsed_ms( $started ),
+				'lastError'       => $last_error,
+				'integrations'    => $integration_data,
+			);
+			update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false );
+		} finally {
 			self::release_archive_queue_lock( $lock );
 		}
 
 		return array(
-			'success'      => 'failed' !== $overall_status && 'partial' !== $overall_status,
+			'success'      => ! in_array( $overall_status, array( 'failed', 'partial' ), true ),
 			'status'       => $overall_status,
 			'processed'    => true,
 			'urlCount'     => count( $urls ),
@@ -1122,11 +1201,19 @@ final class Mobo_Core_Cache_Purger {
 		 * If the self runner is disabled/throttled, the site's real cron will drain
 		 * the same persistent queue on its next normal hit.
 		 */
-		if ( $queued > 0 && class_exists( 'Mobo_Core_Self_Runner' ) ) {
-			try {
-				Mobo_Core_Self_Runner::kick( 'cache-warmup-queued', false );
-			} catch ( Throwable $e ) {
-				self::log_warning( 'Product cache warmup was queued but the self-runner wake-up failed: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'cache-warmup' ) );
+		if ( $queued > 0 ) {
+			$recovery_pending = class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::recovery_pending();
+			if ( $recovery_pending ) {
+				/* Recovery can enqueue hundreds of product URLs. Keep the deduplicated
+				 * queue, but create only one post-recovery serial warmup intent. */
+				Mobo_Core_Recovery_Coordinator::mark_post_recovery_warmup_pending();
+				$result['status'] = 'queued-after-recovery';
+			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				try {
+					Mobo_Core_Self_Runner::kick( 'cache-warmup-queued', false );
+				} catch ( Throwable $e ) {
+					self::log_warning( 'Product cache warmup was queued but the self-runner wake-up failed: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'cache-warmup' ) );
+				}
 			}
 		}
 

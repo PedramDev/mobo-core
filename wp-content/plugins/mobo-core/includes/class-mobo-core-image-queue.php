@@ -123,15 +123,20 @@ class Mobo_Core_Image_Queue {
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
 
-		if ( $product_id <= 0 || ! is_array( $images ) || empty( $images ) || ! self::table_exists() ) {
-			return array( 'enqueued' => 0, 'skipped' => 0 );
+		if ( $product_id <= 0 || ! is_array( $images ) || empty( $images ) ) {
+			return array( 'enqueued' => 0, 'skipped' => 0, 'error' => '' );
+		}
+		if ( ! self::table_exists() ) {
+			return array( 'enqueued' => 0, 'skipped' => 0, 'error' => 'Image queue table is unavailable.' );
 		}
 
 		$table      = self::table_name();
 		$now        = current_time( 'mysql', true );
 		$count      = 0;
 		$skip       = 0;
+		$db_error   = '';
 		$normalized = array();
+		$seen_keys  = array();
 
 		foreach ( array_values( $images ) as $position => $image ) {
 			if ( ! is_array( $image ) ) {
@@ -147,6 +152,14 @@ class Mobo_Core_Image_Queue {
 			}
 
 			$key = $this->queue_key( $product_id, $image_guid );
+			if ( isset( $seen_keys[ $key ] ) ) {
+				/* Duplicate remote identities are not authoritative desired-state input.
+				 * Keep the first occurrence and defer destructive pruning until Portal
+				 * sends an unambiguous image list. */
+				$skip++;
+				continue;
+			}
+			$seen_keys[ $key ] = true;
 			$normalized[] = array(
 				'key'       => $key,
 				'position'  => absint( $position ),
@@ -156,14 +169,18 @@ class Mobo_Core_Image_Queue {
 		}
 
 		if ( empty( $normalized ) ) {
-			return array( 'enqueued' => 0, 'skipped' => $skip );
+			return array( 'enqueued' => 0, 'skipped' => $skip, 'removed' => 0, 'error' => '' );
 		}
 
 		/* One lookup for the full product image set instead of one SELECT per image. */
 		$keys         = array_values( array_unique( array_filter( array_map( 'strval', wp_list_pluck( $normalized, 'key' ) ) ) ) );
 		$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
 		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE queue_key IN ({$placeholders})";
+		$wpdb->last_error = '';
 		$rows         = $wpdb->get_results( $wpdb->prepare( $query, $keys ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all values are bound by wpdb::prepare().
+		if ( ! is_array( $rows ) && '' !== (string) $wpdb->last_error ) {
+			return array( 'enqueued' => 0, 'skipped' => $skip, 'removed' => 0, 'error' => 'Could not read the image queue.' );
+		}
 		$existing_map = array();
 		$existing_attachment_ids = array();
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
@@ -172,6 +189,48 @@ class Mobo_Core_Image_Queue {
 				$existing_attachment_id = absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
 				if ( $existing_attachment_id > 0 ) {
 					$existing_attachment_ids[] = $existing_attachment_id;
+				}
+			}
+		}
+
+		/* Queue keys were case-sensitive before 10.33.24 while remote image GUID
+		 * identity is case-insensitive. When the new canonical key misses, adopt the
+		 * legacy row for the same product/GUID instead of inserting a second row. */
+		if ( count( $existing_map ) < count( $keys ) ) {
+			$requested_by_guid = array();
+			foreach ( $normalized as $item ) {
+				$canonical_guid = strtolower( trim( sanitize_text_field( (string) $item['imageGuid'] ) ) );
+				if ( '' !== $canonical_guid ) {
+					$requested_by_guid[ $canonical_guid ] = (string) $item['key'];
+				}
+			}
+
+			$wpdb->last_error = '';
+			$legacy_rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, queue_key, status, attachment_id, source_url, image_guid FROM {$table} WHERE product_id = %d",
+					$product_id
+				),
+				ARRAY_A
+			);
+
+			if ( ! is_array( $legacy_rows ) && '' !== (string) $wpdb->last_error ) {
+				return array( 'enqueued' => 0, 'skipped' => $skip, 'removed' => 0, 'error' => 'Could not read legacy image queue rows.' );
+			}
+
+			foreach ( is_array( $legacy_rows ) ? $legacy_rows : array() as $legacy_row ) {
+				$legacy_guid = strtolower( trim( sanitize_text_field( (string) ( isset( $legacy_row['image_guid'] ) ? $legacy_row['image_guid'] : '' ) ) ) );
+				if ( '' === $legacy_guid || ! isset( $requested_by_guid[ $legacy_guid ] ) ) {
+					continue;
+				}
+				$canonical_key = $requested_by_guid[ $legacy_guid ];
+				if ( isset( $existing_map[ $canonical_key ] ) ) {
+					continue;
+				}
+				$existing_map[ $canonical_key ] = $legacy_row;
+				$legacy_attachment_id = absint( isset( $legacy_row['attachment_id'] ) ? $legacy_row['attachment_id'] : 0 );
+				if ( $legacy_attachment_id > 0 ) {
+					$existing_attachment_ids[] = $legacy_attachment_id;
 				}
 			}
 		}
@@ -191,21 +250,27 @@ class Mobo_Core_Image_Queue {
 			$attachment_id         = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
 			$existing_url          = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
 			$status                = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
-			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_source( $attachment_id, $url );
+			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_identity( $attachment_id, $image_guid, $url );
 
 			if ( 'done' === $status && $attachment_compatible && $existing_url === $url ) {
-				$wpdb->update(
+				$write_result = $wpdb->update(
 					$table,
 					array(
+						'queue_key'      => $key,
 						'product_id'     => $product_id,
 						'product_guid'   => $product_guid,
+						'image_guid'     => $image_guid,
 						'position_index' => $position,
 						'updated_at'     => $now,
 					),
 					array( 'id' => absint( $existing['id'] ) ),
-					array( '%d', '%s', '%d', '%s' ),
+					array( '%s', '%d', '%s', '%s', '%d', '%s' ),
 					array( '%d' )
 				);
+				if ( false === $write_result ) {
+					$db_error = 'Could not refresh an existing image queue row.';
+					continue;
+				}
 				$count++;
 				continue;
 			}
@@ -221,7 +286,22 @@ class Mobo_Core_Image_Queue {
 			);
 
 			if ( is_array( $existing ) ) {
-				if ( $existing_url !== $url || ! $attachment_compatible ) {
+				$source_changed = $existing_url !== $url;
+
+				/*
+				 * Do not steal an active worker's lease. A changed desired source updates
+				 * the identity in place, causing the old worker's guarded commit to fail;
+				 * the replacement becomes claimable when the short lease expires. This
+				 * avoids running two workers for one queue row at the same time.
+				 */
+				if ( 'processing' === $status ) {
+					if ( $source_changed ) {
+						$data['try_count']     = 0;
+						$data['next_retry_at'] = null;
+						$data['last_error']    = null;
+						$data['attachment_id'] = 0;
+					}
+				} elseif ( $source_changed || ! $attachment_compatible ) {
 					$data['status']        = 'pending';
 					$data['try_count']     = 0;
 					$data['next_retry_at'] = null;
@@ -230,7 +310,7 @@ class Mobo_Core_Image_Queue {
 					$data['attachment_id'] = 0;
 				}
 
-				$wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), null, array( '%d' ) );
+				$write_result = $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), null, array( '%d' ) );
 			} else {
 				$data['attachment_id'] = 0;
 				$data['try_count']     = 0;
@@ -239,14 +319,75 @@ class Mobo_Core_Image_Queue {
 				$data['locked_until']  = null;
 				$data['last_error']    = null;
 				$data['created_at']    = $now;
-				$wpdb->insert( $table, $data );
+				$write_result = $wpdb->insert( $table, $data );
+			}
+
+			if ( false === $write_result ) {
+				$db_error = 'Could not persist the desired image queue row.';
+				continue;
 			}
 
 			$count++;
 		}
 
+		/*
+		 * The queue is also the durable desired image order for a product. Remove rows
+		 * that belonged to an older non-empty payload; otherwise get_ordered_rows_for_product()
+		 * keeps deleted Mobo images in the WooCommerce gallery forever. This removes
+		 * only queue state, never the attachment/file itself because another product
+		 * may legitimately reuse that attachment.
+		 */
+		/* Never prune desired-state rows from a partially malformed payload. One bad
+		 * image row must not make a previously valid gallery image disappear. A fully
+		 * valid non-empty payload is required before absence is authoritative. */
+		$prune_safe  = '' === $db_error && 0 === $skip && count( $normalized ) === count( array_values( $images ) );
+		$prune_error = '';
+		$removed     = $prune_safe ? $this->prune_product_rows_except( $product_id, $keys, $prune_error ) : 0;
+		if ( '' !== $prune_error ) {
+			$db_error = $prune_error;
+		}
+
 		self::invalidate_summary_cache();
-		return array( 'enqueued' => $count, 'skipped' => $skip );
+		return array(
+			'enqueued'      => $count,
+			'skipped'       => $skip,
+			'removed'       => $removed,
+			'pruneDeferred' => ! $prune_safe || '' !== $db_error,
+			'error'         => $db_error,
+		);
+	}
+
+	/**
+	 * Remove obsolete queue rows for one product while preserving the current
+	 * desired non-empty image set. Attachments and files are intentionally kept.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $keep_keys Current desired queue keys.
+	 * @return int Removed row count.
+	 */
+	private function prune_product_rows_except( $product_id, $keep_keys, &$error = '' ) {
+		global $wpdb;
+
+		$error      = '';
+		$product_id = absint( $product_id );
+		$keep_keys  = array_values( array_unique( array_filter( array_map( 'strval', is_array( $keep_keys ) ? $keep_keys : array() ) ) ) );
+
+		if ( $product_id <= 0 || empty( $keep_keys ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table        = self::table_name();
+		$placeholders = implode( ',', array_fill( 0, count( $keep_keys ), '%s' ) );
+		$args         = array_merge( array( $product_id ), $keep_keys );
+		$query        = "DELETE FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders})";
+		$deleted      = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
+
+		if ( false === $deleted ) {
+			$error = 'Could not prune stale image queue rows.';
+			return 0;
+		}
+
+		return absint( $deleted );
 	}
 
 	/**
@@ -674,6 +815,68 @@ class Mobo_Core_Image_Queue {
 		);
 	}
 
+
+	/**
+	 * Commit the processing -> attaching transition only if the queue row still
+	 * represents the exact identity claimed by this worker. A webhook may supersede
+	 * the source URL while a download is in flight.
+	 *
+	 * @return bool
+	 */
+	public function mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $source_url, $retry_delay = 0 ) {
+		global $wpdb;
+
+		$id            = absint( $id );
+		$attachment_id = absint( $attachment_id );
+		$product_id    = absint( $product_id );
+		$image_guid    = sanitize_text_field( (string) $image_guid );
+		$source_url    = esc_url_raw( (string) $source_url );
+		$retry_delay   = max( 0, min( 300, absint( $retry_delay ) ) );
+		if ( $id <= 0 || $attachment_id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		if ( $retry_delay > 0 ) {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = 'attaching', attachment_id = %d, next_retry_at = %s, locked_until = NULL, last_error = NULL, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+					$attachment_id,
+					gmdate( 'Y-m-d H:i:s', time() + $retry_delay ),
+					$now,
+					$id,
+					$product_id,
+					$image_guid,
+					$source_url
+				)
+			);
+		} else {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = 'attaching', attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+					$attachment_id,
+					$now,
+					$id,
+					$product_id,
+					$image_guid,
+					$source_url
+				)
+			);
+		}
+
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+
+		return false;
+	}
+
 	/**
 	 * Mark image as done.
 	 *
@@ -763,6 +966,138 @@ class Mobo_Core_Image_Queue {
 				'last_error'    => $message,
 			)
 		);
+	}
+
+	/**
+	 * Mark a claimed row failed only if its source identity has not been superseded
+	 * while the worker was downloading/validating the image.
+	 *
+	 * @return bool
+	 */
+	/**
+	 * Release a stale processing lease after the desired source identity changed.
+	 * The negative identity predicate prevents this worker from unlocking its own
+	 * still-current row by mistake.
+	 *
+	 * @return bool
+	 */
+	/**
+	 * Requeue a durable done/attaching row for storage repair only when it still
+	 * represents the identity that failed the final linkage/readiness check.
+	 *
+	 * @return bool
+	 */
+	public function schedule_repair_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url ) {
+		global $wpdb;
+		$id         = absint( $id );
+		$product_id = absint( $product_id );
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$source_url = esc_url_raw( (string) $source_url );
+		$try_count  = max( 1, absint( $try_count ) );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+			return false;
+		}
+
+		$delay = $this->calculate_retry_delay( $id, $try_count );
+		$table = self::table_name();
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
+				WHERE id = %d AND status IN ('done','attaching') AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+				$try_count,
+				gmdate( 'Y-m-d H:i:s', time() + $delay ),
+				sanitize_text_field( (string) $message ),
+				current_time( 'mysql', true ),
+				$id,
+				$product_id,
+				$image_guid,
+				$source_url
+			)
+		);
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+		return false;
+	}
+
+	public function release_if_superseded( $id, $product_id, $image_guid, $source_url ) {
+		global $wpdb;
+
+		$id         = absint( $id );
+		$product_id = absint( $product_id );
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$source_url = esc_url_raw( (string) $source_url );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s
+				WHERE id = %d AND status = 'processing'
+				AND NOT (product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s)",
+				$now, $id, $product_id, $image_guid, $source_url
+			)
+		);
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+		return false;
+	}
+
+	public function mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url, $final_failed = false ) {
+		global $wpdb;
+
+		$id         = absint( $id );
+		$product_id = absint( $product_id );
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$source_url = esc_url_raw( (string) $source_url );
+		$try_count  = max( 1, absint( $try_count ) );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+			return false;
+		}
+
+		$status  = $final_failed ? 'failed' : 'pending';
+		$delay   = $final_failed ? null : $this->calculate_retry_delay( $id, $try_count );
+		$message = sanitize_text_field( (string) $message );
+		if ( $final_failed && 0 !== strpos( $message, 'Permanent:' ) ) {
+			$message = 'Permanent: ' . $message;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		if ( null === $delay ) {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+					$status, $try_count, $message, $now, $id, $product_id, $image_guid, $source_url
+				)
+			);
+		} else {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+					$status, $try_count, gmdate( 'Y-m-d H:i:s', time() + $delay ), $message, $now, $id, $product_id, $image_guid, $source_url
+				)
+			);
+		}
+
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -870,7 +1205,7 @@ class Mobo_Core_Image_Queue {
 		$table = self::table_name();
 		$rows  = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, image_guid, source_url, position_index, attachment_id, status
+				"SELECT id, image_guid, source_url, position_index, attachment_id, status, try_count
 				FROM {$table}
 				WHERE product_id = %d
 				ORDER BY position_index ASC, id ASC",
@@ -1045,7 +1380,7 @@ class Mobo_Core_Image_Queue {
 		$now   = current_time( 'mysql', true );
 		$rows  = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT q.id, q.product_id, q.attachment_id
+				"SELECT DISTINCT q.id, q.product_id, q.attachment_id
 				FROM {$table} q
 				INNER JOIN {$wpdb->posts} p
 					ON p.ID = q.product_id
@@ -1057,13 +1392,19 @@ class Mobo_Core_Image_Queue {
 				LEFT JOIN {$wpdb->postmeta} thumb
 					ON thumb.post_id = q.product_id
 					AND thumb.meta_key = '_thumbnail_id'
+				LEFT JOIN {$wpdb->postmeta} gallery
+					ON gallery.post_id = q.product_id
+					AND gallery.meta_key = '_product_image_gallery'
 				WHERE q.status = 'done'
-					AND q.position_index = 0
 					AND q.attachment_id > 0
 					AND (
-						thumb.meta_value IS NULL
-						OR thumb.meta_value = ''
-						OR CAST(thumb.meta_value AS UNSIGNED) <> q.attachment_id
+						( q.position_index = 0 AND (
+							thumb.meta_value IS NULL
+							OR thumb.meta_value = ''
+							OR CAST(thumb.meta_value AS UNSIGNED) <> q.attachment_id
+							OR FIND_IN_SET(CAST(q.attachment_id AS CHAR), COALESCE(gallery.meta_value, '')) > 0
+						) )
+						OR ( q.position_index > 0 AND FIND_IN_SET(CAST(q.attachment_id AS CHAR), COALESCE(gallery.meta_value, '')) = 0 )
 					)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
@@ -1107,6 +1448,113 @@ class Mobo_Core_Image_Queue {
 		return array(
 			'status'    => 'ok',
 			'scheduled' => $scheduled,
+		);
+	}
+
+	/**
+	 * Requeue completed rows whose physical image file is missing, corrupt or no
+	 * longer matches the recorded source URL. The audit is cursor-based and
+	 * bounded so maintenance can safely cover large stores over several runs.
+	 *
+	 * @param int $limit Maximum rows to requeue in one call.
+	 * @return array
+	 */
+	public static function schedule_file_repairs( $limit = 75 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 500, absint( $limit ) ) );
+		if ( ! self::table_exists() ) {
+			return array( 'status' => 'missing-table', 'scheduled' => 0, 'scanned' => 0, 'cycleComplete' => true );
+		}
+
+		$table       = self::table_name();
+		$cursor_key  = 'mobo_core_image_queue_file_audit_cursor';
+		$cursor      = absint( get_option( $cursor_key, 0 ) );
+		$scan_limit  = max( 100, min( 1000, $limit * 8 ) );
+		$rows        = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, attachment_id, image_guid, source_url
+				FROM {$table}
+				WHERE status = 'done'
+					AND attachment_id > 0
+					AND id > %d
+				ORDER BY id ASC
+				LIMIT %d",
+				$cursor,
+				$scan_limit
+			),
+			ARRAY_A
+		);
+
+		$rows      = is_array( $rows ) ? $rows : array();
+		$matcher         = new self();
+		$refresh_service = class_exists( 'Mobo_Core_Image_Refresh_Service' ) ? new Mobo_Core_Image_Refresh_Service() : null;
+		$repair_ids      = array();
+		$scanned   = 0;
+		$cursor_end = $cursor;
+		$stopped_for_limit = false;
+
+		foreach ( $rows as $row ) {
+			$id            = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+			$attachment_id = absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
+			$image_guid    = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+			$source_url    = esc_url_raw( (string) ( isset( $row['source_url'] ) ? $row['source_url'] : '' ) );
+
+			if ( $id <= 0 ) {
+				continue;
+			}
+
+			$scanned++;
+			$cursor_end = $id;
+
+			$attachment_healthy = $matcher->attachment_matches_identity( $attachment_id, $image_guid, $source_url );
+			$shared_attachment  = class_exists( 'Mobo_Core_Shared_Media' ) && method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id );
+			if ( $attachment_healthy && ( $matcher->is_webp_url( $source_url ) || $shared_attachment ) && $refresh_service && method_exists( $refresh_service, 'inspect_webp_attachment_health' ) ) {
+				$storage_health     = $refresh_service->inspect_webp_attachment_health( $attachment_id );
+				$attachment_healthy = ! empty( $storage_health['healthy'] );
+			}
+
+			if ( ! $attachment_healthy ) {
+				$repair_ids[] = $id;
+				if ( count( $repair_ids ) >= $limit ) {
+					$stopped_for_limit = true;
+					break;
+				}
+			}
+		}
+
+		$scheduled = 0;
+		if ( ! empty( $repair_ids ) ) {
+			$now          = current_time( 'mysql', true );
+			$placeholders = implode( ',', array_fill( 0, count( $repair_ids ), '%d' ) );
+			$args         = array_merge( array( $now, $now ), $repair_ids );
+			$query        = "UPDATE {$table}
+				SET status = 'pending', attachment_id = 0, try_count = 0,
+					next_retry_at = %s, locked_until = NULL,
+					last_error = 'Completed image file was missing, corrupt, or source-mismatched; source retry scheduled.',
+					updated_at = %s
+				WHERE status = 'done' AND id IN ({$placeholders})";
+			$updated      = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Internal table name and generated %d placeholder list; all values are bound.
+			$scheduled    = absint( false === $updated ? 0 : $updated );
+			if ( $scheduled > 0 ) {
+				self::invalidate_summary_cache();
+			}
+		}
+
+		$cycle_complete = ! $stopped_for_limit && count( $rows ) < $scan_limit;
+		if ( $cycle_complete ) {
+			update_option( $cursor_key, 0, false );
+		} elseif ( $cursor_end > 0 ) {
+			update_option( $cursor_key, $cursor_end, false );
+		}
+
+		return array(
+			'status'        => 'ok',
+			'scheduled'     => $scheduled,
+			'scanned'       => $scanned,
+			'cursorStart'   => $cursor,
+			'cursorEnd'     => $cycle_complete ? 0 : $cursor_end,
+			'cycleComplete' => $cycle_complete,
 		);
 	}
 
@@ -1201,7 +1649,11 @@ class Mobo_Core_Image_Queue {
 	 * @return string
 	 */
 	private function queue_key( $product_id, $image_guid ) {
-		return md5( absint( $product_id ) . '|' . sanitize_text_field( (string) $image_guid ) );
+		/* Remote GUID identity is treated case-insensitively everywhere else in the
+		 * image subsystem. Normalize here as well so a casing-only Portal change
+		 * cannot create a second durable queue identity for the same image. */
+		$image_guid = strtolower( trim( sanitize_text_field( (string) $image_guid ) ) );
+		return md5( absint( $product_id ) . '|' . $image_guid );
 	}
 
 	/**
@@ -1214,6 +1666,50 @@ class Mobo_Core_Image_Queue {
 		$attachment_id = absint( $attachment_id );
 
 		return $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
+	}
+
+	/**
+	 * Check that a queue attachment belongs to the same remote image identity and
+	 * still contains a healthy payload for the expected source. Attachments from
+	 * older releases with no stored image GUID remain adoptable; an attachment
+	 * explicitly owned by another GUID must never satisfy this queue row merely
+	 * because both remote records currently expose the same URL.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $image_guid Remote image GUID.
+	 * @param string $url Source URL.
+	 * @return bool
+	 */
+	private function attachment_matches_identity( $attachment_id, $image_guid, $url ) {
+		$attachment_id = absint( $attachment_id );
+		$image_guid    = strtolower( trim( sanitize_text_field( (string) $image_guid ) ) );
+		if ( $attachment_id <= 0 || '' === $image_guid ) {
+			return false;
+		}
+
+		$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
+		if ( '' === $stored_guid ) {
+			$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
+		}
+		if ( '' === $stored_guid && class_exists( 'Mobo_Core_Shared_Media' ) && method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, '_mobo_shared_media_image_id', true ) );
+		}
+
+		/* Resolver code may temporarily adopt a legacy unclaimed attachment, but a
+		 * durable queue row is not converged until the Mobo GUID has actually been
+		 * persisted. Otherwise old rows can remain done forever while every source-hash
+		 * fast-path check correctly reports identity drift. */
+		if ( '' === $stored_guid || ! hash_equals( strtolower( trim( $stored_guid ) ), $image_guid ) ) {
+			return false;
+		}
+
+		/* Explicitly incomplete is a recoverable import checkpoint, not a durable
+		 * `done` attachment. Requeue it so readiness can finish and commit the marker. */
+		if ( '1' === (string) get_post_meta( $attachment_id, 'mobo_sync_incomplete', true ) ) {
+			return false;
+		}
+
+		return $this->attachment_matches_source( $attachment_id, $url );
 	}
 
 	/**
@@ -1234,7 +1730,44 @@ class Mobo_Core_Image_Queue {
 			return false;
 		}
 
+		$stored_source_url = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+		if ( '' !== $stored_source_url && '' !== $url && $stored_source_url !== $url ) {
+			return false;
+		}
+
+		$file = get_attached_file( $attachment_id );
+		if ( ! is_string( $file ) || '' === $file || ! is_file( $file ) ) {
+			return false;
+		}
+
+		$size = @filesize( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A concurrent file removal is treated as an invalid attachment.
+		if ( false === $size || $size <= 0 ) {
+			return false;
+		}
+
+		$detected_mime = '';
+		if ( function_exists( 'wp_get_image_mime' ) ) {
+			$detected_mime = strtolower( (string) wp_get_image_mime( $file ) );
+			if ( '' === $detected_mime || 0 !== strpos( $detected_mime, 'image/' ) ) {
+				return false;
+			}
+		}
+
+		if ( class_exists( 'Mobo_Core_Shared_Media' )
+			&& method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
+			&& Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id )
+			&& method_exists( 'Mobo_Core_Shared_Media', 'attachment_health' ) ) {
+			$shared_health = Mobo_Core_Shared_Media::attachment_health( $attachment_id, true );
+			if ( empty( $shared_health['healthy'] ) ) {
+				return false;
+			}
+		}
+
 		if ( $this->is_webp_url( $url ) ) {
+			if ( '' !== $detected_mime && 'image/webp' !== $detected_mime ) {
+				return false;
+			}
+
 			return $this->is_attachment_webp( $attachment_id );
 		}
 

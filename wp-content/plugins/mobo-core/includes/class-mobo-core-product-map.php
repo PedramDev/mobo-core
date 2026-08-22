@@ -25,6 +25,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Product_Map {
 
+	/** @var bool Whether the current legacy seed pass stalled on a durable DB write. */
+	private $legacy_seed_stalled = false;
+
+
 	/** @var bool|null Request-local table existence cache. */
 	private static $table_exists_cache = null;
 
@@ -72,10 +76,11 @@ class Mobo_Core_Product_Map {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY remote_object (remote_guid, object_type),
+			UNIQUE KEY remote_object (remote_guid(150), object_type),
 			KEY wp_post_id (wp_post_id),
 			KEY object_type (object_type),
 			KEY parent_remote_guid (parent_remote_guid),
+			KEY parent_object (parent_remote_guid(120), object_type),
 			KEY updated_id (updated_at, id)
 		) {$charset_collate};";
 
@@ -218,21 +223,29 @@ class Mobo_Core_Product_Map {
 		 * product/variation while remaining compatible with MySQL/MariaDB versions
 		 * used by WordPress hosts. Existing created_at is intentionally preserved.
 		 */
+		/*
+		 * remote_object uses a 150-character GUID prefix so utf8mb4 remains compatible
+		 * with legacy 767-byte InnoDB key limits. Therefore a pathological pair of
+		 * long identifiers can collide at the index level even though the full GUIDs
+		 * differ. Never let that prefix collision mutate the existing mapping: every
+		 * ON DUPLICATE assignment is conditional on full GUID equality under the table collation, followed
+		 * by an exact read-back postcondition. Normal UUID/numeric identifiers take the
+		 * same single-write fast path.
+		 */
 		$query = "INSERT INTO {$table}
 			(remote_guid, wp_post_id, object_type, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at)
 			VALUES (%s, %d, %s, %s, %s, %d, %s, %s)
 			ON DUPLICATE KEY UPDATE
-				wp_post_id = %d,
-				parent_remote_guid = %s,
-				last_hash = %s,
-				sync_incomplete = %d,
-				updated_at = %s";
+				wp_post_id = IF(remote_guid = VALUES(remote_guid), VALUES(wp_post_id), wp_post_id),
+				parent_remote_guid = IF(remote_guid = VALUES(remote_guid), VALUES(parent_remote_guid), parent_remote_guid),
+				last_hash = IF(remote_guid = VALUES(remote_guid), VALUES(last_hash), last_hash),
+				sync_incomplete = IF(remote_guid = VALUES(remote_guid), VALUES(sync_incomplete), sync_incomplete),
+				updated_at = IF(remote_guid = VALUES(remote_guid), VALUES(updated_at), updated_at)";
 
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
-				$guid, $post_id, $object_type, $parent_guid, $last_hash, $incomplete, $now, $now,
-				$post_id, $parent_guid, $last_hash, $incomplete, $now
+				$guid, $post_id, $object_type, $parent_guid, $last_hash, $incomplete, $now, $now
 			)
 		);
 
@@ -240,7 +253,47 @@ class Mobo_Core_Product_Map {
 			return false;
 		}
 
+		$persisted = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT wp_post_id, parent_remote_guid, last_hash, sync_incomplete FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+				$guid,
+				$object_type
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $persisted )
+			|| absint( $persisted['wp_post_id'] ) !== $post_id
+			|| (string) $persisted['parent_remote_guid'] !== $parent_guid
+			|| (string) $persisted['last_hash'] !== $last_hash
+			|| absint( $persisted['sync_incomplete'] ) !== $incomplete ) {
+			return false;
+		}
+
+		/* A WooCommerce variation must have exactly one current remote GUID. During
+		 * identity migration (same attribute signature, new Portal GUID), keep the old
+		 * mapping until the new GUID has been durably upserted, then retire every stale
+		 * reverse mapping for the same local variation. This avoids a crash window where
+		 * neither identity is resolvable, and prevents a later old-GUID event from being
+		 * routed to the migrated variation. */
+		if ( self::TYPE_VARIATION === $object_type ) {
+			$stale_deleted = $wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM {$table} WHERE wp_post_id = %d AND object_type = %s AND remote_guid <> %s",
+					$post_id,
+					self::TYPE_VARIATION,
+					$guid
+				)
+			);
+			if ( false === $stale_deleted ) {
+				return false;
+			}
+		}
+
 		$cache_key = self::lookup_cache_key( $guid, $object_type );
+		if ( self::TYPE_VARIATION === $object_type ) {
+			self::$lookup_cache = array();
+			self::$status_cache = array();
+		}
 		self::$lookup_cache[ $cache_key ] = $post_id;
 		unset( self::$status_cache[ $cache_key ] );
 		return true;
@@ -549,13 +602,20 @@ class Mobo_Core_Product_Map {
 	 *
 	 * @param string $parent_guid Parent remote product GUID.
 	 * @param array  $keep_guids Remote variation GUIDs to retain.
+	 * @param string $error Database error message, if any.
 	 * @return int Number of deleted rows.
 	 */
-	public function delete_variations_for_parent( $parent_guid, $keep_guids = array() ) {
+	public function delete_variations_for_parent( $parent_guid, $keep_guids = array(), &$error = '' ) {
+		$error = '';
 		global $wpdb;
 
 		$parent_guid = sanitize_text_field( (string) $parent_guid );
-		if ( '' === $parent_guid || ! self::table_exists() ) {
+		if ( '' === $parent_guid ) {
+			return 0;
+		}
+
+		if ( ! self::table_exists() ) {
+			$error = 'Mobo product-map table is unavailable.';
 			return 0;
 		}
 
@@ -577,7 +637,12 @@ class Mobo_Core_Product_Map {
 			ARRAY_A
 		);
 
-		if ( ! is_array( $rows ) || empty( $rows ) ) {
+		if ( ! is_array( $rows ) ) {
+			$error = '' !== (string) $wpdb->last_error ? sanitize_text_field( (string) $wpdb->last_error ) : 'Could not read variation mappings for the parent product.';
+			return 0;
+		}
+
+		if ( empty( $rows ) ) {
 			return 0;
 		}
 
@@ -606,9 +671,11 @@ class Mobo_Core_Product_Map {
 		foreach ( array_chunk( $delete_ids, 500 ) as $chunk ) {
 			$id_sql = implode( ',', array_map( 'absint', $chunk ) );
 			$result = $wpdb->query( "DELETE FROM {$table} WHERE id IN ({$id_sql})" );
-			if ( false !== $result ) {
-				$deleted += absint( $result );
+			if ( false === $result ) {
+				$error = '' !== (string) $wpdb->last_error ? sanitize_text_field( (string) $wpdb->last_error ) : 'Could not delete stale variation mappings.';
+				break;
 			}
+			$deleted += absint( $result );
 		}
 
 		foreach ( $delete_guids as $guid ) {
@@ -668,16 +735,23 @@ class Mobo_Core_Product_Map {
 			return array( 'products' => 0, 'variations' => 0 );
 		}
 
+		$this->legacy_seed_stalled = false;
 		$products   = $this->seed_products_from_legacy_meta( $limit );
-		$variations = $this->seed_variations_from_legacy_meta( $limit );
+		$product_stalled = $this->legacy_seed_stalled;
 
-		if ( 0 === $products && 0 === $variations ) {
+		$this->legacy_seed_stalled = false;
+		$variations = $this->seed_variations_from_legacy_meta( $limit );
+		$variation_stalled = $this->legacy_seed_stalled;
+		$stalled = $product_stalled || $variation_stalled;
+
+		if ( ! $stalled && 0 === $products && 0 === $variations ) {
 			update_option( 'mobo_core_product_map_seed_completed_at', time(), false );
 		}
 
 		return array(
 			'products'   => $products,
 			'variations' => $variations,
+			'stalled'    => $stalled,
 		);
 	}
 
@@ -720,10 +794,17 @@ class Mobo_Core_Product_Map {
 			$post_id = absint( $row['ID'] );
 			$guid    = sanitize_text_field( (string) $row['remote_guid'] );
 
-			if ( $post_id > 0 && '' !== $guid && $this->upsert_product( $guid, $post_id ) ) {
-				$count++;
+			if ( $post_id <= 0 || '' === $guid ) {
+				$last = max( $last, $post_id );
+				continue;
 			}
 
+			if ( ! $this->upsert_product( $guid, $post_id ) ) {
+				$this->legacy_seed_stalled = true;
+				break;
+			}
+
+			$count++;
 			$last = max( $last, $post_id );
 		}
 
@@ -773,10 +854,17 @@ class Mobo_Core_Product_Map {
 			$guid        = sanitize_text_field( (string) $row['remote_guid'] );
 			$parent_guid = sanitize_text_field( (string) $row['parent_remote_guid'] );
 
-			if ( $post_id > 0 && '' !== $guid && $this->upsert_variation( $guid, $post_id, $parent_guid ) ) {
-				$count++;
+			if ( $post_id <= 0 || '' === $guid ) {
+				$last = max( $last, $post_id );
+				continue;
 			}
 
+			if ( ! $this->upsert_variation( $guid, $post_id, $parent_guid ) ) {
+				$this->legacy_seed_stalled = true;
+				break;
+			}
+
+			$count++;
 			$last = max( $last, $post_id );
 		}
 

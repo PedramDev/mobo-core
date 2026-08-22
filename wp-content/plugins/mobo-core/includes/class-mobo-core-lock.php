@@ -249,6 +249,53 @@ class Mobo_Core_Lock {
 	}
 
 	/**
+	 * Release a lease only when its non-secret snapshot is still unchanged.
+	 *
+	 * This is intended for coordinator cleanup of a lease that is known to be
+	 * pre-work (for example a self-runner HTTP handoff). The exact raw option
+	 * value is deleted with compare-and-delete semantics, so a concurrent renew
+	 * or ownership transfer makes the deletion fail instead of removing live work.
+	 *
+	 * @param string $name Lock name.
+	 * @param array  $snapshot Snapshot returned by get_status().
+	 * @return bool True when the matching lease was removed or was already absent.
+	 */
+	public static function release_if_snapshot_matches( $name, $snapshot ) {
+		$name = sanitize_key( (string) $name );
+
+		if ( '' === $name || ! is_array( $snapshot ) ) {
+			return false;
+		}
+
+		$key = self::option_key( $name );
+		$raw = self::read_raw_option( $key );
+		if ( null === $raw ) {
+			return true;
+		}
+
+		$payload = self::decode_payload( $raw );
+		if ( ! is_array( $payload ) || $payload['expires_at'] <= time() ) {
+			return self::delete_raw_option_if_value( $key, $raw );
+		}
+
+		$expected_created   = isset( $snapshot['acquiredAt'] ) ? absint( $snapshot['acquiredAt'] ) : 0;
+		$expected_heartbeat = isset( $snapshot['lastHeartbeatAt'] ) ? absint( $snapshot['lastHeartbeatAt'] ) : 0;
+		$expected_expires   = isset( $snapshot['expiresAt'] ) ? absint( $snapshot['expiresAt'] ) : 0;
+
+		if (
+			$expected_created <= 0
+			|| $expected_expires <= 0
+			|| $payload['created_at'] !== $expected_created
+			|| $payload['heartbeat_at'] !== $expected_heartbeat
+			|| $payload['expires_at'] !== $expected_expires
+		) {
+			return false;
+		}
+
+		return self::delete_raw_option_if_value( $key, $raw );
+	}
+
+	/**
 	 * Check whether a named lock currently exists.
 	 *
 	 * Expired or malformed rows are removed while checking.

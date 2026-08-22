@@ -76,8 +76,14 @@ class Mobo_Core_City_Assets {
 	 * @return array|WP_Error
 	 */
 	public function generate( $mapping, $manual = array(), $source = 'manual' ) {
-		$mapping = is_array( $mapping ) ? $mapping : array();
-		$manual  = is_array( $manual ) ? $manual : array();
+		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'city_assets_generate', 90 ) : 'legacy-unlocked';
+		if ( false === $lock_token ) {
+			return new WP_Error( 'mobo_core_city_assets_busy', 'تولید فایل شهرهای موبو هم‌اکنون توسط پردازش دیگری در حال انجام است.' );
+		}
+
+		try {
+			$mapping = is_array( $mapping ) ? $mapping : array();
+			$manual  = is_array( $manual ) ? $manual : array();
 
 		$groups = $this->build_city_groups( $mapping, $manual );
 		if ( is_wp_error( $groups ) ) {
@@ -134,9 +140,23 @@ class Mobo_Core_City_Assets {
 			'minUrl'      => $assets['minUrl'],
 			'lastError'   => '',
 		);
-		update_option( self::STATUS_OPTION, $status, false );
+			update_option( self::STATUS_OPTION, $status, false );
+			$stored_status = get_option( self::STATUS_OPTION, array() );
+			if ( ! is_array( $stored_status )
+				|| empty( $stored_status['ready'] )
+				|| ! isset( $stored_status['sourceHash'], $stored_status['assetHash'] )
+				|| ! hash_equals( (string) $status['sourceHash'], (string) $stored_status['sourceHash'] )
+				|| ! hash_equals( (string) $status['assetHash'], (string) $stored_status['assetHash'] )
+			) {
+				return new WP_Error( 'mobo_core_city_asset_status_persist_failed', 'فایل‌های شهر ساخته شدند اما ثبت durable وضعیت آن‌ها در دیتابیس تأیید نشد؛ عملیات در اجرای بعدی دوباره تلاش می‌شود.' );
+			}
 
-		return $status;
+			return $status;
+		} finally {
+			if ( 'legacy-unlocked' !== $lock_token && class_exists( 'Mobo_Core_Lock' ) ) {
+				Mobo_Core_Lock::release( 'city_assets_generate', $lock_token );
+			}
+		}
 	}
 
 	/**

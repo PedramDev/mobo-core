@@ -32,9 +32,10 @@ class Mobo_Core_Missing_Image_Recovery {
 	}
 
 	/**
-	 * Return a cursor batch of existing local Mobo products whose featured image
-	 * reference is missing or invalid. A final runtime check prevents races where
-	 * another worker attaches a valid image after the SQL candidate query.
+	 * Return a cursor batch of existing local Mobo products and runtime-filter it
+	 * to products whose featured image is physically missing or invalid. Scanning
+	 * the full Mobo product set also catches stale attachment metadata that still
+	 * points at a deleted/corrupt file.
 	 *
 	 * @param int $limit Maximum local products to inspect.
 	 * @param int $after_id Cursor.
@@ -47,7 +48,12 @@ class Mobo_Core_Missing_Image_Recovery {
 		$after_id    = max( 0, absint( $after_id ) );
 		$fetch_limit = $limit + 1;
 
-
+		/*
+		 * Deliberately scan every known local Mobo product, not only rows whose
+		 * attachment metadata is missing. A valid `_wp_attached_file` database
+		 * value can still point at a deleted, zero-byte or non-image file. The
+		 * bounded runtime check below is the authoritative health test.
+		 */
 		$estimated_total = absint(
 			$wpdb->get_var(
 				"SELECT COUNT(DISTINCT p.ID)
@@ -56,23 +62,8 @@ class Mobo_Core_Missing_Image_Recovery {
 					ON guid_meta.post_id = p.ID
 					AND guid_meta.meta_key = 'product_guid'
 					AND guid_meta.meta_value <> ''
-				LEFT JOIN {$wpdb->postmeta} thumbnail
-					ON thumbnail.post_id = p.ID
-					AND thumbnail.meta_key = '_thumbnail_id'
-				LEFT JOIN {$wpdb->posts} attachment
-					ON attachment.ID = CAST(thumbnail.meta_value AS UNSIGNED)
-					AND attachment.post_type = 'attachment'
-				LEFT JOIN {$wpdb->postmeta} attached_file
-					ON attached_file.post_id = attachment.ID
-					AND attached_file.meta_key = '_wp_attached_file'
 				WHERE p.post_type = 'product'
-				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND ( thumbnail.meta_value IS NULL
-				OR thumbnail.meta_value = ''
-				OR CAST(thumbnail.meta_value AS UNSIGNED) = 0
-				OR attachment.ID IS NULL
-				OR attached_file.meta_value IS NULL
-				OR attached_file.meta_value = '' )"
+					AND p.post_status NOT IN ('trash', 'auto-draft')"
 			)
 		);
 
@@ -84,24 +75,9 @@ class Mobo_Core_Missing_Image_Recovery {
 					ON guid_meta.post_id = p.ID
 					AND guid_meta.meta_key = 'product_guid'
 					AND guid_meta.meta_value <> ''
-				LEFT JOIN {$wpdb->postmeta} thumbnail
-					ON thumbnail.post_id = p.ID
-					AND thumbnail.meta_key = '_thumbnail_id'
-				LEFT JOIN {$wpdb->posts} attachment
-					ON attachment.ID = CAST(thumbnail.meta_value AS UNSIGNED)
-					AND attachment.post_type = 'attachment'
-				LEFT JOIN {$wpdb->postmeta} attached_file
-					ON attached_file.post_id = attachment.ID
-					AND attached_file.meta_key = '_wp_attached_file'
 				WHERE p.post_type = 'product'
-				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND ( thumbnail.meta_value IS NULL
-				OR thumbnail.meta_value = ''
-				OR CAST(thumbnail.meta_value AS UNSIGNED) = 0
-				OR attachment.ID IS NULL
-				OR attached_file.meta_value IS NULL
-				OR attached_file.meta_value = '' )
-				AND p.ID > %d
+					AND p.post_status NOT IN ('trash', 'auto-draft')
+					AND p.ID > %d
 				ORDER BY p.ID ASC
 				LIMIT %d",
 				$after_id,
@@ -110,9 +86,9 @@ class Mobo_Core_Missing_Image_Recovery {
 			ARRAY_A
 		);
 
-		$rows     = is_array( $rows ) ? $rows : array();
-		$has_more = count( $rows ) > $limit;
-		$rows     = array_slice( $rows, 0, $limit );
+		$rows       = is_array( $rows ) ? $rows : array();
+		$has_more   = count( $rows ) > $limit;
+		$rows       = array_slice( $rows, 0, $limit );
 		$candidates = array();
 		$cursor_end = $after_id;
 
@@ -165,14 +141,22 @@ class Mobo_Core_Missing_Image_Recovery {
 
 		try {
 			$file = get_attached_file( $attachment_id );
-			if ( is_string( $file ) && '' !== $file && is_file( $file ) && filesize( $file ) > 0 ) {
-				return false;
+			if ( ! is_string( $file ) || '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
+				return true;
 			}
+
+			/* Detect non-image HTTP/error payloads that happen to be non-empty files. */
+			if ( function_exists( 'wp_get_image_mime' ) ) {
+				$mime = strtolower( (string) wp_get_image_mime( $file ) );
+				if ( '' === $mime || 0 !== strpos( $mime, 'image/' ) ) {
+					return true;
+				}
+			}
+
+			return false;
 		} catch ( Throwable $error ) {
 			return true;
 		}
-
-		return true;
 	}
 
 	/**

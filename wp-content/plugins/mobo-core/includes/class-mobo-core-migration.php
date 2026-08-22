@@ -26,6 +26,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Migration {
 
+	/** @var string Last concrete schema validation/repair failure for diagnostics. */
+	private static $schema_last_failure = '';
+
 	/**
 	 * Activation hook.
 	 *
@@ -36,6 +39,11 @@ class Mobo_Core_Migration {
 	 * @return void
 	 */
 	public static function activate() {
+		/* Preserve the pre-activation version before finalize_database_version() stamps
+		 * the new build. Recovery migrations must make their upgrade/fresh-install
+		 * decision from this value, not from the version written at the end. */
+		$previous_version = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+
 		self::ensure_defaults();
 		self::apply_10331613_runtime_option_autoload_cleanup( '' );
 		self::apply_10307_default_adjustments( '' );
@@ -43,7 +51,7 @@ class Mobo_Core_Migration {
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
-		self::create_database_tables();
+		$schema_ready = self::create_database_tables();
 		self::apply_10331614_table_housekeeping_fast_path( '' );
 		self::apply_103171_runtime_lock_recovery( '' );
 		self::apply_103164_image_family_migration( '' );
@@ -65,13 +73,25 @@ class Mobo_Core_Migration {
 		self::apply_103316_automatic_stage7_convergence( '' );
 		self::apply_1033161_install_bootstrap_safety( '' );
 		self::apply_1033171_stage7_autodrain( '' );
+		self::apply_103320_image_cleanup_recovery( '' );
+		self::apply_103324_image_storage_integrity_reaudit( '' );
+		self::apply_103325_system_integrity_safety( '' );
+		self::apply_103328_legacy_map_reseed_safety( '' );
+		/* Manual deactivate/replace/activate upgrades do not necessarily get a later
+		 * maybe_run() with the old DB version. Schedule parent-product retention
+		 * recovery here as well, using the captured pre-activation version. */
+		self::apply_103329_product_retention_recovery( $previous_version );
+		self::apply_103333_product_recovery_reaudit( $previous_version );
+		self::apply_103335_variation_integrity_reaudit( $previous_version );
+		self::apply_103336_recovery_state_selfheal( $previous_version );
+		self::apply_103337_variation_integrity_reason_selfheal( $previous_version );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
 		self::discard_legacy_webhook_queue();
 		self::clear_legacy_cron_hooks();
 
-		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
+		self::finalize_database_version( $schema_ready );
 	}
 
 	/**
@@ -97,7 +117,7 @@ class Mobo_Core_Migration {
 		self::ensure_webhook_dirs();
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
-		self::create_database_tables();
+		$schema_ready = self::create_database_tables();
 		self::apply_10331614_table_housekeeping_fast_path( $current );
 		self::apply_103171_runtime_lock_recovery( $current );
 		self::apply_103164_image_family_migration( $current );
@@ -119,6 +139,15 @@ class Mobo_Core_Migration {
 		self::apply_103316_automatic_stage7_convergence( $current );
 		self::apply_1033161_install_bootstrap_safety( $current );
 		self::apply_1033171_stage7_autodrain( $current );
+		self::apply_103320_image_cleanup_recovery( $current );
+		self::apply_103324_image_storage_integrity_reaudit( $current );
+		self::apply_103325_system_integrity_safety( $current );
+		self::apply_103328_legacy_map_reseed_safety( $current );
+		self::apply_103329_product_retention_recovery( $current );
+		self::apply_103333_product_recovery_reaudit( $current );
+		self::apply_103335_variation_integrity_reaudit( $current );
+		self::apply_103336_recovery_state_selfheal( $current );
+		self::apply_103337_variation_integrity_reason_selfheal( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -131,7 +160,7 @@ class Mobo_Core_Migration {
 		 */
 		delete_option( 'mobo_core_enable_wp_cron' );
 
-		update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
+		self::finalize_database_version( $schema_ready );
 	}
 
 	/**
@@ -315,11 +344,15 @@ class Mobo_Core_Migration {
 	/**
 	 * Create/update custom sync tables.
 	 *
-	 * @return void
+	 * @return bool True only when required runtime schema postconditions exist.
 	 */
 	private static function create_database_tables() {
 		if ( class_exists( 'Mobo_Core_Product_Map' ) ) {
 			Mobo_Core_Product_Map::create_table();
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
+			Mobo_Core_Product_Ledger::create_table();
 		}
 
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
@@ -346,7 +379,306 @@ class Mobo_Core_Migration {
 			Mobo_Core_Reconciliation::create_table();
 		}
 
-		update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
+		$ready = self::database_schema_ready();
+		if ( $ready ) {
+			update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
+			delete_option( 'mobo_core_schema_last_error' );
+			delete_option( 'mobo_core_schema_last_error_at' );
+		} else {
+			$error = '' !== self::$schema_last_failure
+				? 'Mobo Core database schema is incomplete: ' . self::$schema_last_failure . ' Migration will retry automatically.'
+				: 'Mobo Core database schema is incomplete; migration will retry automatically.';
+			update_option( 'mobo_core_schema_last_error', $error, false );
+			update_option( 'mobo_core_schema_last_error_at', time(), false );
+		}
+
+		return $ready;
+	}
+
+	/**
+	 * Verify postconditions that runtime queues depend on before stamping a DB version.
+	 *
+	 * @return bool
+	 */
+	private static function database_schema_ready() {
+		global $wpdb;
+		self::$schema_last_failure = '';
+
+		$classes = array(
+			'Mobo_Core_Product_Map',
+			'Mobo_Core_Product_Ledger',
+			'Mobo_Core_Sync_Event_Store',
+			'Mobo_Core_Category_Map',
+			'Mobo_Core_Image_Queue',
+			'Mobo_Core_Image_Refresh_Queue',
+			'Mobo_Core_Orphan_Image_Cleanup',
+			'Mobo_Core_Reconciliation',
+		);
+
+		foreach ( $classes as $class_name ) {
+			if ( ! class_exists( $class_name ) || ! is_callable( array( $class_name, 'table_name' ) ) ) {
+				self::$schema_last_failure = 'required schema class is unavailable: ' . $class_name . '.';
+				return false;
+			}
+			$table = call_user_func( array( $class_name, 'table_name' ) );
+			if ( ! is_string( $table ) || '' === $table ) {
+				self::$schema_last_failure = 'required schema class returned an empty table name: ' . $class_name . '.';
+				return false;
+			}
+			$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
+			if ( (string) $found !== $table ) {
+				self::$schema_last_failure = 'required table is missing or inaccessible: ' . $table . '.';
+				return false;
+			}
+		}
+
+		$event_table = Mobo_Core_Sync_Event_Store::table_name();
+		$claim_token = $wpdb->get_var( $wpdb->prepare( "SHOW COLUMNS FROM {$event_table} LIKE %s", 'claim_token' ) );
+		if ( 'claim_token' !== (string) $claim_token ) {
+			self::$schema_last_failure = 'required column is missing or inaccessible: ' . $event_table . '.claim_token.';
+			return false;
+		}
+
+		/*
+		 * Identity/ownership indexes are correctness constraints, not merely query
+		 * optimizations. A partial dbDelta that creates columns but misses one of these
+		 * indexes must never advance the schema version. Validate both the column order
+		 * and uniqueness flag; the Product Map GUID prefixes are also part of the old
+		 * utf8mb4 key-length compatibility contract.
+		 */
+		$required_indexes = array(
+			array( Mobo_Core_Product_Map::table_name(), 'remote_object', true, array( array( 'remote_guid', 150 ), array( 'object_type', 0 ) ) ),
+			array( Mobo_Core_Product_Map::table_name(), 'parent_object', false, array( array( 'parent_remote_guid', 120 ), array( 'object_type', 0 ) ) ),
+			array( Mobo_Core_Product_Ledger::table_name(), 'product_guid', true, array( array( 'product_guid', 150 ) ) ),
+			array( Mobo_Core_Sync_Event_Store::table_name(), 'event_uuid', true, array( array( 'event_uuid', 0 ) ) ),
+			array( Mobo_Core_Sync_Event_Store::table_name(), 'claim_token', false, array( array( 'claim_token', 0 ) ) ),
+			array( Mobo_Core_Category_Map::table_name(), 'remote_guid', true, array( array( 'remote_guid', 0 ) ) ),
+			array( Mobo_Core_Image_Queue::table_name(), 'queue_key', true, array( array( 'queue_key', 0 ) ) ),
+			array( Mobo_Core_Image_Refresh_Queue::table_name(), 'queue_key', true, array( array( 'queue_key', 0 ) ) ),
+			array( Mobo_Core_Orphan_Image_Cleanup::table_name(), 'file_key', true, array( array( 'file_key', 0 ) ) ),
+			array( Mobo_Core_Reconciliation::table_name(), 'product_guid', true, array( array( 'product_guid', 0 ) ) ),
+		);
+
+		foreach ( $required_indexes as $requirement ) {
+			if ( self::database_index_matches( $requirement[0], $requirement[1], $requirement[2], $requirement[3] ) ) {
+				continue;
+			}
+
+			/*
+			 * dbDelta does not reliably replace an existing index whose name stayed the
+			 * same while its prefix/column definition changed. Repair only Mobo Core's
+			 * own named indexes, then verify the exact postcondition again.
+			 */
+			if ( ! self::repair_database_index( $requirement[0], $requirement[1], $requirement[2], $requirement[3] )
+				|| ! self::database_index_matches( $requirement[0], $requirement[1], $requirement[2], $requirement[3] ) ) {
+				if ( '' === self::$schema_last_failure ) {
+					self::$schema_last_failure = 'required index does not match after automatic repair: ' . $requirement[0] . '.' . $requirement[1] . '.';
+				}
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Verify one required database index exactly enough for runtime correctness.
+	 *
+	 * @param string $table Table name.
+	 * @param string $index Index name.
+	 * @param bool   $unique Whether the index must be unique.
+	 * @param array  $columns Ordered array of [column_name, required_prefix_length].
+	 * @return bool
+	 */
+	private static function database_index_matches( $table, $index, $unique, $columns ) {
+		global $wpdb;
+
+		/*
+		 * Do not depend on metadata schemas here. Shared-hosting database users can
+		 * legitimately be denied visibility into them even though the application
+		 * has full access to its own WordPress tables. SHOW INDEX operates against
+		 * the target table itself and is therefore a better portability contract.
+		 */
+		$table = is_string( $table ) ? trim( $table ) : '';
+		$index = is_string( $index ) ? trim( $index ) : '';
+		if ( '' === $table || '' === $index || ! is_array( $columns ) ) {
+			return false;
+		}
+
+		/* Table names originate from Mobo Core table_name() methods. Quote the
+		 * identifier defensively rather than interpolating it unescaped. */
+		$quoted_table = '`' . str_replace( '`', '``', $table ) . '`';
+		$all_rows     = $wpdb->get_results( "SHOW INDEX FROM {$quoted_table}", ARRAY_A );
+		if ( ! is_array( $all_rows ) || empty( $all_rows ) ) {
+			return false;
+		}
+
+		$rows = array();
+		foreach ( $all_rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+
+			$key_name = '';
+			if ( isset( $row['Key_name'] ) ) {
+				$key_name = (string) $row['Key_name'];
+			} elseif ( isset( $row['KEY_NAME'] ) ) {
+				$key_name = (string) $row['KEY_NAME'];
+			} elseif ( isset( $row['key_name'] ) ) {
+				$key_name = (string) $row['key_name'];
+			}
+
+			if ( $index === $key_name ) {
+				$rows[] = $row;
+			}
+		}
+
+		if ( count( $rows ) !== count( $columns ) ) {
+			return false;
+		}
+
+		usort(
+			$rows,
+			static function ( $left, $right ) {
+				$left_seq  = isset( $left['Seq_in_index'] ) ? absint( $left['Seq_in_index'] ) : ( isset( $left['SEQ_IN_INDEX'] ) ? absint( $left['SEQ_IN_INDEX'] ) : 0 );
+				$right_seq = isset( $right['Seq_in_index'] ) ? absint( $right['Seq_in_index'] ) : ( isset( $right['SEQ_IN_INDEX'] ) ? absint( $right['SEQ_IN_INDEX'] ) : 0 );
+				return $left_seq <=> $right_seq;
+			}
+		);
+
+		foreach ( array_values( $columns ) as $offset => $expected ) {
+			$row = isset( $rows[ $offset ] ) && is_array( $rows[ $offset ] ) ? $rows[ $offset ] : array();
+			$expected_name   = isset( $expected[0] ) ? (string) $expected[0] : '';
+			$expected_prefix = isset( $expected[1] ) ? absint( $expected[1] ) : 0;
+
+			if ( isset( $row['Column_name'] ) ) {
+				$actual_name = (string) $row['Column_name'];
+			} elseif ( isset( $row['COLUMN_NAME'] ) ) {
+				$actual_name = (string) $row['COLUMN_NAME'];
+			} else {
+				$actual_name = '';
+			}
+
+			if ( array_key_exists( 'Sub_part', $row ) ) {
+				$actual_prefix = null !== $row['Sub_part'] ? absint( $row['Sub_part'] ) : 0;
+			} elseif ( array_key_exists( 'SUB_PART', $row ) ) {
+				$actual_prefix = null !== $row['SUB_PART'] ? absint( $row['SUB_PART'] ) : 0;
+			} else {
+				$actual_prefix = 0;
+			}
+
+			if ( $expected_name !== $actual_name || $expected_prefix !== $actual_prefix ) {
+				return false;
+			}
+		}
+
+		$first_row = $rows[0];
+		if ( isset( $first_row['Non_unique'] ) ) {
+			$non_unique = absint( $first_row['Non_unique'] );
+		} elseif ( isset( $first_row['NON_UNIQUE'] ) ) {
+			$non_unique = absint( $first_row['NON_UNIQUE'] );
+		} else {
+			return false;
+		}
+
+		return $unique ? 0 === $non_unique : 1 === $non_unique;
+	}
+
+
+	/**
+	 * Repair one Mobo-owned required index using table-local SHOW/ALTER statements.
+	 *
+	 * This intentionally avoids metadata schemas because shared-hosting database
+	 * users may not be allowed to inspect them. Index/table/column identifiers are
+	 * internal constants assembled by Mobo Core; no request data reaches this SQL.
+	 *
+	 * @param string $table Table name.
+	 * @param string $index Index name.
+	 * @param bool   $unique Whether the index must be unique.
+	 * @param array  $columns Ordered array of [column_name, required_prefix_length].
+	 * @return bool
+	 */
+	private static function repair_database_index( $table, $index, $unique, $columns ) {
+		global $wpdb;
+
+		$table = is_string( $table ) ? trim( $table ) : '';
+		$index = is_string( $index ) ? trim( $index ) : '';
+		if ( '' === $table || '' === $index || ! is_array( $columns ) || empty( $columns ) ) {
+			self::$schema_last_failure = 'automatic index repair received an invalid requirement.';
+			return false;
+		}
+
+		$quoted_table = '`' . str_replace( '`', '``', $table ) . '`';
+		$quoted_index = '`' . str_replace( '`', '``', $index ) . '`';
+		$rows         = $wpdb->get_results( "SHOW INDEX FROM {$quoted_table}", ARRAY_A );
+		if ( ! is_array( $rows ) ) {
+			self::$schema_last_failure = 'SHOW INDEX failed for ' . $table . ': ' . (string) $wpdb->last_error;
+			return false;
+		}
+
+		$index_exists = false;
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$key_name = isset( $row['Key_name'] ) ? (string) $row['Key_name'] : ( isset( $row['KEY_NAME'] ) ? (string) $row['KEY_NAME'] : ( isset( $row['key_name'] ) ? (string) $row['key_name'] : '' ) );
+			if ( $index === $key_name ) {
+				$index_exists = true;
+				break;
+			}
+		}
+
+		if ( $index_exists ) {
+			$dropped = $wpdb->query( "ALTER TABLE {$quoted_table} DROP INDEX {$quoted_index}" );
+			if ( false === $dropped ) {
+				self::$schema_last_failure = 'could not replace index ' . $table . '.' . $index . ' (DROP failed): ' . (string) $wpdb->last_error;
+				return false;
+			}
+		}
+
+		$column_sql = array();
+		foreach ( array_values( $columns ) as $expected ) {
+			$name   = isset( $expected[0] ) ? trim( (string) $expected[0] ) : '';
+			$prefix = isset( $expected[1] ) ? absint( $expected[1] ) : 0;
+			if ( '' === $name ) {
+				self::$schema_last_failure = 'automatic index repair received an empty column for ' . $table . '.' . $index . '.';
+				return false;
+			}
+			$quoted_column = '`' . str_replace( '`', '``', $name ) . '`';
+			$column_sql[]  = $quoted_column . ( $prefix > 0 ? '(' . $prefix . ')' : '' );
+		}
+
+		$kind = $unique ? 'UNIQUE KEY' : 'KEY';
+		$sql  = "ALTER TABLE {$quoted_table} ADD {$kind} {$quoted_index} (" . implode( ', ', $column_sql ) . ')';
+		$added = $wpdb->query( $sql );
+		if ( false === $added ) {
+			self::$schema_last_failure = 'could not create required index ' . $table . '.' . $index . ': ' . (string) $wpdb->last_error;
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Stamp the plugin DB version only after schema postconditions are verified.
+	 *
+	 * @param bool $initial_ready Result immediately after dbDelta/create-table calls.
+	 * @return void
+	 */
+	private static function finalize_database_version( $initial_ready ) {
+		$ready = (bool) $initial_ready && self::database_schema_ready();
+		if ( $ready ) {
+			update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
+			delete_option( 'mobo_core_schema_last_error' );
+			delete_option( 'mobo_core_schema_last_error_at' );
+			return;
+		}
+
+		$error = '' !== self::$schema_last_failure
+			? 'Mobo Core database migration did not satisfy required schema postconditions: ' . self::$schema_last_failure . ' It will retry on the next request.'
+			: 'Mobo Core database migration did not satisfy required schema postconditions; it will retry on the next request.';
+		update_option( 'mobo_core_schema_last_error', $error, false );
+		update_option( 'mobo_core_schema_last_error_at', time(), false );
 	}
 
 
@@ -829,66 +1161,197 @@ class Mobo_Core_Migration {
 	}
 
 	/**
+	 * Enable the non-destructive image-maintenance invariants introduced in
+	 * 10.33.20 and reopen the orphan-family scan for old collision leftovers.
+	 * No media file is deleted by this migration.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103320_image_cleanup_recovery( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.33.20', '>=' ) ) {
+			return;
+		}
+
+		/* Retire the old hidden execution switch; automation state or an explicit manual action now controls execution. */
+		update_option( 'mobo_core_image_refresh_enabled', '0', false );
+		update_option( 'mobo_core_image_refresh_generate_subsizes', '1', false );
+		update_option( 'mobo_core_image_refresh_cleanup_leftover_subsizes', '1', false );
+		delete_option( 'mobo_core_orphan_image_scan_cursor' );
+		delete_option( 'mobo_core_orphan_image_cleanup_last_scan' );
+		delete_option( 'mobo_core_orphan_image_cleanup_last_delete' );
+
+		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) && Mobo_Core_Orphan_Image_Cleanup::table_exists() ) {
+			$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
+			$cleanup->reset( true );
+		}
+
+		update_option( 'mobo_core_103320_image_cleanup_recovery_at', time(), false );
+	}
+
+	/**
+	 * Re-open non-destructive image integrity audits introduced in 10.33.24.
+	 * Existing files are never deleted here; maintenance/refresh workers re-check
+	 * local dimensions, subsize metadata and WooCommerce linkage asynchronously.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103324_image_storage_integrity_reaudit( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.33.24', '>=' ) ) {
+			return;
+		}
+
+		/* The stronger 10.33.24 health rules need one complete pass from the start;
+		 * keeping an old cursor could postpone detection of stale dimensions/files. */
+		delete_option( 'mobo_core_image_queue_file_audit_cursor' );
+		delete_option( 'mobo_core_image_subsize_scan_cursor' );
+		delete_option( 'mobo_core_image_subsize_repair_cursor' );
+		delete_option( 'mobo_core_image_refresh_last_subsize_scan' );
+		delete_option( 'mobo_core_image_refresh_last_subsize_repair' );
+
+		/* Reuse the deferred queue recovery hook so existing duplicate/missing gallery
+		 * linkage is repaired after WooCommerce has registered its product runtime. */
+		update_option( 'mobo_core_image_queue_recovery_pending', '1', false );
+		update_option( 'mobo_core_103324_image_storage_reaudit_at', time(), false );
+	}
+
+
+	/**
+	 * Apply system-integrity safety guards introduced in 10.33.25.
+	 *
+	 * This migration is intentionally non-destructive. It retires the legacy cart
+	 * option lock and aborts only a pre-10.33.25 deep reconciliation sweep whose
+	 * catalog completion was never proven by the stronger response contract.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103325_system_integrity_safety( $previous_version ) {
+		$installed_version = trim( (string) $previous_version );
+		if ( '' !== $installed_version && version_compare( $installed_version, '10.33.25', '>=' ) ) {
+			return;
+		}
+
+		delete_option( 'mobo_core_shared_mobo_cart_lock' );
+
+		$state = get_option( 'mobo_core_reconciliation_state', array() );
+		if ( is_array( $state )
+			&& 'deep' === ( isset( $state['mode'] ) ? (string) $state['mode'] : '' )
+			&& 'sweep' === ( isset( $state['phase'] ) ? (string) $state['phase'] : '' )
+			&& empty( $state['catalogCompletionValidated'] ) ) {
+			$state['status']                     = 'idle';
+			$state['phase']                      = '';
+			$state['pending']                    = array();
+			$state['deepSeen']                   = array();
+			$state['catalogValidatedPages']      = 0;
+			$state['catalogCompletionValidated'] = false;
+			$state['scanCursor']                 = 0;
+			$state['nextScanCursor']             = 0;
+			$state['scanHasMore']                = false;
+			$state['sweepCursor']                = 0;
+			$state['updatedAt']                  = time();
+			$state['lastError']                  = 'Unsafe legacy deep sweep was aborted during the 10.33.25 integrity migration.';
+			$state['lastMessage']                = 'Deep reconciliation will restart from a fully validated catalog snapshot.';
+			update_option( 'mobo_core_reconciliation_state', $state, false );
+			update_option( 'mobo_core_103325_legacy_sweep_aborted_at', time(), false );
+		}
+
+		update_option( 'mobo_core_103325_integrity_safety_at', time(), false );
+	}
+
+	/**
 	 * Run repairs that require taxonomies registered on WordPress init.
 	 *
 	 * @return void
 	 */
 	public static function run_deferred_repairs() {
 		/*
-		 * Stage 7 resume kicks are intentionally dispatched only after init.
-		 * This avoids rest_url()/rewrite access during plugins_loaded migrations.
+		 * Upgrade activation can leave several independent durable intents behind.
+		 * Never fire one loopback per intent: collect them and hand the dispatcher a
+		 * single wake-up after all cheap/local repair scheduling is complete.
 		 */
-		if ( '1' === (string) get_option( 'mobo_core_stage7_resume_kick_pending', '0' )
-			&& class_exists( 'Mobo_Core_Self_Runner' )
-			&& method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+		$worker_reasons = array();
+
+		if ( '1' === (string) get_option( 'mobo_core_worker_dispatch_pending', '0' ) ) {
+			$worker_reasons[] = 'pending-dispatch';
+		}
+
+		if ( '1' === (string) get_option( 'mobo_core_stage7_resume_kick_pending', '0' ) ) {
 			delete_option( 'mobo_core_stage7_resume_kick_pending' );
-			$kick = Mobo_Core_Self_Runner::kick( 'stage7-auto-resume-upgrade', true );
-			update_option( 'mobo_core_stage7_resume_deferred_kick_result', $kick, false );
-			update_option( 'mobo_core_stage7_resume_deferred_kick_at', time(), false );
+			$worker_reasons[] = 'stage7-auto-resume-upgrade';
 		}
 
 		if ( '1' === (string) get_option( 'mobo_core_category_placeholder_repair_pending', '0' )
 			&& taxonomy_exists( 'product_cat' ) ) {
 			$result = self::repair_placeholder_category_titles_from_map();
-
 			update_option( 'mobo_core_category_placeholder_repair_result', $result, false );
 			update_option( 'mobo_core_category_placeholder_repair_at', time(), false );
 			delete_option( 'mobo_core_category_placeholder_repair_pending' );
 		}
 
-		if ( '1' !== (string) get_option( 'mobo_core_image_queue_recovery_pending', '0' ) ) {
+		$product_recovery_requested = '1' === (string) get_option( 'mobo_core_product_recovery_kick_pending', '0' );
+		if ( $product_recovery_requested ) {
+			delete_option( 'mobo_core_product_recovery_kick_pending' );
+			$worker_reasons[] = 'product-retention-recovery';
+		}
+
+		if ( '1' === (string) get_option( 'mobo_core_image_queue_recovery_pending', '0' )
+			&& class_exists( 'Mobo_Core_Image_Queue' )
+			&& Mobo_Core_Image_Queue::table_exists() ) {
+			$failed_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
+				? Mobo_Core_Image_Queue::recover_legacy_failed( 500 )
+				: array( 'status' => 'unavailable', 'recovered' => 0, 'remaining' => 0 );
+			$linkage_recovery = method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
+				? Mobo_Core_Image_Queue::schedule_linkage_repairs( 200 )
+				: array( 'status' => 'unavailable', 'scheduled' => 0 );
+
+			$result = array(
+				'failedRows' => $failed_recovery,
+				'linkage'    => $linkage_recovery,
+				'executedAt' => time(),
+			);
+			update_option( 'mobo_core_103199_image_queue_recovery_result', $result, false );
+			update_option( 'mobo_core_103199_image_queue_recovery_at', time(), false );
+
+			$scheduled_work = ( isset( $failed_recovery['recovered'] ) ? absint( $failed_recovery['recovered'] ) : 0 )
+				+ ( isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0 );
+			if ( $scheduled_work > 0 ) {
+				$worker_reasons[] = 'image-queue-recovery';
+			}
+			if ( empty( $failed_recovery['remaining'] ) ) {
+				delete_option( 'mobo_core_image_queue_recovery_pending' );
+			}
+		}
+
+		$worker_reasons = array_values( array_unique( array_filter( array_map( 'sanitize_key', $worker_reasons ) ) ) );
+		if ( empty( $worker_reasons ) || ! class_exists( 'Mobo_Core_Self_Runner' ) || ! method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
 			return;
 		}
 
-		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
-			return;
-		}
-
-		$failed_recovery = method_exists( 'Mobo_Core_Image_Queue', 'recover_legacy_failed' )
-			? Mobo_Core_Image_Queue::recover_legacy_failed( 500 )
-			: array( 'status' => 'unavailable', 'recovered' => 0, 'remaining' => 0 );
-		$linkage_recovery = method_exists( 'Mobo_Core_Image_Queue', 'schedule_linkage_repairs' )
-			? Mobo_Core_Image_Queue::schedule_linkage_repairs( 200 )
-			: array( 'status' => 'unavailable', 'scheduled' => 0 );
-
-		$result = array(
-			'failedRows' => $failed_recovery,
-			'linkage'    => $linkage_recovery,
-			'executedAt' => time(),
+		$kick = Mobo_Core_Self_Runner::kick( 'deferred-repair-coalesced', true );
+		update_option(
+			'mobo_core_deferred_repair_coalesced_kick_result',
+			array(
+				'reasons' => $worker_reasons,
+				'kick'    => $kick,
+				'at'      => time(),
+			),
+			false
 		);
 
-		update_option( 'mobo_core_103199_image_queue_recovery_result', $result, false );
-		update_option( 'mobo_core_103199_image_queue_recovery_at', time(), false );
-
-		$scheduled_work = ( isset( $failed_recovery['recovered'] ) ? absint( $failed_recovery['recovered'] ) : 0 )
-			+ ( isset( $linkage_recovery['scheduled'] ) ? absint( $linkage_recovery['scheduled'] ) : 0 );
-
-		if ( $scheduled_work > 0 && class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
-			Mobo_Core_Self_Runner::kick( 'image-queue-recovery', true );
+		if ( in_array( 'stage7-auto-resume-upgrade', $worker_reasons, true ) ) {
+			update_option( 'mobo_core_stage7_resume_deferred_kick_result', $kick, false );
+			update_option( 'mobo_core_stage7_resume_deferred_kick_at', time(), false );
 		}
-
-		if ( empty( $failed_recovery['remaining'] ) ) {
-			delete_option( 'mobo_core_image_queue_recovery_pending' );
+		if ( in_array( 'product-retention-recovery', $worker_reasons, true ) ) {
+			update_option( 'mobo_core_103329_product_recovery_kick_result', $kick, false );
+			update_option( 'mobo_core_103329_product_recovery_kick_at', time(), false );
+			if ( ! is_array( $kick ) || empty( $kick['success'] ) ) {
+				update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+			}
 		}
 	}
 
@@ -1253,6 +1716,223 @@ class Mobo_Core_Migration {
 		return $attachment_meta_count > 0;
 	}
 
+
+
+
+	/**
+	 * Establish append-only product ownership and schedule one automatic recovery
+	 * pass for upgrades from versions that could physically delete parent products.
+	 * Existing customer settings, including OnlyInStock, are never changed.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103329_product_retention_recovery( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.29', '>=' ) ) {
+			return;
+		}
+
+		$has_existing_evidence = false;
+		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
+			$seed = Mobo_Core_Product_Ledger::seed_existing_evidence();
+			update_option( 'mobo_core_103329_product_ledger_seed_result', $seed, false );
+			update_option( 'mobo_core_103329_product_ledger_seed_at', time(), false );
+			$has_existing_evidence = ! empty( Mobo_Core_Product_Ledger::get_after_id( 0, 1 ) );
+		}
+
+		/*
+		 * A blank DB version normally means a fresh install. Treat it as an existing
+		 * legacy installation when durable Mobo product evidence is already present;
+		 * this keeps recovery available after unusual/manual DB-version loss.
+		 */
+		if ( ( '' !== $previous_version || $has_existing_evidence ) && class_exists( 'Mobo_Core_Product_Recovery' ) ) {
+			Mobo_Core_Product_Recovery::schedule( 'upgrade-10.33.29' );
+			update_option( 'mobo_core_103329_product_recovery_scheduled_at', time(), false );
+			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
+			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+
+	/**
+	 * One-time 10.33.33 recovery re-audit.
+	 *
+	 * 10.33.32 could miss the 10.33.29 recovery scheduling step when an upgrade
+	 * was performed through deactivate/replace/activate: activation stamped the
+	 * new DB version before maybe_run() could observe the old version. Re-arm one
+	 * bounded site-scoped recovery generation for every existing pre-10.33.33
+	 * installation so those sites are healed automatically as well. Fresh installs
+	 * remain quiet unless durable local Mobo product evidence already exists.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103333_product_recovery_reaudit( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+
+		/* Fresh installs and upgrades from pre-10.33.29 are already handled by the
+		 * original retention migration immediately above. This re-audit exists only
+		 * for the 10.33.29..10.33.32 window where an activation-style upgrade could
+		 * have stamped the version without ever scheduling that migration. */
+		if ( '' === $previous_version
+			|| version_compare( $previous_version, '10.33.29', '<' )
+			|| version_compare( $previous_version, '10.33.33', '>=' ) ) {
+			return;
+		}
+
+		/* Schema self-heal may intentionally leave the old DB version in place for
+		 * another request. Do not repeat the full evidence seed on every request once
+		 * this one-shot generation has already been armed. */
+		if ( absint( get_option( 'mobo_core_103333_product_recovery_reaudit_scheduled_at', 0 ) ) > 0 ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
+			$seed = Mobo_Core_Product_Ledger::seed_existing_evidence();
+			update_option( 'mobo_core_103333_product_ledger_reaudit_seed_result', $seed, false );
+			update_option( 'mobo_core_103333_product_ledger_reaudit_seed_at', time(), false );
+		}
+
+		/* A versioned installation may have Portal-only delivery evidence even when
+		 * every local trace of a previously deleted product has already vanished. */
+		if ( class_exists( 'Mobo_Core_Product_Recovery' ) ) {
+			Mobo_Core_Product_Recovery::schedule( 'upgrade-10.33.33-reaudit' );
+			update_option( 'mobo_core_103333_product_recovery_reaudit_scheduled_at', time(), false );
+			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
+			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+	/**
+	 * One-time 10.33.35 storefront-integrity re-audit.
+	 *
+	 * Older installations could keep a locally missing product or a variation with
+	 * only a subset of the parent's attributes while Portal ContentHash remained
+	 * unchanged. Re-run the existing site-scoped recovery ledger once; healthy local
+	 * products are skipped cheaply, while missing/drifted products take the exact GUID
+	 * desired-state path.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103335_variation_integrity_reaudit( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.35', '>=' ) ) {
+			return;
+		}
+
+		if ( absint( get_option( 'mobo_core_103335_variation_integrity_reaudit_scheduled_at', 0 ) ) > 0 ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
+			$seed = Mobo_Core_Product_Ledger::seed_existing_evidence();
+			update_option( 'mobo_core_103335_variation_integrity_ledger_seed_result', $seed, false );
+			update_option( 'mobo_core_103335_variation_integrity_ledger_seed_at', time(), false );
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Recovery' ) ) {
+			Mobo_Core_Product_Recovery::schedule_followup( Mobo_Core_Product_Recovery::VARIATION_INTEGRITY_REASON );
+			update_option( 'mobo_core_103335_variation_integrity_reaudit_scheduled_at', time(), false );
+			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
+			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+
+	/**
+	 * One-time 10.33.36 recovery-state self-heal.
+	 *
+	 * Versions through 10.33.35 could arm product-recovery pending without creating
+	 * the state row when that option was entirely absent. schedule_followup() also
+	 * treated pending + empty-array state as an active generation. Re-arm one fresh
+	 * site-scoped generation after upgrading so installs that crossed that window
+	 * cannot remain permanently pending with no generation/cursor. If an older
+	 * generation is genuinely active, the fixed follow-up scheduler queues this
+	 * self-heal behind it instead of overlapping it.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103336_recovery_state_selfheal( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.36', '>=' ) ) {
+			return;
+		}
+
+		if ( absint( get_option( 'mobo_core_103336_recovery_state_selfheal_scheduled_at', 0 ) ) > 0 ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Recovery' ) ) {
+			Mobo_Core_Product_Recovery::schedule_followup( 'upgrade-10.33.36-recovery-state-selfheal' );
+			update_option( 'mobo_core_103336_recovery_state_selfheal_scheduled_at', time(), false );
+			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
+			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+	/**
+	 * One-time 10.33.38 variation-integrity reason self-heal.
+	 *
+	 * 10.33.35/10.33.36 sanitized a dotted reason to upgrade-103335-..., while
+	 * the recovery worker compared against a hyphenated literal. Sites that already
+	 * crossed those builds therefore need one serialized authoritative ledger pass.
+	 * Older sites execute the corrected 10.33.35 migration directly and are not
+	 * scheduled twice.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103337_variation_integrity_reason_selfheal( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+
+		if ( '' === $previous_version
+			|| version_compare( $previous_version, '10.33.35', '<' )
+			|| version_compare( $previous_version, '10.33.38', '>=' ) ) {
+			return;
+		}
+
+		if ( absint( get_option( 'mobo_core_103337_variation_integrity_reason_selfheal_scheduled_at', 0 ) ) > 0 ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Recovery' ) ) {
+			Mobo_Core_Product_Recovery::schedule_followup( Mobo_Core_Product_Recovery::VARIATION_INTEGRITY_REASON );
+			update_option( 'mobo_core_103337_variation_integrity_reason_selfheal_scheduled_at', time(), false );
+			update_option( 'mobo_core_maintenance_next_due_at', time(), false );
+			update_option( 'mobo_core_product_recovery_kick_pending', '1', false );
+		}
+	}
+
+	/**
+	 * Re-run legacy identity-map seeding through bounded maintenance.
+	 *
+	 * Versions before 10.33.28 could advance a legacy seed cursor after a failed
+	 * mapping write and migration itself only ran one bounded batch. Reset only the
+	 * cursors/completion markers; existing map rows remain intact and are idempotently
+	 * re-verified by maintenance until the scan actually completes.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103328_legacy_map_reseed_safety( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.28', '>=' ) ) {
+			return;
+		}
+
+		delete_option( 'mobo_core_product_map_product_cursor' );
+		delete_option( 'mobo_core_product_map_variation_cursor' );
+		delete_option( 'mobo_core_product_map_seed_completed_at' );
+		delete_option( 'mobo_core_category_map_cursor' );
+		delete_option( 'mobo_core_category_map_seed_completed_at' );
+		delete_option( 'mobo_core_103328_legacy_map_reseed_completed_at' );
+		update_option( 'mobo_core_103328_legacy_map_reseed_scheduled_at', time(), false );
+		update_option( 'mobo_core_maintenance_next_due_at', time() + 60, false );
+	}
 
 	/**
 	 * Seed product/variation map from old post meta without blocking upgrades.

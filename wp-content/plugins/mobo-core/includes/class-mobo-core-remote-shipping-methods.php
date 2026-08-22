@@ -69,15 +69,16 @@ class Mobo_Core_Remote_Shipping_Methods {
 	public function sync_now( $source = 'manual', $force = true ) {
 		update_option( self::OPTION_LAST_ATTEMPT, time(), false );
 
-		$api    = new Mobo_Core_API_Client();
-		$result = method_exists( $api, 'get_mobo_shipping_methods' ) ? $api->get_mobo_shipping_methods() : new WP_Error( 'mobo_core_missing_shipping_api', 'MoboCore shipping-methods API is not available in this plugin build.' );
+		$request_started_at = time();
+		$api                = new Mobo_Core_API_Client();
+		$result             = method_exists( $api, 'get_mobo_shipping_methods' ) ? $api->get_mobo_shipping_methods() : new WP_Error( 'mobo_core_missing_shipping_api', 'MoboCore shipping-methods API is not available in this plugin build.' );
 
 		if ( is_wp_error( $result ) ) {
 			update_option( self::OPTION_LAST_ERROR, $result->get_error_message(), false );
 			return array( 'success' => false, 'status' => 'failed', 'message' => $result->get_error_message() );
 		}
 
-		$stored = $this->store_snapshot( $result, $source );
+		$stored = $this->store_snapshot( $result, $source, $request_started_at );
 		if ( empty( $stored['success'] ) ) {
 			update_option( self::OPTION_LAST_ERROR, isset( $stored['message'] ) ? $stored['message'] : 'Invalid Mobo shipping-methods payload.', false );
 			return $stored;
@@ -88,9 +89,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 
 		return array(
 			'success' => true,
-			'status'  => 'ok',
+			'status'  => isset( $stored['status'] ) ? sanitize_key( (string) $stored['status'] ) : 'ok',
 			'count'   => isset( $stored['count'] ) ? absint( $stored['count'] ) : count( $this->get_methods() ),
-			'message' => 'Mobo shipping methods synced from MoboCore.',
+			'message' => 'stale-ignored' === ( isset( $stored['status'] ) ? $stored['status'] : '' ) ? 'A newer Mobo shipping snapshot was already stored; the late response was ignored.' : 'Mobo shipping methods synced from MoboCore.',
 		);
 	}
 
@@ -99,42 +100,104 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 *
 	 * @param array  $payload Payload.
 	 * @param string $source Source name.
+	 * @param int    $request_started_at Local request start time for stale-response protection.
 	 * @return array
 	 */
-	public function store_snapshot( $payload, $source = 'webhook' ) {
-		$data = isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : $payload;
-		$raw_methods = array();
+	public function store_snapshot( $payload, $source = 'webhook', $request_started_at = 0 ) {
+		if ( ! is_array( $payload ) ) {
+			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload is invalid.' );
+		}
 
-		if ( isset( $data['shippings'] ) && is_array( $data['shippings'] ) ) {
+		global $wpdb;
+		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
+		$lock_name = 'mobo_ship_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 3 ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic authoritative snapshot replacement.
+		if ( '1' !== (string) $acquired ) {
+			return array( 'success' => false, 'status' => 'busy', 'message' => 'Mobo shipping snapshot is being updated by another request.' );
+		}
+
+		try {
+			$data        = isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : $payload;
+		$raw_methods = null;
+
+		if ( array_key_exists( 'shippings', $data ) && is_array( $data['shippings'] ) ) {
 			$raw_methods = $data['shippings'];
-		} elseif ( isset( $data['methods'] ) && is_array( $data['methods'] ) ) {
+		} elseif ( array_key_exists( 'methods', $data ) && is_array( $data['methods'] ) ) {
 			$raw_methods = $data['methods'];
-		} elseif ( isset( $payload['shippings'] ) && is_array( $payload['shippings'] ) ) {
+		} elseif ( array_key_exists( 'shippings', $payload ) && is_array( $payload['shippings'] ) ) {
 			$raw_methods = $payload['shippings'];
 		}
 
-		$methods = $this->normalize_methods( $raw_methods );
-		if ( empty( $methods ) ) {
-			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload is empty or invalid.' );
+		/* Missing collection is malformed; an explicit empty collection is a valid
+		 * authoritative state meaning Mobo currently exposes no active methods. */
+		if ( ! is_array( $raw_methods ) ) {
+			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload is missing an explicit methods collection.' );
 		}
 
-		$changed_at = ! empty( $data['changedAt'] ) ? strtotime( (string) $data['changedAt'] ) : time();
-		if ( ! $changed_at ) {
-			$changed_at = time();
+		$seen_method_ids = array();
+		foreach ( $raw_methods as $raw_method ) {
+			if ( ! is_array( $raw_method ) ) {
+				return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload contains a malformed method row.' );
+			}
+			$id = array_key_exists( 'id', $raw_method )
+				? $this->parse_remote_positive_integer_id( $raw_method['id'] )
+				: ( array_key_exists( 'Id', $raw_method ) ? $this->parse_remote_positive_integer_id( $raw_method['Id'] ) : 0 );
+			if ( $id <= 0 || isset( $seen_method_ids[ $id ] ) ) {
+				return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload contains a missing, malformed, or duplicate method identity.' );
+			}
+			if ( ! $this->remote_shipping_method_shape_is_safe( $raw_method ) ) {
+				return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload contains malformed restrictions, status, or numeric bounds.' );
+			}
+			$seen_method_ids[ $id ] = true;
+		}
+
+		$methods = $this->normalize_methods( $raw_methods );
+
+		$changed_at_raw = array_key_exists( 'changedAt', $data ) ? $data['changedAt'] : ( array_key_exists( 'changedAt', $payload ) ? $payload['changedAt'] : null );
+		$changed_explicit = null !== $changed_at_raw && '' !== trim( (string) $changed_at_raw );
+		$changed_at       = $changed_explicit ? $this->parse_changed_at( $changed_at_raw ) : time();
+		if ( $changed_explicit && $changed_at <= 0 ) {
+			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods changedAt value is invalid.' );
+		}
+
+		$current = get_option( self::OPTION_SNAPSHOT, array() );
+		$current = is_array( $current ) ? $current : array();
+		$current_changed_at       = absint( isset( $current['changedAt'] ) ? $current['changedAt'] : 0 );
+		$current_changed_explicit = ! empty( $current['changedAtExplicit'] );
+		$current_synced_at        = absint( isset( $current['syncedAt'] ) ? $current['syncedAt'] : 0 );
+		$request_started_at       = absint( $request_started_at );
+
+		if ( $changed_explicit && $current_changed_explicit && $current_changed_at > 0 && $changed_at < $current_changed_at ) {
+			return array( 'success' => true, 'status' => 'stale-ignored', 'count' => count( isset( $current['shippings'] ) && is_array( $current['shippings'] ) ? $current['shippings'] : array() ) );
+		}
+		if ( ! $changed_explicit && $request_started_at > 0 && $current_synced_at > $request_started_at ) {
+			return array( 'success' => true, 'status' => 'stale-ignored', 'count' => count( isset( $current['shippings'] ) && is_array( $current['shippings'] ) ? $current['shippings'] : array() ) );
 		}
 
 		$snapshot = array(
-			'success'   => true,
-			'source'    => sanitize_key( (string) $source ),
-			'syncedAt'  => time(),
-			'changedAt' => $changed_at,
-			'shippings' => $methods,
+			'success'           => true,
+			'source'            => sanitize_key( (string) $source ),
+			'syncedAt'          => time(),
+			'changedAt'         => $changed_at,
+			'changedAtExplicit' => $changed_explicit,
+			'shippings'         => $methods,
 		);
 
-		update_option( self::OPTION_SNAPSHOT, $snapshot, false );
-		update_option( self::OPTION_CHANGED_AT, $changed_at, false );
+			update_option( self::OPTION_SNAPSHOT, $snapshot, false );
+			$stored_snapshot = get_option( self::OPTION_SNAPSHOT, array() );
+			if ( ! is_array( $stored_snapshot ) || $stored_snapshot !== $snapshot ) {
+				return array( 'success' => false, 'status' => 'storage-failed', 'message' => 'Could not persist the Mobo shipping methods snapshot.' );
+			}
 
-		return array( 'success' => true, 'status' => 'stored', 'count' => count( $methods ) );
+			update_option( self::OPTION_CHANGED_AT, $changed_at, false );
+			if ( absint( get_option( self::OPTION_CHANGED_AT, 0 ) ) !== absint( $changed_at ) ) {
+				return array( 'success' => false, 'status' => 'storage-failed', 'message' => 'Could not persist the Mobo shipping methods revision.' );
+			}
+
+			return array( 'success' => true, 'status' => 'stored', 'count' => count( $methods ) );
+		} finally {
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release authoritative snapshot guard.
+		}
 	}
 
 	/**
@@ -636,7 +699,10 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$shipping_city    = method_exists( $order, 'get_shipping_city' ) ? trim( (string) $order->get_shipping_city() ) : '';
 		$shipping_address = method_exists( $order, 'get_shipping_address_1' ) ? trim( (string) $order->get_shipping_address_1() ) : '';
 
-		if ( '' !== $shipping_country || '' !== $shipping_state || '' !== $shipping_city || '' !== $shipping_address ) {
+		/* Keep address ownership identical to checkout payload construction. A default
+		 * shipping country/state alone must not make shipping mapping use a partial
+		 * destination while the Mobo checkout payload correctly falls back to billing. */
+		if ( '' !== $shipping_country && '' !== $shipping_state && '' !== $shipping_city && '' !== $shipping_address ) {
 			return 'shipping';
 		}
 		return 'billing';
@@ -653,14 +719,13 @@ class Mobo_Core_Remote_Shipping_Methods {
 			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
 		}
 
-		$fallback = null;
-		$legacy_mobo_fallback = null;
+		$real_methods   = array();
+		$legacy_methods = array();
 		foreach ( $order->get_items( 'shipping' ) as $shipping_item ) {
 			$method_id   = method_exists( $shipping_item, 'get_method_id' ) ? sanitize_key( (string) $shipping_item->get_method_id() ) : '';
 			$instance_id = method_exists( $shipping_item, 'get_instance_id' ) ? absint( $shipping_item->get_instance_id() ) : 0;
 			$title       = method_exists( $shipping_item, 'get_name' ) ? sanitize_text_field( (string) $shipping_item->get_name() ) : '';
 			$mobo_shipping_id = method_exists( $shipping_item, 'get_meta' ) ? absint( $shipping_item->get_meta( '_mobo_shipping_id', true ) ) : 0;
-
 			if ( '' === $method_id ) {
 				continue;
 			}
@@ -671,26 +736,29 @@ class Mobo_Core_Remote_Shipping_Methods {
 				'title'          => '' !== $title ? $title : $method_id,
 				'moboShippingId' => $mobo_shipping_id,
 			);
+			$key = $method_id . ':' . $instance_id . ':' . $mobo_shipping_id;
 
-			/* Mapping-only policy: prefer the merchant's real WooCommerce shipping
-			 * line. A retired Mobo shipping line is kept only as a legacy fallback for
-			 * orders that were created before the upgrade. */
+			/* Mapping-only policy: retired Mobo shipping lines are legacy evidence only. */
 			if ( 'mobo_core_shipping' === $method_id || $mobo_shipping_id > 0 ) {
-				if ( null === $legacy_mobo_fallback ) {
-					$legacy_mobo_fallback = $context;
-				}
-				continue;
-			}
-			if ( null === $fallback ) {
-				$fallback = $context;
+				$legacy_methods[ $key ] = $context;
+			} else {
+				$real_methods[ $method_id . ':' . $instance_id ] = $context;
 			}
 		}
 
-		if ( is_array( $fallback ) ) {
-			return $fallback;
+		/* Mobo accepts one shipping_id for the whole remote order. Silently choosing the
+		 * first WooCommerce package would buy the order with an arbitrary delivery mode. */
+		if ( count( $real_methods ) > 1 ) {
+			return new WP_Error( 'mobo_core_wc_shipping_method_ambiguous', 'این سفارش بیش از یک روش ارسال WooCommerce دارد و نمی‌توان یک shipping_id واحد موبو را با اطمینان انتخاب کرد.' );
 		}
-		if ( is_array( $legacy_mobo_fallback ) ) {
-			return $legacy_mobo_fallback;
+		if ( 1 === count( $real_methods ) ) {
+			return reset( $real_methods );
+		}
+		if ( count( $legacy_methods ) > 1 ) {
+			return new WP_Error( 'mobo_core_wc_shipping_method_ambiguous', 'سفارش قدیمی بیش از یک روش ارسال موبو دارد و انتخاب خودکار امن نیست.' );
+		}
+		if ( 1 === count( $legacy_methods ) ) {
+			return reset( $legacy_methods );
 		}
 
 		return new WP_Error( 'mobo_core_wc_shipping_method_missing', 'در سفارش ووکامرس هیچ روش ارسالی ثبت نشده است؛ بنابراین shipping_id موبو قابل انتخاب نیست.' );
@@ -764,7 +832,11 @@ class Mobo_Core_Remote_Shipping_Methods {
 			$product = $line_item->get_product();
 			$product_id = absint( $line_item->get_product_id() );
 			$variation_id = absint( $line_item->get_variation_id() );
-			if ( $this->is_mobo_product( $product, $product_id, $variation_id ) ) {
+			$captured = 'yes' === (string) $line_item->get_meta( '_mobo_identity_captured', true );
+			$is_mobo  = $captured
+				? 'yes' === (string) $line_item->get_meta( '_mobo_identity_is_mobo', true )
+				: $this->is_mobo_product( $product, $product_id, $variation_id );
+			if ( $is_mobo ) {
 				$mobo++;
 			} else {
 				$non++;
@@ -799,6 +871,140 @@ class Mobo_Core_Remote_Shipping_Methods {
 		return false;
 	}
 
+	/**
+	 * Parse an upstream changedAt value into a Unix timestamp.
+	 *
+	 * @param mixed $value Value.
+	 * @return int
+	 */
+	private function parse_changed_at( $value ) {
+		if ( is_numeric( $value ) ) {
+			return absint( $value );
+		}
+		$timestamp = strtotime( (string) $value );
+		return false === $timestamp ? 0 : absint( $timestamp );
+	}
+
+	/**
+	 * Strictly parse an ID coming from Mobo. Do not let strings such as "123abc"
+	 * silently become 123 and accidentally satisfy a configured shipping mapping.
+	 *
+	 * @param mixed $value Remote ID.
+	 * @return int
+	 */
+	private function parse_remote_positive_integer_id( $value ) {
+		if ( is_int( $value ) ) {
+			return $value > 0 ? $value : 0;
+		}
+		if ( ! is_string( $value ) ) {
+			return 0;
+		}
+		$value = trim( $value );
+		if ( '' === $value || ! preg_match( '/^[0-9]+$/', $value ) ) {
+			return 0;
+		}
+		$value = ltrim( $value, '0' );
+		if ( '' === $value ) {
+			return 0;
+		}
+		$max = (string) PHP_INT_MAX;
+		if ( strlen( $value ) > strlen( $max ) || ( strlen( $value ) === strlen( $max ) && strcmp( $value, $max ) > 0 ) ) {
+			return 0;
+		}
+		$id = (int) $value;
+		return $id > 0 ? $id : 0;
+	}
+
+	/**
+	 * Validate an authoritative shipping row before it can replace the last known-good snapshot.
+	 * Invalid restrictions must fail the whole snapshot: silently dropping a bad state/city list
+	 * could otherwise broaden a restricted method into an unrestricted one.
+	 *
+	 * @param array $method Raw remote method.
+	 * @return bool
+	 */
+	private function remote_shipping_method_shape_is_safe( $method ) {
+		if ( isset( $method['status'] ) && is_array( $method['status'] ) ) {
+			foreach ( $method['status'] as $status ) {
+				if ( ! is_scalar( $status ) ) {
+					return false;
+				}
+			}
+		} elseif ( isset( $method['status'] ) && ! is_scalar( $method['status'] ) ) {
+			return false;
+		}
+
+		foreach ( array( 'countries', 'states', 'cities' ) as $location_key ) {
+			if ( ! array_key_exists( $location_key, $method ) ) {
+				continue;
+			}
+			if ( ! is_array( $method[ $location_key ] ) ) {
+				return false;
+			}
+			foreach ( $method[ $location_key ] as $location ) {
+				if ( ! is_array( $location ) ) {
+					return false;
+				}
+				if ( array_key_exists( 'id', $location ) && $this->parse_remote_positive_integer_id( $location['id'] ) <= 0 ) {
+					return false;
+				}
+				if ( ! array_key_exists( 'id', $location ) && ( ! isset( $location['name'] ) || ! is_scalar( $location['name'] ) || '' === trim( (string) $location['name'] ) ) ) {
+					return false;
+				}
+			}
+		}
+
+		$numeric_keys = array( 'minimum_weight', 'maximum_weight', 'minimum_subtotal', 'maximum_subtotal', 'minimum_cost', 'maximum_cost', 'round_cost', 'cost' );
+		foreach ( $numeric_keys as $numeric_key ) {
+			if ( array_key_exists( $numeric_key, $method ) && ! $this->remote_nullable_number_is_safe( $method[ $numeric_key ] ) ) {
+				return false;
+			}
+		}
+
+		if ( array_key_exists( 'rules', $method ) ) {
+			if ( ! is_array( $method['rules'] ) ) {
+				return false;
+			}
+			foreach ( $method['rules'] as $rule ) {
+				if ( ! is_array( $rule ) ) {
+					return false;
+				}
+				foreach ( array( 'minimum_weight', 'maximum_weight', 'minimum_subtotal', 'maximum_subtotal', 'cost' ) as $numeric_key ) {
+					if ( array_key_exists( $numeric_key, $rule ) && ! $this->remote_nullable_number_is_safe( $rule[ $numeric_key ] ) ) {
+						return false;
+					}
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Accept null/blank or a finite numeric value from Mobo.
+	 *
+	 * @param mixed $value Remote numeric field.
+	 * @return bool
+	 */
+	private function remote_nullable_number_is_safe( $value ) {
+		if ( null === $value || ( is_string( $value ) && '' === trim( $value ) ) ) {
+			return true;
+		}
+		if ( is_int( $value ) || is_float( $value ) ) {
+			return is_finite( (float) $value );
+		}
+		if ( ! is_string( $value ) ) {
+			return false;
+		}
+		$value = trim( $value );
+		/* Remote shipping amounts/bounds are plain decimal strings. Do not accept
+		 * scientific notation such as "1e3" and silently reinterpret it. */
+		if ( ! preg_match( '/^[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/D', $value ) ) {
+			return false;
+		}
+		return is_finite( (float) $value );
+	}
+
 	private function normalize_methods( $methods ) {
 		if ( ! is_array( $methods ) ) {
 			return array();
@@ -810,7 +1016,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 				continue;
 			}
 
-			$id = isset( $method['id'] ) ? absint( $method['id'] ) : ( isset( $method['Id'] ) ? absint( $method['Id'] ) : 0 );
+			$id = array_key_exists( 'id', $method )
+				? $this->parse_remote_positive_integer_id( $method['id'] )
+				: ( array_key_exists( 'Id', $method ) ? $this->parse_remote_positive_integer_id( $method['Id'] ) : 0 );
 			if ( $id <= 0 ) {
 				continue;
 			}
@@ -819,7 +1027,13 @@ class Mobo_Core_Remote_Shipping_Methods {
 			$type     = isset( $method['type'] ) ? (string) $method['type'] : ( isset( $method['Type'] ) ? (string) $method['Type'] : '' );
 			$desc     = isset( $method['description'] ) ? $method['description'] : ( isset( $method['Description'] ) ? $method['Description'] : null );
 			$cost     = array_key_exists( 'cost', $method ) ? $method['cost'] : ( array_key_exists( 'Cost', $method ) ? $method['Cost'] : null );
-			$status   = isset( $method['status'] ) && is_array( $method['status'] ) ? array_values( array_filter( array_map( 'sanitize_key', $method['status'] ) ) ) : array( 'approved' );
+			if ( isset( $method['status'] ) && is_array( $method['status'] ) ) {
+				$status = array_values( array_filter( array_map( 'sanitize_key', $method['status'] ) ) );
+			} elseif ( isset( $method['status'] ) && '' !== trim( (string) $method['status'] ) ) {
+				$status = array( sanitize_key( (string) $method['status'] ) );
+			} else {
+				$status = array( 'approved' );
+			}
 			$rules    = isset( $method['rules'] ) && is_array( $method['rules'] ) ? $this->normalize_shipping_rules( $method['rules'] ) : array();
 
 			if ( in_array( 'suspended', $status, true ) || ( ! empty( $status ) && ! in_array( 'approved', $status, true ) ) ) {
@@ -886,7 +1100,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 				continue;
 			}
 			$normalized[] = array(
-				'id'        => isset( $item['id'] ) ? absint( $item['id'] ) : 0,
+				'id'        => isset( $item['id'] ) ? $this->parse_remote_positive_integer_id( $item['id'] ) : 0,
 				'name'      => isset( $item['name'] ) ? sanitize_text_field( (string) $item['name'] ) : '',
 				'latitude'  => $this->nullable_number( isset( $item['latitude'] ) ? $item['latitude'] : null ),
 				'longitude' => $this->nullable_number( isset( $item['longitude'] ) ? $item['longitude'] : null ),
@@ -896,7 +1110,11 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function nullable_number( $value ) {
-		return is_numeric( $value ) ? (float) $value : null;
+		if ( ! $this->remote_nullable_number_is_safe( $value ) || null === $value || ( is_string( $value ) && '' === trim( $value ) ) ) {
+			return null;
+		}
+		$number = (float) $value;
+		return is_finite( $number ) ? $number : null;
 	}
 
 	private function get_mobo_api_price( $variation_id, $product_id ) {

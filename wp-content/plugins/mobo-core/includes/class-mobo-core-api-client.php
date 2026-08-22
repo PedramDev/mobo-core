@@ -120,8 +120,12 @@ class Mobo_Core_API_Client {
 	 * @param string $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	public function get_products_page( $page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false ) {
-		$only_in_stock = Mobo_Core_Settings::enabled( 'mobo_core_only_in_stock', '0' ) ? 'true' : 'false';
+	public function get_products_page( $page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false, $only_in_stock_override = null ) {
+		if ( null === $only_in_stock_override ) {
+			$only_in_stock = Mobo_Core_Settings::enabled( 'mobo_core_only_in_stock', '0' ) ? 'true' : 'false';
+		} else {
+			$only_in_stock = $only_in_stock_override ? 'true' : 'false';
+		}
 
 		$args = array(
 			'OnlyInStock'   => $only_in_stock,
@@ -226,6 +230,28 @@ class Mobo_Core_API_Client {
 
 		$this->remember_sync_changes_unavailable_if_missing( $compat_response );
 		return $compat_response;
+	}
+
+
+	/**
+	 * Get the site-scoped recovery manifest. Portal returns only product identities
+	 * with delivered ProductUpdated/UpdateVariant history for the current licensed domain.
+	 * This endpoint is intentionally independent of OnlyInStock.
+	 *
+	 * @param int $cursor Product AutoIdentity cursor.
+	 * @param int $limit Maximum identities.
+	 * @return array|WP_Error
+	 */
+	public function get_product_recovery_manifest( $cursor = 0, $limit = 20 ) {
+		$path = add_query_arg(
+			array(
+				'cursor' => max( 0, absint( $cursor ) ),
+				'limit'  => max( 1, min( 200, absint( $limit ) ) ),
+			),
+			'get-product-recovery-manifest'
+		);
+
+		return $this->get_json( $path );
 	}
 
 	/**
@@ -625,129 +651,179 @@ class Mobo_Core_API_Client {
 	 */
 	private function normalize_payload_url( $payload_url ) {
 		$payload_url = trim( (string) $payload_url );
-
-		if ( preg_match( '#^https?://#i', $payload_url ) ) {
-			return esc_url_raw( $payload_url );
-		}
-
-		$base_url = $this->get_base_url();
+		$base_url    = $this->get_base_url();
 
 		if ( '' === $base_url ) {
-			return new WP_Error( 'mobo_core_missing_api_base_url', 'API base URL is missing for relative payload URL.' );
+			return new WP_Error( 'mobo_core_missing_api_base_url', 'API base URL is missing for payload URL validation.' );
 		}
 
-		if ( 0 === strpos( $payload_url, '/' ) ) {
+		if ( preg_match( '#^https?://#i', $payload_url ) ) {
+			$url = esc_url_raw( $payload_url );
+		} elseif ( 0 === strpos( $payload_url, '/' ) ) {
 			$parts = wp_parse_url( $base_url );
-
 			if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
 				return new WP_Error( 'mobo_core_invalid_api_base_url', 'API base URL is invalid.' );
 			}
-
 			$port = isset( $parts['port'] ) ? ':' . absint( $parts['port'] ) : '';
-			return esc_url_raw( $parts['scheme'] . '://' . $parts['host'] . $port . $payload_url );
+			$url  = esc_url_raw( $parts['scheme'] . '://' . $parts['host'] . $port . $payload_url );
+		} else {
+			$url = esc_url_raw( trailingslashit( $base_url ) . ltrim( $payload_url, '/' ) );
 		}
 
-		return esc_url_raw( trailingslashit( $base_url ) . ltrim( $payload_url, '/' ) );
+		return $this->validate_trusted_api_url( $url );
 	}
 
 	/**
-	 * GET JSON from a full URL.
+	 * Require Portal payload/API URLs to stay on the configured API origin.
+	 * License Token and X-SEC must never be forwarded to an arbitrary host.
+	 *
+	 * @param string $url Candidate URL.
+	 * @return string|WP_Error
+	 */
+	private function validate_trusted_api_url( $url ) {
+		$url      = esc_url_raw( (string) $url );
+		$base_url = $this->get_base_url();
+		$target   = wp_parse_url( $url );
+		$base     = wp_parse_url( $base_url );
+
+		if ( '' === $url || ! is_array( $target ) || ! is_array( $base ) || empty( $target['scheme'] ) || empty( $target['host'] ) || empty( $base['scheme'] ) || empty( $base['host'] ) ) {
+			return new WP_Error( 'mobo_core_invalid_payload_url', 'Payload URL is invalid.' );
+		}
+		if ( isset( $target['user'] ) || isset( $target['pass'] ) ) {
+			return new WP_Error( 'mobo_core_untrusted_payload_url', 'Payload URL with embedded credentials is not allowed.' );
+		}
+
+		$target_scheme = strtolower( (string) $target['scheme'] );
+		$base_scheme   = strtolower( (string) $base['scheme'] );
+		$target_host   = strtolower( rtrim( (string) $target['host'], '.' ) );
+		$base_host     = strtolower( rtrim( (string) $base['host'], '.' ) );
+		$target_port   = isset( $target['port'] ) ? absint( $target['port'] ) : ( 'https' === $target_scheme ? 443 : 80 );
+		$base_port     = isset( $base['port'] ) ? absint( $base['port'] ) : ( 'https' === $base_scheme ? 443 : 80 );
+
+		if ( ! in_array( $target_scheme, array( 'http', 'https' ), true ) || $target_scheme !== $base_scheme || $target_host !== $base_host || $target_port !== $base_port ) {
+			return new WP_Error( 'mobo_core_untrusted_payload_url', 'Payload URL must use the same origin as the configured Portal API.' );
+		}
+
+		return $url;
+	}
+
+	/**
+	 * Resolve one redirect Location and validate it before credentials are resent.
+	 *
+	 * @param string $current_url Current URL.
+	 * @param string $location Location header.
+	 * @return string|WP_Error
+	 */
+	private function resolve_trusted_redirect_url( $current_url, $location ) {
+		$location = trim( (string) $location );
+		if ( '' === $location ) {
+			return new WP_Error( 'mobo_core_redirect_location_missing', 'Portal redirect did not include a Location header.' );
+		}
+		if ( preg_match( '#^https?://#i', $location ) ) {
+			return $this->validate_trusted_api_url( $location );
+		}
+
+		$current = wp_parse_url( $current_url );
+		if ( ! is_array( $current ) || empty( $current['scheme'] ) || empty( $current['host'] ) ) {
+			return new WP_Error( 'mobo_core_invalid_redirect_base', 'Could not resolve Portal redirect.' );
+		}
+		$port   = isset( $current['port'] ) ? ':' . absint( $current['port'] ) : '';
+		$origin = $current['scheme'] . '://' . $current['host'] . $port;
+		if ( 0 === strpos( $location, '/' ) ) {
+			return $this->validate_trusted_api_url( $origin . $location );
+		}
+		$path = isset( $current['path'] ) ? (string) $current['path'] : '/';
+		$dir  = preg_replace( '#/[^/]*$#', '/', $path );
+		return $this->validate_trusted_api_url( $origin . $dir . $location );
+	}
+
+	/**
+	 * GET JSON from a full trusted Portal URL.
 	 *
 	 * @param string $url Full URL.
 	 * @param int    $timeout Timeout seconds.
 	 * @return array|WP_Error
 	 */
 	private function get_json_url( $url, $timeout = 20 ) {
-		$url = esc_url_raw( (string) $url );
-
-		if ( '' === $url ) {
-			return new WP_Error( 'mobo_core_invalid_payload_url', 'Payload URL is invalid.' );
+		$url = $this->validate_trusted_api_url( $url );
+		if ( is_wp_error( $url ) ) {
+			return $url;
 		}
 
 		$circuit_error = $this->get_open_circuit_error();
 		if ( is_wp_error( $circuit_error ) ) {
 			return $circuit_error;
 		}
-
 		$context = $this->get_request_context();
 		if ( is_wp_error( $context ) ) {
 			return $context;
 		}
 
-		$effective_timeout = $this->get_effective_timeout( $timeout );
-		if ( is_wp_error( $effective_timeout ) ) {
-			return $effective_timeout;
-		}
-
-		$response = wp_remote_get(
-			$url,
-			array(
-				'timeout'     => $effective_timeout,
-				'redirection' => 3,
-				'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'api_client' ),
-				'headers'     => $context['headers'],
-			)
-		);
-
-		if ( is_wp_error( $response ) ) {
-			$error_message = sprintf(
-				'Payload request failed. URL=%s Error=%s',
-				$url,
-				$response->get_error_message()
-			);
-
-			$error = new WP_Error(
-				'mobo_core_payload_request_failed',
-				$error_message,
+		$current_url = $url;
+		for ( $redirects = 0; $redirects <= 3; $redirects++ ) {
+			$effective_timeout = $this->get_effective_timeout( $timeout );
+			if ( is_wp_error( $effective_timeout ) ) {
+				return $effective_timeout;
+			}
+			$response = wp_remote_get(
+				$current_url,
 				array(
-					'url'            => $url,
-					'original_error' => $response->get_error_code(),
-					'error_message'  => $response->get_error_message(),
-				)
-			);
-			$this->open_request_circuit( $error, 5 );
-			return $error;
-		}
-
-		$code = absint( wp_remote_retrieve_response_code( $response ) );
-
-		$body = (string) wp_remote_retrieve_body( $response );
-
-		if ( $code < 200 || $code >= 300 ) {
-			$error_payload = json_decode( $body, true );
-			$error_status  = is_array( $error_payload ) && isset( $error_payload['status'] ) ? sanitize_key( (string) $error_payload['status'] ) : '';
-			$error_message = is_array( $error_payload ) && isset( $error_payload['message'] ) ? sanitize_text_field( (string) $error_payload['message'] ) : '';
-
-			$error = new WP_Error(
-				'mobo_core_payload_http_error',
-				'' !== $error_message ? $error_message : sprintf( 'Portal API HTTP error. URL=%s Status=%d', $url, $code ),
-				array(
-					'url'           => $url,
-					'status'        => $code,
-					'portal_status' => $error_status,
-					'body'          => function_exists( 'mb_substr' ) ? mb_substr( $body, 0, 1000 ) : substr( $body, 0, 1000 ),
+					'timeout'     => $effective_timeout,
+					'redirection' => 0,
+					'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'api_client' ),
+					'headers'     => $context['headers'],
 				)
 			);
 
-			if ( in_array( $code, array( 502, 503, 504 ), true ) ) {
+			if ( is_wp_error( $response ) ) {
+				$error = new WP_Error(
+					'mobo_core_payload_request_failed',
+					sprintf( 'Payload request failed. URL=%s Error=%s', $current_url, $response->get_error_message() ),
+					array( 'url' => $current_url, 'original_error' => $response->get_error_code(), 'error_message' => $response->get_error_message() )
+				);
 				$this->open_request_circuit( $error, 5 );
+				return $error;
 			}
 
-			return $error;
+			$code = absint( wp_remote_retrieve_response_code( $response ) );
+			if ( in_array( $code, array( 301, 302, 303, 307, 308 ), true ) ) {
+				if ( $redirects >= 3 ) {
+					return new WP_Error( 'mobo_core_payload_too_many_redirects', 'Portal payload request exceeded the redirect limit.' );
+				}
+				$current_url = $this->resolve_trusted_redirect_url( $current_url, wp_remote_retrieve_header( $response, 'location' ) );
+				if ( is_wp_error( $current_url ) ) {
+					return $current_url;
+				}
+				continue;
+			}
+
+			$body = (string) wp_remote_retrieve_body( $response );
+			if ( $code < 200 || $code >= 300 ) {
+				$error_payload = json_decode( $body, true );
+				$error_status  = is_array( $error_payload ) && isset( $error_payload['status'] ) ? sanitize_key( (string) $error_payload['status'] ) : '';
+				$error_message = is_array( $error_payload ) && isset( $error_payload['message'] ) ? sanitize_text_field( (string) $error_payload['message'] ) : '';
+				$error = new WP_Error(
+					'mobo_core_payload_http_error',
+					'' !== $error_message ? $error_message : sprintf( 'Portal API HTTP error. URL=%s Status=%d', $current_url, $code ),
+					array( 'url' => $current_url, 'status' => $code, 'portal_status' => $error_status, 'body' => function_exists( 'mb_substr' ) ? mb_substr( $body, 0, 1000 ) : substr( $body, 0, 1000 ) )
+				);
+				if ( in_array( $code, array( 502, 503, 504 ), true ) ) {
+					$this->open_request_circuit( $error, 5 );
+				}
+				return $error;
+			}
+
+			if ( '' === trim( $body ) ) {
+				return new WP_Error( 'mobo_core_empty_payload_response', 'Payload endpoint returned empty response.' );
+			}
+			$json = json_decode( $body, true );
+			if ( ! is_array( $json ) ) {
+				return new WP_Error( 'mobo_core_invalid_payload_json', 'Payload endpoint returned invalid JSON.' );
+			}
+			return $json;
 		}
 
-
-		if ( '' === trim( (string) $body ) ) {
-			return new WP_Error( 'mobo_core_empty_payload_response', 'Payload endpoint returned empty response.' );
-		}
-
-		$json = json_decode( $body, true );
-
-		if ( ! is_array( $json ) ) {
-			return new WP_Error( 'mobo_core_invalid_payload_json', 'Payload endpoint returned invalid JSON.' );
-		}
-
-		return $json;
+		return new WP_Error( 'mobo_core_payload_request_failed', 'Portal payload request failed unexpectedly.' );
 	}
 
 	/**

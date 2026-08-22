@@ -75,7 +75,7 @@ class Mobo_Core_Category_Map {
 		) {$charset_collate};";
 
 		dbDelta( $sql );
-		self::$table_exists_cache = true;
+		self::$table_exists_cache = null;
 	}
 
 	/**
@@ -528,23 +528,38 @@ class Mobo_Core_Category_Map {
 			return array( 'categories' => 0 );
 		}
 
-		$count = 0;
-		$last  = $cursor;
+		$count   = 0;
+		$last    = $cursor;
+		$stalled = false;
+		$error   = '';
 
 		foreach ( $rows as $row ) {
 			$term_id = absint( $row['term_id'] );
 			$guid    = sanitize_text_field( (string) $row['remote_guid'] );
 
-			if ( $term_id > 0 && '' !== $guid && $this->upsert_synced_category( $guid, $term_id, $row['name'], $row['remote_url'], $row['parent_remote_guid'] ) ) {
-				$count++;
+			if ( $term_id <= 0 || '' === $guid ) {
+				$last = max( $last, $term_id );
+				continue;
 			}
 
+			if ( ! $this->upsert_synced_category( $guid, $term_id, $row['name'], $row['remote_url'], $row['parent_remote_guid'] ) ) {
+				$stalled = true;
+				$error   = 'Category Map legacy seed stalled because the mapping write did not persist.';
+				break;
+			}
+
+			$count++;
 			$last = max( $last, $term_id );
 		}
 
 		update_option( 'mobo_core_category_map_cursor', $last, false );
 
-		return array( 'categories' => $count );
+		return array(
+			'categories' => $count,
+			'stalled'    => $stalled,
+			'error'      => $error,
+			'cursor'     => $last,
+		);
 	}
 
 
@@ -597,7 +612,6 @@ class Mobo_Core_Category_Map {
 		global $wpdb;
 
 		if ( ! is_array( $row ) || empty( $row['term_id'] ) ) {
-			$this->term_lookup_cache[ $cache_key ] = 0;
 			return 0;
 		}
 

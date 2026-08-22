@@ -45,6 +45,12 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	public function start( $source = 'admin' ) {
+		$control_lock = Mobo_Core_Lock::acquire( 'reprice_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'عملیات قیمت‌گذاری در حال اجرا است؛ پس از پایان batch جاری دوباره تلاش کنید.' );
+		}
+
+		try {
 		$state = array(
 			'status'       => 'running',
 			'source'       => sanitize_key( (string) $source ),
@@ -59,6 +65,7 @@ class Mobo_Core_Reprice_Queue {
 			'updatedAt'    => time(),
 			'completedAt'  => 0,
 			'policyType'   => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
+			'failureAttempts' => array(),
 		);
 
 		update_option( self::STATE_OPTION, $state, false );
@@ -68,6 +75,9 @@ class Mobo_Core_Reprice_Queue {
 			'message' => $state['lastMessage'],
 			'status'  => $this->get_status(),
 		);
+		} finally {
+			Mobo_Core_Lock::release( 'reprice_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -76,6 +86,12 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	public function cancel() {
+		$control_lock = Mobo_Core_Lock::acquire( 'reprice_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'Worker قیمت‌گذاری هنوز batch جاری را تمام نکرده است؛ دوباره تلاش کنید.' );
+		}
+
+		try {
 		$state = $this->get_state();
 
 		if ( ! in_array( $state['status'], array( 'running', 'waiting' ), true ) ) {
@@ -88,6 +104,9 @@ class Mobo_Core_Reprice_Queue {
 		update_option( self::STATE_OPTION, $state, false );
 
 		return array( 'success' => true, 'message' => $state['lastMessage'] );
+		} finally {
+			Mobo_Core_Lock::release( 'reprice_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -96,9 +115,18 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	public function reset() {
+		$control_lock = Mobo_Core_Lock::acquire( 'reprice_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'Worker قیمت‌گذاری هنوز batch جاری را تمام نکرده است؛ وضعیت فعلاً پاک نشد.' );
+		}
+
+		try {
 		delete_option( self::STATE_OPTION );
 
 		return array( 'success' => true, 'message' => 'وضعیت اعمال مجدد قیمت‌گذاری پاک شد.' );
+		} finally {
+			Mobo_Core_Lock::release( 'reprice_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -192,6 +220,7 @@ class Mobo_Core_Reprice_Queue {
 
 		$paused_for_upgrade = false;
 		$budget_exhausted   = false;
+		$retry_blocked      = false;
 		$last_checkpoint_at = microtime( true );
 		$checkpoint_every   = 5;
 		$checkpoint_seconds = 2.0;
@@ -208,11 +237,23 @@ class Mobo_Core_Reprice_Queue {
 			}
 
 			$post_id = absint( $post_id );
-			$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
-			$processed++;
 
 			try {
 				$result = $this->reprice_object( $post_id );
+				$reason = is_array( $result ) && isset( $result['reason'] ) ? sanitize_key( (string) $result['reason'] ) : '';
+
+				if ( in_array( $reason, array( 'product-sync-active', 'product-lock-busy' ), true ) ) {
+					/* A transient product lock must defer the cursor, not permanently skip this object. */
+					$retry_blocked = true;
+					$state['lastMessage'] = sprintf( 'قیمت‌گذاری محصول %d به دلیل همگام‌سازی هم‌زمان به اجرای بعد موکول شد.', $post_id );
+					break;
+				}
+
+				$processed++;
+				$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
+				if ( isset( $state['failureAttempts'][ (string) $post_id ] ) ) {
+					unset( $state['failureAttempts'][ (string) $post_id ] );
+				}
 
 				if ( ! empty( $result['updated'] ) ) {
 					$updated++;
@@ -224,6 +265,20 @@ class Mobo_Core_Reprice_Queue {
 			} catch ( Throwable $e ) {
 				$failed++;
 				$state['lastError'] = sanitize_text_field( $e->getMessage() );
+				$key = (string) $post_id;
+				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
+				$state['failureAttempts'][ $key ] = $attempts;
+				$max_attempts = max( 1, min( 10, absint( apply_filters( 'mobo_core_reprice_failure_retry_limit', 3, $post_id ) ) ) );
+				if ( $attempts < $max_attempts ) {
+					$retry_blocked = true;
+					$state['lastMessage'] = sprintf( 'قیمت‌گذاری محصول %d ناموفق بود و در اجرای بعد دوباره تلاش می‌شود (%d/%d).', $post_id, $attempts, $max_attempts );
+					break;
+				}
+
+				/* Persistent failures are surfaced but cannot block the entire store forever. */
+				unset( $state['failureAttempts'][ $key ] );
+				$processed++;
+				$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
 			}
 
 			/*
@@ -263,7 +318,7 @@ class Mobo_Core_Reprice_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d مورد بررسی شد؛ %d مورد به‌روزرسانی شد.', $processed, $updated );
 
-		$remaining = $paused_for_upgrade || $budget_exhausted || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -280,6 +335,7 @@ class Mobo_Core_Reprice_Queue {
 			'remaining' => $remaining,
 			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ),
 			'budgetExhausted' => $budget_exhausted,
+			'retryBlocked'    => $retry_blocked,
 			'state'     => $state,
 		);
 	
@@ -387,6 +443,10 @@ class Mobo_Core_Reprice_Queue {
 			$context
 		);
 
+		if ( ! empty( $pair['error'] ) ) {
+			throw new RuntimeException( 'Stored Mobo source price is invalid for object ' . $post_id . ': ' . sanitize_text_field( (string) $pair['error'] ) );
+		}
+
 		$frontend_changed = false;
 		$desired_regular  = null !== $pair['regular_price'] && '' !== $pair['regular_price'] ? wc_format_decimal( $pair['regular_price'] ) : null;
 		$desired_sale     = isset( $pair['sale_price'] ) ? wc_format_decimal( $pair['sale_price'] ) : '';
@@ -422,7 +482,17 @@ class Mobo_Core_Reprice_Queue {
 				$product->update_meta_data( 'mobo_price_policy_updated_at', gmdate( 'c' ) );
 			}
 
-			$product->save();
+			$saved_id = absint( $product->save() );
+			if ( $saved_id !== $post_id ) {
+				throw new RuntimeException( 'WooCommerce price save could not be verified for object ' . $post_id . '.' );
+			}
+			$fresh_product = wc_get_product( $post_id );
+			if ( ! $fresh_product instanceof WC_Product
+				|| ( null !== $desired_regular && wc_format_decimal( $fresh_product->get_regular_price( 'edit' ) ) !== $desired_regular )
+				|| wc_format_decimal( $fresh_product->get_sale_price( 'edit' ) ) !== $desired_sale
+			) {
+				throw new RuntimeException( 'WooCommerce price postcondition failed for object ' . $post_id . '.' );
+			}
 			wc_delete_product_transients( $post_id );
 		} else {
 			/*
@@ -432,7 +502,14 @@ class Mobo_Core_Reprice_Queue {
 			foreach ( $meta_values as $key => $value ) {
 				$current = get_post_meta( $post_id, $key, true );
 				if ( $current != $value ) {
-					update_post_meta( $post_id, $key, $value );
+					$written = update_post_meta( $post_id, $key, $value );
+					$stored  = get_post_meta( $post_id, $key, true );
+					if ( false === $written && $stored != $value ) {
+						throw new RuntimeException( 'Price bookkeeping meta could not be persisted for object ' . $post_id . ' (' . sanitize_key( $key ) . ').' );
+					}
+					if ( $stored != $value ) {
+						throw new RuntimeException( 'Price bookkeeping meta postcondition failed for object ' . $post_id . ' (' . sanitize_key( $key ) . ').' );
+					}
 					$meta_changed = true;
 				}
 			}
@@ -632,6 +709,7 @@ class Mobo_Core_Reprice_Queue {
 			'updatedAt'   => 0,
 			'completedAt' => 0,
 			'policyType'  => '',
+			'failureAttempts' => array(),
 		);
 
 		return array_merge( $defaults, $state );

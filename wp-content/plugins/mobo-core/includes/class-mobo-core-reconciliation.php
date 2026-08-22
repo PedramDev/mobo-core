@@ -110,11 +110,6 @@ class Mobo_Core_Reconciliation {
 		$source     = sanitize_key( (string) $source );
 		$force      = (bool) $force;
 		$force_deep = (bool) $force_deep;
-		$state      = $this->get_state();
-
-		if ( 'idle' === $state['status'] && ! $force && ! $force_deep && ! Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) ) {
-			return $this->finish_result( array( 'success' => true, 'status' => 'disabled', 'source' => $source ) );
-		}
 
 		$sync = new Mobo_Core_Product_Sync();
 		$manual_status = $sync->get_manual_sync_status();
@@ -135,6 +130,18 @@ class Mobo_Core_Reconciliation {
 		}
 
 		try {
+			/*
+			 * Load state only after owning the worker lease. A second request may have
+			 * inspected an older option value while the previous worker was finishing;
+			 * re-reading here prevents that stale snapshot from overwriting newer
+			 * reconciliation progress after the lock changes hands.
+			 */
+			$state = $this->get_state();
+
+			if ( 'idle' === $state['status'] && ! $force && ! $force_deep && ! Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) ) {
+				return $this->finish_result( array( 'success' => true, 'status' => 'disabled', 'source' => $source ) );
+			}
+
 			if ( 'running' !== $state['status'] ) {
 				if ( $force_deep ) {
 					$state = $this->start_deep_state( $source );
@@ -193,10 +200,11 @@ class Mobo_Core_Reconciliation {
 		update_option( self::LAST_CHECK_OPTION, $now, false );
 
 		$response = $api->get_sync_changes( $after, $limit );
-		if ( ! is_wp_error( $response ) && $this->looks_like_changes_response( $response ) ) {
+		$validated_changes = ! is_wp_error( $response ) ? $this->validate_changes_response( $response, $after ) : $response;
+		if ( ! is_wp_error( $validated_changes ) ) {
 			update_option( self::ENDPOINT_SUPPORT_OPTION, 'supported', false );
-			$change_payload = $this->get_changes_payload( $response );
-			$changes = $this->normalize_changes( $change_payload );
+			$change_payload = $validated_changes['payload'];
+			$changes        = $validated_changes['changes'];
 			$state   = $this->get_state_defaults();
 			$state['status']          = 'running';
 			$state['mode']            = 'fast-changes';
@@ -211,7 +219,7 @@ class Mobo_Core_Reconciliation {
 			return $state;
 		}
 
-		update_option( self::ENDPOINT_SUPPORT_OPTION, is_wp_error( $response ) ? $response->get_error_code() : 'unsupported-shape', false );
+		update_option( self::ENDPOINT_SUPPORT_OPTION, is_wp_error( $validated_changes ) ? $validated_changes->get_error_code() : 'unsupported-shape', false );
 		$cursor   = absint( get_option( self::FALLBACK_CURSOR_OPTION, 0 ) );
 		$fallback = $api->get_products_page( 1, $limit, 'auto-fallback-' . gmdate( 'YmdHis' ), $cursor, true );
 		$state    = $this->get_state_defaults();
@@ -229,11 +237,29 @@ class Mobo_Core_Reconciliation {
 			return $state;
 		}
 
-		$items = $this->get_value( $fallback, 'data', array() );
-		$items = is_array( $items ) ? $items : array();
+		$items = $this->extract_explicit_data_array( $fallback, 'fast fallback catalog' );
+		if ( is_wp_error( $items ) || ! $this->has_response_key( $fallback, 'hasMore' ) ) {
+			$state['status']      = 'idle';
+			$state['lastError']   = is_wp_error( $items ) ? $items->get_error_message() : 'Fast fallback catalog response is missing explicit hasMore.';
+			$state['lastMessage'] = 'Fast reconciliation stopped because the catalog response was incomplete.';
+			return $state;
+		}
+
+		$has_more = $this->to_bool( $this->get_value( $fallback, 'hasMore', false ) );
+		$next_cursor = absint( $this->get_value( $fallback, 'nextCursor', $cursor ) );
+		if ( $has_more && ( empty( $items ) || $next_cursor <= $cursor ) ) {
+			$state['status']      = 'idle';
+			$state['lastError']   = empty( $items ) ? 'Fast fallback returned an empty non-terminal page.' : 'Fast fallback cursor did not advance.';
+			$state['lastMessage'] = 'Fast reconciliation stopped before applying an ambiguous catalog page.';
+			return $state;
+		}
+
 		foreach ( $items as $item ) {
-			if ( ! is_array( $item ) ) {
-				continue;
+			if ( ! is_array( $item ) || '' === $this->extract_product_guid( $item ) ) {
+				$state['status']      = 'idle';
+				$state['lastError']   = 'Fast fallback catalog contains an invalid product snapshot.';
+				$state['lastMessage'] = 'Fast reconciliation stopped before applying an invalid catalog page.';
+				return $state;
 			}
 			$pending = $this->build_pending_from_product( $item, 0 );
 			if ( $this->should_skip_unchanged_product( $pending ) ) {
@@ -242,8 +268,8 @@ class Mobo_Core_Reconciliation {
 			$state['pending'][] = $pending;
 		}
 
-		$state['nextScanCursor'] = absint( $this->get_value( $fallback, 'nextCursor', $cursor ) );
-		$state['scanHasMore']     = $this->to_bool( $this->get_value( $fallback, 'hasMore', false ) );
+		$state['nextScanCursor'] = $next_cursor;
+		$state['scanHasMore']     = $has_more;
 		$state['lastMessage']     = 'Rolling fallback reconciliation started.';
 		return $state;
 	}
@@ -264,7 +290,14 @@ class Mobo_Core_Reconciliation {
 		$state['updatedAt']   = time();
 		$state['scanCursor']  = 0;
 		$state['deepSeen']    = array();
-		$state['lastMessage'] = 'Deep integrity check started.';
+		/* Capture the catalog filter once for the whole deep scan. A filtered
+		 * OnlyInStock catalog cannot prove that an unseen local product was deleted
+		 * remotely; the product may simply have become out of stock. */
+		$state['catalogOnlyInStock']          = Mobo_Core_Settings::enabled( 'mobo_core_only_in_stock', '0' );
+		$state['catalogAllowsMissingDeletion'] = ! $state['catalogOnlyInStock'];
+		$state['lastMessage'] = $state['catalogOnlyInStock']
+			? 'Deep integrity check started in filtered-catalog mode; unseen local products will be retained.'
+			: 'Deep integrity check started.';
 		update_option( self::LAST_CHECK_OPTION, time(), false );
 		return $state;
 	}
@@ -301,8 +334,19 @@ class Mobo_Core_Reconciliation {
 						break;
 					}
 				} elseif ( 'deep' === $state['mode'] && 'sweep' === $state['phase'] ) {
+					if ( empty( $state['catalogCompletionValidated'] ) ) {
+						$state['lastError'] = 'Deep catalog sweep blocked because catalog completion was not validated.';
+						$this->complete_state( $state, false, 'Deep integrity sweep was stopped safely; a fresh catalog scan is required.' );
+						break;
+					}
 					$sweep = $this->process_deep_sweep( $state, $product_budget - $processed );
 					$processed += absint( $sweep['processed'] );
+					if ( ! empty( $sweep['error'] ) ) {
+						$state['lastError']   = sanitize_text_field( (string) $sweep['error'] );
+						$state['lastMessage'] = 'Deep sweep paused because a local deletion could not be completed safely.';
+						$failed++;
+						break;
+					}
 					if ( ! empty( $sweep['done'] ) ) {
 						$this->complete_state( $state, true, 'Deep integrity check completed.' );
 						update_option( self::LAST_DEEP_OPTION, time(), false );
@@ -424,8 +468,14 @@ class Mobo_Core_Reconciliation {
 		$revision  = absint( $item['revision'] );
 
 		if ( ! empty( $item['deleted'] ) ) {
-			$this->delete_local_product( $guid, $portal_id );
-			return array( 'complete' => true, 'failed' => false, 'variations' => 0, 'item' => $item );
+			/* Product deletion is intentionally non-destructive. Once a Mobo product has
+			 * reached a store, source-side deletion/unavailability must never remove the
+			 * WooCommerce parent. Advance the revision while preserving local identity. */
+			$wp_id = $this->find_local_product_id( $guid, $portal_id );
+			if ( '' !== $guid ) {
+				self::mark_synced( $guid, $wp_id, $revision, sanitize_text_field( (string) $item['portalHash'] ), $portal_id );
+			}
+			return array( 'complete' => true, 'failed' => false, 'variations' => 0, 'item' => $item, 'retainedDeletedProduct' => true );
 		}
 
 		if ( '' !== $guid ) {
@@ -448,10 +498,20 @@ class Mobo_Core_Reconciliation {
 					return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
 				}
 
-				$products = $this->get_value( $response, 'data', array() );
-				if ( ! is_array( $products ) || empty( $products ) ) {
-					$this->delete_local_product( $guid, $portal_id );
-					return array( 'complete' => true, 'failed' => false, 'variations' => 0, 'item' => $item );
+				$products = $this->extract_explicit_data_array( $response, 'single-product reconciliation' );
+				if ( is_wp_error( $products ) ) {
+					self::mark_failed( $guid, 0, $products->get_error_message(), $revision, $portal_id );
+					return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
+				}
+				if ( empty( $products ) ) {
+					/* Empty/not-found snapshots are never authorization to delete a local Mobo
+					 * product. This applies regardless of OnlyInStock. Product parents are
+					 * append-only once imported; only their state may change. */
+					$wp_id = $this->find_local_product_id( $guid, $portal_id );
+					if ( '' !== $guid ) {
+						self::mark_synced( $guid, $wp_id, $revision, sanitize_text_field( (string) $item['portalHash'] ), $portal_id );
+					}
+					return array( 'complete' => true, 'failed' => false, 'variations' => 0, 'item' => $item, 'retainedUnavailable' => true );
 				}
 
 				$product = reset( $products );
@@ -503,7 +563,27 @@ class Mobo_Core_Reconciliation {
 			return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
 		}
 
-		$item['hashParts'][] = $this->stable_hash( $response );
+		$variant_items = $this->extract_explicit_data_array( $response, 'variant reconciliation' );
+		if ( is_wp_error( $variant_items ) || ! $this->has_response_key( $response, 'hasMore' ) ) {
+			$error = is_wp_error( $variant_items ) ? $variant_items->get_error_message() : 'Variant reconciliation response is missing hasMore.';
+			self::mark_failed( $item['productGuid'], 0, $error, $revision, $portal_id );
+			return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
+		}
+		$has_more_before = $this->to_bool( $this->get_value( $response, 'hasMore', false ) );
+		$next_before     = absint( $this->get_value( $response, 'nextCursor', $item['variantCursor'] ) );
+		if ( $has_more_before && empty( $variant_items ) ) {
+			$error = 'Variant reconciliation returned hasMore=true with an empty data page.';
+			self::mark_failed( $item['productGuid'], 0, $error, $revision, $portal_id );
+			return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
+		}
+		if ( $has_more_before && Mobo_Core_Settings::enabled( 'mobo_core_variant_cursor_sync_enabled', '1' ) && $next_before <= absint( $item['variantCursor'] ) ) {
+			$error = 'Variant reconciliation cursor did not advance while hasMore=true.';
+			self::mark_failed( $item['productGuid'], 0, $error, $revision, $portal_id );
+			return array( 'complete' => true, 'failed' => true, 'variations' => 0, 'item' => $item );
+		}
+
+		$response['data']                     = $variant_items;
+		$item['hashParts'][]                  = $this->stable_hash( $response );
 		$response['variantListAuthoritative'] = true;
 		$response['isFullVariantSnapshot']    = true;
 		$result = $sync->process_update_variant_payload( $response, true );
@@ -540,30 +620,49 @@ class Mobo_Core_Reconciliation {
 	 * @return true|WP_Error
 	 */
 	private function fill_deep_catalog_page( &$state, $limit ) {
-		$api = new Mobo_Core_API_Client();
-		$response = $api->get_products_page( 1, $limit, 'deep-integrity-' . gmdate( 'YmdHis' ), absint( $state['scanCursor'] ), true );
+		$api      = new Mobo_Core_API_Client();
+		$current  = absint( $state['scanCursor'] );
+		$only_in_stock = ! empty( $state['catalogOnlyInStock'] );
+		$response = $api->get_products_page( 1, $limit, 'deep-integrity-' . gmdate( 'YmdHis' ), $current, true, $only_in_stock );
 		if ( is_wp_error( $response ) ) {
 			return $response;
 		}
 
-		$items = $this->get_value( $response, 'data', array() );
-		$items = is_array( $items ) ? $items : array();
-		foreach ( $items as $product ) {
-			if ( ! is_array( $product ) ) {
-				continue;
-			}
-			$item = $this->build_pending_from_product( $product, 0 );
-			if ( '' !== $item['productGuid'] ) {
-				$state['deepSeen'][ $item['productGuid'] ] = 1;
-			}
-			$state['pending'][] = $item;
+		$items = $this->extract_explicit_data_array( $response, 'deep catalog' );
+		if ( is_wp_error( $items ) ) {
+			return $items;
+		}
+		if ( ! $this->has_response_key( $response, 'hasMore' ) ) {
+			return new WP_Error( 'mobo_core_reconcile_invalid_catalog_shape', 'Deep catalog response is missing hasMore; destructive sweep was not authorized.' );
 		}
 
 		$has_more = $this->to_bool( $this->get_value( $response, 'hasMore', false ) );
-		$state['scanCursor'] = absint( $this->get_value( $response, 'nextCursor', $state['scanCursor'] ) );
-		if ( empty( $items ) || ! $has_more ) {
-			$state['phase']       = 'sweep';
-			$state['sweepCursor'] = 0;
+		$next     = absint( $this->get_value( $response, 'nextCursor', $current ) );
+		if ( $has_more && empty( $items ) ) {
+			return new WP_Error( 'mobo_core_reconcile_empty_nonterminal_catalog', 'Deep catalog returned an empty non-terminal page.' );
+		}
+		if ( $has_more && $next <= $current ) {
+			return new WP_Error( 'mobo_core_reconcile_catalog_cursor_stalled', 'Deep catalog cursor did not advance while hasMore=true.' );
+		}
+
+		foreach ( $items as $product ) {
+			if ( ! is_array( $product ) ) {
+				return new WP_Error( 'mobo_core_reconcile_invalid_catalog_item', 'Deep catalog contained a non-object product item.' );
+			}
+			$item = $this->build_pending_from_product( $product, 0 );
+			if ( '' === $item['productGuid'] ) {
+				return new WP_Error( 'mobo_core_reconcile_catalog_guid_missing', 'Deep catalog contained a product without a GUID.' );
+			}
+			$state['deepSeen'][ $item['productGuid'] ] = 1;
+			$state['pending'][] = $item;
+		}
+
+		$state['catalogValidatedPages'] = absint( $state['catalogValidatedPages'] ) + 1;
+		$state['scanCursor']            = $next;
+		if ( ! $has_more ) {
+			$state['catalogCompletionValidated'] = true;
+			$state['phase']                      = 'sweep';
+			$state['sweepCursor']                = 0;
 		}
 		return true;
 	}
@@ -577,12 +676,17 @@ class Mobo_Core_Reconciliation {
 	 */
 	private function fill_more_changes( &$state, $limit ) {
 		$api      = new Mobo_Core_API_Client();
-		$response = $api->get_sync_changes( absint( $state['afterRevision'] ), $limit );
+		$after    = absint( $state['afterRevision'] );
+		$response = $api->get_sync_changes( $after, $limit );
 		if ( is_wp_error( $response ) ) {
 			return $response;
 		}
-		$change_payload = $this->get_changes_payload( $response );
-		$changes = $this->normalize_changes( $change_payload );
+		$validated = $this->validate_changes_response( $response, $after );
+		if ( is_wp_error( $validated ) ) {
+			return $validated;
+		}
+		$change_payload   = $validated['payload'];
+		$changes          = $validated['changes'];
 		$state['pending'] = $changes;
 		$state['currentRevision'] = absint( $this->get_value( $change_payload, 'currentRevision', $state['currentRevision'] ) );
 		$state['moreChanges'] = count( $changes ) >= $limit;
@@ -615,19 +719,24 @@ class Mobo_Core_Reconciliation {
 
 		if ( ! is_array( $rows ) || empty( $rows ) ) {
 			$this->cleanup_orphan_health_rows();
-			return array( 'processed' => 0, 'deleted' => 0, 'orphans' => 0, 'done' => true );
+			return array( 'processed' => 0, 'deleted' => 0, 'orphans' => 0, 'done' => true, 'error' => '' );
 		}
 
-		$deleted = 0;
-		$orphans = 0;
-		$map     = new Mobo_Core_Product_Map();
+		$deleted   = 0;
+		$orphans   = 0;
+		$retained  = 0;
+		$processed = 0;
+		/*
+		 * Parent products are append-only from 10.33.29 onward. Catalog absence,
+		 * including an authoritative unfiltered sweep, is never deletion authority.
+		 */
+		$map       = new Mobo_Core_Product_Map();
 		foreach ( $rows as $row ) {
 			$id          = absint( $row['id'] );
 			$guid        = sanitize_text_field( (string) $row['remote_guid'] );
 			$post_id     = absint( $row['wp_post_id'] );
 			$object_type = sanitize_key( (string) $row['object_type'] );
 			$parent_guid = sanitize_text_field( (string) $row['parent_remote_guid'] );
-			$state['sweepCursor'] = max( absint( $state['sweepCursor'] ), $id );
 
 			if ( Mobo_Core_Product_Map::TYPE_VARIATION === $object_type ) {
 				$parent_id = '' !== $parent_guid ? $map->get_product_id( $parent_guid ) : 0;
@@ -637,30 +746,65 @@ class Mobo_Core_Reconciliation {
 					|| absint( wp_get_post_parent_id( $post_id ) ) !== $parent_id;
 				if ( $is_orphan ) {
 					if ( $post_id > 0 && 'product_variation' === get_post_type( $post_id ) ) {
-						wp_delete_post( $post_id, true );
+						$removed = wp_delete_post( $post_id, true );
+						if ( ! $removed ) {
+							return array(
+								'processed' => $processed,
+								'deleted'   => $deleted,
+								'orphans'   => $orphans,
+								'done'      => false,
+								'error'     => 'WooCommerce refused to delete orphan variation ' . $post_id . '; mapping and sweep cursor were preserved.',
+							);
+						}
 					}
-					$wpdb->delete( $table, array( 'id' => $id ), array( '%d' ) );
+					$map_deleted = $wpdb->delete( $table, array( 'id' => $id ), array( '%d' ) );
+					if ( false === $map_deleted ) {
+						return array(
+							'processed' => $processed,
+							'deleted'   => $deleted,
+							'orphans'   => $orphans,
+							'done'      => false,
+							'error'     => 'Database refused to delete orphan variation mapping ' . $id . '; sweep cursor was preserved.',
+						);
+					}
 					$orphans++;
 				}
+				$state['sweepCursor'] = max( absint( $state['sweepCursor'] ), $id );
+				$processed++;
 				continue;
 			}
 
 			if ( Mobo_Core_Product_Map::TYPE_PRODUCT !== $object_type || $post_id <= 0 || 'product' !== get_post_type( $post_id ) ) {
-				$wpdb->delete( $table, array( 'id' => $id ), array( '%d' ) );
+				$map_deleted = $wpdb->delete( $table, array( 'id' => $id ), array( '%d' ) );
+				if ( false === $map_deleted ) {
+					return array(
+						'processed' => $processed,
+						'deleted'   => $deleted,
+						'orphans'   => $orphans,
+						'done'      => false,
+						'error'     => 'Database refused to delete invalid product mapping ' . $id . '; sweep cursor was preserved.',
+					);
+				}
 				if ( '' !== $guid ) {
 					$wpdb->delete( self::table_name(), array( 'product_guid' => $guid ), array( '%s' ) );
 				}
 				$orphans++;
+				$state['sweepCursor'] = max( absint( $state['sweepCursor'] ), $id );
+				$processed++;
 				continue;
 			}
 
 			if ( '' !== $guid && ! isset( $state['deepSeen'][ $guid ] ) ) {
-				$this->delete_local_product( $guid, 0 );
-				$deleted++;
+				/* Parent products are append-only once imported. Deep reconciliation may
+				 * remove stale variations, but it never deletes a Mobo parent product. */
+				$retained++;
 			}
+
+			$state['sweepCursor'] = max( absint( $state['sweepCursor'] ), $id );
+			$processed++;
 		}
 
-		return array( 'processed' => count( $rows ), 'deleted' => $deleted, 'orphans' => $orphans, 'done' => false );
+		return array( 'processed' => $processed, 'deleted' => $deleted, 'orphans' => $orphans, 'retained' => $retained, 'done' => false, 'error' => '' );
 	}
 
 	/**
@@ -671,28 +815,9 @@ class Mobo_Core_Reconciliation {
 	 * @return bool
 	 */
 	private function delete_local_product( $guid, $portal_id ) {
-		global $wpdb;
-
-		$post_id = $this->find_local_product_id( $guid, $portal_id );
-		if ( $post_id > 0 ) {
-			wp_delete_post( $post_id, true );
-		}
-
-		$map = new Mobo_Core_Product_Map();
-		if ( $post_id > 0 ) {
-			$map->delete_by_post_id( $post_id );
-		}
-		$map_table = Mobo_Core_Product_Map::table_name();
-		if ( '' !== $guid ) {
-			$wpdb->delete( $map_table, array( 'parent_remote_guid' => $guid ), array( '%s' ) );
-			$wpdb->delete( $map_table, array( 'remote_guid' => $guid, 'object_type' => Mobo_Core_Product_Map::TYPE_PRODUCT ), array( '%s', '%s' ) );
-		}
-		if ( '' !== $guid ) {
-			$wpdb->delete( self::table_name(), array( 'product_guid' => $guid ), array( '%s' ) );
-		}
-		if ( $portal_id > 0 ) {
-			$wpdb->delete( self::table_name(), array( 'portal_product_id' => $portal_id ), array( '%d' ) );
-		}
+		/* Compatibility shim retained for older internal call sites. Product parents
+		 * are never physically deleted by Mobo Core. Do not remove product_map or
+		 * sync-health identity either; those records are recovery evidence. */
 		return true;
 	}
 
@@ -814,6 +939,69 @@ class Mobo_Core_Reconciliation {
 	}
 
 	/**
+	 * Validate the revision feed before it is allowed to advance the local watermark.
+	 * One malformed change must fail the whole page; silently dropping it would make
+	 * currentRevision skip desired-state work permanently.
+	 *
+	 * @param array $response API response.
+	 * @param int   $after_revision Current local watermark.
+	 * @return array|WP_Error Array with payload and normalized changes.
+	 */
+	private function validate_changes_response( $response, $after_revision ) {
+		$after_revision = absint( $after_revision );
+		if ( ! is_array( $response ) || ! $this->looks_like_changes_response( $response ) ) {
+			return new WP_Error( 'mobo_core_reconcile_changes_shape_invalid', 'Revision response is missing an explicit changes collection.' );
+		}
+
+		$payload = $this->get_changes_payload( $response );
+		if ( ! is_array( $payload ) || ! $this->has_response_key( $payload, 'changes' ) ) {
+			return new WP_Error( 'mobo_core_reconcile_changes_missing', 'Revision response is missing changes.' );
+		}
+		$raw_changes = $this->get_value( $payload, 'changes', null );
+		if ( ! is_array( $raw_changes ) ) {
+			return new WP_Error( 'mobo_core_reconcile_changes_invalid', 'Revision response changes is not an array.' );
+		}
+		if ( ! $this->has_response_key( $payload, 'currentRevision' ) ) {
+			return new WP_Error( 'mobo_core_reconcile_revision_missing', 'Revision response is missing currentRevision.' );
+		}
+		$current_revision = absint( $this->get_value( $payload, 'currentRevision', 0 ) );
+		if ( $current_revision < $after_revision ) {
+			return new WP_Error( 'mobo_core_reconcile_revision_regressed', 'Revision response currentRevision moved backwards.' );
+		}
+
+		foreach ( $raw_changes as $index => $change ) {
+			if ( ! is_array( $change ) ) {
+				return new WP_Error( 'mobo_core_reconcile_change_invalid', 'Revision response contains a non-object change at index ' . absint( $index ) . '.' );
+			}
+			$raw_product_id = $this->first_value( $change, array( 'productId', 'ProductId' ), '' );
+			$guid = sanitize_text_field( (string) $this->first_value( $change, array( 'productGuid', 'product_guid', 'guid', 'entityGuid' ), '' ) );
+			if ( '' === $guid && is_string( $raw_product_id ) && preg_match( '/^[0-9a-f-]{32,36}$/i', $raw_product_id ) ) {
+				$guid = sanitize_text_field( $raw_product_id );
+			}
+			$portal_id = absint( $this->first_value( $change, array( 'portalProductId', 'portal_product_id' ), 0 ) );
+			if ( $portal_id <= 0 && is_numeric( $raw_product_id ) ) {
+				$portal_id = absint( $raw_product_id );
+			}
+			if ( '' === $guid && $portal_id <= 0 ) {
+				return new WP_Error( 'mobo_core_reconcile_change_identity_missing', 'Revision response contains a change without a product identity at index ' . absint( $index ) . '.' );
+			}
+		}
+
+		$changes = $this->normalize_changes( $payload );
+		if ( count( $changes ) !== count( $raw_changes ) ) {
+			return new WP_Error( 'mobo_core_reconcile_change_normalization_loss', 'Revision response could not be normalized without dropping changes.' );
+		}
+		if ( ! empty( $changes ) && $current_revision <= $after_revision ) {
+			return new WP_Error( 'mobo_core_reconcile_revision_not_advanced', 'Revision response contains changes but currentRevision did not advance.' );
+		}
+
+		return array(
+			'payload' => $payload,
+			'changes' => $changes,
+		);
+	}
+
+	/**
 	 * Normalize change endpoint response.
 	 *
 	 * @param array $response Response.
@@ -890,8 +1078,9 @@ class Mobo_Core_Reconciliation {
 	private function should_skip_unchanged_product( $item ) {
 		global $wpdb;
 
-		$guid = sanitize_text_field( (string) ( isset( $item['productGuid'] ) ? $item['productGuid'] : '' ) );
-		$hash = sanitize_text_field( (string) ( isset( $item['portalHash'] ) ? $item['portalHash'] : '' ) );
+		$guid      = sanitize_text_field( (string) ( isset( $item['productGuid'] ) ? $item['productGuid'] : '' ) );
+		$hash      = sanitize_text_field( (string) ( isset( $item['portalHash'] ) ? $item['portalHash'] : '' ) );
+		$portal_id = absint( isset( $item['portalProductId'] ) ? $item['portalProductId'] : 0 );
 		if ( '' === $guid || '' === $hash || ! self::health_table_exists() ) {
 			return false;
 		}
@@ -900,9 +1089,123 @@ class Mobo_Core_Reconciliation {
 			$wpdb->prepare( "SELECT portal_hash, sync_status FROM {$table} WHERE product_guid = %s LIMIT 1", $guid ),
 			ARRAY_A
 		);
-		return is_array( $row )
-			&& 'synced' === sanitize_key( (string) $row['sync_status'] )
-			&& hash_equals( (string) $row['portal_hash'], $hash );
+
+		if ( ! is_array( $row )
+			|| 'synced' !== sanitize_key( (string) $row['sync_status'] )
+			|| ! hash_equals( (string) $row['portal_hash'], $hash ) ) {
+			return false;
+		}
+
+		/*
+		 * Portal ContentHash only proves that the remote desired state did not change.
+		 * It does NOT prove that the local WooCommerce object is still healthy. Older
+		 * builds could leave a product missing or a variable child with only a subset
+		 * of the parent's variation attributes. Skipping solely by remote hash makes
+		 * that local drift permanent. Refetch whenever the local storefront structure
+		 * is missing/incomplete so the desired-state engine can self-heal it.
+		 */
+		$product_id = $this->find_local_product_id( $guid, $portal_id );
+		return self::local_product_structure_is_sane( $product_id );
+	}
+
+	/**
+	 * Verify the minimum local storefront structure required before a remote-hash
+	 * no-op is allowed. This is intentionally cheap: it does not call Portal and it
+	 * checks only identity/existence plus variable-attribute completeness.
+	 *
+	 * @param string $guid Product GUID.
+	 * @param int    $portal_id Portal numeric product ID.
+	 * @return bool
+	 */
+	/**
+	 * Public integrity predicate shared by reconciliation and upgrade recovery.
+	 * Missing products and variable products with incomplete child selections must
+	 * be exact-refetched even when Portal ContentHash is unchanged.
+	 *
+	 * @param int $product_id WooCommerce product ID.
+	 * @return bool
+	 */
+	public static function local_product_structure_is_sane( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
+			return false;
+		}
+
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return false;
+		}
+
+		if ( ! $product instanceof WC_Product_Variable ) {
+			return true;
+		}
+
+		return self::local_variable_attributes_are_complete( $product );
+	}
+
+	/**
+	 * Check exact attribute-key coverage for all children of a variable product.
+	 *
+	 * @param WC_Product_Variable $product Variable product.
+	 * @return bool
+	 */
+	private static function local_variable_attributes_are_complete( $product ) {
+		$expected = array();
+		foreach ( (array) $product->get_attributes() as $attribute ) {
+			if ( ! $attribute instanceof WC_Product_Attribute || ! $attribute->get_variation() ) {
+				continue;
+			}
+			$key = sanitize_title( (string) $attribute->get_name() );
+			if ( '' !== $key ) {
+				$options = array();
+				foreach ( (array) $attribute->get_options() as $option ) {
+					$option = sanitize_text_field( (string) $option );
+					if ( '' !== $option ) {
+						$options[] = $option;
+					}
+				}
+				$expected[ $key ] = array_values( array_unique( $options ) );
+			}
+		}
+
+		$expected_keys = array_keys( $expected );
+		sort( $expected_keys, SORT_STRING );
+		if ( empty( $expected_keys ) ) {
+			return false;
+		}
+
+		$children = array_values( array_filter( array_map( 'absint', (array) $product->get_children() ) ) );
+		if ( empty( $children ) ) {
+			return false;
+		}
+
+		foreach ( $children as $variation_id ) {
+			$variation = wc_get_product( $variation_id );
+			if ( ! $variation instanceof WC_Product_Variation || absint( $variation->get_parent_id() ) !== absint( $product->get_id() ) ) {
+				return false;
+			}
+
+			$actual = array();
+			foreach ( (array) $variation->get_attributes( 'edit' ) as $key => $value ) {
+				$key   = preg_replace( '/^attribute_/', '', sanitize_title( (string) $key ) );
+				$value = sanitize_text_field( (string) $value );
+				if ( '' === $key || '' === $value ) {
+					return false;
+				}
+				if ( isset( $expected[ $key ] ) && ! empty( $expected[ $key ] ) && ! in_array( $value, $expected[ $key ], true ) ) {
+					return false;
+				}
+				$actual[ $key ] = true;
+			}
+
+			$actual_keys = array_keys( $actual );
+			sort( $actual_keys, SORT_STRING );
+			if ( $actual_keys !== $expected_keys ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -964,13 +1267,21 @@ class Mobo_Core_Reconciliation {
 			$data['last_successful_sync_time'] = $now;
 		}
 		if ( $row_id ) {
-			$wpdb->update( $table, $data, array( 'id' => absint( $row_id ) ) );
+			$written = $wpdb->update( $table, $data, array( 'id' => absint( $row_id ) ) );
 		} else {
 			$data['created_at'] = $now;
 			if ( ! isset( $data['last_successful_sync_time'] ) ) {
 				$data['last_successful_sync_time'] = null;
 			}
-			$wpdb->insert( $table, $data );
+			$written = $wpdb->insert( $table, $data );
+		}
+
+		/* Reconciliation health is an operational checkpoint, not a best-effort log.
+		 * Never stamp product meta as synced/failed when the canonical health row did
+		 * not persist; otherwise a transient DB failure creates contradictory health
+		 * sources and can hide a repair on the next pass. */
+		if ( false === $written ) {
+			return false;
 		}
 
 		$wp_id = absint( $data['wp_product_id'] );
@@ -1150,6 +1461,10 @@ class Mobo_Core_Reconciliation {
 			'source' => '',
 			'pending' => array(),
 			'deepSeen' => array(),
+			'catalogValidatedPages' => 0,
+			'catalogCompletionValidated' => false,
+			'catalogOnlyInStock' => false,
+			'catalogAllowsMissingDeletion' => false,
 			'scanCursor' => 0,
 			'nextScanCursor' => 0,
 			'scanHasMore' => false,
@@ -1267,6 +1582,37 @@ class Mobo_Core_Reconciliation {
 			}
 		}
 		return $default;
+	}
+
+	/**
+	 * Require an explicit array-valued data field before a response may drive deletes.
+	 *
+	 * @param array  $response Response.
+	 * @param string $context Context.
+	 * @return array|WP_Error
+	 */
+	private function extract_explicit_data_array( $response, $context ) {
+		if ( ! is_array( $response ) || ! $this->has_response_key( $response, 'data' ) ) {
+			return new WP_Error( 'mobo_core_reconcile_data_missing', sanitize_text_field( (string) $context ) . ' response is missing explicit data.' );
+		}
+		$data = $this->get_value( $response, 'data', null );
+		if ( ! is_array( $data ) ) {
+			return new WP_Error( 'mobo_core_reconcile_data_invalid', sanitize_text_field( (string) $context ) . ' response data is not an array.' );
+		}
+		return $data;
+	}
+
+	private function has_response_key( $array, $key ) {
+		if ( ! is_array( $array ) ) {
+			return false;
+		}
+		$needle = strtolower( (string) $key );
+		foreach ( array_keys( $array ) as $candidate ) {
+			if ( strtolower( (string) $candidate ) === $needle ) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private function get_value( $array, $key, $default = null ) {

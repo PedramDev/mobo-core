@@ -24,7 +24,7 @@ class Mobo_Core_Shared_Media {
 	 * Register URL/path filters only on private shared-media sites.
 	 */
 	public static function init() {
-		if ( ! self::is_enabled() ) {
+		if ( ! self::is_configured() ) {
 			return;
 		}
 
@@ -40,15 +40,26 @@ class Mobo_Core_Shared_Media {
 	 * @return bool
 	 */
 	public static function is_enabled() {
-		$enabled = self::config_bool( 'MOBO_CORE_SHARED_MEDIA_ENABLED', false );
-		if ( ! $enabled ) {
+		if ( ! self::is_configured() ) {
 			return false;
 		}
 
-		$root     = self::root_path();
-		$base_url = self::base_url();
+		$root = self::root_path();
+		return '' !== $root && is_dir( $root ) && is_readable( $root );
+	}
 
-		return '' !== $root && is_dir( $root ) && is_readable( $root ) && '' !== $base_url;
+	/**
+	 * Whether this site is configured to use Shared Media, even when the mounted
+	 * repository is temporarily unavailable. Storage/sync code must distinguish
+	 * this from is_enabled(): a transient mount outage must not silently switch a
+	 * strict shared site back to per-site downloads and recreate duplicate media.
+	 *
+	 * @return bool
+	 */
+	public static function is_configured() {
+		return self::config_bool( 'MOBO_CORE_SHARED_MEDIA_ENABLED', false )
+			&& '' !== self::root_path()
+			&& '' !== self::base_url();
 	}
 
 	/**
@@ -98,9 +109,25 @@ class Mobo_Core_Shared_Media {
 			return 0;
 		}
 
+		$validation = self::validate_manifest_files( $manifest, true );
+		if ( empty( $validation['healthy'] ) ) {
+			return 0;
+		}
+
 		$original = isset( $manifest['original'] ) && is_array( $manifest['original'] ) ? $manifest['original'] : array();
-		$relative = self::safe_relative_file( isset( $original['file'] ) ? $original['file'] : '' );
+		$relative = isset( $validation['originalRelative'] ) ? (string) $validation['originalRelative'] : '';
 		if ( '' === $relative ) {
+			return 0;
+		}
+
+		/*
+		 * Build metadata only after every manifest-advertised file has passed physical
+		 * size, MIME and dimension validation. This makes Shared Media import atomic
+		 * from WordPress' point of view: a partially written worker family can never
+		 * become a usable attachment.
+		 */
+		$metadata = self::build_attachment_metadata( $manifest );
+		if ( empty( $metadata ) ) {
 			return 0;
 		}
 
@@ -113,6 +140,9 @@ class Mobo_Core_Shared_Media {
 		if ( $attachment_id > 0 && ! self::is_shared_attachment( $attachment_id ) && self::config_bool( 'MOBO_CORE_SHARED_MEDIA_DELETE_LOCAL_COPIES', true ) ) {
 			$old_files = self::collect_local_attachment_files( $attachment_id );
 		}
+
+		$existing_attachment = $attachment_id > 0;
+		$rollback_snapshot   = $existing_attachment ? self::snapshot_attachment_state( $attachment_id ) : array();
 
 		$mime  = isset( $original['mime'] ) ? sanitize_mime_type( (string) $original['mime'] ) : 'image/webp';
 		$title = isset( $manifest['title'] ) ? sanitize_text_field( (string) $manifest['title'] ) : $image_id;
@@ -142,14 +172,11 @@ class Mobo_Core_Shared_Media {
 			return 0;
 		}
 
-		$metadata = self::build_attachment_metadata( $manifest );
-		if ( empty( $metadata ) ) {
-			return 0;
-		}
-
 		update_post_meta( $attachment_id, '_wp_attached_file', $relative );
 		update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
 		update_post_meta( $attachment_id, self::META_IMAGE_ID, $image_id );
+		update_post_meta( $attachment_id, 'image_guid', $image_id );
+		update_post_meta( $attachment_id, 'img_guid', $image_id );
 		update_post_meta( $attachment_id, self::META_FILE, $relative );
 		update_post_meta( $attachment_id, self::META_REVISION, sanitize_text_field( isset( $manifest['revision'] ) ? (string) $manifest['revision'] : '' ) );
 		update_post_meta( $attachment_id, self::META_PROFILE, sanitize_text_field( isset( $manifest['profileHash'] ) ? (string) $manifest['profileHash'] : '' ) );
@@ -161,6 +188,25 @@ class Mobo_Core_Shared_Media {
 		}
 
 		clean_post_cache( $attachment_id );
+
+		/* Treat post/meta mutation as committed only after the resulting virtual
+		 * attachment can be read back against the same complete manifest. If a DB
+		 * write was interrupted, retain any previous local files and let the queue
+		 * retry instead of deleting the last known-good copy. */
+		$committed_health = self::attachment_health( $attachment_id, true );
+		if ( empty( $committed_health['healthy'] ) ) {
+			/* Never expose a half-converted virtual attachment. Existing attachments
+			 * are restored byte-for-byte at the post/meta level; newly-created virtual
+			 * rows are removed from the database without invoking attachment deletion
+			 * hooks that could unlink read-only Shared Media files. */
+			if ( $existing_attachment && ! empty( $rollback_snapshot ) ) {
+				self::restore_attachment_state( $attachment_id, $rollback_snapshot );
+			} elseif ( ! $existing_attachment ) {
+				self::delete_virtual_attachment_record( $attachment_id );
+			}
+			return 0;
+		}
+		delete_post_meta( $attachment_id, 'mobo_sync_incomplete' );
 
 		if ( ! empty( $old_files ) ) {
 			self::delete_old_local_files( $old_files );
@@ -260,6 +306,99 @@ class Mobo_Core_Shared_Media {
 	}
 
 	/**
+	 * Refresh only WordPress metadata for an existing shared attachment from the
+	 * current committed worker manifest. No image file is generated or modified.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return int Attachment ID or 0.
+	 */
+	public static function refresh_attachment_from_manifest( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		$image_id      = self::normalize_image_id( get_post_meta( $attachment_id, self::META_IMAGE_ID, true ) );
+		if ( $attachment_id <= 0 || ! self::is_enabled() || ! self::is_shared_attachment( $attachment_id ) || '' === $image_id ) {
+			return 0;
+		}
+
+		$lock_name  = 'image_import_guid_' . substr( hash( 'sha256', strtolower( $image_id ) ), 0, 32 );
+		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( $lock_name, 300 ) : 'no-lock-class';
+		if ( false === $lock_token ) {
+			return 0;
+		}
+
+		try {
+			return self::refresh_attachment_from_manifest_unlocked( $attachment_id, $image_id );
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && 'no-lock-class' !== $lock_token ) {
+				Mobo_Core_Lock::release( $lock_name, $lock_token );
+			}
+		}
+	}
+
+	/**
+	 * Commit refreshed Shared Media metadata while the remote GUID lock is held.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $image_id Remote image GUID.
+	 * @return int
+	 */
+	private static function refresh_attachment_from_manifest_unlocked( $attachment_id, $image_id ) {
+		$manifest = self::read_manifest( $image_id );
+		if ( empty( $manifest ) ) {
+			return 0;
+		}
+
+		$validation = self::validate_manifest_files( $manifest, true );
+		$metadata   = ! empty( $validation['healthy'] ) ? self::build_attachment_metadata( $manifest ) : array();
+		$relative   = isset( $validation['originalRelative'] ) ? (string) $validation['originalRelative'] : '';
+		if ( empty( $metadata ) || '' === $relative ) {
+			return 0;
+		}
+
+		$original          = isset( $manifest['original'] ) && is_array( $manifest['original'] ) ? $manifest['original'] : array();
+		$mime              = isset( $original['mime'] ) ? sanitize_mime_type( (string) $original['mime'] ) : 'image/webp';
+		$title             = isset( $manifest['title'] ) ? sanitize_text_field( (string) $manifest['title'] ) : $image_id;
+		$url               = self::url_for_file( $relative );
+		$rollback_snapshot = self::snapshot_attachment_state( $attachment_id );
+		$result            = wp_update_post(
+			wp_slash(
+				array(
+					'ID'             => $attachment_id,
+					'post_mime_type' => $mime ? $mime : 'image/webp',
+					'post_title'     => '' !== $title ? $title : $image_id,
+					'guid'           => $url,
+				)
+			),
+			true
+		);
+		if ( is_wp_error( $result ) || absint( $result ) <= 0 ) {
+			return 0;
+		}
+
+		update_post_meta( $attachment_id, '_wp_attached_file', $relative );
+		update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
+		update_post_meta( $attachment_id, self::META_IMAGE_ID, $image_id );
+		update_post_meta( $attachment_id, 'image_guid', $image_id );
+		update_post_meta( $attachment_id, 'img_guid', $image_id );
+		update_post_meta( $attachment_id, self::META_FILE, $relative );
+		update_post_meta( $attachment_id, self::META_REVISION, sanitize_text_field( isset( $manifest['revision'] ) ? (string) $manifest['revision'] : '' ) );
+		update_post_meta( $attachment_id, self::META_PROFILE, sanitize_text_field( isset( $manifest['profileHash'] ) ? (string) $manifest['profileHash'] : '' ) );
+		update_post_meta( $attachment_id, 'mobo_shared_media', '1' );
+		update_post_meta( $attachment_id, 'mobo_image_format', 'webp' );
+		clean_post_cache( $attachment_id );
+
+		$committed_health = self::attachment_health( $attachment_id, true );
+		if ( empty( $committed_health['healthy'] ) ) {
+			if ( ! empty( $rollback_snapshot ) ) {
+				self::restore_attachment_state( $attachment_id, $rollback_snapshot );
+			}
+			return 0;
+		}
+		delete_post_meta( $attachment_id, 'mobo_sync_incomplete' );
+
+		return $attachment_id;
+	}
+
+	/**
 	 * Verify that a virtual attachment still has its complete worker manifest and
 	 * all generated files. This intentionally ignores unrelated WordPress image
 	 * sizes that are not part of the centrally approved profile.
@@ -267,7 +406,7 @@ class Mobo_Core_Shared_Media {
 	 * @param int $attachment_id Attachment ID.
 	 * @return array
 	 */
-	public static function attachment_health( $attachment_id ) {
+	public static function attachment_health( $attachment_id, $deep = true ) {
 		$attachment_id = absint( $attachment_id );
 		$image_id      = self::normalize_image_id( get_post_meta( $attachment_id, self::META_IMAGE_ID, true ) );
 
@@ -275,34 +414,218 @@ class Mobo_Core_Shared_Media {
 			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared attachment metadata is invalid.' );
 		}
 
+		/* All persisted identity fields must agree. A partial DB write can leave the
+		 * manifest pointer correct while image_guid/post MIME still belong to the old
+		 * local attachment; treating that state as healthy causes future resolver
+		 * decisions to oscillate between identities. */
+		$stored_image_guid = self::normalize_image_id( get_post_meta( $attachment_id, 'image_guid', true ) );
+		$stored_img_guid   = self::normalize_image_id( get_post_meta( $attachment_id, 'img_guid', true ) );
+		if ( '' === $stored_image_guid || '' === $stored_img_guid
+			|| ! hash_equals( strtolower( $image_id ), strtolower( $stored_image_guid ) )
+			|| ! hash_equals( strtolower( $image_id ), strtolower( $stored_img_guid ) ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared attachment GUID identity fields are incomplete or inconsistent.' );
+		}
+
+		if ( 'webp' !== strtolower( trim( (string) get_post_meta( $attachment_id, 'mobo_image_format', true ) ) ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared attachment format marker is stale.' );
+		}
+
 		$manifest = self::read_manifest( $image_id );
 		if ( empty( $manifest ) ) {
 			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared-media manifest is missing or incompatible.' );
 		}
 
-		$files = array();
-		if ( isset( $manifest['original']['file'] ) ) {
-			$files[] = $manifest['original']['file'];
+		$manifest_original = isset( $manifest['original'] ) && is_array( $manifest['original'] ) ? $manifest['original'] : array();
+		$expected_mime     = strtolower( sanitize_mime_type( isset( $manifest_original['mime'] ) ? (string) $manifest_original['mime'] : 'image/webp' ) );
+		$expected_mime     = 'image/jpg' === $expected_mime ? 'image/jpeg' : $expected_mime;
+		$stored_post_mime  = strtolower( (string) get_post_mime_type( $attachment_id ) );
+		if ( '' !== $expected_mime && ! hash_equals( $expected_mime, $stored_post_mime ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared attachment post MIME does not match the committed manifest.' );
 		}
 
-		$sizes = isset( $manifest['sizes'] ) && is_array( $manifest['sizes'] ) ? $manifest['sizes'] : array();
-		foreach ( $sizes as $row ) {
-			if ( is_array( $row ) && isset( $row['file'] ) ) {
-				$files[] = $row['file'];
+		$manifest_revision = sanitize_text_field( isset( $manifest['revision'] ) ? (string) $manifest['revision'] : '' );
+		$stored_revision   = sanitize_text_field( (string) get_post_meta( $attachment_id, self::META_REVISION, true ) );
+		if ( '' !== $manifest_revision && ! hash_equals( $manifest_revision, $stored_revision ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared-media manifest revision changed and the attachment must be refreshed.' );
+		}
+
+		$manifest_profile = strtolower( trim( isset( $manifest['profileHash'] ) ? (string) $manifest['profileHash'] : '' ) );
+		$stored_profile   = strtolower( trim( (string) get_post_meta( $attachment_id, self::META_PROFILE, true ) ) );
+		if ( '' !== $manifest_profile && ! hash_equals( $manifest_profile, $stored_profile ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared-media profile changed and the attachment metadata must be refreshed.' );
+		}
+
+		$validation = self::validate_manifest_files( $manifest, (bool) $deep );
+		if ( empty( $validation['healthy'] ) ) {
+			return array(
+				'healthy'    => false,
+				'registered' => isset( $validation['registered'] ) ? absint( $validation['registered'] ) : 0,
+				'message'    => isset( $validation['message'] ) ? (string) $validation['message'] : 'Shared-media files failed validation.',
+			);
+		}
+
+		$expected_relative = isset( $validation['originalRelative'] ) ? (string) $validation['originalRelative'] : '';
+		$stored_relative   = self::safe_relative_file( get_post_meta( $attachment_id, self::META_FILE, true ) );
+		if ( '' === $stored_relative || '' === $expected_relative || ! hash_equals( $expected_relative, $stored_relative ) ) {
+			return array( 'healthy' => false, 'registered' => absint( $validation['registered'] ), 'message' => 'Shared attachment points to an outdated manifest file.' );
+		}
+
+		$stored_attached_file = self::safe_relative_file( get_post_meta( $attachment_id, '_wp_attached_file', true ) );
+		if ( '' === $stored_attached_file || ! hash_equals( $expected_relative, $stored_attached_file ) ) {
+			return array( 'healthy' => false, 'registered' => absint( $validation['registered'] ), 'message' => 'WordPress attached-file metadata is not committed to the current shared manifest.' );
+		}
+
+		$expected_metadata = self::build_attachment_metadata( $manifest );
+		$stored_metadata   = get_post_meta( $attachment_id, '_wp_attachment_metadata', true );
+		if ( empty( $expected_metadata ) || ! self::stored_attachment_metadata_matches( $stored_metadata, $expected_metadata ) ) {
+			return array( 'healthy' => false, 'registered' => absint( $validation['registered'] ), 'message' => 'WordPress attachment metadata is incomplete or stale for the current shared manifest.' );
+		}
+
+		return array(
+			'healthy'    => true,
+			'registered' => absint( $validation['registered'] ),
+			'message'    => 'Shared-media manifest and every advertised generated file passed integrity checks.',
+		);
+	}
+
+	/**
+	 * Verify the persisted WordPress attachment metadata contains every manifest
+	 * field required for safe image resolution. Extra plugin-added metadata is
+	 * allowed; only the centrally committed file/dimension rows are authoritative.
+	 *
+	 * @param mixed $stored Persisted _wp_attachment_metadata value.
+	 * @param array $expected Metadata built from the current manifest.
+	 * @return bool
+	 */
+	private static function stored_attachment_metadata_matches( $stored, $expected ) {
+		if ( ! is_array( $stored ) || ! is_array( $expected ) ) {
+			return false;
+		}
+
+		foreach ( array( 'width', 'height' ) as $key ) {
+			if ( absint( isset( $stored[ $key ] ) ? $stored[ $key ] : 0 ) !== absint( isset( $expected[ $key ] ) ? $expected[ $key ] : 0 ) ) {
+				return false;
 			}
 		}
 
-		foreach ( $files as $relative ) {
-			if ( '' === self::safe_relative_file( $relative ) ) {
-				return array( 'healthy' => false, 'registered' => count( $sizes ), 'message' => 'One or more shared-media files are missing.' );
+		$stored_file   = self::safe_relative_syntax( isset( $stored['file'] ) ? $stored['file'] : '' );
+		$expected_file = self::safe_relative_syntax( isset( $expected['file'] ) ? $expected['file'] : '' );
+		if ( '' === $stored_file || '' === $expected_file || ! hash_equals( $expected_file, $stored_file ) ) {
+			return false;
+		}
+
+		$stored_sizes   = isset( $stored['sizes'] ) && is_array( $stored['sizes'] ) ? $stored['sizes'] : array();
+		$expected_sizes = isset( $expected['sizes'] ) && is_array( $expected['sizes'] ) ? $expected['sizes'] : array();
+		foreach ( $expected_sizes as $name => $expected_row ) {
+			if ( ! is_array( $expected_row ) || ! isset( $stored_sizes[ $name ] ) || ! is_array( $stored_sizes[ $name ] ) ) {
+				return false;
+			}
+			$stored_row = $stored_sizes[ $name ];
+			if ( basename( (string) ( isset( $stored_row['file'] ) ? $stored_row['file'] : '' ) ) !== basename( (string) ( isset( $expected_row['file'] ) ? $expected_row['file'] : '' ) )
+				|| absint( isset( $stored_row['width'] ) ? $stored_row['width'] : 0 ) !== absint( isset( $expected_row['width'] ) ? $expected_row['width'] : 0 )
+				|| absint( isset( $stored_row['height'] ) ? $stored_row['height'] : 0 ) !== absint( isset( $expected_row['height'] ) ? $expected_row['height'] : 0 ) ) {
+				return false;
+			}
+
+			$expected_mime = strtolower( sanitize_mime_type( isset( $expected_row['mime-type'] ) ? (string) $expected_row['mime-type'] : '' ) );
+			$stored_mime   = strtolower( sanitize_mime_type( isset( $stored_row['mime-type'] ) ? (string) $stored_row['mime-type'] : '' ) );
+			if ( '' !== $expected_mime && $stored_mime !== $expected_mime ) {
+				return false;
+			}
+
+			$expected_bytes = absint( isset( $expected_row['filesize'] ) ? $expected_row['filesize'] : 0 );
+			$stored_bytes   = absint( isset( $stored_row['filesize'] ) ? $stored_row['filesize'] : 0 );
+			if ( $expected_bytes > 0 && $stored_bytes !== $expected_bytes ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Validate every physical file advertised by a worker manifest before the
+	 * attachment is created/reused. The manifest is the commit record: if any cut
+	 * is missing, empty, the wrong MIME/dimensions, or has an unexpected byte count,
+	 * the family is treated as not ready and the image queue retries later.
+	 *
+	 * @param array $manifest Worker manifest.
+	 * @return array
+	 */
+	private static function validate_manifest_files( $manifest, $deep = true ) {
+		if ( ! is_array( $manifest ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => 'Shared-media manifest is invalid.', 'originalRelative' => '' );
+		}
+
+		$original = isset( $manifest['original'] ) && is_array( $manifest['original'] ) ? $manifest['original'] : array();
+		$original_check = self::validate_manifest_file_row( $original, 'original', (bool) $deep );
+		if ( empty( $original_check['healthy'] ) ) {
+			return array( 'healthy' => false, 'registered' => 0, 'message' => isset( $original_check['message'] ) ? $original_check['message'] : 'Shared-media original failed validation.', 'originalRelative' => '' );
+		}
+
+		$sizes = isset( $manifest['sizes'] ) && is_array( $manifest['sizes'] ) ? $manifest['sizes'] : array();
+		foreach ( $sizes as $name => $row ) {
+			if ( ! is_array( $row ) ) {
+				return array( 'healthy' => false, 'registered' => count( $sizes ), 'message' => 'Shared-media size manifest row is invalid: ' . sanitize_key( (string) $name ) . '.', 'originalRelative' => $original_check['relative'] );
+			}
+
+			$check = self::validate_manifest_file_row( $row, sanitize_key( (string) $name ), (bool) $deep );
+			if ( empty( $check['healthy'] ) ) {
+				return array( 'healthy' => false, 'registered' => count( $sizes ), 'message' => isset( $check['message'] ) ? $check['message'] : 'Shared-media generated size failed validation.', 'originalRelative' => $original_check['relative'] );
 			}
 		}
 
 		return array(
-			'healthy'    => ! empty( $files ),
-			'registered' => count( $sizes ),
-			'message'    => ! empty( $files ) ? 'Shared-media manifest and generated files are complete.' : 'Shared-media manifest contains no files.',
+			'healthy'          => true,
+			'registered'       => count( $sizes ),
+			'message'          => 'Shared-media manifest files are complete.',
+			'originalRelative' => $original_check['relative'],
 		);
+	}
+
+	/** @return array */
+	private static function validate_manifest_file_row( $row, $label, $deep = true ) {
+		$relative = self::safe_relative_file( isset( $row['file'] ) ? $row['file'] : '' );
+		$width    = isset( $row['width'] ) ? absint( $row['width'] ) : 0;
+		$height   = isset( $row['height'] ) ? absint( $row['height'] ) : 0;
+		$label    = sanitize_text_field( (string) $label );
+
+		if ( '' === $relative || $width <= 0 || $height <= 0 ) {
+			return array( 'healthy' => false, 'relative' => '', 'message' => 'Shared-media file metadata is incomplete: ' . $label . '.' );
+		}
+
+		$absolute = self::absolute_file( $relative );
+		if ( '' === $absolute || ! is_file( $absolute ) || ! is_readable( $absolute ) ) {
+			return array( 'healthy' => false, 'relative' => $relative, 'message' => 'Shared-media file is missing or unreadable: ' . $label . '.' );
+		}
+
+		$actual_bytes = filesize( $absolute );
+		if ( false === $actual_bytes || $actual_bytes <= 0 ) {
+			return array( 'healthy' => false, 'relative' => $relative, 'message' => 'Shared-media file is empty: ' . $label . '.' );
+		}
+
+		$expected_bytes = isset( $row['bytes'] ) ? absint( $row['bytes'] ) : 0;
+		if ( $expected_bytes > 0 && $expected_bytes !== absint( $actual_bytes ) ) {
+			return array( 'healthy' => false, 'relative' => $relative, 'message' => 'Shared-media file size does not match its committed manifest: ' . $label . '.' );
+		}
+
+		if ( $deep && function_exists( 'wp_get_image_mime' ) ) {
+			$actual_mime   = strtolower( (string) wp_get_image_mime( $absolute ) );
+			$expected_mime = strtolower( sanitize_mime_type( isset( $row['mime'] ) ? (string) $row['mime'] : 'image/webp' ) );
+			$expected_mime = 'image/jpg' === $expected_mime ? 'image/jpeg' : $expected_mime;
+			if ( '' === $actual_mime || 0 !== strpos( $actual_mime, 'image/' ) || ( '' !== $expected_mime && $expected_mime !== $actual_mime ) ) {
+				return array( 'healthy' => false, 'relative' => $relative, 'message' => 'Shared-media file MIME does not match its manifest: ' . $label . '.' );
+			}
+		}
+
+		if ( $deep ) {
+			$dimensions = function_exists( 'wp_getimagesize' ) ? wp_getimagesize( $absolute ) : @getimagesize( $absolute ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- fallback only when WordPress helper is unavailable.
+			if ( ! is_array( $dimensions ) || empty( $dimensions[0] ) || empty( $dimensions[1] ) || absint( $dimensions[0] ) !== $width || absint( $dimensions[1] ) !== $height ) {
+				return array( 'healthy' => false, 'relative' => $relative, 'message' => 'Shared-media file dimensions do not match its manifest: ' . $label . '.' );
+			}
+		}
+
+		return array( 'healthy' => true, 'relative' => $relative, 'message' => '' );
 	}
 
 	private static function build_attachment_metadata( $manifest ) {
@@ -493,6 +816,113 @@ class Mobo_Core_Shared_Media {
 		return $manifest;
 	}
 
+	/**
+	 * Snapshot every post field/meta key mutated by Shared Media installation so a
+	 * detected partial commit can be rolled back without touching physical files.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	private static function snapshot_attachment_state( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		$post          = get_post( $attachment_id );
+		if ( $attachment_id <= 0 || ! $post || 'attachment' !== $post->post_type ) {
+			return array();
+		}
+
+		$keys = array(
+			'_wp_attached_file',
+			'_wp_attachment_metadata',
+			self::META_IMAGE_ID,
+			'image_guid',
+			'img_guid',
+			self::META_FILE,
+			self::META_REVISION,
+			self::META_PROFILE,
+			'mobo_shared_media',
+			'mobo_image_format',
+			'mobo_source_url',
+			'mobo_sync_incomplete',
+		);
+		$meta = array();
+		foreach ( $keys as $key ) {
+			$exists       = metadata_exists( 'post', $attachment_id, $key );
+			$meta[ $key ] = array(
+				'exists' => $exists,
+				'value'  => $exists ? get_post_meta( $attachment_id, $key, true ) : null,
+			);
+		}
+
+		return array(
+			'post' => array(
+				'post_mime_type' => (string) $post->post_mime_type,
+				'post_title'     => (string) $post->post_title,
+				'post_status'    => (string) $post->post_status,
+				'post_parent'    => absint( $post->post_parent ),
+				'guid'           => (string) $post->guid,
+			),
+			'meta' => $meta,
+		);
+	}
+
+	/**
+	 * Restore a Shared Media mutation snapshot after post-write verification fails.
+	 *
+	 * @param int   $attachment_id Attachment ID.
+	 * @param array $snapshot Snapshot from snapshot_attachment_state().
+	 * @return void
+	 */
+	private static function restore_attachment_state( $attachment_id, $snapshot ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || ! is_array( $snapshot ) || empty( $snapshot['post'] ) ) {
+			return;
+		}
+
+		$post = is_array( $snapshot['post'] ) ? $snapshot['post'] : array();
+		wp_update_post(
+			wp_slash(
+				array(
+					'ID'             => $attachment_id,
+					'post_mime_type' => isset( $post['post_mime_type'] ) ? (string) $post['post_mime_type'] : '',
+					'post_title'     => isset( $post['post_title'] ) ? (string) $post['post_title'] : '',
+					'post_status'    => isset( $post['post_status'] ) ? (string) $post['post_status'] : 'inherit',
+					'post_parent'    => isset( $post['post_parent'] ) ? absint( $post['post_parent'] ) : 0,
+					'guid'           => isset( $post['guid'] ) ? (string) $post['guid'] : '',
+				)
+			)
+		);
+
+		foreach ( isset( $snapshot['meta'] ) && is_array( $snapshot['meta'] ) ? $snapshot['meta'] : array() as $key => $row ) {
+			if ( ! is_array( $row ) || empty( $row['exists'] ) ) {
+				delete_post_meta( $attachment_id, $key );
+				continue;
+			}
+			update_post_meta( $attachment_id, $key, isset( $row['value'] ) ? $row['value'] : '' );
+		}
+		clean_post_cache( $attachment_id );
+	}
+
+	/**
+	 * Remove a newly-created virtual attachment row after a failed commit without
+	 * calling wp_delete_attachment(), which could try to unlink worker-owned files.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return void
+	 */
+	private static function delete_virtual_attachment_record( $attachment_id ) {
+		global $wpdb;
+
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 ) {
+			return;
+		}
+
+		$wpdb->delete( $wpdb->term_relationships, array( 'object_id' => $attachment_id ), array( '%d' ) );
+		$wpdb->delete( $wpdb->postmeta, array( 'post_id' => $attachment_id ), array( '%d' ) );
+		$wpdb->delete( $wpdb->posts, array( 'ID' => $attachment_id, 'post_type' => 'attachment' ), array( '%d', '%s' ) );
+		clean_post_cache( $attachment_id );
+	}
+
 	private static function find_attachment( $image_id ) {
 		$query = new WP_Query(
 			array(
@@ -523,11 +953,14 @@ class Mobo_Core_Shared_Media {
 	}
 
 	private static function attachment_relative_file( $attachment_id ) {
-		if ( ! self::is_enabled() || ! self::is_shared_attachment( $attachment_id ) ) {
+		if ( ! self::is_configured() || ! self::is_shared_attachment( $attachment_id ) ) {
 			return '';
 		}
 
-		return self::safe_relative_file( get_post_meta( absint( $attachment_id ), self::META_FILE, true ) );
+		/* URL generation only needs a syntactically safe committed relative path.
+		 * Physical readability is checked separately by filter_attached_file()/health.
+		 * This keeps public Shared Media URLs stable during a temporary local mount outage. */
+		return self::safe_relative_syntax( get_post_meta( absint( $attachment_id ), self::META_FILE, true ) );
 	}
 
 	private static function collect_local_attachment_files( $attachment_id ) {
@@ -578,6 +1011,18 @@ class Mobo_Core_Shared_Media {
 	}
 
 	private static function safe_relative_file( $value ) {
+		$value = self::safe_relative_syntax( $value );
+		return '' !== $value && '' !== self::absolute_file( $value ) ? $value : '';
+	}
+
+	/**
+	 * Validate only the relative-path syntax without requiring the shared mount to
+	 * be readable. Used for public URL rewriting during transient repository outages.
+	 *
+	 * @param mixed $value Relative path candidate.
+	 * @return string
+	 */
+	private static function safe_relative_syntax( $value ) {
 		$value = str_replace( '\\', '/', trim( (string) $value ) );
 		if ( '' === $value || '/' === substr( $value, 0, 1 ) || false !== strpos( $value, "\0" ) ) {
 			return '';
@@ -590,7 +1035,7 @@ class Mobo_Core_Shared_Media {
 			}
 		}
 
-		return '' !== self::absolute_file( $value ) ? $value : '';
+		return $value;
 	}
 
 	private static function absolute_file( $relative ) {
@@ -634,7 +1079,7 @@ class Mobo_Core_Shared_Media {
 		}
 
 		$relative = ltrim( substr( $path, $position + 1 ), '/' );
-		return self::safe_relative_file( $relative );
+		return self::safe_relative_syntax( $relative );
 	}
 
 	private static function url_for_file( $relative ) {

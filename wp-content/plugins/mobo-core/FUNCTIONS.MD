@@ -428,7 +428,7 @@ Public methods: **8** · Internal non-public methods: **4**
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public function get_categories($sync_id)` | دریافت categories در بخش کلاینت درخواست های خروجی به API پرتال. | Get categories from API. |
-| `public function get_products_page($page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false)` | دریافت products page در بخش کلاینت درخواست های خروجی به API پرتال. | Get products page. |
+| `public function get_products_page($page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false, $only_in_stock_override = null)` | دریافت products page در بخش کلاینت درخواست های خروجی به API پرتال. | Get products page. |
 | `public function get_product_by_guid($product_guid, $sync_id = '')` | دریافت product by guid در بخش کلاینت درخواست های خروجی به API پرتال. | Get a single product payload by remote product GUID. |
 | `public function get_variants_page($product_guid, $page_number, $record_per_page, $sync_id, $cursor = 0, $use_cursor = false)` | دریافت variants page در بخش کلاینت درخواست های خروجی به API پرتال. | Get variants page. |
 | `public function get_event_payload($payload_url)` | دریافت event payload در بخش کلاینت درخواست های خروجی به API پرتال. | Pull a lightweight webhook payload from MoboCore. |

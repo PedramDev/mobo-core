@@ -45,6 +45,12 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	public function start( $source = 'admin' ) {
+		$control_lock = Mobo_Core_Lock::acquire( 'recategorize_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'عملیات دسته‌بندی در حال اجرا است؛ پس از پایان batch جاری دوباره تلاش کنید.' );
+		}
+
+		try {
 		$state = array(
 			'status'      => 'running',
 			'source'      => sanitize_key( (string) $source ),
@@ -59,6 +65,7 @@ class Mobo_Core_Recategorize_Queue {
 			'startedAt'   => time(),
 			'updatedAt'   => time(),
 			'completedAt' => 0,
+			'failureAttempts' => array(),
 		);
 
 		update_option( self::STATE_OPTION, $state, false );
@@ -68,6 +75,9 @@ class Mobo_Core_Recategorize_Queue {
 			'message' => $state['lastMessage'],
 			'status'  => $this->get_status(),
 		);
+		} finally {
+			Mobo_Core_Lock::release( 'recategorize_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -76,6 +86,12 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	public function cancel() {
+		$control_lock = Mobo_Core_Lock::acquire( 'recategorize_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'Worker دسته‌بندی هنوز batch جاری را تمام نکرده است؛ دوباره تلاش کنید.' );
+		}
+
+		try {
 		$state = $this->get_state();
 
 		if ( ! in_array( $state['status'], array( 'running', 'waiting' ), true ) ) {
@@ -88,6 +104,9 @@ class Mobo_Core_Recategorize_Queue {
 		update_option( self::STATE_OPTION, $state, false );
 
 		return array( 'success' => true, 'message' => $state['lastMessage'] );
+		} finally {
+			Mobo_Core_Lock::release( 'recategorize_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -96,9 +115,18 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	public function reset() {
+		$control_lock = Mobo_Core_Lock::acquire( 'recategorize_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked', 'message' => 'Worker دسته‌بندی هنوز batch جاری را تمام نکرده است؛ وضعیت فعلاً پاک نشد.' );
+		}
+
+		try {
 		delete_option( self::STATE_OPTION );
 
 		return array( 'success' => true, 'message' => 'وضعیت اعمال مجدد دسته‌بندی‌ها پاک شد.' );
+		} finally {
+			Mobo_Core_Lock::release( 'recategorize_queue_worker', $control_lock );
+		}
 	}
 
 	/**
@@ -193,6 +221,7 @@ class Mobo_Core_Recategorize_Queue {
 
 		$paused_for_upgrade = false;
 		$budget_exhausted   = false;
+		$retry_blocked      = false;
 		$last_checkpoint_at = microtime( true );
 		$checkpoint_every   = 5;
 		$checkpoint_seconds = 2.0;
@@ -209,11 +238,21 @@ class Mobo_Core_Recategorize_Queue {
 			}
 
 			$post_id = absint( $post_id );
-			$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
-			$processed++;
 
 			try {
 				$result = $this->recategorize_product( $post_id );
+				$reason = is_array( $result ) && isset( $result['reason'] ) ? sanitize_key( (string) $result['reason'] ) : '';
+				if ( 'product-lock-busy' === $reason ) {
+					$retry_blocked = true;
+					$state['lastMessage'] = sprintf( 'دسته‌بندی محصول %d به دلیل همگام‌سازی هم‌زمان به اجرای بعد موکول شد.', $post_id );
+					break;
+				}
+
+				$processed++;
+				$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
+				if ( isset( $state['failureAttempts'][ (string) $post_id ] ) ) {
+					unset( $state['failureAttempts'][ (string) $post_id ] );
+				}
 
 				if ( ! empty( $result['changed'] ) ) {
 					$updated++;
@@ -224,6 +263,18 @@ class Mobo_Core_Recategorize_Queue {
 				$failed++;
 				$state['lastError'] = sanitize_text_field( $e->getMessage() );
 				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': ' . $e->getMessage() );
+				$key = (string) $post_id;
+				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
+				$state['failureAttempts'][ $key ] = $attempts;
+				$max_attempts = max( 1, min( 10, absint( apply_filters( 'mobo_core_recategorize_failure_retry_limit', 3, $post_id ) ) ) );
+				if ( $attempts < $max_attempts ) {
+					$retry_blocked = true;
+					$state['lastMessage'] = sprintf( 'دسته‌بندی محصول %d ناموفق بود و در اجرای بعد دوباره تلاش می‌شود (%d/%d).', $post_id, $attempts, $max_attempts );
+					break;
+				}
+				unset( $state['failureAttempts'][ $key ] );
+				$processed++;
+				$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
 			}
 
 			/* Recategorization is idempotent; checkpoint every few objects/seconds
@@ -248,7 +299,7 @@ class Mobo_Core_Recategorize_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d محصول بررسی شد؛ %d محصول تغییر کرد، %d محصول رد شد.', $processed, $updated, $skipped );
 
-		$remaining = $paused_for_upgrade || $budget_exhausted || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -266,6 +317,7 @@ class Mobo_Core_Recategorize_Queue {
 			'remaining' => $remaining,
 			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ),
 			'budgetExhausted' => $budget_exhausted,
+			'retryBlocked'    => $retry_blocked,
 			'state'     => $state,
 		);
 	
@@ -361,6 +413,10 @@ class Mobo_Core_Recategorize_Queue {
 			false,
 			false
 		);
+
+		if ( is_array( $result ) && ! empty( $result['error'] ) ) {
+			throw new RuntimeException( 'Category assignment failed for product ' . $post_id . ': ' . sanitize_text_field( (string) $result['error'] ) );
+		}
 
 		$after   = $this->get_product_term_ids( $post_id );
 		$changed = $before !== $after;
@@ -1006,6 +1062,7 @@ class Mobo_Core_Recategorize_Queue {
 			'startedAt'   => 0,
 			'updatedAt'   => 0,
 			'completedAt' => 0,
+			'failureAttempts' => array(),
 		);
 
 		return array_merge( $defaults, $state );

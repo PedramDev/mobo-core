@@ -68,57 +68,81 @@ class Mobo_Core_SMS_Notifications {
 			return false;
 		}
 
-		$scenario = $this->classify_order( $order );
-		$config   = $this->get_scenario_config( $scenario );
+		$order_id  = absint( $order->get_id() );
+		$lock_name = 'order_sms_' . $order_id;
+		$lock      = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( $lock_name, 180 ) : 'no-lock';
 
-		if ( empty( $config['enabled'] ) ) {
+		if ( false === $lock ) {
+			/* Another checkout hook/request owns the one-shot decision for this order. */
 			return false;
 		}
 
-		$client = $this->get_pwsms_client();
-		if ( is_wp_error( $client ) ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $client->get_error_message() );
-			return $client;
-		}
+		try {
+			/*
+			 * Re-read after taking the lease so a parallel Classic/Blocks hook cannot
+			 * make the sent-meta check against a stale WC_Order object.
+			 */
+			$fresh_order = function_exists( 'wc_get_order' ) ? wc_get_order( $order_id ) : false;
+			if ( $fresh_order instanceof WC_Order ) {
+				$order = $fresh_order;
+			}
 
-		$sent_meta_key = self::META_SENT_PREFIX . $scenario;
-		if ( $order->get_meta( $sent_meta_key ) ) {
-			return false;
-		}
+			$scenario = $this->classify_order( $order );
+			$config   = $this->get_scenario_config( $scenario );
 
-		$recipients = $this->normalize_recipients( $config['recipients'], $order, $client );
-		$template   = trim( (string) $config['template'] );
+			if ( empty( $config['enabled'] ) ) {
+				return false;
+			}
 
-		if ( empty( $recipients ) ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» شماره گیرنده معتبر تنظیم نشده است.' );
-			return new WP_Error( 'mobo_core_sms_empty_recipients', 'SMS recipients are empty or invalid after normalization.' );
-		}
+			$sent_meta_key = self::META_SENT_PREFIX . $scenario;
+			if ( $order->get_meta( $sent_meta_key ) ) {
+				return false;
+			}
 
-		if ( '' === $template ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» متن/الگوی پیامک تنظیم نشده است.' );
-			return new WP_Error( 'mobo_core_sms_empty_template', 'SMS template is empty.' );
-		}
+			$client = $this->get_pwsms_client();
+			if ( is_wp_error( $client ) ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $client->get_error_message() );
+				return $client;
+			}
 
-		$message = $this->render_template( $template, $order, $scenario, $client );
-		if ( is_wp_error( $message ) ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $message->get_error_message() );
-			return $message;
-		}
-		if ( '' === trim( $message ) ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: خروجی متن/الگوی پیامک خالی شد.' );
-			return new WP_Error( 'mobo_core_sms_empty_message', 'Rendered SMS message is empty.' );
-		}
+			$recipients = $this->normalize_recipients( $config['recipients'], $order, $client );
+			$template   = trim( (string) $config['template'] );
 
-		$send = $this->dispatch_sms( $client, $recipients, $message, $order->get_id(), 'mobo_core_sms_send_failed' );
-		if ( is_wp_error( $send ) ) {
-			$this->add_order_note( $order, 'ارسال پیامک موبو ناموفق بود: ' . $send->get_error_message() );
-			return $send;
-		}
+			if ( empty( $recipients ) ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» شماره گیرنده معتبر تنظیم نشده است.' );
+				return new WP_Error( 'mobo_core_sms_empty_recipients', 'SMS recipients are empty or invalid after normalization.' );
+			}
 
-		$order->update_meta_data( $sent_meta_key, current_time( 'mysql' ) );
-		$order->save();
-		$this->add_order_note( $order, 'پیامک موبو برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» به این شماره ها ارسال شد: ' . implode( ', ', $recipients ) );
-		return true;
+			if ( '' === $template ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» متن/الگوی پیامک تنظیم نشده است.' );
+				return new WP_Error( 'mobo_core_sms_empty_template', 'SMS template is empty.' );
+			}
+
+			$message = $this->render_template( $template, $order, $scenario, $client );
+			if ( is_wp_error( $message ) ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $message->get_error_message() );
+				return $message;
+			}
+			if ( '' === trim( $message ) ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: خروجی متن/الگوی پیامک خالی شد.' );
+				return new WP_Error( 'mobo_core_sms_empty_message', 'Rendered SMS message is empty.' );
+			}
+
+			$send = $this->dispatch_sms( $client, $recipients, $message, $order->get_id(), 'mobo_core_sms_send_failed' );
+			if ( is_wp_error( $send ) ) {
+				$this->add_order_note( $order, 'ارسال پیامک موبو ناموفق بود: ' . $send->get_error_message() );
+				return $send;
+			}
+
+			$order->update_meta_data( $sent_meta_key, current_time( 'mysql' ) );
+			$order->save();
+			$this->add_order_note( $order, 'پیامک موبو برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» به این شماره ها ارسال شد: ' . implode( ', ', $recipients ) );
+			return true;
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && 'no-lock' !== $lock ) {
+				Mobo_Core_Lock::release( $lock_name, $lock );
+			}
+		}
 	}
 
 	/**

@@ -44,6 +44,16 @@ class Mobo_Core_Health_Reporter {
 		$last_sync_success = $this->get_last_sync_success_timestamp( $sync_status );
 		$last_error        = $this->resolve_last_error( $sync_status, $cron_status );
 
+		$plugin_db_version      = sanitize_text_field( (string) get_option( 'mobo_core_db_version', '' ) );
+		$schema_version         = sanitize_text_field( (string) get_option( 'mobo_core_schema_version', '' ) );
+		$schema_last_error      = sanitize_text_field( (string) get_option( 'mobo_core_schema_last_error', '' ) );
+		$schema_last_error_at   = absint( get_option( 'mobo_core_schema_last_error_at', 0 ) );
+		$current_plugin_version = defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '';
+		$database_schema_ready  = '' !== $current_plugin_version
+			&& $plugin_db_version === $current_plugin_version
+			&& $schema_version === $current_plugin_version
+			&& '' === $schema_last_error;
+
 		return array(
 			'siteUrl'               => home_url( '/' ),
 			'licenseToken'          => (string) get_option( 'mobo_core_token', '' ),
@@ -55,6 +65,11 @@ class Mobo_Core_Health_Reporter {
 			'webServerSoftware'     => $environment['web_server'],
 			'serverName'            => $environment['server_name'],
 			'databaseVersion'       => $environment['database_version'],
+			'pluginDatabaseVersion' => $plugin_db_version,
+			'databaseSchemaVersion' => $schema_version,
+			'databaseSchemaReady'   => $database_schema_ready,
+			'databaseSchemaLastError' => $schema_last_error,
+			'databaseSchemaLastErrorAt' => $this->format_timestamp( $schema_last_error_at ),
 			'activeTheme'           => $environment['active_theme'],
 			'activePluginsCount'    => $environment['active_plugins_count'],
 			'opCacheEnabled'        => $environment['opcache_enabled'],

@@ -170,13 +170,12 @@ class Mobo_Core_Remote_Updater {
 			$barrier_activated = true;
 			$barrier_result = 'draining';
 
-			$drain_timeout = class_exists( 'Mobo_Core_Settings' )
-				? Mobo_Core_Settings::get_int( 'mobo_core_upgrade_drain_timeout_seconds', 120, 15, 300 )
-				: 120;
+			$drain_timeout = self::resolve_effective_drain_timeout();
 			$drained = Mobo_Core_Upgrade_Coordinator::wait_for_quiescence( $barrier_token, $drain_timeout, 900 );
 			if ( is_wp_error( $drained ) ) {
 				$data = $drained->get_error_data();
 				$data = is_array( $data ) ? $data : array();
+				$drain_message = self::with_blocking_lock_summary( $drained->get_error_message(), isset( $data['activeLocks'] ) ? $data['activeLocks'] : array() );
 				$blocked = array(
 					'status'        => 'blocked-site-busy',
 					'deploymentId'  => $deployment_id,
@@ -184,14 +183,14 @@ class Mobo_Core_Remote_Updater {
 					'targetVersion' => $target_version,
 					'startedAt'     => self::current_status_value( 'startedAt' ),
 					'completedAt'   => gmdate( 'c' ),
-					'lastError'     => sanitize_text_field( $drained->get_error_message() ),
+					'lastError'     => sanitize_text_field( $drain_message ),
 				);
 				self::write_status( $blocked );
 				$barrier_result = 'blocked-site-busy';
 				$barrier_error  = $blocked['lastError'];
 				return new WP_Error(
 					$drained->get_error_code(),
-					$drained->get_error_message(),
+					$drain_message,
 					array_merge(
 						$data,
 						array(
@@ -207,7 +206,22 @@ class Mobo_Core_Remote_Updater {
 			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'drained' );
 
 			if ( ! Mobo_Core_Lock::renew( 'remote_plugin_upgrade', $lock, 900 ) || ! Mobo_Core_Upgrade_Coordinator::renew( $barrier_token, 900 ) ) {
-				return new WP_Error( 'mobo_core_upgrade_lease_lost', 'Upgrade lease was lost before filesystem replacement.', array( 'status' => 409, 'retryAfter' => 60 ) );
+				$lease_message = 'Upgrade lease was lost before filesystem replacement.';
+				$barrier_result = 'failed';
+				$barrier_error  = $lease_message;
+				Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'failed', array( 'lastError' => $lease_message ) );
+				$failed = array(
+					'status'        => 'failed',
+					'deploymentId'  => $deployment_id,
+					'fromVersion'   => $current_version,
+					'targetVersion' => $target_version,
+					'startedAt'     => self::current_status_value( 'startedAt' ),
+					'completedAt'   => gmdate( 'c' ),
+					'lastError'     => $lease_message,
+				);
+				self::write_status( $failed );
+				self::append_history( $failed );
+				return new WP_Error( 'mobo_core_upgrade_lease_lost', $lease_message, array( 'status' => 409, 'retryAfter' => 60 ) );
 			}
 
 			self::update_status_stage( 'backing-up' );
@@ -218,6 +232,10 @@ class Mobo_Core_Remote_Updater {
 				throw new RuntimeException( $backup->get_error_message() );
 			}
 			$backup_created = true;
+
+			if ( ! Mobo_Core_Lock::renew( 'remote_plugin_upgrade', $lock, 900 ) || ! Mobo_Core_Upgrade_Coordinator::renew( $barrier_token, 900 ) ) {
+				throw new RuntimeException( 'Upgrade lease was lost after backup and before plugin installation.' );
+			}
 
 			self::update_status_stage( 'installing' );
 			$barrier_result = 'installing';
@@ -315,6 +333,62 @@ class Mobo_Core_Remote_Updater {
 		}
 	}
 
+
+	/**
+	 * Resolve the drain timeout with enough headroom for configured blocking Mobo
+	 * HTTP calls. This does not wait for lease TTLs; live workers still need to
+	 * release at a safe boundary and the existing hard cap remains 300 seconds.
+	 *
+	 * @return int
+	 */
+	private static function resolve_effective_drain_timeout() {
+		$configured = class_exists( 'Mobo_Core_Settings' )
+			? Mobo_Core_Settings::get_int( 'mobo_core_upgrade_drain_timeout_seconds', 120, 15, 300 )
+			: 120;
+
+		if ( ! class_exists( 'Mobo_Core_Settings' ) ) {
+			return max( 15, min( 300, absint( $configured ) ) );
+		}
+
+		$api_timeout      = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
+		$payload_timeout  = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
+		$checkout_timeout = Mobo_Core_Settings::get_int( 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
+		$blocking_timeout = max( 15, $api_timeout, $payload_timeout, $checkout_timeout );
+		$minimum_safe     = min( 300, $blocking_timeout + 30 );
+
+		return min( 300, max( absint( $configured ), $minimum_safe ) );
+	}
+
+	/**
+	 * Add bounded lock diagnostics to a retryable busy-upgrade error.
+	 *
+	 * @param string $message Base message.
+	 * @param array  $locks Blocking lock map.
+	 * @return string
+	 */
+	private static function with_blocking_lock_summary( $message, $locks ) {
+		$message = sanitize_text_field( (string) $message );
+		if ( ! is_array( $locks ) || empty( $locks ) ) {
+			return $message;
+		}
+
+		$parts = array();
+		foreach ( array_slice( $locks, 0, 5, true ) as $name => $status ) {
+			$name = sanitize_key( (string) $name );
+			if ( '' === $name ) {
+				continue;
+			}
+			$remaining = is_array( $status ) && isset( $status['remainingSeconds'] ) ? absint( $status['remainingSeconds'] ) : 0;
+			$parts[] = $remaining > 0 ? $name . ' (' . $remaining . 's)' : $name;
+		}
+
+		if ( empty( $parts ) ) {
+			return $message;
+		}
+
+		return $message . ' Blocking locks: ' . implode( ', ', $parts ) . '.';
+	}
+
 	private static function download_package( $url, $token ) {
 		$license_token = trim( (string) get_option( 'mobo_core_token', '' ) );
 		if ( '' === $license_token ) {
@@ -323,53 +397,110 @@ class Mobo_Core_Remote_Updater {
 		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $license_token ) ) {
 			return new WP_Error( 'mobo_core_upgrade_invalid_license_token', 'ساختار کد لایسنس برای دانلود بسته Deploy معتبر نیست.' );
 		}
+		if ( ! self::is_trusted_package_url( $url ) ) {
+			return new WP_Error( 'mobo_core_upgrade_untrusted_redirect', 'Package URL is outside the trusted package policy.' );
+		}
 
 		if ( ! function_exists( 'wp_tempnam' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
-
 		$tmp = wp_tempnam( 'mobo-core-update.zip' );
 		if ( ! $tmp ) {
 			return new WP_Error( 'mobo_core_upgrade_temp_failed', 'Could not create a temporary package file.' );
 		}
 
-		$response = wp_remote_get(
-			$url,
-			array(
-				'timeout'             => 90,
-				'redirection'         => 3,
-				'sslverify'           => true,
-				'stream'              => true,
-				'filename'            => $tmp,
-				'limit_response_size' => self::MAX_PACKAGE_BYTES,
-				'headers'             => array(
-					'Accept'                  => 'application/zip, application/octet-stream',
-					'Token'                   => $license_token,
-					'X-Mobo-Package-Token'    => $token,
-					'Cache-Control'            => 'no-store',
-					'X-Mobo-Plugin-Version'    => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
-				),
-			)
-		);
+		$initial_url = esc_url_raw( (string) $url );
+		$current_url = $initial_url;
+		$response    = null;
+		for ( $redirects = 0; $redirects <= 3; $redirects++ ) {
+			@file_put_contents( $tmp, '' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Temp stream target must be truncated between manually validated redirects.
+			$response = wp_remote_get(
+				$current_url,
+				array(
+					'timeout'             => 90,
+					'redirection'         => 0,
+					'sslverify'           => true,
+					'stream'              => true,
+					'filename'            => $tmp,
+					'limit_response_size' => self::MAX_PACKAGE_BYTES,
+					'headers'             => array(
+						'Accept'               => 'application/zip, application/octet-stream',
+						'Token'                => $license_token,
+						'X-Mobo-Package-Token' => $token,
+						'Cache-Control'         => 'no-store',
+						'X-Mobo-Plugin-Version' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+					),
+				)
+			);
 
-		if ( is_wp_error( $response ) ) {
-			wp_delete_file( $tmp );
-			return $response;
+			if ( is_wp_error( $response ) ) {
+				wp_delete_file( $tmp );
+				return $response;
+			}
+			$code = (int) wp_remote_retrieve_response_code( $response );
+			if ( ! in_array( $code, array( 301, 302, 303, 307, 308 ), true ) ) {
+				break;
+			}
+			if ( $redirects >= 3 ) {
+				wp_delete_file( $tmp );
+				return new WP_Error( 'mobo_core_upgrade_too_many_redirects', 'Portal package endpoint exceeded the redirect limit.' );
+			}
+			$next = self::resolve_package_redirect_url( $current_url, wp_remote_retrieve_header( $response, 'location' ) );
+			if ( is_wp_error( $next ) || ! self::is_trusted_package_url( $next ) || ! self::same_url_origin( $initial_url, $next ) ) {
+				wp_delete_file( $tmp );
+				return is_wp_error( $next ) ? $next : new WP_Error( 'mobo_core_upgrade_untrusted_redirect', 'Package redirect left the trusted package origin.' );
+			}
+			$current_url = $next;
 		}
 
-		$code = (int) wp_remote_retrieve_response_code( $response );
+		$code = is_array( $response ) ? (int) wp_remote_retrieve_response_code( $response ) : 0;
 		if ( 200 !== $code ) {
 			wp_delete_file( $tmp );
 			return new WP_Error( 'mobo_core_upgrade_download_http', 'Portal package endpoint returned HTTP ' . $code . '.' );
 		}
-
 		$size = is_file( $tmp ) ? filesize( $tmp ) : 0;
 		if ( ! $size || $size > self::MAX_PACKAGE_BYTES ) {
 			wp_delete_file( $tmp );
 			return new WP_Error( 'mobo_core_upgrade_package_size', 'Downloaded package is empty or exceeds 50 MiB.' );
 		}
-
 		return $tmp;
+	}
+
+	private static function resolve_package_redirect_url( $current_url, $location ) {
+		$location = trim( (string) $location );
+		if ( '' === $location ) {
+			return new WP_Error( 'mobo_core_upgrade_redirect_location_missing', 'Package redirect did not include a Location header.' );
+		}
+		if ( preg_match( '#^https?://#i', $location ) ) {
+			return esc_url_raw( $location );
+		}
+		$parts = wp_parse_url( $current_url );
+		if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+			return new WP_Error( 'mobo_core_upgrade_redirect_base_invalid', 'Package redirect base URL is invalid.' );
+		}
+		$port   = isset( $parts['port'] ) ? ':' . absint( $parts['port'] ) : '';
+		$origin = $parts['scheme'] . '://' . $parts['host'] . $port;
+		if ( 0 === strpos( $location, '/' ) ) {
+			return esc_url_raw( $origin . $location );
+		}
+		$path = isset( $parts['path'] ) ? (string) $parts['path'] : '/';
+		$dir  = preg_replace( '#/[^/]*$#', '/', $path );
+		return esc_url_raw( $origin . $dir . $location );
+	}
+
+	private static function same_url_origin( $a, $b ) {
+		$pa = wp_parse_url( $a );
+		$pb = wp_parse_url( $b );
+		if ( ! is_array( $pa ) || ! is_array( $pb ) || empty( $pa['scheme'] ) || empty( $pa['host'] ) || empty( $pb['scheme'] ) || empty( $pb['host'] ) ) {
+			return false;
+		}
+		$sa = strtolower( (string) $pa['scheme'] );
+		$sb = strtolower( (string) $pb['scheme'] );
+		$ha = strtolower( rtrim( (string) $pa['host'], '.' ) );
+		$hb = strtolower( rtrim( (string) $pb['host'], '.' ) );
+		$porta = isset( $pa['port'] ) ? absint( $pa['port'] ) : ( 'https' === $sa ? 443 : 80 );
+		$portb = isset( $pb['port'] ) ? absint( $pb['port'] ) : ( 'https' === $sb ? 443 : 80 );
+		return $sa === $sb && $ha === $hb && $porta === $portb;
 	}
 
 	/**
@@ -492,6 +623,9 @@ class Mobo_Core_Remote_Updater {
 			}
 
 			$file = trailingslashit( $plugin_root ) . $relative;
+			if ( is_link( $file ) ) {
+				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin package must not contain symbolic links: ' . sanitize_text_field( $relative ) );
+			}
 			$real_root = realpath( $plugin_root );
 			$real_file = realpath( $file );
 
@@ -524,7 +658,10 @@ class Mobo_Core_Remote_Updater {
 			RecursiveIteratorIterator::LEAVES_ONLY
 		);
 		foreach ( $iterator as $file_info ) {
-			if ( ! $file_info->isFile() || $file_info->isLink() ) {
+			if ( $file_info->isLink() ) {
+				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin package contains a symbolic link, which is not allowed.' );
+			}
+			if ( ! $file_info->isFile() ) {
 				continue;
 			}
 			$absolute = str_replace( '\\', '/', $file_info->getPathname() );
@@ -691,6 +828,9 @@ class Mobo_Core_Remote_Updater {
 		if ( ! is_array( $parts ) || empty( $parts['host'] ) || empty( $parts['scheme'] ) || empty( $parts['path'] ) ) {
 			return false;
 		}
+		if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+			return false;
+		}
 		if ( 'http' !== strtolower( (string) $parts['scheme'] ) && ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
 			return false;
 		}
@@ -704,7 +844,15 @@ class Mobo_Core_Remote_Updater {
 		$allowed = array_values( array_unique( array_filter( array_map( 'strtolower', is_array( $allowed ) ? $allowed : array() ) ) ) );
 
 		if ( empty( $allowed ) ) {
-			return true;
+			$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+			if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
+				$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+			}
+
+			/* License/package credentials are sent to this URL. With no explicit
+			 * administrator allowlist, require the exact Portal origin, including
+			 * scheme and effective port—not merely the same hostname. */
+			return '' !== trim( $api_base ) && self::same_url_origin( $api_base, $url );
 		}
 
 		return in_array( strtolower( (string) $parts['host'] ), $allowed, true );

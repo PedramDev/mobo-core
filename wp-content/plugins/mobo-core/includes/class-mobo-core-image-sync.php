@@ -42,6 +42,14 @@ class Mobo_Core_Image_Sync {
 	 */
 	private $attachment_meta_lookup_cache = array();
 
+	/**
+	 * Request-local positive readiness cache. A verified attachment does not need
+	 * its full subsize/manifest health checked again while rebuilding image order.
+	 *
+	 * @var array<string,bool>
+	 */
+	private $attachment_readiness_cache = array();
+
 
 	/**
 	 * Process images for a product.
@@ -218,6 +226,23 @@ class Mobo_Core_Image_Sync {
 		$product_guid = $this->get_product_guid( $product_id );
 
 		$enqueue  = $queue->enqueue_product_images( $product_id, $product_guid, $images );
+		$enqueue_error = isset( $enqueue['error'] ) ? sanitize_text_field( (string) $enqueue['error'] ) : '';
+		if ( '' !== $enqueue_error ) {
+			return array(
+				'done'        => false,
+				'nextOffset'  => 0,
+				'processed'   => 0,
+				'failed'      => 1,
+				'skipped'     => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
+				'queued'      => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+				'removed'     => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
+				'pending'     => 0,
+				'due'         => 0,
+				'blocking'    => false,
+				'queuedAsync' => false,
+				'error'       => $enqueue_error,
+			);
+		}
 		$blocking = is_bool( $queue_blocking_override ) ? $queue_blocking_override : Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '0' );
 
 		/*
@@ -270,10 +295,12 @@ class Mobo_Core_Image_Sync {
 			'failed'     => $failed,
 			'skipped'    => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
 			'queued'     => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+			'removed'    => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
 			'pending'    => $pending,
 			'due'        => $due_by_product,
 			'blocking'   => $blocking,
 			'queuedAsync'=> ! $blocking,
+			'error'      => '',
 		);
 	}
 
@@ -309,9 +336,12 @@ class Mobo_Core_Image_Sync {
 
 			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 
-			if ( $attachment_id > 0 ) {
+			if ( $attachment_id > 0 && $this->ensure_attachment_ready_for_linkage( $attachment_id, $url ) ) {
 				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
 			} else {
+				if ( $attachment_id > 0 ) {
+					update_post_meta( $attachment_id, 'mobo_sync_incomplete', '1' );
+				}
 				$skipped++;
 			}
 
@@ -427,7 +457,7 @@ class Mobo_Core_Image_Sync {
 					continue;
 				}
 
-				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $queue->lock( $id, 120 ) ) {
+				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $queue->lock( $id, 300 ) ) {
 					continue;
 				}
 
@@ -437,27 +467,47 @@ class Mobo_Core_Image_Sync {
 				 * the state transition without downloading again. In Shared Media mode
 				 * only a real shared attachment may bypass import/conversion.
 				 */
-				$shared_mode = class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled();
-				$can_reuse_queued_attachment = $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id );
+				$shared_mode = class_exists( 'Mobo_Core_Shared_Media' )
+				&& ( method_exists( 'Mobo_Core_Shared_Media', 'is_configured' ) ? Mobo_Core_Shared_Media::is_configured() : Mobo_Core_Shared_Media::is_enabled() );
+				$can_reuse_queued_attachment = $attachment_id > 0
+					&& $this->attachment_guid_matches_or_unclaimed( $attachment_id, $image_guid )
+					&& $this->is_attachment_reusable_for_source( $attachment_id, $url );
 
-				if ( $can_reuse_queued_attachment && $shared_mode
-					&& method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
-					&& ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
-					$can_reuse_queued_attachment = false;
+				if ( $can_reuse_queued_attachment && $shared_mode ) {
+					if ( ! method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' )
+						|| ! Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+						$can_reuse_queued_attachment = false;
+					} elseif ( method_exists( 'Mobo_Core_Shared_Media', 'attachment_health' ) ) {
+						$shared_health = Mobo_Core_Shared_Media::attachment_health( $attachment_id );
+						$can_reuse_queued_attachment = ! empty( $shared_health['healthy'] );
+					}
 				}
 
 				if ( ! $can_reuse_queued_attachment ) {
 					$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 				}
 
-				if ( $attachment_id > 0 ) {
-					$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+				if ( $attachment_id > 0 && $this->ensure_attachment_ready_for_linkage( $attachment_id, $url ) ) {
 					/*
-					 * Keep the durable intermediate state until the product has been linked.
-					 * Do not save the WooCommerce product per image; all successful images
-					 * for the same product are linked once after the batch loop.
+					 * Commit only if this row still describes the source claimed by this
+					 * worker. A webhook may supersede source_url while the download is in
+					 * flight; a stale worker must never attach/complete the newer state.
 					 */
-					$queue->mark_attaching( $id, $attachment_id, 90 );
+					$attaching_committed = method_exists( $queue, 'mark_attaching_if_current' )
+						? $queue->mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $url, 90 )
+						: true;
+					if ( ! $attaching_committed ) {
+						if ( method_exists( $queue, 'release_if_superseded' ) ) {
+							$queue->release_if_superseded( $id, $product_id, $image_guid, $url );
+						}
+						$deferred++;
+						continue;
+					}
+					if ( ! method_exists( $queue, 'mark_attaching_if_current' ) ) {
+						$queue->mark_attaching( $id, $attachment_id, 90 );
+					}
+
+					$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
 					$touched[ $product_id ] = true;
 					if ( ! isset( $link_rows[ $product_id ] ) ) {
 						$link_rows[ $product_id ] = array();
@@ -465,6 +515,10 @@ class Mobo_Core_Image_Sync {
 					$link_rows[ $product_id ][] = $id;
 					$processed++;
 					continue;
+				}
+
+				if ( $attachment_id > 0 ) {
+					update_post_meta( $attachment_id, 'mobo_sync_incomplete', '1' );
 				}
 
 				$message = $this->get_last_image_error();
@@ -482,7 +536,20 @@ class Mobo_Core_Image_Sync {
 				 * failure. Count it as deferred so Runtime Diagnostics/Circuit Breaker
 				 * do not isolate the image stage while it is correctly waiting.
 				 */
-				$queue->mark_failure( $id, $message, $try_count, false );
+				$failure_committed = method_exists( $queue, 'mark_failure_if_current' )
+					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, false )
+					: true;
+				if ( ! $failure_committed ) {
+					/* The row was superseded while this worker was active. */
+					if ( method_exists( $queue, 'release_if_superseded' ) ) {
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $url );
+					}
+					$deferred++;
+					continue;
+				}
+				if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
+					$queue->mark_failure( $id, $message, $try_count, false );
+				}
 				if ( 0 === strpos( $message, 'Shared-media manifest is not ready or is incompatible.' ) ) {
 					$deferred++;
 				} else {
@@ -612,37 +679,132 @@ class Mobo_Core_Image_Sync {
 	 * @param string $url Source URL.
 	 * @param int    $product_id Product ID.
 	 * @param string $image_guid Remote image GUID.
+	 * @param bool   $allow_shared_local_conversion Whether Shared Media may convert an existing local attachment in place.
 	 * @return int Attachment ID or 0.
 	 */
-	private function resolve_image_attachment( $url, $product_id, $image_guid ) {
+	private function resolve_image_attachment( $url, $product_id, $image_guid, $allow_shared_local_conversion = true ) {
 		$this->last_image_error = '';
-		$existing_id = $this->find_existing_attachment( $image_guid, $url );
+		$url                    = esc_url_raw( (string) $url );
+		$product_id             = absint( $product_id );
+		$image_guid             = sanitize_text_field( (string) $image_guid );
 
-		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled() ) {
-			/* Convert an older jpg/png attachment in place even when normal reuse rules reject it. */
-			$shared_existing_id = $existing_id > 0 ? $existing_id : $this->find_attachment_by_guid( $image_guid );
-			$shared_id = Mobo_Core_Shared_Media::import_attachment(
-				$image_guid,
-				$product_id,
-				$url,
-				$shared_existing_id
-			);
-
-			if ( $shared_id > 0 ) {
-				return $shared_id;
-			}
-
-			if ( ! Mobo_Core_Shared_Media::allow_download_fallback() ) {
-				$this->set_last_image_error( 'Shared-media manifest is not ready or is incompatible.' );
-				return 0;
-			}
+		if ( '' === $url || $product_id <= 0 || '' === $image_guid ) {
+			$this->set_last_image_error( 'Image resolution arguments are invalid.' );
+			return 0;
 		}
 
-		if ( $existing_id > 0 ) {
+		$shared_mode = class_exists( 'Mobo_Core_Shared_Media' )
+			&& ( method_exists( 'Mobo_Core_Shared_Media', 'is_configured' ) ? Mobo_Core_Shared_Media::is_configured() : Mobo_Core_Shared_Media::is_enabled() );
+
+		/*
+		 * Fast path for ordinary per-site media. Shared Media may intentionally
+		 * convert an older local attachment in place, so it must continue through
+		 * the identity lock even when a reusable local attachment already exists.
+		 */
+		$existing_id = $this->find_existing_attachment( $image_guid, $url );
+		if ( ! $shared_mode && $existing_id > 0 ) {
 			return $existing_id;
 		}
 
-		return $this->download_image( $url, $product_id, $image_guid );
+		/*
+		 * The normal image queue and Image Refresh have independent worker locks.
+		 * Without one lock per remote image identity they can both observe a miss
+		 * and sideload the same source concurrently, causing WordPress to create
+		 * collision files such as image-1.webp, image-2.webp, ... . Serialize only
+		 * the import/conversion for this GUID and source URL; unrelated images remain parallel.
+		 */
+		$identity_locks = array();
+		$lock_names     = array(
+			'image_import_guid_' . substr( hash( 'sha256', strtolower( $image_guid ) ), 0, 32 ),
+			'image_import_url_' . substr( hash( 'sha256', strtolower( $url ) ), 0, 32 ),
+		);
+		sort( $lock_names, SORT_STRING );
+
+		if ( class_exists( 'Mobo_Core_Lock' ) ) {
+			foreach ( $lock_names as $lock_name ) {
+				$lock_token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+				if ( false === $lock_token ) {
+					foreach ( array_reverse( $identity_locks, true ) as $owned_name => $owned_token ) {
+						Mobo_Core_Lock::release( $owned_name, $owned_token );
+					}
+
+					/* The owner may have completed between our first lookup and lock attempt. */
+					$this->forget_attachment_lookup_caches( $image_guid, $url );
+					$existing_id = $this->find_existing_attachment( $image_guid, $url );
+					if ( $existing_id > 0 ) {
+						if ( ! $shared_mode ) {
+							return $existing_id;
+						}
+
+						/* In Shared Media mode another request may currently be converting this
+						 * very attachment in place. Never bypass that critical section by linking
+						 * its old local representation. A committed shared attachment is safe to
+						 * reuse; otherwise defer and let the owner finish. */
+						if ( Mobo_Core_Shared_Media::is_shared_attachment( $existing_id ) ) {
+							$shared_health = method_exists( 'Mobo_Core_Shared_Media', 'attachment_health' )
+								? Mobo_Core_Shared_Media::attachment_health( $existing_id )
+								: array( 'healthy' => true );
+							if ( ! empty( $shared_health['healthy'] ) ) {
+								return $existing_id;
+							}
+						}
+					}
+
+					$this->set_last_image_error( 'Image import is already in progress for this image GUID or source URL.' );
+					return 0;
+				}
+
+				$identity_locks[ $lock_name ] = $lock_token;
+			}
+		}
+
+		try {
+			/* Re-check inside the identity lock to close the lookup/import race. */
+			$this->forget_attachment_lookup_caches( $image_guid, $url );
+			$existing_id = $this->find_existing_attachment( $image_guid, $url );
+
+			if ( $shared_mode ) {
+				/*
+				 * Normal sync may convert an older local attachment to shared mode in place.
+				 * Legacy refresh explicitly disables that behavior because it must replace
+				 * the old attachment with a distinct shared attachment before cleanup.
+				 */
+				$shared_existing_id = 0;
+				if ( $existing_id > 0 && ( $allow_shared_local_conversion || Mobo_Core_Shared_Media::is_shared_attachment( $existing_id ) ) ) {
+					$shared_existing_id = $existing_id;
+				} elseif ( $allow_shared_local_conversion ) {
+					$shared_existing_id = $this->find_attachment_by_guid( $image_guid );
+				}
+
+				$shared_id = Mobo_Core_Shared_Media::import_attachment(
+					$image_guid,
+					$product_id,
+					$url,
+					$shared_existing_id
+				);
+
+				if ( $shared_id > 0 ) {
+					return $shared_id;
+				}
+
+				if ( ! Mobo_Core_Shared_Media::allow_download_fallback() ) {
+					$this->set_last_image_error( 'Shared-media manifest is not ready or is incompatible.' );
+					return 0;
+				}
+			}
+
+			if ( $existing_id > 0 ) {
+				return $existing_id;
+			}
+
+			return $this->download_image( $url, $product_id, $image_guid );
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && ! empty( $identity_locks ) ) {
+				foreach ( array_reverse( $identity_locks, true ) as $lock_name => $lock_token ) {
+					Mobo_Core_Lock::release( $lock_name, $lock_token );
+				}
+			}
+		}
 	}
 
 	private function download_image( $url, $product_id, $image_guid ) {
@@ -677,16 +839,15 @@ class Mobo_Core_Image_Sync {
 				return $args;
 			};
 
-			$allow_local_image_host = $this->build_safe_local_image_host_filter( $url );
+			$identity_bootstrap = $this->register_attachment_identity_bootstrap( $product_id, $image_guid, $url );
 
 			add_filter( 'http_request_args', $secure_image_request_args, 10, 2 );
-			add_filter( 'http_request_host_is_external', $allow_local_image_host, 10, 3 );
 
 			try {
 				$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
 			} finally {
 				remove_filter( 'http_request_args', $secure_image_request_args, 10 );
-				remove_filter( 'http_request_host_is_external', $allow_local_image_host, 10 );
+				$this->unregister_attachment_identity_bootstrap( $identity_bootstrap );
 			}
 
 			if ( is_wp_error( $attachment_id ) ) {
@@ -712,7 +873,26 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
-		$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+		/* The sideload API returning an attachment ID is not the final storage commit.
+		 * Verify the physical payload immediately; otherwise a mislabeled/corrupt WebP
+		 * source can create one unusable attachment on every retry. This attachment was
+		 * created inside the current identity lock and has not been linked to a product,
+		 * so deleting it here is safe and prevents orphan accumulation. */
+		if ( ! $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
+			if ( 'attachment' === get_post_type( $attachment_id ) ) {
+				wp_delete_attachment( $attachment_id, true );
+			}
+			$this->set_last_image_error( 'Downloaded image failed physical MIME/file validation and was discarded before product linkage.' );
+			return 0;
+		}
+
+		/* Do not mark the attachment complete here. The physical original passed the
+		 * first gate, but metadata/subsize readiness is verified by the caller. Keep
+		 * the identity durable and explicitly incomplete across any crash in that gap. */
+		$this->update_attachment_meta_if_changed( $attachment_id, 'image_guid', $image_guid );
+		$this->update_attachment_meta_if_changed( $attachment_id, 'img_guid', $image_guid );
+		$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_source_url', $url );
+		$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_sync_incomplete', '1' );
 
 		return $attachment_id;
 	}
@@ -813,12 +993,14 @@ class Mobo_Core_Image_Sync {
 			return $mimes;
 		};
 
+		$identity_bootstrap = $this->register_attachment_identity_bootstrap( $product_id, $image_guid, $url );
 		add_filter( 'upload_mimes', $allow_webp, 10, 1 );
 
 		try {
 			$attachment_id = media_handle_sideload( $file, $product_id );
 		} finally {
 			remove_filter( 'upload_mimes', $allow_webp, 10 );
+			$this->unregister_attachment_identity_bootstrap( $identity_bootstrap );
 		}
 
 		if ( is_wp_error( $attachment_id ) ) {
@@ -833,13 +1015,67 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
-		$attachment_id = absint( $attachment_id );
+		/* Final identity completion is deliberately owned by download_image() after
+		 * physical validation. The add_attachment bootstrap above leaves this row
+		 * marked incomplete if PHP stops before that final gate. */
+		return absint( $attachment_id );
+	}
 
-		if ( $attachment_id > 0 ) {
-			$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+	/**
+	 * Register the Mobo identity at the earliest possible WordPress attachment
+	 * lifecycle point. media_sideload_image()/media_handle_sideload() create the DB
+	 * row before returning control to us; without this hook a fatal error in that
+	 * gap leaves an unidentifiable physical file and the next retry creates -1/-2
+	 * collision filenames. The first attachment inserted for the expected parent is
+	 * claimed and marked incomplete until the outer storage validation commits it.
+	 *
+	 * @param int    $product_id Parent product ID.
+	 * @param string $image_guid Remote image GUID.
+	 * @param string $url Source URL.
+	 * @return callable|null
+	 */
+	private function register_attachment_identity_bootstrap( $product_id, $image_guid, $url ) {
+		$product_id = absint( $product_id );
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$url        = esc_url_raw( (string) $url );
+		if ( $product_id <= 0 || '' === $image_guid || '' === $url ) {
+			return null;
 		}
 
-		return $attachment_id;
+		$claimed = 0;
+		$callback = function ( $attachment_id ) use ( $product_id, $image_guid, $url, &$claimed ) {
+			$attachment_id = absint( $attachment_id );
+			if ( $claimed > 0 || $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+				return;
+			}
+
+			$post = get_post( $attachment_id );
+			if ( ! $post || absint( $post->post_parent ) !== $product_id ) {
+				return;
+			}
+
+			$claimed = $attachment_id;
+			update_post_meta( $attachment_id, 'image_guid', $image_guid );
+			update_post_meta( $attachment_id, 'img_guid', $image_guid );
+			update_post_meta( $attachment_id, 'mobo_source_url', $url );
+			update_post_meta( $attachment_id, 'mobo_sync_incomplete', '1' );
+			update_post_meta( $attachment_id, 'mobo_image_format', $this->is_webp_url( $url ) ? 'webp' : 'image' );
+		};
+
+		add_action( 'add_attachment', $callback, 1, 1 );
+		return $callback;
+	}
+
+	/**
+	 * Remove a request-scoped attachment bootstrap hook.
+	 *
+	 * @param callable|null $callback Callback returned by register_attachment_identity_bootstrap().
+	 * @return void
+	 */
+	private function unregister_attachment_identity_bootstrap( $callback ) {
+		if ( is_callable( $callback ) ) {
+			remove_action( 'add_attachment', $callback, 1 );
+		}
 	}
 
 	/**
@@ -944,23 +1180,14 @@ class Mobo_Core_Image_Sync {
 	public function import_image_for_refresh( $url, $product_id, $image_guid, $old_attachment_id = 0 ) {
 		$this->load_media_dependencies();
 
-		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_enabled() ) {
+		if ( class_exists( 'Mobo_Core_Shared_Media' )
+			&& ( method_exists( 'Mobo_Core_Shared_Media', 'is_configured' ) ? Mobo_Core_Shared_Media::is_configured() : Mobo_Core_Shared_Media::is_enabled() ) ) {
 			/*
-			 * The legacy refresh service replaces one attachment ID with another. Do
-			 * not convert the old local attachment in place here; create/reuse the
-			 * dedicated virtual shared attachment and let the service safely remove
-			 * the superseded local attachment after product references are changed.
+			 * Route Shared Media refresh through the same GUID/source identity lock as
+			 * normal imports, but keep the refresh invariant that the old local
+			 * attachment is never converted in place.
 			 */
-			$attachment_id = Mobo_Core_Shared_Media::import_attachment(
-				$image_guid,
-				$product_id,
-				$url,
-				0
-			);
-
-			if ( $attachment_id <= 0 && Mobo_Core_Shared_Media::allow_download_fallback() ) {
-				$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
-			}
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid, false );
 		} else {
 			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 		}
@@ -973,6 +1200,54 @@ class Mobo_Core_Image_Sync {
 		}
 
 		return $attachment_id;
+	}
+
+	/**
+	 * Final storage gate before an attachment is linked to a WooCommerce product.
+	 * A successful sideload is not enough: WebP metadata/subsizes (or the complete
+	 * Shared Media manifest) must also be healthy.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $url Current source URL.
+	 * @return bool
+	 */
+	private function ensure_attachment_ready_for_linkage( $attachment_id, $url ) {
+		$attachment_id = absint( $attachment_id );
+		$url           = esc_url_raw( (string) $url );
+		$cache_key     = $attachment_id . '|' . md5( $url );
+		if ( isset( $this->attachment_readiness_cache[ $cache_key ] ) && $this->attachment_readiness_cache[ $cache_key ] ) {
+			return true;
+		}
+
+		if ( ! $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
+			$this->set_last_image_error( 'Imported attachment failed final file/source validation.' );
+			return false;
+		}
+
+		if ( ! $this->is_webp_url( $url ) && ! $this->is_attachment_webp( $attachment_id ) ) {
+			$this->attachment_readiness_cache[ $cache_key ] = true;
+			return true;
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Image_Refresh_Service' ) ) {
+			$this->set_last_image_error( 'WebP readiness service is unavailable.' );
+			return false;
+		}
+
+		$refresh = new Mobo_Core_Image_Refresh_Service();
+		if ( ! method_exists( $refresh, 'ensure_webp_attachment_ready' ) ) {
+			$this->set_last_image_error( 'WebP readiness verifier is unavailable.' );
+			return false;
+		}
+
+		$result = $refresh->ensure_webp_attachment_ready( $attachment_id );
+		if ( empty( $result['success'] ) ) {
+			$this->set_last_image_error( 'Image file exists but final WebP/subsize validation failed: ' . sanitize_text_field( isset( $result['message'] ) ? (string) $result['message'] : 'Unknown readiness error.' ) );
+			return false;
+		}
+
+		$this->attachment_readiness_cache[ $cache_key ] = true;
+		return true;
 	}
 
 	private function mark_attachment_synced( $attachment_id, $image_guid, $url ) {
@@ -1063,7 +1338,28 @@ class Mobo_Core_Image_Sync {
 				$first_position = $position;
 			}
 
-			if ( ! in_array( $status, array( 'done', 'attaching', 'processing' ), true ) || $attachment_id <= 0 ) {
+			if ( ! in_array( $status, array( 'done', 'attaching' ), true ) || $attachment_id <= 0 ) {
+				continue;
+			}
+
+			$source_url = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
+			if ( ! $this->is_attachment_reusable_for_source( $attachment_id, $source_url )
+				|| ! $this->ensure_attachment_ready_for_linkage( $attachment_id, $source_url ) ) {
+				/* A durable done row from an older release may have a healthy original but
+				 * incomplete/corrupt cuts. Do not silently omit it forever: move it back to
+				 * the normal repair path so storage readiness and product linkage converge. */
+				$row_id    = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+				$try_count = absint( isset( $row['try_count'] ) ? $row['try_count'] : 0 ) + 1;
+				if ( $row_id > 0 ) {
+					$message    = $this->get_last_image_error();
+					$message    = '' !== $message ? $message : 'Attachment failed final storage readiness while rebuilding the product gallery.';
+					$image_guid = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+					if ( method_exists( $queue, 'schedule_repair_if_current' ) ) {
+						$queue->schedule_repair_if_current( $row_id, $message, $try_count, $product_id, $image_guid, $source_url );
+					} else {
+						$queue->mark_failure( $row_id, $message, $try_count, false );
+					}
+				}
 				continue;
 			}
 
@@ -1128,6 +1424,9 @@ class Mobo_Core_Image_Sync {
 			}
 
 			$attachment_id = $this->find_existing_attachment( $image_guid, $url );
+			if ( $attachment_id > 0 && ! $this->ensure_attachment_ready_for_linkage( $attachment_id, $url ) ) {
+				$attachment_id = 0;
+			}
 
 			if ( ! $first_seen ) {
 				$first_seen      = true;
@@ -1175,8 +1474,21 @@ class Mobo_Core_Image_Sync {
 
 		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
 
+		/* Gallery-only mode intentionally preserves the current featured image. It
+		 * must therefore also exclude that ID from WooCommerce gallery metadata;
+		 * otherwise a partial async image batch can duplicate the featured image. */
+		$current_featured = absint( $product->get_image_id() );
+		if ( $current_featured > 0 ) {
+			$gallery_ids = array_values( array_filter( $gallery_ids, static function ( $id ) use ( $current_featured ) {
+				return absint( $id ) !== $current_featured;
+			} ) );
+		}
+
 		if ( empty( $gallery_ids ) ) {
-			return false;
+			/* This path is used while the authoritative first image is still pending.
+			 * With no ready non-featured image, preserve the existing gallery rather
+			 * than turning a transient download gap into destructive UI churn. */
+			return true;
 		}
 
 		$current_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
@@ -1185,7 +1497,19 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$product->set_gallery_image_ids( $gallery_ids );
-		$product->save();
+		$saved_id = absint( $product->save() );
+		if ( $saved_id !== $product_id ) {
+			return false;
+		}
+
+		$fresh = wc_get_product( $product_id );
+		if ( ! $fresh instanceof WC_Product ) {
+			return false;
+		}
+		$fresh_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $fresh->get_gallery_image_ids() ) ) ) );
+		if ( $fresh_gallery !== $gallery_ids ) {
+			return false;
+		}
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
@@ -1205,17 +1529,33 @@ class Mobo_Core_Image_Sync {
 			return false;
 		}
 
-		$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
-		$desired_image_id = ! empty( $gallery_ids ) ? absint( $gallery_ids[0] ) : 0;
-		$current_gallery  = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
+		$ordered_ids      = array_values( array_unique( array_filter( array_map( 'absint', (array) $gallery_ids ) ) ) );
+		$desired_image_id = ! empty( $ordered_ids ) ? absint( $ordered_ids[0] ) : 0;
+		/* WooCommerce stores the featured image separately in _thumbnail_id. The
+		 * gallery meta must contain only the remaining images; storing the first ID
+		 * in both places causes duplicate rendering and false reference counts. */
+		$desired_gallery = $desired_image_id > 0 ? array_values( array_slice( $ordered_ids, 1 ) ) : $ordered_ids;
+		$current_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
 
-		if ( absint( $product->get_image_id() ) === $desired_image_id && $current_gallery === $gallery_ids ) {
+		if ( absint( $product->get_image_id() ) === $desired_image_id && $current_gallery === $desired_gallery ) {
 			return true;
 		}
 
 		$product->set_image_id( $desired_image_id );
-		$product->set_gallery_image_ids( $gallery_ids );
-		$product->save();
+		$product->set_gallery_image_ids( $desired_gallery );
+		$saved_id = absint( $product->save() );
+		if ( $saved_id !== $product_id ) {
+			return false;
+		}
+
+		$fresh = wc_get_product( $product_id );
+		if ( ! $fresh instanceof WC_Product ) {
+			return false;
+		}
+		$fresh_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $fresh->get_gallery_image_ids() ) ) ) );
+		if ( absint( $fresh->get_image_id() ) !== $desired_image_id || $fresh_gallery !== $desired_gallery ) {
+			return false;
+		}
 
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
@@ -1228,7 +1568,18 @@ class Mobo_Core_Image_Sync {
 		$cache_key  = $this->attachment_lookup_key( $image_guid, $url );
 
 		if ( array_key_exists( $cache_key, $this->attachment_lookup_cache ) ) {
-			return absint( $this->attachment_lookup_cache[ $cache_key ] );
+			$cached_id = absint( $this->attachment_lookup_cache[ $cache_key ] );
+			if ( $cached_id <= 0 ) {
+				return 0;
+			}
+
+			/* A request-local hit can become stale after repair/deletion in the same request. */
+			if ( $this->attachment_guid_matches_or_unclaimed( $cached_id, $image_guid )
+				&& $this->is_attachment_reusable_for_source( $cached_id, $url ) ) {
+				return $cached_id;
+			}
+
+			unset( $this->attachment_lookup_cache[ $cache_key ] );
 		}
 
 		$candidates = array();
@@ -1245,7 +1596,8 @@ class Mobo_Core_Image_Sync {
 		$candidates = array_values( array_unique( array_filter( array_map( 'absint', $candidates ) ) ) );
 
 		foreach ( $candidates as $attachment_id ) {
-			if ( $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
+			if ( $this->attachment_guid_matches_or_unclaimed( $attachment_id, $image_guid )
+				&& $this->is_attachment_reusable_for_source( $attachment_id, $url ) ) {
 				$this->attachment_lookup_cache[ $cache_key ] = absint( $attachment_id );
 				return absint( $attachment_id );
 			}
@@ -1257,6 +1609,33 @@ class Mobo_Core_Image_Sync {
 
 	private function attachment_lookup_key( $image_guid, $url ) {
 		return md5( sanitize_text_field( (string) $image_guid ) . '|' . esc_url_raw( (string) $url ) );
+	}
+
+	/**
+	 * Forget request-local identity/meta lookup entries before a post-lock recheck.
+	 *
+	 * A miss cached immediately before another worker completes an import must not
+	 * survive into the identity-lock critical section, otherwise the second worker
+	 * can still create a collision copy despite owning the lock after the first one.
+	 *
+	 * @param string $image_guid Remote image GUID.
+	 * @param string $url Source URL.
+	 * @return void
+	 */
+	private function forget_attachment_lookup_caches( $image_guid, $url ) {
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$url        = esc_url_raw( (string) $url );
+
+		unset( $this->attachment_lookup_cache[ $this->attachment_lookup_key( $image_guid, $url ) ] );
+
+		if ( '' !== $image_guid ) {
+			unset( $this->attachment_meta_lookup_cache[ 'image_guid|' . md5( $image_guid ) ] );
+			unset( $this->attachment_meta_lookup_cache[ 'img_guid|' . md5( $image_guid ) ] );
+		}
+
+		if ( '' !== $url ) {
+			unset( $this->attachment_meta_lookup_cache[ 'mobo_source_url|' . md5( $url ) ] );
+		}
 	}
 
 	private function find_attachment_by_guid( $guid ) {
@@ -1350,6 +1729,36 @@ class Mobo_Core_Image_Sync {
 		$this->attachment_meta_lookup_cache[ $cache_key ] = $current;
 	}
 
+	/**
+	 * An exact source URL is not sufficient identity when different Mobo image
+	 * records happen to point at the same physical URL. Never steal an attachment
+	 * already owned by another GUID; legacy attachments with no GUID may be adopted.
+	 *
+	 * @param int    $attachment_id Attachment ID.
+	 * @param string $image_guid Desired image GUID.
+	 * @return bool
+	 */
+	private function attachment_guid_matches_or_unclaimed( $attachment_id, $image_guid ) {
+		$attachment_id = absint( $attachment_id );
+		$image_guid    = sanitize_text_field( (string) $image_guid );
+		if ( $attachment_id <= 0 || '' === $image_guid ) {
+			return false;
+		}
+
+		$stored = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
+		if ( '' === $stored ) {
+			$stored = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
+		}
+		if ( '' === $stored && class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			$stored = sanitize_text_field( (string) get_post_meta( $attachment_id, '_mobo_shared_media_image_id', true ) );
+			if ( '' !== $stored ) {
+				return hash_equals( strtolower( $stored ), strtolower( $image_guid ) );
+			}
+		}
+
+		return '' === $stored || hash_equals( strtolower( trim( $stored ) ), strtolower( trim( $image_guid ) ) );
+	}
+
 	private function is_attachment_reusable_for_source( $attachment_id, $url ) {
 		$attachment_id = absint( $attachment_id );
 		$url           = esc_url_raw( (string) $url );
@@ -1359,12 +1768,91 @@ class Mobo_Core_Image_Sync {
 		}
 
 		/*
+		 * A GUID identifies the remote image record, but its source URL can change
+		 * when the image is replaced/re-encoded. Once an attachment has a recorded
+		 * Mobo source URL, a different current URL must trigger a fresh import instead
+		 * of silently relabeling the old physical file with the new URL. Legacy rows
+		 * without mobo_source_url remain eligible for GUID-based recovery.
+		 */
+		$stored_source_url = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+		if ( '' !== $stored_source_url && '' !== $url && ! hash_equals( $stored_source_url, $url ) ) {
+			return false;
+		}
+
+		/*
+		 * A database Attachment row is not enough. Files can be removed manually, by
+		 * a failed migration/cache cleanup, or left as zero-byte files after an I/O
+		 * failure. Reusing such a row prevents both the normal queue and Missing Image
+		 * Recovery from ever downloading a healthy replacement.
+		 */
+		$detected_mime = '';
+		try {
+			$file = get_attached_file( $attachment_id );
+			$file = is_string( $file ) ? $file : '';
+
+			if ( '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
+				return false;
+			}
+
+			/* A non-empty HTML/error payload renamed as an image must not be reused. */
+			if ( function_exists( 'wp_get_image_mime' ) ) {
+				$detected_mime = strtolower( (string) wp_get_image_mime( $file ) );
+				if ( '' === $detected_mime || 0 !== strpos( $detected_mime, 'image/' ) ) {
+					return false;
+				}
+			}
+		} catch ( Throwable $error ) {
+			return false;
+		}
+
+		/* Physical bytes, filename extension and WordPress MIME must describe the
+		 * same format. This is important beyond WebP: a .jpg containing WebP/PNG (or
+		 * stale post_mime_type) may be decoded by PHP yet served with the wrong HTTP
+		 * Content-Type by Apache/nginx/CDNs. Reject inconsistent storage identities so
+		 * a retry produces a clean attachment instead of preserving mislabeled media. */
+		if ( '' !== $detected_mime && isset( $file ) && '' !== (string) $file ) {
+			$physical_ext = strtolower( pathinfo( (string) $file, PATHINFO_EXTENSION ) );
+			$mime_by_ext  = array(
+				'jpg'  => 'image/jpeg',
+				'jpeg' => 'image/jpeg',
+				'jpe'  => 'image/jpeg',
+				'png'  => 'image/png',
+				'gif'  => 'image/gif',
+				'webp' => 'image/webp',
+			);
+			if ( isset( $mime_by_ext[ $physical_ext ] ) && ! hash_equals( $mime_by_ext[ $physical_ext ], $detected_mime ) ) {
+				return false;
+			}
+
+			$stored_mime = strtolower( (string) get_post_mime_type( $attachment_id ) );
+			if ( '' !== $stored_mime && 0 === strpos( $stored_mime, 'image/' ) && ! hash_equals( $stored_mime, $detected_mime ) ) {
+				return false;
+			}
+		}
+
+		/*
 		 * If the new source is WebP, do not reuse an older jpg/png attachment with
 		 * the same image_guid. This is the critical migration behavior: it allows the
 		 * normal image queue to download the new WebP instead of silently keeping the
 		 * heavy legacy file.
 		 */
 		if ( $this->is_webp_url( $url ) ) {
+			if ( '' !== $detected_mime && 'image/webp' !== $detected_mime ) {
+				return false;
+			}
+
+			/* Content alone is not enough for a reusable WebP attachment. A file that
+			 * contains WebP bytes but is stored as .jpg/.png (or whose attachment MIME
+			 * still says JPEG/PNG) may be served with the wrong HTTP Content-Type by the
+			 * web server/CDN. Reject it so the normal import path creates a clean WebP
+			 * attachment rather than perpetuating an inconsistent storage identity. */
+			$physical_file = isset( $file ) ? (string) $file : (string) get_attached_file( $attachment_id );
+			$physical_ext  = strtolower( pathinfo( $physical_file, PATHINFO_EXTENSION ) );
+			$stored_mime   = strtolower( (string) get_post_mime_type( $attachment_id ) );
+			if ( 'webp' !== $physical_ext || 'image/webp' !== $stored_mime ) {
+				return false;
+			}
+
 			return $this->is_attachment_webp( $attachment_id );
 		}
 

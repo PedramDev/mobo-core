@@ -374,7 +374,7 @@ class Mobo_Core_Image_Refresh_Service {
 					$result['skipped']++;
 				} elseif ( 'inserted' === $action ) {
 					$result['enqueued']++;
-				} elseif ( 'requeued' === $action ) {
+				} elseif ( in_array( $action, array( 'requeued', 'source_changed_requeued' ), true ) ) {
 					$result['requeued']++;
 				} elseif ( 'already_done' === $action ) {
 					$result['alreadyDone']++;
@@ -499,18 +499,6 @@ class Mobo_Core_Image_Refresh_Service {
 			);
 		}
 
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_enabled', '0' ) ) {
-			return $this->save_last_result(
-				array(
-					'success'   => true,
-					'status'    => 'disabled',
-					'processed' => 0,
-					'failed'    => 0,
-					'remaining' => false,
-				)
-			);
-		}
-
 		$limit = $limit > 0 ? absint( $limit ) : Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
 		$limit = max( 1, min( 20, $limit ) );
 		$queue = new Mobo_Core_Image_Refresh_Queue();
@@ -533,6 +521,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$processed = 0;
 		$failed    = 0;
 		$skipped   = 0;
+		$superseded = 0;
 		$paused_for_upgrade = false;
 
 		foreach ( $rows as $row ) {
@@ -543,27 +532,87 @@ class Mobo_Core_Image_Refresh_Service {
 
 			$id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
 
-			if ( $id <= 0 || ! $queue->lock( $id, 180 ) ) {
+			if ( $id <= 0 || ! $queue->lock( $id, 300 ) ) {
 				continue;
 			}
 
-			$result = $this->process_row( $row );
+			$product_id        = absint( isset( $row['product_id'] ) ? $row['product_id'] : 0 );
+			$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
+			$old_attachment_id = absint( isset( $row['old_attachment_id'] ) ? $row['old_attachment_id'] : 0 );
+			$new_source_url    = esc_url_raw( (string) ( isset( $row['new_source_url'] ) ? $row['new_source_url'] : '' ) );
+			if ( method_exists( $queue, 'is_current_identity' )
+				&& ! $queue->is_current_identity( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+				if ( method_exists( $queue, 'release_if_superseded' ) ) {
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+				}
+				$superseded++;
+				continue;
+			}
+
+			$result = $this->process_row( $row, $queue );
+			if ( ! empty( $result['stale'] ) ) {
+				if ( method_exists( $queue, 'release_if_superseded' ) ) {
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+				}
+				$superseded++;
+				continue;
+			}
 
 			if ( ! empty( $result['success'] ) ) {
-				$queue->mark_done( $id, isset( $result['newAttachmentId'] ) ? absint( $result['newAttachmentId'] ) : 0, isset( $result['note'] ) ? $result['note'] : '' );
+				$note       = isset( $result['note'] ) ? $result['note'] : '';
+				$new_id     = isset( $result['newAttachmentId'] ) ? absint( $result['newAttachmentId'] ) : 0;
+				$committed  = method_exists( $queue, 'mark_done_if_current' )
+					? $queue->mark_done_if_current( $id, $new_id, $note, $product_id, $image_guid, $old_attachment_id, $new_source_url )
+					: true;
+				if ( ! $committed ) {
+					if ( method_exists( $queue, 'release_if_superseded' ) ) {
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+					}
+					$superseded++;
+					continue;
+				}
+				if ( ! method_exists( $queue, 'mark_done_if_current' ) ) {
+					$queue->mark_done( $id, $new_id, $note );
+				}
 				$processed++;
 				continue;
 			}
 
 			if ( ! empty( $result['skipped'] ) ) {
-				$queue->mark_skipped( $id, isset( $result['message'] ) ? $result['message'] : 'این ردیف بدون تغییر رد شد.' );
+				$message   = isset( $result['message'] ) ? $result['message'] : 'این ردیف بدون تغییر رد شد.';
+				$committed = method_exists( $queue, 'mark_skipped_if_current' )
+					? $queue->mark_skipped_if_current( $id, $message, $product_id, $image_guid, $old_attachment_id, $new_source_url )
+					: true;
+				if ( ! $committed ) {
+					if ( method_exists( $queue, 'release_if_superseded' ) ) {
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+					}
+					$superseded++;
+					continue;
+				}
+				if ( ! method_exists( $queue, 'mark_skipped_if_current' ) ) {
+					$queue->mark_skipped( $id, $message );
+				}
 				$skipped++;
 				continue;
 			}
 
 			$try_count = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
-			$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_max_try', 5, 1, 20 );
-			$queue->mark_failure( $id, isset( $result['message'] ) ? $result['message'] : 'نوسازی تصویر ناموفق بود.', $try_count, $try_count >= $max_try );
+			$message   = isset( $result['message'] ) ? $result['message'] : 'نوسازی تصویر ناموفق بود.';
+			/* Network/storage/worker failures are recoverable. Only an explicitly permanent result may become terminal. */
+			$committed = method_exists( $queue, 'mark_failure_if_current' )
+				? $queue->mark_failure_if_current( $id, $message, $try_count, ! empty( $result['permanent'] ), $product_id, $image_guid, $old_attachment_id, $new_source_url )
+				: true;
+			if ( ! $committed ) {
+				if ( method_exists( $queue, 'release_if_superseded' ) ) {
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+				}
+				$superseded++;
+				continue;
+			}
+			if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
+				$queue->mark_failure( $id, $message, $try_count, ! empty( $result['permanent'] ) );
+			}
 			$failed++;
 		}
 
@@ -574,6 +623,7 @@ class Mobo_Core_Image_Refresh_Service {
 				'processed' => $processed,
 				'failed'    => $failed,
 				'skipped'   => $skipped,
+				'superseded'=> $superseded,
 				'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
 			)
 		);
@@ -589,7 +639,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @param array $row Row.
 	 * @return array
 	 */
-	private function process_row( $row ) {
+	private function process_row( $row, Mobo_Core_Image_Refresh_Queue $queue = null ) {
 		$product_id        = absint( isset( $row['product_id'] ) ? $row['product_id'] : 0 );
 		$old_attachment_id = absint( isset( $row['old_attachment_id'] ) ? $row['old_attachment_id'] : 0 );
 		$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
@@ -599,17 +649,71 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'skipped' => true, 'message' => 'اطلاعات این ردیف صف ناقص یا نامعتبر است.' );
 		}
 
+		$row_id = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+		if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
+			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+			return array( 'success' => false, 'stale' => true, 'message' => 'این ردیف هنگام پردازش با منبع جدید جایگزین شد.' );
+		}
+
 		$product = wc_get_product( $product_id );
 		if ( ! $product instanceof WC_Product ) {
 			return array( 'success' => false, 'skipped' => true, 'message' => 'محصول مربوط به این ردیف دیگر وجود ندارد.' );
 		}
 
-		if ( 'attachment' !== get_post_type( $old_attachment_id ) ) {
-			return array( 'success' => false, 'skipped' => true, 'message' => 'پیوست تصویر قدیمی دیگر وجود ندارد.' );
-		}
+		$active_old_attachment_id = $old_attachment_id;
+		$old_exists               = 'attachment' === get_post_type( $old_attachment_id );
+		$old_in_use               = $old_exists && $this->product_uses_attachment( $product_id, $old_attachment_id );
 
-		if ( ! $this->product_uses_attachment( $product_id, $old_attachment_id ) ) {
-			return array( 'success' => false, 'skipped' => true, 'message' => 'محصول دیگر از تصویر قدیمی این ردیف استفاده نمی کند.' );
+		/*
+		 * Crash-safe reconciliation: PHP may stop after the product was saved with the
+		 * new WebP but before mark_refresh_completed()/queue mark_done(). On retry the
+		 * old attachment is no longer in use, which used to turn a successful refresh
+		 * into a misleading skipped row. Recover only when the product demonstrably
+		 * uses a healthy attachment matching this exact image GUID/source identity.
+		 */
+		if ( ! $old_exists || ! $old_in_use ) {
+			$preferred_id = absint( isset( $row['new_attachment_id'] ) ? $row['new_attachment_id'] : 0 );
+			$recovered_id = $this->find_valid_webp_attachment_for_identity( $image_guid, $new_source_url, $preferred_id );
+
+			if ( $recovered_id > 0 && $this->product_uses_attachment( $product_id, $recovered_id ) ) {
+				$ready = $this->ensure_webp_attachment_ready( $recovered_id );
+				if ( empty( $ready['success'] ) ) {
+					return array( 'success' => false, 'message' => 'جایگزینی قبلاً روی محصول انجام شده، اما فایل WebP بازیابی‌شده هنوز سالم/کامل نیست: ' . sanitize_text_field( isset( $ready['message'] ) ? (string) $ready['message'] : 'خطای نامشخص' ) );
+				}
+
+				if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
+					&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+					return array( 'success' => false, 'stale' => true, 'message' => 'منبع تصویر در زمان بازیابی اجرای نیمه‌تمام تغییر کرد.' );
+				}
+
+				$this->mark_refresh_completed( $product_id, $old_attachment_id, $recovered_id, $image_guid, $new_source_url );
+				$note = 'اجرای نیمه‌تمام قبلی شناسایی شد و بدون دانلود تکراری تکمیل شد.';
+				$shared_attachment = class_exists( 'Mobo_Core_Shared_Media' )
+					&& Mobo_Core_Shared_Media::is_shared_attachment( $recovered_id );
+				$delete_old = $old_exists && ( Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+					|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() ) );
+				if ( $delete_old ) {
+					$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $recovered_id );
+					$note .= ' ' . ( isset( $delete_check['message'] ) ? (string) $delete_check['message'] : 'تصویر قدیمی نگه داشته شد.' );
+				}
+
+				return array( 'success' => true, 'newAttachmentId' => $recovered_id, 'note' => $note );
+			}
+
+			/* A superseded worker may already have replaced the original legacy
+			 * attachment with an older source for the same image GUID before its CAS
+			 * commit was rejected. Continue from that in-use successor instead of
+			 * permanently skipping the newer desired source. */
+			$continuation_id = $this->find_product_attachment_for_image_guid( $product_id, $image_guid );
+			if ( $continuation_id > 0 ) {
+				$active_old_attachment_id = $continuation_id;
+			} else {
+				return array(
+					'success' => false,
+					'skipped' => true,
+					'message' => $old_exists ? 'محصول دیگر از تصویر قدیمی این ردیف استفاده نمی کند و جایگزین/ادامه معتبر همان GUID روی محصول پیدا نشد.' : 'پیوست تصویر قدیمی دیگر وجود ندارد و جایگزین/ادامه معتبر همان GUID روی محصول پیدا نشد.',
+				);
+			}
 		}
 
 		$image_sync = new Mobo_Core_Image_Sync();
@@ -617,7 +721,7 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'message' => 'بخش دریافت تصویر جدید در افزونه در دسترس نیست.' );
 		}
 
-		$new_attachment_id = absint( $image_sync->import_image_for_refresh( $new_source_url, $product_id, $image_guid, $old_attachment_id ) );
+		$new_attachment_id = absint( $image_sync->import_image_for_refresh( $new_source_url, $product_id, $image_guid, $active_old_attachment_id ) );
 
 		if ( $new_attachment_id <= 0 || 'attachment' !== get_post_type( $new_attachment_id ) ) {
 			return array( 'success' => false, 'message' => 'دریافت یا ثبت تصویر WebP ناموفق بود.' );
@@ -627,37 +731,14 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'message' => 'فایل دریافت شده یک تصویر معتبر نیست.' );
 		}
 
-		if ( $new_attachment_id === $old_attachment_id || ! $this->is_webp_attachment( $new_attachment_id ) ) {
+		if ( $new_attachment_id === $active_old_attachment_id || ! $this->is_webp_attachment( $new_attachment_id ) ) {
 			return array( 'success' => false, 'message' => 'تصویر جایگزین یک فایل WebP مستقل و معتبر نیست.' );
 		}
 
 		$shared_attachment = class_exists( 'Mobo_Core_Shared_Media' )
-			&& Mobo_Core_Shared_Media::is_enabled()
 			&& Mobo_Core_Shared_Media::is_shared_attachment( $new_attachment_id );
 
-		if ( $shared_attachment ) {
-			/* The central worker already generated and verified the approved cuts. */
-			$shared_health = Mobo_Core_Shared_Media::attachment_health( $new_attachment_id );
-			$subsize_result = array(
-				'success'    => ! empty( $shared_health['healthy'] ),
-				'generated'  => 0,
-				'registered' => isset( $shared_health['registered'] ) ? absint( $shared_health['registered'] ) : 0,
-				'message'    => isset( $shared_health['message'] ) ? (string) $shared_health['message'] : 'وضعیت مخزن اشتراکی تصویر مشخص نیست.',
-			);
-		} else {
-			$generate_subsizes = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_generate_subsizes', '1' );
-			if ( $generate_subsizes ) {
-				$subsize_result = $this->ensure_attachment_subsizes( $new_attachment_id );
-			} else {
-				$subsize_health = $this->inspect_attachment_subsizes( $new_attachment_id );
-				$subsize_result = array(
-					'success'    => ! empty( $subsize_health['healthy'] ),
-					'generated'  => 0,
-					'registered' => isset( $subsize_health['registered'] ) ? absint( $subsize_health['registered'] ) : 0,
-					'message'    => isset( $subsize_health['message'] ) ? (string) $subsize_health['message'] : 'وضعیت برش های تصویر مشخص نیست.',
-				);
-			}
-		}
+		$subsize_result = $this->ensure_webp_attachment_ready( $new_attachment_id );
 
 		if ( empty( $subsize_result['success'] ) ) {
 			return array(
@@ -666,14 +747,27 @@ class Mobo_Core_Image_Refresh_Service {
 			);
 		}
 
-		$this->replace_product_attachment( $product, $old_attachment_id, $new_attachment_id );
-		$this->mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
+		/* Local sideloads are born with mobo_sync_incomplete=1 at add_attachment.
+		 * Shared imports already commit their manifest atomically, but writing the
+		 * same final marker is harmless and gives both storage modes one readiness
+		 * boundary: only a fully verified replacement is complete. */
+		update_post_meta( $new_attachment_id, 'mobo_sync_incomplete', '0' );
+
+		if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
+			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+			return array( 'success' => false, 'stale' => true, 'message' => 'منبع تصویر قبل از جایگزینی محصول تغییر کرد.' );
+		}
+
+		if ( ! $this->replace_product_attachment( $product, $active_old_attachment_id, $new_attachment_id ) ) {
+			return array( 'success' => false, 'message' => 'تصویر جدید آماده شد، اما ذخیره Featured/Gallery محصول در WooCommerce تأیید نشد و در اجرای بعد دوباره تلاش می‌شود.' );
+		}
+		$this->mark_refresh_completed( $product_id, $active_old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
 
 		$note       = 'تصویر قدیمی نگه داشته شد.';
 		$delete_old = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
 			|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() );
 		if ( $delete_old ) {
-			$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $new_attachment_id );
+			$delete_check = $this->safe_delete_old_attachment( $active_old_attachment_id, $new_attachment_id );
 			$note         = ! empty( $delete_check['deleted'] ) ? ( isset( $delete_check['message'] ) ? (string) $delete_check['message'] : 'تصویر قدیمی با موفقیت و به صورت امن حذف شد.' ) : ( isset( $delete_check['message'] ) ? $delete_check['message'] : 'تصویر قدیمی نگه داشته شد.' );
 		}
 
@@ -692,7 +786,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @param WC_Product $product Product object.
 	 * @param int        $old_attachment_id Old attachment.
 	 * @param int        $new_attachment_id New attachment.
-	 * @return void
+	 * @return bool
 	 */
 	private function replace_product_attachment( WC_Product $product, $old_attachment_id, $new_attachment_id ) {
 		$product_id        = $product->get_id();
@@ -713,12 +807,36 @@ class Mobo_Core_Image_Refresh_Service {
 				is_array( $gallery_ids ) ? $gallery_ids : array()
 			);
 
-			$product->set_gallery_image_ids( array_values( array_unique( array_filter( array_map( 'absint', $gallery_ids ) ) ) ) );
+			$featured_id = absint( $product->get_image_id() );
+			$gallery_ids = array_values( array_unique( array_filter( array_map( 'absint', $gallery_ids ) ) ) );
+			if ( $featured_id > 0 ) {
+				$gallery_ids = array_values( array_filter( $gallery_ids, static function ( $id ) use ( $featured_id ) {
+					return absint( $id ) !== $featured_id;
+				} ) );
+			}
+			$product->set_gallery_image_ids( $gallery_ids );
 		}
 
-		$product->save();
+		$saved_id = absint( $product->save() );
+		if ( $saved_id !== absint( $product_id ) ) {
+			return false;
+		}
+
+		$fresh = wc_get_product( $product_id );
+		if ( ! $fresh instanceof WC_Product ) {
+			return false;
+		}
+		$fresh_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $fresh->get_gallery_image_ids() ) ) ) );
+		if ( absint( $fresh->get_image_id() ) === $old_attachment_id || in_array( $old_attachment_id, $fresh_gallery, true ) ) {
+			return false;
+		}
+		if ( absint( $fresh->get_image_id() ) !== $new_attachment_id && ! in_array( $new_attachment_id, $fresh_gallery, true ) ) {
+			return false;
+		}
+
 		wc_delete_product_transients( $product_id );
 		clean_post_cache( $product_id );
+		return true;
 	}
 
 
@@ -775,6 +893,15 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر قدیمی به عنوان تصویر موبو ثبت نشده است.', 'referenceMigration' => $migration_result );
 		}
 
+		/* Shared Media files are worker-owned/read-only from the WordPress site's
+		 * perspective. wp_delete_attachment(..., true) would otherwise ask WordPress
+		 * to unlink the centrally shared physical family. Never do that from a site
+		 * refresh/cleanup path, even when a superseded refresh created a newer shared
+		 * attachment for the same image GUID. */
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'پیوست قدیمی Shared Media است؛ حذف فایل فیزیکی فقط در اختیار Worker/مخزن مرکزی است و از سایت انجام نشد.', 'referenceMigration' => $migration_result );
+		}
+
 		if ( $new_attachment_id <= 0 || ! $this->is_valid_new_attachment( $new_attachment_id ) || ! $this->is_webp_attachment( $new_attachment_id ) ) {
 			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر WebP جایگزین معتبر نیست؛ انتقال مراجع و حذف انجام نشد.', 'referenceMigration' => $migration_result );
 		}
@@ -782,6 +909,17 @@ class Mobo_Core_Image_Refresh_Service {
 		$registered_replacement = absint( get_post_meta( $attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) );
 		if ( $registered_replacement !== $new_attachment_id ) {
 			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'ارتباط پیوست قدیمی با WebP جایگزین در سابقه نوسازی تایید نشد.', 'referenceMigration' => $migration_result );
+		}
+
+		$identity_preflight = $this->product_references_match_replacement_identity( $attachment_id, $new_attachment_id );
+		if ( empty( $identity_preflight['safe'] ) ) {
+			return array(
+				'deleted'             => false,
+				'outcome'             => 'blocked',
+				'message'             => isset( $identity_preflight['message'] ) ? (string) $identity_preflight['message'] : 'یک یا چند محصول هنوز هویت تصویر متفاوت/نامشخصی برای پیوست قدیمی دارند؛ انتقال سراسری مرجع انجام نشد.',
+				'referenceMigration'  => $migration_result,
+				'remainingReferences' => true,
+			);
 		}
 
 		/* Migration is safe and idempotent for this verified old -> new pair.
@@ -823,9 +961,8 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		$leftover_result = array( 'deletedFiles' => 0, 'bytes' => 0, 'keptFiles' => 0 );
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_cleanup_leftover_subsizes', '1' ) ) {
-			$leftover_result = $this->cleanup_leftover_legacy_family( $family_snapshot, $old_file, $new_file );
-		}
+		/* Safe invariant: unregistered/unreferenced leftovers are always cleaned after the attachment itself is safely deleted. */
+		$leftover_result = $this->cleanup_leftover_legacy_family( $family_snapshot, $old_file, $new_file );
 
 		$message = 'تصویر قدیمی و برش های ثبت شده آن با موفقیت و به صورت امن حذف شدند.';
 		if ( ! empty( $migration_result['updatedRows'] ) ) {
@@ -1059,7 +1196,10 @@ class Mobo_Core_Image_Refresh_Service {
 		$image_guid  = sanitize_text_field( (string) $image_guid );
 		$source_url  = esc_url_raw( (string) $source_url );
 		$preferred_id = absint( $preferred_id );
-		if ( $preferred_id > 0 && $this->is_valid_new_attachment( $preferred_id ) && $this->is_webp_attachment( $preferred_id ) ) {
+		if ( $preferred_id > 0
+			&& $this->attachment_matches_refresh_identity( $preferred_id, $image_guid, $source_url )
+			&& $this->is_valid_new_attachment( $preferred_id )
+			&& $this->is_webp_attachment( $preferred_id ) ) {
 			return $preferred_id;
 		}
 
@@ -1075,7 +1215,7 @@ class Mobo_Core_Image_Refresh_Service {
 				WHERE p.post_type = 'attachment'
 					AND p.post_status IN ('inherit', 'private')
 					AND (
-						(pm.meta_key IN ('image_guid', 'img_guid') AND pm.meta_value = %s)
+						(pm.meta_key IN ('image_guid', 'img_guid', '_mobo_shared_media_image_id') AND pm.meta_value = %s)
 						OR (pm.meta_key = 'mobo_source_url' AND pm.meta_value = %s)
 					)
 				ORDER BY p.ID DESC
@@ -1088,12 +1228,58 @@ class Mobo_Core_Image_Refresh_Service {
 
 		foreach ( is_array( $candidates ) ? $candidates : array() as $candidate_id ) {
 			$candidate_id = absint( $candidate_id );
-			if ( $candidate_id > 0 && $this->is_valid_new_attachment( $candidate_id ) && $this->is_webp_attachment( $candidate_id ) ) {
+			if ( $candidate_id > 0
+				&& $this->attachment_matches_refresh_identity( $candidate_id, $image_guid, $source_url )
+				&& $this->is_valid_new_attachment( $candidate_id )
+				&& $this->is_webp_attachment( $candidate_id ) ) {
 				return $candidate_id;
 			}
 		}
 
 		return 0;
+	}
+
+	/**
+	 * Require a recovered attachment to belong to the exact refresh identity.
+	 * Existing metadata may be legacy/incomplete, but any populated GUID/source
+	 * value must agree and at least one identity value must positively match.
+	 */
+	private function attachment_matches_refresh_identity( $attachment_id, $image_guid, $source_url ) {
+		$attachment_id = absint( $attachment_id );
+		$image_guid    = sanitize_text_field( (string) $image_guid );
+		$source_url    = esc_url_raw( (string) $source_url );
+		if ( $attachment_id <= 0 || '' === $image_guid || '' === $source_url ) {
+			return false;
+		}
+
+		$wanted_guid = strtolower( trim( $image_guid ) );
+		$guid_a      = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
+		$guid_b      = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
+		$guid_shared = '';
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			$guid_shared = sanitize_text_field( (string) get_post_meta( $attachment_id, '_mobo_shared_media_image_id', true ) );
+		}
+		$stored_source = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+
+		foreach ( array( $guid_a, $guid_b, $guid_shared ) as $stored_guid ) {
+			if ( '' !== $stored_guid && ! hash_equals( $wanted_guid, strtolower( trim( $stored_guid ) ) ) ) {
+				return false;
+			}
+		}
+		if ( '' !== $stored_source && ! hash_equals( $source_url, $stored_source ) ) {
+			return false;
+		}
+
+		$guid_match = false;
+		foreach ( array( $guid_a, $guid_b, $guid_shared ) as $stored_guid ) {
+			if ( '' !== $stored_guid && hash_equals( $wanted_guid, strtolower( trim( $stored_guid ) ) ) ) {
+				$guid_match = true;
+				break;
+			}
+		}
+		$source_match = '' !== $stored_source && hash_equals( $source_url, $stored_source );
+
+		return $guid_match || $source_match;
 	}
 
 	/** @return array */
@@ -1512,6 +1698,9 @@ class Mobo_Core_Image_Refresh_Service {
 					'needsRepair'   => 0,
 					'repaired'      => 0,
 					'generatedFiles'=> 0,
+					'localNeedsRepair' => 0,
+					'sharedNeedsRepair'=> 0,
+					'sharedChecked'    => 0,
 					'failed'        => 0,
 					'issues'        => array(),
 					'cursorStart'   => absint( get_option( $cursor_option, 0 ) ),
@@ -1541,6 +1730,9 @@ class Mobo_Core_Image_Refresh_Service {
 			'needsRepair'       => $continue_cycle ? absint( isset( $previous['needsRepair'] ) ? $previous['needsRepair'] : 0 ) : 0,
 			'repaired'          => $continue_cycle ? absint( isset( $previous['repaired'] ) ? $previous['repaired'] : 0 ) : 0,
 			'generatedFiles'    => $continue_cycle ? absint( isset( $previous['generatedFiles'] ) ? $previous['generatedFiles'] : 0 ) : 0,
+			'localNeedsRepair'  => $continue_cycle ? absint( isset( $previous['localNeedsRepair'] ) ? $previous['localNeedsRepair'] : 0 ) : 0,
+			'sharedNeedsRepair' => $continue_cycle ? absint( isset( $previous['sharedNeedsRepair'] ) ? $previous['sharedNeedsRepair'] : 0 ) : 0,
+			'sharedChecked'     => $continue_cycle ? absint( isset( $previous['sharedChecked'] ) ? $previous['sharedChecked'] : 0 ) : 0,
 			'failed'            => $continue_cycle ? absint( isset( $previous['failed'] ) ? $previous['failed'] : 0 ) : 0,
 			'unsupportedEditor' => $continue_cycle ? absint( isset( $previous['unsupportedEditor'] ) ? $previous['unsupportedEditor'] : 0 ) : 0,
 			'missingOriginal'   => $continue_cycle ? absint( isset( $previous['missingOriginal'] ) ? $previous['missingOriginal'] : 0 ) : 0,
@@ -1562,6 +1754,53 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 
 			$result['webpChecked']++;
+
+			$shared_attachment = class_exists( 'Mobo_Core_Shared_Media' )
+				&& Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id );
+			if ( $shared_attachment ) {
+				$shared_health = Mobo_Core_Shared_Media::attachment_health( $attachment_id );
+				if ( ! isset( $result['sharedChecked'] ) ) {
+					$result['sharedChecked'] = 0;
+				}
+				if ( ! isset( $result['sharedNeedsRepair'] ) ) {
+					$result['sharedNeedsRepair'] = 0;
+				}
+				$result['sharedChecked']++;
+
+				if ( ! empty( $shared_health['healthy'] ) ) {
+					$result['healthy']++;
+					continue;
+				}
+
+				$result['needsRepair']++;
+				$result['sharedNeedsRepair']++;
+				if ( $repair && method_exists( 'Mobo_Core_Shared_Media', 'refresh_attachment_from_manifest' ) ) {
+					$refreshed = Mobo_Core_Shared_Media::refresh_attachment_from_manifest( $attachment_id );
+					$verified  = $refreshed > 0 ? Mobo_Core_Shared_Media::attachment_health( $attachment_id ) : array();
+					if ( ! empty( $verified['healthy'] ) ) {
+						$result['repaired']++;
+						continue;
+					}
+					$result['failed']++;
+					$shared_health = ! empty( $verified ) ? $verified : $shared_health;
+				}
+
+				if ( count( $result['issues'] ) < 20 ) {
+					$result['issues'][] = array(
+						'attachmentId'    => $attachment_id,
+						'file'            => (string) get_post_meta( $attachment_id, '_mobo_shared_media_file', true ),
+						'missingSizes'    => array(),
+						'missingFiles'    => array(),
+						'wrongFormatFiles'=> array(),
+						'message'         => sanitize_text_field( isset( $shared_health['message'] ) ? (string) $shared_health['message'] : 'Shared Media attachment is not healthy.' ),
+					);
+				}
+				continue;
+			}
+
+			if ( ! isset( $result['localNeedsRepair'] ) ) {
+				$result['localNeedsRepair'] = 0;
+			}
 			$health = $this->inspect_attachment_subsizes( $attachment_id );
 
 			if ( isset( $health['editorSupported'] ) && ! $health['editorSupported'] ) {
@@ -1588,6 +1827,7 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 
 			$result['needsRepair']++;
+			$result['localNeedsRepair']++;
 
 			if ( $repair ) {
 				$repair_result = $this->ensure_attachment_subsizes( $attachment_id );
@@ -1835,6 +2075,54 @@ class Mobo_Core_Image_Refresh_Service {
 	}
 
 	/**
+	 * Verify one WebP attachment is actually ready for product linkage. Shared
+	 * attachments must match their committed manifest; local attachments must have
+	 * complete WordPress/WooCommerce subsizes, repairing only when inspection finds
+	 * a real gap. This is also used by the normal image-storage queue.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	public function ensure_webp_attachment_ready( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'پیوست WebP معتبر نیست.' );
+		}
+
+		/* A shared marker remains authoritative even during a temporary mount outage.
+		 * Never fall through to local subsize generation for worker-owned media. */
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			if ( ! Mobo_Core_Shared_Media::is_enabled() ) {
+				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'پیوست متعلق به Shared Media است، اما مخزن مشترک اکنون قابل خواندن نیست.' );
+			}
+
+			$health = Mobo_Core_Shared_Media::attachment_health( $attachment_id );
+			return array(
+				'success'    => ! empty( $health['healthy'] ),
+				'generated'  => 0,
+				'registered' => isset( $health['registered'] ) ? absint( $health['registered'] ) : 0,
+				'message'    => isset( $health['message'] ) ? (string) $health['message'] : 'وضعیت مخزن اشتراکی تصویر مشخص نیست.',
+			);
+		}
+
+		if ( ! $this->is_valid_new_attachment( $attachment_id ) || ! $this->is_webp_attachment( $attachment_id ) ) {
+			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'پیوست WebP معتبر و قابل خواندن نیست.' );
+		}
+
+		$health = $this->inspect_attachment_subsizes( $attachment_id );
+		if ( ! empty( $health['healthy'] ) ) {
+			return array(
+				'success'    => true,
+				'generated'  => 0,
+				'registered' => isset( $health['registered'] ) ? absint( $health['registered'] ) : 0,
+				'message'    => isset( $health['message'] ) ? (string) $health['message'] : 'برش های تصویر کامل هستند.',
+			);
+		}
+
+		return $this->ensure_attachment_subsizes( $attachment_id );
+	}
+
+	/**
 	 * Inspect attachment cuts without modifying metadata or files.
 	 *
 	 * @param int $attachment_id Attachment ID.
@@ -1844,14 +2132,15 @@ class Mobo_Core_Image_Refresh_Service {
 		$attachment_id = absint( $attachment_id );
 		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) || ! $this->is_webp_attachment( $attachment_id ) ) {
 			return array(
-				'healthy'         => false,
-				'code'            => 'invalid_attachment',
-				'message'         => 'پیوست WebP نامعتبر است.',
-				'missingSizes'    => array(),
-				'missingFiles'    => array(),
-				'wrongFormatFiles'=> array(),
-				'registered'      => 0,
-				'editorSupported' => false,
+				'healthy'                => false,
+				'code'                   => 'invalid_attachment',
+				'message'                => 'پیوست WebP نامعتبر است.',
+				'missingSizes'           => array(),
+				'missingFiles'           => array(),
+				'wrongFormatFiles'       => array(),
+				'dimensionMismatchFiles' => array(),
+				'registered'             => 0,
+				'editorSupported'        => false,
 			);
 		}
 
@@ -1860,35 +2149,98 @@ class Mobo_Core_Image_Refresh_Service {
 		$file = is_string( $file ) ? $this->normalize_file_path( $file ) : '';
 		if ( '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
 			return array(
-				'healthy'         => false,
-				'code'            => 'missing_original',
-				'message'         => 'فایل اصلی WebP وجود ندارد یا خالی است.',
-				'missingSizes'    => array(),
-				'missingFiles'    => array( '' !== $file ? basename( $file ) : 'فایل اصلی' ),
-				'wrongFormatFiles'=> array(),
-				'registered'      => 0,
-				'editorSupported' => false,
+				'healthy'                => false,
+				'code'                   => 'missing_original',
+				'message'                => 'فایل اصلی WebP وجود ندارد یا خالی است.',
+				'missingSizes'           => array(),
+				'missingFiles'           => array( '' !== $file ? basename( $file ) : 'فایل اصلی' ),
+				'wrongFormatFiles'       => array(),
+				'dimensionMismatchFiles' => array(),
+				'registered'             => 0,
+				'editorSupported'        => false,
 			);
 		}
 
-		$metadata       = wp_get_attachment_metadata( $attachment_id );
-		$metadata_valid = is_array( $metadata )
-			&& ! empty( $metadata['file'] )
+		$stored_mime       = strtolower( (string) get_post_mime_type( $attachment_id ) );
+		$physical_ext      = strtolower( pathinfo( $file, PATHINFO_EXTENSION ) );
+		$actual_mime       = function_exists( 'wp_get_image_mime' ) ? strtolower( (string) wp_get_image_mime( $file ) ) : '';
+		$original_format_ok = 'webp' === $physical_ext
+			&& 'image/webp' === $stored_mime
+			&& ( '' === $actual_mime || 'image/webp' === $actual_mime );
+
+		$metadata          = wp_get_attachment_metadata( $attachment_id );
+		$attached_relative = $this->relative_upload_path( $file );
+		$metadata_file     = is_array( $metadata ) && ! empty( $metadata['file'] ) ? ltrim( $this->normalize_file_path( (string) $metadata['file'] ), '/' ) : '';
+		$original_dims     = $this->get_physical_image_dimensions( $file );
+		$metadata_valid    = is_array( $metadata )
+			&& '' !== $metadata_file
+			&& '' !== $attached_relative
+			&& hash_equals( ltrim( $this->normalize_file_path( $attached_relative ), '/' ), $metadata_file )
 			&& ! empty( $metadata['width'] )
-			&& ! empty( $metadata['height'] );
-		$registered         = is_array( $metadata ) && isset( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ? count( $metadata['sizes'] ) : 0;
-		$missing_sizes      = array();
-		$wrong_format_files = array();
+			&& ! empty( $metadata['height'] )
+			&& ! empty( $original_dims )
+			&& absint( $metadata['width'] ) === absint( $original_dims[0] )
+			&& absint( $metadata['height'] ) === absint( $original_dims[1] );
+		$registered               = is_array( $metadata ) && isset( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ? count( $metadata['sizes'] ) : 0;
+		$missing_sizes            = array();
+		$wrong_format_files       = array();
+		$dimension_mismatch_files = array();
+		$registered_expected_dims = ! empty( $original_dims )
+			? $this->get_registered_subsize_expected_dimensions( absint( $original_dims[0] ), absint( $original_dims[1] ) )
+			: array();
+		$registered_size_names = $this->get_registered_subsize_names();
 
 		if ( is_array( $metadata ) && isset( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
-			foreach ( $metadata['sizes'] as $size_data ) {
+			$dir = dirname( $file );
+			foreach ( $metadata['sizes'] as $size_name => $size_data ) {
 				$size_file = is_array( $size_data ) && ! empty( $size_data['file'] ) ? basename( (string) $size_data['file'] ) : '';
-				if ( '' !== $size_file && 'webp' !== strtolower( pathinfo( $size_file, PATHINFO_EXTENSION ) ) ) {
+				if ( '' === $size_file ) {
+					$dimension_mismatch_files[] = sanitize_key( (string) $size_name );
+					continue;
+				}
+
+				$size_path  = $this->normalize_file_path( trailingslashit( $dir ) . $size_file );
+				$wrong_mime = false;
+				if ( is_file( $size_path ) && function_exists( 'wp_get_image_mime' ) ) {
+					$wrong_mime = 'image/webp' !== strtolower( (string) wp_get_image_mime( $size_path ) );
+				}
+				if ( 'webp' !== strtolower( pathinfo( $size_file, PATHINFO_EXTENSION ) ) || $wrong_mime ) {
 					$wrong_format_files[] = $size_file;
+				}
+
+				if ( is_file( $size_path ) && filesize( $size_path ) > 0 ) {
+					$actual_dims = $this->get_physical_image_dimensions( $size_path );
+					$expected_w  = is_array( $size_data ) ? absint( isset( $size_data['width'] ) ? $size_data['width'] : 0 ) : 0;
+					$expected_h  = is_array( $size_data ) ? absint( isset( $size_data['height'] ) ? $size_data['height'] : 0 ) : 0;
+					if ( empty( $actual_dims ) || $expected_w <= 0 || $expected_h <= 0 || absint( $actual_dims[0] ) !== $expected_w || absint( $actual_dims[1] ) !== $expected_h ) {
+						$dimension_mismatch_files[] = $size_file;
+					}
+
+					/* A metadata row can be internally self-consistent and still be stale for
+					 * the site's current registered image size definition. Recompute the
+					 * expected output from the physical original so theme/settings changes
+					 * cannot leave an old cut permanently marked healthy. */
+					$size_key = sanitize_key( (string) $size_name );
+					if ( isset( $registered_size_names[ $size_key ] ) && ! isset( $registered_expected_dims[ $size_key ] ) ) {
+						/* The size is registered, but the current original is too small (or the
+						 * current resize rules intentionally produce no derivative). A stale cut
+						 * left from an older/larger original must not remain authoritative. */
+						$dimension_mismatch_files[] = $size_file;
+					} elseif ( isset( $registered_expected_dims[ $size_key ] ) ) {
+						$registered_w = absint( $registered_expected_dims[ $size_key ][0] );
+						$registered_h = absint( $registered_expected_dims[ $size_key ][1] );
+						if ( $expected_w !== $registered_w || $expected_h !== $registered_h
+							|| empty( $actual_dims )
+							|| absint( $actual_dims[0] ) !== $registered_w
+							|| absint( $actual_dims[1] ) !== $registered_h ) {
+							$dimension_mismatch_files[] = $size_file;
+						}
+					}
 				}
 			}
 		}
-		$wrong_format_files = array_values( array_unique( array_filter( $wrong_format_files ) ) );
+		$wrong_format_files       = array_values( array_unique( array_filter( $wrong_format_files ) ) );
+		$dimension_mismatch_files = array_values( array_unique( array_filter( $dimension_mismatch_files ) ) );
 
 		if ( $metadata_valid && function_exists( 'wp_get_missing_image_subsizes' ) ) {
 			$missing = wp_get_missing_image_subsizes( $attachment_id );
@@ -1907,42 +2259,167 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$editor           = wp_get_image_editor( $file );
 		$editor_supported = ! is_wp_error( $editor );
-		$healthy          = $metadata_valid && empty( $missing_sizes ) && empty( $missing_files ) && empty( $wrong_format_files );
+		$healthy          = $original_format_ok && $metadata_valid && empty( $missing_sizes ) && empty( $missing_files ) && empty( $wrong_format_files ) && empty( $dimension_mismatch_files );
 
 		if ( $healthy && $editor_supported ) {
 			$code    = 'healthy';
-			$message = 'تمام برش های لازم موجود هستند و موتور تصویر سرور نیز امکان بازسازی WebP را دارد.';
+			$message = 'تمام برش های لازم موجود هستند، مسیر و ابعاد متادیتا با فایل واقعی تطبیق دارد و موتور تصویر سرور نیز WebP را پشتیبانی می‌کند.';
 		} elseif ( $healthy ) {
 			$code    = 'healthy_editor_unavailable';
 			$message = 'برش های فعلی کامل هستند، اما موتور تصویر سرور امکان بازسازی WebP را ندارد: ' . $editor->get_error_message();
+		} elseif ( ! $original_format_ok ) {
+			$code    = 'wrong_original_storage_format';
+			$message = 'فایل اصلی از نظر محتوای تصویر WebP است، اما پسوند فایل یا MIME پیوست با image/webp سازگار نیست؛ برای جلوگیری از Content-Type اشتباه باید Attachment تمیز دوباره import شود.';
 		} elseif ( ! $metadata_valid && ! $editor_supported ) {
 			$code    = 'unsupported_editor';
-			$message = 'متادیتای تصویر ناقص است و موتور تصویر سرور نیز قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
+			$message = 'مسیر/ابعاد متادیتای تصویر با فایل اصلی سازگار نیست و موتور تصویر سرور نیز قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
 		} elseif ( ! $editor_supported ) {
 			$code    = 'unsupported_editor';
-			$message = 'یک یا چند برش ناقص است و موتور تصویر سرور قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
+			$message = 'یک یا چند برش ناقص یا ناسازگار است و موتور تصویر سرور قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
 		} elseif ( ! $metadata_valid ) {
-			$code    = 'missing_metadata';
-			$message = 'متادیتای اصلی تصویر ناقص است و باید بازسازی شود.';
+			$code    = 'stale_metadata';
+			$message = 'مسیر یا ابعاد متادیتای اصلی تصویر با فایل واقعی تطبیق ندارد و باید بازسازی شود.';
 		} elseif ( ! empty( $wrong_format_files ) ) {
 			$code    = 'wrong_subsize_format';
 			$message = 'یک یا چند برش با فرمتی غیر از WebP ثبت شده است و باید دوباره ساخته شود.';
+		} elseif ( ! empty( $dimension_mismatch_files ) ) {
+			$code    = 'wrong_subsize_dimensions';
+			$message = 'ابعاد واقعی یک یا چند برش با متادیتای ثبت‌شده تطبیق ندارد و باید دوباره ساخته شود.';
 		} else {
 			$code    = 'missing_subsizes';
 			$message = 'یک یا چند برش لازم در متادیتا یا فایل های uploads ناقص است.';
 		}
 
 		return array(
-			'healthy'         => $healthy,
-			'code'            => $code,
-			'message'         => $message,
-			'missingSizes'    => $missing_sizes,
-			'missingFiles'    => $missing_files,
-			'wrongFormatFiles'=> $wrong_format_files,
-			'registered'      => $registered,
-			'editorSupported' => $editor_supported,
-			'metadataValid'   => $metadata_valid,
+			'healthy'                => $healthy,
+			'code'                   => $code,
+			'message'                => $message,
+			'missingSizes'           => $missing_sizes,
+			'missingFiles'           => $missing_files,
+			'wrongFormatFiles'       => $wrong_format_files,
+			'dimensionMismatchFiles' => $dimension_mismatch_files,
+			'registered'             => $registered,
+			'editorSupported'        => $editor_supported,
+			'metadataValid'          => $metadata_valid,
 		);
+	}
+
+	/**
+	 * Public, read-only WebP storage health used by the durable image queue. It
+	 * intentionally performs no generation; a bad done row is merely requeued and
+	 * the normal linkage path repairs it under the subsize mutation lock.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	public function inspect_webp_attachment_health( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 ) {
+			return array( 'healthy' => false, 'code' => 'invalid_attachment', 'message' => 'Invalid attachment.' );
+		}
+
+		if ( '1' === (string) get_post_meta( $attachment_id, 'mobo_sync_incomplete', true ) ) {
+			return array( 'healthy' => false, 'code' => 'incomplete_commit', 'message' => 'Attachment import has not crossed the final storage commit boundary.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			return Mobo_Core_Shared_Media::attachment_health( $attachment_id, true );
+		}
+
+		return $this->inspect_attachment_subsizes( $attachment_id );
+	}
+
+	/**
+	 * Read actual image dimensions without trusting attachment metadata.
+	 *
+	 * @param string $path Absolute file path.
+	 * @return array<int,int>
+	 */
+	private function get_physical_image_dimensions( $path ) {
+		$path = $this->normalize_file_path( (string) $path );
+		if ( '' === $path || ! is_file( $path ) ) {
+			return array();
+		}
+
+		$dimensions = function_exists( 'wp_getimagesize' ) ? wp_getimagesize( $path ) : @getimagesize( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Fallback only when the WordPress helper is unavailable.
+		if ( ! is_array( $dimensions ) || empty( $dimensions[0] ) || empty( $dimensions[1] ) ) {
+			return array();
+		}
+
+		return array( absint( $dimensions[0] ), absint( $dimensions[1] ) );
+	}
+
+	/**
+	 * Return the names of sizes currently registered with WordPress. A registered
+	 * size may intentionally have no derivative for a small original; that absence
+	 * is meaningful when deciding whether an old metadata row is stale.
+	 *
+	 * @return array<string,bool>
+	 */
+	private function get_registered_subsize_names() {
+		if ( ! function_exists( 'wp_get_registered_image_subsizes' ) ) {
+			return array();
+		}
+
+		$definitions = wp_get_registered_image_subsizes();
+		if ( ! is_array( $definitions ) ) {
+			return array();
+		}
+
+		$names = array();
+		foreach ( array_keys( $definitions ) as $name ) {
+			$key = sanitize_key( (string) $name );
+			if ( '' !== $key ) {
+				$names[ $key ] = true;
+			}
+		}
+		return $names;
+	}
+
+	/**
+	 * Calculate the physical output dimensions expected for the site's current
+	 * registered image sizes. This catches stale-but-self-consistent metadata
+	 * after theme/size setting changes, which wp_get_missing_image_subsizes()
+	 * cannot detect because that API primarily checks size names.
+	 *
+	 * @param int $original_width Physical original width.
+	 * @param int $original_height Physical original height.
+	 * @return array<string,array<int,int>>
+	 */
+	private function get_registered_subsize_expected_dimensions( $original_width, $original_height ) {
+		$original_width  = absint( $original_width );
+		$original_height = absint( $original_height );
+		if ( $original_width <= 0 || $original_height <= 0 || ! function_exists( 'wp_get_registered_image_subsizes' ) || ! function_exists( 'image_resize_dimensions' ) ) {
+			return array();
+		}
+
+		$registered = wp_get_registered_image_subsizes();
+		if ( ! is_array( $registered ) ) {
+			return array();
+		}
+
+		$expected = array();
+		foreach ( $registered as $size_name => $definition ) {
+			if ( ! is_array( $definition ) ) {
+				continue;
+			}
+
+			$target_width  = absint( isset( $definition['width'] ) ? $definition['width'] : 0 );
+			$target_height = absint( isset( $definition['height'] ) ? $definition['height'] : 0 );
+			$crop          = isset( $definition['crop'] ) ? $definition['crop'] : false;
+			if ( $target_width <= 0 && $target_height <= 0 ) {
+				continue;
+			}
+
+			$resized = image_resize_dimensions( $original_width, $original_height, $target_width, $target_height, $crop );
+			if ( ! is_array( $resized ) || ! isset( $resized[4], $resized[5] ) || absint( $resized[4] ) <= 0 || absint( $resized[5] ) <= 0 ) {
+				continue;
+			}
+
+			$expected[ sanitize_key( (string) $size_name ) ] = array( absint( $resized[4] ), absint( $resized[5] ) );
+		}
+
+		return $expected;
 	}
 
 	/**
@@ -2036,6 +2513,64 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	private function ensure_attachment_subsizes( $attachment_id ) {
 		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 ) {
+			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'پیوست تصویر جایگزین نامعتبر است.' );
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return $this->ensure_attachment_subsizes_unlocked( $attachment_id );
+		}
+
+		$lock_name = 'image_subsizes_' . $attachment_id;
+		$lock_token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+		if ( false === $lock_token ) {
+			/* Another queue/refresh request may already be repairing this attachment.
+			 * Re-read health once; otherwise defer instead of racing metadata/files. */
+			$health = $this->inspect_attachment_subsizes( $attachment_id );
+			if ( ! empty( $health['healthy'] ) ) {
+				return array(
+					'success'    => true,
+					'generated'  => 0,
+					'registered' => isset( $health['registered'] ) ? absint( $health['registered'] ) : 0,
+					'message'    => 'برش های تصویر توسط اجرای همزمان تکمیل شده‌اند.',
+				);
+			}
+
+			return array(
+				'success'    => false,
+				'generated'  => 0,
+				'registered' => isset( $health['registered'] ) ? absint( $health['registered'] ) : 0,
+				'message'    => 'بازسازی برش‌های این تصویر در اجرای دیگری در حال انجام است؛ این ردیف بعداً دوباره بررسی می‌شود.',
+			);
+		}
+
+		try {
+			/* Re-check after entering the critical section; the previous owner may have
+			 * completed immediately before this lease was acquired. */
+			$health = $this->inspect_attachment_subsizes( $attachment_id );
+			if ( ! empty( $health['healthy'] ) ) {
+				return array(
+					'success'    => true,
+					'generated'  => 0,
+					'registered' => isset( $health['registered'] ) ? absint( $health['registered'] ) : 0,
+					'message'    => 'تمام برش های لازم از قبل کامل هستند.',
+				);
+			}
+
+			return $this->ensure_attachment_subsizes_unlocked( $attachment_id );
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $lock_token );
+		}
+	}
+
+	/**
+	 * Generate/repair local subsizes while the per-attachment mutation lock is held.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	private function ensure_attachment_subsizes_unlocked( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
 		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
 			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'پیوست تصویر جایگزین نامعتبر است.' );
 		}
@@ -2062,11 +2597,38 @@ class Mobo_Core_Image_Refresh_Service {
 		$metadata_changed = false;
 		$dir              = dirname( $file );
 
+		/* Missing metadata needs a full regeneration. wp_update_image_subsizes() is
+		 * optimized for an existing metadata array and is not a reliable recovery
+		 * primitive when the root record itself was lost. */
+		if ( ! is_array( $metadata ) ) {
+			$generated_metadata = wp_generate_attachment_metadata( $attachment_id, $file );
+			if ( is_wp_error( $generated_metadata ) || ! is_array( $generated_metadata ) ) {
+				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => is_wp_error( $generated_metadata ) ? 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند. جزئیات فنی: ' . sanitize_text_field( $generated_metadata->get_error_message() ) : 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند.' );
+			}
+			wp_update_attachment_metadata( $attachment_id, $generated_metadata );
+			$metadata = $generated_metadata;
+		}
+
 		if ( is_array( $metadata ) ) {
 			$attached_relative = $this->relative_upload_path( $file );
 			if ( '' !== $attached_relative && ( empty( $metadata['file'] ) || $this->normalize_file_path( (string) $metadata['file'] ) !== $this->normalize_file_path( $attached_relative ) ) ) {
 				$metadata['file'] = $attached_relative;
 				$metadata_changed = true;
+			}
+
+			$actual_original_dims = $this->get_physical_image_dimensions( $file );
+			if ( ! empty( $actual_original_dims )
+				&& ( absint( isset( $metadata['width'] ) ? $metadata['width'] : 0 ) !== absint( $actual_original_dims[0] )
+					|| absint( isset( $metadata['height'] ) ? $metadata['height'] : 0 ) !== absint( $actual_original_dims[1] ) ) ) {
+				$metadata['width']  = absint( $actual_original_dims[0] );
+				$metadata['height'] = absint( $actual_original_dims[1] );
+				$metadata_changed   = true;
+			}
+
+			$actual_original_size = @filesize( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Concurrent removal is handled by the earlier existence guard.
+			if ( false !== $actual_original_size && $actual_original_size > 0 && absint( isset( $metadata['filesize'] ) ? $metadata['filesize'] : 0 ) !== absint( $actual_original_size ) ) {
+				$metadata['filesize'] = absint( $actual_original_size );
+				$metadata_changed      = true;
 			}
 
 			if ( ! empty( $metadata['original_image'] ) ) {
@@ -2090,6 +2652,11 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 		}
 
+		$registered_expected_dims = ! empty( $actual_original_dims )
+			? $this->get_registered_subsize_expected_dimensions( absint( $actual_original_dims[0] ), absint( $actual_original_dims[1] ) )
+			: array();
+		$registered_size_names = $this->get_registered_subsize_names();
+
 		if ( is_array( $metadata ) && isset( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
 			foreach ( $metadata['sizes'] as $size_name => $size_data ) {
 				$size_file = is_array( $size_data ) && ! empty( $size_data['file'] )
@@ -2098,8 +2665,29 @@ class Mobo_Core_Image_Refresh_Service {
 
 				$wrong_format = is_array( $size_data ) && ! empty( $size_data['file'] )
 					&& 'webp' !== strtolower( pathinfo( (string) $size_data['file'], PATHINFO_EXTENSION ) );
+				if ( ! $wrong_format && '' !== $size_file && is_file( $size_file ) && function_exists( 'wp_get_image_mime' ) ) {
+					$wrong_format = 'image/webp' !== strtolower( (string) wp_get_image_mime( $size_file ) );
+				}
 
-				if ( '' === $size_file || ! is_file( $size_file ) || filesize( $size_file ) <= 0 || $wrong_format ) {
+				$wrong_dimensions = false;
+				if ( ! $wrong_format && '' !== $size_file && is_file( $size_file ) && filesize( $size_file ) > 0 ) {
+					$actual_dims = $this->get_physical_image_dimensions( $size_file );
+					$expected_w  = is_array( $size_data ) ? absint( isset( $size_data['width'] ) ? $size_data['width'] : 0 ) : 0;
+					$expected_h  = is_array( $size_data ) ? absint( isset( $size_data['height'] ) ? $size_data['height'] : 0 ) : 0;
+					$wrong_dimensions = empty( $actual_dims ) || $expected_w <= 0 || $expected_h <= 0 || absint( $actual_dims[0] ) !== $expected_w || absint( $actual_dims[1] ) !== $expected_h;
+
+					$size_key = sanitize_key( (string) $size_name );
+					if ( ! $wrong_dimensions && isset( $registered_size_names[ $size_key ] ) && ! isset( $registered_expected_dims[ $size_key ] ) ) {
+						$wrong_dimensions = true;
+					} elseif ( ! $wrong_dimensions && isset( $registered_expected_dims[ $size_key ] ) ) {
+						$registered_w = absint( $registered_expected_dims[ $size_key ][0] );
+						$registered_h = absint( $registered_expected_dims[ $size_key ][1] );
+						$wrong_dimensions = $expected_w !== $registered_w || $expected_h !== $registered_h
+							|| absint( $actual_dims[0] ) !== $registered_w || absint( $actual_dims[1] ) !== $registered_h;
+					}
+				}
+
+				if ( '' === $size_file || ! is_file( $size_file ) || filesize( $size_file ) <= 0 || $wrong_format || $wrong_dimensions ) {
 					unset( $metadata['sizes'][ $size_name ] );
 					$metadata_changed = true;
 				}
@@ -2221,7 +2809,7 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		if ( '' !== $stem && is_dir( $dir ) && is_readable( $dir ) ) {
-			$pattern = '/^' . preg_quote( $stem, '/' ) . '(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*\.(?:jpe?g|png)$/i';
+			$pattern = '/^' . preg_quote( $stem, '/' ) . '(?:-\d+)?(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*\.(?:jpe?g|png)$/i';
 			foreach ( (array) scandir( $dir ) as $item ) {
 				if ( 1 !== preg_match( $pattern, (string) $item ) ) {
 					continue;
@@ -2470,6 +3058,13 @@ class Mobo_Core_Image_Refresh_Service {
 		$file          = (string) get_attached_file( $attachment_id );
 		$ext           = strtolower( pathinfo( $file, PATHINFO_EXTENSION ) );
 
+		if ( '' !== $file && is_file( $file ) && function_exists( 'wp_get_image_mime' ) ) {
+			$actual_mime = strtolower( (string) wp_get_image_mime( $file ) );
+			if ( '' !== $actual_mime ) {
+				return 'image/webp' === $actual_mime;
+			}
+		}
+
 		return 'image/webp' === $mime || 'webp' === $ext;
 	}
 
@@ -2483,7 +3078,61 @@ class Mobo_Core_Image_Refresh_Service {
 		$attachment_id = absint( $attachment_id );
 		$file          = get_attached_file( $attachment_id );
 
-		return $attachment_id > 0 && is_string( $file ) && '' !== $file && file_exists( $file ) && filesize( $file ) > 0 && 0 === strpos( strtolower( (string) get_post_mime_type( $attachment_id ) ), 'image/' );
+		if ( $attachment_id <= 0 || ! is_string( $file ) || '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
+			return false;
+		}
+
+		$stored_mime = strtolower( (string) get_post_mime_type( $attachment_id ) );
+		if ( 0 !== strpos( $stored_mime, 'image/' ) ) {
+			return false;
+		}
+
+		if ( function_exists( 'wp_get_image_mime' ) ) {
+			$actual_mime = strtolower( (string) wp_get_image_mime( $file ) );
+			if ( '' === $actual_mime || 0 !== strpos( $actual_mime, 'image/' ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Before migrating every reference from one old attachment to one replacement,
+	 * prove that every product still using the old attachment resolves to the same
+	 * current Mobo image identity. One legacy attachment can be shared by multiple
+	 * products; if their desired images later diverge, a global replacement would
+	 * silently assign the wrong image to some products.
+	 *
+	 * @return array
+	 */
+	private function product_references_match_replacement_identity( $old_attachment_id, $new_attachment_id ) {
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		$product_ids       = $this->find_products_using_attachment( $old_attachment_id );
+		if ( empty( $product_ids ) ) {
+			return array( 'safe' => true, 'message' => '' );
+		}
+
+		$expected_guid   = $this->get_image_guid_from_attachment( $new_attachment_id );
+		$expected_source = esc_url_raw( (string) get_post_meta( $new_attachment_id, 'mobo_source_url', true ) );
+		if ( '' === $expected_guid || '' === $expected_source ) {
+			return array( 'safe' => false, 'message' => 'هویت GUID/Source تصویر جایگزین برای انتقال سراسری مرجع کامل نیست.' );
+		}
+
+		foreach ( $product_ids as $product_id ) {
+			$identity = $this->resolve_refresh_identity( $old_attachment_id, absint( $product_id ), false );
+			$guid     = sanitize_text_field( (string) ( isset( $identity['image_guid'] ) ? $identity['image_guid'] : '' ) );
+			$source   = esc_url_raw( (string) ( isset( $identity['new_source_url'] ) ? $identity['new_source_url'] : '' ) );
+			if ( '' === $guid || '' === $source || ! hash_equals( $expected_guid, $guid ) || ! hash_equals( $expected_source, $source ) ) {
+				return array(
+					'safe'    => false,
+					'message' => 'پیوست قدیمی هنوز توسط محصولی با هویت تصویر متفاوت یا نامشخص استفاده می‌شود؛ برای جلوگیری از جایگزینی اشتباه، حذف و انتقال سراسری متوقف شد.',
+				);
+			}
+		}
+
+		return array( 'safe' => true, 'message' => '' );
 	}
 
 	/**
@@ -2566,6 +3215,53 @@ class Mobo_Core_Image_Refresh_Service {
 			|| '' !== sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_portal_product_id', true ) )
 			|| '' !== sanitize_text_field( (string) get_post_meta( $product_id, 'PortalProductId', true ) )
 			|| '' !== sanitize_text_field( (string) get_post_meta( $product_id, 'mobo_url', true ) );
+	}
+
+	/**
+	 * Find the attachment currently used by one product for the same remote image
+	 * GUID, regardless of its older source URL. This is used only to continue a
+	 * refresh that was superseded after a prior worker had already replaced the
+	 * original attachment.
+	 *
+	 * @param int    $product_id Product ID.
+	 * @param string $image_guid Remote image GUID.
+	 * @return int
+	 */
+	private function find_product_attachment_for_image_guid( $product_id, $image_guid ) {
+		$product_id = absint( $product_id );
+		$image_guid = strtolower( trim( sanitize_text_field( (string) $image_guid ) ) );
+		if ( $product_id <= 0 || '' === $image_guid ) {
+			return 0;
+		}
+
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return 0;
+		}
+
+		$ids = array();
+		$image_id = absint( $product->get_image_id() );
+		if ( $image_id > 0 ) {
+			$ids[] = $image_id;
+		}
+		if ( method_exists( $product, 'get_gallery_image_ids' ) ) {
+			$ids = array_merge( $ids, array_map( 'absint', (array) $product->get_gallery_image_ids() ) );
+		}
+
+		foreach ( array_values( array_unique( array_filter( $ids ) ) ) as $attachment_id ) {
+			$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
+			if ( '' === $stored_guid ) {
+				$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
+			}
+			if ( '' === $stored_guid && class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+				$stored_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, '_mobo_shared_media_image_id', true ) );
+			}
+			if ( '' !== $stored_guid && hash_equals( strtolower( trim( $stored_guid ) ), $image_guid ) ) {
+				return absint( $attachment_id );
+			}
+		}
+
+		return 0;
 	}
 
 	/**

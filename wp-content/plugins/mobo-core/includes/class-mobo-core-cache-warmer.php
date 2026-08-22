@@ -132,9 +132,12 @@ final class Mobo_Core_Cache_Warmer {
 		$limit               = max( 1, min( 10, absint( $limit ) ) );
 		$time_budget_seconds = max( 2, min( 30, absint( $time_budget_seconds ) ) );
 		$source              = sanitize_key( (string) $source );
+		$post_recovery_serial = class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::post_recovery_warmup_pending();
+		if ( $post_recovery_serial ) {
+			$limit = 1;
+		}
 		$started             = microtime( true );
 		$deadline            = $started + $time_budget_seconds;
-		$now                 = time();
 
 		$result = array(
 			'success'      => true,
@@ -157,61 +160,91 @@ final class Mobo_Core_Cache_Warmer {
 			return $result;
 		}
 
+		/* Recovery owns the site mutation pipeline. Warmup is a strictly post-recovery
+		 * side effect and must never race product recreation/cache invalidation. */
+		if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::recovery_pending() ) {
+			Mobo_Core_Recovery_Coordinator::mark_post_recovery_warmup_pending();
+			$result['status']    = 'deferred-recovery';
+			$result['remaining'] = true;
+			self::persist_last_result( $result, $started );
+			return $result;
+		}
+
+		$pipeline_lock = class_exists( 'Mobo_Core_Recovery_Coordinator' ) ? Mobo_Core_Recovery_Coordinator::acquire( 300 ) : '__mobo_no_lock__';
+		if ( false === $pipeline_lock ) {
+			$result['status']    = 'recovery-pipeline-locked';
+			$result['remaining'] = true;
+			return $result;
+		}
+
+		/* Close the schedule-vs-warmup race after obtaining the shared lease. */
+		if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::recovery_pending() ) {
+			Mobo_Core_Recovery_Coordinator::mark_post_recovery_warmup_pending();
+			Mobo_Core_Recovery_Coordinator::release( $pipeline_lock );
+			$result['status']    = 'deferred-recovery';
+			$result['remaining'] = true;
+			self::persist_last_result( $result, $started );
+			return $result;
+		}
+
 		$lock = self::acquire_lock();
 		if ( false === $lock ) {
+			if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) ) {
+				Mobo_Core_Recovery_Coordinator::release( $pipeline_lock );
+			}
 			$result['success'] = false;
 			$result['status']  = 'locked';
 			return $result;
 		}
 
 		try {
-			$queue = self::read_queue();
-			if ( empty( $queue['items'] ) ) {
-				$result['status'] = 'empty';
-				self::persist_last_result( $result, $started );
-				return $result;
-			}
-
-			$due = array();
-			foreach ( $queue['items'] as $key => $item ) {
-				$next = absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 );
-				if ( $next <= $now ) {
-					$due[ $key ] = $item;
-				}
-			}
-
-			if ( empty( $due ) ) {
-				$result['status']       = 'waiting';
-				$result['deferred']     = count( $queue['items'] );
-				$result['pendingCount'] = count( $queue['items'] );
-				$result['remaining']    = true;
-				self::persist_last_result( $result, $started );
-				return $result;
-			}
-
-			uasort(
-				$due,
-				static function ( $a, $b ) {
-					$next_a = absint( isset( $a['nextAttemptAt'] ) ? $a['nextAttemptAt'] : 0 );
-					$next_b = absint( isset( $b['nextAttemptAt'] ) ? $b['nextAttemptAt'] : 0 );
-					if ( $next_a === $next_b ) {
-						return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
-					}
-					return $next_a <=> $next_b;
-				}
-			);
-
 			$max_attempts = Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_max_attempts', 5, 1, 10 );
 			$base_timeout = Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_timeout_seconds', 8, 2, 20 );
 
-			foreach ( $due as $key => $item ) {
-				if ( $result['processed'] >= $limit || microtime( true ) >= ( $deadline - 0.5 ) ) {
+			while ( $result['processed'] < $limit && microtime( true ) < ( $deadline - 0.5 ) ) {
+				/* Recovery scheduled after this batch started wins the next mutation slot. */
+				if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::recovery_pending() ) {
+					Mobo_Core_Recovery_Coordinator::mark_post_recovery_warmup_pending();
+					$result['status']    = 'deferred-recovery';
+					$result['remaining'] = true;
 					break;
 				}
 
-				$url = self::normalize_frontend_url( isset( $item['url'] ) ? $item['url'] : '' );
+				$queue = self::read_queue();
+				if ( empty( $queue['items'] ) ) {
+					break;
+				}
+
+				$due = array();
+				$now = time();
+				foreach ( $queue['items'] as $key => $item ) {
+					if ( self::item_is_due( $item, $now ) ) {
+						$due[ $key ] = $item;
+					}
+				}
+
+				if ( empty( $due ) ) {
+					break;
+				}
+
+				uasort(
+					$due,
+					static function ( $a, $b ) {
+						$next_a = absint( isset( $a['nextAttemptAt'] ) ? $a['nextAttemptAt'] : 0 );
+						$next_b = absint( isset( $b['nextAttemptAt'] ) ? $b['nextAttemptAt'] : 0 );
+						if ( $next_a === $next_b ) {
+							return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
+						}
+						return $next_a <=> $next_b;
+					}
+				);
+
+				$key  = (string) array_key_first( $due );
+				$item = $due[ $key ];
+				$url  = self::normalize_frontend_url( isset( $item['url'] ) ? $item['url'] : '' );
 				if ( '' === $url ) {
 					unset( $queue['items'][ $key ] );
+					self::write_queue( $queue );
 					$result['processed']++;
 					$result['dropped']++;
 					continue;
@@ -219,12 +252,57 @@ final class Mobo_Core_Cache_Warmer {
 
 				$remaining_seconds = max( 2, (int) floor( $deadline - microtime( true ) ) );
 				$request_timeout   = max( 2, min( $base_timeout, $remaining_seconds ) );
-				$attempt           = absint( isset( $item['attempts'] ) ? $item['attempts'] : 0 ) + 1;
-				$response          = self::warm_url( $url, $request_timeout );
+				$claim_token       = wp_generate_uuid4();
+				$claim_until       = time() + max( 120, $request_timeout + 30 );
+
+				/*
+				 * Persist a short claim, then release the queue mutex before the HTTP GET.
+				 * enqueue_url() may now record a newer mutation while this request is in
+				 * flight. A newer enqueue overwrites the claim, so the stale response below
+				 * cannot delete or postpone that newer queue item.
+				 */
+				$queue['items'][ $key ]['processingToken'] = $claim_token;
+				$queue['items'][ $key ]['processingUntil'] = $claim_until;
+				$queue['items'][ $key ]['updatedAt']       = time();
+				self::write_queue( $queue );
+
+				self::release_lock( $lock );
+				$lock = false;
+
+				try {
+					$response = self::warm_url( $url, $request_timeout );
+				} catch ( Throwable $e ) {
+					$response = array(
+						'success' => false,
+						'code'    => 0,
+						'error'   => $e->getMessage(),
+					);
+				}
 				$result['processed']++;
 
+				$lock = self::acquire_lock();
+				if ( false === $lock ) {
+					$result['success']   = false;
+					$result['status']    = 'commit-lock-lost';
+					$result['remaining'] = true;
+					self::persist_last_result( $result, $started );
+					return $result;
+				}
+
+				$queue   = self::read_queue();
+				$current = isset( $queue['items'][ $key ] ) && is_array( $queue['items'][ $key ] ) ? $queue['items'][ $key ] : array();
+				$current_token = isset( $current['processingToken'] ) ? (string) $current['processingToken'] : '';
+
+				if ( '' === $current_token || ! hash_equals( $claim_token, $current_token ) ) {
+					/* A newer enqueue/worker superseded this result. Never commit stale work. */
+					$result['deferred']++;
+					continue;
+				}
+
+				$attempt = absint( isset( $current['attempts'] ) ? $current['attempts'] : 0 ) + 1;
 				if ( ! empty( $response['success'] ) ) {
 					unset( $queue['items'][ $key ] );
+					self::write_queue( $queue );
 					$result['warmed']++;
 					continue;
 				}
@@ -238,6 +316,7 @@ final class Mobo_Core_Cache_Warmer {
 				$terminal = in_array( $code, array( 400, 401, 403, 404, 405, 410 ), true );
 				if ( $terminal || $attempt >= $max_attempts ) {
 					unset( $queue['items'][ $key ] );
+					self::write_queue( $queue );
 					$result['dropped']++;
 					continue;
 				}
@@ -246,14 +325,15 @@ final class Mobo_Core_Cache_Warmer {
 				$queue['items'][ $key ]['updatedAt']     = time();
 				$queue['items'][ $key ]['nextAttemptAt'] = time() + self::retry_delay_seconds( $attempt );
 				$queue['items'][ $key ]['lastError']     = $error;
+				unset( $queue['items'][ $key ]['processingToken'], $queue['items'][ $key ]['processingUntil'] );
+				self::write_queue( $queue );
 			}
 
-			$queue['updatedAt'] = time();
-			self::write_queue( $queue );
-
+			$queue         = self::read_queue();
 			$due_remaining = 0;
+			$now           = time();
 			foreach ( $queue['items'] as $item ) {
-				if ( absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= time() ) {
+				if ( self::item_is_due( $item, $now ) ) {
 					$due_remaining++;
 				}
 			}
@@ -261,16 +341,22 @@ final class Mobo_Core_Cache_Warmer {
 			$result['pendingCount'] = count( $queue['items'] );
 			$result['remaining']    = ! empty( $queue['items'] );
 			$result['remainingDue'] = $due_remaining > 0;
-			$result['deferred']     = max( 0, count( $queue['items'] ) - $due_remaining );
+			$result['deferred']     = max( $result['deferred'], count( $queue['items'] ) - $due_remaining );
 			$result['status']       = $result['failed'] > 0
 				? ( $result['warmed'] > 0 ? 'partial' : 'failed' )
 				: ( $result['warmed'] > 0 ? 'success' : ( $result['remaining'] ? 'waiting' : 'empty' ) );
 			$result['success']      = 'failed' !== $result['status'];
+			if ( empty( $result['remaining'] ) && class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::post_recovery_warmup_pending() ) {
+				Mobo_Core_Recovery_Coordinator::clear_post_recovery_warmup_pending();
+			}
 			self::persist_last_result( $result, $started );
 
 			return $result;
 		} finally {
 			self::release_lock( $lock );
+			if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) ) {
+				Mobo_Core_Recovery_Coordinator::release( $pipeline_lock );
+			}
 		}
 	}
 
@@ -287,7 +373,7 @@ final class Mobo_Core_Cache_Warmer {
 		$queue = self::read_queue();
 		$now   = time();
 		foreach ( $queue['items'] as $item ) {
-			if ( absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= $now ) {
+			if ( self::item_is_due( $item, $now ) ) {
 				return true;
 			}
 		}
@@ -311,9 +397,9 @@ final class Mobo_Core_Cache_Warmer {
 
 		foreach ( $queue['items'] as $item ) {
 			$next_at = absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 );
-			if ( $next_at <= $now ) {
+			if ( self::item_is_due( $item, $now ) ) {
 				$due++;
-			} elseif ( 0 === $next || $next_at < $next ) {
+			} elseif ( ! self::item_is_actively_processing( $item, $now ) && $next_at > $now && ( 0 === $next || $next_at < $next ) ) {
 				$next = $next_at;
 			}
 		}
@@ -476,6 +562,40 @@ final class Mobo_Core_Cache_Warmer {
 		}
 
 		return self::normalize_frontend_url( $location );
+	}
+
+
+	/**
+	 * Whether a queue item is currently owned by a non-expired processor.
+	 *
+	 * @param array $item Queue item.
+	 * @param int   $now Current epoch.
+	 * @return bool
+	 */
+	private static function item_is_actively_processing( $item, $now ) {
+		if ( ! is_array( $item ) ) {
+			return false;
+		}
+		$token = isset( $item['processingToken'] ) ? trim( (string) $item['processingToken'] ) : '';
+		$until = absint( isset( $item['processingUntil'] ) ? $item['processingUntil'] : 0 );
+		return '' !== $token && $until > absint( $now );
+	}
+
+	/**
+	 * Whether a queue item can be claimed now.
+	 *
+	 * Expired processing claims are deliberately reclaimable after a worker
+	 * crash. A live claim is not reported as due, preventing duplicate GETs.
+	 *
+	 * @param array $item Queue item.
+	 * @param int   $now Current epoch.
+	 * @return bool
+	 */
+	private static function item_is_due( $item, $now ) {
+		if ( ! is_array( $item ) || self::item_is_actively_processing( $item, $now ) ) {
+			return false;
+		}
+		return absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= absint( $now );
 	}
 
 	private static function retry_delay_seconds( $attempt ) {

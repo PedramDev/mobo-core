@@ -85,9 +85,10 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return array(
-			'created' => $created,
-			'updated' => $updated,
-			'skipped' => $skipped,
+			'created'  => $created,
+			'updated'  => $updated,
+			'skipped'  => $skipped,
+			'complete' => 0 === $skipped,
 		);
 	}
 
@@ -109,31 +110,65 @@ class Mobo_Core_Category_Sync {
 		$created = 0;
 		$updated = 0;
 		$skipped = 0;
+		$pending = array();
 
 		foreach ( $categories as $category_data ) {
 			if ( ! is_array( $category_data ) ) {
 				$skipped++;
 				continue;
 			}
+			$pending[] = $category_data;
+		}
 
-			$result = $this->upsert_category( $category_data );
+		/*
+		 * Category payload order is not authoritative. A child can arrive before
+		 * its parent, so defer only that child and retry after the rest of the
+		 * snapshot has had a chance to create its ancestors. Cycles or genuinely
+		 * missing parents stop when a pass makes no progress.
+		 */
+		$max_passes = max( 1, count( $pending ) );
+		for ( $pass = 0; $pass < $max_passes && ! empty( $pending ); $pass++ ) {
+			$next_pending = array();
+			$progress     = 0;
 
-			if ( empty( $result['term_id'] ) ) {
-				$skipped++;
-				continue;
+			foreach ( $pending as $category_data ) {
+				$result = $this->upsert_category( $category_data );
+
+				if ( ! empty( $result['missing_parent'] ) ) {
+					$next_pending[] = $category_data;
+					continue;
+				}
+
+				$progress++;
+				if ( empty( $result['term_id'] ) || ! empty( $result['incomplete'] ) ) {
+					$skipped++;
+					continue;
+				}
+
+				if ( ! empty( $result['created'] ) ) {
+					$created++;
+				} else {
+					$updated++;
+				}
 			}
 
-			if ( ! empty( $result['created'] ) ) {
-				$created++;
-			} else {
-				$updated++;
+			if ( empty( $next_pending ) ) {
+				break;
 			}
+
+			if ( 0 === $progress ) {
+				$skipped += count( $next_pending );
+				break;
+			}
+
+			$pending = $next_pending;
 		}
 
 		return array(
-			'created' => $created,
-			'updated' => $updated,
-			'skipped' => $skipped,
+			'created'  => $created,
+			'updated'  => $updated,
+			'skipped'  => $skipped,
+			'complete' => 0 === $skipped,
 		);
 	}
 
@@ -185,8 +220,11 @@ class Mobo_Core_Category_Sync {
 			$term_ids = array_values( array_unique( array_filter( array_map( 'absint', $manual_result['term_ids'] ) ) ) );
 
 			if ( ! empty( $term_ids ) ) {
-				$changed = $this->set_product_categories_if_changed( $product_id, $term_ids );
-				$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
+				$assignment_error = '';
+				$changed = $this->set_product_categories_if_changed( $product_id, $term_ids, $assignment_error );
+				if ( '' === $assignment_error ) {
+					$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
+				}
 				$this->store_missing_category_guids_if_changed( $product_id, $manual_result['missing_guids'] );
 
 				return array(
@@ -194,6 +232,7 @@ class Mobo_Core_Category_Sync {
 					'source'       => 'manual-mapping',
 					'changed'      => $changed,
 					'missingGuids' => array_values( array_unique( $manual_result['missing_guids'] ) ),
+					'error'        => $assignment_error,
 				);
 			}
 		}
@@ -296,14 +335,18 @@ class Mobo_Core_Category_Sync {
 		$this->store_missing_category_guids_if_changed( $product_id, $missing_guids );
 
 		if ( ! empty( $term_ids ) ) {
-			$changed = $this->set_product_categories_if_changed( $product_id, $term_ids );
-			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', implode( ',', $sources ) );
+			$assignment_error = '';
+			$changed = $this->set_product_categories_if_changed( $product_id, $term_ids, $assignment_error );
+			if ( '' === $assignment_error ) {
+				$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', implode( ',', $sources ) );
+			}
 
 			return array(
 				'assigned'      => count( $term_ids ),
 				'source'        => ! empty( $sources ) ? implode( ',', $sources ) : 'mapped-or-synced',
 				'changed'       => $changed,
 				'missingGuids'  => array_values( array_unique( $missing_guids ) ),
+				'error'         => $assignment_error,
 			);
 		}
 
@@ -518,95 +561,162 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		$term_id = $this->find_term_id_by_guid( $category_guid );
+		$term_id        = $this->find_term_id_by_guid( $category_guid );
+		$parent_term_id = 0;
+
+		if ( '' !== $parent_guid ) {
+			$parent_term_id = $this->find_term_id_by_guid( $parent_guid );
+			if ( $parent_term_id <= 0 ) {
+				return array(
+					'term_id'       => $term_id,
+					'created'       => false,
+					'missing_parent' => true,
+					'parent_guid'   => $parent_guid,
+				);
+			}
+		}
 
 		$args = array();
-
 		if ( '' !== $title ) {
 			$args['name'] = $title;
 		}
 
 		$slug = $this->slug_from_url( $url );
-
 		if ( '' !== $slug ) {
 			$args['slug'] = $slug;
 		}
-
-		if ( '' !== $parent_guid ) {
-			$parent_term_id = $this->find_term_id_by_guid( $parent_guid );
-
-			if ( $parent_term_id > 0 ) {
-				$args['parent'] = $parent_term_id;
-			}
-		} else {
-			$args['parent'] = 0;
-		}
+		$args['parent'] = '' !== $parent_guid ? $parent_term_id : 0;
 
 		if ( $term_id > 0 ) {
-			$placeholder_repaired = false;
-			$current_term         = get_term( $term_id, 'product_cat' );
+			$current_term = get_term( $term_id, 'product_cat' );
+			$incomplete   = '1' === (string) get_term_meta( $term_id, 'mobo_sync_incomplete', true );
 
-			/*
-			 * Existing WooCommerce categories are protected by default. The only
-			 * exception is a placeholder created by older Mobo Core versions. When
-			 * the API finally supplies a real readable title, repairing only that
-			 * generated placeholder is safe and does not overwrite customer titles.
-			 */
+			/* A half-created Mobo term is owned by this workflow and may be fully repaired. */
+			if ( $incomplete ) {
+				$updated_term = wp_update_term( $term_id, 'product_cat', $args );
+				if ( is_wp_error( $updated_term ) && isset( $args['slug'] ) ) {
+					$retry_args = $args;
+					unset( $retry_args['slug'] );
+					$updated_term = wp_update_term( $term_id, 'product_cat', $retry_args );
+				}
+
+				if ( is_wp_error( $updated_term ) ) {
+					return array(
+						'term_id'    => $term_id,
+						'created'    => false,
+						'incomplete' => true,
+						'error'      => sanitize_text_field( $updated_term->get_error_message() ),
+					);
+				}
+
+				if ( ! $this->save_category_meta( $term_id, $category_guid, $url, $parent_guid ) ) {
+					return array(
+						'term_id'    => $term_id,
+						'created'    => false,
+						'incomplete' => true,
+						'error'      => 'Category term was repaired but its identity metadata did not persist.',
+					);
+				}
+				if ( ! $this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid ) ) {
+					return array(
+						'term_id'    => $term_id,
+						'created'    => false,
+						'incomplete' => true,
+						'error'      => 'Category term was repaired but the Mobo category map did not persist.',
+					);
+				}
+				$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
+				if ( ! $this->set_term_meta_verified( $term_id, 'mobo_sync_incomplete', '0' ) ) {
+					return array(
+						'term_id'    => $term_id,
+						'created'    => false,
+						'incomplete' => true,
+						'error'      => 'Category identity committed, but the completion marker did not persist.',
+					);
+				}
+
+				return array(
+					'term_id'          => $term_id,
+					'created'          => false,
+					'incomplete_repaired' => true,
+				);
+			}
+
+			$placeholder_repaired = false;
+			$hierarchy_repaired   = false;
+
+			/* Existing customer categories remain protected except generated placeholders. */
 			if (
 				'' !== $title
 				&& $current_term instanceof WP_Term
 				&& $this->is_placeholder_category_title( $current_term->name, $category_guid )
 			) {
-				$updated_term = wp_update_term(
-					$term_id,
-					'product_cat',
-					array( 'name' => $title )
-				);
-
+				$updated_term = wp_update_term( $term_id, 'product_cat', array( 'name' => $title ) );
 				$placeholder_repaired = ! is_wp_error( $updated_term );
 			}
 
-			$this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid );
+			/*
+			 * Older builds could create a child at root when its parent had not been
+			 * seen yet, while still recording the intended parent GUID. Repair only
+			 * that exact generated state. A customer move to another non-root parent
+			 * is deliberately preserved.
+			 */
+			$stored_parent_guid = sanitize_text_field( (string) get_term_meta( $term_id, 'mobo_parent_category_guid', true ) );
+			if (
+				'' !== $parent_guid
+				&& $parent_term_id > 0
+				&& $current_term instanceof WP_Term
+				&& 0 === absint( $current_term->parent )
+				&& hash_equals( $parent_guid, $stored_parent_guid )
+			) {
+				$updated_parent = wp_update_term( $term_id, 'product_cat', array( 'parent' => $parent_term_id ) );
+				$hierarchy_repaired = ! is_wp_error( $updated_parent );
+			}
+
+			if ( ! $this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid ) ) {
+				return array(
+					'term_id'    => $term_id,
+					'created'    => false,
+					'incomplete' => true,
+					'error'      => 'WooCommerce category exists but its Mobo category map could not be persisted.',
+				);
+			}
 			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 
 			return array(
 				'term_id'              => $term_id,
 				'created'              => false,
-				'skipped_update'       => ! $placeholder_repaired,
+				'skipped_update'       => ! $placeholder_repaired && ! $hierarchy_repaired,
 				'placeholder_repaired' => $placeholder_repaired,
+				'hierarchy_repaired'   => $hierarchy_repaired,
 			);
 		}
 
-		/*
-		 * Never create a customer-visible WooCommerce category from a GUID. A
-		 * missing title means the payload is incomplete; keep the remote mapping
-		 * row and wait for a later complete category payload.
-		 */
+		/* Never create a customer-visible category from an incomplete GUID-only payload. */
 		if ( '' === $title ) {
 			if ( $this->category_map instanceof Mobo_Core_Category_Map ) {
 				$this->category_map->upsert_remote_category_for_mapping( $category_guid, '', $url, $parent_guid );
 			}
 
 			return array(
-				'term_id'      => 0,
-				'created'      => false,
+				'term_id'       => 0,
+				'created'       => false,
 				'missing_title' => true,
 			);
 		}
 
-		$insert_name = $title;
-
 		$insert_args = array();
-
 		if ( isset( $args['slug'] ) ) {
 			$insert_args['slug'] = $args['slug'];
 		}
+		if ( $parent_term_id > 0 ) {
+			$insert_args['parent'] = $parent_term_id;
+		}
 
-		$result = wp_insert_term( $insert_name, 'product_cat', $insert_args );
-
+		$result = wp_insert_term( $title, 'product_cat', $insert_args );
 		if ( is_wp_error( $result ) && isset( $insert_args['slug'] ) ) {
 			unset( $insert_args['slug'] );
-			$result = wp_insert_term( $insert_name, 'product_cat', $insert_args );
+			$result = wp_insert_term( $title, 'product_cat', $insert_args );
 		}
 
 		if ( is_wp_error( $result ) || empty( $result['term_id'] ) ) {
@@ -618,20 +728,77 @@ class Mobo_Core_Category_Sync {
 
 		$term_id = absint( $result['term_id'] );
 
-		update_term_meta( $term_id, 'category_guid', $category_guid );
-		update_term_meta( $term_id, 'mobo_sync_incomplete', '1' );
+		/*
+		 * Establish a durable identity before any later step can fail. A newly
+		 * inserted term without category_guid/incomplete metadata is dangerous:
+		 * the next retry may not be able to find it and can create a duplicate.
+		 * Both markers therefore have to survive a read-back before the term is
+		 * allowed to enter the repairable half-created state. If that bootstrap
+		 * cannot be persisted, roll back the term we created in this call.
+		 */
+		$identity_bootstrapped = $this->set_term_meta_verified( $term_id, 'category_guid', $category_guid )
+			&& $this->set_term_meta_verified( $term_id, 'mobo_sync_incomplete', '1' );
 
-		$result = wp_update_term( $term_id, 'product_cat', $args );
+		if ( ! $identity_bootstrapped ) {
+			$deleted = wp_delete_term( $term_id, 'product_cat' );
+			unset( $this->term_id_by_guid_cache[ $category_guid ] );
 
-		if ( is_wp_error( $result ) && isset( $args['slug'] ) ) {
-			unset( $args['slug'] );
-			$result = wp_update_term( $term_id, 'product_cat', $args );
+			return array(
+				'term_id'    => ( ! is_wp_error( $deleted ) && false !== $deleted ) ? 0 : $term_id,
+				'created'    => false,
+				'incomplete' => true,
+				'rolled_back'=> ! is_wp_error( $deleted ) && false !== $deleted,
+				'error'      => 'Category term identity bootstrap did not persist; the newly-created term was rolled back when possible.',
+			);
 		}
 
-		$this->save_category_meta( $term_id, $category_guid, $url, $parent_guid );
-		$this->upsert_category_map( $category_guid, $term_id, $insert_name, $url, $parent_guid );
+		$updated_term = wp_update_term( $term_id, 'product_cat', $args );
+		if ( is_wp_error( $updated_term ) && isset( $args['slug'] ) ) {
+			$retry_args = $args;
+			unset( $retry_args['slug'] );
+			$updated_term = wp_update_term( $term_id, 'product_cat', $retry_args );
+		}
+
+		if ( is_wp_error( $updated_term ) ) {
+			/* Keep category_guid + incomplete=1 so a later payload can safely repair it. */
+			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
+			return array(
+				'term_id'    => $term_id,
+				'created'    => true,
+				'incomplete' => true,
+				'error'      => sanitize_text_field( $updated_term->get_error_message() ),
+			);
+		}
+
+		if ( ! $this->save_category_meta( $term_id, $category_guid, $url, $parent_guid ) ) {
+			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
+			return array(
+				'term_id'    => $term_id,
+				'created'    => true,
+				'incomplete' => true,
+				'error'      => 'Category term was created but its identity metadata did not persist.',
+			);
+		}
+		if ( ! $this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid ) ) {
+			/* Keep mobo_sync_incomplete=1 so a later pass can safely finish the
+			 * identity commit without treating this half-created term as customer-owned. */
+			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
+			return array(
+				'term_id'    => $term_id,
+				'created'    => true,
+				'incomplete' => true,
+				'error'      => 'Category term was created but its Mobo category map could not be persisted.',
+			);
+		}
 		$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
-		update_term_meta( $term_id, 'mobo_sync_incomplete', '0' );
+		if ( ! $this->set_term_meta_verified( $term_id, 'mobo_sync_incomplete', '0' ) ) {
+			return array(
+				'term_id'    => $term_id,
+				'created'    => true,
+				'incomplete' => true,
+				'error'      => 'Category identity committed, but the completion marker did not persist.',
+			);
+		}
 
 		return array(
 			'term_id' => $term_id,
@@ -711,12 +878,14 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		$changed = $this->set_product_categories_if_changed( $product_id, array( $default_category_id ) );
+		$assignment_error = '';
+		$changed = $this->set_product_categories_if_changed( $product_id, array( $default_category_id ), $assignment_error );
 
 		return array(
 			'assigned' => 1,
 			'source'   => 'default',
 			'changed'  => $changed,
+			'error'    => $assignment_error,
 		);
 	}
 
@@ -725,10 +894,12 @@ class Mobo_Core_Category_Sync {
 	 * Avoids taxonomy hooks, term counting and cache churn on price/stock-only syncs.
 	 *
 	 * @param int   $product_id Product ID.
-	 * @param array $term_ids Desired product_cat IDs.
+	 * @param array  $term_ids Desired product_cat IDs.
+	 * @param string $error Assignment error message, if any.
 	 * @return bool True only when WordPress taxonomy state changed.
 	 */
-	private function set_product_categories_if_changed( $product_id, $term_ids ) {
+	private function set_product_categories_if_changed( $product_id, $term_ids, &$error = '' ) {
+		$error = '';
 		$product_id = absint( $product_id );
 		$desired    = array_values( array_unique( array_filter( array_map( 'absint', is_array( $term_ids ) ? $term_ids : array() ) ) ) );
 		sort( $desired, SORT_NUMERIC );
@@ -744,6 +915,10 @@ class Mobo_Core_Category_Sync {
 
 		$result = wp_set_object_terms( $product_id, $desired, 'product_cat', false );
 		if ( is_wp_error( $result ) ) {
+			$error = sanitize_text_field( $result->get_error_message() );
+			if ( '' === $error ) {
+				$error = 'WordPress rejected the product category assignment.';
+			}
 			return false;
 		}
 
@@ -959,22 +1134,45 @@ class Mobo_Core_Category_Sync {
 
 	private function upsert_category_map( $category_guid, $term_id, $name = '', $url = '', $parent_guid = '' ) {
 		if ( ! ( $this->category_map instanceof Mobo_Core_Category_Map ) ) {
-			return;
+			return false;
 		}
 
-		$this->category_map->upsert_synced_category( $category_guid, $term_id, $name, $url, $parent_guid );
+		return (bool) $this->category_map->upsert_synced_category( $category_guid, $term_id, $name, $url, $parent_guid );
 	}
 
 	private function save_category_meta( $term_id, $category_guid, $url, $parent_guid ) {
 		$term_id = absint( $term_id );
 
 		if ( $term_id <= 0 ) {
-			return;
+			return false;
 		}
 
-		update_term_meta( $term_id, 'category_guid', sanitize_text_field( (string) $category_guid ) );
-		update_term_meta( $term_id, 'mobo_category_url', sanitize_text_field( (string) $url ) );
-		update_term_meta( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) );
+		return $this->set_term_meta_verified( $term_id, 'category_guid', sanitize_text_field( (string) $category_guid ) )
+			&& $this->set_term_meta_verified( $term_id, 'mobo_category_url', sanitize_text_field( (string) $url ) )
+			&& $this->set_term_meta_verified( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) );
+	}
+
+	/**
+	 * Persist term metadata and prove the postcondition. update_term_meta() returns
+	 * false both for a real DB failure and for an unchanged value, so the stored
+	 * value—not the raw return code—is the durability boundary.
+	 *
+	 * @param int    $term_id Term ID.
+	 * @param string $key Meta key.
+	 * @param mixed  $value Expected value.
+	 * @return bool
+	 */
+	private function set_term_meta_verified( $term_id, $key, $value ) {
+		$term_id = absint( $term_id );
+		$key     = sanitize_key( (string) $key );
+		if ( $term_id <= 0 || '' === $key ) {
+			return false;
+		}
+
+		update_term_meta( $term_id, $key, $value );
+		$stored = get_term_meta( $term_id, $key, true );
+
+		return maybe_serialize( $stored ) === maybe_serialize( $value );
 	}
 
 	private function slug_from_url( $url ) {

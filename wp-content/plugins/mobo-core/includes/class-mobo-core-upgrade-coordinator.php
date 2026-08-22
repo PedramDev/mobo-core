@@ -89,7 +89,16 @@ class Mobo_Core_Upgrade_Coordinator {
 			)
 		);
 
-		self::mark_sync_paused( $deployment_id );
+		/* A non-blocking self-runner request can own worker_dispatcher before its
+		 * HTTP request actually reaches WordPress. That handoff is not live work.
+		 * Cancel only the exact unchanged pre-claim lease; a concurrent claim/renew
+		 * changes the lease snapshot and therefore cannot be deleted here. */
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'cancel_pending_handoff_for_upgrade' ) ) {
+			$handoff = Mobo_Core_Self_Runner::cancel_pending_handoff_for_upgrade( $now );
+			$state = self::read_state();
+			$state['dispatchHandoffDrain'] = is_array( $handoff ) ? $handoff : array();
+			self::write_state( $state );
+		}
 
 		return $token;
 	}
@@ -185,7 +194,6 @@ class Mobo_Core_Upgrade_Coordinator {
 			);
 			update_option( self::AUDIT_OPTION, $audit, false );
 			delete_option( self::STATE_OPTION );
-			self::clear_sync_pause();
 		}
 
 		return $released;
@@ -201,7 +209,6 @@ class Mobo_Core_Upgrade_Coordinator {
 
 		if ( ! $active ) {
 			delete_option( self::STATE_OPTION );
-			self::clear_sync_pause();
 		}
 
 		return $active;
@@ -222,6 +229,10 @@ class Mobo_Core_Upgrade_Coordinator {
 		$timeout_seconds = max( 10, min( 300, absint( $timeout_seconds ) ) );
 		$deadline        = microtime( true ) + $timeout_seconds;
 		$last_locks      = array();
+
+		$state = self::read_state();
+		$state['drainTimeoutSeconds'] = $timeout_seconds;
+		self::write_state( $state );
 
 		do {
 			if ( ! self::renew( $barrier_token, $ttl_seconds ) ) {
@@ -317,6 +328,8 @@ class Mobo_Core_Upgrade_Coordinator {
 			'installStartedAt' => isset( $state['installStartedAt'] ) ? absint( $state['installStartedAt'] ) : 0,
 			'verifyStartedAt'  => isset( $state['verifyStartedAt'] ) ? absint( $state['verifyStartedAt'] ) : 0,
 			'retryAfter'       => isset( $state['retryAfter'] ) ? absint( $state['retryAfter'] ) : self::DEFAULT_RETRY_AFTER_SECONDS,
+			'drainTimeoutSeconds' => isset( $state['drainTimeoutSeconds'] ) ? absint( $state['drainTimeoutSeconds'] ) : 0,
+			'dispatchHandoffDrain' => isset( $state['dispatchHandoffDrain'] ) && is_array( $state['dispatchHandoffDrain'] ) ? $state['dispatchHandoffDrain'] : array(),
 			'blockingLocks'    => $active ? self::get_blocking_locks() : array(),
 			'lock'             => is_array( $lock ) ? $lock : array(),
 			'lastAudit'        => $audit,
@@ -339,47 +352,6 @@ class Mobo_Core_Upgrade_Coordinator {
 			'needsContinuation' => false,
 			'upgradeBarrier'    => self::get_status(),
 		);
-	}
-
-	/**
-	 * Store pause metadata without changing the resumable sync status/cursor.
-	 *
-	 * @param string $deployment_id Deployment ID.
-	 * @return void
-	 */
-	private static function mark_sync_paused( $deployment_id ) {
-		$state = get_option( 'mobo_core_sync_state', array() );
-		if ( ! is_array( $state ) ) {
-			return;
-		}
-
-		$status = isset( $state['status'] ) ? sanitize_key( (string) $state['status'] ) : '';
-		if ( ! in_array( $status, array( 'running', 'waiting_for_portal' ), true ) ) {
-			return;
-		}
-
-		$state['upgradePaused']      = true;
-		$state['pausedReason']       = 'plugin-upgrade';
-		$state['pausedAt']           = time();
-		$state['pauseDeploymentId']  = sanitize_text_field( (string) $deployment_id );
-		$state['updatedAt']          = time();
-		update_option( 'mobo_core_sync_state', $state, false );
-	}
-
-	/**
-	 * Remove only upgrade-specific pause metadata; preserve all sync cursors.
-	 *
-	 * @return void
-	 */
-	private static function clear_sync_pause() {
-		$state = get_option( 'mobo_core_sync_state', array() );
-		if ( ! is_array( $state ) || empty( $state['upgradePaused'] ) ) {
-			return;
-		}
-
-		unset( $state['upgradePaused'], $state['pausedReason'], $state['pausedAt'], $state['pauseDeploymentId'] );
-		$state['updatedAt'] = time();
-		update_option( 'mobo_core_sync_state', $state, false );
 	}
 
 	/**

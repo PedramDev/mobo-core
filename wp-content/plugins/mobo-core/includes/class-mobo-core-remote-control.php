@@ -64,17 +64,38 @@ class Mobo_Core_Remote_Control {
 		$sync = new Mobo_Core_Product_Sync();
 		$result = $sync->start_manual_sync( $request_id, 'portal-' . $operation, $repair_mode );
 
-		$record = array(
-			'requestId'   => $request_id,
-			'operation'   => $operation,
-			'source'      => 'portal',
-			'requestedAt' => time(),
-			'acceptedAt'  => ! empty( $result['success'] ) ? time() : 0,
-			'finishedAt'  => 0,
-			'status'      => ! empty( $result['success'] ) ? 'running' : 'rejected',
-			'message'     => isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '',
-		);
-		update_option( self::LAST_OPERATION_OPTION, $record, false );
+		if ( ! empty( $result['success'] ) ) {
+			$record = array(
+				'requestId'   => $request_id,
+				'operation'   => $operation,
+				'source'      => 'portal',
+				'requestedAt' => time(),
+				'acceptedAt'  => time(),
+				'finishedAt'  => 0,
+				'status'      => 'running',
+				'message'     => isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '',
+			);
+			update_option( self::LAST_OPERATION_OPTION, $record, false );
+		} else {
+			/*
+			 * Never let a rejected concurrent request replace the identity/status of
+			 * the operation that actually owns the running manual-sync generation.
+			 */
+			$after = self::get_status();
+			if ( empty( $after['isRunning'] ) ) {
+				$record = array(
+					'requestId'   => $request_id,
+					'operation'   => $operation,
+					'source'      => 'portal',
+					'requestedAt' => time(),
+					'acceptedAt'  => 0,
+					'finishedAt'  => time(),
+					'status'      => 'rejected',
+					'message'     => isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '',
+				);
+				update_option( self::LAST_OPERATION_OPTION, $record, false );
+			}
+		}
 
 		if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			$result['selfKick'] = Mobo_Core_Self_Runner::kick( 'portal-' . $operation . '-start', false );

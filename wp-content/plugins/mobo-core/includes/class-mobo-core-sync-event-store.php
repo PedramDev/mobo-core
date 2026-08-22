@@ -64,6 +64,7 @@ class Mobo_Core_Sync_Event_Store {
 			try_count int(10) unsigned NOT NULL DEFAULT 0,
 			next_retry_at datetime NULL,
 			locked_until datetime NULL,
+			claim_token varchar(64) NOT NULL DEFAULT '',
 			expires_at datetime NULL,
 			payload_json longtext NOT NULL,
 			progress_json longtext NULL,
@@ -77,6 +78,7 @@ class Mobo_Core_Sync_Event_Store {
 			KEY status_retry (status, next_retry_at),
 			KEY status_retry_id (status, next_retry_at, id),
 			KEY locked_until (locked_until),
+			KEY claim_token (claim_token),
 			KEY status_locked_id (status, locked_until, id),
 			KEY status_updated_id (status, updated_at, id),
 			KEY event_entity_id (event_type, entity_guid(100), id),
@@ -114,6 +116,43 @@ class Mobo_Core_Sync_Event_Store {
 	 */
 	private static function invalidate_summary_cache() {
 		self::$summary_cache = null;
+	}
+
+
+	/**
+	 * Acquire a connection-scoped lock for one remote event identity.
+	 *
+	 * @param string $remote_event_id Remote event identity.
+	 * @return string Lock name or empty string.
+	 */
+	private function acquire_remote_event_dedupe_lock( $remote_event_id ) {
+		global $wpdb;
+
+		$remote_event_id = sanitize_text_field( (string) $remote_event_id );
+		if ( '' === $remote_event_id ) {
+			return '';
+		}
+
+		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
+		$lock_name = 'mobo_evt_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $remote_event_id ), 0, 40 );
+		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 5 ) );
+
+		return '1' === (string) $acquired ? $lock_name : '';
+	}
+
+	/**
+	 * Release a connection-scoped remote-event dedupe lock.
+	 *
+	 * @param string $lock_name Lock name.
+	 * @return void
+	 */
+	private function release_remote_event_dedupe_lock( $lock_name ) {
+		global $wpdb;
+
+		$lock_name = sanitize_text_field( (string) $lock_name );
+		if ( '' !== $lock_name ) {
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) );
+		}
 	}
 
 	/**
@@ -183,7 +222,14 @@ class Mobo_Core_Sync_Event_Store {
 			$remote_event_id = $this->build_local_dedupe_id( $event_type, $payload, sanitize_text_field( (string) $normalized['syncId'] ), $entity_type, $entity_guid );
 		}
 
+		$dedupe_lock_name = '';
 		if ( '' !== $remote_event_id ) {
+			/*
+			 * SELECT-then-INSERT is not a dedupe boundary under concurrency. Serialize
+			 * only this tiny database critical section so two identical webhook
+			 * requests cannot both observe a miss and create duplicate queue rows.
+			 */
+			$dedupe_lock_name = $this->acquire_remote_event_dedupe_lock( $remote_event_id );
 			$existing = $wpdb->get_var(
 				$wpdb->prepare(
 					"SELECT id FROM {$table} WHERE remote_event_id = %s AND status IN ('pending', 'processing', 'done') ORDER BY id DESC LIMIT 1",
@@ -192,7 +238,14 @@ class Mobo_Core_Sync_Event_Store {
 			);
 
 			if ( $existing ) {
+				if ( '' !== $dedupe_lock_name ) {
+					$this->release_remote_event_dedupe_lock( $dedupe_lock_name );
+				}
 				return absint( $existing );
+			}
+
+			if ( '' === $dedupe_lock_name ) {
+				return new WP_Error( 'mobo_core_event_dedupe_lock_busy', 'Could not obtain webhook dedupe lock.' );
 			}
 		}
 
@@ -225,6 +278,10 @@ class Mobo_Core_Sync_Event_Store {
 			),
 			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
+
+		if ( '' !== $dedupe_lock_name ) {
+			$this->release_remote_event_dedupe_lock( $dedupe_lock_name );
+		}
 
 		if ( false === $inserted ) {
 			return new WP_Error( 'mobo_core_event_insert_failed', 'Could not store sync event.' );
@@ -606,11 +663,12 @@ class Mobo_Core_Sync_Event_Store {
 
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
-		$update_args     = array_merge( array( $locked_until, $now ), $ids, array( $now, $now ) );
+		$claim_token     = str_replace( '-', '', wp_generate_uuid4() );
+		$update_args     = array_merge( array( $locked_until, $claim_token, $now ), $ids, array( $now, $now ) );
 		$updated         = $wpdb->query(
 			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
-				SET status = 'processing', locked_until = %s, updated_at = %s
+				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
 				WHERE id IN ({$id_placeholders})
 					AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
@@ -624,13 +682,13 @@ class Mobo_Core_Sync_Event_Store {
 
 		self::invalidate_summary_cache();
 
-		$select_args = array_merge( $ids, array( $locked_until ) );
+		$select_args = array_merge( $ids, array( $claim_token ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, event_uuid, remote_event_id, event_type, entity_guid, sync_id,
+				"SELECT id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, claim_token,
 					try_count, expires_at, payload_json, created_at, updated_at
 				FROM {$table}
-				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
+				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND claim_token = %s
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC",
 				$select_args
 			),
@@ -658,11 +716,12 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param array $ids Claimed row IDs.
 	 * @return int
 	 */
-	public function release_claimed_events( $ids ) {
+	public function release_claimed_events( $ids, $claim_token = '' ) {
 		global $wpdb;
 
-		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
-		if ( empty( $ids ) || ! self::table_exists() ) {
+		$ids         = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( empty( $ids ) || '' === $claim_token || ! self::table_exists() ) {
 			return 0;
 		}
 
@@ -672,9 +731,10 @@ class Mobo_Core_Sync_Event_Store {
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'pending', locked_until = NULL, updated_at = %s
-				WHERE status = 'processing' AND id IN ({$id_sql})",
-				$now
+				SET status = 'pending', locked_until = NULL, claim_token = '', updated_at = %s
+				WHERE status = 'processing' AND claim_token = %s AND id IN ({$id_sql})",
+				$now,
+				$claim_token
 			)
 		);
 
@@ -732,7 +792,7 @@ class Mobo_Core_Sync_Event_Store {
 	 *
 	 * @param int $id Event ID.
 	 * @param int $ttl TTL seconds.
-	 * @return bool
+	 * @return string|false Claim token or false.
 	 */
 	public function lock_event( $id, $ttl = 90 ) {
 		global $wpdb;
@@ -746,17 +806,19 @@ class Mobo_Core_Sync_Event_Store {
 		$table        = self::table_name();
 		$now          = current_time( 'mysql', true );
 		$locked_until = gmdate( 'Y-m-d H:i:s', time() + max( 30, absint( $ttl ) ) );
+		$claim_token  = str_replace( '-', '', wp_generate_uuid4() );
 
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'processing', locked_until = %s, updated_at = %s
+				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
 				WHERE id = %d
 				AND (
 					status = 'pending'
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)",
 				$locked_until,
+				$claim_token,
 				$now,
 				$id,
 				$now
@@ -765,7 +827,7 @@ class Mobo_Core_Sync_Event_Store {
 
 		if ( 1 === absint( $updated ) ) {
 			self::invalidate_summary_cache();
-			return true;
+			return $claim_token;
 		}
 
 		return false;
@@ -809,10 +871,10 @@ class Mobo_Core_Sync_Event_Store {
 	 * Mark event as completed.
 	 *
 	 * @param int $id Event ID.
-	 * @return void
+	 * @return bool
 	 */
-	public function mark_done( $id ) {
-		$this->update_status( $id, 'done', array( 'locked_until' => null, 'next_retry_at' => null, 'last_error' => null ) );
+	public function mark_done( $id, $claim_token = '' ) {
+		return $this->update_status( $id, 'done', array( 'locked_until' => null, 'claim_token' => '', 'next_retry_at' => null, 'last_error' => null ), $claim_token );
 	}
 
 	/**
@@ -821,11 +883,12 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param int   $id Event ID.
 	 * @param array $payload Event payload.
 	 * @param array $progress Progress/diagnostic data.
-	 * @return void
+	 * @return bool
 	 */
-	public function mark_done_with_progress( $id, $payload = array(), $progress = array() ) {
+	public function mark_done_with_progress( $id, $payload = array(), $progress = array(), $claim_token = '' ) {
 		$fields = array(
 			'locked_until'  => null,
+			'claim_token'   => '',
 			'next_retry_at' => null,
 			'last_error'    => null,
 		);
@@ -846,7 +909,7 @@ class Mobo_Core_Sync_Event_Store {
 			}
 		}
 
-		$this->update_status( $id, 'done', $fields );
+		return $this->update_status( $id, 'done', $fields, $claim_token );
 	}
 
 	/**
@@ -911,8 +974,32 @@ class Mobo_Core_Sync_Event_Store {
 			$progress['parentWaitTimeoutSeconds'] = $timeout_seconds;
 			$progress['parentWaitAgeSeconds']     = $wait_age;
 
-			$this->mark_done_with_progress( absint( $row['id'] ), $payload, $progress );
-			$retired++;
+			$payload_json  = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			$progress_json = wp_json_encode( $progress, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			$updated = $wpdb->update(
+				$table,
+				array(
+					'status'        => 'done',
+					'payload_json'  => false === $payload_json ? '{}' : $payload_json,
+					'progress_json' => false === $progress_json ? '{}' : $progress_json,
+					'locked_until'  => null,
+					'claim_token'   => '',
+					'next_retry_at' => null,
+					'last_error'    => null,
+					'updated_at'    => current_time( 'mysql', true ),
+				),
+				array(
+					'id'     => absint( $row['id'] ),
+					'status' => 'pending',
+				),
+				array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ),
+				array( '%d', '%s' )
+			);
+
+			if ( 1 === absint( $updated ) ) {
+				self::invalidate_summary_cache();
+				$retired++;
+			}
 		}
 
 		return $retired;
@@ -924,23 +1011,25 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param int   $id Event ID.
 	 * @param array $payload Updated payload.
 	 * @param array $progress Progress data.
-	 * @return void
+	 * @return bool
 	 */
-	public function mark_pending_progress( $id, $payload, $progress = array() ) {
+	public function mark_pending_progress( $id, $payload, $progress = array(), $claim_token = '' ) {
 		$payload_json  = wp_json_encode( is_array( $payload ) ? $payload : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		$progress_json = wp_json_encode( is_array( $progress ) ? $progress : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		$defer_seconds = is_array( $progress ) && isset( $progress['deferSeconds'] ) ? absint( $progress['deferSeconds'] ) : 0;
 
-		$this->update_status(
+		return $this->update_status(
 			$id,
 			'pending',
 			array(
 				'payload_json'  => false === $payload_json ? '{}' : $payload_json,
 				'progress_json' => false === $progress_json ? '{}' : $progress_json,
 				'locked_until'  => null,
+				'claim_token'   => '',
 				'next_retry_at' => $defer_seconds > 0 ? gmdate( 'Y-m-d H:i:s', time() + $defer_seconds ) : null,
 				'last_error'    => null,
-			)
+			),
+			$claim_token
 		);
 	}
 
@@ -951,21 +1040,23 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param string $message Error.
 	 * @param int    $try_count New try count.
 	 * @param bool   $final_failed Mark as failed.
-	 * @return void
+	 * @return bool
 	 */
-	public function mark_failure( $id, $message, $try_count, $final_failed = false ) {
+	public function mark_failure( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
 		$status = $final_failed ? 'failed' : 'pending';
 		$delay  = $final_failed ? null : min( 300, max( 30, absint( $try_count ) * 30 ) );
 
-		$this->update_status(
+		return $this->update_status(
 			$id,
 			$status,
 			array(
 				'try_count'     => absint( $try_count ),
 				'next_retry_at' => null === $delay ? null : gmdate( 'Y-m-d H:i:s', time() + $delay ),
 				'locked_until'  => null,
+				'claim_token'   => '',
 				'last_error'    => sanitize_text_field( (string) $message ),
-			)
+			),
+			$claim_token
 		);
 	}
 
@@ -979,18 +1070,20 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param string $message Error.
 	 * @param int    $try_count New try count.
 	 * @param bool   $final_failed Mark as failed.
-	 * @return void
+	 * @return bool
 	 */
-	public function mark_retry_now( $id, $message, $try_count, $final_failed = false ) {
-		$this->update_status(
+	public function mark_retry_now( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
+		return $this->update_status(
 			$id,
 			$final_failed ? 'failed' : 'pending',
 			array(
 				'try_count'     => absint( $try_count ),
 				'next_retry_at' => null,
 				'locked_until'  => null,
+				'claim_token'   => '',
 				'last_error'    => sanitize_text_field( (string) $message ),
-			)
+			),
+			$claim_token
 		);
 	}
 
@@ -1065,7 +1158,7 @@ class Mobo_Core_Sync_Event_Store {
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'pending', try_count = 0, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
+				SET status = 'pending', try_count = 0, next_retry_at = NULL, locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
 				WHERE id IN ({$placeholders})",
 				$params
 			)
@@ -1109,15 +1202,15 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param int    $id Event ID.
 	 * @param string $status Status.
 	 * @param array  $fields Additional fields.
-	 * @return void
+	 * @return bool
 	 */
-	private function update_status( $id, $status, $fields = array() ) {
+	private function update_status( $id, $status, $fields = array(), $claim_token = '' ) {
 		global $wpdb;
 
 		$id = absint( $id );
 
 		if ( $id <= 0 || ! self::table_exists() ) {
-			return;
+			return false;
 		}
 
 		$data = array_merge(
@@ -1138,10 +1231,41 @@ class Mobo_Core_Sync_Event_Store {
 			}
 		}
 
-		$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( '' !== $claim_token ) {
+			$table = self::table_name();
+			$sets  = array();
+			$args  = array();
+			foreach ( $data as $key => $value ) {
+				$key = sanitize_key( (string) $key );
+				if ( '' === $key ) {
+					continue;
+				}
+				$sets[] = $key . ' = ' . ( null === $value ? 'NULL' : ( 'try_count' === $key ? '%d' : '%s' ) );
+				if ( null !== $value ) {
+					$args[] = $value;
+				}
+			}
+			$args[] = $id;
+			$args[] = $claim_token;
+			$updated = empty( $sets ) ? false : $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table} SET " . implode( ', ', $sets ) . " WHERE id = %d AND status = 'processing' AND claim_token = %s",
+					$args
+				)
+			);
+		} else {
+			$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		}
 		if ( false !== $updated ) {
 			self::invalidate_summary_cache();
 		}
+
+		if ( '' !== $claim_token ) {
+			return 1 === (int) $updated;
+		}
+
+		return false !== $updated;
 	}
 
 	private function build_local_dedupe_id( $event_type, $payload, $sync_id, $entity_type, $entity_guid ) {
@@ -1435,9 +1559,11 @@ class Mobo_Core_Sync_Event_Store {
 				}
 			}
 		} elseif ( 'ShippingMethodsChanged' === $event_type || 'WebhookDeliveryStatusChanged' === $event_type ) {
+			/* extract_entity() has one internal contract: type/guid. Returning the
+			 * normalized output names here made normalize_event() read undefined keys. */
 			return array(
-				'entityType' => 'system',
-				'entityGuid' => null,
+				'type' => 'system',
+				'guid' => '',
 			);
 		} elseif ( 'ProductUpdated' === $event_type ) {
 			$type = 'product';

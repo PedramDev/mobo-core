@@ -4,8 +4,9 @@
  *
  * A legacy image and all WordPress derivatives are treated as one family. For
  * uploads/2026/07/abc.webp, the family may contain abc.jpg, abc-300x300.jpg,
- * abc-scaled.jpg, abc-e1234567890123-150x150.jpg, and similar core-generated
- * files. Registered attachment families are ignored before queue persistence;
+ * abc-scaled.jpg, abc-e1234567890123-150x150.jpg, and stale WordPress filename
+ * collision copies such as abc-1.webp / abc-1-300x300.webp. Registered or
+ * referenced files are ignored before queue persistence;
  * only fully unregistered and unreferenced families are stored as candidates.
  *
  * PHP 7.4 compatible.
@@ -144,6 +145,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				'registeredFamilies'   => 0,
 				'referencedFamilies'   => 0,
 				'invalidFamilies'      => 0,
+				'sharedSkipped'         => 0,
 				'skippedFiles'         => 0,
 				'alreadyDeleted'       => 0,
 				'totalBytes'           => 0,
@@ -174,6 +176,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			'registeredFamilies' => $continue_cycle ? absint( isset( $previous['registeredFamilies'] ) ? $previous['registeredFamilies'] : 0 ) : 0,
 			'referencedFamilies' => $continue_cycle ? absint( isset( $previous['referencedFamilies'] ) ? $previous['referencedFamilies'] : 0 ) : 0,
 			'invalidFamilies'    => $continue_cycle ? absint( isset( $previous['invalidFamilies'] ) ? $previous['invalidFamilies'] : 0 ) : 0,
+			'sharedSkipped'       => $continue_cycle ? absint( isset( $previous['sharedSkipped'] ) ? $previous['sharedSkipped'] : 0 ) : 0,
 			'skippedFiles'       => $continue_cycle ? absint( isset( $previous['skippedFiles'] ) ? $previous['skippedFiles'] : 0 ) : 0,
 			'alreadyDeleted'     => $continue_cycle ? absint( isset( $previous['alreadyDeleted'] ) ? $previous['alreadyDeleted'] : 0 ) : 0,
 			'totalBytes'         => $continue_cycle ? absint( isset( $previous['totalBytes'] ) ? $previous['totalBytes'] : 0 ) : 0,
@@ -189,7 +192,15 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		foreach ( isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array() as $attachment_id ) {
 			$attachment_id = absint( $attachment_id );
 			$result['processedAttachments']++;
-			$webp_file     = get_attached_file( $attachment_id );
+
+			// Shared Media files are worker-owned and may live in a read-only repository
+			// outside wp-content/uploads. Per-site orphan cleanup must never scan it.
+			if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+				$result['sharedSkipped']++;
+				continue;
+			}
+
+			$webp_file = get_attached_file( $attachment_id );
 
 			if ( ! is_string( $webp_file ) || '' === $webp_file || ! $this->is_webp_file_path( $webp_file ) || ! is_file( $webp_file ) ) {
 				continue;
@@ -251,6 +262,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			'skippedFamilies'  => 0,
 			'failed'           => 0,
 			'failedFamilies'   => 0,
+			'failedFiles'      => array(),
 			'remainingFamilies'=> 0,
 			'bytes'            => 0,
 			'executedAt'       => time(),
@@ -316,19 +328,21 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				continue;
 			}
 
-			$deleted_files = 0;
-			$deleted_bytes = 0;
-			$remaining     = array();
+			$deleted_files   = 0;
+			$deleted_bytes   = 0;
+			$remaining       = array();
+			$failure_details = array();
 
 			foreach ( $current_paths as $path ) {
 				$size = is_file( $path ) ? absint( filesize( $path ) ) : 0;
-				wp_delete_file( $path );
+				$delete_result = $this->delete_candidate_file( $path );
 
-				if ( ! is_file( $path ) ) {
+				if ( ! empty( $delete_result['deleted'] ) ) {
 					$deleted_files++;
 					$deleted_bytes += $size;
 				} else {
 					$remaining[] = $path;
+					$failure_details[] = isset( $delete_result['detail'] ) ? (string) $delete_result['detail'] : $this->relative_to_uploads( $path );
 				}
 			}
 
@@ -342,10 +356,16 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				continue;
 			}
 
+			$failure_details = array_values( array_filter( array_map( 'sanitize_text_field', $failure_details ) ) );
+			$message = sprintf( '%d فایل حذف شد، اما حذف %d فایل ناموفق بود.', $deleted_files, count( $remaining ) );
+			if ( ! empty( $failure_details ) ) {
+				$message .= ' فایل های ناموفق: ' . implode( ' | ', array_slice( $failure_details, 0, 8 ) );
+			}
+
 			$this->update_row_status(
 				$id,
-				'failed',
-				sprintf( '%d فایل حذف شد، اما حذف %d فایل ناموفق بود.', $deleted_files, count( $remaining ) ),
+				'skipped',
+				$message,
 				false,
 				$this->sum_file_sizes( $remaining ),
 				count( $remaining ),
@@ -353,6 +373,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			);
 			$result['failed']++;
 			$result['failedFamilies']++;
+			$result['failedFiles'] = array_slice( array_merge( $result['failedFiles'], $failure_details ), 0, 20 );
 		}
 
 		$result['status'] = 'done';
@@ -360,6 +381,42 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		update_option( 'mobo_core_orphan_image_cleanup_last_delete', $result, false );
 
 		return $result;
+	}
+
+	/**
+	 * Delete one already re-validated candidate and return diagnostics if the
+	 * filesystem refuses the operation. No path outside uploads is accepted.
+	 *
+	 * @param string $path Absolute path.
+	 * @return array
+	 */
+	private function delete_candidate_file( $path ) {
+		$path = $this->normalize_path( (string) $path );
+		if ( '' === $path || ! is_file( $path ) || ! $this->is_inside_uploads( $path ) ) {
+			return array( 'deleted' => false, 'detail' => 'مسیر نامعتبر یا خارج از uploads: ' . $this->relative_to_uploads( $path ) );
+		}
+
+		$relative = $this->relative_to_uploads( $path );
+		$parent   = dirname( $path );
+		$uploads  = wp_upload_dir( null, false );
+		$basedir  = isset( $uploads['basedir'] ) ? $this->normalize_path( (string) $uploads['basedir'] ) : '';
+
+		if ( function_exists( 'wp_delete_file_from_directory' ) && '' !== $basedir ) {
+			wp_delete_file_from_directory( $path, $basedir );
+		} else {
+			wp_delete_file( $path );
+		}
+
+		clearstatcache( true, $path );
+		if ( ! is_file( $path ) ) {
+			return array( 'deleted' => true, 'detail' => $relative );
+		}
+
+		$detail = ( '' !== $relative ? $relative : $path )
+			. ' [fileWritable=' . ( is_writable( $path ) ? 'yes' : 'no' )
+			. ', parentWritable=' . ( is_dir( $parent ) && is_writable( $parent ) ? 'yes' : 'no' ) . ']';
+
+		return array( 'deleted' => false, 'detail' => $detail );
 	}
 
 	/**
@@ -393,12 +450,16 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 * @return array
 	 */
 	public function get_status() {
+		$candidate = $this->count_by_statuses( array( 'candidate' ) );
+		$failed    = $this->count_by_statuses( array( 'failed' ) );
+
 		return array(
 			'enabled'    => Mobo_Core_Settings::enabled( 'mobo_core_orphan_image_cleanup_enabled', '0' ),
-			'candidate'  => $this->count_by_statuses( array( 'candidate' ) ),
+			'candidate'  => $candidate,
+			'actionable' => $candidate,
 			'skipped'    => $this->count_by_statuses( array( 'skipped' ) ),
 			'deleted'    => $this->count_by_statuses( array( 'deleted' ) ),
-			'failed'     => $this->count_by_statuses( array( 'failed' ) ),
+			'failed'     => $failed,
 			'cursor'     => absint( get_option( self::CURSOR_OPTION, 0 ) ),
 			'lastScan'   => get_option( 'mobo_core_orphan_image_cleanup_last_scan', array() ),
 			'lastDelete' => get_option( 'mobo_core_orphan_image_cleanup_last_delete', array() ),
@@ -527,6 +588,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		$items    = scandir( $dir );
 		$patterns = array_map( array( $this, 'legacy_family_pattern' ), $bases );
 		$paths    = array();
+		$current_registered = array_fill_keys( $this->get_registered_attachment_relative_paths( $webp_attachment_id ), true );
 
 		foreach ( is_array( $items ) ? $items : array() as $item ) {
 			if ( '.' === $item || '..' === $item ) {
@@ -545,7 +607,12 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				continue;
 			}
 
-			$path = $this->normalize_path( $dir . '/' . $item );
+			$path     = $this->normalize_path( $dir . '/' . $item );
+			$relative = $this->relative_to_uploads( $path );
+			if ( $path === $webp_file || ( '' !== $relative && isset( $current_registered[ $relative ] ) ) ) {
+				continue;
+			}
+
 			if ( is_file( $path ) ) {
 				$paths[] = $path;
 			}
@@ -591,6 +658,18 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		$names              = array( basename( $webp_file ) );
 		$metadata           = $webp_attachment_id > 0 ? wp_get_attachment_metadata( $webp_attachment_id ) : array();
 
+		/* Old Mobo versions could repeatedly sideload the same remote WebP and let
+		 * WordPress create collision names such as image-89.webp. The persisted
+		 * source URL is a trusted way to recover the intended canonical basename. */
+		if ( $webp_attachment_id > 0 ) {
+			$source_url  = (string) get_post_meta( $webp_attachment_id, 'mobo_source_url', true );
+			$source_path = (string) wp_parse_url( $source_url, PHP_URL_PATH );
+			$source_name = basename( $source_path );
+			if ( '' !== $source_name && 'webp' === strtolower( (string) pathinfo( $source_name, PATHINFO_EXTENSION ) ) ) {
+				$names[] = $source_name;
+			}
+		}
+
 		if ( is_array( $metadata ) ) {
 			if ( ! empty( $metadata['file'] ) ) {
 				$names[] = basename( (string) $metadata['file'] );
@@ -623,7 +702,13 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 * @return string
 	 */
 	private function legacy_family_pattern( $base ) {
-		return '/^' . preg_quote( (string) $base, '/' ) . '(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*\.(?:jpe?g|png)$/i';
+		$quoted = preg_quote( (string) $base, '/' );
+		$derivative = '(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*';
+
+		/* Raster originals/cuts plus old WordPress collision copies. For WebP, only
+		 * numeric collision names are included; the canonical base.webp is never a
+		 * cleanup candidate. Registered/referenced files are rejected later. */
+		return '/^(?:' . $quoted . '(?:-\d+)?' . $derivative . '\.(?:jpe?g|png)|' . $quoted . '-\d+' . $derivative . '\.webp)$/i';
 	}
 
 	/**
@@ -648,7 +733,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		}
 
 		foreach ( $paths as $path ) {
-			if ( ! is_file( $path ) || ! $this->is_inside_uploads( $path ) || ! $this->is_legacy_raster_file_path( $path ) || ! $this->is_same_base_legacy_file( $path, $webp_file, $webp_attachment_id ) ) {
+			if ( ! is_file( $path ) || ! $this->is_inside_uploads( $path ) || ! $this->is_same_base_legacy_file( $path, $webp_file, $webp_attachment_id ) ) {
 				return array( 'state' => 'invalid', 'message' => 'خانواده شامل فایل نامعتبر یا نامرتبط است.', 'fileCount' => count( $paths ), 'bytes' => $this->sum_file_sizes( $paths ) );
 			}
 		}
@@ -658,10 +743,13 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		}
 
 		foreach ( $paths as $path ) {
-			$relative = $this->relative_to_uploads( $path );
-			if ( '' === $relative || $this->is_referenced_in_database( $relative ) ) {
-				return array( 'state' => 'referenced', 'message' => 'حداقل یکی از فایل های خانواده در محتوا، متادیتا یا تنظیمات دیتابیس مرجع دارد.', 'fileCount' => count( $paths ), 'bytes' => $this->sum_file_sizes( $paths ) );
+			if ( '' === $this->relative_to_uploads( $path ) ) {
+				return array( 'state' => 'invalid', 'message' => 'حداقل یک فایل خانواده خارج از uploads است.', 'fileCount' => count( $paths ), 'bytes' => $this->sum_file_sizes( $paths ) );
 			}
+		}
+
+		if ( $this->family_is_referenced_in_database( $paths ) ) {
+			return array( 'state' => 'referenced', 'message' => 'حداقل یکی از فایل های خانواده در محتوا، متادیتا یا تنظیمات دیتابیس مرجع دارد.', 'fileCount' => count( $paths ), 'bytes' => $this->sum_file_sizes( $paths ) );
 		}
 
 		return array(
@@ -967,40 +1055,57 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 * @param string $relative_path Uploads-relative path.
 	 * @return bool
 	 */
-	private function is_referenced_in_database( $relative_path ) {
+	private function family_is_referenced_in_database( $paths ) {
 		global $wpdb;
 
-		$relative_path = ltrim( $this->normalize_path( (string) $relative_path ), '/' );
-		$name          = basename( $relative_path );
-		$uploads       = wp_upload_dir( null, false );
-		$baseurl       = isset( $uploads['baseurl'] ) ? untrailingslashit( (string) $uploads['baseurl'] ) : '';
-		$url           = '' !== $baseurl ? $baseurl . '/' . $relative_path : '';
+		$uploads = wp_upload_dir( null, false );
+		$baseurl = isset( $uploads['baseurl'] ) ? untrailingslashit( (string) $uploads['baseurl'] ) : '';
+		$needles = array();
 
-		$needles = array_values(
-			array_unique(
-				array_filter(
-					array(
-						$relative_path,
-						str_replace( '/', '\\/', $relative_path ),
-						$url,
-						$name,
-					)
-				)
-			)
-		);
-
-		foreach ( $needles as $needle ) {
-			$like = '%' . $wpdb->esc_like( $needle ) . '%';
-
-			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_status NOT IN ('trash', 'auto-draft') AND (post_content LIKE %s OR guid LIKE %s) LIMIT 1", $like, $like ) ) ) > 0 ) {
+		foreach ( (array) $paths as $path ) {
+			$relative = ltrim( $this->relative_to_uploads( $path ), '/' );
+			if ( '' === $relative ) {
 				return true;
 			}
 
-			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$wpdb->postmeta} WHERE meta_value LIKE %s LIMIT 1", $like ) ) ) > 0 ) {
+			$needles[] = $relative;
+			$needles[] = str_replace( '/', '\\/', $relative );
+			$needles[] = basename( $relative );
+			if ( '' !== $baseurl ) {
+				$needles[] = $baseurl . '/' . $relative;
+			}
+		}
+
+		$needles = array_values( array_unique( array_filter( $needles ) ) );
+		foreach ( array_chunk( $needles, 120 ) as $chunk ) {
+			$likes = array_map(
+				static function ( $needle ) use ( $wpdb ) {
+					return '%' . $wpdb->esc_like( (string) $needle ) . '%';
+				},
+				$chunk
+			);
+
+			$post_clauses = array();
+			$post_args    = array();
+			foreach ( $likes as $like ) {
+				$post_clauses[] = '(post_content LIKE %s OR guid LIKE %s)';
+				$post_args[] = $like;
+				$post_args[] = $like;
+			}
+			if ( ! empty( $post_clauses ) ) {
+				$sql = "SELECT ID FROM {$wpdb->posts} WHERE post_status NOT IN ('trash', 'auto-draft') AND (" . implode( ' OR ', $post_clauses ) . ') LIMIT 1';
+				if ( absint( $wpdb->get_var( $wpdb->prepare( $sql, ...$post_args ) ) ) > 0 ) {
+					return true;
+				}
+			}
+
+			$meta_clause = implode( ' OR ', array_fill( 0, count( $likes ), 'meta_value LIKE %s' ) );
+			if ( '' !== $meta_clause && absint( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$wpdb->postmeta} WHERE {$meta_clause} LIMIT 1", ...$likes ) ) ) > 0 ) {
 				return true;
 			}
 
-			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM {$wpdb->options} WHERE option_value LIKE %s LIMIT 1", $like ) ) ) > 0 ) {
+			$option_clause = implode( ' OR ', array_fill( 0, count( $likes ), 'option_value LIKE %s' ) );
+			if ( '' !== $option_clause && absint( $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM {$wpdb->options} WHERE {$option_clause} LIMIT 1", ...$likes ) ) ) > 0 ) {
 				return true;
 			}
 		}
@@ -1099,17 +1204,5 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 */
 	private function is_webp_file_path( $path ) {
 		return 'webp' === strtolower( pathinfo( (string) $path, PATHINFO_EXTENSION ) );
-	}
-
-	/**
-	 * Is old raster path.
-	 *
-	 * @param string $path Path.
-	 * @return bool
-	 */
-	private function is_legacy_raster_file_path( $path ) {
-		$ext = strtolower( pathinfo( (string) $path, PATHINFO_EXTENSION ) );
-
-		return in_array( $ext, array( 'jpg', 'jpeg', 'png' ), true );
 	}
 }

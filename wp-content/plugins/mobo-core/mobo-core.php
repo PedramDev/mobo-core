@@ -3,7 +3,7 @@
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.33.19
+ * Version: 10.33.44.1
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.33.19' );
+define( 'MOBO_CORE_VERSION', '10.33.44.1' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -189,11 +189,21 @@ function mobo_core_has_deferred_repair() {
 		'mobo_core_stage7_resume_kick_pending',
 		'mobo_core_category_placeholder_repair_pending',
 		'mobo_core_image_queue_recovery_pending',
+		'mobo_core_product_recovery_kick_pending',
 	) as $option_name ) {
 		if ( '1' === (string) get_option( $option_name, '0' ) ) {
 			return true;
 		}
 	}
+
+	/* A failed/non-arrived loopback remains durable, but only load the migration
+	 * repair hook when self-runner dispatch is actually configured. */
+	if ( '1' === (string) get_option( 'mobo_core_worker_dispatch_pending', '0' )
+		&& mobo_core_bootstrap_enabled( 'mobo_core_self_runner_enabled', '1' )
+		&& '' !== trim( (string) get_option( 'mobo_core_cron_token', '' ) ) ) {
+		return true;
+	}
+
 	return false;
 }
 
@@ -381,6 +391,14 @@ add_action(
 		}
 
 		/*
+		 * Revenue source snapshots are private bookkeeping metadata. Keep them stored
+		 * on line items for immutable calculations while removing them from every
+		 * WooCommerce display path that relies on hidden/formatted item metadata.
+		 */
+		add_filter( 'woocommerce_hidden_order_itemmeta', array( 'Mobo_Core_Revenue_Ledger', 'hide_internal_order_item_meta' ), PHP_INT_MAX, 1 );
+		add_filter( 'woocommerce_order_item_get_formatted_meta_data', array( 'Mobo_Core_Revenue_Ledger', 'filter_internal_formatted_item_meta' ), PHP_INT_MAX, 2 );
+
+		/*
 		 * Lazy order hooks: keep SMS and wallet classes off catalogue/product page
 		 * requests and instantiate them only when the corresponding order event fires.
 		 */
@@ -421,6 +439,43 @@ add_action(
 			20,
 			4
 		);
+		add_action(
+			'woocommerce_checkout_order_processed',
+			function ( $order_id, $posted_data = array(), $order = null ) {
+				if ( ! $order instanceof WC_Order && function_exists( 'wc_get_order' ) ) {
+					$order = wc_get_order( absint( $order_id ) );
+				}
+				if ( $order instanceof WC_Order ) {
+					$ledger = new Mobo_Core_Revenue_Ledger();
+					$ledger->snapshot_missing_source_costs( $order );
+				}
+			},
+			10,
+			3
+		);
+		add_action(
+			'woocommerce_store_api_checkout_update_order_meta',
+			function ( $order ) {
+				if ( $order instanceof WC_Order ) {
+					$ledger = new Mobo_Core_Revenue_Ledger();
+					$ledger->snapshot_missing_source_costs( $order );
+				}
+			},
+			30,
+			1
+		);
+		add_action(
+			'woocommerce_store_api_checkout_order_processed',
+			function ( $order ) {
+				if ( $order instanceof WC_Order ) {
+					$ledger = new Mobo_Core_Revenue_Ledger();
+					$ledger->snapshot_missing_source_costs( $order );
+				}
+			},
+			10,
+			1
+		);
+
 		add_action(
 			'mobo_core_mobo_order_submission_success',
 			function ( $order_id, $mobo_order_id = 0, $payment_json = array() ) {

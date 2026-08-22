@@ -78,9 +78,9 @@ class Mobo_Core_Webhook_Queue {
 			return new WP_Error( 'mobo_core_webhook_encode_failed', 'Could not encode webhook payload.' );
 		}
 
-		$written = file_put_contents( $path, $json, LOCK_EX );
+		$written = $this->write_json_atomically( $path, $json );
 
-		if ( false === $written ) {
+		if ( ! $written ) {
 			return new WP_Error( 'mobo_core_webhook_write_failed', 'Could not write webhook file.' );
 		}
 
@@ -151,6 +151,44 @@ class Mobo_Core_Webhook_Queue {
 
 		$this->ensure_dirs();
 		return ! empty( $this->get_queue_files() );
+	}
+
+	/**
+	 * Whether foreground webhook work is genuinely runnable right now.
+	 *
+	 * Unlike has_due_work(), this helper honors nextRetryAt on legacy JSON queue
+	 * items. Repair/Sync cooperative preemption uses this stricter predicate so a
+	 * deferred fallback file cannot cause a busy loop that yields every product step.
+	 *
+	 * @return bool
+	 */
+	public function has_priority_work_due_now() {
+		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
+			$store = new Mobo_Core_Sync_Event_Store();
+			if ( method_exists( $store, 'has_due_events' ) && $store->has_due_events() ) {
+				return true;
+			}
+		}
+
+		$this->ensure_dirs();
+		$now = time();
+
+		foreach ( $this->get_queue_files() as $file ) {
+			$item = $this->read_file( $file );
+
+			/* Malformed/expired items are runnable cleanup work and should be allowed
+			 * to reach the queue processor instead of blocking behind Repair. */
+			if ( is_wp_error( $item ) || ! is_array( $item ) ) {
+				return true;
+			}
+
+			$retry_at = isset( $item['nextRetryAt'] ) ? absint( $item['nextRetryAt'] ) : 0;
+			if ( $retry_at <= 0 || $retry_at <= $now ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -407,6 +445,7 @@ class Mobo_Core_Webhook_Queue {
 	 */
 	private function process_locked( $time_budget = null, $max_items = null, $adaptive_ceiling = null ) {
 		$started_at = time();
+		$this->maybe_cleanup_terminal_history();
 		$budget     = null === $time_budget
 			? Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 )
 			: max( 1, min( 25, absint( $time_budget ) ) );
@@ -498,7 +537,10 @@ class Mobo_Core_Webhook_Queue {
 				* Invalid JSON can never be processed.
 				* Move it away and continue to the next file.
 				*/
-				$this->move_to_failed( $file, 'invalid-json' );
+				if ( ! $this->move_to_failed( $file, 'invalid-json' ) ) {
+					$messages[] = 'فایل JSON نامعتبر قابل انتقال به failed نبود؛ پردازش متوقف شد.';
+					break;
+				}
 				$failed++;
 				$messages[] = 'یک فایل وب‌هوک نامعتبر به failed منتقل شد.';
 				continue;
@@ -506,12 +548,28 @@ class Mobo_Core_Webhook_Queue {
 
 			$item = $this->normalize_queue_item( $item, $file );
 
+			/* A previous run may have completed the side effect but failed to remove the
+			 * fallback file from the active directory. Never execute a terminal envelope
+			 * again; only retry its archival move. */
+			if ( ! empty( $item['terminal'] ) ) {
+				if ( $this->move_to_processed( $file ) || ! file_exists( $file ) ) {
+					$messages[] = 'یک فایل terminal وب‌هوک بدون اجرای دوباره از صف فعال خارج شد.';
+					continue;
+				}
+				$failed++;
+				$messages[] = 'فایل terminal وب‌هوک قابل آرشیو نبود؛ برای جلوگیری از اجرای دوباره پردازش متوقف شد.';
+				break;
+			}
+
 			if ( empty( $item['event'] ) || empty( $item['payload'] ) || ! is_array( $item['payload'] ) ) {
 				/*
 				* Invalid envelope can never be processed.
 				* Move it away and continue to the next file.
 				*/
-				$this->move_to_failed( $file, 'invalid-envelope' );
+				if ( ! $this->move_to_failed( $file, 'invalid-envelope' ) ) {
+					$messages[] = 'envelope نامعتبر قابل انتقال به failed نبود؛ پردازش متوقف شد.';
+					break;
+				}
 				$failed++;
 				$messages[] = 'ساختار فایل وب‌هوک نامعتبر بود.';
 				continue;
@@ -527,7 +585,10 @@ class Mobo_Core_Webhook_Queue {
 				* Expired item is no longer valid.
 				* Move it away and continue to the next file.
 				*/
-				$this->move_to_failed( $file, 'expired' );
+				if ( ! $this->move_to_failed( $file, 'expired' ) ) {
+					$messages[] = 'فایل منقضی قابل انتقال به failed نبود؛ پردازش متوقف شد.';
+					break;
+				}
 				$failed++;
 				$messages[] = 'یک وب‌هوک منقضی شد و به failed منتقل شد.';
 				continue;
@@ -550,8 +611,16 @@ class Mobo_Core_Webhook_Queue {
 				if ( ! $delete_file && $this->should_retire_waiting_for_parent( $item, $data ) ) {
 					$data = $this->build_waiting_parent_retired_data( $item, $data );
 					$item['lastResult'] = $data;
-					$this->write_item( $file, $item );
-					$this->move_to_failed( $file, 'parent-wait-timeout' );
+					if ( ! $this->write_item( $file, $item ) ) {
+						$failed++;
+						$messages[] = 'ذخیره وضعیت نهایی فایل وب‌هوک ناموفق بود؛ نسخه durable قبلی حفظ شد و پردازش متوقف شد.';
+						break;
+					}
+					if ( ! $this->move_to_failed( $file, 'parent-wait-timeout' ) ) {
+						$failed++;
+						$messages[] = 'فایل parent-wait terminal قابل انتقال از صف active نبود؛ پردازش متوقف شد.';
+						break;
+					}
 
 					$processed++;
 					$messages[] = 'UpdateVariant بیش از مهلت مجاز منتظر محصول مادر ماند و از صف فایل خارج شد.';
@@ -560,7 +629,11 @@ class Mobo_Core_Webhook_Queue {
 				}
 
 				if ( $delete_file ) {
-					wp_delete_file( $file );
+					if ( ! $this->retire_completed_file( $file, $item, $data ) ) {
+						$failed++;
+						$messages[] = 'side-effect وب‌هوک موفق بود، اما خروج durable فایل از صف تأیید نشد؛ envelope terminal شد و اجرای دوباره متوقف شد.';
+						break;
+					}
 				} else {
 					$item['try']       = absint( $item['try'] );
 					$item['updatedAt'] = time();
@@ -575,7 +648,11 @@ class Mobo_Core_Webhook_Queue {
 						$item['payload'] = $result['payload'];
 					}
 
-					$this->write_item( $file, $item );
+					if ( ! $this->write_item( $file, $item ) ) {
+						$failed++;
+						$messages[] = 'ذخیره وضعیت defer وب‌هوک ناموفق بود؛ نسخه durable قبلی حفظ شد و پردازش متوقف شد.';
+						break;
+					}
 
 					if ( ! empty( $data['waitingForParent'] ) ) {
 						$messages[] = 'UpdateVariant فایل منتظر محصول مادر است؛ این فایل defer شد و runner سراغ فایل بعدی رفت.';
@@ -618,8 +695,16 @@ class Mobo_Core_Webhook_Queue {
 				* We intentionally do NOT continue in the same run. The next run can
 				* continue with the next ordered file after the failed blocker is moved.
 				*/
-				$this->write_item( $file, $item );
-				$this->move_to_failed( $file, 'max-try' );
+				if ( ! $this->write_item( $file, $item ) ) {
+					$failed++;
+					$messages[] = 'ذخیره آخرین خطای وب‌هوک ناموفق بود؛ فایل قبلی حفظ شد و پردازش متوقف شد.';
+					break;
+				}
+				if ( ! $this->move_to_failed( $file, 'max-try' ) ) {
+					$failed++;
+					$messages[] = 'انتقال فایل max-try به failed ناموفق بود؛ نسخه active حفظ شد و پردازش متوقف شد.';
+					break;
+				}
 
 				$failed++;
 				$messages[] = 'یک وب‌هوک پس از چند تلاش ناموفق به failed منتقل شد. پردازش صف در این اجرا متوقف شد.';
@@ -627,7 +712,11 @@ class Mobo_Core_Webhook_Queue {
 				break;
 			}
 
-			$this->write_item( $file, $item );
+			if ( ! $this->write_item( $file, $item ) ) {
+				$failed++;
+				$messages[] = 'ذخیره وضعیت retry وب‌هوک ناموفق بود؛ فایل قبلی حفظ شد و پردازش متوقف شد.';
+				break;
+			}
 
 			$failed++;
 			$messages[] = 'پردازش وب‌هوک ناموفق بود و برای تلاش بعدی در صف ماند. پردازش فایل‌های بعدی متوقف شد.';
@@ -680,8 +769,19 @@ class Mobo_Core_Webhook_Queue {
 	 */
 	private function process_webhook_delivery_status_payload( $payload ) {
 		$data = isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : $payload;
+		$at   = time();
 		update_option( 'mobo_core_portal_webhook_delivery_status', $data, false );
-		update_option( 'mobo_core_portal_webhook_delivery_status_at', time(), false );
+		update_option( 'mobo_core_portal_webhook_delivery_status_at', $at, false );
+
+		$stored_data = get_option( 'mobo_core_portal_webhook_delivery_status', null );
+		$stored_at   = absint( get_option( 'mobo_core_portal_webhook_delivery_status_at', 0 ) );
+		if ( maybe_serialize( $stored_data ) !== maybe_serialize( $data ) || $stored_at !== $at ) {
+			return array(
+				'success' => false,
+				'message' => 'Webhook delivery status could not be durably stored.',
+				'data'    => array(),
+			);
+		}
 
 		return array(
 			'success' => true,
@@ -782,11 +882,21 @@ class Mobo_Core_Webhook_Queue {
 		$remaining_slots = max( 0, absint( $max_items ) - $processed );
 		$bulk_claim      = $remaining_slots > 0 && method_exists( $store, 'claim_due_events' );
 		$rows            = array();
+		$claim_ttl       = min(
+			300,
+			max(
+				120,
+				Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 ) + 60,
+				Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 ) + 60
+			)
+		);
 
 		if ( $remaining_slots > 0 ) {
 			if ( $bulk_claim ) {
-				/* Global webhook_queue lease means no over-scan is needed. */
-				$rows = $store->claim_due_events( $remaining_slots, max( 60, $budget + 30 ) );
+				/* A single product/variation application may legitimately outlive the runner's
+				 * cooperative time budget. Keep row ownership aligned with the longest remote
+				 * request plus a local write margin rather than the short scheduling slice. */
+				$rows = $store->claim_due_events( $remaining_slots, $claim_ttl );
 			} else {
 				$scan_limit = max( $remaining_slots, min( 50, $remaining_slots * 10 ) );
 				$rows       = $store->get_due_events( $scan_limit );
@@ -807,7 +917,8 @@ class Mobo_Core_Webhook_Queue {
 			);
 		}
 
-		$claimed_ids = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
+		$claimed_ids        = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
+		$batch_claim_token = $bulk_claim && ! empty( $rows[0]['claim_token'] ) ? sanitize_text_field( (string) $rows[0]['claim_token'] ) : '';
 
 		try {
 			foreach ( $rows as $row ) {
@@ -825,26 +936,36 @@ class Mobo_Core_Webhook_Queue {
 					break;
 				}
 
-				$event_id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+				$event_id    = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+				$claim_token = isset( $row['claim_token'] ) ? sanitize_text_field( (string) $row['claim_token'] ) : '';
 				if ( $event_id <= 0 ) {
 					continue;
 				}
 
 				$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
 				if ( $expires_at > 0 && time() > $expires_at ) {
-					$store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true );
+					if ( ! $store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true, $claim_token ) ) {
+						$messages[] = 'commit وضعیت expired وب‌هوک به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
+						break;
+					}
 					$failed++;
 					$messages[] = 'یک event وب‌هوک منقضی شد و failed شد.';
 					continue;
 				}
 
-				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $store->lock_event( $event_id, max( 60, $budget + 30 ) ) ) {
-					continue;
+				if ( empty( $row['_mobo_bulk_claimed'] ) ) {
+					$claim_token = $store->lock_event( $event_id, $claim_ttl );
+					if ( false === $claim_token ) {
+						continue;
+					}
 				}
 
 				$item = $store->row_to_item( $row );
 				if ( is_wp_error( $item ) ) {
-					$store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true );
+					if ( ! $store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true, $claim_token ) ) {
+						$messages[] = 'commit وضعیت payload نامعتبر به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
+						break;
+					}
 					$failed++;
 					$messages[] = 'payload یک event وب‌هوک نامعتبر بود و failed شد.';
 					continue;
@@ -870,7 +991,7 @@ class Mobo_Core_Webhook_Queue {
 					$busy_products[ $product_guid ] = $is_busy;
 
 					if ( $is_busy ) {
-						$store->mark_pending_progress(
+						$deferred = $store->mark_pending_progress(
 							$event_id,
 							isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array(),
 							array(
@@ -879,8 +1000,13 @@ class Mobo_Core_Webhook_Queue {
 								'waitingForProduct' => true,
 								'waitingReason'     => 'product_preflight_busy',
 								'productGuid'       => $product_guid,
-							)
+							),
+							$claim_token
 						);
+						if ( ! $deferred ) {
+							$messages[] = 'defer کردن event به دلیل از دست رفتن claim یا خطای DB commit نشد.';
+							break;
+						}
 						$messages[] = 'محصول در مسیر دیگری در حال پردازش است؛ event پیش از payload pull برای ۱۵ ثانیه defer شد.';
 						continue;
 					}
@@ -917,9 +1043,14 @@ class Mobo_Core_Webhook_Queue {
 						$data            = $this->build_waiting_parent_retired_data( $item, $data );
 
 						if ( method_exists( $store, 'mark_done_with_progress' ) ) {
-							$store->mark_done_with_progress( $event_id, $updated_payload, $data );
+							$transitioned = $store->mark_done_with_progress( $event_id, $updated_payload, $data, $claim_token );
 						} else {
-							$store->mark_done( $event_id );
+							$transitioned = $store->mark_done( $event_id, $claim_token );
+						}
+
+						if ( empty( $transitioned ) ) {
+							$messages[] = 'commit نهایی event منتظر parent به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
+							break;
 						}
 
 						$processed++;
@@ -929,16 +1060,25 @@ class Mobo_Core_Webhook_Queue {
 
 					if ( ! $delete_file && ! empty( $data['waitingForParent'] ) ) {
 						$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
-						$store->mark_pending_progress( $event_id, $updated_payload, $data );
+						$transitioned = $store->mark_pending_progress( $event_id, $updated_payload, $data, $claim_token );
+						if ( ! $transitioned ) {
+							$messages[] = 'commit defer مربوط به parent به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
+							break;
+						}
 						$messages[] = 'UpdateVariant منتظر محصول مادر است؛ این event defer شد و runner سراغ event بعدی رفت.';
 						continue;
 					}
 
 					if ( $delete_file ) {
-						$store->mark_done( $event_id );
+						$transitioned = $store->mark_done( $event_id, $claim_token );
 					} else {
 						$updated_payload = isset( $result['payload'] ) && is_array( $result['payload'] ) ? $result['payload'] : $item['payload'];
-						$store->mark_pending_progress( $event_id, $updated_payload, $data );
+						$transitioned = $store->mark_pending_progress( $event_id, $updated_payload, $data, $claim_token );
+					}
+
+					if ( ! $transitioned ) {
+						$messages[] = 'نتیجه event اجرا شد اما commit queue به دلیل claim/DB failure تأیید نشد؛ stale worker موفق اعلام نشد.';
+						break;
 					}
 
 					$processed++;
@@ -961,12 +1101,17 @@ class Mobo_Core_Webhook_Queue {
 					}
 
 					if ( method_exists( $store, 'mark_retry_now' ) ) {
-						$store->mark_retry_now( $event_id, $message, $try_count, $try_count >= $max_try );
+						$transitioned = $store->mark_retry_now( $event_id, $message, $try_count, $try_count >= $max_try, $claim_token );
 					} else {
-						$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+						$transitioned = $store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try, $claim_token );
 					}
 				} else {
-					$store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try );
+					$transitioned = $store->mark_failure( $event_id, $message, $try_count, $try_count >= $max_try, $claim_token );
+				}
+
+				if ( empty( $transitioned ) ) {
+					$messages[] = 'ثبت retry/failure event به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
+					break;
 				}
 
 				$failed++;
@@ -979,7 +1124,7 @@ class Mobo_Core_Webhook_Queue {
 			}
 		} finally {
 			if ( $bulk_claim && ! empty( $claimed_ids ) && method_exists( $store, 'release_claimed_events' ) ) {
-				$store->release_claimed_events( $claimed_ids );
+				$store->release_claimed_events( $claimed_ids, $batch_claim_token );
 			}
 		}
 
@@ -1029,6 +1174,13 @@ class Mobo_Core_Webhook_Queue {
 		if ( is_array( $payload_result ) ) {
 			$payload = $payload_result;
 		}
+
+		/*
+		 * Mark foreground webhook application explicitly. Product Sync uses this
+		 * context only for an ordering watermark; it is not part of the Mobo payload
+		 * hash and remains harmless when a partially processed event is persisted.
+		 */
+		$payload['_moboWebhookForegroundContext'] = '1';
 
 		$product_sync = new Mobo_Core_Product_Sync();
 
@@ -1311,8 +1463,11 @@ class Mobo_Core_Webhook_Queue {
 
 		$files = array_filter(
 			$files,
-			static function ( $file ) {
-				return is_string( $file ) && is_file( $file ) && is_readable( $file );
+			function ( $file ) {
+				return is_string( $file )
+					&& is_file( $file )
+					&& is_readable( $file )
+					&& ! $this->has_terminal_marker( $file );
 			}
 		);
 
@@ -1366,7 +1521,58 @@ class Mobo_Core_Webhook_Queue {
 			return false;
 		}
 
-		return false !== file_put_contents( $file, $json, LOCK_EX );
+		return $this->write_json_atomically( $file, $json );
+	}
+
+	/**
+	 * Persist a queue JSON document using a same-directory temp file and rename.
+	 *
+	 * The file queue is the database-failure fallback, so a PHP crash during a
+	 * retry-state rewrite must not truncate the only durable copy of the event.
+	 * Same-directory rename is atomic on normal Unix filesystems. We intentionally
+	 * never rewrite the durable active file in place when rename-over-existing is
+	 * unavailable; callers retry or use a separate terminal sidecar commit marker.
+	 *
+	 * @param string $file Final file path.
+	 * @param string $json Encoded JSON.
+	 * @return bool
+	 */
+	private function write_json_atomically( $file, $json ) {
+		$file = (string) $file;
+		$json = (string) $json;
+
+		if ( '' === $file || '' === $json ) {
+			return false;
+		}
+
+		$dir = dirname( $file );
+		if ( ! is_dir( $dir ) || ! is_writable( $dir ) ) {
+			return false;
+		}
+
+		$tmp = trailingslashit( $dir ) . '.' . basename( $file ) . '.tmp-' . wp_generate_password( 12, false, false );
+		$written = file_put_contents( $tmp, $json, LOCK_EX ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Same-directory temp write is required for atomic rename.
+
+		if ( false === $written || strlen( $json ) !== (int) $written ) {
+			if ( file_exists( $tmp ) ) {
+				wp_delete_file( $tmp );
+			}
+			return false;
+		}
+
+		if ( @rename( $tmp, $file ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Same-directory rename is the durability boundary.
+			return true;
+		}
+
+		/*
+		 * Never fall back to rewriting the durable queue file in place. On filesystems
+		 * that reject rename-over-existing (notably some Windows setups), an in-place
+		 * file_put_contents() can truncate the last known-good event if PHP/IO fails
+		 * mid-write. Keeping the old document is safer: the worker will retry it and
+		 * the caller can report that the new retry-state was not durably committed.
+		 */
+		wp_delete_file( $tmp );
+		return false;
 	}
 
 	/**
@@ -1442,23 +1648,154 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
+	 * Retire a successfully processed fallback file without risking duplicate execution.
+	 *
+	 * The file queue exists specifically for database/write-failure scenarios. Deleting
+	 * the active file without checking the result can replay an already successful
+	 * event forever on hosts with filesystem permission problems. Prefer an atomic move
+	 * into a protected processed directory; if that cannot be done, persist a terminal
+	 * marker in the envelope so a later pass never invokes the business side effect again.
+	 *
+	 * @param string $file Active queue file.
+	 * @param array  $item Queue envelope.
+	 * @param array  $result_data Processor result data.
+	 * @return bool
+	 */
+	private function retire_completed_file( $file, $item, $result_data = array() ) {
+		if ( ! is_string( $file ) || '' === $file || ! file_exists( $file ) ) {
+			return true;
+		}
+
+		if ( $this->move_to_processed( $file ) || ! file_exists( $file ) ) {
+			$this->delete_terminal_marker( $file );
+			return true;
+		}
+
+		/*
+		 * On some Windows/WAMP/filesystem combinations rename-over-existing and even
+		 * an atomic rewrite of the active JSON can be unavailable. The sidecar is a
+		 * separate durable commit record: get_queue_files() excludes any active JSON
+		 * that owns this marker, so the already-applied business side effect can never
+		 * execute again merely because the original queue file could not be archived.
+		 */
+		$marker = array(
+			'terminal'    => true,
+			'status'      => 'processed',
+			'completedAt' => time(),
+			'eventId'     => isset( $item['id'] ) ? sanitize_text_field( (string) $item['id'] ) : '',
+			'event'       => isset( $item['event'] ) ? sanitize_text_field( (string) $item['event'] ) : '',
+			'lastResult'  => is_array( $result_data ) ? $result_data : array(),
+		);
+
+		if ( $this->write_terminal_marker( $file, $marker ) ) {
+			return true;
+		}
+
+		/* Last compatibility attempt: if replacing the active JSON is supported, mark
+		 * the envelope itself terminal. Failure here is reported to the caller and the
+		 * processor stops rather than pretending completion was durably recorded. */
+		$item = is_array( $item ) ? $item : array();
+		$item['terminal']       = true;
+		$item['terminalStatus'] = 'processed';
+		$item['completedAt']    = time();
+		$item['updatedAt']      = time();
+		if ( is_array( $result_data ) && ! empty( $result_data ) ) {
+			$item['lastResult'] = $result_data;
+		}
+
+		return $this->write_item( $file, $item );
+	}
+
+	/**
+	 * Return the sidecar path that durably suppresses replay of a completed file.
+	 *
+	 * @param string $file Active queue JSON path.
+	 * @return string
+	 */
+	private function terminal_marker_path( $file ) {
+		return (string) $file . '.terminal';
+	}
+
+	/**
+	 * Whether a completed fallback file has a durable sidecar commit marker.
+	 *
+	 * @param string $file Active queue JSON path.
+	 * @return bool
+	 */
+	private function has_terminal_marker( $file ) {
+		$marker = $this->terminal_marker_path( $file );
+		return '' !== $marker && is_file( $marker ) && is_readable( $marker );
+	}
+
+	/**
+	 * Persist a terminal sidecar without mutating the last-known-good queue JSON.
+	 *
+	 * @param string $file Active queue JSON path.
+	 * @param array  $marker Marker payload.
+	 * @return bool
+	 */
+	private function write_terminal_marker( $file, $marker ) {
+		$path = $this->terminal_marker_path( $file );
+		if ( '' === $path ) {
+			return false;
+		}
+		if ( is_file( $path ) ) {
+			return true;
+		}
+		$json = wp_json_encode( is_array( $marker ) ? $marker : array( 'terminal' => true ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		return is_string( $json ) && '' !== $json && $this->write_json_atomically( $path, $json );
+	}
+
+	/**
+	 * Remove a terminal sidecar after its active JSON was archived successfully.
+	 *
+	 * @param string $file Active queue JSON path.
+	 * @return void
+	 */
+	private function delete_terminal_marker( $file ) {
+		$marker = $this->terminal_marker_path( $file );
+		if ( is_file( $marker ) ) {
+			wp_delete_file( $marker );
+		}
+	}
+
+	/**
+	 * Move one completed file out of the active queue.
+	 *
+	 * @param string $file Active queue file.
+	 * @return bool
+	 */
+	private function move_to_processed( $file ) {
+		$this->ensure_dirs();
+
+		if ( ! file_exists( $file ) ) {
+			return true;
+		}
+
+		$processed_dir = trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'processed/';
+		$target        = trailingslashit( $processed_dir ) . gmdate( 'Ymd-His' ) . '-processed-' . basename( $file );
+
+		return $this->move_file( $file, $target );
+	}
+
+	/**
 	 * Move file to failed directory.
 	 *
 	 * @param string $file File.
 	 * @param string $reason Reason.
-	 * @return void
+	 * @return bool
 	 */
 	private function move_to_failed( $file, $reason ) {
 		$this->ensure_dirs();
 
 		if ( ! file_exists( $file ) ) {
-			return;
+			return true;
 		}
 
 		$failed_dir = trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/';
 		$target     = trailingslashit( $failed_dir ) . gmdate( 'Ymd-His' ) . '-' . sanitize_file_name( $reason ) . '-' . basename( $file );
 
-		$this->move_file( $file, $target );
+		return $this->move_file( $file, $target );
 	}
 
 	/**
@@ -1480,10 +1817,110 @@ class Mobo_Core_Webhook_Queue {
 
 		$moved = $wp_filesystem->move( $source, $target, true );
 		if ( ! $moved ) {
-			Mobo_Core_Logger::error( 'Mobo Core could not move a webhook queue file to the failed directory.' );
+			Mobo_Core_Logger::error( 'Mobo Core could not move a webhook queue file to its terminal directory.' );
+		} else {
+			$this->delete_terminal_marker( $source );
 		}
 
 		return (bool) $moved;
+	}
+
+
+	/**
+	 * Bounded retention cleanup for terminal fallback artifacts.
+	 *
+	 * Active queue JSON without a terminal marker is never touched here. Processed
+	 * history is short-lived because the table-backed event log is the primary audit
+	 * record; failed files are kept longer for diagnostics. A terminal sidecar proves
+	 * that the business side effect already committed, so its stranded active JSON may
+	 * also be removed after the processed retention window.
+	 *
+	 * @return void
+	 */
+	private function maybe_cleanup_terminal_history() {
+		$now      = time();
+		$last_run = absint( get_option( 'mobo_core_webhook_file_retention_last_run', 0 ) );
+		if ( $last_run > 0 && ( $now - $last_run ) < 6 * HOUR_IN_SECONDS ) {
+			return;
+		}
+
+		update_option( 'mobo_core_webhook_file_retention_last_run', $now, false );
+		$this->ensure_dirs();
+
+		$processed_days = Mobo_Core_Settings::get_int( 'mobo_core_webhook_processed_retention_days', 7, 1, 90 );
+		$failed_days    = Mobo_Core_Settings::get_int( 'mobo_core_webhook_failed_retention_days', 30, 7, 365 );
+		$processed_cut  = $now - ( $processed_days * DAY_IN_SECONDS );
+		$failed_cut     = $now - ( $failed_days * DAY_IN_SECONDS );
+		$deleted        = 0;
+		$limit          = 100;
+
+		$sets = array(
+			array( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'processed/*.json', $processed_cut ),
+			array( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/*.json', $failed_cut ),
+		);
+
+		foreach ( $sets as $set ) {
+			$files = glob( $set[0] );
+			if ( ! is_array( $files ) ) {
+				continue;
+			}
+			foreach ( $files as $file ) {
+				if ( $deleted >= $limit ) {
+					break 2;
+				}
+				$mtime = @filemtime( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Retention cleanup is best-effort.
+				if ( false !== $mtime && $mtime < $set[1] && $this->delete_file_verified( $file ) ) {
+					$deleted++;
+				}
+			}
+		}
+
+		if ( $deleted >= $limit ) {
+			return;
+		}
+
+		/* Stranded active JSON guarded by a terminal marker is already committed and
+		 * cannot replay. Retire the pair after the processed retention period. */
+		$markers = glob( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . '*.json.terminal' );
+		if ( ! is_array( $markers ) ) {
+			return;
+		}
+		foreach ( $markers as $marker ) {
+			if ( $deleted >= $limit ) {
+				break;
+			}
+			$mtime = @filemtime( $marker ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Retention cleanup is best-effort.
+			if ( false === $mtime || $mtime >= $processed_cut ) {
+				continue;
+			}
+			$active = substr( $marker, 0, -strlen( '.terminal' ) );
+			if ( is_file( $active ) && ! $this->delete_file_verified( $active ) ) {
+				continue;
+			}
+			if ( $this->delete_file_verified( $marker ) ) {
+				$deleted++;
+			}
+		}
+	}
+
+
+	/**
+	 * Delete a file and verify the filesystem postcondition.
+	 *
+	 * wp_delete_file() is a fire-and-forget helper on some WordPress versions, so
+	 * callers must not treat its return value as authoritative.
+	 *
+	 * @param string $file Absolute file path.
+	 * @return bool
+	 */
+	private function delete_file_verified( $file ) {
+		$file = (string) $file;
+		if ( '' === $file || ! file_exists( $file ) ) {
+			return true;
+		}
+		wp_delete_file( $file );
+		clearstatcache( true, $file );
+		return ! file_exists( $file );
 	}
 
 	/**
@@ -1527,6 +1964,7 @@ class Mobo_Core_Webhook_Queue {
 	private function ensure_dirs() {
 		$this->protect_dir( MOBO_CORE_WEBHOOK_FILE_DIR );
 		$this->protect_dir( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/' );
+		$this->protect_dir( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'processed/' );
 	}
 
 	/**
