@@ -123,8 +123,8 @@ class Mobo_Core_Image_Queue {
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
 
-		if ( $product_id <= 0 || ! is_array( $images ) || empty( $images ) ) {
-			return array( 'enqueued' => 0, 'skipped' => 0, 'error' => '' );
+		if ( $product_id <= 0 || ! is_array( $images ) ) {
+			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => '' );
 		}
 		if ( ! self::table_exists() ) {
 			return array( 'enqueued' => 0, 'skipped' => 0, 'error' => 'Image queue table is unavailable.' );
@@ -132,6 +132,16 @@ class Mobo_Core_Image_Queue {
 
 		$table      = self::table_name();
 		$now        = current_time( 'mysql', true );
+
+		if ( empty( $images ) ) {
+			$wpdb->last_error = '';
+			$removed = $wpdb->delete( $table, array( 'product_id' => $product_id ), array( '%d' ) );
+			if ( false === $removed ) {
+				return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => 'Could not clear obsolete image queue rows.' );
+			}
+			self::invalidate_summary_cache();
+			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => absint( $removed ), 'error' => '' );
+		}
 		$count      = 0;
 		$skip       = 0;
 		$db_error   = '';
@@ -596,6 +606,85 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Terminally classify due queue rows whose WooCommerce product no longer exists.
+	 *
+	 * Orphan cleanup is intentionally separate from the normal image batch. A large
+	 * historical orphan prefix must never consume every images-per-run slot and hide
+	 * valid rows behind it. This is a status transition only: no attachment/file is
+	 * deleted and no Repair/Reconciliation workflow is invoked.
+	 *
+	 * @param int $limit Maximum orphan rows to classify in one worker pass.
+	 * @return int Number of rows terminally classified.
+	 */
+	public function terminalize_due_missing_products( $limit = 100 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 500, absint( $limit ) ) );
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$ids   = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT q.id
+				FROM {$table} q
+				LEFT JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+				WHERE p.ID IS NULL
+					AND (
+						(q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
+						OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s)
+					)
+				ORDER BY q.updated_at ASC, q.id ASC
+				LIMIT %d",
+				$now,
+				$now,
+				$limit
+			)
+		);
+
+		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		if ( empty( $ids ) ) {
+			return 0;
+		}
+
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$args            = array_merge( array( $now ), $ids, array( $now, $now ) );
+		$updated         = $wpdb->query(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- dynamic ID placeholders are generated from integer IDs only.
+				"UPDATE {$table}
+				SET status = 'failed',
+					attachment_id = 0,
+					try_count = GREATEST(1, try_count + 1),
+					next_retry_at = NULL,
+					locked_until = NULL,
+					last_error = 'Permanent: Product does not exist.',
+					updated_at = %s
+				WHERE id IN ({$id_placeholders})
+					AND NOT EXISTS (
+						SELECT 1 FROM {$wpdb->posts} p
+						WHERE p.ID = {$table}.product_id AND p.post_type = 'product'
+					)
+					AND (
+						(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+					)",
+				$args
+			)
+		);
+
+		$updated = false === $updated ? 0 : absint( $updated );
+		if ( $updated > 0 ) {
+			self::invalidate_summary_cache();
+		}
+
+		return $updated;
+	}
+
+	/**
 	 * Bulk-claim due image rows for the dedicated image worker.
 	 *
 	 * @param int $limit Limit.
@@ -615,10 +704,13 @@ class Mobo_Core_Image_Queue {
 		$now   = current_time( 'mysql', true );
 		$ids   = $wpdb->get_col(
 			$wpdb->prepare(
-				"SELECT id FROM {$table}
-				WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
-				ORDER BY updated_at ASC, id ASC
+				"SELECT q.id FROM {$table} q
+				INNER JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+				WHERE (q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
+					OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s)
+				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
 				$now,
 				$now,
@@ -653,7 +745,7 @@ class Mobo_Core_Image_Queue {
 		$select_args = array_merge( $ids, array( $locked_until ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, product_id, product_guid, image_guid, source_url, position_index, attachment_id, try_count, updated_at
+				"SELECT id, product_id, product_guid, image_guid, source_url, position_index, attachment_id, try_count, last_error, locked_until, updated_at
 				FROM {$table}
 				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
 				ORDER BY updated_at ASC, id ASC",
@@ -668,6 +760,7 @@ class Mobo_Core_Image_Queue {
 
 		foreach ( $rows as &$row ) {
 			$row['_mobo_bulk_claimed'] = 1;
+			$row['_mobo_claim_token']  = isset( $row['locked_until'] ) ? sanitize_text_field( (string) $row['locked_until'] ) : '';
 		}
 		unset( $row );
 
@@ -677,26 +770,29 @@ class Mobo_Core_Image_Queue {
 	/**
 	 * Release rows that were bulk-claimed but not handled before a safe stop.
 	 *
-	 * @param array $ids Row IDs.
+	 * @param array  $ids Row IDs.
+	 * @param string $claim_token Exact persisted bulk-claim token.
 	 * @return int
 	 */
-	public function release_claimed_images( $ids ) {
+	public function release_claimed_images( $ids, $claim_token = '' ) {
 		global $wpdb;
 
-		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
-		if ( empty( $ids ) || ! self::table_exists() ) {
+		$ids         = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( empty( $ids ) || '' === $claim_token || ! self::table_exists() ) {
 			return 0;
 		}
 
-		$table   = self::table_name();
-		$id_sql  = implode( ',', $ids );
-		$now     = current_time( 'mysql', true );
-		$updated = $wpdb->query(
+		$table          = self::table_name();
+		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$now            = current_time( 'mysql', true );
+		$args           = array_merge( array( $now ), $ids, array( $claim_token ) );
+		$updated        = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'pending', locked_until = NULL, updated_at = %s
-				WHERE status = 'processing' AND id IN ({$id_sql})",
-				$now
+				WHERE status = 'processing' AND id IN ({$id_placeholders}) AND locked_until = %s",
+				$args
 			)
 		);
 
@@ -752,18 +848,31 @@ class Mobo_Core_Image_Queue {
 	 * @return bool
 	 */
 	public function lock( $id, $ttl = 90 ) {
+		return '' !== $this->lock_with_token( $id, $ttl );
+	}
+
+	/**
+	 * Claim one image row and return the exact persisted lease token.
+	 *
+	 * The token is the claimed locked_until value. Conditional worker commits must
+	 * present the same token so a worker whose lease expired cannot commit after a
+	 * newer worker reclaimed the same row/source identity.
+	 *
+	 * @param int $id Row ID.
+	 * @param int $ttl TTL seconds.
+	 * @return string Empty string on failure.
+	 */
+	public function lock_with_token( $id, $ttl = 90 ) {
 		global $wpdb;
 
 		$id = absint( $id );
-
 		if ( $id <= 0 || ! self::table_exists() ) {
-			return false;
+			return '';
 		}
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$until = gmdate( 'Y-m-d H:i:s', time() + max( 30, absint( $ttl ) ) );
-
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
@@ -773,19 +882,53 @@ class Mobo_Core_Image_Queue {
 					status IN ('pending','attaching')
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)",
-				$until,
-				$now,
-				$id,
-				$now
+				$until, $now, $id, $now
 			)
 		);
-
-		if ( 1 === absint( $updated ) ) {
-			self::invalidate_summary_cache();
-			return true;
+		if ( 1 !== absint( $updated ) ) {
+			return '';
 		}
 
-		return false;
+		$persisted = sanitize_text_field( (string) $wpdb->get_var( $wpdb->prepare( "SELECT locked_until FROM {$table} WHERE id = %d AND status = 'processing' LIMIT 1", $id ) ) );
+		if ( '' === $persisted || ! hash_equals( $until, $persisted ) ) {
+			return '';
+		}
+		self::invalidate_summary_cache();
+		return $persisted;
+	}
+
+	/**
+	 * Persist an attempt before entering sideload/subsize code that can terminate
+	 * PHP at the host time/memory boundary. A stale lease can then advance instead
+	 * of retrying forever with an unchanged try_count.
+	 *
+	 * @return bool
+	 */
+	public function begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $source_url, $claim_token = '' ) {
+		global $wpdb;
+		$id         = absint( $id );
+		$try_count  = max( 1, absint( $try_count ) );
+		$product_id = absint( $product_id );
+		$image_guid = sanitize_text_field( (string) $image_guid );
+		$source_url = esc_url_raw( (string) $source_url );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
+		$args = array( $try_count, current_time( 'mysql', true ), $id, $try_count, $product_id, $image_guid, $source_url );
+		if ( '' !== $claim_token ) { $args[] = $claim_token; }
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table} SET try_count = %d, updated_at = %s
+				WHERE id = %d AND status = 'processing' AND try_count < %d
+					AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}",
+				$args
+			)
+		);
+		return 1 === absint( $updated );
 	}
 
 	/**
@@ -823,7 +966,7 @@ class Mobo_Core_Image_Queue {
 	 *
 	 * @return bool
 	 */
-	public function mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $source_url, $retry_delay = 0 ) {
+	public function mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $source_url, $retry_delay = 0, $claim_token = '' ) {
 		global $wpdb;
 
 		$id            = absint( $id );
@@ -832,48 +975,25 @@ class Mobo_Core_Image_Queue {
 		$image_guid    = sanitize_text_field( (string) $image_guid );
 		$source_url    = esc_url_raw( (string) $source_url );
 		$retry_delay   = max( 0, min( 300, absint( $retry_delay ) ) );
+		$claim_token   = sanitize_text_field( (string) $claim_token );
 		if ( $id <= 0 || $attachment_id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
 		if ( $retry_delay > 0 ) {
-			$updated = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$table}
-					SET status = 'attaching', attachment_id = %d, next_retry_at = %s, locked_until = NULL, last_error = NULL, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
-					$attachment_id,
-					gmdate( 'Y-m-d H:i:s', time() + $retry_delay ),
-					$now,
-					$id,
-					$product_id,
-					$image_guid,
-					$source_url
-				)
-			);
+			$args = array( $attachment_id, gmdate( 'Y-m-d H:i:s', time() + $retry_delay ), $now, $id, $product_id, $image_guid, $source_url );
+			if ( '' !== $claim_token ) { $args[] = $claim_token; }
+			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = %s, locked_until = NULL, last_error = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		} else {
-			$updated = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$table}
-					SET status = 'attaching', attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
-					$attachment_id,
-					$now,
-					$id,
-					$product_id,
-					$image_guid,
-					$source_url
-				)
-			);
+			$args = array( $attachment_id, $now, $id, $product_id, $image_guid, $source_url );
+			if ( '' !== $claim_token ) { $args[] = $claim_token; }
+			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		}
-
-		if ( 1 === absint( $updated ) ) {
-			self::invalidate_summary_cache();
-			return true;
-		}
-
+		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
+		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
 		return false;
 	}
 
@@ -968,6 +1088,78 @@ class Mobo_Core_Image_Queue {
 		);
 	}
 
+
+	/**
+	 * Mark a processing row failed only while the exact claim is still owned.
+	 *
+	 * This is used before source identity can be trusted (for example malformed
+	 * rows). A stale worker must not terminally fail a row reclaimed by another
+	 * worker merely because the row id is unchanged.
+	 *
+	 * @param int    $id Row ID.
+	 * @param string $message Error.
+	 * @param int    $try_count Try count.
+	 * @param bool   $final_failed Final failure.
+	 * @param string $claim_token Exact persisted claim token.
+	 * @return bool
+	 */
+	public function mark_failure_if_claimed( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
+		global $wpdb;
+
+		$id          = absint( $id );
+		$try_count   = max( 1, absint( $try_count ) );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( $id <= 0 || '' === $claim_token || ! self::table_exists() ) {
+			return false;
+		}
+
+		$status  = $final_failed ? 'failed' : 'pending';
+		$delay   = $final_failed ? null : $this->calculate_retry_delay( $id, $try_count );
+		$message = sanitize_text_field( (string) $message );
+		if ( $final_failed && 0 !== strpos( $message, 'Permanent:' ) ) {
+			$message = 'Permanent: ' . $message;
+		}
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		if ( null === $delay ) {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND locked_until = %s",
+					$status,
+					$try_count,
+					$message,
+					$now,
+					$id,
+					$claim_token
+				)
+			);
+		} else {
+			$updated = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
+					WHERE id = %d AND status = 'processing' AND locked_until = %s",
+					$status,
+					$try_count,
+					gmdate( 'Y-m-d H:i:s', time() + $delay ),
+					$message,
+					$now,
+					$id,
+					$claim_token
+				)
+			);
+		}
+
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+		return false;
+	}
+
 	/**
 	 * Mark a claimed row failed only if its source identity has not been superseded
 	 * while the worker was downloading/validating the image.
@@ -1022,36 +1214,66 @@ class Mobo_Core_Image_Queue {
 		return false;
 	}
 
-	public function release_if_superseded( $id, $product_id, $image_guid, $source_url ) {
+	public function release_if_superseded( $id, $product_id, $image_guid, $source_url, $claim_token = '' ) {
 		global $wpdb;
-
 		$id         = absint( $id );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$source_url = esc_url_raw( (string) $source_url );
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
+
+		$table = self::table_name();
+		$now   = current_time( 'mysql', true );
+		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
+		$args = array( $now, $id, $product_id, $image_guid, $source_url );
+		if ( '' !== $claim_token ) { $args[] = $claim_token; }
+		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND NOT (product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s){$lease_sql}", $args ) );
+		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
+		return false;
+	}
+
+	/**
+	 * Terminate one claimed image row because its parent product is currently
+	 * excluded by the administrator URL policy. The exact lease/identity fence
+	 * prevents an old worker from cancelling a superseding image row.
+	 *
+	 * A later authoritative enqueue re-opens this row automatically because an
+	 * `excluded` row has no reusable attachment and is normalized back to pending.
+	 *
+	 * @return bool
+	 */
+	public function mark_excluded_if_current( $id, $product_id, $image_guid, $source_url, $claim_token = '' ) {
+		global $wpdb;
+
+		$id          = absint( $id );
+		$product_id  = absint( $product_id );
+		$image_guid  = sanitize_text_field( (string) $image_guid );
+		$source_url  = esc_url_raw( (string) $source_url );
+		$claim_token = sanitize_text_field( (string) $claim_token );
 		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
-		$updated = $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
-				SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s
-				WHERE id = %d AND status = 'processing'
-				AND NOT (product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s)",
-				$now, $id, $product_id, $image_guid, $source_url
-			)
-		);
+		$table     = self::table_name();
+		$now       = current_time( 'mysql', true );
+		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
+		$args      = array( $now, $id, $product_id, $image_guid, $source_url );
+		if ( '' !== $claim_token ) {
+			$args[] = $claim_token;
+		}
+
+		$sql = "UPDATE {$table} SET status = 'excluded', attachment_id = 0, next_retry_at = NULL, locked_until = NULL, last_error = 'Product excluded by administrator URL policy.', updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
 		if ( 1 === absint( $updated ) ) {
 			self::invalidate_summary_cache();
 			return true;
 		}
+
 		return false;
 	}
 
-	public function mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url, $final_failed = false ) {
+	public function mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url, $final_failed = false, $claim_token = '' ) {
 		global $wpdb;
 
 		$id         = absint( $id );
@@ -1059,44 +1281,27 @@ class Mobo_Core_Image_Queue {
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$source_url = esc_url_raw( (string) $source_url );
 		$try_count  = max( 1, absint( $try_count ) );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
-			return false;
-		}
+		$claim_token = sanitize_text_field( (string) $claim_token );
+		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
 
 		$status  = $final_failed ? 'failed' : 'pending';
 		$delay   = $final_failed ? null : $this->calculate_retry_delay( $id, $try_count );
 		$message = sanitize_text_field( (string) $message );
-		if ( $final_failed && 0 !== strpos( $message, 'Permanent:' ) ) {
-			$message = 'Permanent: ' . $message;
-		}
-
+		if ( $final_failed && 0 !== strpos( $message, 'Permanent:' ) ) { $message = 'Permanent: ' . $message; }
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
 		if ( null === $delay ) {
-			$updated = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$table}
-					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
-					$status, $try_count, $message, $now, $id, $product_id, $image_guid, $source_url
-				)
-			);
+			$args = array( $status, $try_count, $message, $now, $id, $product_id, $image_guid, $source_url );
+			if ( '' !== $claim_token ) { $args[] = $claim_token; }
+			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		} else {
-			$updated = $wpdb->query(
-				$wpdb->prepare(
-					"UPDATE {$table}
-					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
-					$status, $try_count, gmdate( 'Y-m-d H:i:s', time() + $delay ), $message, $now, $id, $product_id, $image_guid, $source_url
-				)
-			);
+			$args = array( $status, $try_count, gmdate( 'Y-m-d H:i:s', time() + $delay ), $message, $now, $id, $product_id, $image_guid, $source_url );
+			if ( '' !== $claim_token ) { $args[] = $claim_token; }
+			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		}
-
-		if ( 1 === absint( $updated ) ) {
-			self::invalidate_summary_cache();
-			return true;
-		}
-
+		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
+		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
 		return false;
 	}
 
@@ -1802,31 +2007,11 @@ class Mobo_Core_Image_Queue {
 	}
 
 	private function get_image_guid( $image ) {
-		$keys = array( 'image_guid', 'img_guid', 'imageGuid', 'imageId', 'guid', 'remote_guid', 'remoteGuid', 'id' );
-
-		foreach ( $keys as $key ) {
-			$value = sanitize_text_field( (string) $this->get_value( $image, $key, '' ) );
-
-			if ( $this->is_remote_guid_value( $value ) ) {
-				return $value;
-			}
-		}
-
-		return '';
+		return Mobo_Core_Image_Desired_State_Policy::image_guid( $image );
 	}
 
 	private function get_image_url( $image ) {
-		$keys = array( 'url', 'src' );
-
-		foreach ( $keys as $key ) {
-			$value = esc_url_raw( (string) $this->get_value( $image, $key, '' ) );
-
-			if ( '' !== $value ) {
-				return $value;
-			}
-		}
-
-		return '';
+		return Mobo_Core_Image_Desired_State_Policy::image_url( $image );
 	}
 
 
@@ -1837,18 +2022,8 @@ class Mobo_Core_Image_Queue {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	private function get_value( $array, $key, $default = null ) {
 		if ( ! is_array( $array ) ) {

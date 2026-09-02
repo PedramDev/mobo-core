@@ -47,7 +47,6 @@ final class Mobo_Core_Adaptive_Budget {
 			'repriceQueue'      => 45,
 			'recategorizeQueue' => 45,
 			'cacheWarmup'       => 25,
-			'reconciliation'    => 25,
 			'maintenance'       => 15,
 		);
 
@@ -61,7 +60,6 @@ final class Mobo_Core_Adaptive_Budget {
 			'repriceQueue'      => 400,
 			'recategorizeQueue' => 400,
 			'cacheWarmup'       => 350,
-			'reconciliation'    => 350,
 			'maintenance'       => 350,
 		);
 

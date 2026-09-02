@@ -192,14 +192,18 @@ class Mobo_Core_Category_Sync {
 	 * @param mixed $categories Product category refs.
 	 * @param bool  $auto_categories_enabled Auto categories enabled.
 	 * @param bool  $is_new_product Is new product.
+	 * @param bool  $authoritative_state_present Whether the payload explicitly carried category desired state.
 	 * @return array
 	 */
-	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled, $is_new_product = false ) {
-		$product_id              = absint( $product_id );
-		$is_new_product          = (bool) $is_new_product;
-		$auto_categories_enabled = (bool) $auto_categories_enabled;
-		$mapping_enabled         = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_enabled', '1' );
-		$mapping_required        = Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_required', '0' );
+	public function assign_product_categories( $product_id, $categories, $auto_categories_enabled, $is_new_product = false, $authoritative_state_present = true ) {
+		$product_id                 = absint( $product_id );
+		$is_new_product             = (bool) $is_new_product;
+		$auto_categories_enabled    = (bool) $auto_categories_enabled;
+		$authoritative_state_present = (bool) $authoritative_state_present;
+		$policy                  = Mobo_Core_Category_Assignment_Policy::settings( $auto_categories_enabled );
+		$mapping_enabled         = (bool) $policy['mapping_enabled'];
+		$mapping_required        = (bool) $policy['mapping_required'];
+		$auto_categories_enabled = (bool) $policy['auto_categories_enabled'];
 		$category_refs           = is_array( $categories ) ? $categories : array();
 
 		if ( $product_id <= 0 ) {
@@ -269,6 +273,28 @@ class Mobo_Core_Category_Sync {
 				'assigned' => 0,
 				'source'   => 'disabled-existing-product-unchanged',
 				'changed'  => false,
+			);
+		}
+
+		/*
+		 * ProductUpdated is an authoritative snapshot for categories when the field
+		 * is present. An explicit [] means the source removed every category and must
+		 * not be confused with a partial payload that omitted the field entirely.
+		 */
+		if ( $authoritative_state_present && empty( $category_refs ) ) {
+			$this->store_missing_category_guids_if_changed( $product_id, array() );
+			$assignment_error = '';
+			$changed = $this->set_product_categories_if_changed( $product_id, array(), $assignment_error );
+			if ( '' === $assignment_error ) {
+				$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'api-explicit-empty' );
+			}
+
+			return array(
+				'assigned'     => 0,
+				'source'       => 'api-explicit-empty',
+				'changed'      => $changed,
+				'missingGuids' => array(),
+				'error'        => $assignment_error,
 			);
 		}
 
@@ -466,50 +492,8 @@ class Mobo_Core_Category_Sync {
 	 * @return array
 	 */
 	private function collect_category_guid_candidates( $category_ref ) {
-		$identifiers = array();
-
-		if ( ! is_array( $category_ref ) ) {
-			$value = sanitize_text_field( (string) $category_ref );
-			return $this->is_remote_guid_value( $value ) ? array( $value ) : array();
-		}
-
-		/* Explicit category GUID fields first. */
-		$primary_keys = array(
-			'category_guid',
-			'categoryGuid',
-			'categoryId',
-			'categoryGUID',
-			'guid',
-			'remote_guid',
-			'remoteGuid',
-			'portal_category_id',
-			'portalCategoryId',
-			'category_portal_id',
-			'categoryPortalId',
-		);
-
-		foreach ( $primary_keys as $key ) {
-			$this->append_guid_candidate( $identifiers, $this->get_value( $category_ref, $key, '' ) );
-		}
-
-		/* Actual category object, when payload wraps the relation. */
-		$nested = $this->get_value( $category_ref, 'category', null );
-		if ( is_array( $nested ) ) {
-			foreach ( $this->collect_category_guid_candidates( $nested ) as $nested_guid ) {
-				$this->append_guid_candidate( $identifiers, $nested_guid );
-			}
-		} else {
-			$this->append_guid_candidate( $identifiers, $nested );
-		}
-
-		/* Last-resort compatibility only. These may be relation GUIDs in some payloads. */
-		$fallback_keys = array( 'product_category_id', 'productCategoryId', 'product_category_guid', 'productCategoryGuid', 'id' );
-		foreach ( $fallback_keys as $key ) {
-			$this->append_guid_candidate( $identifiers, $this->get_value( $category_ref, $key, '' ) );
-		}
-
-		return array_values( array_unique( array_filter( $identifiers ) ) );
-	}
+	return Mobo_Core_Remote_Identity_Policy::collect_category_guid_candidates( $category_ref );
+}
 
 	/**
 	 * Append a GUID candidate if valid.
@@ -534,19 +518,8 @@ class Mobo_Core_Category_Sync {
 	 * @return string
 	 */
 	private function get_primary_category_identifier( $identifiers ) {
-		if ( ! is_array( $identifiers ) || empty( $identifiers ) ) {
-			return '';
-		}
-
-		foreach ( $identifiers as $identifier ) {
-			$identifier = sanitize_text_field( (string) $identifier );
-			if ( '' !== $identifier && false === strpos( $identifier, '/' ) ) {
-				return $identifier;
-			}
-		}
-
-		return sanitize_text_field( (string) reset( $identifiers ) );
-	}
+	return Mobo_Core_Remote_Identity_Policy::primary_identifier( $identifiers );
+}
 
 	public function upsert_category( $category_data ) {
 		$category_guid = $this->get_category_guid( $category_data );
@@ -857,10 +830,10 @@ class Mobo_Core_Category_Sync {
 	}
 
 	private function assign_default_category( $product_id ) {
-		$product_id          = absint( $product_id );
-		$default_category_id = absint( get_option( 'mobo_default_category_id', 0 ) );
+		$product_id = absint( $product_id );
+		$fallback   = Mobo_Core_Category_Assignment_Policy::fallback_status();
 
-		if ( $product_id <= 0 || $default_category_id <= 0 ) {
+		if ( $product_id <= 0 || 'missing' === $fallback['status'] ) {
 			return array(
 				'assigned' => 0,
 				'source'   => 'default-not-configured',
@@ -868,9 +841,7 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		$term = term_exists( $default_category_id, 'product_cat' );
-
-		if ( empty( $term ) || is_wp_error( $term ) ) {
+		if ( 'valid' !== $fallback['status'] || absint( $fallback['term_id'] ) <= 0 ) {
 			return array(
 				'assigned' => 0,
 				'source'   => 'default-missing',
@@ -878,6 +849,7 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
+		$default_category_id = absint( $fallback['term_id'] );
 		$assignment_error = '';
 		$changed = $this->set_product_categories_if_changed( $product_id, array( $default_category_id ), $assignment_error );
 
@@ -904,7 +876,7 @@ class Mobo_Core_Category_Sync {
 		$desired    = array_values( array_unique( array_filter( array_map( 'absint', is_array( $term_ids ) ? $term_ids : array() ) ) ) );
 		sort( $desired, SORT_NUMERIC );
 
-		if ( $product_id <= 0 || empty( $desired ) ) {
+		if ( $product_id <= 0 ) {
 			return false;
 		}
 
@@ -913,7 +885,15 @@ class Mobo_Core_Category_Sync {
 			return false;
 		}
 
-		$result = wp_set_object_terms( $product_id, $desired, 'product_cat', false );
+		/* WooCommerce force-create assigns default_product_cat when a product has no
+		 * categories. Authoritative [] must be able to remove that bootstrap term after
+		 * the product save, so use the relationship-deletion primitive for the empty set. */
+		if ( empty( $desired ) ) {
+			wp_delete_object_term_relationships( $product_id, 'product_cat' );
+			$result = array();
+		} else {
+			$result = wp_set_object_terms( $product_id, $desired, 'product_cat', false );
+		}
 		if ( is_wp_error( $result ) ) {
 			$error = sanitize_text_field( $result->get_error_message() );
 			if ( '' === $error ) {
@@ -922,7 +902,15 @@ class Mobo_Core_Category_Sync {
 			return false;
 		}
 
-		$this->product_category_ids_cache[ $product_id ] = $desired;
+		/* Read the taxonomy state back from WordPress instead of trusting the write
+		 * return value. This is also what makes an explicit empty desired set durable. */
+		unset( $this->product_category_ids_cache[ $product_id ] );
+		$persisted = $this->get_product_category_ids( $product_id );
+		if ( $persisted !== $desired ) {
+			$error = 'Product category assignment did not persist the requested term set.';
+			return false;
+		}
+
 		return true;
 	}
 
@@ -1119,18 +1107,8 @@ class Mobo_Core_Category_Sync {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	private function upsert_category_map( $category_guid, $term_id, $name = '', $url = '', $parent_guid = '' ) {
 		if ( ! ( $this->category_map instanceof Mobo_Core_Category_Map ) ) {
@@ -1163,16 +1141,7 @@ class Mobo_Core_Category_Sync {
 	 * @return bool
 	 */
 	private function set_term_meta_verified( $term_id, $key, $value ) {
-		$term_id = absint( $term_id );
-		$key     = sanitize_key( (string) $key );
-		if ( $term_id <= 0 || '' === $key ) {
-			return false;
-		}
-
-		update_term_meta( $term_id, $key, $value );
-		$stored = get_term_meta( $term_id, $key, true );
-
-		return maybe_serialize( $stored ) === maybe_serialize( $value );
+		return Mobo_Core_Durable_State_Policy::update_term_meta_verified( $term_id, $key, $value );
 	}
 
 	private function slug_from_url( $url ) {

@@ -228,76 +228,73 @@ class Mobo_Core_Category_Map {
 			);
 		}
 
-		$now   = current_time( 'mysql', true );
-		$table = self::table_name();
-
-		$existing = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT id, remote_name, remote_slug, remote_url, parent_remote_guid
-				FROM {$table}
-				WHERE remote_guid = %s
-				LIMIT 1",
-				$guid
-			),
-			ARRAY_A
-		);
-
+		$now                = current_time( 'mysql', true );
+		$table              = self::table_name();
 		$remote_name        = sanitize_text_field( (string) $name );
 		$remote_url         = sanitize_text_field( (string) $url );
 		$remote_slug        = sanitize_title( $this->slug_from_url( $remote_url ) );
 		$parent_remote_guid = sanitize_text_field( (string) $parent_guid );
 
 		/*
-		 * Product payloads may contain only the remote GUID. Never erase richer
-		 * metadata previously received from a category payload with empty values.
+		 * Empty metadata means "preserve what is already known", not "write the
+		 * value seen by an earlier SELECT". Perform the merge inside the atomic
+		 * upsert so a partial product payload cannot replay a stale metadata
+		 * snapshot over a newer category payload that committed concurrently.
+		 * Manual/synced term ownership is intentionally untouched on duplicate.
 		 */
-		if ( is_array( $existing ) ) {
-			if ( '' === $remote_name ) {
-				$remote_name = isset( $existing['remote_name'] ) ? (string) $existing['remote_name'] : '';
-			}
-			if ( '' === $remote_slug ) {
-				$remote_slug = isset( $existing['remote_slug'] ) ? (string) $existing['remote_slug'] : '';
-			}
-			if ( '' === $remote_url ) {
-				$remote_url = isset( $existing['remote_url'] ) ? (string) $existing['remote_url'] : '';
-			}
-			if ( '' === $parent_remote_guid ) {
-				$parent_remote_guid = isset( $existing['parent_remote_guid'] ) ? (string) $existing['parent_remote_guid'] : '';
-			}
-		}
+		$query = "INSERT INTO {$table}
+			(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+			VALUES (%s, 0, 0, %s, %s, %s, %s, %s, %s)
+			ON DUPLICATE KEY UPDATE
+				remote_name = IF(VALUES(remote_name) = '', remote_name, VALUES(remote_name)),
+				remote_slug = IF(VALUES(remote_slug) = '', remote_slug, VALUES(remote_slug)),
+				remote_url = IF(VALUES(remote_url) = '', remote_url, VALUES(remote_url)),
+				parent_remote_guid = IF(VALUES(parent_remote_guid) = '', parent_remote_guid, VALUES(parent_remote_guid)),
+				updated_at = IF(VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
 
-		$data = array(
-			'remote_guid'        => $guid,
-			'remote_name'        => $remote_name,
-			'remote_slug'        => $remote_slug,
-			'remote_url'         => $remote_url,
-			'parent_remote_guid' => $parent_remote_guid,
-			'updated_at'         => $now,
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
+				$guid,
+				$remote_name,
+				$remote_slug,
+				$remote_url,
+				$parent_remote_guid,
+				$now,
+				$now
+			)
 		);
 
-		$formats = array( '%s', '%s', '%s', '%s', '%s', '%s' );
-
-		if ( is_array( $existing ) && ! empty( $existing['id'] ) ) {
-			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
-
+		if ( false === $updated ) {
 			return array(
-				'success' => $success,
+				'success' => false,
 				'created' => false,
 			);
 		}
 
-		$data['manual_term_id'] = 0;
-		$data['synced_term_id'] = 0;
-		$data['created_at']     = $now;
-		$formats[]              = '%d';
-		$formats[]              = '%d';
-		$formats[]              = '%s';
+		/*
+		 * Verify only fields this payload explicitly owns. Empty fields are
+		 * preserve-intent and may legitimately contain a newer concurrent value.
+		 */
+		$expected = array( 'remote_guid' => $guid );
+		if ( '' !== $remote_name ) {
+			$expected['remote_name'] = $remote_name;
+		}
+		if ( '' !== $remote_slug ) {
+			$expected['remote_slug'] = $remote_slug;
+		}
+		if ( '' !== $remote_url ) {
+			$expected['remote_url'] = $remote_url;
+		}
+		if ( '' !== $parent_remote_guid ) {
+			$expected['parent_remote_guid'] = $parent_remote_guid;
+		}
 
-		$success = false !== $wpdb->insert( $table, $data, $formats );
+		$success = $this->verify_mapping_row( $guid, $expected );
 
 		return array(
 			'success' => $success,
-			'created' => $success,
+			'created' => $success && 1 === (int) $updated,
 		);
 	}
 
@@ -321,63 +318,66 @@ class Mobo_Core_Category_Map {
 			return false;
 		}
 
-		$now   = current_time( 'mysql', true );
-		$table = self::table_name();
-
-		$existing = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT id, remote_name, remote_slug, remote_url, parent_remote_guid
-				FROM {$table}
-				WHERE remote_guid = %s
-				LIMIT 1",
-				$guid
-			),
-			ARRAY_A
-		);
-
+		$now                = current_time( 'mysql', true );
+		$table              = self::table_name();
 		$remote_name        = sanitize_text_field( (string) $name );
 		$remote_url         = sanitize_text_field( (string) $url );
 		$remote_slug        = sanitize_title( $this->slug_from_url( $remote_url ) );
 		$parent_remote_guid = sanitize_text_field( (string) $parent_guid );
 
-		/* Preserve previously known category metadata on partial product payloads. */
-		if ( is_array( $existing ) ) {
-			if ( '' === $remote_name ) {
-				$remote_name = isset( $existing['remote_name'] ) ? (string) $existing['remote_name'] : '';
-			}
-			if ( '' === $remote_slug ) {
-				$remote_slug = isset( $existing['remote_slug'] ) ? (string) $existing['remote_slug'] : '';
-			}
-			if ( '' === $remote_url ) {
-				$remote_url = isset( $existing['remote_url'] ) ? (string) $existing['remote_url'] : '';
-			}
-			if ( '' === $parent_remote_guid ) {
-				$parent_remote_guid = isset( $existing['parent_remote_guid'] ) ? (string) $existing['parent_remote_guid'] : '';
-			}
-		}
+		/*
+		 * synced_term_id belongs to this sync write, while empty metadata fields
+		 * mean preserve-current. Merge those fields atomically in MySQL so an old
+		 * partial payload cannot clobber fresher category metadata read after it.
+		 * Manual mapping remains untouched on duplicate.
+		 */
+		$query = "INSERT INTO {$table}
+			(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+			VALUES (%s, 0, %d, %s, %s, %s, %s, %s, %s)
+			ON DUPLICATE KEY UPDATE
+				synced_term_id = VALUES(synced_term_id),
+				remote_name = IF(VALUES(remote_name) = '', remote_name, VALUES(remote_name)),
+				remote_slug = IF(VALUES(remote_slug) = '', remote_slug, VALUES(remote_slug)),
+				remote_url = IF(VALUES(remote_url) = '', remote_url, VALUES(remote_url)),
+				parent_remote_guid = IF(VALUES(parent_remote_guid) = '', parent_remote_guid, VALUES(parent_remote_guid)),
+				updated_at = IF(VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
 
-		$data = array(
-			'remote_guid'        => $guid,
-			'synced_term_id'     => $synced_term_id,
-			'remote_name'        => $remote_name,
-			'remote_slug'        => $remote_slug,
-			'remote_url'         => $remote_url,
-			'parent_remote_guid' => $parent_remote_guid,
-			'updated_at'         => $now,
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
+				$guid,
+				$synced_term_id,
+				$remote_name,
+				$remote_slug,
+				$remote_url,
+				$parent_remote_guid,
+				$now,
+				$now
+			)
 		);
 
-		$formats = array( '%s', '%d', '%s', '%s', '%s', '%s', '%s' );
-
-		if ( is_array( $existing ) && ! empty( $existing['id'] ) ) {
-			$success = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), $formats, array( '%d' ) );
-		} else {
-			$data['manual_term_id'] = 0;
-			$data['created_at']     = $now;
-			$formats[]              = '%d';
-			$formats[]              = '%s';
-			$success                = false !== $wpdb->insert( $table, $data, $formats );
+		if ( false === $updated ) {
+			return false;
 		}
 
+		$expected = array(
+			'remote_guid'    => $guid,
+			'synced_term_id' => $synced_term_id,
+		);
+		if ( '' !== $remote_name ) {
+			$expected['remote_name'] = $remote_name;
+		}
+		if ( '' !== $remote_slug ) {
+			$expected['remote_slug'] = $remote_slug;
+		}
+		if ( '' !== $remote_url ) {
+			$expected['remote_url'] = $remote_url;
+		}
+		if ( '' !== $parent_remote_guid ) {
+			$expected['parent_remote_guid'] = $parent_remote_guid;
+		}
+
+		$success = $this->verify_mapping_row( $guid, $expected );
 		if ( $success ) {
 			$this->term_lookup_cache[ 'synced_term_id|' . $guid ] = $synced_term_id;
 		}
@@ -441,9 +441,79 @@ class Mobo_Core_Category_Map {
 		}
 
 		if ( $success ) {
+			$success = $this->verify_mapping_row(
+				$guid,
+				array(
+					'manual_term_id' => $term_id,
+				)
+			);
+		}
+		if ( $success ) {
 			$this->term_lookup_cache[ 'manual_term_id|' . $guid ] = $term_id;
 		}
 		return $success;
+	}
+
+	/**
+	 * Verify a category-map write by reading the canonical row back from MySQL.
+	 *
+	 * A successful wpdb write call only proves that MySQL accepted the statement;
+	 * it does not prove that the row now contains the identity/mapping state this
+	 * request intends to advertise to product assignment and admin mapping code.
+	 *
+	 * @param string $guid Remote category GUID.
+	 * @param array  $expected Expected persisted columns (subset is allowed).
+	 * @return bool
+	 */
+	private function verify_mapping_row( $guid, $expected ) {
+		global $wpdb;
+
+		$guid = sanitize_text_field( (string) $guid );
+		if ( '' === $guid || ! is_array( $expected ) || empty( $expected ) || ! self::table_exists() ) {
+			return false;
+		}
+
+		$allowed = array(
+			'remote_guid',
+			'manual_term_id',
+			'synced_term_id',
+			'remote_name',
+			'remote_slug',
+			'remote_url',
+			'parent_remote_guid',
+		);
+		$columns = array_values( array_intersect( array_keys( $expected ), $allowed ) );
+		if ( empty( $columns ) ) {
+			return false;
+		}
+
+		$select_columns = array_unique( array_merge( array( 'remote_guid' ), $columns ) );
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT ' . implode( ', ', $select_columns ) . ' FROM ' . self::table_name() . ' WHERE remote_guid = %s LIMIT 1',
+				$guid
+			),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $row ) || ! isset( $row['remote_guid'] ) || $guid !== (string) $row['remote_guid'] ) {
+			return false;
+		}
+
+		foreach ( $columns as $column ) {
+			if ( ! array_key_exists( $column, $row ) ) {
+				return false;
+			}
+			if ( in_array( $column, array( 'manual_term_id', 'synced_term_id' ), true ) ) {
+				if ( absint( $row[ $column ] ) !== absint( $expected[ $column ] ) ) {
+					return false;
+				}
+			} elseif ( (string) $row[ $column ] !== (string) $expected[ $column ] ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -487,6 +557,122 @@ class Mobo_Core_Category_Map {
 	}
 
 	/**
+	 * Seed one legacy category mapping without overwriting an existing canonical row.
+	 *
+	 * Legacy term meta is bootstrap evidence only. It must not elect a canonical term
+	 * when the same remote GUID exists on more than one product_cat term, and it must
+	 * never overwrite a row already established by normal sync or manual mapping.
+	 * INSERT IGNORE closes the race with a concurrent category-sync writer: whichever
+	 * writer establishes the unique remote_guid first wins, and this legacy path never
+	 * rewrites that winner afterwards.
+	 *
+	 * @param string $guid Remote category GUID.
+	 * @param int    $term_id Local product_cat term ID.
+	 * @return bool True when safely inserted, preserved, or intentionally skipped.
+	 */
+	private function seed_legacy_category_if_safe( $guid, $term_id ) {
+		global $wpdb;
+
+		$guid    = sanitize_text_field( (string) $guid );
+		$term_id = absint( $term_id );
+		if ( '' === $guid || $term_id <= 0 || ! self::table_exists() ) {
+			return false;
+		}
+
+		$term = get_term( $term_id, 'product_cat' );
+		if ( ! $term instanceof WP_Term || is_wp_error( $term ) ) {
+			return true;
+		}
+
+		$current_guid = sanitize_text_field( (string) get_term_meta( $term_id, 'category_guid', true ) );
+		if ( '' === $current_guid || ! hash_equals( $guid, $current_guid ) ) {
+			return true;
+		}
+
+		$table = self::table_name();
+
+		/* Existing rows are durable/current evidence and are preserved exactly. */
+		$existing = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT id, manual_term_id, synced_term_id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				$guid
+			),
+			ARRAY_A
+		);
+		if ( is_array( $existing ) ) {
+			return true;
+		}
+
+		$live_count = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(DISTINCT t.term_id)
+				FROM {$wpdb->terms} t
+				INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id AND tt.taxonomy = 'product_cat'
+				INNER JOIN {$wpdb->termmeta} gm ON gm.term_id = t.term_id AND gm.meta_key = 'category_guid'
+				WHERE gm.meta_value = %s",
+				$guid
+			)
+		);
+		if ( null === $live_count ) {
+			return false;
+		}
+
+		/* Ambiguous legacy identity is intentionally skipped; Repair/sync owns election. */
+		if ( 1 !== absint( $live_count ) ) {
+			return true;
+		}
+
+		$remote_name        = sanitize_text_field( (string) $term->name );
+		$remote_url         = sanitize_text_field( (string) get_term_meta( $term_id, 'mobo_category_url', true ) );
+		$remote_slug        = sanitize_title( $this->slug_from_url( $remote_url ) );
+		$parent_remote_guid = sanitize_text_field( (string) get_term_meta( $term_id, 'mobo_parent_category_guid', true ) );
+		$now                = current_time( 'mysql', true );
+
+		$inserted = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT IGNORE INTO {$table}
+				(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+				VALUES (%s, 0, %d, %s, %s, %s, %s, %s, %s)",
+				$guid,
+				$term_id,
+				$remote_name,
+				$remote_slug,
+				$remote_url,
+				$parent_remote_guid,
+				$now,
+				$now
+			)
+		);
+		if ( false === $inserted ) {
+			return false;
+		}
+
+		$persisted = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				$guid
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $persisted ) ) {
+			return false;
+		}
+
+		/* If our INSERT won, require exact read-back. Concurrent winners are preserved. */
+		if ( absint( $inserted ) > 0
+			&& ( 0 !== absint( $persisted['manual_term_id'] ?? 0 )
+				|| $term_id !== absint( $persisted['synced_term_id'] ?? 0 )
+				|| $remote_name !== (string) ( $persisted['remote_name'] ?? '' )
+				|| $remote_slug !== (string) ( $persisted['remote_slug'] ?? '' )
+				|| $remote_url !== (string) ( $persisted['remote_url'] ?? '' )
+				|| $parent_remote_guid !== (string) ( $persisted['parent_remote_guid'] ?? '' ) ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
 	 * Seed map from legacy term meta category_guid.
 	 *
 	 * @param int $limit Max rows.
@@ -503,29 +689,59 @@ class Mobo_Core_Category_Map {
 
 		$cursor = absint( get_option( 'mobo_core_category_map_cursor', 0 ) );
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT t.term_id, t.name, t.slug, guid_meta.meta_value AS remote_guid,
-					url_meta.meta_value AS remote_url,
-					parent_meta.meta_value AS parent_remote_guid
-				FROM {$wpdb->terms} t
-				INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id AND tt.taxonomy = 'product_cat'
-				INNER JOIN {$wpdb->termmeta} guid_meta ON guid_meta.term_id = t.term_id AND guid_meta.meta_key = 'category_guid'
-				LEFT JOIN {$wpdb->termmeta} url_meta ON url_meta.term_id = t.term_id AND url_meta.meta_key = 'mobo_category_url'
-				LEFT JOIN {$wpdb->termmeta} parent_meta ON parent_meta.term_id = t.term_id AND parent_meta.meta_key = 'mobo_parent_category_guid'
-				WHERE t.term_id > %d
-				AND guid_meta.meta_value <> ''
-				ORDER BY t.term_id ASC
-				LIMIT %d",
-				$cursor,
-				$limit
-			),
-			ARRAY_A
+		$sql = $wpdb->prepare(
+			"SELECT t.term_id, t.name, t.slug, guid_meta.meta_value AS remote_guid,
+				url_meta.meta_value AS remote_url,
+				parent_meta.meta_value AS parent_remote_guid
+			FROM {$wpdb->terms} t
+			INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id AND tt.taxonomy = 'product_cat'
+			INNER JOIN {$wpdb->termmeta} guid_meta ON guid_meta.term_id = t.term_id AND guid_meta.meta_key = 'category_guid'
+			LEFT JOIN {$wpdb->termmeta} url_meta ON url_meta.term_id = t.term_id AND url_meta.meta_key = 'mobo_category_url'
+			LEFT JOIN {$wpdb->termmeta} parent_meta ON parent_meta.term_id = t.term_id AND parent_meta.meta_key = 'mobo_parent_category_guid'
+			WHERE t.term_id > %d
+			AND guid_meta.meta_value <> ''
+			ORDER BY t.term_id ASC
+			LIMIT %d",
+			$cursor,
+			$limit
 		);
 
-		if ( ! is_array( $rows ) || empty( $rows ) ) {
+		$query_result = $wpdb->query( $sql );
+		if ( false === $query_result ) {
+			return array(
+				'categories' => 0,
+				'stalled'    => true,
+				'error'      => 'Category Map legacy seed database read failed; cursor and completion remain retryable.',
+				'cursor'     => $cursor,
+			);
+		}
+
+		if ( ! is_array( $wpdb->last_result ) ) {
+			return array(
+				'categories' => 0,
+				'stalled'    => true,
+				'error'      => 'Category Map legacy seed result could not be read; cursor and completion remain retryable.',
+				'cursor'     => $cursor,
+			);
+		}
+
+		$rows = array();
+		foreach ( $wpdb->last_result as $row ) {
+			if ( is_object( $row ) ) {
+				$rows[] = get_object_vars( $row );
+			} elseif ( is_array( $row ) ) {
+				$rows[] = $row;
+			}
+		}
+
+		if ( empty( $rows ) ) {
 			update_option( 'mobo_core_category_map_seed_completed_at', time(), false );
-			return array( 'categories' => 0 );
+			return array(
+				'categories' => 0,
+				'stalled'    => false,
+				'error'      => '',
+				'cursor'     => $cursor,
+			);
 		}
 
 		$count   = 0;
@@ -542,9 +758,9 @@ class Mobo_Core_Category_Map {
 				continue;
 			}
 
-			if ( ! $this->upsert_synced_category( $guid, $term_id, $row['name'], $row['remote_url'], $row['parent_remote_guid'] ) ) {
+			if ( ! $this->seed_legacy_category_if_safe( $guid, $term_id ) ) {
 				$stalled = true;
-				$error   = 'Category Map legacy seed stalled because the mapping write did not persist.';
+				$error   = 'Category Map legacy seed stalled because safe bootstrap persistence could not be proven.';
 				break;
 			}
 
@@ -626,16 +842,79 @@ class Mobo_Core_Category_Map {
 		}
 
 		if ( $clear_stale && ! empty( $row['id'] ) ) {
-			$wpdb->update(
-				self::table_name(),
-				array( $column => 0, 'updated_at' => current_time( 'mysql', true ) ),
-				array( 'id' => absint( $row['id'] ) ),
-				array( '%d', '%s' ),
-				array( '%d' )
-			);
+			$clear_result = $this->clear_stale_term_id_if_unchanged( absint( $row['id'] ), $column, $term_id );
+			if ( 1 !== $clear_result ) {
+				$current_term_id = $this->read_current_term_id_by_row( absint( $row['id'] ), $column );
+				if ( $current_term_id > 0 && $this->term_exists( $current_term_id ) ) {
+					return $current_term_id;
+				}
+			}
 		}
 
 		return 0;
+	}
+
+	/**
+	 * Clear a stale term mapping only if the observed value is still unchanged.
+	 *
+	 * @param int    $row_id Map row ID.
+	 * @param string $column manual_term_id or synced_term_id.
+	 * @param int    $term_id Stale term ID observed by the lookup.
+	 * @return int|false Number of updated rows, or false on SQL failure.
+	 */
+	private function clear_stale_term_id_if_unchanged( $row_id, $column, $term_id ) {
+		global $wpdb;
+
+		$row_id  = absint( $row_id );
+		$column  = sanitize_key( (string) $column );
+		$term_id = absint( $term_id );
+
+		if ( $row_id <= 0 || $term_id <= 0 || ! in_array( $column, array( 'manual_term_id', 'synced_term_id' ), true ) || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table = self::table_name();
+		$sql   = 'manual_term_id' === $column
+			? "UPDATE {$table} SET manual_term_id = 0, updated_at = %s WHERE id = %d AND manual_term_id = %d"
+			: "UPDATE {$table} SET synced_term_id = 0, updated_at = %s WHERE id = %d AND synced_term_id = %d";
+
+		return $wpdb->query(
+			$wpdb->prepare(
+				$sql, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
+				current_time( 'mysql', true ),
+				$row_id,
+				$term_id
+			)
+		);
+	}
+
+	/**
+	 * Re-read a term mapping after a compare-and-clear miss.
+	 *
+	 * @param int    $row_id Map row ID.
+	 * @param string $column manual_term_id or synced_term_id.
+	 * @return int
+	 */
+	private function read_current_term_id_by_row( $row_id, $column ) {
+		global $wpdb;
+
+		$row_id = absint( $row_id );
+		$column = sanitize_key( (string) $column );
+
+		if ( $row_id <= 0 || ! in_array( $column, array( 'manual_term_id', 'synced_term_id' ), true ) || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table = self::table_name();
+		$sql   = 'manual_term_id' === $column
+			? "SELECT manual_term_id FROM {$table} WHERE id = %d LIMIT 1"
+			: "SELECT synced_term_id FROM {$table} WHERE id = %d LIMIT 1";
+
+		return absint(
+			$wpdb->get_var(
+				$wpdb->prepare( $sql, $row_id ) // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
+			)
+		);
 	}
 
 	/**
@@ -680,18 +959,8 @@ class Mobo_Core_Category_Map {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	/**
 	 * Get term ID by table column and validate existence.
@@ -738,13 +1007,14 @@ class Mobo_Core_Category_Map {
 
 		if ( ! $this->term_exists( $term_id ) ) {
 			if ( $clear_stale ) {
-				$wpdb->update(
-					$table,
-					array( $column => 0, 'updated_at' => current_time( 'mysql', true ) ),
-					array( 'id' => absint( $row['id'] ) ),
-					array( '%d', '%s' ),
-					array( '%d' )
-				);
+				$clear_result = $this->clear_stale_term_id_if_unchanged( absint( $row['id'] ), $column, $term_id );
+				if ( 1 !== $clear_result ) {
+					$current_term_id = $this->read_current_term_id_by_row( absint( $row['id'] ), $column );
+					if ( $current_term_id > 0 && $this->term_exists( $current_term_id ) ) {
+						$this->term_lookup_cache[ $cache_key ] = $current_term_id;
+						return $current_term_id;
+					}
+				}
 			}
 
 			$this->term_lookup_cache[ $cache_key ] = 0;

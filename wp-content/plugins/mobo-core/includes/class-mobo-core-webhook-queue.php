@@ -807,17 +807,10 @@ class Mobo_Core_Webhook_Queue {
 	 * @return bool
 	 */
 	private function should_retire_waiting_for_parent( $item, $data ) {
-		if ( ! is_array( $data ) || empty( $data['waitingForParent'] ) ) {
-			return false;
-		}
-
-		$created_at = isset( $item['createdAt'] ) ? absint( $item['createdAt'] ) : 0;
-
-		if ( $created_at <= 0 ) {
-			return false;
-		}
-
-		return ( time() - $created_at ) >= $this->get_parent_wait_timeout_seconds();
+		/* Missing-parent UpdateVariant rows are desired-state evidence. Age alone is
+		 * never proof that they are obsolete; a site can be offline longer than the
+		 * old timeout. Supersession/deduplication may retire them, not wall-clock age. */
+		return false;
 	}
 
 	/**
@@ -866,18 +859,9 @@ class Mobo_Core_Webhook_Queue {
 		 * every webhook pass. Deferred rows already self-retire when they become due,
 		 * so this safety sweep only needs to run occasionally.
 		 */
-		$parent_wait_timeout = $this->get_parent_wait_timeout_seconds();
-		$retired_waiting     = 0;
-		$last_retire_scan    = absint( get_option( 'mobo_core_parent_wait_retirement_scan_at', 0 ) );
-		if ( method_exists( $store, 'retire_stale_parent_waiting_events' ) && ( $last_retire_scan <= 0 || ( time() - $last_retire_scan ) >= 300 ) ) {
-			update_option( 'mobo_core_parent_wait_retirement_scan_at', time(), false );
-			$retired_waiting = $store->retire_stale_parent_waiting_events( $parent_wait_timeout, max( 50, absint( $max_items ) * 20 ) );
-
-			if ( $retired_waiting > 0 ) {
-				$processed += $retired_waiting;
-				$messages[] = sprintf( '%d event تنوع که بیش از حد منتظر محصول مادر مانده بود از صف خارج شد.', $retired_waiting );
-			}
-		}
+		/* Parent-wait rows are not retired by age. They remain pending until the
+		 * parent arrives or a newer desired-state event supersedes them. */
+		$retired_waiting = 0;
 
 		$remaining_slots = max( 0, absint( $max_items ) - $processed );
 		$bulk_claim      = $remaining_slots > 0 && method_exists( $store, 'claim_due_events' );
@@ -1114,6 +1098,21 @@ class Mobo_Core_Webhook_Queue {
 					break;
 				}
 
+				/*
+				 * process_item_safely() converts thrown product/variation validation
+				 * exceptions into durable queue failures. Those exceptions bypass
+				 * process_item()'s normal record_webhook_result() call, so mirror the
+				 * failure into Sync Health only after the queue transition commits.
+				 */
+				if ( ! empty( $data['processorException'] ) && '' !== $product_guid ) {
+					$this->record_processor_exception_health(
+						$event_type,
+						$product_guid,
+						isset( $row['event_version'] ) ? (string) $row['event_version'] : '',
+						$message
+					);
+				}
+
 				$failed++;
 				if ( $try_count >= $max_try ) {
 					$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
@@ -1188,8 +1187,8 @@ class Mobo_Core_Webhook_Queue {
 			case 'ProductUpdated':
 				$result = $product_sync->process_product_updated_payload( $payload );
 
-				if ( class_exists( 'Mobo_Core_Reconciliation' ) && is_array( $result ) ) {
-					Mobo_Core_Reconciliation::record_webhook_result( 'ProductUpdated', $payload, $result );
+				if ( class_exists( 'Mobo_Core_Sync_Health' ) && is_array( $result ) ) {
+					Mobo_Core_Sync_Health::record_webhook_result( 'ProductUpdated', $payload, $result );
 				}
 
 				if ( is_array( $result ) ) {
@@ -1200,8 +1199,8 @@ class Mobo_Core_Webhook_Queue {
 
 			case 'UpdateVariant':
 				$result = $product_sync->process_update_variant_payload( $payload );
-				if ( class_exists( 'Mobo_Core_Reconciliation' ) && is_array( $result ) ) {
-					Mobo_Core_Reconciliation::record_webhook_result( 'UpdateVariant', $payload, $result );
+				if ( class_exists( 'Mobo_Core_Sync_Health' ) && is_array( $result ) ) {
+					Mobo_Core_Sync_Health::record_webhook_result( 'UpdateVariant', $payload, $result );
 				}
 				return $result;
 
@@ -1218,6 +1217,29 @@ class Mobo_Core_Webhook_Queue {
 					'data'    => array(),
 				);
 		}
+	}
+
+	/**
+	 * Mirror a caught ProductUpdated/UpdateVariant processor exception into Sync
+	 * Health after its queue retry/failure transition has been durably committed.
+	 *
+	 * @param string $event_type Event type.
+	 * @param string $product_guid Canonical product GUID.
+	 * @param string $event_version Durable event ordering watermark.
+	 * @param string $message Failure message.
+	 * @return void
+	 */
+	private function record_processor_exception_health( $event_type, $product_guid, $event_version, $message ) {
+		$event_type    = sanitize_text_field( (string) $event_type );
+		$product_guid  = sanitize_text_field( (string) $product_guid );
+		$event_version = sanitize_text_field( (string) $event_version );
+		$message       = sanitize_text_field( (string) $message );
+
+		if ( '' === $product_guid || ! in_array( $event_type, array( 'ProductUpdated', 'UpdateVariant' ), true ) || ! class_exists( 'Mobo_Core_Sync_Health' ) ) {
+			return;
+		}
+
+		Mobo_Core_Sync_Health::mark_failed( $product_guid, 0, $message, 0, 0, $event_version );
 	}
 
 	/**
@@ -1291,7 +1313,7 @@ class Mobo_Core_Webhook_Queue {
 		);
 
 		if ( '' === $payload_url ) {
-			return $this->unwrap_event_model_payload( $event, $payload );
+			return $this->merge_event_ordering_context( $this->unwrap_event_model_payload( $event, $payload ), $payload );
 		}
 
 		/*
@@ -1300,7 +1322,7 @@ class Mobo_Core_Webhook_Queue {
 		 */
 		$existing_data = $this->get_value( $payload, 'data', null );
 		if ( is_array( $existing_data ) && ! empty( $existing_data ) ) {
-			return $this->unwrap_event_model_payload( $event, $payload );
+			return $this->merge_event_ordering_context( $this->unwrap_event_model_payload( $event, $payload ), $payload );
 		}
 
 		$api      = new Mobo_Core_API_Client();
@@ -1311,6 +1333,8 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$normalized = $this->unwrap_event_model_payload( $event, $fetched );
+		$normalized = $this->merge_event_ordering_context( $normalized, $fetched );
+		$normalized = $this->merge_event_ordering_context( $normalized, $payload );
 
 		if ( ! is_array( $normalized ) ) {
 			return new WP_Error( 'mobo_core_invalid_pulled_payload', 'Pulled payload is invalid.' );
@@ -1373,7 +1397,47 @@ class Mobo_Core_Webhook_Queue {
 			return $payload;
 		}
 
-		return $data;
+		return $this->merge_event_ordering_context( $data, $payload );
+	}
+
+	/**
+	 * Preserve durable ordering/identity context when EventModel wrappers or
+	 * lightweight notification envelopes are replaced by their fetched payload.
+	 * Inner/fetched values win; wrapper values only fill fields that are absent.
+	 *
+	 * @param array $payload Normalized payload.
+	 * @param array $wrapper Outer notification/EventModel envelope.
+	 * @return array
+	 */
+	private function merge_event_ordering_context( $payload, $wrapper ) {
+		if ( ! is_array( $payload ) || ! is_array( $wrapper ) ) {
+			return is_array( $payload ) ? $payload : array();
+		}
+
+		$payload = Mobo_Core_Ordering_Policy::merge_context( $payload, $wrapper );
+
+		/* Identity is transport context, not ordering evidence. Keep it local. */
+		$identity_fields = array(
+			'entityGuid'    => array( 'entityGuid', 'EntityGuid', 'entity_guid' ),
+			'remoteEventId' => array( 'remoteEventId', 'RemoteEventId', 'eventId', 'EventId' ),
+		);
+
+		foreach ( $identity_fields as $canonical => $aliases ) {
+			$current = $this->get_value( $payload, $canonical, null );
+			if ( null !== $current && '' !== trim( (string) $current ) ) {
+				continue;
+			}
+			foreach ( $aliases as $alias ) {
+				$value = $this->get_value( $wrapper, $alias, null );
+				if ( null === $value || ! is_scalar( $value ) || '' === trim( (string) $value ) ) {
+					continue;
+				}
+				$payload[ $canonical ] = sanitize_text_field( (string) $value );
+				break;
+			}
+		}
+
+		return $payload;
 	}
 
 
@@ -1672,22 +1736,8 @@ class Mobo_Core_Webhook_Queue {
 	 * @return string
 	 */
 	private function detect_event( $payload ) {
-		if ( ! is_array( $payload ) ) {
-			return '';
-		}
-
-		$event = $this->get_value( $payload, 'event', '' );
-
-		if ( '' === $event ) {
-			$event = $this->get_value( $payload, 'type', '' );
-		}
-
-		if ( is_numeric( $event ) ) {
-			$event = $this->map_numeric_event_type( absint( $event ) );
-		}
-
-		return sanitize_text_field( (string) $event );
-	}
+	return Mobo_Core_Event_Type_Policy::detect( $payload );
+}
 
 	/**
 	 * Retire a successfully processed fallback file without risking duplicate execution.
@@ -2042,17 +2092,8 @@ class Mobo_Core_Webhook_Queue {
 	 * @return string
 	 */
 	private function map_numeric_event_type( $type ) {
-		$map = array(
-			0 => 'ProductUpdated',
-			1 => 'UpdateVariant',
-			2 => 'ProductUpdated',
-			4 => 'UpdateVariant',
-			20 => 'ShippingMethodsChanged',
-			21 => 'WebhookDeliveryStatusChanged',
-		);
-
-		return isset( $map[ $type ] ) ? $map[ $type ] : '';
-	}
+	return Mobo_Core_Event_Type_Policy::map_numeric( $type );
+}
 
 	/**
 	 * Check if array is a list-style array.

@@ -1185,7 +1185,7 @@ class Mobo_Core_Automatic_Shipping {
 
 		return array(
 			'available' => true,
-			'cost'      => self::source_amount_to_store_amount( $source_cost ),
+			'cost'      => Mobo_Core_Money_Policy::source_amount_to_store_amount( $source_cost ),
 			'sourceCost'=> $source_cost,
 			'reason'    => 'ok',
 			'method'    => $method,
@@ -1574,12 +1574,12 @@ class Mobo_Core_Automatic_Shipping {
 
 			$quantity = isset( $item['quantity'] ) ? max( 0.0, (float) $item['quantity'] ) : 0.0;
 			$count   += $quantity > 0 ? 1 : 0;
-			$api_price = self::get_mobo_api_price( $variation_id, $product_id );
+			$api_price = Mobo_Core_Money_Policy::get_mobo_api_price( $variation_id, $product_id );
 			if ( null !== $api_price && Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_use_api_price', '1' ) ) {
 				$subtotal += $api_price * $quantity;
 			} else {
 				$line_total = isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
-				$subtotal  += self::store_amount_to_source_amount( $line_total );
+				$subtotal  += Mobo_Core_Money_Policy::store_amount_to_source_amount( $line_total );
 			}
 
 			if ( $product && method_exists( $product, 'get_weight' ) ) {
@@ -1828,45 +1828,8 @@ class Mobo_Core_Automatic_Shipping {
 	}
 
 	private static function is_mobo_product( $product, $product_id, $variation_id ) {
-		$ids = array_filter( array( absint( $variation_id ), absint( $product_id ), $product instanceof WC_Product ? absint( $product->get_id() ) : 0 ) );
-		foreach ( $ids as $id ) {
-			if ( get_post_meta( $id, 'variant_guid', true ) || get_post_meta( $id, 'product_guid', true ) ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_variant_id', true ) ) > 0 ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_product_id', true ) ) > 0 ) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	private static function get_mobo_api_price( $variation_id, $product_id ) {
-		$ids = array_values( array_unique( array_filter( array( absint( $variation_id ), absint( $product_id ) ) ) ) );
-		foreach ( $ids as $id ) {
-			$value = get_post_meta( $id, 'mobo_api_price', true );
-			if ( is_numeric( $value ) && (float) $value >= 0 ) {
-				return (float) $value;
-			}
-		}
-		return null;
-	}
-
-	private static function source_amount_to_store_amount( $amount ) {
-		$currency   = function_exists( 'get_woocommerce_currency' ) ? strtoupper( (string) get_woocommerce_currency() ) : '';
-		$multiplier = 'IRR' === $currency ? 10.0 : 1.0;
-		$multiplier = (float) apply_filters( 'mobo_core_shipping_source_to_store_multiplier', $multiplier, $currency );
-		return max( 0.0, (float) $amount * max( 0.0, $multiplier ) );
-	}
-
-	private static function store_amount_to_source_amount( $amount ) {
-		$currency   = function_exists( 'get_woocommerce_currency' ) ? strtoupper( (string) get_woocommerce_currency() ) : '';
-		$divisor    = 'IRR' === $currency ? 10.0 : 1.0;
-		$divisor    = (float) apply_filters( 'mobo_core_shipping_store_to_source_divisor', $divisor, $currency );
-		return max( 0.0, (float) $amount / ( $divisor > 0 ? $divisor : 1.0 ) );
-	}
+	return Mobo_Core_Product_Identity_Policy::is_mobo_product( $product, $product_id, $variation_id );
+}
 
 	private static function normalize_text( $value ) {
 		$value = sanitize_text_field( (string) $value );

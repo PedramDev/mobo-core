@@ -18,6 +18,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Image_Sync {
 
 	/**
+	 * One bounded fresh-import escape hatch for a locally incomplete attachment.
+	 *
+	 * The exact attempt is intentional. Once the old identity is quarantined, a
+	 * later disk-full or network failure must not quarantine every newly-created
+	 * attachment and accumulate orphan files on each retry.
+	 */
+	const FRESH_REIMPORT_ATTEMPT = 3;
+
+	/**
 	 * Last image resolution error for queue diagnostics.
 	 *
 	 * @var string
@@ -92,7 +101,7 @@ class Mobo_Core_Image_Sync {
 		$offset     = max( 0, absint( $offset ) );
 		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
 
-		if ( $product_id <= 0 || ! is_array( $images ) || empty( $images ) || $limit <= 0 ) {
+		if ( $product_id <= 0 || ! is_array( $images ) || $limit <= 0 ) {
 			return array(
 				'done'       => true,
 				'nextOffset' => 0,
@@ -103,6 +112,16 @@ class Mobo_Core_Image_Sync {
 
 		if ( $this->should_use_queue() ) {
 			return $this->process_images_with_queue( $product_id, $images, $limit, $blocking_override );
+		}
+
+		if ( empty( $images ) ) {
+			$product = wc_get_product( $product_id );
+			if ( $product instanceof WC_Product ) {
+				$product->set_image_id( 0 );
+				$product->set_gallery_image_ids( array() );
+				$product->save();
+			}
+			return array( 'done' => true, 'nextOffset' => 0, 'processed' => 0, 'skipped' => 0 );
 		}
 
 		return $this->process_images_direct( $product_id, $images, $offset, $limit );
@@ -178,9 +197,35 @@ class Mobo_Core_Image_Sync {
 			}
 
 			$queue = new Mobo_Core_Image_Queue();
-			$rows  = $queue->get_due_images( $limit );
 
-			return $this->process_queue_rows( $queue, $rows, $limit );
+			/*
+			 * Drain historical orphan rows outside the normal image batch. They are
+			 * terminal state transitions, not download failures, so they must not consume
+			 * images-per-run capacity or trip the image-stage failure circuit. No rows,
+			 * attachments or files are deleted here.
+			 */
+			$terminalized = method_exists( $queue, 'terminalize_due_missing_products' )
+				? $queue->terminalize_due_missing_products( max( 25, min( 100, $limit * 20 ) ) )
+				: 0;
+
+			/*
+			 * Claim the selected rows before any row-level validation. In particular,
+			 * missing/deleted products and malformed source identities are terminally
+			 * classified by process_queue_rows() through mark_failure_if_claimed().
+			 * Reading due rows without a claim leaves those branches without a lease
+			 * token, so they can only defer and the oldest rows can permanently block
+			 * every newer image (head-of-line starvation).
+			 */
+			$rows = method_exists( $queue, 'claim_due_images' )
+				? $queue->claim_due_images( $limit, 300 )
+				: $queue->get_due_images( $limit );
+
+			$result = $this->process_queue_rows( $queue, $rows, $limit );
+			if ( is_array( $result ) ) {
+				$result['terminalized'] = absint( $terminalized );
+				$result['convergedImageHashes'] = $this->promote_pending_image_hashes( $queue, min( 10, max( 1, $limit ) ) );
+			}
+			return $result;
 		} finally {
 			Mobo_Core_Lock::release( 'image_queue_worker', $worker_lock );
 		}
@@ -215,6 +260,25 @@ class Mobo_Core_Image_Sync {
 	 * @return array
 	 */
 	private function process_images_with_queue( $product_id, $images, $limit, $blocking_override = null ) {
+		$product_id = absint( $product_id );
+		if ( $product_id > 0 && class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+			return array(
+				'done'        => true,
+				'nextOffset'  => 0,
+				'processed'   => 0,
+				'failed'      => 0,
+				'skipped'     => is_array( $images ) ? count( $images ) : 0,
+				'queued'      => 0,
+				'removed'     => 0,
+				'pending'     => 0,
+				'due'         => 0,
+				'blocking'    => false,
+				'queuedAsync' => false,
+				'error'       => '',
+				'excluded'    => true,
+			);
+		}
+
 		/*
 		 * Keep this variable local and explicit. Older cached copies of this file
 		 * could reference the override without a default; this guard also keeps the
@@ -227,6 +291,9 @@ class Mobo_Core_Image_Sync {
 
 		$enqueue  = $queue->enqueue_product_images( $product_id, $product_guid, $images );
 		$enqueue_error = isset( $enqueue['error'] ) ? sanitize_text_field( (string) $enqueue['error'] ) : '';
+		if ( '' === $enqueue_error && ( ! empty( $enqueue['skipped'] ) || ! empty( $enqueue['pruneDeferred'] ) ) ) {
+			$enqueue_error = 'Image desired state was not fully accepted; malformed or ambiguous rows were preserved for retry.';
+		}
 		if ( '' !== $enqueue_error ) {
 			return array(
 				'done'        => false,
@@ -262,8 +329,27 @@ class Mobo_Core_Image_Sync {
 			$result = $this->process_queue_rows( $queue, $rows, $limit );
 		}
 
-		/* Attach any rows that had already completed in an earlier runner pass. */
-		$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
+		/* Attach any rows that had already completed in an earlier runner pass.
+		 * An explicit empty desired set must also remove old WooCommerce linkage. */
+		if ( empty( $images ) ) {
+			$product = wc_get_product( $product_id );
+			if ( ! $product instanceof WC_Product ) {
+				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'Product could not be reloaded while committing an explicit empty image desired state.' );
+			}
+			if ( absint( $product->get_image_id() ) > 0 || ! empty( $product->get_gallery_image_ids() ) ) {
+				$product->set_image_id( 0 );
+				$product->set_gallery_image_ids( array() );
+				if ( absint( $product->save() ) !== $product_id ) {
+					return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'WooCommerce did not confirm the explicit empty image desired-state save.' );
+				}
+			}
+			$fresh_product = wc_get_product( $product_id );
+			if ( ! $fresh_product instanceof WC_Product || absint( $fresh_product->get_image_id() ) > 0 || ! empty( $fresh_product->get_gallery_image_ids() ) ) {
+				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'Explicit empty image desired state did not persist after read-back.' );
+			}
+		} else {
+			$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
+		}
 
 		if ( method_exists( $queue, 'get_product_summary' ) ) {
 			$product_queue_summary = $queue->get_product_summary( $product_id );
@@ -337,7 +423,9 @@ class Mobo_Core_Image_Sync {
 			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
 
 			if ( $attachment_id > 0 && $this->ensure_attachment_ready_for_linkage( $attachment_id, $url ) ) {
-				$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+				if ( ! $this->mark_attachment_synced( $attachment_id, $image_guid, $url ) ) {
+					$skipped++;
+				}
 			} else {
 				if ( $attachment_id > 0 ) {
 					update_post_meta( $attachment_id, 'mobo_sync_incomplete', '1' );
@@ -378,6 +466,7 @@ class Mobo_Core_Image_Sync {
 		$processed = 0;
 		$failed    = 0;
 		$deferred  = 0;
+		$excluded  = 0;
 		$touched   = array();
 		$link_rows = array();
 		$paused_for_upgrade = false;
@@ -419,8 +508,9 @@ class Mobo_Core_Image_Sync {
 			_prime_post_caches( $prime_ids, false, true );
 		}
 
-		$claimed_ids = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
-		$bulk_claim  = ! empty( $claimed_ids ) && ! empty( $rows[0]['_mobo_bulk_claimed'] ) && method_exists( $queue, 'release_claimed_images' );
+		$claimed_ids       = array_values( array_filter( array_map( 'absint', wp_list_pluck( $rows, 'id' ) ) ) );
+		$batch_claim_token = ! empty( $rows[0]['_mobo_claim_token'] ) ? sanitize_text_field( (string) $rows[0]['_mobo_claim_token'] ) : '';
+		$bulk_claim        = ! empty( $claimed_ids ) && '' !== $batch_claim_token && ! empty( $rows[0]['_mobo_bulk_claimed'] ) && method_exists( $queue, 'release_claimed_images' );
 
 		try {
 			foreach ( $rows as $row ) {
@@ -439,6 +529,9 @@ class Mobo_Core_Image_Sync {
 				$url           = isset( $row['source_url'] ) ? esc_url_raw( (string) $row['source_url'] ) : '';
 				$attachment_id = isset( $row['attachment_id'] ) ? absint( $row['attachment_id'] ) : 0;
 				$try_count     = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
+				$previous_error = isset( $row['last_error'] ) ? sanitize_text_field( (string) $row['last_error'] ) : '';
+				$fresh_reimport_prepared = false;
+				$claim_token = isset( $row['_mobo_claim_token'] ) ? sanitize_text_field( (string) $row['_mobo_claim_token'] ) : '';
 
 				if ( $id <= 0 ) {
 					$failed++;
@@ -446,19 +539,90 @@ class Mobo_Core_Image_Sync {
 				}
 
 				if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
-					$queue->mark_failure( $id, 'Product does not exist.', $try_count, true );
-					$failed++;
+					$committed = '' !== $claim_token && method_exists( $queue, 'mark_failure_if_claimed' )
+						? $queue->mark_failure_if_claimed( $id, 'Product does not exist.', $try_count, true, $claim_token )
+						: false;
+					if ( $committed ) {
+						$failed++;
+					} else {
+						$deferred++;
+					}
 					continue;
 				}
 
 				if ( '' === $image_guid || ! $this->is_valid_image_source_url( $url ) ) {
-					$queue->mark_failure( $id, 'Image GUID or HTTP(S) source URL is invalid.', $try_count, true );
-					$failed++;
+					$committed = '' !== $claim_token && method_exists( $queue, 'mark_failure_if_claimed' )
+						? $queue->mark_failure_if_claimed( $id, 'Image GUID or HTTP(S) source URL is invalid.', $try_count, true, $claim_token )
+						: false;
+					if ( $committed ) {
+						$failed++;
+					} else {
+						$deferred++;
+					}
 					continue;
 				}
 
-				if ( empty( $row['_mobo_bulk_claimed'] ) && ! $queue->lock( $id, 300 ) ) {
+				if ( empty( $row['_mobo_bulk_claimed'] ) ) {
+					if ( method_exists( $queue, 'lock_with_token' ) ) {
+						$claim_token = $queue->lock_with_token( $id, 300 );
+						if ( '' === $claim_token ) {
+							continue;
+						}
+					} elseif ( ! $queue->lock( $id, 300 ) ) {
+						continue;
+					}
+				}
+
+				if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+					$excluded_committed = method_exists( $queue, 'mark_excluded_if_current' )
+						? $queue->mark_excluded_if_current( $id, $product_id, $image_guid, $url, $claim_token )
+						: false;
+					if ( $excluded_committed ) {
+						$this->delete_product_meta_verified( $product_id, '_mobo_product_images_pending_source_hash' );
+						$this->delete_product_meta_verified( $product_id, '_mobo_product_images_pending_source_hash_updated_at' );
+						$excluded++;
+					} else {
+						if ( method_exists( $queue, 'release_if_superseded' ) ) {
+							$queue->release_if_superseded( $id, $product_id, $image_guid, $url, $claim_token );
+						}
+						$deferred++;
+					}
 					continue;
+				}
+
+				if ( method_exists( $queue, 'begin_attempt_if_current' )
+					&& ! $queue->begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $url, $claim_token ) ) {
+					if ( method_exists( $queue, 'release_if_superseded' ) ) {
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $url, $claim_token );
+					}
+					$deferred++;
+					continue;
+				}
+
+				/* If attempts one and two already returned the distinctive readiness
+				 * failure, quarantine before invoking the expensive editor a third time.
+				 * This also makes a persisted attempt checkpoint useful after a prior
+				 * timeout: the next lease can escape the same oversized local original. */
+				$quarantine_error = $previous_error;
+				if ( $attachment_id > 0 && 3 === $try_count && '' === $quarantine_error
+					&& '1' === (string) get_post_meta( $attachment_id, 'mobo_sync_incomplete', true ) ) {
+					/* Two requests may have terminated inside the image editor before a
+					 * graceful error could be committed. The persisted attempt checkpoint
+					 * is sufficient evidence to take the same exact third-attempt escape
+					 * hatch, but only for an explicitly incomplete Mobo attachment. */
+					$quarantine_error = 'Image file exists but final WebP/subsize validation failed: previous image attempt ended before readiness commit.';
+				}
+				if ( $attachment_id > 0 && '' !== $quarantine_error ) {
+					$fresh_reimport_prepared = $this->maybe_quarantine_incomplete_attachment_for_fresh_reimport(
+						$attachment_id,
+						$image_guid,
+						$url,
+						$try_count,
+						$quarantine_error
+					);
+					if ( $fresh_reimport_prepared ) {
+						$attachment_id = 0;
+					}
 				}
 
 				/*
@@ -494,11 +658,11 @@ class Mobo_Core_Image_Sync {
 					 * flight; a stale worker must never attach/complete the newer state.
 					 */
 					$attaching_committed = method_exists( $queue, 'mark_attaching_if_current' )
-						? $queue->mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $url, 90 )
+						? $queue->mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $url, 90, $claim_token )
 						: true;
 					if ( ! $attaching_committed ) {
 						if ( method_exists( $queue, 'release_if_superseded' ) ) {
-							$queue->release_if_superseded( $id, $product_id, $image_guid, $url );
+							$queue->release_if_superseded( $id, $product_id, $image_guid, $url, $claim_token );
 						}
 						$deferred++;
 						continue;
@@ -507,7 +671,14 @@ class Mobo_Core_Image_Sync {
 						$queue->mark_attaching( $id, $attachment_id, 90 );
 					}
 
-					$this->mark_attachment_synced( $attachment_id, $image_guid, $url );
+					if ( ! $this->mark_attachment_synced( $attachment_id, $image_guid, $url ) ) {
+						/* Keep the durable row in attaching state. The next due pass can reuse
+						 * the already-created attachment and retry only the identity/completion
+						 * commit instead of acknowledging an attachment that cannot be found
+						 * reliably by GUID/source on a later request. */
+						$deferred++;
+						continue;
+					}
 					$touched[ $product_id ] = true;
 					if ( ! isset( $link_rows[ $product_id ] ) ) {
 						$link_rows[ $product_id ] = array();
@@ -537,12 +708,12 @@ class Mobo_Core_Image_Sync {
 				 * do not isolate the image stage while it is correctly waiting.
 				 */
 				$failure_committed = method_exists( $queue, 'mark_failure_if_current' )
-					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, false )
+					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, false, $claim_token )
 					: true;
 				if ( ! $failure_committed ) {
 					/* The row was superseded while this worker was active. */
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
-						$queue->release_if_superseded( $id, $product_id, $image_guid, $url );
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $url, $claim_token );
 					}
 					$deferred++;
 					continue;
@@ -550,6 +721,29 @@ class Mobo_Core_Image_Sync {
 				if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
 					$queue->mark_failure( $id, $message, $try_count, false );
 				}
+
+				/*
+				 * A legacy oversized WebP can leave a durable attachment whose original
+				 * exists but whose metadata/subsizes can never converge on this host. The
+				 * ordinary identity lookup would reuse that same attachment forever, even
+				 * after the authoritative source was replaced with a smaller file.
+				 *
+				 * Quarantine only after the queue failure was conditionally committed for
+				 * the same GUID/source. No file or attachment is deleted: the current
+				 * product image remains visible until the next retry imports and validates
+				 * a fresh attachment. The exact-attempt gate guarantees that a temporary
+				 * disk-full condition cannot create an unbounded reimport loop.
+				 */
+				if ( ! $fresh_reimport_prepared ) {
+					$this->maybe_quarantine_incomplete_attachment_for_fresh_reimport(
+						$attachment_id,
+						$image_guid,
+						$url,
+						$try_count,
+						$message
+					);
+				}
+
 				if ( 0 === strpos( $message, 'Shared-media manifest is not ready or is incompatible.' ) ) {
 					$deferred++;
 				} else {
@@ -586,11 +780,12 @@ class Mobo_Core_Image_Sync {
 							}
 						}
 					}
+					$this->promote_pending_image_hash_if_converged( $product_id, $queue, true );
 				}
 			}
 		} finally {
 			if ( $bulk_claim ) {
-				$queue->release_claimed_images( $claimed_ids );
+				$queue->release_claimed_images( $claimed_ids, $batch_claim_token );
 			}
 		}
 
@@ -600,6 +795,7 @@ class Mobo_Core_Image_Sync {
 			'processed' => $processed,
 			'failed'    => $failed,
 			'deferred'  => $deferred,
+			'excluded'  => $excluded,
 			'remaining' => $paused_for_upgrade || ( method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0 ),
 		);
 	}
@@ -680,13 +876,17 @@ class Mobo_Core_Image_Sync {
 	 * @param int    $product_id Product ID.
 	 * @param string $image_guid Remote image GUID.
 	 * @param bool   $allow_shared_local_conversion Whether Shared Media may convert an existing local attachment in place.
+	 * @param bool   $force_fresh Bypass reusable attachment lookup for a source refresh.
+	 * @param string $refresh_generation Stable workflow generation used for cache busting.
 	 * @return int Attachment ID or 0.
 	 */
-	private function resolve_image_attachment( $url, $product_id, $image_guid, $allow_shared_local_conversion = true ) {
+	private function resolve_image_attachment( $url, $product_id, $image_guid, $allow_shared_local_conversion = true, $force_fresh = false, $refresh_generation = '' ) {
 		$this->last_image_error = '';
 		$url                    = esc_url_raw( (string) $url );
 		$product_id             = absint( $product_id );
 		$image_guid             = sanitize_text_field( (string) $image_guid );
+		$force_fresh            = (bool) $force_fresh;
+		$refresh_generation     = sanitize_text_field( (string) $refresh_generation );
 
 		if ( '' === $url || $product_id <= 0 || '' === $image_guid ) {
 			$this->set_last_image_error( 'Image resolution arguments are invalid.' );
@@ -702,7 +902,7 @@ class Mobo_Core_Image_Sync {
 		 * the identity lock even when a reusable local attachment already exists.
 		 */
 		$existing_id = $this->find_existing_attachment( $image_guid, $url );
-		if ( ! $shared_mode && $existing_id > 0 ) {
+		if ( ! $shared_mode && ! $force_fresh && $existing_id > 0 ) {
 			return $existing_id;
 		}
 
@@ -731,7 +931,7 @@ class Mobo_Core_Image_Sync {
 					/* The owner may have completed between our first lookup and lock attempt. */
 					$this->forget_attachment_lookup_caches( $image_guid, $url );
 					$existing_id = $this->find_existing_attachment( $image_guid, $url );
-					if ( $existing_id > 0 ) {
+					if ( ! $force_fresh && $existing_id > 0 ) {
 						if ( ! $shared_mode ) {
 							return $existing_id;
 						}
@@ -793,11 +993,11 @@ class Mobo_Core_Image_Sync {
 				}
 			}
 
-			if ( $existing_id > 0 ) {
+			if ( ! $force_fresh && $existing_id > 0 ) {
 				return $existing_id;
 			}
 
-			return $this->download_image( $url, $product_id, $image_guid );
+			return $this->download_image( $url, $product_id, $image_guid, $force_fresh, $refresh_generation );
 		} finally {
 			if ( class_exists( 'Mobo_Core_Lock' ) && ! empty( $identity_locks ) ) {
 				foreach ( array_reverse( $identity_locks, true ) as $lock_name => $lock_token ) {
@@ -807,34 +1007,63 @@ class Mobo_Core_Image_Sync {
 		}
 	}
 
-	private function download_image( $url, $product_id, $image_guid ) {
+	private function download_image( $url, $product_id, $image_guid, $force_fresh = false, $refresh_generation = '' ) {
 		$url        = esc_url_raw( (string) $url );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
+		$force_fresh = (bool) $force_fresh;
+		$refresh_generation = sanitize_text_field( (string) $refresh_generation );
 
 		if ( '' === $url || $product_id <= 0 || '' === $image_guid ) {
 			$this->set_last_image_error( 'Image download arguments are invalid.' );
 			return 0;
 		}
 
-		$existing_id = $this->find_existing_attachment( $image_guid, $url );
+		$existing_id = $force_fresh ? 0 : $this->find_existing_attachment( $image_guid, $url );
 
 		if ( $existing_id > 0 ) {
 			return $existing_id;
 		}
 
+		/* Do not enter WordPress sideload/metadata generation while the hosting
+		 * account cannot safely accept another image family. This turns disk/quota
+		 * exhaustion into an ordinary queue backoff instead of partial collision
+		 * attachments such as image-10.webp, image-11.webp, ... . */
+		if ( class_exists( 'Mobo_Core_Image_Storage' ) ) {
+			$storage = Mobo_Core_Image_Storage::check();
+			if ( empty( $storage['ready'] ) ) {
+				$this->set_last_image_error( 'Image storage is not ready: ' . sanitize_text_field( isset( $storage['message'] ) ? (string) $storage['message'] : 'Insufficient writable storage.' ) );
+				return 0;
+			}
+		}
+
+		$request_url = $url;
+		if ( $force_fresh ) {
+			$cache_token = '' !== $refresh_generation ? $refresh_generation : (string) time();
+			$request_url = esc_url_raw( add_query_arg( 'mobo_refresh', $cache_token, $url ) );
+		}
+
 		if ( $this->is_local_or_private_image_url( $url ) ) {
-			if ( ! (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id ) ) {
+			if ( ! $this->allow_unsafe_local_image_download( $url, $product_id ) ) {
 				$this->set_last_image_error( 'WordPress blocked a local/private image URL.' );
 				return 0;
 			}
+			if ( ! $this->is_trusted_unsafe_local_image_source( $url ) ) {
+				$this->set_last_image_error( 'Local/private image URL is outside the trusted Mobo image origin policy.' );
+				return 0;
+			}
 
-			$attachment_id = $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid );
+			$attachment_id = $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid, $request_url, $force_fresh );
 		} else {
-			$secure_image_request_args = static function ( $args, $request_url ) {
+			$secure_image_request_args = static function ( $args, $http_url ) use ( $force_fresh ) {
 				$args['sslverify'] = (bool) apply_filters( 'mobo_core_http_sslverify', true, 'image_sideload' );
 				$args['timeout']   = min( 20, max( 8, isset( $args['timeout'] ) ? absint( $args['timeout'] ) : 15 ) );
 				$args['redirection'] = min( 3, isset( $args['redirection'] ) ? absint( $args['redirection'] ) : 3 );
+				if ( $force_fresh ) {
+					$args['headers'] = isset( $args['headers'] ) && is_array( $args['headers'] ) ? $args['headers'] : array();
+					$args['headers']['Cache-Control'] = 'no-cache, no-store, max-age=0';
+					$args['headers']['Pragma']        = 'no-cache';
+				}
 
 				return $args;
 			};
@@ -844,7 +1073,7 @@ class Mobo_Core_Image_Sync {
 			add_filter( 'http_request_args', $secure_image_request_args, 10, 2 );
 
 			try {
-				$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
+				$attachment_id = media_sideload_image( $request_url, $product_id, null, 'id' );
 			} finally {
 				remove_filter( 'http_request_args', $secure_image_request_args, 10 );
 				$this->unregister_attachment_identity_bootstrap( $identity_bootstrap );
@@ -858,8 +1087,10 @@ class Mobo_Core_Image_Sync {
 					Mobo_Core_Logger::error( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $error_message );
 				}
 
-				$attachment_id = (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id )
-					? $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid )
+				$attachment_id = $this->allow_unsafe_local_image_download( $url, $product_id )
+					&& $this->is_local_or_private_image_url( $url )
+					&& $this->is_trusted_unsafe_local_image_source( $url )
+					? $this->download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid, $request_url, $force_fresh )
 					: 0;
 			}
 		}
@@ -911,11 +1142,88 @@ class Mobo_Core_Image_Sync {
 	 */
 
 	/**
+	 * Decide whether Mobo image sync may use the local/private HTTP fallback.
+	 *
+	 * IMPORTANT: This MUST remain hard-coded TRUE. Do not change it back to false
+	 * and do not make it filter-dependent again. Mobo/Portal image origins may
+	 * legitimately resolve to local/private destinations; disabling this path can
+	 * leave the image queue permanently deferred with zero convergence.
+	 *
+	 * @param string $url Image URL.
+	 * @param int    $product_id Product ID.
+	 * @return bool
+	 */
+	private function allow_unsafe_local_image_download( $url, $product_id ) {
+		return true;
+	}
+
+	/**
+	 * Restrict the hard-coded local/private fallback to Mobo-controlled image origins.
+	 *
+	 * The compatibility flag above intentionally remains TRUE, but that must not turn
+	 * arbitrary queue payload URLs into a general SSRF primitive. Private fallback is
+	 * limited to the configured Mobo API host or the owned codeya.ir namespace, the
+	 * dedicated /images/ path, and the known HTTP(S)/development image ports.
+	 *
+	 * @param string $url Image URL.
+	 * @return bool
+	 */
+	private function is_trusted_unsafe_local_image_source( $url ) {
+		$parts = wp_parse_url( esc_url_raw( (string) $url ) );
+		if ( ! is_array( $parts ) ) {
+			return false;
+		}
+
+		$scheme = isset( $parts['scheme'] ) ? strtolower( (string) $parts['scheme'] ) : '';
+		$host   = isset( $parts['host'] ) ? strtolower( rtrim( (string) $parts['host'], '.' ) ) : '';
+		$path   = isset( $parts['path'] ) ? (string) $parts['path'] : '';
+		$port   = isset( $parts['port'] ) ? absint( $parts['port'] ) : ( 'https' === $scheme ? 443 : 80 );
+
+		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) || '' === $host ) {
+			return false;
+		}
+		if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+			return false;
+		}
+		if ( 0 !== strpos( $path, '/images/' ) ) {
+			return false;
+		}
+		if ( ! in_array( $port, array( 80, 443, 5015 ), true ) ) {
+			return false;
+		}
+
+		$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+		if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
+			$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+		}
+		if ( '' === trim( $api_base ) && defined( 'MOBO_API_BASE_URL' ) ) {
+			$api_base = (string) MOBO_API_BASE_URL;
+		}
+		$api_host = strtolower( rtrim( (string) wp_parse_url( esc_url_raw( $api_base ), PHP_URL_HOST ), '.' ) );
+
+		/*
+		 * PRODUCTION DEPLOYMENT CONTRACT — DO NOT "UPGRADE" THIS TO HTTPS.
+		 * The production Mobo Portal/image origin is exactly http://mobo.codeya.ir
+		 * on port 80. It does not serve HTTPS. Keep HTTP valid permanently and make
+		 * an accidental HTTPS-only refactor fail closed instead of silently changing
+		 * the production origin contract.
+		 */
+		if ( 'mobo.codeya.ir' === $host ) {
+			return 'http' === $scheme && 80 === $port;
+		}
+
+		$owned_codeya_host = 'codeya.ir' === $host || substr( $host, -10 ) === '.codeya.ir';
+		$configured_host   = '' !== $api_host && hash_equals( $api_host, $host );
+
+		return $owned_codeya_host || $configured_host;
+	}
+
+	/**
 	 * Download an image using wp_remote_get with reject_unsafe_urls disabled.
 	 *
-	 * This fallback is disabled by default and only runs when a developer explicitly
-	 * enables the mobo_core_allow_unsafe_local_image_download filter for local/dev use.
-	 * It is only intended for environments where WordPress rejects
+	 * This fallback is enabled by default for Mobo image sync so configured Portal/Mobo
+	 * image origins that resolve to local/private destinations are not rejected solely
+	 * by WordPress safe-URL validation. It is only intended for environments where WordPress rejects
 	 * localhost/private IP URLs before media_sideload_image() can download them.
 	 * It still imports the file via media_handle_sideload(), so WordPress validates
 	 * the file type before creating the attachment.
@@ -925,10 +1233,13 @@ class Mobo_Core_Image_Sync {
 	 * @param string $image_guid Image GUID.
 	 * @return int Attachment ID or 0.
 	 */
-	private function download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid ) {
+	private function download_image_with_unsafe_local_fallback( $url, $product_id, $image_guid, $request_url = '', $force_fresh = false ) {
 		$url        = esc_url_raw( (string) $url );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
+		$request_url = esc_url_raw( (string) $request_url );
+		$request_url = '' !== $request_url ? $request_url : $url;
+		$force_fresh = (bool) $force_fresh;
 
 		if ( '' === $url || $product_id <= 0 ) {
 			$this->set_last_image_error( 'Unsafe-local fallback arguments are invalid.' );
@@ -944,16 +1255,19 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$response = wp_remote_get(
-			$url,
+			$request_url,
 			array(
 				'timeout'            => 15,
-				'redirection'        => 5,
+				/* Never follow redirects while safe-URL rejection is disabled. */
+				'redirection'        => 0,
 				'sslverify'          => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'image_sync' ),
-				'reject_unsafe_urls' => ! (bool) apply_filters( 'mobo_core_allow_unsafe_local_image_download', false, $url, $product_id ),
+				'reject_unsafe_urls' => ! ( $this->allow_unsafe_local_image_download( $url, $product_id ) && $this->is_trusted_unsafe_local_image_source( $url ) ),
 				'stream'             => true,
 				'filename'           => $tmp_file,
 				'headers'            => array(
 					'User-Agent' => 'Mobo Core/' . ( defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : 'dev' ) . '; ' . home_url( '/' ),
+					'Cache-Control' => $force_fresh ? 'no-cache, no-store, max-age=0' : 'max-age=0',
+					'Pragma'        => $force_fresh ? 'no-cache' : '',
 				),
 			)
 		);
@@ -1175,9 +1489,11 @@ class Mobo_Core_Image_Sync {
 	 * @param int    $product_id Product ID.
 	 * @param string $image_guid Remote image GUID.
 	 * @param int    $old_attachment_id Old attachment being replaced.
+	 * @param bool   $force_fresh Force a distinct local sideload.
+	 * @param string $refresh_generation Workflow generation token.
 	 * @return int Attachment ID or 0.
 	 */
-	public function import_image_for_refresh( $url, $product_id, $image_guid, $old_attachment_id = 0 ) {
+	public function import_image_for_refresh( $url, $product_id, $image_guid, $old_attachment_id = 0, $force_fresh = false, $refresh_generation = '' ) {
 		$this->load_media_dependencies();
 
 		if ( class_exists( 'Mobo_Core_Shared_Media' )
@@ -1187,9 +1503,9 @@ class Mobo_Core_Image_Sync {
 			 * normal imports, but keep the refresh invariant that the old local
 			 * attachment is never converted in place.
 			 */
-			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid, false );
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid, false, false, '' );
 		} else {
-			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+			$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid, true, (bool) $force_fresh, $refresh_generation );
 		}
 
 		$attachment_id = absint( $attachment_id );
@@ -1256,21 +1572,29 @@ class Mobo_Core_Image_Sync {
 		$url           = esc_url_raw( (string) $url );
 
 		if ( $attachment_id <= 0 ) {
-			return;
+			return false;
 		}
 
+		/* Attachment identity is correctness state: later retries use these keys to
+		 * reuse the physical media object instead of creating duplicate -1/-2 files.
+		 * Never let the queue become done until each identity key and the incomplete
+		 * marker can be read back exactly from WordPress metadata. */
 		if ( '' !== $image_guid ) {
-			$this->update_attachment_meta_if_changed( $attachment_id, 'image_guid', $image_guid );
-			$this->update_attachment_meta_if_changed( $attachment_id, 'img_guid', $image_guid );
+			if ( ! $this->persist_attachment_meta_verified( $attachment_id, 'image_guid', $image_guid )
+				|| ! $this->persist_attachment_meta_verified( $attachment_id, 'img_guid', $image_guid ) ) {
+				return false;
+			}
 		}
 
-		if ( '' !== $url ) {
-			$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_source_url', $url );
+		if ( '' !== $url && ! $this->persist_attachment_meta_verified( $attachment_id, 'mobo_source_url', $url ) ) {
+			return false;
 		}
 
-		$this->update_attachment_meta_if_changed( $attachment_id, 'mobo_sync_incomplete', '0' );
+		if ( ! $this->persist_attachment_meta_verified( $attachment_id, 'mobo_sync_incomplete', '0' ) ) {
+			return false;
+		}
 
-		/* Seed request-local lookup caches with the newly confirmed identity. */
+		/* Seed request-local lookup caches only after the durable postcondition passed. */
 		if ( '' !== $image_guid || '' !== $url ) {
 			$this->attachment_lookup_cache[ $this->attachment_lookup_key( $image_guid, $url ) ] = $attachment_id;
 		}
@@ -1281,6 +1605,7 @@ class Mobo_Core_Image_Sync {
 		if ( '' !== $url ) {
 			$this->prime_attachment_meta_lookup_cache( 'mobo_source_url', $url, $attachment_id );
 		}
+		return true;
 	}
 
 	/**
@@ -1295,15 +1620,119 @@ class Mobo_Core_Image_Sync {
 		$attachment_id = absint( $attachment_id );
 		$meta_key      = sanitize_key( (string) $meta_key );
 		if ( $attachment_id <= 0 || '' === $meta_key ) {
-			return;
+			return false;
 		}
 
 		$current = get_post_meta( $attachment_id, $meta_key, true );
 		if ( (string) $current === (string) $value ) {
-			return;
+			return false;
 		}
 
-		update_post_meta( $attachment_id, $meta_key, $value );
+		return false !== update_post_meta( $attachment_id, $meta_key, $value );
+	}
+
+	/** Persist correctness-critical attachment metadata and verify exact read-back. */
+	private function persist_attachment_meta_verified( $attachment_id, $meta_key, $value ) {
+		return Mobo_Core_Durable_State_Policy::update_post_meta_verified( $attachment_id, $meta_key, $value );
+	}
+
+	/**
+	 * Promote the exact desired image hash accepted by Product Sync only after the
+	 * durable queue and WooCommerce linkage have converged. Keeping a separate
+	 * pending hash closes the gap where asynchronous image work completed after the
+	 * ProductUpdated event had already been acknowledged.
+	 *
+	 * @param int                   $product_id Product ID.
+	 * @param Mobo_Core_Image_Queue $queue Queue service.
+	 * @param bool                  $link_already_verified Whether this request just linked the product successfully.
+	 * @return bool
+	 */
+	private function promote_pending_image_hash_if_converged( $product_id, Mobo_Core_Image_Queue $queue, $link_already_verified = false ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
+			return false;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+			return false;
+		}
+
+		$pending_hash = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_images_pending_source_hash', true ) );
+		if ( '' === $pending_hash ) {
+			return false;
+		}
+
+		$rows = $queue->get_ordered_rows_for_product( $product_id );
+		if ( empty( $rows ) ) {
+			return false;
+		}
+
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row )
+				|| 'done' !== sanitize_key( (string) ( isset( $row['status'] ) ? $row['status'] : '' ) )
+				|| absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 ) <= 0 ) {
+				return false;
+			}
+		}
+
+		if ( ! $link_already_verified && ! $this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue ) ) {
+			return false;
+		}
+
+		if ( ! $this->persist_product_meta_verified( $product_id, '_mobo_product_images_source_hash', $pending_hash ) ) {
+			return false;
+		}
+		if ( ! $this->persist_product_meta_verified( $product_id, '_mobo_product_images_source_hash_updated_at', gmdate( 'c' ) ) ) {
+			return false;
+		}
+		if ( ! $this->delete_product_meta_verified( $product_id, '_mobo_product_images_pending_source_hash' ) ) {
+			return false;
+		}
+		return $this->delete_product_meta_verified( $product_id, '_mobo_product_images_pending_source_hash_updated_at' );
+	}
+
+	/**
+	 * Bounded crash-recovery sweep for products whose queue finished after the
+	 * originating ProductUpdated request ended. The meta_key index keeps this
+	 * inexpensive and avoids a full catalog scan.
+	 *
+	 * @return int Number of hashes promoted.
+	 */
+	private function promote_pending_image_hashes( Mobo_Core_Image_Queue $queue, $limit = 5 ) {
+		global $wpdb;
+
+		$limit = max( 1, min( 20, absint( $limit ) ) );
+		$ids   = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY post_id ASC LIMIT %d",
+				'_mobo_product_images_pending_source_hash',
+				$limit
+			)
+		);
+		$promoted = 0;
+		foreach ( is_array( $ids ) ? $ids : array() as $product_id ) {
+			if ( $this->promote_pending_image_hash_if_converged( absint( $product_id ), $queue, false ) ) {
+				$promoted++;
+			}
+		}
+		return $promoted;
+	}
+
+	private function persist_product_meta_verified( $product_id, $key, $value ) {
+		return Mobo_Core_Durable_State_Policy::update_post_meta_verified( $product_id, $key, $value );
+	}
+
+	private function delete_product_meta_verified( $product_id, $key ) {
+		$product_id = absint( $product_id );
+		$key        = sanitize_key( (string) $key );
+		if ( $product_id <= 0 || '' === $key ) {
+			return false;
+		}
+		if ( metadata_exists( 'post', $product_id, $key ) ) {
+			delete_post_meta( $product_id, $key );
+		}
+		wp_cache_delete( $product_id, 'post_meta' );
+		return ! metadata_exists( 'post', $product_id, $key );
 	}
 
 	private function sync_woocommerce_product_image_objects_from_queue( $product_id, Mobo_Core_Image_Queue $queue ) {
@@ -1638,6 +2067,96 @@ class Mobo_Core_Image_Sync {
 		}
 	}
 
+	/**
+	 * Retire one repeatedly-unready local attachment from Mobo identity lookup.
+	 *
+	 * Values are moved to private quarantine meta instead of deleted so the old
+	 * attachment remains auditable and reversible. Product/gallery references are
+	 * deliberately untouched until a fresh attachment passes the final readiness
+	 * gate and the normal queue commit replaces them.
+	 *
+	 * @param int    $attachment_id Attachment ID returned by identity resolution.
+	 * @param string $image_guid Current authoritative image GUID.
+	 * @param string $url Current authoritative source URL.
+	 * @param int    $try_count Queue attempt being committed.
+	 * @param string $message Readiness failure message.
+	 * @return bool Whether at least one live identity marker was quarantined.
+	 */
+	private function maybe_quarantine_incomplete_attachment_for_fresh_reimport( $attachment_id, $image_guid, $url, $try_count, $message ) {
+		$attachment_id = absint( $attachment_id );
+		$image_guid    = sanitize_text_field( (string) $image_guid );
+		$url           = esc_url_raw( (string) $url );
+		$message       = sanitize_text_field( (string) $message );
+
+		if (
+			self::FRESH_REIMPORT_ATTEMPT !== absint( $try_count )
+			|| $attachment_id <= 0
+			|| '' === $image_guid
+			|| '' === $url
+			|| 0 !== strpos( $message, 'Image file exists but final WebP/subsize validation failed:' )
+			|| 'attachment' !== get_post_type( $attachment_id )
+			|| '1' !== (string) get_post_meta( $attachment_id, 'mobo_sync_incomplete', true )
+		) {
+			return false;
+		}
+
+		/* Shared Media readiness is controlled by its committed manifest. Removing
+		 * local identity markers there would bypass the single-writer contract. */
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			return false;
+		}
+
+		$stored_image_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
+		$stored_legacy_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
+		$stored_source_url  = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+		$has_stored_guid    = '' !== $stored_image_guid || '' !== $stored_legacy_guid;
+		$guid_matches       = ( '' !== $stored_image_guid && hash_equals( $stored_image_guid, $image_guid ) )
+			|| ( '' !== $stored_legacy_guid && hash_equals( $stored_legacy_guid, $image_guid ) );
+		$source_matches     = '' !== $stored_source_url && hash_equals( $stored_source_url, $url );
+
+		/* An attachment owned by a different GUID is never quarantined merely
+		 * because two remote records happened to share one source URL. */
+		if ( ( $has_stored_guid && ! $guid_matches ) || ( ! $has_stored_guid && ! $source_matches ) ) {
+			return false;
+		}
+
+		$moved = false;
+		if ( '' !== $stored_image_guid && hash_equals( $stored_image_guid, $image_guid ) ) {
+			update_post_meta( $attachment_id, '_mobo_quarantined_image_guid', $stored_image_guid );
+			$moved = delete_post_meta( $attachment_id, 'image_guid', $stored_image_guid ) || $moved;
+		}
+		if ( '' !== $stored_legacy_guid && hash_equals( $stored_legacy_guid, $image_guid ) ) {
+			update_post_meta( $attachment_id, '_mobo_quarantined_img_guid', $stored_legacy_guid );
+			$moved = delete_post_meta( $attachment_id, 'img_guid', $stored_legacy_guid ) || $moved;
+		}
+		if ( $source_matches ) {
+			update_post_meta( $attachment_id, '_mobo_quarantined_source_url', $stored_source_url );
+			$moved = delete_post_meta( $attachment_id, 'mobo_source_url', $stored_source_url ) || $moved;
+		}
+
+		if ( ! $moved ) {
+			return false;
+		}
+
+		update_post_meta( $attachment_id, '_mobo_quarantine_reason', 'fresh-reimport-after-readiness-failure' );
+		update_post_meta( $attachment_id, '_mobo_quarantined_at', time() );
+		$this->forget_attachment_lookup_caches( $image_guid, $url );
+		clean_post_cache( $attachment_id );
+
+		if ( class_exists( 'Mobo_Core_Logger' ) ) {
+			Mobo_Core_Logger::warning(
+				'Mobo Core quarantined an incomplete image identity for one bounded fresh source reimport.',
+				array(
+					'attachment_id' => $attachment_id,
+					'image_guid'    => $image_guid,
+					'try_count'     => absint( $try_count ),
+				)
+			);
+		}
+
+		return true;
+	}
+
 	private function find_attachment_by_guid( $guid ) {
 		$ids = $this->find_attachments_by_guid( $guid, 1 );
 
@@ -1742,6 +2261,14 @@ class Mobo_Core_Image_Sync {
 		$attachment_id = absint( $attachment_id );
 		$image_guid    = sanitize_text_field( (string) $image_guid );
 		if ( $attachment_id <= 0 || '' === $image_guid ) {
+			return false;
+		}
+
+		/* A queue row can still carry the old attachment_id after its live Mobo
+		 * identity has been quarantined. Treat the marker as an explicit reuse veto;
+		 * otherwise the "unclaimed" compatibility path below would select the same
+		 * incomplete file again and the fresh-import escape hatch would be ineffective. */
+		if ( 'fresh-reimport-after-readiness-failure' === (string) get_post_meta( $attachment_id, '_mobo_quarantine_reason', true ) ) {
 			return false;
 		}
 
@@ -1915,43 +2442,11 @@ class Mobo_Core_Image_Sync {
 	}
 
 	private function get_image_guid( $image ) {
-		$keys = array(
-			'image_guid',
-			'img_guid',
-			'imageGuid',
-			'imageId',
-			'guid',
-			'remote_guid',
-			'remoteGuid',
-			'id',
-		);
-
-		foreach ( $keys as $key ) {
-			$value = sanitize_text_field( (string) $this->get_value( $image, $key, '' ) );
-
-			if ( $this->is_remote_guid_value( $value ) ) {
-				return $value;
-			}
-		}
-
-		return '';
+		return Mobo_Core_Image_Desired_State_Policy::image_guid( $image );
 	}
 
 	private function get_image_url( $image ) {
-		$keys = array(
-			'url',
-			'src',
-		);
-
-		foreach ( $keys as $key ) {
-			$value = esc_url_raw( (string) $this->get_value( $image, $key, '' ) );
-
-			if ( '' !== $value ) {
-				return $value;
-			}
-		}
-
-		return '';
+		return Mobo_Core_Image_Desired_State_Policy::image_url( $image );
 	}
 
 
@@ -1962,18 +2457,8 @@ class Mobo_Core_Image_Sync {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	private function get_value( $array, $key, $default = null ) {
 		if ( ! is_array( $array ) ) {

@@ -359,7 +359,7 @@ class Mobo_Core_Checkout_Validator {
 
 		$master_enabled = $this->is_enabled();
 		$mobo_cart_raw = $this->is_mobo_cart_validation_enabled();
-		$auto_order_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$auto_order_enabled = Mobo_Core_Order_Submission_Policy::is_enabled();
 		$local_stock_raw = Mobo_Core_Settings::enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' );
 		$external_raw    = Mobo_Core_Settings::enabled( 'mobo_core_checkout_external_validation_enabled', '0' );
 
@@ -2120,6 +2120,12 @@ class Mobo_Core_Checkout_Validator {
 			if ( '' !== $token ) {
 				$headers['Token'] = $token;
 			}
+
+			$signed_headers = Mobo_Core_Portal_Request_Signer::sign_headers( 'POST', $url, $body, $headers );
+			if ( is_wp_error( $signed_headers ) ) {
+				return $this->external_error_result( $signed_headers->get_error_message() );
+			}
+			$headers = $signed_headers;
 		}
 
 		$response = wp_remote_post(
@@ -3689,7 +3695,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function is_order_submission_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		return Mobo_Core_Order_Submission_Policy::is_enabled();
 	}
 
 	private function order_was_already_sent_to_mobo( $order ) {

@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.44.6
+Stable tag: 10.33.45
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -144,6 +144,143 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.33.45 =
+* Consolidates the deep-audit durability, ownership, concurrency, migration and retry-safety fixes validated through MOBO-4426 to MOBO-4451.
+* Hardens Product/Variation Map canonical ownership, stale cleanup, cross-parent remaps, rollback restoration and reverse-map cleanup against TOCTOU races.
+* Makes legacy Product/Variation/Category seed completion fail closed on database read errors and preserves retry cursors/completion semantics.
+* Hardens Category Map partial metadata upserts so empty fields preserve the current durable value atomically instead of replaying stale snapshots.
+* Makes database index replacement atomic so a failed schema repair does not drop an existing protective index before the replacement is ready.
+* Preserves normal stale cleanup, migration, rollback and retry behavior while preventing concurrent fresh durability evidence from being overwritten or deleted.
+
+= 10.33.44.22 =
+* Adds centralized stale runtime-lock recovery with compare-and-delete safety; healthy live leases are never force-unlocked.
+* Expired/malformed locks are automatically reclaimed and corrupted far-future leases require a lock-specific heartbeat safety ceiling before recovery.
+* Adds bounded non-secret recovery diagnostics with lock name, reason and timestamps only.
+* A running Repair/Sync with no active worker and no checkpoint progress can be safely re-awakened from the same durable syncId/cursors instead of being rejected as permanently busy.
+* Stale checkpoint recovery preserves mode/generation boundaries, refuses live worker takeover and never resets or deletes durable Repair state.
+* Deep Test Suite target: 10.33.44.22-r7.11.
+
+= 10.33.44.21 =
+* Speeds up Repair on sites where Self Runner/loopback cannot advance the worker reliably.
+* Admin polling now performs a small time-bounded multi-step catch-up burst after one missed Repair poll instead of one step every eight seconds.
+* Every catch-up iteration still uses the canonical manual_sync lease, product locks, ordering fences and durable checkpoints.
+* Catch-up yields immediately to foreground Webhook pressure and stops on worker lock, error, no-progress, completion or time budget.
+* Image queue I/O is deferred on the same admin request that rescues stalled Repair so product convergence gets the request budget.
+* Deep Test Suite target: 10.33.44.21-r7.10.
+
+= 10.33.44.20 =
+* Adds persistent per-product Mobo pricing override from the WooCommerce Products list.
+* Custom percentage is stored on the parent and applies to Simple products or every live Mobo-owned Variation.
+* Product override takes precedence over legacy per-Variation fixed add-on while active; resetting to Global restores existing pricing behavior.
+* Uses the shared product lock, durable generation-token retry, full-family preflight, and rollback snapshots to avoid partial price convergence.
+* Webhook/Product Sync/Reprice all resolve the same centralized pricing policy; manual/non-Mobo Variations are preserved.
+* Adds visible custom/pending pricing badges and nonce/capability protected Save & Reprice admin flow.
+* Deep Test Suite target: 10.33.44.20-r7.9.
+
+= 10.33.44.19 =
+* Makes authoritative Variable-to-Simple topology transitions retire historical Mobo variations through Trash/quarantine instead of hard deletion, including already-Simple parents left with stale live children by older builds.
+* Requires explicit valid Variant and Attribute collection presence before destructive topology changes; absent attributes preserve topology and malformed collections fail closed.
+* Quarantines only unambiguously Mobo-owned missing variations during partial authoritative snapshots while preserving merchant/manual variations and blocking conflicting identity aliases.
+* Adds crash-safe Variation retirement with exact Product Map snapshots, variation-only verified map deletion, forensic marker read-back, Trash failure rollback, and idempotent retry behavior.
+* Clears stale parent purchase-Variant identity and forces authoritative Simple products with no purchasable source Variant to zero stock/out-of-stock.
+* Hardens post-sync Repair with the shared lifecycle quarantine policy, product lock/generation fences, and conservative identity handling.
+* Deep Test Suite target: 10.33.44.19-r7.8.
+
+= 10.33.44.18 =
+* Adds a bounded post-sync Repair integrity phase between authoritative Product Repair and missing-image recovery.
+* Marks only products durably completed by the exact Repair syncId as eligible for final topology cleanup, and fences that marker with the captured applied revision + last-webhook watermark so products changed after Repair are never mutated by stale cleanup.
+* Acquires the shared per-product concurrency lock for final Variation topology cleanup; transient lock contention retries the same parent without advancing the Repair cursor.
+* Quarantines stale Mobo variations under an authoritatively repaired non-variable parent and only removes same-signature siblings under a variable parent when exactly one durable canonical identity exists; ambiguous groups remain untouched.
+* Re-runs duplicate WooCommerce price-meta cleanup against final Repair state using canonical-row-first collapse and read-back verification, avoiding a delete-all/add-one crash window.
+* Centralizes Product/Variation identity key families, including mobo_variant_guid aliases, and makes Portal Variant duplicate Repair recognize all shared aliases while failing closed on conflicting aliases.
+* Adds a time-bounded local-only Cron Runner fence so deterministic WAMP baseline cannot be mutated by Task Scheduler, REST/Portal, self-runner or another path reaching the real cron runner.
+* Deep Test Suite target: 10.33.44.18-r7.6.
+
+= 10.33.44.17 =
+* Aligns Repair price-meta ownership with the shared Product Identity Policy and recognizes all durable Portal/Mobo product and variant ID aliases.
+* Prevents valid Mobo objects using non-underscored identity aliases from being skipped by duplicate price-meta cleanup.
+* Deep Test Suite target: 10.33.44.17-r7.5.
+
+= 10.33.44.16 =
+* Fixes verified postmeta/termmeta persistence for integer/float values by comparing WordPress-normalized scalar read-back; revision and identity checkpoints no longer fail because an integer is read back as a string.
+* Makes authoritative `categories=[]` explicitly remove `product_cat` relationships after WooCommerce product creation so the WooCommerce default category cannot survive an authoritative empty desired state.
+* Makes image desired-state URLs fail closed unless the raw source explicitly contains an HTTP(S) scheme before URL normalization.
+* Refreshes stale contract tests after shared-policy extraction without weakening their runtime invariants, and fixes the authoritative-Variant regression fixture to opt into authoritative snapshot semantics explicitly.
+* Keeps read-only shipping diagnostics distinct from checkout shipping mutators in the shipping-hook contract.
+* Adds durable-scalar, ordering-watermark, raw-image-URL and authoritative-empty regression coverage.
+* Deep Test Suite target: 10.33.44.16-r7.3.
+
+= 10.33.44.15 =
+* Extends the shared excluded-product policy to every Repair mutator: Trash restore, duplicate Portal-variation identity repair and duplicate price-meta cleanup now all preserve excluded products unchanged.
+* Removes the remaining Product Sync fallback copy of excluded-URL option parsing so the shared exclusion policy is the only runtime source of truth.
+* Adds full cross-consumer regression coverage for exclusions, ordering aliases/stale fences, payload presence matrices, category fallback decisions, money/currency boundaries, order-submission activation and image lease ownership.
+* Adds stale-worker transition tests for Image Queue and Image Refresh Queue, including release/fail/attach/skip/Done ownership gates after lease reclaim.
+* Adds a full Repair state-preservation mutation test that compares price, stock, categories, image references, incomplete marker and variation identity before/after Repair on an excluded product.
+* Deep Test Suite target: 10.33.44.15-r7.2.
+
+= 10.33.44.14 =
+* Centralizes source/store money conversion and canonical Mobo API-price lookup in one Money Policy used by Automatic Shipping and Remote Shipping.
+* Centralizes automatic Mobo order-submission activation so bootstrap, checkout, address mapping, cron, diagnostics and remote shipping use one enabled-state truth table.
+* Adds a shared payload-field presence policy that keeps absent, explicit null, explicit empty arrays and malformed values distinct across Product/Variant desired state.
+* Fixes `compare_price` alias drift where presence could be detected but the value was read as null; compare-price hashing, no-op checks, source meta and mutations now use the same alias resolver.
+* Makes malformed present Product/Variant price and compare-price values fail closed before WooCommerce mutation while preserving absent fields and explicit nullable state.
+* Centralizes authoritative image collection validation and prevents Missing-Image Recovery from treating missing/malformed API evidence as an authoritative empty image set.
+* Uses the same remote image GUID/source extractor in Product fast-path checks, Image Queue and Image Sync so identity aliases and accepted HTTP(S) sources cannot drift between image paths.
+* Prevents Recategorize from converting malformed category payloads into authoritative `[]` or falling back to older stale category event evidence.
+* Adds policy/presence regression coverage in Deep Test Suite 10.33.44.14-r7.1.
+
+= 10.33.44.13 =
+* Fixes excluded-product Repair recovery so a Trash product whose source URL is in «محصولات مستثنی از همگام‌سازی» can never be resurrected by Repair integrity.
+* Centralizes URL exclusion across ProductUpdated, UpdateVariant, Manual/Repair fresh snapshots, Reprice, Recategorize, Missing-Image Recovery, Image Queue, Image Refresh and Parent Finalize so existing excluded products are not mutated by background work left from an older event.
+* Preserves exact normalized source paths including leading-zero identities such as `/0338`; absolute URLs, trailing slashes and query strings converge to the same path key without collapsing `/0338` into `/338`.
+* Adds durable GUID-to-excluded-URL evidence for URL-less Variant events while keeping the administrator URL list as the only source of truth; removing an exclusion immediately re-enables that GUID.
+* Adds dashboard and Categories warnings when the default/fallback category is missing or invalid, and clarifies that this does not block product creation: unresolved new products can remain without the intended category.
+* Clarifies required-manual-mapping and explicit `categories=[]` semantics so fallback cannot silently override either policy.
+* Adds dedicated exclusion/Repair/category-warning contract and local mutation regressions to Deep Test Suite 10.33.44.13-r7.0.
+
+= 10.33.44.12 =
+* Hardens persisted ordering so event_version/source revision, foreground-webhook fences and Manual/Repair snapshot fences cannot let an older retry or snapshot overwrite newer WooCommerce state.
+* Makes Product/Variation completion fail closed when Product Map, crash markers, parent-finalize checkpoints, Sync Health watermarks or authoritative-variation evidence cannot be persisted/read back.
+* Fixes explicit-empty desired state for categories and images, while preserving existing values when those fields are omitted from a partial payload and rejecting malformed partial collections.
+* Preserves canonical full-snapshot hashes across partial Product/Variation updates and backfills Product Map hash/incomplete state from canonical postmeta.
+* Hardens image and image-refresh workers with exact lease ownership so an expired worker cannot commit after a newer worker reclaims the same row/source identity.
+* Stops incomplete authoritative Variant snapshots from being acknowledged, persists child ordering watermarks, and prevents stale Variant deltas from mutating parent topology.
+* Corrects PublishedAt handling so source publication time no longer overwrites WooCommerce date_modified, and uses full Product Ledger GUID uniqueness instead of a 150-character prefix.
+* Adds crash/read-back regression coverage for queue ordering, partial-vs-empty payloads, category/image convergence, source-hash preservation, behind/synced health, Manual-vs-Webhook races and stale image leases.
+
+= 10.33.44.11 =
+* Permanently retires automatic Product Recovery and product-mutating Reconciliation from the runtime runner, scheduler, adaptive budget and circuit-breaker stages.
+* Extracts observational per-product sync bookkeeping into Mobo_Core_Sync_Health; the existing mobo_sync_health table is retained without any automatic product mutation.
+* Fixes per-product health convergence: terminal ProductUpdated syncs simple products, variable products remain behind until terminal UpdateVariant, partial work remains behind, and failures remain failed.
+* Removes obsolete Reconciliation settings/admin actions and migrates away old recovery/reconciliation state, cursors, pending markers and locks while preserving upgrade compatibility facades.
+* Keeps ordered Webhook, Product Sync, Reprice, Recategorize, images and manual Repair as the authoritative mutation paths.
+
+= 10.33.44.10 =
+* Prevents administrator-started Reprice and Recategorize queues from being starved behind large image/Product Sync backlogs by running them before heavy background lanes and reserving bounded fair-scheduler slots when webhook pressure is clear.
+* Keeps webhook/order foreground priority intact; the maintenance-queue slot reservation is disabled while due webhook pressure exists.
+* Fixes Recategorize so a product currently owned by manual Product Sync is deferred with a retryable product-sync-active result instead of being permanently advanced as not-allowed.
+* Preserves existing product-level locks, bounded queue budgets, retry limits, circuit breakers, cache-mutation guards and upgrade barriers; no schema migration is required.
+
+= 10.33.44.9 =
+* Turns Image Refresh into a full source refresh: marked local Mobo WebP attachments are fetched again even when the canonical URL is unchanged, using a generation cache-buster and no-cache request headers.
+* Downloads each source attachment only once per workflow generation, safely reuses the verified replacement across products/retries, and releases the old family immediately after the reference audit converges to avoid holding two full libraries on disk.
+* Keeps worker-owned Shared Media out of site-local forced replacement and preserves all existing storage, identity-lock, WebP/subsize and reference/deletion safety gates.
+* Adds a compact live stage report with current-step progress, fresh-download/reuse counts and measured attachment-family size savings.
+* Automatically resets only inactive legacy refresh queue state on upgrade; no schema change, manual SQL, Repair or Reconciliation run is started.
+
+= 10.33.44.8 =
+* Runs a bounded stage-zero cleanup before image download/conversion, deleting only incomplete numeric WebP collision attachments whose Mobo source identity is proven and whose live references/worker leases are absent.
+* Refuses new image sideload/subsize work when the uploads reserve, quota/inode write probe, or directory writability check fails; cleanup can still run first to recover space.
+* Persists normal and refresh queue attempt counters before fatal-prone editor work, gives interrupted normal imports the same exact third-attempt quarantine escape hatch, and terminally quarantines refresh rows that exhaust their persisted budget.
+* Keeps image optimization independent from product mutation: it never starts or retries Product Repair/Reconciliation and requires any Repair prerequisite to have been completed separately by an administrator.
+* Caps heavy media-library scan batches at 50 during migration to preserve runner checkpoints on shared hosting.
+
+= 10.33.44.7 =
+* Quarantines one repeatedly incomplete local WebP identity on the exact third readiness failure so the next retry performs a bounded fresh import from a corrected/downsized source without deleting the current attachment first.
+* Prevents disk-full or network failures after that escape hatch from creating an unbounded replacement-attachment loop; Shared Media remains manifest-controlled.
+* Re-arms legacy active readiness failures already beyond the new threshold, then lets the ordinary queue apply the same guarded path.
+* Disables automatic Product Recovery at build level, clears persisted payload/follow-up state and retires only its own runtime leases; manual Product Repair remains available.
 
 = 10.33.44.6 =
 * Disables product-mutating Reconciliation at build level across Cron, direct/manual execution, fair-scheduler pressure reporting, and the admin UI while keeping webhook health bookkeeping available.

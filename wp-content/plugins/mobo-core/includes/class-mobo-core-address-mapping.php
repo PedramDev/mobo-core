@@ -636,7 +636,7 @@ class Mobo_Core_Address_Mapping {
 			'enabled'                => $this->is_enabled(),
 			'checkoutActive'         => $this->is_checkout_mapping_active(),
 			'checkoutMode'           => $this->is_enabled() ? 'mobo-city-assets' : 'disabled',
-			'orderSubmissionEnabled' => Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ),
+			'orderSubmissionEnabled' => Mobo_Core_Order_Submission_Policy::is_enabled(),
 			'lastAttemptAt'          => absint( get_option( 'mobo_core_address_mapping_last_attempt_at', 0 ) ),
 			'lastSuccessAt'          => absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ),
 			'lastError'              => (string) get_option( 'mobo_core_address_mapping_last_error', '' ),
@@ -1651,7 +1651,7 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	private function is_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		return Mobo_Core_Order_Submission_Policy::is_enabled();
 	}
 
 	private function is_checkout_mapping_active() {

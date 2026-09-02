@@ -31,7 +31,7 @@ final class Mobo_Core_Fair_Scheduler {
 		$weights = isset( $budget_profile['weights'] ) && is_array( $budget_profile['weights'] ) ? $budget_profile['weights'] : array();
 		$pressure = isset( $budget_profile['pressurePermille'] ) && is_array( $budget_profile['pressurePermille'] ) ? $budget_profile['pressurePermille'] : array();
 
-		$background = array( 'parentFinalize', 'imageQueue', 'imageRefreshQueue', 'repriceQueue', 'recategorizeQueue', 'cacheWarmup', 'reconciliation', 'maintenance' );
+		$background = array( 'parentFinalize', 'imageQueue', 'imageRefreshQueue', 'repriceQueue', 'recategorizeQueue', 'cacheWarmup', 'maintenance' );
 		$scores = array();
 		$now = time();
 		foreach ( $background as $stage ) {
@@ -62,7 +62,24 @@ final class Mobo_Core_Fair_Scheduler {
 
 		arsort( $scores, SORT_NUMERIC );
 		$capacity = $webhook_pressure ? 1 : 3;
-		$selected = array_slice( array_keys( $scores ), 0, $capacity );
+		$ordered  = array_keys( $scores );
+
+		/* Reprice/recategorize are explicit finite administrator jobs. A score
+		 * boost alone is not a starvation guarantee because old background lanes
+		 * can legitimately receive their own starvation/probe boosts. While due
+		 * webhook pressure is clear, reserve at most two of the three background
+		 * slots for these active queues and leave the remaining slot weighted/fair. */
+		if ( ! $webhook_pressure ) {
+			$reserved = array();
+			foreach ( array( 'repriceQueue', 'recategorizeQueue' ) as $admin_stage ) {
+				if ( isset( $scores[ $admin_stage ] ) ) {
+					$reserved[] = $admin_stage;
+				}
+			}
+			$ordered = array_values( array_unique( array_merge( $reserved, $ordered ) ) );
+		}
+
+		$selected = array_slice( $ordered, 0, $capacity );
 		$allow = array();
 		$deferred = array();
 		foreach ( $background as $stage ) {

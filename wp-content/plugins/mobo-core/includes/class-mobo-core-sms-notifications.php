@@ -235,22 +235,8 @@ class Mobo_Core_SMS_Notifications {
 	 * @return bool
 	 */
 	private function is_mobo_product( $product, $product_id, $variation_id ) {
-		$ids = array_filter( array( absint( $variation_id ), absint( $product_id ), $product instanceof WC_Product ? absint( $product->get_id() ) : 0 ) );
-
-		foreach ( $ids as $id ) {
-			if ( get_post_meta( $id, 'variant_guid', true ) || get_post_meta( $id, 'product_guid', true ) ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_variant_id', true ) ) > 0 ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_product_id', true ) ) > 0 ) {
-				return true;
-			}
-		}
-
-		return false;
-	}
+	return Mobo_Core_Product_Identity_Policy::is_mobo_product( $product, $product_id, $variation_id );
+}
 
 	/**
 	 * Send the dedicated one-shot Mobo wallet low-balance alert.

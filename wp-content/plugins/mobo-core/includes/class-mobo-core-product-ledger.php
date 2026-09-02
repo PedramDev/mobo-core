@@ -40,7 +40,7 @@ final class Mobo_Core_Product_Ledger {
 			last_source varchar(32) NOT NULL DEFAULT 'sync',
 			last_restored_at datetime NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY product_guid (product_guid(150)),
+			UNIQUE KEY product_guid (product_guid),
 			KEY last_wp_product_id (last_wp_product_id),
 			KEY last_seen_at (last_seen_at)
 		) {$charset_collate};";

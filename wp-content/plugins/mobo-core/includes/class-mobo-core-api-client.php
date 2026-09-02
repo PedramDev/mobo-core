@@ -765,13 +765,18 @@ class Mobo_Core_API_Client {
 			if ( is_wp_error( $effective_timeout ) ) {
 				return $effective_timeout;
 			}
+			$signed_headers = Mobo_Core_Portal_Request_Signer::sign_headers( 'GET', $current_url, '', $context['headers'] );
+			if ( is_wp_error( $signed_headers ) ) {
+				return $signed_headers;
+			}
+
 			$response = wp_remote_get(
 				$current_url,
 				array(
 					'timeout'     => $effective_timeout,
 					'redirection' => 0,
 					'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'api_client' ),
-					'headers'     => $context['headers'],
+					'headers'     => $signed_headers,
 				)
 			);
 

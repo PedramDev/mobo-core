@@ -1,9 +1,11 @@
 <?php
+if ( defined( 'ABSPATH' ) ) { require_once __DIR__ . '/includes/class-mobo-core-health-read-cache.php'; } // MOBO-HEALTH-SYNC-LICENSE-HARDENING-r1
+
 /**
  * Plugin Name: Mobo Core
  * Plugin URI: https://github.com/PedramDev/mobo-core
  * Description: همگام‌سازی محصولات و ثبت سفارش ووکامرس برای فروشگاه‌های ایران متصل به MoboCore و منبع mobomobo.ir.
- * Version: 10.33.44.6
+ * Version: 10.33.46
  * Author: Pedram Karimi
  * Author URI: http://mobo.codeya.ir/
  * Requires at least: 5.8
@@ -20,7 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MOBO_CORE_VERSION', '10.33.44.6' );
+define( 'MOBO_CORE_VERSION', '10.33.46' );
 define( 'MOBO_CORE_PLUGIN_FILE', __FILE__ );
 define( 'MOBO_CORE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MOBO_CORE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -97,6 +99,9 @@ add_action( 'admin_init', function() {
  */
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-autoloader.php';
 Mobo_Core_Autoloader::register();
+
+/* Durable retry hook for per-product pricing overrides. The class stays lazy-loaded. */
+add_action( 'mobo_core_apply_product_pricing_override', array( 'Mobo_Core_Product_Pricing_Policy', 'handle_retry_action' ), 10, 1 );
 
 /**
  * Detect a REST request early enough for plugins_loaded gating.
@@ -189,7 +194,6 @@ function mobo_core_has_deferred_repair() {
 		'mobo_core_stage7_resume_kick_pending',
 		'mobo_core_category_placeholder_repair_pending',
 		'mobo_core_image_queue_recovery_pending',
-		'mobo_core_product_recovery_kick_pending',
 	) as $option_name ) {
 		if ( '1' === (string) get_option( $option_name, '0' ) ) {
 			return true;
@@ -353,7 +357,7 @@ add_action(
 		 * requests when every Mobo checkout feature is disabled.
 		 */
 		$checkout_validation_master_enabled = mobo_core_bootstrap_enabled( 'mobo_core_checkout_validation_enabled', '0' );
-		$order_submission_enabled = mobo_core_bootstrap_enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$order_submission_enabled = Mobo_Core_Order_Submission_Policy::is_enabled();
 		$checkout_runtime_enabled = $order_submission_enabled
 			|| ( $checkout_validation_master_enabled && mobo_core_bootstrap_enabled( 'mobo_core_checkout_mobo_cart_validation_enabled', '0' ) )
 			|| ( $checkout_validation_master_enabled && mobo_core_bootstrap_enabled( 'mobo_core_checkout_local_stock_check_enabled', '0' ) )

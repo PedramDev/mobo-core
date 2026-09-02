@@ -59,7 +59,7 @@ class Mobo_Core_Price_Calculator {
 	 * @param string $context Context: product|variation.
 	 * @return array
 	 */
-	public function calculate_price_pair( $object_id, $price, $compare_price, $context ) {
+	public function calculate_price_pair( $object_id, $price, $compare_price, $context, $parent_id = 0 ) {
 		if ( null === $price || '' === $price ) {
 			return array(
 				'regular_price' => null,
@@ -94,6 +94,35 @@ class Mobo_Core_Price_Calculator {
 		if ( null !== $compare_price && '' !== $compare_price && '1' === $auto_compare ) {
 			$regular_base = intval( $normalized_compare_price );
 			$sale_base    = $base_price;
+		}
+
+		$product_override = class_exists( 'Mobo_Core_Product_Pricing_Policy' )
+			? Mobo_Core_Product_Pricing_Policy::resolve_for_object( $object_id, $parent_id, $context )
+			: array( 'enabled' => false );
+		if ( ! empty( $product_override['error'] ) ) {
+			return $this->invalid_price_pair( 'Mobo product pricing override identity is ambiguous: ' . sanitize_text_field( (string) $product_override['error'] ) );
+		}
+
+		/* Parent-level custom pricing is intentionally above the legacy per-variation
+		 * fixed add-on. When the parent override is disabled, the old behavior resumes
+		 * unchanged. */
+		if ( ! empty( $product_override['enabled'] ) ) {
+			$percentage = isset( $product_override['value'] ) && is_numeric( $product_override['value'] ) ? (float) $product_override['value'] : 0.0;
+			$factor = 1 + ( $percentage / 100 );
+			$regular_price = (float) $regular_base * $factor;
+			$sale_price = '';
+			if ( '' !== $sale_base ) {
+				$sale_price = (float) $sale_base * $factor;
+			}
+			return $this->format_pair(
+				$regular_price,
+				$sale_price,
+				$price,
+				$compare_price,
+				$options,
+				'product-percentage-override',
+				$context
+			);
 		}
 
 		$additional_price = $this->get_object_additional_price( $object_id );
@@ -423,6 +452,7 @@ class Mobo_Core_Price_Calculator {
 			'regular_price' => null === $regular_price ? null : wc_format_decimal( $regular_price ),
 			'sale_price'    => '' === $sale_price ? '' : wc_format_decimal( $sale_price ),
 			'error'         => '',
+			'policy_type'   => sanitize_key( (string) $price_type ),
 		);
 
 		/**
@@ -453,6 +483,7 @@ class Mobo_Core_Price_Calculator {
 			'regular_price' => array_key_exists( 'regular_price', $filtered_pair ) ? $filtered_pair['regular_price'] : $pair['regular_price'],
 			'sale_price'    => array_key_exists( 'sale_price', $filtered_pair ) ? $filtered_pair['sale_price'] : $pair['sale_price'],
 			'error'         => isset( $filtered_pair['error'] ) ? sanitize_text_field( (string) $filtered_pair['error'] ) : '',
+			'policy_type'   => $pair['policy_type'],
 		);
 	}
 

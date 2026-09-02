@@ -23,7 +23,10 @@ class Mobo_Core_Admin {
 		add_action( 'admin_bar_menu', array( $this, 'register_admin_bar_menu' ), 80 );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
 		add_action( 'admin_head-edit.php', array( $this, 'render_product_list_badge_styles' ) );
+		add_action( 'admin_footer-edit.php', array( $this, 'render_product_pricing_override_modal' ) );
 		add_filter( 'display_post_states', array( $this, 'add_mobo_product_post_state' ), 10, 2 );
+		add_filter( 'post_row_actions', array( $this, 'add_mobo_product_pricing_row_action' ), 20, 2 );
+		add_action( 'wp_ajax_mobo_core_save_product_pricing_override', array( $this, 'handle_ajax_save_product_pricing_override' ) );
 
 		add_action( 'admin_post_mobo_core_save_settings', array( $this, 'handle_save_settings' ) );
 		add_action( 'admin_post_mobo_core_rearm_wallet_alert', array( $this, 'handle_rearm_wallet_alert' ) );
@@ -38,14 +41,13 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_tool_run_cron_now', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_start_sync', array( $this, 'handle_start_sync' ) );
 		add_action( 'admin_post_mobo_core_start_repair', array( $this, 'handle_start_repair' ) );
-		add_action( 'admin_post_mobo_core_run_auto_reconciliation', array( $this, 'handle_run_auto_reconciliation' ) );
-		add_action( 'admin_post_mobo_core_run_deep_integrity', array( $this, 'handle_run_deep_integrity' ) );
 		add_action( 'admin_post_mobo_core_sync_categories', array( $this, 'handle_sync_categories' ) );
 		add_action( 'admin_post_mobo_core_resume_sync', array( $this, 'handle_resume_sync' ) );
 		add_action( 'admin_post_mobo_core_cancel_sync', array( $this, 'handle_cancel_sync' ) );
 		add_action( 'admin_post_mobo_core_reset_sync', array( $this, 'handle_reset_sync' ) );
 		add_action( 'admin_post_mobo_core_quarantine_duplicate_products', array( $this, 'handle_quarantine_duplicate_products' ) );
 		add_action( 'admin_post_mobo_core_start_reprice', array( $this, 'handle_start_reprice' ) );
+		add_action( 'admin_post_mobo_core_resume_reprice', array( $this, 'handle_resume_reprice' ) );
 		add_action( 'admin_post_mobo_core_cancel_reprice', array( $this, 'handle_cancel_reprice' ) );
 		add_action( 'admin_post_mobo_core_reset_reprice', array( $this, 'handle_reset_reprice' ) );
 		add_action( 'admin_post_mobo_core_start_recategorize', array( $this, 'handle_start_recategorize' ) );
@@ -202,6 +204,18 @@ class Mobo_Core_Admin {
 		}
 
 		$post_states['mobo_core_product'] = '<span class="mobo-product-state" title="محصول متصل به موبو"><span class="dashicons dashicons-update-alt" aria-hidden="true"></span> موبویی</span>';
+		if ( class_exists( 'Mobo_Core_Product_Pricing_Policy' ) ) {
+			$pricing = Mobo_Core_Product_Pricing_Policy::get_parent_state( $post->ID );
+			if ( 'custom' === $pricing['mode'] ) {
+				$post_states['mobo_core_pricing_override'] = '<span class="mobo-pricing-state" title="سود اختصاصی این محصول">سود اختصاصی +' . esc_html( (string) $pricing['value'] ) . '%</span>';
+			}
+			if ( ! empty( $pricing['error'] ) ) {
+				$post_states['mobo_core_pricing_error'] = '<span class="mobo-pricing-error-state" title="' . esc_attr( $pricing['error'] ) . '">خطای سیاست قیمت</span>';
+			}
+			if ( ! empty( $pricing['pending'] ) ) {
+				$post_states['mobo_core_pricing_pending'] = '<span class="mobo-pricing-pending-state" title="درخواست قیمت‌گذاری منتظر اجرای امن است">قیمت‌گذاری در صف</span>';
+			}
+		}
 		return $post_states;
 	}
 
@@ -238,8 +252,81 @@ class Mobo_Core_Admin {
 			height:14px;
 			line-height:14px;
 		}
+		.mobo-pricing-state,.mobo-pricing-pending-state,.mobo-pricing-error-state{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;line-height:18px;vertical-align:middle}
+		.mobo-pricing-state{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+		.mobo-pricing-pending-state{background:#fffbeb;border:1px solid #fcd34d;color:#92400e}
+		.mobo-pricing-error-state{background:#fcf0f1;border:1px solid #f0a8ad;color:#8a2424}
+		.mobo-pricing-row-action{font-weight:600}
 		</style>
 		<?php
+	}
+
+
+	/** Add per-product Mobo pricing action to WooCommerce product rows. */
+	public function add_mobo_product_pricing_row_action( $actions, $post ) {
+		if ( ! $post instanceof WP_Post || 'product' !== $post->post_type || ! current_user_can( 'edit_post', $post->ID ) ) { return $actions; }
+		if ( ! class_exists( 'Mobo_Core_Product_Identity_Policy' ) || ! Mobo_Core_Product_Identity_Policy::is_mobo_object_id( $post->ID ) ) { return $actions; }
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $post->ID ) ) { return $actions; }
+		$state = Mobo_Core_Product_Pricing_Policy::get_parent_state( $post->ID );
+		$actions['mobo_pricing'] = sprintf(
+			'<a href="#" class="mobo-pricing-row-action" data-product-id="%1$d" data-product-name="%2$s" data-mode="%3$s" data-value="%4$s">قیمت‌گذاری موبو</a>',
+			absint( $post->ID ), esc_attr( get_the_title( $post->ID ) ), esc_attr( $state['mode'] ), esc_attr( $state['value'] )
+		);
+		return $actions;
+	}
+
+	/** Render the small product-pricing modal only on the WooCommerce Products list. */
+	public function render_product_pricing_override_modal() {
+		$post_type = isset( $_GET['post_type'] ) ? sanitize_key( wp_unslash( $_GET['post_type'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ( 'product' !== $post_type || ! current_user_can( 'edit_products' ) ) { return; }
+		$global_type = sanitize_key( (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ) );
+		$global_description = 'static-percentage' === $global_type
+			? 'سود عمومی فعلی: ' . esc_html( (string) Mobo_Core_Settings::get( 'global_additional_percentage', '0' ) ) . '%'
+			: ( 'static-price' === $global_type ? 'سیاست عمومی فعلی: مبلغ ثابت' : 'سیاست عمومی فعلی: قیمت‌گذاری پویا' );
+		$nonce = wp_create_nonce( 'mobo_core_product_pricing_override' );
+		?>
+		<div id="mobo-pricing-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100100;align-items:center;justify-content:center">
+			<div role="dialog" aria-modal="true" aria-labelledby="mobo-pricing-title" style="direction:rtl;background:#fff;width:min(480px,calc(100vw - 32px));border-radius:10px;box-shadow:0 18px 60px rgba(0,0,0,.25);padding:22px">
+				<h2 id="mobo-pricing-title" style="margin:0 0 8px">قیمت‌گذاری اختصاصی موبو</h2>
+				<p id="mobo-pricing-product" style="margin:0 0 14px;font-weight:600"></p>
+				<label style="display:block;margin:10px 0"><input type="radio" name="mobo_pricing_mode" value="global"> استفاده از تنظیمات عمومی</label>
+				<label style="display:block;margin:10px 0"><input type="radio" name="mobo_pricing_mode" value="custom"> سود اختصاصی برای این محصول و تمام تنوع‌های موبویی آن</label>
+				<div id="mobo-pricing-custom-wrap" style="margin:12px 0"><label for="mobo-pricing-value">درصد سود اختصاصی</label><div style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="mobo-pricing-value" type="number" min="0" max="10000" step="0.01" style="width:150px" inputmode="decimal"><strong>%</strong></div></div>
+				<p style="color:#646970"><?php echo esc_html( $global_description ); ?></p>
+				<div id="mobo-pricing-message" style="display:none;margin:10px 0;padding:8px 10px;border-radius:6px"></div>
+				<div style="display:flex;gap:8px;justify-content:flex-start;margin-top:18px"><button type="button" class="button button-primary" id="mobo-pricing-save">ذخیره و قیمت‌گذاری مجدد</button><button type="button" class="button" id="mobo-pricing-cancel">انصراف</button></div>
+			</div>
+		</div>
+		<script>
+		(function(){
+			var modal=document.getElementById('mobo-pricing-modal'), pid=0, save=document.getElementById('mobo-pricing-save'), msg=document.getElementById('mobo-pricing-message'), value=document.getElementById('mobo-pricing-value'), wrap=document.getElementById('mobo-pricing-custom-wrap');
+			function mode(){var e=document.querySelector('input[name="mobo_pricing_mode"]:checked');return e?e.value:'global';}
+			function refresh(){wrap.style.display=mode()==='custom'?'block':'none';}
+			document.addEventListener('click',function(e){var a=e.target.closest('.mobo-pricing-row-action');if(!a)return;e.preventDefault();pid=parseInt(a.dataset.productId||'0',10);document.getElementById('mobo-pricing-product').textContent=a.dataset.productName||('محصول #'+pid);var m=a.dataset.mode==='custom'?'custom':'global';document.querySelector('input[name="mobo_pricing_mode"][value="'+m+'"]').checked=true;value.value=a.dataset.value||'';msg.style.display='none';refresh();modal.style.display='flex';});
+			document.querySelectorAll('input[name="mobo_pricing_mode"]').forEach(function(r){r.addEventListener('change',refresh);});
+			document.getElementById('mobo-pricing-cancel').addEventListener('click',function(){modal.style.display='none';});
+			modal.addEventListener('click',function(e){if(e.target===modal)modal.style.display='none';});
+			save.addEventListener('click',function(){var m=mode(), v=value.value;if(m==='custom'&&(v===''||isNaN(Number(v))||Number(v)<0||Number(v)>10000)){msg.textContent='درصد سود باید عددی بین ۰ تا ۱۰۰۰۰ باشد.';msg.style.cssText='display:block;margin:10px 0;padding:8px 10px;border-radius:6px;background:#fcf0f1;color:#8a2424';return;}save.disabled=true;msg.textContent='در حال ذخیره و قیمت‌گذاری…';msg.style.cssText='display:block;margin:10px 0;padding:8px 10px;border-radius:6px;background:#f0f6fc;color:#135e96';var body=new URLSearchParams({action:'mobo_core_save_product_pricing_override',nonce:'<?php echo esc_js( $nonce ); ?>',product_id:String(pid),mode:m,value:v});fetch(ajaxurl,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:body.toString()}).then(function(r){return r.json();}).then(function(r){if(!r||!r.success)throw new Error(r&&r.data&&r.data.message?r.data.message:'ذخیره انجام نشد.');msg.textContent=r.data.message||'ذخیره شد.';msg.style.cssText='display:block;margin:10px 0;padding:8px 10px;border-radius:6px;background:#edfaef;color:#166534';setTimeout(function(){window.location.reload();},650);}).catch(function(err){msg.textContent=err.message||'خطا در ذخیره.';msg.style.cssText='display:block;margin:10px 0;padding:8px 10px;border-radius:6px;background:#fcf0f1;color:#8a2424';save.disabled=false;});});
+		})();
+		</script>
+		<?php
+	}
+
+	/** Secure AJAX endpoint for the durable parent-level pricing request. */
+	public function handle_ajax_save_product_pricing_override() {
+		check_ajax_referer( 'mobo_core_product_pricing_override', 'nonce' );
+		$product_id = isset( $_POST['product_id'] ) ? absint( wp_unslash( $_POST['product_id'] ) ) : 0;
+		if ( $product_id <= 0 || ! current_user_can( 'edit_post', $product_id ) || ! current_user_can( 'edit_products' ) ) {
+			wp_send_json_error( array( 'message' => 'دسترسی برای ویرایش این محصول وجود ندارد.' ), 403 );
+		}
+		$mode = isset( $_POST['mode'] ) ? sanitize_key( wp_unslash( $_POST['mode'] ) ) : 'global';
+		$value = isset( $_POST['value'] ) ? sanitize_text_field( wp_unslash( $_POST['value'] ) ) : '';
+		$result = Mobo_Core_Product_Pricing_Policy::request( $product_id, $mode, $value );
+		if ( is_wp_error( $result ) ) { wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 ); }
+		if ( ! empty( $result['queued'] ) ) {
+			wp_send_json_success( array( 'status' => 'queued', 'message' => 'درخواست ذخیره شد و برای اجرای امن پس از آزاد شدن قفل محصول در صف قرار گرفت.' ) );
+		}
+		wp_send_json_success( array( 'status' => 'applied', 'message' => sprintf( 'سیاست قیمت‌گذاری ذخیره شد و روی %d مورد موبویی اعمال شد.', isset( $result['processed'] ) ? absint( $result['processed'] ) : 0 ) ) );
 	}
 
 
@@ -389,6 +476,70 @@ class Mobo_Core_Admin {
 	}
 
 	/**
+	 * Return the category-fallback warning when the configured fallback cannot
+	 * currently be used. Product creation itself is intentionally not blocked by
+	 * this condition; the warning exists to prevent that behavior from being
+	 * mistaken for a failed import.
+	 *
+	 * @return array Empty when healthy, otherwise title/message.
+	 */
+	private function get_category_fallback_warning() {
+		$policy            = Mobo_Core_Category_Assignment_Policy::settings();
+		$fallback          = Mobo_Core_Category_Assignment_Policy::fallback_status();
+		$mapping_required  = (bool) $policy['mapping_required'];
+		$auto_categories   = (bool) $policy['auto_categories_enabled'];
+
+		if ( 'valid' === $fallback['status'] ) {
+			return array();
+		}
+
+		if ( 'invalid' === $fallback['status'] ) {
+			$title = 'دسته‌بندی پیشفرض / جایگزین معتبر نیست';
+			$message = 'دسته‌ای که قبلاً به‌عنوان پیشفرض انتخاب شده دیگر در ووکامرس پیدا نمی‌شود. این وضعیت جلوی درج محصول را نمی‌گیرد؛ اما اگر دسته Source از طریق نگاشت، category_guid یا ساخت خودکار قابل resolve نباشد، محصول جدید می‌تواند بدون دسته‌بندی مطلوب باقی بماند.';
+		} else {
+			$title = 'دسته‌بندی پیشفرض / جایگزین انتخاب نشده است';
+			$message = 'این وضعیت جلوی درج محصول را نمی‌گیرد. محصول ابتدا در ووکامرس ذخیره می‌شود؛ اگر دسته Source از طریق نگاشت، category_guid یا ساخت خودکار قابل resolve نباشد، پلاگین fallback دیگری برای دسته‌بندی ندارد و محصول می‌تواند بدون دسته‌بندی مطلوب باقی بماند.';
+		}
+
+		if ( $mapping_required ) {
+			$message .= ' «اجباری بودن نگاشت دستی» نیز فعال است؛ در این حالت نبود mapping معتبر خودش باعث می‌شود دسته محصول تغییر نکند و دسته پیشفرض جای mapping اجباری را نمی‌گیرد.';
+		} elseif ( $auto_categories ) {
+			$message .= ' چون ساخت/همگام‌سازی خودکار دسته فعال است، پلاگین ابتدا تلاش می‌کند دسته Source را resolve یا در صورت مجاز بودن ایجاد کند و fallback فقط مسیر جایگزین است.';
+		} else {
+			$message .= ' چون بروزرسانی خودکار دسته‌بندی خاموش است، برای محصولات جدید وجود یک دسته پیشفرض معتبر اهمیت بیشتری دارد.';
+		}
+
+		$message .= ' Snapshot صریح با categories=[] همچنان یک Desired State خالی است و عمداً با دسته پیشفرض پر نمی‌شود.';
+
+		return array(
+			'title'   => $title,
+			'message' => $message,
+		);
+	}
+
+	/**
+	 * Render category fallback warning in dashboard/categories.
+	 *
+	 * @param bool $with_link Add categories-tab link.
+	 * @return void
+	 */
+	private function render_category_fallback_warning( $with_link = false ) {
+		$warning = $this->get_category_fallback_warning();
+		if ( empty( $warning ) ) {
+			return;
+		}
+		?>
+		<div class="mobo-message mobo-message-warning" data-mobo-category-fallback-warning>
+			<strong><?php echo esc_html( (string) $warning['title'] ); ?>:</strong>
+			<?php echo esc_html( (string) $warning['message'] ); ?>
+			<?php if ( $with_link ) : ?>
+				<a href="<?php echo esc_url( add_query_arg( array( 'page' => self::MENU_SLUG, 'tab' => 'categories' ), admin_url( 'admin.php' ) ) ); ?>">بررسی تنظیمات دسته‌بندی</a>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	/**
 	 * Render dashboard tab.
 	 *
 	 * @param array $status Status.
@@ -413,7 +564,7 @@ class Mobo_Core_Admin {
 					<p>برای سایت‌هایی که از نسخه‌های قدیمی مثل ۷ به نسخه جدید آمده‌اند، یک Repair کامل لازم است تا محصول‌ها، map داخلی و صف تصاویر با ساختار جدید همخوان شوند.</p>
 				</div>
 				<div class="mobo-message mobo-message-warning">
-					اگر «نوسازی تصاویر» را شروع کنید، MoboCore همین Repair کامل را در صورت نیاز خودش آغاز می‌کند و بعد از اتمام بدون درخواست اقدام دیگری وارد مراحل تصاویر می‌شود. برای نوسازی تصاویر نیازی نیست Repair را جداگانه اجرا کنید.
+					نوسازی تصاویر Repair یا Reconciliation محصولات را خودکار شروع نمی‌کند. ابتدا Repair را با تصمیم مدیر تکمیل کنید؛ سپس Workflow تصاویر فقط مراحل مربوط به رسانه را انجام می‌دهد.
 				</div>
 			</div>
 		<?php endif; ?>
@@ -449,6 +600,8 @@ class Mobo_Core_Admin {
 		<?php endif; ?>
 
 		<?php $this->render_webhook_auth_test_status(); ?>
+
+		<?php $this->render_category_fallback_warning( true ); ?>
 
 		<?php $this->render_wallet_alert_dashboard_card(); ?>
 
@@ -1128,7 +1281,7 @@ class Mobo_Core_Admin {
 		$shipping_report = $shipping_diagnostics && method_exists( $shipping_diagnostics, 'get_last_report' ) ? $shipping_diagnostics->get_last_report() : array();
 		$persian_wc_plugins = $this->get_active_persian_woocommerce_plugins();
 		$poina_allowlist_status = $this->get_poina_domain_allowlist_status();
-		$order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$order_submission_enabled = Mobo_Core_Order_Submission_Policy::is_enabled();
 		$address_mapping_enabled = $order_submission_enabled;
 		$address_checkout_active = ! empty( $address_status['checkoutActive'] );
 		$checkout_master_enabled = Mobo_Core_Settings::enabled( 'mobo_core_checkout_validation_enabled', '0' );
@@ -1453,7 +1606,7 @@ class Mobo_Core_Admin {
 					<?php $shared_cart_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'shared_mobo_cart' ) : array(); ?>
 					<?php $shared_cart_locked = is_array( $shared_cart_lock ) && ! empty( $shared_cart_lock['active'] ); ?>
 					<?php $this->status_box( 'وضعیت lock سبد موبو', $lock_disabled ? 'غیرفعال - بررسی سبد و ثبت سفارش خاموش است' : ( $shared_cart_locked ? 'فعال / در حال استفاده' : 'آزاد' ) ); ?>
-					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ? 'فعال' : 'غیرفعال' ); ?>
+					<?php $this->status_box( 'ثبت سفارش خودکار موبو', Mobo_Core_Order_Submission_Policy::is_enabled() ? 'فعال' : 'غیرفعال' ); ?>
 					<?php $this->status_box( 'آخرین نتیجه', isset( $last['success'] ) ? ( ! empty( $last['success'] ) ? 'موفق' : 'ناموفق' ) : '—' ); ?>
 					<?php $this->status_box( 'وضعیت HTTP', isset( $last['status'] ) ? absint( $last['status'] ) : '—' ); ?>
 				</div>
@@ -2173,7 +2326,8 @@ type:{mobo_order_type_label}</textarea>
 	 */
 	private function render_health_tab() {
 		$reporter       = new Mobo_Core_Health_Reporter();
-		$local          = $reporter->build_report();
+		/* Keep wp-admin rendering non-blocking; full probes belong to explicit diagnostics. */
+		$local          = $reporter->build_report( true );
 		$image          = isset( $local['imageProcessing'] ) && is_array( $local['imageProcessing'] ) ? $local['imageProcessing'] : array();
 		$cache_purge    = isset( $local['cachePurge'] ) && is_array( $local['cachePurge'] ) ? $local['cachePurge'] : array();
 		$archive_cache_queue = isset( $cache_purge['archiveQueue'] ) && is_array( $cache_purge['archiveQueue'] ) ? $cache_purge['archiveQueue'] : array();
@@ -2754,6 +2908,8 @@ type:{mobo_order_type_label}</textarea>
 					<p>اول دسته‌بندی‌ها را از موبو دریافت کنید، بعد برای هر دسته‌ی موبو یک دسته‌ی محلی ووکامرس انتخاب کنید. این نگاشت قبل از همگام‌سازی محصول استفاده می‌شود.</p>
 				</div>
 
+				<?php $this->render_category_fallback_warning( false ); ?>
+
 				<div class="mobo-fields-grid">
 					<?php $this->bool_field( 'آپدیت اتوماتیک دسته‌بندی‌های محصول', 'global_update_categories' ); ?>
 					<?php $this->bool_field( 'فعال بودن نگاشت دسته‌بندی', 'mobo_core_category_mapping_enabled' ); ?>
@@ -2763,7 +2919,7 @@ type:{mobo_order_type_label}</textarea>
 
 				<div class="mobo-note">
 					ترتیب انتخاب دسته برای محصول: نگاشت دستی، دسته همگام‌شده با category_guid، ساخت خودکار دسته جدید در صورت مجاز بودن، سپس دسته پیشفرض فقط برای محصول جدید. دسته‌های موجود ووکامرس به‌صورت پیش‌فرض بروزرسانی نمی‌شوند؛ پلاگین فقط دسته‌های جدید را می‌سازد و نام، slug، parent و متادیتای دسته‌های قبلی را تغییر نمی‌دهد.
-					اگر نگاشت اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند.
+					<strong>نبودن دسته پیشفرض باعث توقف درج محصول نمی‌شود:</strong> محصول قبل از assignment دسته ذخیره می‌شود؛ اگر هیچ مسیر دسته‌بندی قابل استفاده نباشد، محصول می‌تواند بدون دسته مطلوب باقی بماند. اگر نگاشت اجباری باشد و برای category_guid دسته محلی انتخاب نشده باشد، دسته محصول تغییر نمی‌کند و GUIDهای گمشده در meta محصول ثبت می‌شوند؛ fallback نیز جای نگاشت اجباری را نمی‌گیرد. همچنین categories=[] صریح به معنی دسته‌بندی Desired State خالی است و عمداً به fallback تبدیل نمی‌شود.
 				</div>
 
 				<?php $this->category_sync_guide_box(); ?>
@@ -3037,90 +3193,62 @@ type:{mobo_order_type_label}</textarea>
 	 * @return void
 	 */
 	private function render_sync_health_tab() {
-		$status = class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array();
-		$counts = isset( $status['counts'] ) && is_array( $status['counts'] ) ? $status['counts'] : array();
-		$state  = isset( $status['state'] ) && is_array( $status['state'] ) ? $status['state'] : array();
-		$reconciliation_runtime_enabled = class_exists( 'Mobo_Core_Reconciliation' ) && Mobo_Core_Reconciliation::runtime_enabled();
-		$interval = Mobo_Core_Settings::get_int( 'mobo_core_reconciliation_fast_interval', 3600, 900, 86400 );
-		$deep_schedule = (string) Mobo_Core_Settings::get( 'mobo_core_reconciliation_deep_schedule', 'weekly' );
+		$status = class_exists( 'Mobo_Core_Sync_Health' )
+			? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' )
+				? Mobo_Core_Sync_Health::get_operational_dashboard_status( 15, false )
+				: Mobo_Core_Sync_Health::get_dashboard_status() )
+			: array();
+		$raw_counts = isset( $status['rawCounts'] ) && is_array( $status['rawCounts'] )
+			? $status['rawCounts']
+			: ( isset( $status['counts'] ) && is_array( $status['counts'] ) ? $status['counts'] : array() );
+		$operational = isset( $status['operational'] ) && is_array( $status['operational'] ) ? $status['operational'] : array();
+		$current_products = absint( isset( $operational['currentProducts'] ) ? $operational['currentProducts'] : 0 );
+		$converged = absint( isset( $operational['converged'] ) ? $operational['converged'] : 0 );
+		$active_owner = absint( isset( $operational['activeRetryOwner'] ) ? $operational['activeRetryOwner'] : 0 );
+		$terminal_upstream = absint( isset( $operational['terminalUpstreamInvalid'] ) ? $operational['terminalUpstreamInvalid'] : 0 );
+		$unowned = absint( isset( $operational['unownedConvergenceGap'] ) ? $operational['unownedConvergenceGap'] : 0 );
+		$needs_attention = absint( isset( $operational['needsAttention'] ) ? $operational['needsAttention'] : 0 );
+		$historical_excluded = absint( isset( $operational['historicalExcluded'] ) ? $operational['historicalExcluded'] : 0 );
+		$accounting_delta = isset( $operational['accountingDelta'] ) ? intval( $operational['accountingDelta'] ) : 0;
 		?>
-		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-settings-form">
-			<input type="hidden" name="action" value="mobo_core_save_settings">
-			<input type="hidden" name="mobo_active_tab" value="sync-health">
-			<?php wp_nonce_field( 'mobo_core_save_settings', 'mobo_core_nonce' ); ?>
-
-			<div class="mobo-grid">
-				<div class="mobo-card mobo-card-wide">
-					<div class="mobo-card-head">
-						<h2>سلامت همگام‌سازی</h2>
-						<p><?php echo $reconciliation_runtime_enabled ? 'بازبینی و ترمیم خودکار از همان موتور وضعیت مطلوب وب‌هوک استفاده می‌کند و فقط محصولات تغییرکرده یا بخش محدودی از کاتالوگ را بررسی می‌کند.' : 'ثبت نتیجه Webhook برای گزارش سلامت فعال است؛ اجرای ترمیم خودکار Reconciliation در این نسخه متوقف شده است.'; ?></p>
-					</div>
-					<div class="mobo-status-grid">
-						<?php $this->status_box( 'محصولات هماهنگ', absint( isset( $counts['synced'] ) ? $counts['synced'] : 0 ) ); ?>
-						<?php $this->status_box( 'محصولات عقب‌مانده', absint( isset( $counts['behind'] ) ? $counts['behind'] : 0 ) ); ?>
-						<?php $this->status_box( 'محصولات خطادار', absint( isset( $counts['failed'] ) ? $counts['failed'] : 0 ) ); ?>
-						<?php $this->status_box( 'در انتظار ترمیم', absint( isset( $status['pendingRepair'] ) ? $status['pendingRepair'] : 0 ) ); ?>
-						<?php $this->status_box( 'آخرین بررسی', ! empty( $status['lastCheckAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastCheckAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'بررسی بعدی', ! empty( $status['nextCheckAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextCheckAt'] ) ) : '—' ); ?>
-						<?php $this->status_box( 'روش تشخیص تغییر', ! empty( $status['endpointSupport'] ) ? $status['endpointSupport'] : 'unknown' ); ?>
-						<?php $this->status_box( 'حالت فعلی', ! empty( $state['mode'] ) ? $state['mode'] . ' / ' . ( isset( $state['phase'] ) ? $state['phase'] : '' ) : 'idle' ); ?>
-					</div>
+		<div class="mobo-grid">
+			<div class="mobo-card mobo-card-wide">
+				<div class="mobo-card-head">
+					<h2>سلامت همگام‌سازی</h2>
+					<p>اعداد اصلی این بخش از Product Map فعلی و محصول Live ووکامرس محاسبه می‌شوند. رکوردهای تاریخی Sync Health جداگانه نمایش داده می‌شوند و دیگر به‌عنوان خرابی محصول فعلی شمرده نمی‌شوند.</p>
+				</div>
+				<div class="mobo-status-grid">
+					<?php $this->status_box( 'محصولات فعلی Mobo', $current_products ); ?>
+					<?php $this->status_box( 'هماهنگ عملیاتی', $converged ); ?>
+					<?php $this->status_box( 'دارای Retry فعال', $active_owner ); ?>
+					<?php $this->status_box( 'شکاف بدون Recovery Owner', $unowned ); ?>
+					<?php $this->status_box( 'مسدود توسط داده نامعتبر منبع', $terminal_upstream ); ?>
+					<?php $this->status_box( 'نیازمند رسیدگی عملیاتی', $needs_attention ); ?>
+					<?php $this->status_box( 'رکورد تاریخی حذف‌شده از محاسبه', $historical_excluded ); ?>
+					<?php $this->status_box( 'Recovery خودکار', 'غیرفعال؛ فقط Retry durable موجود' ); ?>
 				</div>
 
-				<div class="mobo-card mobo-card-wide">
-					<div class="mobo-card-head">
-						<h2>تنظیمات بازبینی و ترمیم خودکار</h2>
-						<?php if ( $reconciliation_runtime_enabled ) : ?>
-							<p>در حالت Revision endpoint فقط شناسه محصولات تغییرکرده دریافت می‌شود. اگر Portal endpoint را نداشته باشد، Rolling Fallback در هر اجرا فقط Batch تنظیم‌شده را بررسی می‌کند.</p>
-						<?php else : ?>
-							<p>Reconciliation در این نسخه از داخل افزونه غیرفعال است. Webhook، Sync و گزارش سلامت مستقل از این مکانیزم ادامه می‌یابند.</p>
-						<?php endif; ?>
-					</div>
-					<?php if ( $reconciliation_runtime_enabled ) : ?>
-						<div class="mobo-fields-grid">
-						<?php $this->bool_field( 'فعال‌سازی بازبینی و ترمیم خودکار', 'mobo_core_auto_reconciliation_enabled' ); ?>
-						<div class="mobo-field">
-							<label for="mobo_core_reconciliation_fast_interval">فاصله بررسی سریع</label>
-							<select id="mobo_core_reconciliation_fast_interval" name="mobo_core_reconciliation_fast_interval">
-								<?php foreach ( array( 900 => '۱۵ دقیقه', 1800 => '۳۰ دقیقه', 3600 => '۱ ساعت', 10800 => '۳ ساعت', 21600 => '۶ ساعت', 43200 => '۱۲ ساعت', 86400 => 'روزانه' ) as $value => $label ) : ?>
-									<option value="<?php echo esc_attr( $value ); ?>" <?php selected( $interval, $value ); ?>><?php echo esc_html( $label ); ?></option>
-								<?php endforeach; ?>
-							</select>
-						</div>
-						<?php $this->int_field( 'Products Per Run', 'mobo_core_reconciliation_products_per_run', 10, 500 ); ?>
-						<?php $this->int_field( 'Variation Batch', 'mobo_core_reconciliation_variation_batch', 100, 10000 ); ?>
-						<div class="mobo-field">
-							<label for="mobo_core_reconciliation_deep_schedule">بازبینی عمیق یکپارچگی</label>
-							<select id="mobo_core_reconciliation_deep_schedule" name="mobo_core_reconciliation_deep_schedule">
-								<option value="daily" <?php selected( $deep_schedule, 'daily' ); ?>>روزانه</option>
-								<option value="weekly" <?php selected( $deep_schedule, 'weekly' ); ?>>هفتگی</option>
-							</select>
-						</div>
-						</div>
-						<div class="mobo-help">Default: یک ساعت، ۱۰۰ محصول، ۱۰۰۰ Variation و Deep Check هفتگی.</div>
-					<?php else : ?>
-						<input type="hidden" name="mobo_core_auto_reconciliation_enabled" value="0">
-						<div class="mobo-help">اجرای زمان‌بندی‌شده، اجرای دستی و ادامه state نیمه‌کاره همگی متوقف شده‌اند.</div>
-					<?php endif; ?>
-				</div>
-			</div>
-			<?php if ( $reconciliation_runtime_enabled ) { $this->save_button(); } ?>
-		</form>
+				<div class="mobo-help"><strong>Raw Sync Health history:</strong>
+					synced=<?php echo esc_html( number_format_i18n( absint( isset( $raw_counts['synced'] ) ? $raw_counts['synced'] : 0 ) ) ); ?>،
+					behind=<?php echo esc_html( number_format_i18n( absint( isset( $raw_counts['behind'] ) ? $raw_counts['behind'] : 0 ) ) ); ?>،
+					failed=<?php echo esc_html( number_format_i18n( absint( isset( $raw_counts['failed'] ) ? $raw_counts['failed'] : 0 ) ) ); ?>.
+					این اعداد تاریخچه ثبت‌شده‌اند و denominator سلامت فعلی نیستند.</div>
+				<div class="mobo-help"><strong>حالت بررسی:</strong> سریع و هدفمند؛ Deep Scan کل Variationهای Catalog هنگام بازشدن صفحه اجرا نمی‌شود.</div>
 
-		<?php if ( $reconciliation_runtime_enabled ) : ?>
-			<div class="mobo-inline-actions">
-			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
-				<input type="hidden" name="action" value="mobo_core_run_auto_reconciliation">
-				<?php wp_nonce_field( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' ); ?>
-				<button type="submit" class="button button-primary">اجرای ترمیم</button>
-			</form>
-			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="mobo-inline-action-form">
-				<input type="hidden" name="action" value="mobo_core_run_deep_integrity">
-				<?php wp_nonce_field( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' ); ?>
-				<button type="submit" class="button button-secondary">اجرای بازبینی عمیق</button>
-			</form>
+				<?php if ( 0 !== $accounting_delta ) : ?>
+					<div class="mobo-help"><strong>خطای محاسباتی:</strong> جمع دسته‌بندی عملیاتی با تعداد Product Map فعلی تطابق ندارد (delta=<?php echo esc_html( (string) $accounting_delta ); ?>). این وضعیت باید قبل از Release بررسی شود.</div>
+				<?php elseif ( $unowned > 0 ) : ?>
+					<div class="mobo-help"><strong>هشدار:</strong> <?php echo esc_html( number_format_i18n( $unowned ) ); ?> محصول فعلی واقعاً ناقص است و هیچ event فعال، terminal upstream-invalid معتبر یا مدرک durable برای convergence ندارد.</div>
+				<?php elseif ( $active_owner > 0 ) : ?>
+					<div class="mobo-help"><?php echo esc_html( number_format_i18n( $active_owner ) ); ?> محصول فعلی ناقص است اما Retry durable فعال دارد؛ Sync Health خودش Recovery اجرا نمی‌کند.</div>
+				<?php elseif ( $terminal_upstream > 0 ) : ?>
+					<div class="mobo-help">شکاف داخلی بدون Owner دیده نشد؛ <?php echo esc_html( number_format_i18n( $terminal_upstream ) ); ?> محصول به دلیل داده نامعتبر terminal در منبع مسدود است و باید از سمت داده ورودی اصلاح شود.</div>
+				<?php else : ?>
+					<div class="mobo-help">برای Product Map فعلی شکاف عملیاتی بدون Owner مشاهده نشد.</div>
+				<?php endif; ?>
+				<div class="mobo-help">behind/failed خام به‌تنهایی اجرای بعدی ایجاد نمی‌کند. فقط event durable در pending/processing یا Webhook/Product Sync جدید می‌تواند پردازش همان محصول را ادامه دهد.</div>
 			</div>
-		<?php endif; ?>
+		</div>
 		<?php
 	}
 
@@ -3132,12 +3260,18 @@ type:{mobo_order_type_label}</textarea>
 		$message           = isset( $automation_status['message'] ) ? sanitize_text_field( (string) $automation_status['message'] ) : '';
 		$queue_status      = class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ? ( new Mobo_Core_Image_Refresh_Queue() )->get_status() : array();
 		$repair_status     = class_exists( 'Mobo_Core_Product_Sync' ) ? ( new Mobo_Core_Product_Sync() )->get_manual_sync_status() : array();
+		$generation_stats  = isset( $automation_status['generationStats'] ) && is_array( $automation_status['generationStats'] ) ? $automation_status['generationStats'] : array();
+		$fresh_downloads   = absint( isset( $generation_stats['freshDownloads'] ) ? $generation_stats['freshDownloads'] : 0 );
+		$reused_links      = absint( isset( $generation_stats['reusedLinks'] ) ? $generation_stats['reusedLinks'] : 0 );
+		$bytes_before      = absint( isset( $generation_stats['bytesBefore'] ) ? $generation_stats['bytesBefore'] : 0 );
+		$bytes_after       = absint( isset( $generation_stats['bytesAfter'] ) ? $generation_stats['bytesAfter'] : 0 );
+		$bytes_saved       = max( 0, $bytes_before - $bytes_after );
 		$live_refresh_nonce    = wp_create_nonce( 'mobo_core_image_refresh_live_status' );
 		$live_refresh_interval = $automation_active ? 4000 : 12000;
 
 		$step_labels = array(
-			0 => 'آماده سازی و Repair خودکار محصولات',
-			1 => 'بررسی تصاویر قدیمی',
+			0 => 'پاک‌سازی اولیه و بررسی پیش‌نیاز',
+			1 => 'بررسی تصاویر Mobo و منبع آن‌ها',
 			2 => 'ساخت صف نوسازی',
 			3 => 'دریافت و جایگزینی تصاویر',
 			4 => 'بررسی سلامت برش های WebP',
@@ -3152,14 +3286,42 @@ type:{mobo_order_type_label}</textarea>
 			$current_stage = 'کامل شده';
 		}
 		if ( 0 === $automation_step && ! empty( $repair_status['repairMode'] ) && ( ! empty( $repair_status['isRunning'] ) || ! empty( $repair_status['isWaitingForPortal'] ) ) ) {
-			$current_stage = 'Repair خودکار محصولات - ' . absint( isset( $repair_status['progressPercent'] ) ? $repair_status['progressPercent'] : 0 ) . '٪';
+			$current_stage = 'Repair مستقل محصولات - ' . absint( isset( $repair_status['progressPercent'] ) ? $repair_status['progressPercent'] : 0 ) . '٪';
 		}
+
+		$stage_done    = 0;
+		$stage_total   = 0;
+		$stage_detail  = '';
+		if ( 1 === $automation_step ) {
+			$scan        = get_option( 'mobo_core_image_refresh_last_scan', array() );
+			$scan        = is_array( $scan ) ? $scan : array();
+			$stage_done  = absint( isset( $scan['scanned'] ) ? $scan['scanned'] : 0 );
+			$stage_total = absint( isset( $scan['estimatedTotal'] ) ? $scan['estimatedTotal'] : 0 );
+			$stage_detail = sprintf( '%s تصویر بررسی شده', number_format_i18n( $stage_done ) );
+		} elseif ( 2 === $automation_step ) {
+			$enqueue     = get_option( 'mobo_core_image_refresh_last_enqueue', array() );
+			$enqueue     = is_array( $enqueue ) ? $enqueue : array();
+			$stage_done  = absint( isset( $enqueue['scanned'] ) ? $enqueue['scanned'] : 0 );
+			$stage_total = absint( isset( $enqueue['estimatedTotal'] ) ? $enqueue['estimatedTotal'] : 0 );
+			$stage_detail = sprintf( '%s ردیف بررسی و %s ردیف وارد صف شده', number_format_i18n( $stage_done ), number_format_i18n( absint( isset( $enqueue['enqueued'] ) ? $enqueue['enqueued'] : 0 ) + absint( isset( $enqueue['requeued'] ) ? $enqueue['requeued'] : 0 ) ) );
+		} elseif ( 3 === $automation_step ) {
+			$stage_done  = absint( isset( $queue_status['done'] ) ? $queue_status['done'] : 0 ) + absint( isset( $queue_status['skipped'] ) ? $queue_status['skipped'] : 0 ) + absint( isset( $queue_status['failed'] ) ? $queue_status['failed'] : 0 );
+			$stage_total = $stage_done + absint( isset( $queue_status['pending'] ) ? $queue_status['pending'] : 0 );
+			$stage_detail = sprintf( '%s تمام‌شده، %s باقی‌مانده', number_format_i18n( $stage_done ), number_format_i18n( absint( isset( $queue_status['pending'] ) ? $queue_status['pending'] : 0 ) ) );
+		} elseif ( 'completed' === $automation_state ) {
+			$stage_done = 1;
+			$stage_total = 1;
+			$stage_detail = 'چرخه کامل شده است';
+		} else {
+			$stage_detail = '' !== $message ? $message : 'این مرحله در batchهای کوچک و خودکار ادامه پیدا می‌کند.';
+		}
+		$stage_percent = $stage_total > 0 ? min( 100, round( ( $stage_done / $stage_total ) * 100, 1 ) ) : 0;
 		?>
 		<div id="mobo-image-refresh-live-root" data-mobo-image-refresh-live-root data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( $live_refresh_nonce ); ?>" data-refresh-interval="<?php echo esc_attr( $live_refresh_interval ); ?>" data-automation-active="<?php echo $automation_active ? '1' : '0'; ?>">
 			<div class="mobo-card mobo-card-wide">
 				<div class="mobo-card-head">
-					<h2>نوسازی خودکار تصاویر</h2>
-					<p>مدیر سایت فقط این عملیات را شروع می کند. از Repair محصولات تا Retry خطاها، بررسی سلامت WebP، انتقال مراجع و پاکسازی امن، تمام تصمیم ها توسط خود MoboCore انجام می شوند.</p>
+					<h2>نوسازی کامل تصاویر از منبع</h2>
+					<p>تصاویر Mobo حتی با URL یکسان و WebP سالم، یک‌بار در هر چرخه با cache-bust از منبع دوباره دریافت و جایگزین می‌شوند. Shared Media همچنان در اختیار Worker مرکزی می‌ماند و Repair/Reconciliation مستقل است.</p>
 				</div>
 
 				<div class="mobo-status-grid">
@@ -3168,6 +3330,17 @@ type:{mobo_order_type_label}</textarea>
 					<?php $this->status_box( 'صف باقی مانده', absint( isset( $queue_status['pending'] ) ? $queue_status['pending'] : 0 ) ); ?>
 					<?php $this->status_box( 'انجام شده', absint( isset( $queue_status['done'] ) ? $queue_status['done'] : 0 ) ); ?>
 					<?php $this->status_box( 'قرنطینه شده', absint( isset( $queue_status['failed'] ) ? $queue_status['failed'] : 0 ) ); ?>
+					<?php $this->status_box( 'دریافت تازه', $fresh_downloads ); ?>
+					<?php $this->status_box( 'صرفه‌جویی ثبت‌شده', size_format( $bytes_saved, 1 ) ); ?>
+				</div>
+
+				<div class="mobo-progress-wrap">
+					<div class="mobo-progress-meta">
+						<span><?php echo esc_html( 'گام ' . min( 9, $automation_step ) . ' از 9 — ' . $current_stage ); ?></span>
+						<strong><?php echo esc_html( number_format_i18n( $stage_percent, 1 ) ); ?>٪</strong>
+					</div>
+					<div class="mobo-progress"><div style="width: <?php echo esc_attr( $stage_percent ); ?>%;"></div></div>
+					<p class="description"><?php echo esc_html( $stage_detail ); ?><?php echo $reused_links > 0 ? esc_html( ' — استفاده مجدد بدون دانلود تکراری: ' . number_format_i18n( $reused_links ) ) : ''; ?></p>
 				</div>
 
 				<div class="mobo-alert <?php echo 'completed' === $automation_state ? 'mobo-alert-success' : 'mobo-alert-info'; ?>">
@@ -3178,7 +3351,7 @@ type:{mobo_order_type_label}</textarea>
 					<input type="hidden" name="action" value="mobo_core_start_image_refresh_automation">
 					<?php wp_nonce_field( 'mobo_core_start_image_refresh_automation', 'mobo_core_nonce' ); ?>
 					<button type="submit" class="button button-primary" <?php disabled( $automation_active ); ?>>
-						<?php echo esc_html( $automation_active ? 'نوسازی تصاویر در حال اجراست' : 'نوسازی تصاویر' ); ?>
+						<?php echo esc_html( $automation_active ? 'نوسازی کامل در حال اجراست' : 'نوسازی کامل تصاویر از منبع' ); ?>
 					</button>
 				</form>
 
@@ -4747,7 +4920,8 @@ type:{mobo_order_type_label}</textarea>
 		$status = $queue ? $queue->get_status() : array();
 		$state = isset( $status['status'] ) ? (string) $status['status'] : 'idle';
 		$percent = isset( $status['percent'] ) ? (float) $status['percent'] : 0;
-		$is_running = 'running' === $state;
+		$is_running   = 'running' === $state;
+		$is_cancelled = 'cancelled' === $state;
 		?>
 		<div class="mobo-card" id="mobo-reprice-status-card" data-ajax-url="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>" data-nonce="<?php echo esc_attr( wp_create_nonce( 'mobo_core_reprice_status' ) ); ?>">
 			<div class="mobo-card-head">
@@ -4786,17 +4960,24 @@ type:{mobo_order_type_label}</textarea>
 			</div>
 
 			<div class="mobo-actions">
-				<?php if ( ! $is_running ) : ?>
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
-						<input type="hidden" name="action" value="mobo_core_start_reprice">
-						<?php wp_nonce_field( 'mobo_core_start_reprice', 'mobo_core_nonce' ); ?>
-						<button type="submit" class="mobo-btn mobo-btn-primary">اعمال مجدد قیمت روی همه محصولات</button>
-					</form>
-				<?php else : ?>
+				<?php if ( $is_running ) : ?>
 					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 						<input type="hidden" name="action" value="mobo_core_cancel_reprice">
 						<?php wp_nonce_field( 'mobo_core_cancel_reprice', 'mobo_core_nonce' ); ?>
 						<button type="submit" class="mobo-btn mobo-btn-danger">توقف اعمال قیمت</button>
+					</form>
+				<?php else : ?>
+					<?php if ( $is_cancelled ) : ?>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+							<input type="hidden" name="action" value="mobo_core_resume_reprice">
+							<?php wp_nonce_field( 'mobo_core_resume_reprice', 'mobo_core_nonce' ); ?>
+							<button type="submit" class="mobo-btn mobo-btn-primary">ادامه اعمال قیمت</button>
+						</form>
+					<?php endif; ?>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+						<input type="hidden" name="action" value="mobo_core_start_reprice">
+						<?php wp_nonce_field( 'mobo_core_start_reprice', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="mobo-btn <?php echo $is_cancelled ? 'mobo-btn-light' : 'mobo-btn-primary'; ?>">اعمال مجدد قیمت روی همه محصولات از ابتدا</button>
 					</form>
 				<?php endif; ?>
 
@@ -5874,11 +6055,11 @@ type:{mobo_order_type_label}</textarea>
 			update_option( 'mobo_core_checkout_mobo_debug_enabled', '0', false );
 		}
 
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
+		if ( ! Mobo_Core_Order_Submission_Policy::is_enabled() ) {
 			update_option( 'mobo_core_mobo_order_auto_complete_enabled', '0', false );
 		}
 
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
+		if ( Mobo_Core_Order_Submission_Policy::is_enabled() ) {
 			/* Address mapping is mandatory for automatic Mobo order submission. */
 			update_option( 'mobo_core_address_mapping_enabled', '1', false );
 		}
@@ -6018,31 +6199,7 @@ type:{mobo_order_type_label}</textarea>
 
 
 			case 'sync-health':
-				/* Reconciliation is intentionally disabled at build level. Cached/old
-				 * admin forms must not be able to turn its stored option back on. */
-				if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
-					update_option( 'mobo_core_auto_reconciliation_enabled', '0', false );
-					break;
-				}
-				$this->save_bool_options_from_post( array( 'mobo_core_auto_reconciliation_enabled' ) );
-				$this->save_int_options_from_post(
-					array(
-						'mobo_core_reconciliation_fast_interval' => array( 900, 86400 ),
-						'mobo_core_reconciliation_products_per_run' => array( 10, 500 ),
-						'mobo_core_reconciliation_variation_batch' => array( 100, 10000 ),
-					)
-				);
-				if ( isset( $_POST['mobo_core_reconciliation_fast_interval'] ) ) {
-					$interval = absint( wp_unslash( $_POST['mobo_core_reconciliation_fast_interval'] ) );
-					if ( ! in_array( $interval, array( 900, 1800, 3600, 10800, 21600, 43200, 86400 ), true ) ) {
-						$interval = 3600;
-					}
-					update_option( 'mobo_core_reconciliation_fast_interval', $interval, false );
-				}
-				if ( isset( $_POST['mobo_core_reconciliation_deep_schedule'] ) ) {
-					$schedule = sanitize_key( wp_unslash( $_POST['mobo_core_reconciliation_deep_schedule'] ) );
-					update_option( 'mobo_core_reconciliation_deep_schedule', in_array( $schedule, array( 'daily', 'weekly' ), true ) ? $schedule : 'weekly', false );
-				}
+				/* Sync Health is observational only; retired reconciliation settings are ignored. */
 				break;
 
 			case 'image-refresh':
@@ -6436,7 +6593,7 @@ type:{mobo_order_type_label}</textarea>
 			}
 		}
 
-		$was_order_submission_enabled = Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		$was_order_submission_enabled = Mobo_Core_Order_Submission_Policy::is_enabled();
 
 		$this->save_current_tab_settings( $tab );
 
@@ -6527,8 +6684,8 @@ type:{mobo_order_type_label}</textarea>
 			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'cron' );
 		}
 
-		if ( 'checkout' === $tab && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
-			if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
+		if ( 'checkout' === $tab && Mobo_Core_Order_Submission_Policy::is_enabled() ) {
+			if ( Mobo_Core_Order_Submission_Policy::is_enabled() && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
 				$address_mapping = new Mobo_Core_Address_Mapping();
 				$address_status  = method_exists( $address_mapping, 'get_status' ) ? $address_mapping->get_status() : array();
 				$counts = isset( $address_status['counts'] ) && is_array( $address_status['counts'] ) ? $address_status['counts'] : array();
@@ -6545,7 +6702,7 @@ type:{mobo_order_type_label}</textarea>
 				}
 			}
 
-			if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
+			if ( Mobo_Core_Order_Submission_Policy::is_enabled() ) {
 				$required_validation = $this->validate_mobo_order_submission_required_config();
 				if ( is_wp_error( $required_validation ) ) {
 					$this->redirect_with_message( $required_validation->get_error_message(), 'error', 'checkout' );
@@ -6558,7 +6715,7 @@ type:{mobo_order_type_label}</textarea>
 		 * durable queue and should resume without waiting for the next external cron. */
 		if ( 'checkout' === $tab
 			&& ! $was_order_submission_enabled
-			&& Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' )
+			&& Mobo_Core_Order_Submission_Policy::is_enabled()
 			&& class_exists( 'Mobo_Core_Self_Runner' )
 		) {
 			Mobo_Core_Self_Runner::kick( 'auto-order-re-enabled', true );
@@ -6593,21 +6750,86 @@ type:{mobo_order_type_label}</textarea>
 		 * such as "UpdateVariant processed." without showing an error.
 		 *
 		 * As a safe fallback, when a running sync has made no progress for a short
-		 * period, the authenticated admin poll advances exactly one manual-sync step.
-		 * This keeps the UI moving without creating parallel workers.
+		 * period, the authenticated admin poll advances a small time-bounded burst
+		 * of canonical manual-sync steps. This keeps the UI moving without creating
+		 * parallel workers or bypassing any normal lock/checkpoint boundary.
 		 */
+		$admin_fallback = array(
+			'attempted'  => false,
+			'steps'      => 0,
+			'stopReason' => 'not-needed',
+		);
+
 		if ( ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
 			$updated_at = isset( $status['updatedAt'] ) ? absint( $status['updatedAt'] ) : 0;
-			$is_stale   = $updated_at > 0 && ( time() - $updated_at ) >= 8;
+			/*
+			 * The admin page polls every three seconds. Waiting eight seconds before
+			 * advancing one fallback step made Repair effectively unusable on hosts
+			 * where loopback/Self Runner is unavailable: a product needs several
+			 * durable steps (page fetch, parent, image desired-state, variants, final).
+			 *
+			 * Treat one missed poll as degraded runner health, then execute a small
+			 * cooperative catch-up burst. Every iteration still enters
+			 * run_manual_sync_step(), so the canonical manual_sync lease, product
+			 * locks, ordering fences and durable checkpoints remain authoritative.
+			 */
+			$stale_after_seconds = ! empty( $status['repairMode'] ) ? 3 : 5;
+			$is_stale            = $updated_at > 0 && ( time() - $updated_at ) >= $stale_after_seconds;
 
 			if ( $is_stale ) {
-				/* run_manual_sync_step() owns the worker lease itself. */
-				$product_sync->run_manual_sync_step();
-				$status = $product_sync->get_manual_sync_status();
+				$admin_fallback['attempted'] = true;
+				$admin_fallback['stopReason'] = 'step-limit';
+				$max_steps = ! empty( $status['repairMode'] ) ? 4 : 3;
+				$deadline  = microtime( true ) + ( ! empty( $status['repairMode'] ) ? 2.25 : 1.50 );
+
+				while ( $admin_fallback['steps'] < $max_steps && microtime( true ) < $deadline ) {
+					/* Foreground Webhook freshness always wins over Repair catch-up. */
+					if ( class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
+						$priority_queue = new Mobo_Core_Webhook_Queue();
+						if ( method_exists( $priority_queue, 'has_priority_work_due_now' ) && $priority_queue->has_priority_work_due_now() ) {
+							$admin_fallback['stopReason'] = 'webhook-pressure';
+							break;
+						}
+					}
+
+					$before = $this->manual_sync_progress_fingerprint( $status );
+					$step   = $product_sync->run_manual_sync_step();
+					$admin_fallback['steps']++;
+					$status = $product_sync->get_manual_sync_status();
+
+					if ( empty( $step['success'] ) || ! empty( $status['lastError'] ) ) {
+						$admin_fallback['stopReason'] = 'error';
+						break;
+					}
+
+					if ( ! empty( $step['data']['locked'] ) ) {
+						$admin_fallback['stopReason'] = 'worker-locked';
+						break;
+					}
+
+					if ( empty( $status['shouldContinue'] ) ) {
+						$admin_fallback['stopReason'] = ! empty( $status['isDone'] ) ? 'done' : 'not-runnable';
+						break;
+					}
+
+					if ( $before === $this->manual_sync_progress_fingerprint( $status ) ) {
+						/* A successful step that made no observable cursor/state progress must
+						 * not be hot-looped by the browser fallback. */
+						$admin_fallback['stopReason'] = 'no-progress';
+						break;
+					}
+
+					if ( microtime( true ) >= $deadline ) {
+						$admin_fallback['stopReason'] = 'time-budget';
+						break;
+					}
+				}
 			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
 				Mobo_Core_Self_Runner::kick( 'admin-status-continue', false );
 			}
 		}
+
+		$status['adminFallback'] = $admin_fallback;
 
 		/*
 		 * Product sync no longer blocks on images, otherwise one slow/bad source image
@@ -6622,8 +6844,17 @@ type:{mobo_order_type_label}</textarea>
 			$image_poll_limit    = max( 3, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
 			$image_queue_result  = array( 'processed' => 0, 'failed' => 0, 'status' => 'skipped' );
 
-			if ( ! empty( $image_queue_before['due'] ) ) {
+			/* If this admin request had to rescue a stalled Sync/Repair, spend the
+			 * request budget on authoritative product progress. Image desired-state is
+			 * already durable in its queue and can be drained by the Self/Real Cron
+			 * worker or a later idle poll. This avoids slow image I/O immediately after
+			 * the catch-up burst making Repair appear stalled again. */
+			$repair_catchup_active = ! empty( $status['repairMode'] ) && ! empty( $admin_fallback['steps'] );
+
+			if ( ! $repair_catchup_active && ! empty( $image_queue_before['due'] ) ) {
 				$image_queue_result = $image_sync->process_queue( $image_poll_limit );
+			} elseif ( $repair_catchup_active ) {
+				$image_queue_result['status'] = 'deferred-for-repair-catchup';
 			}
 
 			$status['imageQueue'] = array(
@@ -6641,6 +6872,46 @@ type:{mobo_order_type_label}</textarea>
 
 		wp_send_json_success( $status );
 	}
+
+	/**
+	 * Build a compact observable progress fingerprint for browser-side Sync fallback.
+	 *
+	 * This intentionally contains only durable/cursor fields. Messages and wall-clock
+	 * timestamps are excluded so a repeated no-op step cannot masquerade as progress.
+	 *
+	 * @param array $status Manual sync status.
+	 * @return string
+	 */
+	private function manual_sync_progress_fingerprint( $status ) {
+		$status = is_array( $status ) ? $status : array();
+
+		$progress = array(
+			'status'                     => sanitize_key( (string) ( $status['status'] ?? '' ) ),
+			'repairIntegrityPhase'       => sanitize_key( (string) ( $status['repairIntegrityPhase'] ?? '' ) ),
+			'repairIntegrityCursor'      => absint( $status['repairIntegrityCursor'] ?? 0 ),
+			'repairIntegrityComplete'    => ! empty( $status['repairIntegrityComplete'] ),
+			'categorySynced'             => ! empty( $status['categorySynced'] ),
+			'productPage'                => absint( $status['productPage'] ?? 0 ),
+			'productCursor'              => absint( $status['productCursor'] ?? 0 ),
+			'queuedProducts'             => absint( $status['queuedProducts'] ?? 0 ),
+			'currentProductGuid'         => sanitize_text_field( (string) ( $status['currentProductGuid'] ?? '' ) ),
+			'currentProductImageOffset'  => absint( $status['currentProductImageOffset'] ?? 0 ),
+			'currentProductImagesDone'   => ! empty( $status['currentProductImagesDone'] ),
+			'variantPage'                => absint( $status['variantPage'] ?? 0 ),
+			'currentVariantCursor'       => absint( $status['currentVariantCursor'] ?? 0 ),
+			'currentVariantProcessedPages'=> absint( $status['currentVariantProcessedPages'] ?? 0 ),
+			'processedProducts'          => absint( $status['processedProducts'] ?? 0 ),
+			'postSyncIntegrityPhase'     => sanitize_key( (string) ( $status['postSyncIntegrityPhase'] ?? '' ) ),
+			'postSyncIntegrityCursor'    => absint( $status['postSyncIntegrityCursor'] ?? 0 ),
+			'postSyncIntegrityComplete'  => ! empty( $status['postSyncIntegrityComplete'] ),
+			'missingImageRecoveryCursor'=> absint( $status['missingImageRecoveryCursor'] ?? 0 ),
+			'missingImageRecoveryScanned'=> absint( $status['missingImageRecoveryScanned'] ?? 0 ),
+			'missingImageRecoveryComplete'=> ! empty( $status['missingImageRecoveryComplete'] ),
+		);
+
+		return md5( wp_json_encode( $progress ) );
+	}
+
 
 	/**
 	 * Return current repricing status for AJAX polling on the pricing tab.
@@ -6883,47 +7154,6 @@ type:{mobo_order_type_label}</textarea>
 	}
 
 
-	/**
-	 * Force one fast reconciliation run.
-	 *
-	 * @return void
-	 */
-	public function handle_run_auto_reconciliation() {
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
-		}
-		check_admin_referer( 'mobo_core_run_auto_reconciliation', 'mobo_core_nonce' );
-		if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
-			$this->redirect_with_message( 'Reconciliation در این نسخه از داخل افزونه غیرفعال است.', 'warning', 'sync-health' );
-		}
-		$service = new Mobo_Core_Reconciliation();
-		$result  = $service->run_tick( 'admin-fast-repair', true, false );
-		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
-			Mobo_Core_Self_Runner::kick( 'admin-fast-repair', true );
-		}
-		$this->redirect_with_message( ! empty( $result['success'] ) ? 'بازبینی و ترمیم خودکار اجرا شد.' : 'بازبینی و ترمیم خودکار با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
-	}
-
-	/**
-	 * Force a complete deep integrity pass.
-	 *
-	 * @return void
-	 */
-	public function handle_run_deep_integrity() {
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
-		}
-		check_admin_referer( 'mobo_core_run_deep_integrity', 'mobo_core_nonce' );
-		if ( ! class_exists( 'Mobo_Core_Reconciliation' ) || ! Mobo_Core_Reconciliation::runtime_enabled() ) {
-			$this->redirect_with_message( 'بازبینی عمیق Reconciliation در این نسخه غیرفعال است.', 'warning', 'sync-health' );
-		}
-		$service = new Mobo_Core_Reconciliation();
-		$result  = $service->run_tick( 'admin-deep-integrity', true, true );
-		if ( ! empty( $result['needsContinuation'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
-			Mobo_Core_Self_Runner::kick( 'admin-deep-integrity', true );
-		}
-		$this->redirect_with_message( ! empty( $result['success'] ) ? 'بازبینی عمیق یکپارچگی شروع شد.' : 'بازبینی عمیق یکپارچگی با خطا مواجه شد.', ! empty( $result['success'] ) ? 'success' : 'error', 'sync-health' );
-	}
 
 	/**
 	 * Resume a waiting manual sync without resetting cursor/page state.
@@ -7029,6 +7259,38 @@ type:{mobo_order_type_label}</textarea>
 		} catch ( Throwable $e ) {
 			Mobo_Core_Logger::error( 'Mobo Core reprice start failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'شروع اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+	/**
+	 * Resume a manually cancelled repricing generation.
+	 *
+	 * @return void
+	 */
+	public function handle_resume_reprice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_resume_reprice', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$queue  = new Mobo_Core_Reprice_Queue();
+			$result = $queue->resume();
+
+			if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-reprice-resume', true );
+			}
+
+			$message = isset( $result['message'] ) ? $result['message'] : 'اعمال مجدد قیمت ادامه یافت.';
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			Mobo_Core_Logger::error( 'Mobo Core reprice resume failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'ادامه اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
 		}
 	}
 
@@ -7267,7 +7529,7 @@ type:{mobo_order_type_label}</textarea>
 		$image_refresh_enabled = true;
 		$delete_old_enabled    = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' );
 		$orphan_delete_enabled = Mobo_Core_Settings::enabled( 'mobo_core_orphan_image_cleanup_enabled', '0' );
-		$scan_limit            = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$scan_limit            = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 
 		$scan_time        = absint( isset( $scan['checkedAt'] ) ? $scan['checkedAt'] : 0 );
 		$enqueue_time     = absint( isset( $enqueue['checkedAt'] ) ? $enqueue['checkedAt'] : 0 );
@@ -7740,7 +8002,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$service = new Mobo_Core_Image_Refresh_Service();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 		$result  = $service->scan_legacy_images( $limit );
 
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
@@ -7773,7 +8035,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$service = new Mobo_Core_Image_Refresh_Service();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 		$result  = $service->enqueue_legacy_images( $limit );
 
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
@@ -7842,7 +8104,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$service = new Mobo_Core_Image_Refresh_Service();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 		$result  = $service->audit_webp_subsizes( $limit, false );
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
 
@@ -7873,7 +8135,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$service = new Mobo_Core_Image_Refresh_Service();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 		$result  = $service->audit_webp_subsizes( $limit, true );
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
 
@@ -7905,7 +8167,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$service = new Mobo_Core_Image_Refresh_Service();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
 		$result  = $service->audit_replaced_legacy_attachments( $limit, false );
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
 
@@ -8142,7 +8404,7 @@ type:{mobo_order_type_label}</textarea>
 		}
 
 		$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
-		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_scan_limit', 500, 50, 5000 );
+		$limit   = Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_scan_limit', 50, 10, 5000 );
 		$result  = $cleanup->scan( $limit );
 
 		$progress = ! empty( $result['cycleComplete'] ) ? 'دوره پیمایش کامل شد.' : 'ادامه پیمایش از WebP شناسه پیوست ' . absint( isset( $result['cursorEnd'] ) ? $result['cursorEnd'] : 0 ) . '.';
@@ -8933,7 +9195,12 @@ type:{mobo_order_type_label}</textarea>
 						}).done(function(response) {
 							if (response && response.success) {
 								applyStatus(response.data);
-								$('[data-mobo-sync-refresh-state]').text('به‌روزرسانی خودکار فعال است.');
+								var fallback = response.data && response.data.adminFallback ? response.data.adminFallback : null;
+								if (fallback && fallback.attempted && parseInt(fallback.steps || 0, 10) > 0) {
+									$('[data-mobo-sync-refresh-state]').text('Self Runner کند/مسدود است؛ مرورگر ' + fallback.steps + ' مرحله امن را جلو برد.');
+								} else {
+									$('[data-mobo-sync-refresh-state]').text('به‌روزرسانی خودکار فعال است.');
+								}
 							} else {
 								$('[data-mobo-sync-refresh-state]').text('خطا در دریافت وضعیت.');
 							}

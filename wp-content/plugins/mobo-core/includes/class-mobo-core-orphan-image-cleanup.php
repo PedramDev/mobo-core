@@ -26,6 +26,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Mobo_Core_Orphan_Image_Cleanup {
 
 	const CURSOR_OPTION = 'mobo_core_orphan_image_scan_cursor';
+	const INCOMPLETE_COLLISION_CURSOR_OPTION = 'mobo_core_incomplete_collision_cleanup_cursor';
+	const INCOMPLETE_COLLISION_RESULT_OPTION = 'mobo_core_incomplete_collision_cleanup_last_result';
 
 	/**
 	 * Return table name.
@@ -121,6 +123,105 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 */
 	private function is_unlocked() {
 		return class_exists( 'Mobo_Core_Product_Sync' ) && Mobo_Core_Product_Sync::is_repair_completed();
+	}
+
+	/**
+	 * Delete a bounded batch of proven WordPress collision attachments left by an
+	 * interrupted Mobo import.
+	 *
+	 * A numeric suffix by itself is never sufficient. Ownership is proven from the
+	 * incomplete marker plus the authoritative source basename; active workers,
+	 * Shared Media and every known database/file reference are revalidated before
+	 * wp_delete_attachment() is allowed to remove the registered family.
+	 *
+	 * @param int $limit Attachment limit.
+	 * @return array
+	 */
+	public function cleanup_incomplete_collision_attachments( $limit = 20 ) {
+		$limit = max( 1, min( 100, absint( $limit ) ) );
+		$result = array(
+			'processed'         => 0,
+			'deletedAttachments'=> 0,
+			'deletedBytes'      => 0,
+			'skippedReferenced' => 0,
+			'skippedActive'     => 0,
+			'skippedUnsafe'     => 0,
+			'failed'            => 0,
+			'cursorStart'       => absint( get_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION, 0 ) ),
+			'cursorEnd'         => absint( get_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION, 0 ) ),
+			'cycleComplete'     => false,
+			'checkedAt'         => time(),
+			'status'            => 'running',
+			'samples'           => array(),
+		);
+
+		if ( ! $this->is_unlocked() ) {
+			$result['status'] = 'locked_until_repair';
+			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
+			return $result;
+		}
+
+		$queue_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'image_queue_worker', 120 ) : '__mobo_no_lock__';
+		if ( false === $queue_lock ) {
+			$result['status'] = 'image-queue-busy';
+			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
+			return $result;
+		}
+
+		$refresh_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'image_refresh_queue_worker', 120 ) : '__mobo_no_lock__';
+		if ( false === $refresh_lock ) {
+			if ( class_exists( 'Mobo_Core_Lock' ) ) {
+				Mobo_Core_Lock::release( 'image_queue_worker', $queue_lock );
+			}
+			$result['status'] = 'image-refresh-queue-busy';
+			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
+			return $result;
+		}
+
+		try {
+			$batch = $this->get_incomplete_collision_attachment_batch( $limit );
+			$result['cursorStart']   = absint( isset( $batch['cursorStart'] ) ? $batch['cursorStart'] : 0 );
+			$result['cursorEnd']     = absint( isset( $batch['cursorEnd'] ) ? $batch['cursorEnd'] : $result['cursorStart'] );
+			$result['cycleComplete'] = ! empty( $batch['cycleComplete'] );
+
+			foreach ( isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array() as $attachment_id ) {
+				$attachment_id = absint( $attachment_id );
+				$result['processed']++;
+				$outcome = $this->delete_incomplete_collision_attachment( $attachment_id );
+				$status  = isset( $outcome['status'] ) ? sanitize_key( (string) $outcome['status'] ) : 'failed';
+
+				if ( 'deleted' === $status ) {
+					$result['deletedAttachments']++;
+					$result['deletedBytes'] += absint( isset( $outcome['bytes'] ) ? $outcome['bytes'] : 0 );
+				} elseif ( 'referenced' === $status ) {
+					$result['skippedReferenced']++;
+				} elseif ( 'active' === $status ) {
+					$result['skippedActive']++;
+				} elseif ( 'unsafe' === $status ) {
+					$result['skippedUnsafe']++;
+				} else {
+					$result['failed']++;
+				}
+
+				if ( count( $result['samples'] ) < 20 ) {
+					$result['samples'][] = array(
+						'attachmentId' => $attachment_id,
+						'status'       => $status,
+						'file'         => sanitize_text_field( isset( $outcome['file'] ) ? (string) $outcome['file'] : '' ),
+						'message'      => sanitize_text_field( isset( $outcome['message'] ) ? (string) $outcome['message'] : '' ),
+					);
+				}
+			}
+
+			$result['status'] = $result['cycleComplete'] ? 'done' : 'running';
+			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
+			return $result;
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) ) {
+				Mobo_Core_Lock::release( 'image_refresh_queue_worker', $refresh_lock );
+				Mobo_Core_Lock::release( 'image_queue_worker', $queue_lock );
+			}
+		}
 	}
 
 	/**
@@ -429,6 +530,8 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		global $wpdb;
 
 		delete_option( self::CURSOR_OPTION );
+		delete_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION );
+		delete_option( self::INCOMPLETE_COLLISION_RESULT_OPTION );
 		delete_option( 'mobo_core_orphan_image_cleanup_last_scan' );
 
 		if ( ! self::table_exists() ) {
@@ -492,6 +595,266 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		);
 
 		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * Fetch one cursor batch of attachments left incomplete by interrupted imports.
+	 * SQL only bounds the candidate set; the exact numeric-collision proof is made
+	 * from the authoritative source basename immediately before deletion.
+	 *
+	 * @param int $limit Limit.
+	 * @return array
+	 */
+	private function get_incomplete_collision_attachment_batch( $limit ) {
+		global $wpdb;
+
+		$limit        = max( 1, min( 100, absint( $limit ) ) );
+		$cursor_start = absint( get_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION, 0 ) );
+		$fetch_limit  = $limit + 1;
+		$ids = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT DISTINCT p.ID
+				FROM {$wpdb->posts} p
+				INNER JOIN {$wpdb->postmeta} incomplete
+					ON incomplete.post_id = p.ID
+					AND incomplete.meta_key = 'mobo_sync_incomplete'
+					AND incomplete.meta_value = '1'
+				INNER JOIN {$wpdb->postmeta} attached
+					ON attached.post_id = p.ID
+					AND attached.meta_key = '_wp_attached_file'
+				WHERE p.post_type = 'attachment'
+					AND p.post_status IN ('inherit','private')
+					AND p.ID > %d
+					AND LOWER(attached.meta_value) LIKE %s
+				ORDER BY p.ID ASC
+				LIMIT %d",
+				$cursor_start,
+				'%.webp',
+				$fetch_limit
+			)
+		);
+
+		$ids            = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		$has_more       = count( $ids ) > $limit;
+		$ids            = array_slice( $ids, 0, $limit );
+		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
+		$cycle_complete = ! $has_more;
+
+		if ( $cycle_complete ) {
+			update_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION, 0, false );
+		} else {
+			update_option( self::INCOMPLETE_COLLISION_CURSOR_OPTION, $cursor_end, false );
+		}
+
+		return array(
+			'ids'           => $ids,
+			'cursorStart'   => $cursor_start,
+			'cursorEnd'     => $cursor_end,
+			'cycleComplete' => $cycle_complete,
+		);
+	}
+
+	/**
+	 * Revalidate and delete one incomplete numeric collision attachment.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	private function delete_incomplete_collision_attachment( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		$file          = $attachment_id > 0 ? get_attached_file( $attachment_id ) : '';
+		$file          = is_string( $file ) ? $this->normalize_path( $file ) : '';
+		$relative      = $this->relative_to_uploads( $file );
+
+		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) || '1' !== (string) get_post_meta( $attachment_id, 'mobo_sync_incomplete', true ) ) {
+			return array( 'status' => 'unsafe', 'file' => $relative, 'message' => 'Attachment دیگر ناقص یا معتبر نیست.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+			return array( 'status' => 'unsafe', 'file' => $relative, 'message' => 'Shared Media از پاک‌سازی محلی مستثنا است.' );
+		}
+
+		$source_url = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+		if ( '' === $source_url ) {
+			$source_url = esc_url_raw( (string) get_post_meta( $attachment_id, '_mobo_quarantined_source_url', true ) );
+		}
+
+		if ( ! $this->is_proven_numeric_webp_collision( $file, $source_url ) ) {
+			return array( 'status' => 'unsafe', 'file' => $relative, 'message' => 'نام فایل از source معتبر به عنوان collision عددی اثبات نشد.' );
+		}
+
+		if ( $this->attachment_has_active_image_worker( $attachment_id ) ) {
+			return array( 'status' => 'active', 'file' => $relative, 'message' => 'یک Worker فعال هنوز این Attachment را در اختیار دارد.' );
+		}
+
+		$family_paths = $this->get_attachment_family_absolute_paths( $attachment_id );
+		if ( empty( $family_paths ) && '' !== $file ) {
+			$family_paths[] = $file;
+		}
+
+		if ( $this->attachment_has_live_reference( $attachment_id, $family_paths ) ) {
+			return array( 'status' => 'referenced', 'file' => $relative, 'message' => 'Attachment یا یکی از فایل‌هایش هنوز مرجع زنده دارد.' );
+		}
+
+		$bytes   = $this->sum_file_sizes( $family_paths );
+		$deleted = wp_delete_attachment( $attachment_id, true );
+		if ( ! $deleted || 'attachment' === get_post_type( $attachment_id ) ) {
+			return array( 'status' => 'failed', 'file' => $relative, 'bytes' => 0, 'message' => 'وردپرس نتوانست Attachment ناقص را حذف کند.' );
+		}
+
+		return array( 'status' => 'deleted', 'file' => $relative, 'bytes' => $bytes, 'message' => 'Attachment collision ناقص و خانواده ثبت‌شده آن حذف شد.' );
+	}
+
+	/**
+	 * Prove `source.webp` -> `source-N[-derivative].webp` naming.
+	 *
+	 * @param string $file Attachment file.
+	 * @param string $source_url Authoritative source URL.
+	 * @return bool
+	 */
+	private function is_proven_numeric_webp_collision( $file, $source_url ) {
+		$file       = $this->normalize_path( (string) $file );
+		$source_url = esc_url_raw( (string) $source_url );
+		if ( '' === $file || '' === $source_url || ! $this->is_inside_uploads( $file ) || ! $this->is_webp_file_path( $file ) ) {
+			return false;
+		}
+
+		$source_path = (string) wp_parse_url( $source_url, PHP_URL_PATH );
+		$source_name = sanitize_file_name( rawurldecode( basename( $source_path ) ) );
+		if ( '' === $source_name || 'webp' !== strtolower( pathinfo( $source_name, PATHINFO_EXTENSION ) ) ) {
+			return false;
+		}
+
+		$base       = pathinfo( $source_name, PATHINFO_FILENAME );
+		$derivative = '(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*';
+		return '' !== $base && 1 === preg_match( '/^' . preg_quote( $base, '/' ) . '-\d+' . $derivative . '\.webp$/i', basename( $file ) );
+	}
+
+	/**
+	 * Protect an attachment currently owned by an unexpired image worker lease.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function attachment_has_active_image_worker( $attachment_id ) {
+		global $wpdb;
+		$attachment_id = absint( $attachment_id );
+		$now           = current_time( 'mysql', true );
+		if ( $attachment_id <= 0 ) {
+			return true;
+		}
+
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+			$table = Mobo_Core_Image_Queue::table_name();
+			$active = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT id FROM {$table} WHERE attachment_id = %d AND status = 'processing' AND locked_until IS NOT NULL AND locked_until >= %s LIMIT 1",
+					$attachment_id,
+					$now
+				)
+			);
+			if ( absint( $active ) > 0 ) {
+				return true;
+			}
+		}
+
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Queue' ) && Mobo_Core_Image_Refresh_Queue::table_exists() ) {
+			$table = Mobo_Core_Image_Refresh_Queue::table_name();
+			$active = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT id FROM {$table} WHERE new_attachment_id = %d AND status = 'processing' AND locked_until IS NOT NULL AND locked_until >= %s LIMIT 1",
+					$attachment_id,
+					$now
+				)
+			);
+			if ( absint( $active ) > 0 ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Check ID and path references outside the candidate attachment itself.
+	 *
+	 * @param int   $attachment_id Attachment ID.
+	 * @param array $family_paths Registered family paths.
+	 * @return bool
+	 */
+	private function attachment_has_live_reference( $attachment_id, $family_paths ) {
+		global $wpdb;
+		$attachment_id = absint( $attachment_id );
+		$id            = (string) $attachment_id;
+		if ( $attachment_id <= 0 ) {
+			return true;
+		}
+
+		$gallery_like = '%,' . $wpdb->esc_like( $id ) . ',%';
+		$serialized_i = '%i:' . $wpdb->esc_like( $id ) . ';%';
+		$serialized_s = '%s:' . strlen( $id ) . ':"' . $wpdb->esc_like( $id ) . '";%';
+		$meta_ref = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT meta_id FROM {$wpdb->postmeta}
+				WHERE post_id <> %d AND (
+					(meta_key = '_thumbnail_id' AND meta_value = %s)
+					OR (meta_key = '_product_image_gallery' AND CONCAT(',', meta_value, ',') LIKE %s)
+					OR ((meta_key LIKE %s OR meta_key LIKE %s OR meta_key LIKE %s OR meta_key LIKE %s OR meta_key LIKE %s)
+						AND (meta_value = %s OR meta_value LIKE %s OR meta_value LIKE %s))
+				) LIMIT 1",
+				$attachment_id,
+				$id,
+				$gallery_like,
+				'%' . $wpdb->esc_like( 'image' ) . '%',
+				'%' . $wpdb->esc_like( 'gallery' ) . '%',
+				'%' . $wpdb->esc_like( 'media' ) . '%',
+				'%' . $wpdb->esc_like( 'attachment' ) . '%',
+				'%' . $wpdb->esc_like( 'icon' ) . '%',
+				$id,
+				$serialized_i,
+				$serialized_s
+			)
+		);
+		if ( absint( $meta_ref ) > 0 ) {
+			return true;
+		}
+
+		$post_ref = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT ID FROM {$wpdb->posts} WHERE ID <> %d AND post_status NOT IN ('trash','auto-draft') AND post_content LIKE %s LIMIT 1",
+				$attachment_id,
+				'%' . $wpdb->esc_like( 'wp-image-' . $id ) . '%'
+			)
+		);
+		if ( absint( $post_ref ) > 0 || absint( get_option( 'site_icon', 0 ) ) === $attachment_id ) {
+			return true;
+		}
+
+		return $this->family_is_referenced_in_database( $family_paths, $attachment_id );
+	}
+
+	/**
+	 * Return every registered physical path for one attachment.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array
+	 */
+	private function get_attachment_family_absolute_paths( $attachment_id ) {
+		$uploads = wp_upload_dir( null, false );
+		$basedir = isset( $uploads['basedir'] ) ? $this->normalize_path( (string) $uploads['basedir'] ) : '';
+		$paths   = array();
+		if ( '' === $basedir ) {
+			return $paths;
+		}
+
+		foreach ( $this->get_registered_attachment_relative_paths( absint( $attachment_id ) ) as $relative ) {
+			$path = $this->normalize_path( trailingslashit( $basedir ) . ltrim( (string) $relative, '/' ) );
+			if ( '' !== $path && $this->is_inside_uploads( $path ) ) {
+				$paths[] = $path;
+			}
+		}
+
+		return array_values( array_unique( array_filter( $paths ) ) );
 	}
 
 	/**
@@ -1052,11 +1415,13 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 * Full relative paths and upload URLs are checked first. The basename check is
 	 * retained as a conservative final guard against manually embedded filenames.
 	 *
-	 * @param string $relative_path Uploads-relative path.
+	 * @param array $paths Absolute paths.
+	 * @param int   $exclude_attachment_id Candidate attachment whose own row/meta must not count as a reference.
 	 * @return bool
 	 */
-	private function family_is_referenced_in_database( $paths ) {
+	private function family_is_referenced_in_database( $paths, $exclude_attachment_id = 0 ) {
 		global $wpdb;
+		$exclude_attachment_id = absint( $exclude_attachment_id );
 
 		$uploads = wp_upload_dir( null, false );
 		$baseurl = isset( $uploads['baseurl'] ) ? untrailingslashit( (string) $uploads['baseurl'] ) : '';
@@ -1093,15 +1458,26 @@ class Mobo_Core_Orphan_Image_Cleanup {
 				$post_args[] = $like;
 			}
 			if ( ! empty( $post_clauses ) ) {
-				$sql = "SELECT ID FROM {$wpdb->posts} WHERE post_status NOT IN ('trash', 'auto-draft') AND (" . implode( ' OR ', $post_clauses ) . ') LIMIT 1';
+				$post_prefix = $exclude_attachment_id > 0 ? 'ID <> %d AND ' : '';
+				$sql = "SELECT ID FROM {$wpdb->posts} WHERE {$post_prefix}post_status NOT IN ('trash', 'auto-draft') AND (" . implode( ' OR ', $post_clauses ) . ') LIMIT 1';
+				if ( $exclude_attachment_id > 0 ) {
+					array_unshift( $post_args, $exclude_attachment_id );
+				}
 				if ( absint( $wpdb->get_var( $wpdb->prepare( $sql, ...$post_args ) ) ) > 0 ) {
 					return true;
 				}
 			}
 
 			$meta_clause = implode( ' OR ', array_fill( 0, count( $likes ), 'meta_value LIKE %s' ) );
-			if ( '' !== $meta_clause && absint( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$wpdb->postmeta} WHERE {$meta_clause} LIMIT 1", ...$likes ) ) ) > 0 ) {
-				return true;
+			if ( '' !== $meta_clause ) {
+				$meta_args   = $likes;
+				$meta_prefix = $exclude_attachment_id > 0 ? 'post_id <> %d AND ' : '';
+				if ( $exclude_attachment_id > 0 ) {
+					array_unshift( $meta_args, $exclude_attachment_id );
+				}
+				if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$wpdb->postmeta} WHERE {$meta_prefix}({$meta_clause}) LIMIT 1", ...$meta_args ) ) ) > 0 ) {
+					return true;
+				}
 			}
 
 			$option_clause = implode( ' OR ', array_fill( 0, count( $likes ), 'option_value LIKE %s' ) );

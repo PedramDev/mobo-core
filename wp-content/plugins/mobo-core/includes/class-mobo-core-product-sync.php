@@ -22,6 +22,11 @@ class Mobo_Core_Product_Sync {
 	const STATE_OPTION = 'mobo_core_sync_state';
 	const REPAIR_COMPLETED_OPTION = 'mobo_core_repair_completed_at';
 	const REPAIR_LAST_SYNC_ID_OPTION = 'mobo_core_repair_last_sync_id';
+	const REPAIR_SYNC_ID_META = '_mobo_last_repair_sync_id';
+	const REPAIR_SYNCED_AT_META = '_mobo_last_repair_synced_at';
+	const REPAIR_APPLIED_REVISION_META = '_mobo_last_repair_applied_revision';
+	const REPAIR_WEBHOOK_US_META = '_mobo_last_repair_webhook_us';
+	const STALE_RUNNING_RECOVERY_SECONDS = 15;
 
 	/** Request-local checkpoint coalescing used only by the real cron runner. */
 	private $checkpoint_coalescing = false;
@@ -96,13 +101,23 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, 'شروع Sync تا پایان آپدیت افزونه متوقف است.', array_merge( $this->get_manual_sync_status(), array( 'pausedForUpgrade' => true, 'upgradeBarrier' => Mobo_Core_Upgrade_Coordinator::get_status() ) ) );
 		}
 
-		if ( class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( 'manual_sync' ) ) {
-			return $this->result( false, 'مرحله قبلی Sync هنوز در حال پایان یافتن است. پس از آزاد شدن Worker دوباره شروع کنید.', array_merge( $this->get_manual_sync_status(), array( 'locked' => true ) ) );
+		if ( class_exists( 'Mobo_Core_Lock' ) ) {
+			Mobo_Core_Lock::recover_stale_locks( array( 'manual_sync', 'manual_sync_start', 'self_runner_kick', 'worker_dispatcher' ) );
+			if ( Mobo_Core_Lock::is_locked( 'manual_sync' ) ) {
+				return $this->result( false, 'مرحله قبلی Sync هنوز در حال پایان یافتن است. پس از آزاد شدن Worker دوباره شروع کنید.', array_merge( $this->get_manual_sync_status(), array( 'locked' => true ) ) );
+			}
 		}
 
 		$sync_id     = sanitize_text_field( (string) $sync_id );
 		$repair_mode = (bool) $repair_mode;
 		$current     = $this->get_manual_sync_status();
+
+		if ( ! empty( $current['isRunning'] ) ) {
+			$recovered = $this->recover_stalled_manual_sync_checkpoint( $current, $sync_id, $source, $repair_mode );
+			if ( is_array( $recovered ) ) {
+				return $recovered;
+			}
+		}
 
 		if ( ! empty( $current['isRunning'] ) || ! empty( $current['isWaitingForPortal'] ) ) {
 			$current_sync_id = isset( $current['syncId'] ) ? sanitize_text_field( (string) $current['syncId'] ) : '';
@@ -140,7 +155,12 @@ class Mobo_Core_Product_Sync {
 
 			'currentProductGuid'           => '',
 			'currentProductId'             => 0,
+			'currentProductPortalId'       => 0,
+			'currentProductSourceRevision' => 0,
+			'currentProductSourceVersion'  => '',
+			'currentProductSourceHash'     => '',
 			'currentProductImages'         => array(),
+			'currentProductImagesPresent'  => false,
 			'currentProductAttributes'     => array(),
 			'currentProductImageOffset'    => 0,
 			'currentProductWasExisting'    => false,
@@ -169,6 +189,9 @@ class Mobo_Core_Product_Sync {
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
+			'staleRecoveryCount'           => 0,
+			'lastStaleRecoveryAt'          => 0,
+			'lastStaleRecoveryReason'      => '',
 
 			'repairIntegrityPhase'           => $repair_mode ? 'portal-variant-duplicates' : 'done',
 			'repairIntegrityCursor'          => 0,
@@ -176,6 +199,10 @@ class Mobo_Core_Product_Sync {
 			'repairIntegrityStats'           => array(),
 
 			'repairProductsComplete'         => false,
+			'postSyncIntegrityPhase'           => $repair_mode ? 'variation-topology' : 'done',
+			'postSyncIntegrityCursor'          => 0,
+			'postSyncIntegrityComplete'        => ! $repair_mode,
+			'postSyncIntegrityStats'           => array(),
 			'missingImageRecoveryCursor'      => 0,
 			'missingImageRecoveryScanned'     => 0,
 			'missingImageRecoveryQueued'      => 0,
@@ -184,7 +211,9 @@ class Mobo_Core_Product_Sync {
 			'missingImageRecoveryComplete'    => false,
 		);
 
-		update_option( self::STATE_OPTION, $state, false );
+		if ( ! $this->persist_manual_sync_state_verified( $state ) ) {
+			return $this->result( false, 'شروع Sync به دلیل ذخیره نشدن checkpoint اولیه متوقف شد.', $this->get_manual_sync_status() );
+		}
 
 		return $this->result(
 			true,
@@ -193,6 +222,74 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
+
+
+	/**
+	 * Recover a stalled running checkpoint without resetting any cursor/state.
+	 *
+	 * Only a generation with no active manual_sync lease and no checkpoint
+	 * progress for the safety window is eligible. Remote callers with another
+	 * explicit syncId cannot take over the old generation.
+	 *
+	 * @param array  $current Current public status.
+	 * @param string $requested_sync_id Requested generation.
+	 * @param string $source Request source.
+	 * @param bool   $repair_mode Requested mode.
+	 * @return array|null Result when recovered, otherwise null.
+	 */
+	private function recover_stalled_manual_sync_checkpoint( $current, $requested_sync_id, $source, $repair_mode ) {
+		if ( empty( $current['isRunning'] ) || empty( $current['stalledWithoutWorker'] ) ) {
+			return null;
+		}
+
+		$current_repair = ! empty( $current['repairMode'] );
+		if ( $current_repair !== (bool) $repair_mode ) {
+			return null;
+		}
+
+		$current_sync_id   = sanitize_text_field( (string) ( $current['syncId'] ?? '' ) );
+		$requested_sync_id = sanitize_text_field( (string) $requested_sync_id );
+		if ( '' !== $requested_sync_id && '' !== $current_sync_id && ! hash_equals( $current_sync_id, $requested_sync_id ) ) {
+			return null;
+		}
+
+		if ( class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( 'manual_sync' ) ) {
+			return null;
+		}
+
+		$state = $this->get_manual_sync_state();
+		if ( 'running' !== sanitize_key( (string) ( $state['status'] ?? '' ) ) ) {
+			return null;
+		}
+
+		$state_sync_id = sanitize_text_field( (string) ( $state['syncId'] ?? '' ) );
+		if ( '' === $state_sync_id || ( '' !== $current_sync_id && ! hash_equals( $current_sync_id, $state_sync_id ) ) ) {
+			return null;
+		}
+
+		$updated_at = absint( $state['updatedAt'] ?? 0 );
+		if ( $updated_at <= 0 || ( time() - $updated_at ) < self::STALE_RUNNING_RECOVERY_SECONDS ) {
+			return null;
+		}
+
+		$state['staleRecoveryCount']      = absint( $state['staleRecoveryCount'] ?? 0 ) + 1;
+		$state['lastStaleRecoveryAt']     = time();
+		$state['lastStaleRecoveryReason'] = 'worker-missing';
+		$state['lastError']               = '';
+		$state['lastMessage']             = $current_repair
+			? 'Repair بدون Worker فعال از آخرین checkpoint پایدار بازیابی شد و ادامه می‌یابد.'
+			: 'Sync بدون Worker فعال از آخرین checkpoint پایدار بازیابی شد و ادامه می‌یابد.';
+
+		if ( ! $this->persist_manual_sync_state_verified( $state ) ) {
+			return $this->result( false, 'Checkpoint گیرکرده تشخیص داده شد اما ثبت recovery پایدار نشد؛ state دست‌نخورده باقی ماند.', $this->get_manual_sync_status() );
+		}
+
+		return $this->result(
+			true,
+			$state['lastMessage'],
+			array_merge( $this->get_manual_sync_status(), array( 'staleRecovered' => true, 'recoveredSyncId' => $state_sync_id, 'recoverySource' => sanitize_key( (string) $source ) ) )
+		);
+	}
 
 	/**
 	 * Resume the same durable manual-sync generation after a Portal wait.
@@ -264,7 +361,9 @@ class Mobo_Core_Product_Sync {
 		$state['lastTransientError'] = '';
 		$state['lastMessage']       = 'همگام‌سازی محصولات متوقف شد.';
 
-		$this->save_manual_sync_state( $state );
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+		}
 
 		return $this->result(
 			true,
@@ -281,6 +380,10 @@ class Mobo_Core_Product_Sync {
 
 		try {
 			delete_option( self::STATE_OPTION );
+			wp_cache_delete( self::STATE_OPTION, 'options' );
+			if ( null !== get_option( self::STATE_OPTION, null ) ) {
+				return false;
+			}
 			$this->checkpoint_state         = null;
 			$this->checkpoint_pending_steps = 0;
 			return true;
@@ -309,7 +412,12 @@ class Mobo_Core_Product_Sync {
 
 			'currentProductGuid'           => '',
 			'currentProductId'             => 0,
+			'currentProductPortalId'       => 0,
+			'currentProductSourceRevision' => 0,
+			'currentProductSourceVersion'  => '',
+			'currentProductSourceHash'     => '',
 			'currentProductImages'         => array(),
+			'currentProductImagesPresent'  => false,
 			'currentProductAttributes'     => array(),
 			'currentProductImageOffset'    => 0,
 			'currentProductWasExisting'    => false,
@@ -338,6 +446,9 @@ class Mobo_Core_Product_Sync {
 			'waitingForPortalSince'         => 0,
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
+			'staleRecoveryCount'           => 0,
+			'lastStaleRecoveryAt'          => 0,
+			'lastStaleRecoveryReason'      => '',
 
 			'repairIntegrityPhase'           => 'done',
 			'repairIntegrityCursor'          => 0,
@@ -345,6 +456,10 @@ class Mobo_Core_Product_Sync {
 			'repairIntegrityStats'           => array(),
 
 			'repairProductsComplete'         => false,
+			'postSyncIntegrityPhase'           => 'done',
+			'postSyncIntegrityCursor'          => 0,
+			'postSyncIntegrityComplete'        => true,
+			'postSyncIntegrityStats'           => array(),
 			'missingImageRecoveryCursor'      => 0,
 			'missingImageRecoveryScanned'     => 0,
 			'missingImageRecoveryQueued'      => 0,
@@ -361,7 +476,18 @@ class Mobo_Core_Product_Sync {
 			$state = array();
 		}
 
-		return wp_parse_args( $state, $default );
+		$had_post_sync_state = array_key_exists( 'postSyncIntegrityComplete', $state );
+		$state = wp_parse_args( $state, $default );
+		/* An in-flight Repair created by an older build did not have the post-sync
+		 * phase. Do not silently treat that missing field as completed after upgrade. */
+		if ( ! empty( $state['repairMode'] ) && ! $had_post_sync_state ) {
+			$state['postSyncIntegrityPhase']    = 'variation-topology';
+			$state['postSyncIntegrityCursor']   = 0;
+			$state['postSyncIntegrityComplete'] = false;
+			$state['postSyncIntegrityStats']    = array();
+		}
+
+		return $state;
 	}
 
 	public function get_manual_sync_status() {
@@ -393,6 +519,12 @@ class Mobo_Core_Product_Sync {
 		$is_waiting      = 'waiting_for_portal' === $current_status;
 		$is_retry_due    = $is_waiting && ( 0 === $next_retry_at || $next_retry_at <= time() );
 		$should_continue = ( 'running' === $current_status && '' === $last_error ) || ( $is_retry_due && '' === $last_error );
+		$worker_lock     = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'manual_sync' ) : array( 'active' => false );
+		$updated_at      = absint( $state['updatedAt'] ?? 0 );
+		$stalled_without_worker = 'running' === $current_status
+			&& empty( $worker_lock['active'] )
+			&& $updated_at > 0
+			&& ( time() - $updated_at ) >= self::STALE_RUNNING_RECOVERY_SECONDS;
 
 		return array(
 			'syncId'                       => sanitize_text_field( (string) $state['syncId'] ),
@@ -416,6 +548,10 @@ class Mobo_Core_Product_Sync {
 			'repairIntegrityComplete'        => ! empty( $state['repairIntegrityComplete'] ),
 			'repairIntegrityStats'           => is_array( $state['repairIntegrityStats'] ) ? $state['repairIntegrityStats'] : array(),
 			'repairProductsComplete'         => ! empty( $state['repairProductsComplete'] ),
+			'postSyncIntegrityPhase'           => sanitize_key( (string) $state['postSyncIntegrityPhase'] ),
+			'postSyncIntegrityCursor'          => absint( $state['postSyncIntegrityCursor'] ),
+			'postSyncIntegrityComplete'        => ! empty( $state['postSyncIntegrityComplete'] ),
+			'postSyncIntegrityStats'           => is_array( $state['postSyncIntegrityStats'] ) ? $state['postSyncIntegrityStats'] : array(),
 			'missingImageRecoveryCursor'      => absint( $state['missingImageRecoveryCursor'] ),
 			'missingImageRecoveryScanned'     => absint( $state['missingImageRecoveryScanned'] ),
 			'missingImageRecoveryQueued'      => absint( $state['missingImageRecoveryQueued'] ),
@@ -456,6 +592,11 @@ class Mobo_Core_Product_Sync {
 			'waitingForPortalSince'         => absint( $state['waitingForPortalSince'] ?? 0 ),
 			'nextRetryAt'                  => $next_retry_at,
 			'cancelRequestedAt'            => absint( $state['cancelRequestedAt'] ?? 0 ),
+			'workerLock'                    => $worker_lock,
+			'stalledWithoutWorker'          => $stalled_without_worker,
+			'staleRecoveryCount'            => absint( $state['staleRecoveryCount'] ?? 0 ),
+			'lastStaleRecoveryAt'           => absint( $state['lastStaleRecoveryAt'] ?? 0 ),
+			'lastStaleRecoveryReason'       => sanitize_key( (string) ( $state['lastStaleRecoveryReason'] ?? '' ) ),
 
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
 			'lastError'                    => $last_error,
@@ -558,7 +699,9 @@ class Mobo_Core_Product_Sync {
 
 			if ( $next_retry_at > 0 && $next_retry_at > time() ) {
 				$state['updatedAt'] = time();
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, 'MoboCore هنوز آماده تلاش مجدد نیست. وضعیت sync حفظ شده است.', $this->get_manual_sync_status() );
 			}
@@ -568,7 +711,9 @@ class Mobo_Core_Product_Sync {
 			$state['lastError']           = '';
 			$state['lastMessage']         = 'اتصال به MoboCore دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
 			$state['updatedAt']           = time();
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 		}
 
 		/*
@@ -580,7 +725,9 @@ class Mobo_Core_Product_Sync {
 			if ( ! class_exists( 'Mobo_Core_Repair_Integrity' ) ) {
 				$state['lastError']   = 'Repair integrity service is unavailable.';
 				$state['lastMessage'] = 'مرحله ترمیم داده‌های قدیمی در دسترس نیست.';
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
@@ -589,14 +736,44 @@ class Mobo_Core_Product_Sync {
 			if ( is_wp_error( $integrity_result ) ) {
 				$state['lastError']   = sanitize_text_field( $integrity_result->get_error_message() );
 				$state['lastMessage'] = 'ترمیم داده‌های قدیمی با خطا متوقف شد: ' . $state['lastError'];
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
 			$state['lastError']   = '';
 			$state['lastMessage'] = sanitize_text_field( (string) ( isset( $integrity_result['message'] ) ? $integrity_result['message'] : 'مرحله ترمیم داده‌های قدیمی اجرا شد.' ) );
 			$state['updatedAt']   = time();
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		/*
+		 * Once the authoritative product pass is complete, run a second bounded
+		 * integrity pass over only the parents that were durably completed by this
+		 * exact Repair generation. This avoids treating OnlyInStock omissions as
+		 * authoritative topology evidence.
+		 */
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && empty( $state['postSyncIntegrityComplete'] ) ) {
+			if ( ! class_exists( 'Mobo_Core_Repair_Integrity' ) ) {
+				return $this->result( false, 'مرحله نهایی Repair در دسترس نیست.', $this->get_manual_sync_status() );
+			}
+			$integrity = new Mobo_Core_Repair_Integrity();
+			$post_result = $integrity->run_post_sync_slice( $state );
+			if ( is_wp_error( $post_result ) ) {
+				$state['lastError']   = sanitize_text_field( $post_result->get_error_message() );
+				$state['lastMessage'] = 'مرحله نهایی Repair با خطا متوقف شد: ' . $state['lastError'];
+				$this->save_manual_sync_state( $state );
+				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
+			}
+			$state['lastError']   = '';
+			$state['lastMessage'] = sanitize_text_field( (string) ( $post_result['message'] ?? 'مرحله نهایی Repair اجرا شد.' ) );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint مرحله نهایی Repair ذخیره نشد.', $this->get_manual_sync_status() );
+			}
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
@@ -606,7 +783,7 @@ class Mobo_Core_Product_Sync {
 		 * have no usable image are fetched individually by GUID and only their
 		 * image payload is applied. Stock, fields and variants are untouched.
 		 */
-		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && empty( $state['missingImageRecoveryComplete'] ) ) {
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && ! empty( $state['postSyncIntegrityComplete'] ) && empty( $state['missingImageRecoveryComplete'] ) ) {
 			return $this->run_missing_image_repair_step( $state );
 		}
 
@@ -647,7 +824,9 @@ class Mobo_Core_Product_Sync {
 					absint( $category_result['skipped'] )
 				);
 
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
@@ -655,7 +834,9 @@ class Mobo_Core_Product_Sync {
 			$state['categorySynced'] = true;
 			$state['lastError']      = '';
 			$state['lastMessage']    = 'همگام‌سازی دسته‌بندی غیرفعال است؛ در صورت ایجاد محصول جدید، دسته پیشفرض استفاده می‌شود.';
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -723,12 +904,19 @@ class Mobo_Core_Product_Sync {
 				$state['productCursorSupported'] = false;
 			}
 
-			$repair_snapshot_us = $this->is_repair_mode() ? $this->current_wall_clock_us() : 0;
+			/* Every manual product page is a point-in-time snapshot. Persist a local
+			 * capture fence on each queued item so a foreground webhook that lands
+			 * after this fetch can never be overwritten when the item is processed
+			 * later. This protection is required for normal Full Sync as well as
+			 * Repair. */
+			$manual_snapshot_us = $this->current_wall_clock_us();
 
 			foreach ( $items as $product_data ) {
 				if ( is_array( $product_data ) ) {
-					if ( $repair_snapshot_us > 0 ) {
-						$product_data['_moboRepairSnapshotUs'] = $repair_snapshot_us;
+					$product_data['_moboManualSnapshotUs'] = $manual_snapshot_us;
+					if ( $this->is_repair_mode() ) {
+						/* Backward-compatible marker for checkpoints created by older builds. */
+						$product_data['_moboRepairSnapshotUs'] = $manual_snapshot_us;
 					}
 					$state['productQueue'][] = $product_data;
 				}
@@ -747,12 +935,16 @@ class Mobo_Core_Product_Sync {
 				$state['completedAt']       = time();
 				$state['lastError']         = '';
 				$state['lastMessage']       = 'همگام‌سازی محصولات کامل شد.';
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, 'همگام‌سازی محصولات کامل شد.', $this->get_manual_sync_status() );
 			}
 
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, 'صفحه محصولات دریافت شد.', $this->get_manual_sync_status() );
 		}
@@ -774,7 +966,9 @@ class Mobo_Core_Product_Sync {
 					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 				}
 
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
@@ -792,7 +986,9 @@ class Mobo_Core_Product_Sync {
 					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 				}
 
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result(
 					true,
@@ -802,31 +998,34 @@ class Mobo_Core_Product_Sync {
 			}
 
 			$product_guid       = $this->extract_product_guid( $product_data );
-			$repair_snapshot_us = isset( $product_data['_moboRepairSnapshotUs'] ) ? absint( $product_data['_moboRepairSnapshotUs'] ) : 0;
+			$manual_snapshot_us = isset( $product_data['_moboManualSnapshotUs'] )
+				? absint( $product_data['_moboManualSnapshotUs'] )
+				: ( isset( $product_data['_moboRepairSnapshotUs'] ) ? absint( $product_data['_moboRepairSnapshotUs'] ) : 0 );
 
 			/*
-			 * Repair pages are snapshots. A foreground webhook may have applied a newer
-			 * parent/variant state after this page was fetched but before this queued
-			 * product reaches Step 3. Never let that old page overwrite the webhook.
-			 * Refresh the exact product outside the product lock so webhook latency stays
-			 * low; a second watermark check after lock acquisition closes the race.
+			 * Manual/Repair pages are snapshots. A foreground webhook may have applied
+			 * newer parent/variant state after this page was fetched but before this
+			 * queued product reaches Step 3. Never let that old page overwrite the
+			 * webhook. Refresh the exact product outside the product lock so webhook
+			 * latency stays low; a second watermark check after lock acquisition closes
+			 * the race.
 			 */
-			if ( $this->is_repair_mode() && '' !== $product_guid && $repair_snapshot_us > 0 ) {
+			if ( '' !== $product_guid && $manual_snapshot_us > 0 ) {
 				$last_webhook_us = $this->get_last_webhook_applied_us( $product_guid );
 
-				if ( $last_webhook_us > $repair_snapshot_us ) {
+				if ( $last_webhook_us > $manual_snapshot_us ) {
 					$fresh_response = $api->get_product_by_guid( $product_guid, $state['syncId'] );
 
 					if ( is_wp_error( $fresh_response ) ) {
 						array_unshift( $state['productQueue'], $product_data );
-						return $this->handle_transient_request_error( $state, $fresh_response, 'Repair برای جلوگیری از بازنویسی Webhook منتظر Snapshot تازه محصول است.' );
+						return $this->handle_transient_request_error( $state, $fresh_response, 'Manual Sync برای جلوگیری از بازنویسی Webhook منتظر Snapshot تازه محصول است.' );
 					}
 
 					$fresh_items = $this->extract_explicit_list_data( $fresh_response, 'repair exact product refresh' );
 
 					if ( is_wp_error( $fresh_items ) ) {
 						array_unshift( $state['productQueue'], $product_data );
-						return $this->handle_transient_request_error( $state, $fresh_items, 'Repair پاسخ Snapshot تازه محصول را معتبر دریافت نکرد.' );
+						return $this->handle_transient_request_error( $state, $fresh_items, 'Manual Sync پاسخ Snapshot تازه محصول را معتبر دریافت نکرد.' );
 					}
 
 					$fresh_product = null;
@@ -844,14 +1043,33 @@ class Mobo_Core_Product_Sync {
 						$state['lastError']         = '';
 						$state['lastMessage']       = 'Repair یک Snapshot قدیمی را کنار گذاشت تا وضعیت جدیدتر Webhook حفظ شود: ' . $product_guid;
 						$state['updatedAt']         = time();
-						$this->save_manual_sync_state( $state );
+						if ( ! $this->save_manual_sync_state( $state ) ) {
+							return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+						}
 
 						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 					}
 
-					$product_data                           = $fresh_product;
-					$repair_snapshot_us                    = $this->current_wall_clock_us();
-					$product_data['_moboRepairSnapshotUs'] = $repair_snapshot_us;
+					$product_data = $fresh_product;
+					if ( $this->should_skip_product_by_url( $product_data ) ) {
+						$skipped_url = class_exists( 'Mobo_Core_Product_Exclusions' )
+							? Mobo_Core_Product_Exclusions::get_payload_url( $product_data )
+							: sanitize_text_field( (string) $this->get_value( $product_data, 'url', '' ) );
+						$state['processedProducts'] = absint( $state['processedProducts'] ) + 1;
+						$state['lastError']         = '';
+						$state['lastMessage']       = 'Snapshot تازه محصول در فهرست عدم همگام‌سازی است و Repair/Sync آن را تغییر نداد: ' . sanitize_text_field( (string) $skipped_url );
+						$state['updatedAt']         = time();
+						if ( ! $this->save_manual_sync_state( $state ) ) {
+							return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+						}
+						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+					}
+
+					$manual_snapshot_us                    = $this->current_wall_clock_us();
+					$product_data['_moboManualSnapshotUs'] = $manual_snapshot_us;
+					if ( $this->is_repair_mode() ) {
+						$product_data['_moboRepairSnapshotUs'] = $manual_snapshot_us;
+					}
 					$this->clear_transient_request_error( $state );
 				}
 			}
@@ -867,7 +1085,9 @@ class Mobo_Core_Product_Sync {
 					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 				}
 
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
@@ -882,19 +1102,23 @@ class Mobo_Core_Product_Sync {
 					$state['lastError']   = '';
 					$state['lastMessage'] = 'این محصول در مسیر دیگری در حال پردازش است؛ sync در مرحله بعدی دوباره تلاش می‌کند: ' . $product_guid;
 					$state['updatedAt']   = time();
-					$this->save_manual_sync_state( $state );
+					if ( ! $this->save_manual_sync_state( $state ) ) {
+						return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+					}
 
 					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 				}
 			}
 
 			try {
-				if ( $this->is_repair_mode() && '' !== $product_guid && $repair_snapshot_us > 0 && $this->get_last_webhook_applied_us( $product_guid ) > $repair_snapshot_us ) {
+				if ( '' !== $product_guid && $manual_snapshot_us > 0 && $this->get_last_webhook_applied_us( $product_guid ) > $manual_snapshot_us ) {
 					array_unshift( $state['productQueue'], $product_data );
 					$state['lastError']   = '';
-					$state['lastMessage'] = 'Webhook جدیدتری هنگام آماده‌سازی Repair رسید؛ این محصول در مرحله بعد با Snapshot تازه پردازش می‌شود: ' . $product_guid;
+					$state['lastMessage'] = 'Webhook جدیدتری هنگام آماده‌سازی Manual Sync رسید؛ این محصول در مرحله بعد با Snapshot تازه پردازش می‌شود: ' . $product_guid;
 					$state['updatedAt']   = time();
-					$this->save_manual_sync_state( $state );
+					if ( ! $this->save_manual_sync_state( $state ) ) {
+						return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+					}
 
 					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 				}
@@ -907,7 +1131,7 @@ class Mobo_Core_Product_Sync {
 				}
 
 				$attribute_structure_changed = false;
-				if ( $existing_product_id > 0 ) {
+				if ( $existing_product_id > 0 && $this->product_attributes_field_present( $product_data ) ) {
 					$existing_product = wc_get_product( $existing_product_id );
 					$attribute_structure_changed = $existing_product instanceof WC_Product
 						&& $this->product_attribute_structure_changed( $existing_product, $desired_attributes );
@@ -919,11 +1143,22 @@ class Mobo_Core_Product_Sync {
 				 * children only after the replacement set is proven complete.
 				 */
 				$product_id = $this->upsert_parent_product( $product_data, true );
+				$product_source_version  = $this->extract_source_version( $product_data, $product_data );
+				$product_source_revision = $this->extract_source_revision( $product_data, $product_data );
+				$product_source_hash     = '' !== $product_guid ? $this->build_product_source_hash( $product_data, $product_guid ) : '';
+				$product_portal_id       = $this->extract_portal_product_id( $product_data );
+				if ( $product_id > 0 && ( '' !== $product_source_version || $product_source_revision > 0 ) && ! $this->persist_ordering_watermarks( $product_id, 'product', $product_source_version, $product_source_revision, true ) ) {
+					$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+					$state['lastError']   = 'Product ordering watermark could not be persisted.';
+					$state['lastMessage'] = 'محصول اعمال شد اما checkpoint ترتیب آن ذخیره نشد؛ همان محصول در اجرای بعد idempotent تکرار می‌شود.';
+					$this->save_manual_sync_state( $state );
+					return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
+				}
 				if ( $attribute_structure_changed && $product_id > 0 ) {
 					update_post_meta( $product_id, '_mobo_desired_state_rebuild_pending', '1' );
 					update_post_meta( $product_id, '_mobo_desired_state_rebuild_requested_at', gmdate( 'c' ) );
-					if ( class_exists( 'Mobo_Core_Reconciliation' ) ) {
-						Mobo_Core_Reconciliation::mark_behind( $product_guid, $product_id );
+					if ( class_exists( 'Mobo_Core_Sync_Health' ) ) {
+						Mobo_Core_Sync_Health::mark_behind( $product_guid, $product_id );
 					}
 				}
 			} finally {
@@ -943,19 +1178,26 @@ class Mobo_Core_Product_Sync {
 					$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 				}
 
-				$this->save_manual_sync_state( $state );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
 
 				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
 			$state['currentProductGuid']            = $product_guid;
 			$state['currentProductId']              = absint( $product_id );
+			$state['currentProductPortalId']        = isset( $product_portal_id ) ? absint( $product_portal_id ) : 0;
+			$state['currentProductSourceRevision']  = isset( $product_source_revision ) ? absint( $product_source_revision ) : 0;
+			$state['currentProductSourceVersion']   = isset( $product_source_version ) ? sanitize_text_field( (string) $product_source_version ) : '';
+			$state['currentProductSourceHash']      = isset( $product_source_hash ) ? sanitize_text_field( (string) $product_source_hash ) : '';
 			$state['currentProductImages']          = $this->get_product_images_from_payload( $product_data );
+			$state['currentProductImagesPresent']   = $this->product_images_field_present( $product_data );
 			$state['currentProductAttributes']      = is_array( $desired_attributes ) ? $desired_attributes : array();
 			$state['currentProductImageOffset']     = 0;
 			$state['currentProductWasExisting']     = $was_existing;
 			$state['currentProductImagesDone']      = false;
-			$state['currentProductCanHaveVariants'] = $this->product_has_variation_attributes( $product_data );
+			$state['currentProductCanHaveVariants'] = $this->product_payload_can_have_variants( $product_data, $product_id );
 
 			$state['variantPage']                   = 1;
 			$state['currentVariantTotalCount']      = 0;
@@ -967,8 +1209,17 @@ class Mobo_Core_Product_Sync {
 				? 'محصول اصلی بدون تغییر بود و ذخیره مجدد نشد: ' . $product_guid
 				: 'محصول اصلی همگام شد: ' . $product_guid;
 
-			$this->reset_seen_variants( $product_guid, $state['syncId'] );
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->reset_seen_variants( $product_guid, $state['syncId'] ) ) {
+				$state['lastError']   = 'Could not durably initialize the variation seen-set.';
+				$state['lastMessage'] = 'Checkpoint تنوع‌های محصول ذخیره نشد؛ برای جلوگیری از حذف اشتباه هیچ Variantی پردازش نشد.';
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+				}
+				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
+			}
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint محصول پس از آماده‌سازی Variantها به‌صورت پایدار ذخیره نشد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -982,7 +1233,9 @@ class Mobo_Core_Product_Sync {
 			$image_offset = absint( $state['currentProductImageOffset'] );
 			$was_existing = ! empty( $state['currentProductWasExisting'] );
 
-			$should_process_images = $product_id > 0 && ! empty( $images )
+			$images_present = ! empty( $state['currentProductImagesPresent'] );
+			$should_process_images = $product_id > 0
+				&& ( ! $was_existing || $images_present )
 				&& ( ! $was_existing || $this->rules->should_update_images() )
 				&& $this->product_images_need_processing( $product_id, $images, ! $was_existing );
 
@@ -1003,12 +1256,20 @@ class Mobo_Core_Product_Sync {
 					$state['lastError']                 = '';
 					$state['lastMessage']               = sprintf( 'تصاویر محصول در حال پردازش است. پردازش‌شده: %d، باقی‌مانده صف: %d', isset( $image_result['processed'] ) ? absint( $image_result['processed'] ) : 0, isset( $image_result['pending'] ) ? absint( $image_result['pending'] ) : 0 );
 
-					$this->save_manual_sync_state( $state );
+					if ( ! $this->save_manual_sync_state( $state ) ) {
+						return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+					}
 
 					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 				}
 
-				$this->mark_product_images_converged( $product_id, $images );
+				if ( ! empty( $image_result['pending'] ) ) {
+					if ( ! $this->mark_product_images_pending( $product_id, $images ) ) {
+						return $this->handle_transient_request_error( $state, 'Image pending desired-state hash could not be committed.', 'ثبت watermark در انتظار تصاویر ناموفق بود.' );
+					}
+				} elseif ( ! $this->mark_product_images_converged( $product_id, $images ) ) {
+					return $this->handle_transient_request_error( $state, 'Image desired-state hash could not be committed.', 'ثبت watermark تصاویر ناموفق بود.' );
+				}
 			}
 
 			$state['currentProductImagesDone']   = true;
@@ -1016,7 +1277,9 @@ class Mobo_Core_Product_Sync {
 			$state['lastError']                  = '';
 			$state['lastMessage']                = 'تصاویر محصول به صف امن منتقل شد و همگام‌سازی محصول ادامه پیدا می‌کند.';
 
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -1040,18 +1303,33 @@ class Mobo_Core_Product_Sync {
 			}
 
 			if ( $product_id > 0 ) {
-				/* Fetch and validate the authoritative simple-variant response before
-				 * converting a previously variable product. The apply path performs the
-				 * conversion only after a valid terminal response is available. */
-				$simple_variant = $this->sync_simple_product_variant_from_api(
+				/*
+				 * Fetch/validate Portal state outside the shared product lock. Only the
+				 * local topology/identity commit is serialized. This keeps Portal latency
+				 * out of the critical section while closing the Step-3 -> Step-5 TOCTOU.
+				 */
+				$simple_snapshot = $this->fetch_simple_product_variant_snapshot_from_api(
 					$api,
 					$product_guid,
 					$product_id,
 					$state['syncId']
 				);
 
+				if ( is_wp_error( $simple_snapshot ) ) {
+					return $this->handle_transient_request_error( $state, $simple_snapshot, 'خطا در دریافت شناسه قابل خرید محصول ساده.' );
+				}
+
+				$simple_variant = $this->commit_manual_simple_product_variant_snapshot(
+					$product_id,
+					$product_guid,
+					$simple_snapshot,
+					isset( $state['currentProductAttributes'] ) && is_array( $state['currentProductAttributes'] )
+						? $state['currentProductAttributes']
+						: array()
+				);
+
 				if ( is_wp_error( $simple_variant ) ) {
-					return $this->handle_transient_request_error( $state, $simple_variant, 'خطا در دریافت شناسه قابل خرید محصول ساده.' );
+					return $this->handle_transient_request_error( $state, $simple_variant, 'محصول ساده برای commit امن منتظر lock/revalidation والد است.' );
 				}
 
 				$message = ! empty( $simple_variant['success'] )
@@ -1063,7 +1341,9 @@ class Mobo_Core_Product_Sync {
 				$message = 'محصول ساده محلی پیدا نشد و پردازش آن رد شد.';
 			}
 
-			$this->finish_current_product_state( $state, $message );
+			if ( ! $this->finish_current_product_state( $state, $message ) ) {
+				return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_product_map_finalize_failed', 'Product Map final checkpoint was not durably stored.' ), 'ثبت نهایی Product Map محصول ناموفق بود.' );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -1118,13 +1398,12 @@ class Mobo_Core_Product_Sync {
 			$product_id = $this->find_product_id_by_guid( $product_guid );
 		}
 
-		if ( $product_id > 0 ) {
-			$type_result = $this->ensure_product_type_for_variants( $product_id, $variant_total_count );
-			if ( is_wp_error( $type_result ) ) {
-				return $this->handle_transient_request_error( $state, $type_result, 'تبدیل امن نوع محصول تا حذف کامل Variationهای قدیمی به تعویق افتاد.' );
-			}
-		}
-
+		/*
+		 * Do not mutate product topology from variant_total_count alone. A zero count
+		 * is destructive evidence only when process_update_variant_payload() also sees
+		 * an explicit valid attributes=[] collection on the authoritative page. This
+		 * keeps manual/API sync on the same presence policy as webhook processing.
+		 */
 
 		$state['currentVariantTotalCount'] = $variant_total_count;
 		$state['currentVariantTotalPages'] = absint( $this->get_value( $response, 'totalPages', 0 ) );
@@ -1139,10 +1418,14 @@ class Mobo_Core_Product_Sync {
 			$state['currentVariantCursor'] = absint( $variant_next_cursor );
 		}
 
+		$variant_source_version  = $this->extract_source_version( $response, $response );
+		$variant_source_revision = $this->extract_source_revision( $response, $response );
 		$payload = array(
 			'event'                    => 'UpdateVariant',
 			'variantListAuthoritative' => true,
 			'syncId'                   => $state['syncId'],
+			'eventVersion'              => $variant_source_version,
+			'sourceRevision'            => $variant_source_revision,
 			'productId'     => $product_guid,
 			'totalCount'    => $variant_total_count,
 			'pageNumber'    => $this->get_value( $response, 'pageNumber', $state['variantPage'] ),
@@ -1159,7 +1442,9 @@ class Mobo_Core_Product_Sync {
 		if ( empty( $result['success'] ) ) {
 			$state['lastError']   = isset( $result['message'] ) ? $result['message'] : 'خطا در پردازش تنوع محصول.';
 			$state['lastMessage'] = 'خطا در پردازش تنوع محصول.';
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( false, $state['lastError'], $this->get_manual_sync_status() );
 		}
@@ -1188,12 +1473,16 @@ class Mobo_Core_Product_Sync {
 			$state['lastError']   = '';
 			$state['lastMessage'] = $result['message'];
 
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
-		$this->finish_current_product_state( $state, $result['message'] );
+		if ( ! $this->finish_current_product_state( $state, $result['message'] ) ) {
+			return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_product_map_finalize_failed', 'Product Map final checkpoint was not durably stored.' ), 'ثبت نهایی Product Map محصول ناموفق بود.' );
+		}
 
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
@@ -1284,15 +1573,16 @@ class Mobo_Core_Product_Sync {
 	 * Record that a foreground webhook successfully applied product state.
 	 *
 	 * @param int $product_id WooCommerce product ID.
-	 * @return void
+	 * @return bool True only when the ordering fence is durably persisted.
 	 */
 	private function mark_webhook_product_applied( $product_id ) {
 		$product_id = absint( $product_id );
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
 
-		update_post_meta( $product_id, '_mobo_last_webhook_applied_us', $this->current_wall_clock_us() );
+		$watermark = $this->current_wall_clock_us();
+		return $this->persist_post_meta_verified( $product_id, '_mobo_last_webhook_applied_us', $watermark );
 	}
 
 	/**
@@ -1343,17 +1633,68 @@ class Mobo_Core_Product_Sync {
 	}
 
 	public function process_product_updated_payload( &$payload ) {
+		$context = $this->extract_product_updated_result_context( $payload );
 		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
-			return Mobo_Core_Cache_Mutation_Guard::run(
+			$result = Mobo_Core_Cache_Mutation_Guard::run(
 				function () use ( &$payload ) {
 					return $this->process_product_updated_payload_guarded( $payload );
 				},
 				$this->is_repair_mode() ? 'repair-product' : 'webhook-product'
 			);
+		} else {
+			$result = $this->process_product_updated_payload_guarded( $payload );
 		}
 
-		return $this->process_product_updated_payload_guarded( $payload );
+		return $this->attach_result_sync_context( $result, $context );
 	}
+
+	/** Build durable identity/revision context for the ProductUpdated item about to run. */
+	private function extract_product_updated_result_context( $payload ) {
+		$payload = is_array( $payload ) ? $payload : array();
+		$items   = $this->get_value( $payload, 'data', array() );
+		$index   = max( 0, absint( $this->get_value( $payload, '_moboProductIndex', 0 ) ) );
+		$item    = is_array( $items ) && isset( $items[ $index ] ) && is_array( $items[ $index ] ) ? $items[ $index ] : array();
+		$guid    = $this->extract_product_guid( $item );
+		return array(
+			'productGuid'    => $guid,
+			'productId'      => '' !== $guid ? $this->find_product_id_by_guid( $guid ) : 0,
+			'portalProductId'=> $this->extract_portal_product_id( $item ),
+			'sourceRevision' => $this->extract_source_revision( $item, $payload ),
+			'sourceVersion'  => $this->extract_source_version( $item, $payload ),
+			'sourceHash'     => '' !== $guid ? $this->build_product_source_hash( $item, $guid ) : '',
+		);
+	}
+
+	/** Attach item identity to every checkpoint result, including batch partials. */
+	private function attach_result_sync_context( $result, $context ) {
+		if ( ! is_array( $result ) ) {
+			return $result;
+		}
+		if ( ! isset( $result['data'] ) || ! is_array( $result['data'] ) ) {
+			$result['data'] = array();
+		}
+		foreach ( array( 'productGuid', 'productId', 'portalProductId', 'sourceRevision', 'sourceVersion', 'sourceHash' ) as $key ) {
+			if ( ! isset( $result['data'][ $key ] ) && isset( $context[ $key ] ) && '' !== (string) $context[ $key ] && 0 !== $context[ $key ] ) {
+				$result['data'][ $key ] = $context[ $key ];
+			}
+		}
+		return $result;
+	}
+
+	/** Extract a numeric source revision from item/wrapper without inventing order. */
+	private function extract_source_revision( $item, $wrapper = array() ) {
+	return Mobo_Core_Ordering_Policy::extract_numeric_revision_from_sources( $item, $wrapper );
+}
+
+	/** Extract the raw ordering watermark without assuming it is numeric. */
+	private function extract_source_version( $item, $wrapper = array() ) {
+	return Mobo_Core_Ordering_Policy::extract_version_from_sources( $item, $wrapper );
+}
+
+	/** Compare numeric or ISO-date source versions; null means format is not safely ordered. */
+	private function compare_source_versions( $left, $right ) {
+	return Mobo_Core_Ordering_Policy::compare_versions( $left, $right );
+}
 
 	/**
 	 * Process ProductUpdated after entering the Mobo cache mutation scope.
@@ -1417,7 +1758,9 @@ class Mobo_Core_Product_Sync {
 					true,
 					'ProductUpdated skipped excluded product; products remaining.',
 					array(
-						'deleteFile' => false,
+						'deleteFile'    => false,
+						'healthSkipped' => true,
+						'skippedBecause'=> 'excluded_url',
 					)
 				);
 			}
@@ -1428,14 +1771,35 @@ class Mobo_Core_Product_Sync {
 				true,
 				'ProductUpdated skipped excluded product.',
 				array(
-					'deleteFile' => true,
+					'deleteFile'    => true,
+					'healthSkipped' => true,
+					'skippedBecause'=> 'excluded_url',
 				)
 			);
 		}
 
 		$product_guid = $this->extract_product_guid( $product_data );
 
-		if ( '' !== $product_guid && $this->is_remote_product_trashed( $product_guid ) ) {
+		if ( '' === $product_guid ) {
+			$product_index++;
+			$payload['_moboProductIndex'] = $product_index;
+			$payload['_moboImageOffset']  = 0;
+			$terminal = $product_index >= count( $items );
+			if ( $terminal ) {
+				unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+			}
+			return $this->result(
+				true,
+				'ProductUpdated skipped malformed product without a stable GUID.',
+				array(
+					'deleteFile'     => $terminal,
+					'healthSkipped'  => true,
+					'skippedBecause' => 'missing_product_guid',
+				)
+			);
+		}
+
+		if ( $this->is_remote_product_trashed( $product_guid ) ) {
 			$product_index++;
 			$payload['_moboProductIndex'] = $product_index;
 			$payload['_moboImageOffset']  = 0;
@@ -1445,8 +1809,10 @@ class Mobo_Core_Product_Sync {
 					true,
 					'ProductUpdated skipped trashed product; products remaining.',
 					array(
-						'deleteFile'  => false,
-						'productGuid' => $product_guid,
+						'deleteFile'    => false,
+						'productGuid'   => $product_guid,
+						'healthSkipped' => true,
+						'skippedBecause'=> 'product_trashed',
 					)
 				);
 			}
@@ -1457,15 +1823,52 @@ class Mobo_Core_Product_Sync {
 				true,
 				'ProductUpdated skipped trashed product.',
 				array(
-					'deleteFile'  => true,
-					'productGuid' => $product_guid,
+					'deleteFile'    => true,
+					'productGuid'   => $product_guid,
+					'healthSkipped' => true,
+					'skippedBecause'=> 'product_trashed',
 				)
 			);
 		}
 
 		$existing_product_id       = '' !== $product_guid ? $this->find_product_id_by_guid( $product_guid ) : 0;
+		$source_version            = $this->extract_source_version( $product_data, $payload );
+		$source_revision           = $this->extract_source_revision( $product_data, $payload );
+		if ( $existing_product_id > 0 && '' !== $source_version ) {
+			$seen_version = sanitize_text_field( (string) get_post_meta( $existing_product_id, '_mobo_product_seen_event_version', true ) );
+			$version_cmp  = $this->compare_source_versions( $source_version, $seen_version );
+			if ( -1 === $version_cmp ) {
+				$product_index++;
+				$payload['_moboProductIndex'] = $product_index;
+				$payload['_moboImageOffset']  = 0;
+				$terminal = $product_index >= count( $items );
+				if ( $terminal ) {
+					unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+				}
+				return $this->result( true, 'Stale ProductUpdated event version skipped.', array( 'deleteFile' => $terminal, 'productGuid' => $product_guid, 'productId' => $existing_product_id, 'sourceRevision' => $source_revision, 'sourceVersion' => $source_version, 'staleSkipped' => true ) );
+			}
+			if ( ( null !== $version_cmp || '' === $seen_version ) && ! $this->persist_post_meta_verified( $existing_product_id, '_mobo_product_seen_event_version', $source_version ) ) {
+				return $this->result( false, 'Product event-version watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
+		if ( $existing_product_id > 0 && $source_revision > 0 ) {
+			$seen_revision = absint( get_post_meta( $existing_product_id, '_mobo_product_seen_revision', true ) );
+			if ( $seen_revision > $source_revision ) {
+				$product_index++;
+				$payload['_moboProductIndex'] = $product_index;
+				$payload['_moboImageOffset']  = 0;
+				$terminal = $product_index >= count( $items );
+				if ( $terminal ) {
+					unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+				}
+				return $this->result( true, 'Stale ProductUpdated revision skipped.', array( 'deleteFile' => $terminal, 'productGuid' => $product_guid, 'productId' => $existing_product_id, 'sourceRevision' => $source_revision, 'staleSkipped' => true ) );
+			}
+			if ( ! $this->persist_post_meta_verified( $existing_product_id, '_mobo_product_seen_revision', $source_revision ) ) {
+				return $this->result( false, 'Product revision watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
 		$was_existing             = $existing_product_id > 0;
-		$attribute_structure_changed = $was_existing && $this->product_attribute_structure_changed(
+		$attribute_structure_changed = $was_existing && $this->product_attributes_field_present( $product_data ) && $this->product_attribute_structure_changed(
 			wc_get_product( $existing_product_id ),
 			$this->get_value( $product_data, 'attributes', array() )
 		);
@@ -1475,29 +1878,41 @@ class Mobo_Core_Product_Sync {
 		 * data has arrived, so deleting children here can make a product unsellable
 		 * when the follow-up variant event is delayed or lost. */
 		$product_id = $this->upsert_parent_product( $product_data, true );
+		if ( $product_id > 0 && ( '' !== $source_version || $source_revision > 0 ) && ! $this->persist_ordering_watermarks( $product_id, 'product', $source_version, $source_revision, true ) ) {
+			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
+			return $this->result( false, 'Product ordering watermark could not be committed after mutation; event will retry idempotently.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'retryable' => true ) );
+		}
 
-		if ( $product_id > 0 && ! empty( $payload['_moboWebhookForegroundContext'] ) ) {
-			$this->mark_webhook_product_applied( $product_id );
+		if ( $product_id > 0 && ! empty( $payload['_moboWebhookForegroundContext'] ) && ! $this->mark_webhook_product_applied( $product_id ) ) {
+			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
+			return $this->result( false, 'Foreground webhook ordering fence could not be persisted; event will retry idempotently.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'retryable' => true ) );
 		}
 
 		if ( $attribute_structure_changed && $product_id > 0 ) {
 			update_post_meta( $product_id, '_mobo_desired_state_rebuild_pending', '1' );
 			update_post_meta( $product_id, '_mobo_desired_state_rebuild_requested_at', gmdate( 'c' ) );
-			if ( class_exists( 'Mobo_Core_Reconciliation' ) ) {
-				Mobo_Core_Reconciliation::mark_behind( $product_guid, $product_id );
+			if ( class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_behind( $product_guid, $product_id );
 			}
 		}
 
 		if ( $product_id <= 0 ) {
-			$product_index++;
-			$payload['_moboProductIndex'] = $product_index;
-			$payload['_moboImageOffset']  = 0;
-
-			return $this->result( true, 'Skipped invalid product.', array( 'deleteFile' => false ) );
+			return $this->result(
+				false,
+				'ProductUpdated could not durably create/update the product; event will retry without advancing the batch cursor.',
+				array(
+					'deleteFile'   => false,
+					'productGuid'  => $product_guid,
+					'retryable'    => true,
+				)
+			);
 		}
 
 		$product_images = $this->get_product_images_from_payload( $product_data );
-		$images_dirty   = ( ! $was_existing || $this->rules->should_update_images() )
+		$images_dirty   = ( ! $was_existing || $this->product_images_field_present( $product_data ) )
+			&& ( ! $was_existing || $this->rules->should_update_images() )
 			&& $this->product_images_need_processing( $product_id, $product_images, ! $was_existing );
 
 		if ( $images_dirty ) {
@@ -1536,11 +1951,17 @@ class Mobo_Core_Product_Sync {
 				);
 			}
 
-			$this->mark_product_images_converged( $product_id, $product_images );
+			if ( ! empty( $image_result['pending'] ) ) {
+				if ( ! $this->mark_product_images_pending( $product_id, $product_images ) ) {
+					return $this->result( false, 'ثبت watermark در انتظار تصاویر محصول ناموفق بود؛ event برای retry حفظ شد.', array( 'deleteFile' => false, 'productId' => $product_id, 'retryable' => true ) );
+				}
+			} elseif ( ! $this->mark_product_images_converged( $product_id, $product_images ) ) {
+				return $this->result( false, 'ثبت watermark نهایی تصاویر محصول ناموفق بود؛ event برای retry حفظ شد.', array( 'deleteFile' => false, 'productId' => $product_id, 'retryable' => true ) );
+			}
 		}
 
 		/* ProductUpdated must leave a simple product immediately purchasable. */
-		if ( ! $this->product_has_variation_attributes( $product_data ) && $this->get_stored_portal_variant_id( $product_id ) <= 0 ) {
+		if ( ! $this->product_payload_can_have_variants( $product_data, $product_id ) ) {
 			$api            = new Mobo_Core_API_Client();
 			$simple_variant = $this->sync_simple_product_variant_from_api( $api, $product_guid, $product_id, 'product-updated-' . gmdate( 'YmdHis' ) );
 
@@ -1555,6 +1976,16 @@ class Mobo_Core_Product_Sync {
 						'error'        => $simple_variant->get_error_message(),
 					)
 				);
+			}
+		}
+
+		if ( ! $this->product_payload_can_have_variants( $product_data, $product_id ) ) {
+			if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
+				$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+				return $this->result( true, 'ProductUpdated منتظر ثبت پایدار Product Map است.', array( 'deleteFile' => false, 'deferSeconds' => 60, 'productGuid' => $product_guid, 'productId' => $product_id ) );
+			}
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
+				return $this->result( true, 'ProductUpdated منتظر ثبت پایدار completion marker است.', array( 'deleteFile' => false, 'deferSeconds' => 60, 'productGuid' => $product_guid, 'productId' => $product_id ) );
 			}
 		}
 
@@ -1642,6 +2073,9 @@ class Mobo_Core_Product_Sync {
 		$page_number  = max( 1, absint( $this->get_value( $payload, 'pageNumber', 1 ) ) );
 		$has_more     = $this->get_value( $payload, 'hasMore', false );
 		$is_last_page = $this->get_value( $payload, 'isLastPage', null );
+		$variant_collection_inspection = Mobo_Core_Payload_Field_Policy::inspect( $payload, array( 'data', 'Data' ) );
+		$variant_collection_present    = ! empty( $variant_collection_inspection['present'] );
+		$variant_collection_is_list    = $variant_collection_present && is_array( $variant_collection_inspection['value'] ) && $this->is_list_array( $variant_collection_inspection['value'] );
 		$variants     = $this->get_value( $payload, 'data', array() );
 
 		if ( is_array( $variants ) && ! $this->is_list_array( $variants ) ) {
@@ -1673,6 +2107,19 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, $this->build_missing_product_id_message( $payload, $variants ) );
 		}
 
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_product_guid_excluded( $product_guid ) ) {
+			return $this->result(
+				true,
+				'محصول مادر در فهرست عدم همگام‌سازی است؛ رویداد تنوع بدون mutation خاتمه یافت.',
+				array(
+					'deleteFile'     => true,
+					'productGuid'    => $product_guid,
+					'healthSkipped'  => true,
+					'skippedBecause' => 'excluded_url',
+				)
+			);
+		}
+
 		foreach ( $variants as $variant_index => $variant_data ) {
 			if ( is_array( $variant_data ) ) {
 				$variant_product_guid = $this->extract_product_guid( $variant_data );
@@ -1690,6 +2137,7 @@ class Mobo_Core_Product_Sync {
 				array(
 					'deleteFile'     => true,
 					'productGuid'    => $product_guid,
+					'healthSkipped'  => true,
 					'skippedBecause' => 'parent_trashed',
 				)
 			);
@@ -1700,6 +2148,19 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_id = $this->find_product_id_by_guid( $product_guid );
+
+		if ( $product_id > 0 && class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+			return $this->result(
+				true,
+				'محصول مادر در فهرست عدم همگام‌سازی است؛ رویداد تنوع بدون mutation خاتمه یافت.',
+				array(
+					'deleteFile'     => true,
+					'productGuid'    => $product_guid,
+					'healthSkipped'  => true,
+					'skippedBecause' => 'excluded_url',
+				)
+			);
+		}
 
 		if ( $product_id <= 0 ) {
 			return $this->result(
@@ -1721,12 +2182,58 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$variant_list_authoritative = $this->is_authoritative_variant_list_payload( $payload, $variants );
-		$variant_total              = max( count( $variants ), absint( $this->get_value( $payload, 'totalCount', count( $variants ) ) ) );
-		$desired_attributes_present = array_key_exists( 'attributes', $payload ) || array_key_exists( 'Attributes', $payload );
-		$desired_attributes         = $this->get_value( $payload, 'attributes', array() );
-		if ( ! is_array( $desired_attributes ) ) {
-			$desired_attributes = array();
+		$source_version             = $this->extract_source_version( $payload, $payload );
+		$source_revision            = $this->extract_source_revision( $payload, $payload );
+
+		$attribute_inspection       = Mobo_Core_Payload_Field_Policy::inspect( $payload, Mobo_Core_Payload_Field_Policy::attribute_aliases() );
+		$desired_attributes_present = ! empty( $attribute_inspection['present'] );
+		$desired_attributes_valid   = ! $desired_attributes_present || is_array( $attribute_inspection['value'] );
+		$desired_attributes         = $desired_attributes_present && is_array( $attribute_inspection['value'] ) ? $attribute_inspection['value'] : array();
+
+		/*
+		 * A destructive topology snapshot requires explicit, well-formed evidence for
+		 * both collections. Missing attributes preserves topology; malformed attributes
+		 * or malformed/absent snapshot data fail closed before any watermark/mutation.
+		 */
+		if ( $variant_list_authoritative && ( ! $variant_collection_present || ! $variant_collection_is_list ) ) {
+			return $this->result( false, 'Authoritative Variant snapshot data is absent or malformed; topology mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 		}
+		if ( $variant_list_authoritative && $desired_attributes_present && ! $desired_attributes_valid ) {
+			return $this->result( false, 'Authoritative Variant attributes are malformed; topology mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+		}
+		$topology_authoritative = $variant_list_authoritative && $variant_collection_is_list && $desired_attributes_present && $desired_attributes_valid;
+
+		/* Validate every parent ordering fence before persisting either watermark. */
+		if ( $variant_list_authoritative ) {
+			$seen_event_version = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_seen_event_version', true ) );
+			$seen_revision      = absint( get_post_meta( $product_id, '_mobo_variant_seen_revision', true ) );
+			$version_cmp        = '' !== $source_version ? $this->compare_source_versions( $source_version, $seen_event_version ) : null;
+			if ( '' !== $source_version && -1 === $version_cmp ) {
+				return $this->result( true, 'Stale authoritative UpdateVariant event version skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'sourceVersion' => $source_version, 'staleSkipped' => true ) );
+			}
+			if ( $source_revision > 0 && $seen_revision > $source_revision ) {
+				return $this->result( true, 'Stale authoritative UpdateVariant revision skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'staleSkipped' => true ) );
+			}
+			if ( '' !== $source_version && ( null !== $version_cmp || '' === $seen_event_version ) && ! $this->persist_post_meta_verified( $product_id, '_mobo_variant_seen_event_version', $source_version ) ) {
+				return $this->result( false, 'Variant snapshot event-version watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( $source_revision > 0 && ! $this->persist_post_meta_verified( $product_id, '_mobo_variant_seen_revision', $source_revision ) ) {
+				return $this->result( false, 'Variant snapshot revision watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
+		if ( $topology_authoritative ) {
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) || ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				return $this->result( false, 'Authoritative Variant topology crash marker could not be persisted before mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
+		$desired_attribute_count = count( $this->build_product_attributes( $desired_attributes ) );
+		if ( $topology_authoritative && 0 === $desired_attribute_count ) {
+			$preflight_simple = $this->preflight_simple_variation_cleanup( $product_id );
+			if ( is_wp_error( $preflight_simple ) ) {
+				return $this->result( false, $preflight_simple->get_error_message(), array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
+		$variant_total = max( count( $variants ), absint( $this->get_value( $payload, 'totalCount', count( $variants ) ) ) );
 
 		$is_last_page = null === $is_last_page ? ! $this->to_bool( $has_more ) : $this->to_bool( $is_last_page );
 
@@ -1741,7 +2248,7 @@ class Mobo_Core_Product_Sync {
 
 		$parent_mutated = false;
 
-		if ( $variant_list_authoritative && $desired_attributes_present ) {
+		if ( $topology_authoritative ) {
 			$structure_changed = $this->product_attribute_structure_changed( $product, $desired_attributes );
 
 			if ( $structure_changed ) {
@@ -1764,19 +2271,42 @@ class Mobo_Core_Product_Sync {
 		 * the parent product itself. An authoritative snapshot with no variation
 		 * attributes is also allowed to convert an old variable product back to simple.
 		 */
-		$desired_attribute_count        = count( $this->build_product_attributes( $desired_attributes ) );
-		$authoritative_simple_snapshot = $variant_list_authoritative
-			&& $desired_attributes_present
+		$authoritative_simple_snapshot = $topology_authoritative
 			&& 0 === $desired_attribute_count;
 
 		if ( 1 === count( $variants ) && $variant_total <= 1 && ! $this->variant_has_selection_attributes( $variants[0] ) && ( $authoritative_simple_snapshot || $product instanceof WC_Product_Simple || '1' === (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true ) ) ) {
+			if ( ! $variant_list_authoritative && ( '' !== $source_version || $source_revision > 0 ) ) {
+				$simple_seen_version  = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_seen_event_version', true ) );
+				$simple_seen_revision = absint( get_post_meta( $product_id, '_mobo_variant_seen_revision', true ) );
+				$simple_version_cmp   = '' !== $source_version ? $this->compare_source_versions( $source_version, $simple_seen_version ) : null;
+				if ( '' !== $source_version && -1 === $simple_version_cmp ) {
+					return $this->result( true, 'Stale simple UpdateVariant event version skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'sourceVersion' => $source_version, 'staleSkipped' => true ) );
+				}
+				if ( $source_revision > 0 && $simple_seen_revision > $source_revision ) {
+					return $this->result( true, 'Stale simple UpdateVariant revision skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'staleSkipped' => true ) );
+				}
+				if ( '' !== $source_version && ( null !== $simple_version_cmp || '' === $simple_seen_version ) && ! $this->persist_post_meta_verified( $product_id, '_mobo_variant_seen_event_version', $source_version ) ) {
+					return $this->result( false, 'Simple-variant event-version watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
+				if ( $source_revision > 0 && ! $this->persist_post_meta_verified( $product_id, '_mobo_variant_seen_revision', $source_revision ) ) {
+					return $this->result( false, 'Simple-variant revision watermark could not be persisted; mutation was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
+			}
+
+
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) ) {
+				return $this->result( false, 'Simple-product crash marker could not be persisted before mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				return $this->result( false, 'ثبت Product Map پیش از تغییر محصول ساده ناموفق بود.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
 			$simple_result = $this->apply_simple_variant_to_product( $product_id, $variants[0], $product_guid );
 
 			if ( is_wp_error( $simple_result ) ) {
 				return $this->result( false, $simple_result->get_error_message(), array( 'deleteFile' => false, 'productGuid' => $product_guid ) );
 			}
 
-			if ( $variant_list_authoritative ) {
+			if ( $authoritative_simple_snapshot ) {
 				if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
 					$mapping_error = '';
 					$this->product_map->delete_variations_for_parent( $product_guid, array(), $mapping_error );
@@ -1793,11 +2323,27 @@ class Mobo_Core_Product_Sync {
 				delete_post_meta( $product_id, '_mobo_missing_variants_seen_count' );
 				delete_post_meta( $product_id, '_mobo_missing_variants_expected_count' );
 				update_post_meta( $product_id, '_mobo_desired_state_last_completed_at', gmdate( 'c' ) );
-				$this->clear_seen_variants( $product_guid, $sync_id );
+				if ( ! $this->clear_seen_variants( $product_guid, $sync_id ) ) {
+					return $this->result( false, 'Authoritative variation seen-set could not be cleared durably after finalization; event will retry idempotently.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
 			}
 
-			if ( ! empty( $payload['_moboWebhookForegroundContext'] ) ) {
-				$this->mark_webhook_product_applied( $product_id );
+			if ( ( '' !== $source_version || $source_revision > 0 ) && ! $this->persist_ordering_watermarks( $product_id, 'variant', $source_version, $source_revision, true ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				return $this->result( false, 'Simple-variant ordering watermark could not be committed after mutation; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
+				$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+				return $this->result( false, 'ثبت نهایی Product Map محصول ساده ناموفق بود.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
+				return $this->result( false, 'Simple-product completion marker could not be persisted; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+
+			if ( ! empty( $payload['_moboWebhookForegroundContext'] ) && ! $this->mark_webhook_product_applied( $product_id ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $product_guid, $product_id, true );
+				return $this->result( false, 'Simple-product webhook ordering fence could not be persisted; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'retryable' => true ) );
 			}
 
 			return $this->result(
@@ -1812,6 +2358,31 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
+		/* A delta can arrive after a newer delta/snapshot has already converged.
+		 * Prove that the entire page is stale before touching parent topology;
+		 * otherwise an old delta could convert a newer simple parent back to
+		 * variable even though every child mutation is subsequently skipped. */
+		if ( ! $variant_list_authoritative && $this->delta_variant_payload_is_fully_stale( $product_id, $variants, $source_version, $source_revision ) ) {
+			return $this->result(
+				true,
+				'Stale UpdateVariant delta skipped before parent mutation.',
+				array(
+					'deleteFile'     => true,
+					'productGuid'    => $product_guid,
+					'productId'      => $product_id,
+					'sourceRevision' => $source_revision,
+					'sourceVersion'  => $source_version,
+					'staleSkipped'   => true,
+				)
+			);
+		}
+
+		if ( ! $variant_list_authoritative ) {
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) || ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				return $this->result( false, 'Variant delta crash marker could not be persisted before mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+		}
+
 		/*
 		 * Delta variant webhooks are coalesced at the parent level. Suppress the
 		 * WooCommerce CRUD purge generated by each child save; the parent-finalize
@@ -1822,12 +2393,14 @@ class Mobo_Core_Product_Sync {
 			Mobo_Core_Cache_Purger::suppress_product_for_request( $product_id );
 		}
 
-		if ( $variant_list_authoritative ) {
-			$this->initialize_seen_variants( $product_guid, $sync_id );
+		if ( $topology_authoritative && ! $this->initialize_seen_variants( $product_guid, $sync_id ) ) {
+			return $this->result( false, 'Could not durably initialize the authoritative variation seen-set; snapshot finalization was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 		}
 
 		$before_product_type = $product instanceof WC_Product ? (string) $product->get_type() : '';
-		$type_result = $this->ensure_product_type_for_variants( $product_id, ( $variant_total > 0 || $desired_attribute_count > 0 ) ? max( 1, $variant_total ) : 0 );
+		$type_result = ( $variant_list_authoritative && ! $topology_authoritative )
+			? $product
+			: $this->ensure_product_type_for_variants( $product_id, ( $variant_total > 0 || $desired_attribute_count > 0 ) ? max( 1, $variant_total ) : 0 );
 		if ( is_wp_error( $type_result ) ) {
 			return $this->result( false, $type_result->get_error_message(), array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 		}
@@ -1837,12 +2410,22 @@ class Mobo_Core_Product_Sync {
 			$parent_mutated = true;
 		}
 
+		if ( $topology_authoritative && 0 === $desired_attribute_count && 0 === $variant_total && empty( $variants ) ) {
+			$empty_simple = $this->apply_authoritative_simple_without_purchase_variant( $product_id, $product_guid );
+			if ( is_wp_error( $empty_simple ) ) {
+				return $this->result( false, $empty_simple->get_error_message(), array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			$product = wc_get_product( $product_id );
+			$parent_mutated = true;
+		}
+
 		/* Prime GUID->ID, post and meta caches once for this variant page. */
 		$this->prime_variation_page_context( $product_id, $variants );
 
 		$updated            = 0;
 		$unchanged          = 0;
 		$skipped            = 0;
+		$stale_skipped      = 0;
 		$seen_variant_guids = array();
 		$last_lock_renewal  = time();
 
@@ -1865,13 +2448,46 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
+			$incoming_variant_guid = $this->extract_variant_guid( $variant_data );
+			if ( ! $variant_list_authoritative && ( '' !== $source_version || $source_revision > 0 ) && '' !== $incoming_variant_guid ) {
+				$existing_variation_id = $this->find_variation_id_by_guid( $incoming_variant_guid );
+				if ( $existing_variation_id > 0 && absint( wp_get_post_parent_id( $existing_variation_id ) ) === $product_id ) {
+					$variation_seen_version  = sanitize_text_field( (string) get_post_meta( $existing_variation_id, '_mobo_variant_seen_event_version', true ) );
+					$variation_seen_revision = absint( get_post_meta( $existing_variation_id, '_mobo_variant_seen_revision', true ) );
+					$variation_version_cmp   = '' !== $source_version ? $this->compare_source_versions( $source_version, $variation_seen_version ) : null;
+					if ( ( '' !== $source_version && -1 === $variation_version_cmp ) || ( $source_revision > 0 && $variation_seen_revision > $source_revision ) ) {
+						$stale_skipped++;
+						$unchanged++;
+						continue;
+					}
+					if ( '' !== $source_version && ( null !== $variation_version_cmp || '' === $variation_seen_version ) && ! $this->persist_post_meta_verified( $existing_variation_id, '_mobo_variant_seen_event_version', $source_version ) ) {
+						return $this->result( false, 'Variation event-version watermark could not be persisted before mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+					}
+					if ( $source_revision > 0 && ! $this->persist_post_meta_verified( $existing_variation_id, '_mobo_variant_seen_revision', $source_revision ) ) {
+						return $this->result( false, 'Variation revision watermark could not be persisted before mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+					}
+				}
+			}
+
+
 			$variation_result = $this->upsert_variation( $product, $variant_data );
 			$variation_id     = is_array( $variation_result ) && isset( $variation_result['id'] ) ? absint( $variation_result['id'] ) : absint( $variation_result );
 
 			if ( $variation_id > 0 ) {
 				$variant_guid = $this->extract_variant_guid( $variant_data );
 
-				if ( $variant_list_authoritative && '' !== $variant_guid ) {
+				/* Every successful child mutation, including authoritative snapshots, must
+				 * persist the child watermark. Otherwise a late pre-snapshot delta can pass
+				 * the per-variation stale guard and overwrite the newer snapshot state. */
+				if ( ( '' !== $source_version || $source_revision > 0 ) && ! $this->persist_ordering_watermarks( $variation_id, 'variant', $source_version, $source_revision, true ) ) {
+					$this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '1' );
+					if ( '' !== $variant_guid ) {
+						$this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true );
+					}
+					return $this->result( false, 'Variation ordering watermark could not be committed after mutation; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
+
+				if ( $topology_authoritative && '' !== $variant_guid ) {
 					$seen_variant_guids[ $variant_guid ] = true;
 				}
 
@@ -1881,19 +2497,34 @@ class Mobo_Core_Product_Sync {
 					$updated++;
 				}
 			} else {
-				$skipped++;
+				$intentional_trash_skip = is_array( $variation_result ) && ! empty( $variation_result['skipped_trash'] );
+				if ( $intentional_trash_skip ) {
+					/* A locally trashed Mobo variation is an explicit retention policy, not an
+					 * incomplete source page. Count its remote identity as seen so an
+					 * authoritative snapshot can finish without restoring it or retrying forever. */
+					if ( $topology_authoritative && '' !== $incoming_variant_guid ) {
+						$seen_variant_guids[ $incoming_variant_guid ] = true;
+					}
+					$unchanged++;
+				} else {
+					$skipped++;
+				}
 			}
 		}
 
-		if ( $variant_list_authoritative && ! empty( $seen_variant_guids ) ) {
-			$this->mark_variants_seen_bulk( $product_guid, $sync_id, array_keys( $seen_variant_guids ) );
+		if ( $topology_authoritative && ! empty( $seen_variant_guids ) && ! $this->mark_variants_seen_bulk( $product_guid, $sync_id, array_keys( $seen_variant_guids ) ) ) {
+			return $this->result( false, 'Could not durably persist the authoritative variation seen-set; destructive finalization was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 		}
 
-		$deleted_missing_variants = 0;
+		$deleted_missing_variants          = 0;
+		$authoritative_snapshot_incomplete = false;
 
-		if ( $variant_list_authoritative ) {
+		if ( $topology_authoritative ) {
 			$expected_variant_total = absint( $this->get_value( $payload, 'totalCount', 0 ) );
 			$seen_variant_count     = $this->count_seen_variants( $product_guid, $sync_id );
+			if ( $seen_variant_count < 0 ) {
+				return $this->result( false, 'Authoritative variation seen-set could not be read back; snapshot finalization was deferred.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
 			$snapshot_complete      = ( 0 === $expected_variant_total && $is_last_page )
 				|| ( $expected_variant_total > 0 && $seen_variant_count >= $expected_variant_total );
 
@@ -1910,8 +2541,11 @@ class Mobo_Core_Product_Sync {
 				delete_post_meta( $product_id, '_mobo_missing_variants_seen_count' );
 				delete_post_meta( $product_id, '_mobo_missing_variants_expected_count' );
 				update_post_meta( $product_id, '_mobo_desired_state_last_completed_at', gmdate( 'c' ) );
-				$this->clear_seen_variants( $product_guid, $sync_id );
+				if ( ! $this->clear_seen_variants( $product_guid, $sync_id ) ) {
+					return $this->result( false, 'Authoritative variation seen-set could not be cleared durably after finalization; event will retry idempotently.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
 			} elseif ( $is_last_page ) {
+				$authoritative_snapshot_incomplete = true;
 				/*
 				 * Keep the accumulated set. A delayed earlier page from the same sync can
 				 * still complete the snapshot and safely trigger finalization.
@@ -1928,7 +2562,11 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $parent_mutated || $updated > 0 || $deleted_missing_variants > 0 ) {
-			$this->update_post_meta_if_changed( $product_id, '_mobo_parent_sync_pending', '1' );
+			if ( ! $this->persist_post_meta_verified( $product_id, '_mobo_parent_sync_pending', '1' ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $product_guid, $product_id, true );
+				return $this->result( false, 'Parent-finalize checkpoint could not be persisted after Variant mutation; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'retryable' => true ) );
+			}
 		}
 
 		$parent_sync_performed = false;
@@ -1980,17 +2618,56 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( ! empty( $payload['_moboWebhookForegroundContext'] ) ) {
-			$this->mark_webhook_product_applied( $product_id );
+		if ( ! empty( $payload['_moboWebhookForegroundContext'] ) && ! $this->mark_webhook_product_applied( $product_id ) ) {
+			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
+			return $this->result( false, 'Variant webhook ordering fence could not be persisted; event will retry idempotently.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'retryable' => true ) );
+		}
+
+		if ( $skipped > 0 || $authoritative_snapshot_incomplete ) {
+			$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
+			return $this->result(
+				true,
+				'تنوع‌ها هنوز کامل همگام نشده‌اند و event برای retry حفظ شد.',
+				array(
+					'deleteFile' => false,
+					'deferSeconds' => 60,
+					'productGuid' => $product_guid,
+					'pageNumber' => $page_number,
+					'skipped' => $skipped,
+					'authoritativeSnapshotIncomplete' => $authoritative_snapshot_incomplete,
+				)
+			);
+		}
+
+		if ( $is_last_page ) {
+			/* Ordering evidence is part of the completion commit. Persist it before
+			 * advertising a clean Product Map / crash marker so a process death can
+			 * never acknowledge a snapshot whose stale guard was not durable. */
+			if ( $variant_list_authoritative && ( '' !== $source_version || $source_revision > 0 ) && ! $this->persist_ordering_watermarks( $product_id, 'variant', $source_version, $source_revision, true ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $product_guid, $product_id, true );
+				return $this->result( false, 'Authoritative Variant ordering watermark could not be committed; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				return $this->result( false, 'ثبت نهایی Product Map پس از Variant Sync ناموفق بود.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
+				$this->upsert_product_map( $product_guid, $product_id, true );
+				return $this->result( false, 'ثبت نهایی completion marker پس از Variant Sync ناموفق بود.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+			}
 		}
 
 		$message = sprintf(
-			'تنوع‌های محصول پردازش شد. محصول: %s، صفحه: %d، بروزرسانی: %d، بدون تغییر: %d، رد شده: %d',
+			'تنوع‌های محصول پردازش شد. محصول: %s، صفحه: %d، بروزرسانی: %d، بدون تغییر: %d، رد شده: %d، stale: %d',
 			$product_guid,
 			$page_number,
 			$updated,
 			$unchanged,
-			$skipped
+			$skipped,
+			$stale_skipped
 		);
 
 		return $this->result(
@@ -2003,6 +2680,9 @@ class Mobo_Core_Product_Sync {
 				'updated'     => $updated,
 				'unchanged'   => $unchanged,
 				'skipped'              => $skipped,
+				'staleSkipped'         => $stale_skipped,
+				'sourceRevision'       => $source_revision,
+				'sourceVersion'        => $source_version,
 				'isLastPage'           => $is_last_page,
 				'parentSyncPerformed'  => $parent_sync_performed,
 				'parentSyncDeferred'   => $parent_sync_deferred || ( ! $is_last_page && ( $parent_mutated || $updated > 0 ) ),
@@ -2206,7 +2886,9 @@ class Mobo_Core_Product_Sync {
 			$state['completedAt']                  = time();
 			$state['lastError']                    = '';
 			$state['lastMessage']                  = 'Repair کامل شد؛ سرویس بازیابی تصویر در دسترس نبود.';
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -2218,7 +2900,9 @@ class Mobo_Core_Product_Sync {
 			$state['completedAt']                  = time();
 			$state['lastError']                    = '';
 			$state['lastMessage']                  = 'Repair کامل شد؛ بازیابی تصویر محصولات بدون عکس به دلیل غیرفعال بودن بروزرسانی تصاویر رد شد.';
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -2249,7 +2933,9 @@ class Mobo_Core_Product_Sync {
 				$state['lastMessage'] = 'Repair محصولات اصلی کامل است؛ جست‌وجوی محصولات محلی بدون تصویر ادامه دارد.';
 			}
 
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
 
@@ -2297,7 +2983,9 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
-		$this->save_manual_sync_state( $state );
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+		}
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
 
@@ -2347,10 +3035,6 @@ class Mobo_Core_Product_Sync {
 
 		$state['updatedAt'] = time();
 
-		if ( ! $this->checkpoint_coalescing ) {
-			$this->persist_repair_completion_if_needed( $state );
-		}
-
 		if ( $this->checkpoint_coalescing ) {
 			$this->checkpoint_state = $state;
 			$this->checkpoint_pending_steps++;
@@ -2366,9 +3050,24 @@ class Mobo_Core_Product_Sync {
 			return $this->flush_manual_sync_checkpoint();
 		}
 
-		update_option( self::STATE_OPTION, $state, false );
+		if ( ! $this->persist_manual_sync_state_verified( $state ) ) {
+			return false;
+		}
+		$this->persist_repair_completion_if_needed( $state );
 
 		return true;
+	}
+
+	/**
+	 * Durably persist the manual-sync checkpoint and verify the exact read-back.
+	 * update_option() returns false both for failures and no-op writes, so the
+	 * postcondition—not its boolean return—is the durability boundary.
+	 *
+	 * @param array $state Sync state.
+	 * @return bool
+	 */
+	private function persist_manual_sync_state_verified( $state ) {
+		return is_array( $state ) && Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
 	}
 
 	/**
@@ -2426,8 +3125,10 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
+		if ( ! $this->persist_manual_sync_state_verified( $pending ) ) {
+			return false;
+		}
 		$this->persist_repair_completion_if_needed( $pending );
-		update_option( self::STATE_OPTION, $pending, false );
 		$this->checkpoint_pending_steps = 0;
 		$this->checkpoint_last_flush_at = microtime( true );
 		return true;
@@ -2456,10 +3157,58 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function finish_current_product_state( &$state, $message ) {
+		$completed_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
+		$completed_id   = absint( $state['currentProductId'] );
+		if ( '' !== $completed_guid && $completed_id > 0 ) {
+			if ( ! $this->upsert_product_map( $completed_guid, $completed_id, false ) ) {
+				$this->update_post_meta_if_changed( $completed_id, 'mobo_sync_incomplete', '1' );
+				return false;
+			}
+			if ( ! $this->persist_post_meta_verified( $completed_id, 'mobo_sync_incomplete', '0' ) ) {
+				$this->upsert_product_map( $completed_guid, $completed_id, true );
+				return false;
+			}
+
+			/* Commit the Repair-generation marker only for products that reached the
+			 * same durable completion boundary as normal sync. The timestamp is written
+			 * first and the syncId last, making syncId the commit marker. Post-sync
+			 * cleanup also requires mobo_sync_incomplete=0. */
+			if ( ! empty( $state['repairMode'] ) ) {
+				$repair_sync_id = sanitize_text_field( (string) ( $state['syncId'] ?? '' ) );
+				$repair_applied_revision = absint( get_post_meta( $completed_id, '_mobo_product_applied_revision', true ) );
+				$repair_webhook_us = absint( get_post_meta( $completed_id, '_mobo_last_webhook_applied_us', true ) );
+				if ( '' === $repair_sync_id
+					|| ! $this->persist_post_meta_verified( $completed_id, self::REPAIR_APPLIED_REVISION_META, $repair_applied_revision )
+					|| ! $this->persist_post_meta_verified( $completed_id, self::REPAIR_WEBHOOK_US_META, $repair_webhook_us )
+					|| ! $this->persist_post_meta_verified( $completed_id, self::REPAIR_SYNCED_AT_META, time() )
+					|| ! $this->persist_post_meta_verified( $completed_id, self::REPAIR_SYNC_ID_META, $repair_sync_id ) ) {
+					$this->persist_post_meta_verified( $completed_id, 'mobo_sync_incomplete', '1' );
+					$this->upsert_product_map( $completed_guid, $completed_id, true );
+					return false;
+				}
+			}
+
+			if ( class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_synced(
+					$completed_guid,
+					$completed_id,
+					absint( $state['currentProductSourceRevision'] ?? 0 ),
+					sanitize_text_field( (string) ( $state['currentProductSourceHash'] ?? '' ) ),
+					absint( $state['currentProductPortalId'] ?? 0 ),
+					sanitize_text_field( (string) ( $state['currentProductSourceVersion'] ?? '' ) )
+				);
+			}
+		}
+
 		$state['processedProducts']              = absint( $state['processedProducts'] ) + 1;
 		$state['currentProductGuid']             = '';
 		$state['currentProductId']               = 0;
+		$state['currentProductPortalId']         = 0;
+		$state['currentProductSourceRevision']   = 0;
+		$state['currentProductSourceVersion']    = '';
+		$state['currentProductSourceHash']       = '';
 		$state['currentProductImages']           = array();
+		$state['currentProductImagesPresent']    = false;
 		$state['currentProductAttributes']       = array();
 		$state['currentProductImageOffset']      = 0;
 		$state['currentProductWasExisting']      = false;
@@ -2479,7 +3228,7 @@ class Mobo_Core_Product_Sync {
 			$state['lastMessage'] = 'همگام‌سازی محصولات کامل شد.';
 		}
 
-		$this->save_manual_sync_state( $state );
+		return $this->save_manual_sync_state( $state );
 	}
 
 	private function upsert_parent_product( $data, $skip_images ) {
@@ -2492,6 +3241,11 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product_id      = $this->find_product_id_by_guid( $product_guid );
+		$is_new_product  = $product_id <= 0;
+		$payload_integrity = $this->validate_product_desired_state_payload( $data, $is_new_product );
+		if ( is_wp_error( $payload_integrity ) ) {
+			throw new RuntimeException( $payload_integrity->get_error_message() );
+		}
 		if ( $product_id <= 0 && $this->is_repair_mode() ) {
 			$product_id = $this->restore_trashed_mobo_object_by_identity( 'product', 'product_guid', $product_guid, 0 );
 			if ( $product_id > 0 ) {
@@ -2504,8 +3258,23 @@ class Mobo_Core_Product_Sync {
 		if ( $product_id > 0 ) {
 			$product = wc_get_product( $product_id );
 
+			/*
+			 * An existing Mobo identity must never be type-coerced merely because the
+			 * WooCommerce factory could not materialize it. Constructing
+			 * WC_Product_Simple with an existing Variable product ID can make
+			 * WC_Product::save() run WooCommerce's Variable->non-Variable transition,
+			 * which force-deletes every child variation before Mobo's quarantine/map
+			 * lifecycle has a chance to preserve forensic identity. Treat a transient
+			 * or structural factory failure as retryable/fail-closed instead.
+			 */
 			if ( ! $product instanceof WC_Product ) {
-				$product = new WC_Product_Simple( $product_id );
+				throw new RuntimeException(
+					sprintf(
+						'WooCommerce could not load existing Mobo product %d (%s); mutation was deferred to avoid unsafe product-type coercion.',
+						$product_id,
+						$product_guid
+					)
+				);
 			}
 		} else {
 			$product = new WC_Product_Simple();
@@ -2530,12 +3299,32 @@ class Mobo_Core_Product_Sync {
 			 * convergence metadata directly and avoid WC CRUD/cache hooks entirely.
 			 */
 			if ( '1' !== $old_incomplete && $this->product_frontend_state_matches_payload( $product, $data ) ) {
-				$this->sync_product_identity_meta_fast( $product_id, $data, $product_guid );
-				$this->sync_price_source_meta_fast( $product_id, $data );
+				if ( ! $this->sync_product_identity_meta_fast( $product_id, $data, $product_guid ) || ! $this->sync_price_source_meta_fast( $product_id, $data ) ) {
+					throw new RuntimeException( 'Could not durably refresh product source bookkeeping on the no-op path.' );
+				}
 				$this->cleanup_stock_diagnostic_meta_fast( $product_id, $data );
-				$this->store_product_attribute_guids_if_changed( $product_id, $this->get_value( $data, 'attributes', array() ) );
-				$this->store_product_category_refs_if_changed( $product_id, $this->get_product_category_refs_from_payload( $data ) );
-				$this->update_post_meta_if_changed( $product_id, '_mobo_product_source_hash', $incoming_hash );
+				if ( $this->product_attributes_field_present( $data ) && ! $this->store_product_attribute_guids_if_changed( $product_id, $this->get_value( $data, 'attributes', array() ) ) ) {
+					throw new RuntimeException( 'Could not durably persist product attribute identity metadata.' );
+				}
+				if ( $this->product_categories_field_present( $data ) ) {
+					$fast_category_refs = $this->get_raw_product_categories_field( $data );
+					if ( ! is_array( $fast_category_refs ) || ! $this->store_product_category_refs_if_changed( $product_id, $fast_category_refs ) ) {
+						throw new RuntimeException( 'Could not durably persist product category reference metadata.' );
+					}
+					$fast_category_assignment = $this->category_sync->assign_product_categories(
+						$product_id,
+						$fast_category_refs,
+						$this->rules->should_update_categories(),
+						false,
+						true
+					);
+					if ( is_array( $fast_category_assignment ) && ! empty( $fast_category_assignment['error'] ) ) {
+						throw new RuntimeException( 'Category assignment failed on product no-op path: ' . sanitize_text_field( (string) $fast_category_assignment['error'] ) );
+					}
+				}
+				if ( ! $this->persist_post_meta_verified( $product_id, '_mobo_product_source_hash', $incoming_hash ) ) {
+					throw new RuntimeException( 'Could not durably persist the product source hash.' );
+				}
 				if ( $old_hash !== $incoming_hash ) {
 					$this->update_post_meta_if_changed( $product_id, '_mobo_product_source_hash_updated_at', gmdate( 'c' ) );
 				}
@@ -2543,12 +3332,29 @@ class Mobo_Core_Product_Sync {
 				if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 					Mobo_Core_Runtime_Diagnostics::increment( 'product_noop' );
 				}
+				if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
+					$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+					throw new RuntimeException( 'Could not refresh product mapping metadata.' );
+				}
 
 				/* A missing simple-product storefront identity must still be repairable. */
-				if ( ! $this->product_has_variation_attributes( $data ) ) {
+				if ( ! $this->product_payload_can_have_variants( $data, $product_id ) ) {
 					$embedded_variant = $this->extract_embedded_simple_variant_data( $data );
 					if ( ! empty( $embedded_variant ) && $this->get_stored_portal_variant_id( $product_id ) <= 0 ) {
-						$this->apply_simple_variant_to_product( $product_id, $embedded_variant, $product_guid );
+						if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) || ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+							throw new RuntimeException( 'Could not durably persist the simple-product repair crash marker.' );
+						}
+						$embedded_result = $this->apply_simple_variant_to_product( $product_id, $embedded_variant, $product_guid );
+						if ( is_wp_error( $embedded_result ) ) {
+							throw new RuntimeException( $embedded_result->get_error_message() );
+						}
+						if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
+							throw new RuntimeException( 'Could not finalize embedded simple-product mapping.' );
+						}
+						if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
+							$this->upsert_product_map( $product_guid, $product_id, true );
+							throw new RuntimeException( 'Could not durably persist the simple-product repair completion marker.' );
+						}
 					}
 				}
 
@@ -2580,7 +3386,9 @@ class Mobo_Core_Product_Sync {
 			 * Direct metadata keeps crash-recovery semantics while removing that first
 			 * expensive save/hook/cache-invalidation cycle.
 			 */
-			$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) ) {
+				throw new RuntimeException( 'Could not durably persist the product crash marker before mutation.' );
+			}
 		}
 
 		if ( $is_new_product || $this->rules->should_update_title() ) {
@@ -2591,7 +3399,9 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( $is_new_product || $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+		$price_field_present   = $this->product_price_field_present( $data );
+		$compare_field_present = $this->product_compare_price_field_present( $data );
+		if ( $is_new_product || ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $price_field_present || $compare_field_present ) ) ) {
 			$this->apply_price_to_product( $product, $data, 'product', $is_new_product );
 		}
 
@@ -2605,10 +3415,6 @@ class Mobo_Core_Product_Sync {
 				}
 			} elseif ( $is_new_product ) {
 				$this->apply_api_stock( $product, null );
-			} else {
-				if ( '' === (string) $product->get_meta( '_mobo_stock_payload_missing', true, 'edit' ) ) {
-					$product->update_meta_data( '_mobo_stock_payload_missing', gmdate( 'c' ) );
-				}
 			}
 		}
 
@@ -2627,9 +3433,10 @@ class Mobo_Core_Product_Sync {
 		$this->update_product_meta_if_changed( $product, 'product_guid', $product_guid );
 		$this->store_portal_product_id_on_product_object( $product, $data );
 
+		$attributes_present        = $is_new_product || $this->product_attributes_field_present( $data );
 		$desired_attribute_payload = $this->get_value( $data, 'attributes', array() );
-		$attribute_state_dirty    = $is_new_product || ! $this->product_attributes_match_payload( $product, $desired_attribute_payload );
-		$default_attributes_dirty = ! empty( $product->get_default_attributes() );
+		$attribute_state_dirty     = $attributes_present && ( $is_new_product || ! $this->product_attributes_match_payload( $product, $desired_attribute_payload ) );
+		$default_attributes_dirty  = $attributes_present && ! empty( $product->get_default_attributes() );
 
 		/*
 		 * Price/stock/title-only updates must not re-serialize _product_attributes.
@@ -2641,15 +3448,13 @@ class Mobo_Core_Product_Sync {
 			$product->set_attributes( $this->build_product_attributes( $desired_attribute_payload ) );
 		}
 
-		$source_hash_changed = $this->update_product_meta_if_changed( $product, '_mobo_product_source_hash', $incoming_hash );
-		if ( $source_hash_changed ) {
-			$this->update_product_meta_if_changed( $product, '_mobo_product_source_hash_updated_at', gmdate( 'c' ) );
+		$source_hash_changed = false;
+		if ( '' !== $incoming_hash ) {
+			$source_hash_changed = $this->update_product_meta_if_changed( $product, '_mobo_product_source_hash', $incoming_hash );
+			if ( $source_hash_changed ) {
+				$this->update_product_meta_if_changed( $product, '_mobo_product_source_hash_updated_at', gmdate( 'c' ) );
+			}
 		}
-		if ( ! $is_new_product ) {
-			/* Existing products were marked incomplete directly in DB before CRUD save. */
-			$product->update_meta_data( 'mobo_sync_incomplete', '0' );
-		}
-
 		$product_id = absint( $product->save() );
 		if ( $product_id > 0 && class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 			Mobo_Core_Runtime_Diagnostics::increment( 'product_save' );
@@ -2659,35 +3464,53 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $product_id > 0 ) {
-			/* New objects were saved with incomplete=1; clear only after successful CRUD persistence. */
-			if ( $is_new_product ) {
-				$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '0' );
+			/* Keep both persistence layers incomplete until category/image/simple-variant
+			 * side effects have durably committed. The caller clears the marker only at
+			 * its terminal desired-state checkpoint. */
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) ) {
+				throw new RuntimeException( 'Could not verify the product crash marker after WooCommerce save.' );
 			}
-			$this->upsert_product_map( $product_guid, $product_id, false );
+			if ( ! $this->sync_product_identity_meta_fast( $product_id, $data, $product_guid ) || ! $this->sync_price_source_meta_fast( $product_id, $data ) || ( '' !== $incoming_hash && ! $this->persist_post_meta_verified( $product_id, '_mobo_product_source_hash', $incoming_hash ) ) ) {
+				throw new RuntimeException( 'Could not verify product identity/source bookkeeping after WooCommerce save.' );
+			}
+			if ( ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				throw new RuntimeException( 'Could not durably commit product identity mapping.' );
+			}
 		}
 
 		if ( $product_id <= 0 ) {
 			return 0;
 		}
 
-		$this->store_product_attribute_guids_if_changed( $product_id, $this->get_value( $data, 'attributes', array() ) );
+		if ( $attributes_present && ! $this->store_product_attribute_guids_if_changed( $product_id, $this->get_value( $data, 'attributes', array() ) ) ) {
+			throw new RuntimeException( 'Could not durably persist product attribute identity metadata.' );
+		}
 
-		$product_category_refs = $this->get_product_category_refs_from_payload( $data );
-		$this->store_product_category_refs_if_changed( $product_id, $product_category_refs );
+		$categories_field_present = $this->product_categories_field_present( $data );
+		$categories_present       = $is_new_product || $categories_field_present;
+		$product_category_refs    = $categories_field_present ? $this->get_raw_product_categories_field( $data ) : array();
+		if ( ! is_array( $product_category_refs ) ) {
+			$product_category_refs = array();
+		}
+		if ( $categories_field_present && ! $this->store_product_category_refs_if_changed( $product_id, $product_category_refs ) ) {
+			throw new RuntimeException( 'Could not durably persist product category reference metadata.' );
+		}
 
-		$category_assignment = $this->category_sync->assign_product_categories(
+		$category_assignment = $categories_present ? $this->category_sync->assign_product_categories(
 			$product_id,
 			$product_category_refs,
 			$this->rules->should_update_categories(),
-			$is_new_product
-		);
+			$is_new_product,
+			$categories_field_present
+		) : array();
 
 		if ( is_array( $category_assignment ) && ! empty( $category_assignment['error'] ) ) {
 			$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
 			throw new RuntimeException( 'Category assignment failed for product ' . $product_id . ': ' . sanitize_text_field( (string) $category_assignment['error'] ) );
 		}
 
-		if ( ! $skip_images && ( $is_new_product || $this->rules->should_update_images() ) && $this->product_images_need_processing( $product_id, $this->get_product_images_from_payload( $data ), $is_new_product ) ) {
+		if ( ! $skip_images && ( $is_new_product || $this->product_images_field_present( $data ) ) && ( $is_new_product || $this->rules->should_update_images() ) && $this->product_images_need_processing( $product_id, $this->get_product_images_from_payload( $data ), $is_new_product ) ) {
 			$image_result = $this->image_sync->process_images(
 				$product_id,
 				$this->get_product_images_from_payload( $data ),
@@ -2696,19 +3519,33 @@ class Mobo_Core_Product_Sync {
 			);
 			if ( ! empty( $image_result['error'] ) ) {
 				$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $product_guid, $product_id, true );
 				throw new RuntimeException( 'Image queue persistence failed for product ' . $product_id . ': ' . sanitize_text_field( (string) $image_result['error'] ) );
 			}
-			if ( ! empty( $image_result['done'] ) ) {
-				$this->mark_product_images_converged( $product_id, $this->get_product_images_from_payload( $data ) );
+			if ( ! empty( $image_result['pending'] ) ) {
+				if ( ! $this->mark_product_images_pending( $product_id, $this->get_product_images_from_payload( $data ) ) ) {
+					$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+					$this->upsert_product_map( $product_guid, $product_id, true );
+					throw new RuntimeException( 'Could not durably persist the pending image desired-state hash.' );
+				}
+			} elseif ( ! empty( $image_result['done'] ) && ! $this->mark_product_images_converged( $product_id, $this->get_product_images_from_payload( $data ) ) ) {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $product_guid, $product_id, true );
+				throw new RuntimeException( 'Could not durably persist the converged image desired-state hash.' );
 			}
 		}
 
 		/* Preserve embedded single-variant behavior. */
-		if ( ! $this->product_has_variation_attributes( $data ) ) {
+		if ( ! $this->product_payload_can_have_variants( $data, $product_id ) ) {
 			$embedded_variant = $this->extract_embedded_simple_variant_data( $data );
 
 			if ( ! empty( $embedded_variant ) ) {
-				$this->apply_simple_variant_to_product( $product_id, $embedded_variant, $product_guid );
+				$embedded_result = $this->apply_simple_variant_to_product( $product_id, $embedded_variant, $product_guid );
+				if ( is_wp_error( $embedded_result ) ) {
+					$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+					$this->upsert_product_map( $product_guid, $product_id, true );
+					throw new RuntimeException( $embedded_result->get_error_message() );
+				}
 			}
 		}
 
@@ -2731,6 +3568,11 @@ class Mobo_Core_Product_Sync {
 				'id'      => 0,
 				'changed' => false,
 			);
+		}
+
+		$money_integrity = $this->validate_money_payload_fields( $data, 'variation' );
+		if ( is_wp_error( $money_integrity ) ) {
+			throw new RuntimeException( $money_integrity->get_error_message() );
 		}
 
 		$product_guid  = $this->extract_product_guid( $data );
@@ -2756,8 +3598,8 @@ class Mobo_Core_Product_Sync {
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_detected_at', gmdate( 'c' ) );
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_variant_guid', $variant_guid );
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_reason', sanitize_text_field( $raw_integrity->get_error_message() ) );
-			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Reconciliation' ) ) {
-				Mobo_Core_Reconciliation::mark_behind( $product_guid, $parent_id );
+			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_behind( $product_guid, $parent_id );
 			}
 			throw new RuntimeException( $raw_integrity->get_error_message() );
 		}
@@ -2768,8 +3610,8 @@ class Mobo_Core_Product_Sync {
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_detected_at', gmdate( 'c' ) );
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_variant_guid', $variant_guid );
 			update_post_meta( $parent_id, '_mobo_variant_attribute_drift_reason', sanitize_text_field( $attrs_integrity->get_error_message() ) );
-			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Reconciliation' ) ) {
-				Mobo_Core_Reconciliation::mark_behind( $product_guid, $parent_id );
+			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_behind( $product_guid, $parent_id );
 			}
 			throw new RuntimeException( $attrs_integrity->get_error_message() );
 		}
@@ -2820,11 +3662,10 @@ class Mobo_Core_Product_Sync {
 				 * looks like the old, now-missing GUID and is deleted immediately after
 				 * being matched.
 				 */
-				$this->update_post_meta_if_changed( $variation_id, 'variant_guid', $variant_guid );
-				$this->store_portal_ids_on_variation_post( $variation_id, $data, $product_guid, $parent_id );
-				$this->sync_price_source_meta_fast( $variation_id, $data );
+				if ( ! $this->persist_post_meta_verified( $variation_id, 'variant_guid', $variant_guid ) || ! $this->store_portal_ids_on_variation_post( $variation_id, $data, $product_guid, $parent_id ) || ! $this->sync_price_source_meta_fast( $variation_id, $data ) || ! $this->persist_post_meta_verified( $variation_id, '_mobo_variant_source_hash', $incoming_hash ) ) {
+					throw new RuntimeException( 'Could not durably refresh variation source bookkeeping on the no-op path.' );
+				}
 				$this->cleanup_stock_diagnostic_meta_fast( $variation_id, $data );
-				$this->update_post_meta_if_changed( $variation_id, '_mobo_variant_source_hash', $incoming_hash );
 				if ( $old_hash !== $incoming_hash ) {
 					$this->update_post_meta_if_changed( $variation_id, '_mobo_variant_source_hash_updated_at', gmdate( 'c' ) );
 				}
@@ -2839,6 +3680,10 @@ class Mobo_Core_Product_Sync {
 				if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 					Mobo_Core_Runtime_Diagnostics::increment( 'variation_noop' );
 				}
+				if ( ! $this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false ) ) {
+					$this->update_post_meta_if_changed( $variation_id, 'mobo_sync_incomplete', '1' );
+					throw new RuntimeException( 'Could not refresh variation mapping metadata.' );
+				}
 				return array(
 					'id'      => $variation_id,
 					'changed' => false,
@@ -2847,6 +3692,9 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $variation_id > 0 ) {
+			if ( ! $this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '1' ) || ! $this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true ) ) {
+				throw new RuntimeException( 'Could not durably persist the variation crash marker before mutation.' );
+			}
 			$variation = wc_get_product( $variation_id );
 
 			if ( ! $variation instanceof WC_Product_Variation ) {
@@ -2904,10 +3752,6 @@ class Mobo_Core_Product_Sync {
 				$this->apply_api_stock( $variation, $stock_value );
 			} elseif ( $is_new_variation ) {
 				$this->apply_api_stock( $variation, null );
-			} else {
-				if ( '' === (string) $variation->get_meta( '_mobo_stock_payload_missing', true, 'edit' ) ) {
-					$variation->update_meta_data( '_mobo_stock_payload_missing', gmdate( 'c' ) );
-				}
 			}
 		}
 
@@ -2923,14 +3767,13 @@ class Mobo_Core_Product_Sync {
 			$this->update_product_meta_if_changed( $variation, 'product_guid', $product_guid );
 		}
 
-		$variation_hash_changed = $this->update_product_meta_if_changed( $variation, '_mobo_variant_source_hash', $incoming_hash );
-		if ( $variation_hash_changed ) {
-			$this->update_product_meta_if_changed( $variation, '_mobo_variant_source_hash_updated_at', gmdate( 'c' ) );
+		$variation_hash_changed = false;
+		if ( '' !== $incoming_hash ) {
+			$variation_hash_changed = $this->update_product_meta_if_changed( $variation, '_mobo_variant_source_hash', $incoming_hash );
+			if ( $variation_hash_changed ) {
+				$this->update_product_meta_if_changed( $variation, '_mobo_variant_source_hash_updated_at', gmdate( 'c' ) );
+			}
 		}
-		if ( ! $is_new_variation ) {
-			$this->update_product_meta_if_changed( $variation, 'mobo_sync_incomplete', '0' );
-		}
-
 		$variation_id = absint( $variation->save() );
 		if ( $variation_id <= 0 ) {
 			throw new RuntimeException( 'WooCommerce variation save returned no durable post ID.' );
@@ -2943,14 +3786,22 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $variation_id > 0 ) {
-			if ( $is_new_variation ) {
-				$this->update_post_meta_if_changed( $variation_id, 'mobo_sync_incomplete', '0' );
-			}
 			$this->remember_variation_signature( $parent_id, $variation_id, $attrs );
+			if ( ! $this->persist_post_meta_verified( $variation_id, 'variant_guid', $variant_guid ) || ! $this->store_portal_ids_on_variation_post( $variation_id, $data, $product_guid, $parent_id ) || ! $this->sync_price_source_meta_fast( $variation_id, $data ) || ( '' !== $incoming_hash && ! $this->persist_post_meta_verified( $variation_id, '_mobo_variant_source_hash', $incoming_hash ) ) ) {
+				$this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '1' );
+				throw new RuntimeException( 'Could not verify variation identity/source bookkeeping after WooCommerce save.' );
+			}
 			$stored_guid = sanitize_text_field( (string) get_post_meta( $variation_id, 'variant_guid', true ) );
-			if ( $stored_guid !== $variant_guid || ! $this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false ) ) {
+			if ( $stored_guid !== $variant_guid || ! $this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, true ) ) {
 				$this->update_post_meta_if_changed( $variation_id, 'mobo_sync_incomplete', '1' );
 				throw new RuntimeException( 'Could not commit variation identity mapping.' );
+			}
+			if ( ! $this->upsert_variation_map( $variant_guid, $variation_id, $product_guid, false ) ) {
+				$this->update_post_meta_if_changed( $variation_id, 'mobo_sync_incomplete', '1' );
+				throw new RuntimeException( 'Could not finalize variation identity mapping.' );
+			}
+			if ( ! $this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '0' ) ) {
+				throw new RuntimeException( 'Could not durably persist the variation completion marker.' );
 			}
 		}
 
@@ -3002,15 +3853,17 @@ class Mobo_Core_Product_Sync {
 		$variation_id = absint( $variation_id );
 
 		if ( $variation_id <= 0 ) {
-			return;
+			return false;
 		}
 
 		$portal_variant_id = $this->extract_portal_variant_id( $data );
 
 		if ( $portal_variant_id > 0 ) {
-			$this->update_post_meta_if_changed( $variation_id, 'portal_variant_id', $portal_variant_id );
-			$this->update_post_meta_if_changed( $variation_id, 'mobo_portal_variant_id', $portal_variant_id );
-			$this->update_post_meta_if_changed( $variation_id, '_mobo_portal_variant_id', $portal_variant_id );
+			foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $key ) {
+				if ( ! $this->persist_post_meta_verified( $variation_id, $key, $portal_variant_id ) ) {
+					return false;
+				}
+			}
 		}
 
 		$portal_product_id = $this->extract_portal_product_id( $data );
@@ -3020,14 +3873,18 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $portal_product_id > 0 ) {
-			$this->update_post_meta_if_changed( $variation_id, 'portal_product_id', $portal_product_id );
-			$this->update_post_meta_if_changed( $variation_id, 'mobo_portal_product_id', $portal_product_id );
-			$this->update_post_meta_if_changed( $variation_id, '_mobo_portal_product_id', $portal_product_id );
+			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
+				if ( ! $this->persist_post_meta_verified( $variation_id, $key, $portal_product_id ) ) {
+					return false;
+				}
+			}
 		}
 
-		if ( '' !== $product_guid ) {
-			$this->update_post_meta_if_changed( $variation_id, 'product_guid', sanitize_text_field( (string) $product_guid ) );
+		if ( '' !== $product_guid && ! $this->persist_post_meta_verified( $variation_id, 'product_guid', sanitize_text_field( (string) $product_guid ) ) ) {
+			return false;
 		}
+
+		return true;
 	}
 
 	private function product_attribute_structure_changed( $product, $desired_attributes ) {
@@ -3064,7 +3921,9 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $this->product_attributes_match_payload( $product, $attributes ) ) {
-			$this->store_product_attribute_guids_if_changed( $product_id, $attributes );
+			if ( ! $this->store_product_attribute_guids_if_changed( $product_id, $attributes ) ) {
+				throw new RuntimeException( 'Product attribute identity metadata failed verification.' );
+			}
 			return false;
 		}
 
@@ -3078,40 +3937,92 @@ class Mobo_Core_Product_Sync {
 		if ( ! $fresh instanceof WC_Product || ! $this->product_attributes_match_payload( $fresh, $attributes ) ) {
 			throw new RuntimeException( 'WooCommerce product attributes failed their post-write verification.' );
 		}
-		$this->store_product_attribute_guids( $product_id, $attributes );
+		if ( ! $this->store_product_attribute_guids( $product_id, $attributes ) ) {
+			throw new RuntimeException( 'Product attribute identity metadata failed verification after attribute save.' );
+		}
 		return true;
 	}
 
-	private function delete_variation_permanently( $variation_id ) {
-		$variation_id = absint( $variation_id );
-		/* Defense in depth: callers are expected to pass a variation ID, but the
-		 * physical deletion boundary itself must enforce that invariant. A corrupt
-		 * map/cursor/caller must never turn this helper into a parent-product delete. */
-		if ( $variation_id <= 0 || 'product_variation' !== get_post_type( $variation_id ) ) {
-			return false;
+	/**
+	 * Return live variation children by post_parent regardless of the parent WC type.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function get_live_variation_children( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return array();
 		}
+		$ids = get_posts(
+			array(
+				'post_type'      => 'product_variation',
+				'post_parent'    => $product_id,
+				'post_status'    => array( 'publish', 'private', 'draft', 'pending' ),
+				'posts_per_page' => -1,
+				'fields'         => 'ids',
+				'orderby'        => 'ID',
+				'order'          => 'ASC',
+				'no_found_rows'  => true,
+			)
+		);
+		return array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+	}
 
+
+	/**
+	 * Return Trash children whose shared quarantine marker proves a prior retirement
+	 * attempt already crossed the storefront boundary but still needs idempotent
+	 * Product Map/identity cleanup. Manually trashed variations without this marker
+	 * are deliberately excluded.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function get_pending_quarantine_children( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return array();
+		}
+		$ids = get_posts(
+			array(
+				'post_type'      => 'product_variation',
+				'post_parent'    => $product_id,
+				'post_status'    => array( 'trash' ),
+				'posts_per_page' => -1,
+				'fields'         => 'ids',
+				'orderby'        => 'ID',
+				'order'          => 'ASC',
+				'no_found_rows'  => true,
+				'meta_query'     => array(
+					array(
+						'key'     => '_mobo_variation_quarantine_reason',
+						'compare' => 'EXISTS',
+					),
+				),
+			)
+		);
+		return array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+	}
+
+	/**
+	 * Move one Mobo-owned variation to Trash/quarantine using the shared crash-safe policy.
+	 *
+	 * @param int    $variation_id Variation ID.
+	 * @param string $reason Reason key.
+	 * @param array  $context Context.
+	 * @return true|WP_Error
+	 */
+	private function quarantine_variation( $variation_id, $reason, $context = array() ) {
+		$variation_id = absint( $variation_id );
+		if ( $variation_id <= 0 || ! class_exists( 'Mobo_Core_Variation_Lifecycle_Policy' ) ) {
+			return new WP_Error( 'mobo_core_variation_lifecycle_unavailable', 'Variation lifecycle policy is unavailable.' );
+		}
 		$parent_id = absint( wp_get_post_parent_id( $variation_id ) );
 		if ( $parent_id > 0 ) {
 			unset( $this->variation_signature_index[ $parent_id ] );
 		}
-
-		$variant_guid = sanitize_text_field( (string) get_post_meta( $variation_id, 'variant_guid', true ) );
-		$deleted      = wp_delete_post( $variation_id, true );
-
-		if ( false === $deleted || null === $deleted ) {
-			return false;
-		}
-
-		/* Mapping is evidence for recovery; never remove it before the post is gone. */
-		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
-			if ( '' !== $variant_guid ) {
-				$this->product_map->delete_variation( $variant_guid );
-			}
-			$this->product_map->delete_by_post_id( $variation_id );
-		}
-
-		return true;
+		return Mobo_Core_Variation_Lifecycle_Policy::quarantine( $variation_id, $reason, $context, $this->product_map );
 	}
 
 	/**
@@ -3244,20 +4155,69 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function variation_attribute_signature( $attributes ) {
-		if ( ! is_array( $attributes ) || empty( $attributes ) ) {
-			return '';
-		}
+	return Mobo_Core_Variation_Identity_Policy::attribute_signature( $attributes );
+}
 
-		$normalized = array();
-		foreach ( $attributes as $key => $value ) {
-			$key   = preg_replace( '/^attribute_/', '', sanitize_title( (string) $key ) );
-			$value = sanitize_title( (string) $value );
-			if ( '' !== $key && '' !== $value ) {
-				$normalized[ $key ] = $value;
+	/**
+	 * Whether a ProductUpdated payload contains every field that contributes to the
+	 * canonical parent source hash. Partial payloads may mutate explicit fields, but
+	 * must never replace the last complete-snapshot hash with a partial-state hash.
+	 */
+	private function product_payload_has_complete_source_hash_state( $data ) {
+		if ( ! is_array( $data ) || ! $this->product_attributes_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_title() && ! $this->product_title_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_price() && ! $this->product_price_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_compare_price() && ! $this->product_compare_price_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_stock() ) {
+			$stock_present = false;
+			$this->get_stock_value_from_payload( $data, $stock_present );
+			if ( ! $stock_present ) {
+				return false;
 			}
 		}
-		ksort( $normalized );
-		return empty( $normalized ) ? '' : md5( wp_json_encode( $normalized ) );
+		if ( $this->rules->should_update_slug() && ! $this->product_slug_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_categories() && ! $this->product_categories_field_present( $data ) ) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Same completeness boundary for one variation snapshot. Attributes are identity
+	 * state and every enabled storefront field must be present before replacing the
+	 * canonical variation hash.
+	 */
+	private function variation_payload_has_complete_source_hash_state( $data ) {
+		if ( ! is_array( $data ) || ! $this->product_attributes_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_title() && ! $this->product_title_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_price() && ! $this->product_price_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_compare_price() && ! $this->product_compare_price_field_present( $data ) ) {
+			return false;
+		}
+		if ( $this->rules->should_update_stock() ) {
+			$stock_present = false;
+			$this->get_stock_value_from_payload( $data, $stock_present );
+			if ( ! $stock_present ) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -3266,14 +4226,12 @@ class Mobo_Core_Product_Sync {
 	 * can be repaired without WC CRUD, while images have their own convergence hash.
 	 */
 	private function build_product_source_hash( $data, $product_guid = '' ) {
-		if ( ! is_array( $data ) ) {
+		if ( ! is_array( $data ) || ! $this->product_payload_has_complete_source_hash_state( $data ) ) {
 			return '';
 		}
 
 		$hash_data = array(
 			'productId'        => sanitize_text_field( (string) $product_guid ),
-			'attributes'       => $this->normalize_product_attributes_for_hash( $this->get_value( $data, 'attributes', array() ) ),
-			'publishedAt'      => sanitize_text_field( (string) $this->get_value( $data, 'publishedAt', '' ) ),
 			'updateTitle'      => $this->rules->should_update_title() ? 1 : 0,
 			'updatePrice'      => $this->rules->should_update_price() ? 1 : 0,
 			'updateCompare'    => $this->rules->should_update_compare_price() ? 1 : 0,
@@ -3282,23 +4240,33 @@ class Mobo_Core_Product_Sync {
 			'updateCategories' => $this->rules->should_update_categories() ? 1 : 0,
 		);
 
-		if ( $this->rules->should_update_title() ) {
+		if ( $this->product_attributes_field_present( $data ) ) {
+			$hash_data['attributes'] = $this->normalize_product_attributes_for_hash( $this->get_value( $data, 'attributes', array() ) );
+		}
+
+		if ( $this->rules->should_update_title() && $this->product_title_field_present( $data ) ) {
 			$hash_data['title'] = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 		}
-		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-			$hash_data['price']           = $this->get_value( $data, 'price', null );
-			$hash_data['comparePrice']    = $this->get_value( $data, 'comparePrice', null );
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $this->product_price_field_present( $data ) || $this->product_compare_price_field_present( $data ) ) ) {
+			if ( $this->product_price_field_present( $data ) ) {
+				$hash_data['price'] = $this->get_value( $data, 'price', null );
+			}
+			if ( $this->product_compare_price_field_present( $data ) ) {
+				$hash_data['comparePrice'] = $this->get_compare_price_field_value( $data, null );
+			}
 			$hash_data['pricePolicyHash'] = $this->build_price_policy_hash();
 		}
 		if ( $this->rules->should_update_stock() ) {
 			$present = false;
-			$hash_data['stock']        = $this->get_stock_value_from_payload( $data, $present );
-			$hash_data['stockPresent'] = $present ? 1 : 0;
+			$stock_value = $this->get_stock_value_from_payload( $data, $present );
+			if ( $present ) {
+				$hash_data['stock'] = $stock_value;
+			}
 		}
-		if ( $this->rules->should_update_slug() ) {
+		if ( $this->rules->should_update_slug() && $this->product_slug_field_present( $data ) ) {
 			$hash_data['slug'] = $this->expected_product_slug( $data );
 		}
-		if ( $this->rules->should_update_categories() ) {
+		if ( $this->rules->should_update_categories() && $this->product_categories_field_present( $data ) ) {
 			$hash_data['categories'] = $this->normalize_category_guids_for_hash( $this->get_product_category_refs_from_payload( $data ) );
 		}
 
@@ -3333,11 +4301,19 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $this->product_price_field_present( $data ) || $this->product_compare_price_field_present( $data ) ) ) {
+			$product_id      = absint( $product->get_id() );
+			$raw_price       = $this->product_price_field_present( $data ) ? $this->get_value( $data, 'price', null ) : get_post_meta( $product_id, 'mobo_api_price', true );
+			$raw_compare     = $this->product_compare_price_field_present( $data ) ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( $product_id, 'mobo_api_compare_price', true );
+			if ( ! $this->product_price_field_present( $data ) && ( null === $raw_price || '' === $raw_price ) ) {
+				/* Compare-price-only partial payload cannot be rendered safely without the
+				 * source price. Preserve storefront prices; fast bookkeeping still stores
+				 * the explicit comparePrice for the next complete price payload. */
+			} else {
 			$pair = $this->price_calculator->calculate_price_pair(
-				absint( $product->get_id() ),
-				$this->get_value( $data, 'price', null ),
-				$this->get_value( $data, 'comparePrice', null ),
+				$product_id,
+				$raw_price,
+				$raw_compare,
 				'product'
 			);
 			if ( ! empty( $pair['error'] ) ) {
@@ -3349,9 +4325,10 @@ class Mobo_Core_Product_Sync {
 			if ( isset( $pair['sale_price'] ) && wc_format_decimal( $product->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
 				return false;
 			}
+			}
 		}
 
-		if ( ! $this->product_attributes_match_payload( $product, $this->get_value( $data, 'attributes', array() ) ) ) {
+		if ( $this->product_attributes_field_present( $data ) && ! $this->product_attributes_match_payload( $product, $this->get_value( $data, 'attributes', array() ) ) ) {
 			return false;
 		}
 
@@ -3360,7 +4337,7 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		if ( $this->rules->should_update_categories() ) {
+		if ( $this->rules->should_update_categories() && $this->product_categories_field_present( $data ) ) {
 			$current = get_post_meta( $product->get_id(), 'mobo_product_category_guids', true );
 			$current = is_array( $current ) ? array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $current ) ) ) ) : array();
 			sort( $current, SORT_STRING );
@@ -3495,19 +4472,24 @@ class Mobo_Core_Product_Sync {
 	private function sync_product_identity_meta_fast( $product_id, $data, $product_guid ) {
 		$product_id = absint( $product_id );
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
-		$this->update_post_meta_if_changed( $product_id, 'product_guid', sanitize_text_field( (string) $product_guid ) );
+		if ( ! $this->persist_post_meta_verified( $product_id, 'product_guid', sanitize_text_field( (string) $product_guid ) ) ) {
+			return false;
+		}
 		$portal_product_id = $this->extract_portal_product_id( $data );
 		if ( $portal_product_id > 0 ) {
 			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
-				$this->update_post_meta_if_changed( $product_id, $key, $portal_product_id );
+				if ( ! $this->persist_post_meta_verified( $product_id, $key, $portal_product_id ) ) {
+					return false;
+				}
 			}
 		}
 		$url = sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
-		if ( '' !== $url ) {
-			$this->update_post_meta_if_changed( $product_id, 'mobo_url', $url );
+		if ( '' !== $url && ! $this->persist_post_meta_verified( $product_id, 'mobo_url', $url ) ) {
+			return false;
 		}
+		return true;
 	}
 
 	/**
@@ -3516,25 +4498,54 @@ class Mobo_Core_Product_Sync {
 	 *
 	 * @param int   $post_id Product/variation ID.
 	 * @param array $data Source payload.
-	 * @return void
+	 * @return bool True only when all correctness-relevant bookkeeping converged.
 	 */
 	private function sync_price_source_meta_fast( $post_id, $data ) {
 		$post_id = absint( $post_id );
-		if ( $post_id <= 0 || ! is_array( $data ) || ( ! $this->rules->should_update_price() && ! $this->rules->should_update_compare_price() ) ) {
-			return;
+		if ( $post_id <= 0 || ! is_array( $data ) ) {
+			return false;
+		}
+		if ( ! $this->rules->should_update_price() && ! $this->rules->should_update_compare_price() ) {
+			return true;
 		}
 
-		$raw_price   = $this->get_value( $data, 'price', null );
-		$raw_compare = $this->get_value( $data, 'comparePrice', null );
+		$price_present   = $this->product_price_field_present( $data );
+		$compare_present = $this->product_compare_price_field_present( $data );
+		if ( ! $price_present && ! $compare_present ) {
+			return true;
+		}
+
+		$raw_price   = $price_present ? $this->get_value( $data, 'price', null ) : get_post_meta( $post_id, 'mobo_api_price', true );
+		$raw_compare = $compare_present ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( $post_id, 'mobo_api_compare_price', true );
 		$changed     = false;
 
-		$changed = $this->update_post_meta_if_changed( $post_id, 'mobo_api_price', null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price ) ) || $changed;
-		$changed = $this->update_post_meta_if_changed( $post_id, 'mobo_api_compare_price', null === $raw_compare || '' === $raw_compare ? '' : wc_format_decimal( $raw_compare ) ) || $changed;
-		$changed = $this->update_post_meta_if_changed( $post_id, 'mobo_price_policy_type', (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ) ) || $changed;
-
-		if ( $changed ) {
-			$this->update_post_meta_if_changed( $post_id, 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+		if ( $price_present ) {
+			$desired = null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price );
+			$changed = maybe_serialize( get_post_meta( $post_id, 'mobo_api_price', true ) ) !== maybe_serialize( $desired ) || $changed;
+			if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_api_price', $desired ) ) {
+				return false;
+			}
 		}
+		if ( $compare_present ) {
+			$desired = null === $raw_compare || '' === $raw_compare ? '' : wc_format_decimal( $raw_compare );
+			$changed = maybe_serialize( get_post_meta( $post_id, 'mobo_api_compare_price', true ) ) !== maybe_serialize( $desired ) || $changed;
+			if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_api_compare_price', $desired ) ) {
+				return false;
+			}
+		}
+
+		$fast_context = 'product_variation' === get_post_type( $post_id ) ? 'variation' : 'product';
+		$fast_parent_id = 'variation' === $fast_context ? absint( wp_get_post_parent_id( $post_id ) ) : 0;
+		$policy_type = class_exists( 'Mobo_Core_Product_Pricing_Policy' ) ? Mobo_Core_Product_Pricing_Policy::effective_policy_type( $post_id, $fast_parent_id, $fast_context ) : (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+		$changed     = (string) get_post_meta( $post_id, 'mobo_price_policy_type', true ) !== $policy_type || $changed;
+		if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_price_policy_type', $policy_type ) ) {
+			return false;
+		}
+
+		if ( $changed && ! $this->persist_post_meta_verified( $post_id, 'mobo_price_policy_updated_at', gmdate( 'c' ) ) ) {
+			return false;
+		}
+		return true;
 	}
 
 	private function update_post_meta_if_changed( $post_id, $key, $value ) {
@@ -3547,6 +4558,53 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 		return false !== update_post_meta( $post_id, $key, $value );
+	}
+
+	/**
+	 * Persist a correctness-critical postmeta value and verify the exact read-back.
+	 * Unlike update_post_meta_if_changed(), true means durable convergence rather
+	 * than "a write was attempted/changed". This is used for crash markers and
+	 * ordering watermarks that must survive before an event can be acknowledged.
+	 */
+	private function persist_post_meta_verified( $post_id, $key, $value ) {
+		return Mobo_Core_Durable_State_Policy::update_post_meta_verified( $post_id, $key, $value );
+	}
+
+	private function delete_post_meta_verified( $post_id, $key ) {
+		$post_id = absint( $post_id );
+		$key     = sanitize_key( (string) $key );
+		if ( $post_id <= 0 || '' === $key ) {
+			return false;
+		}
+		if ( metadata_exists( 'post', $post_id, $key ) ) {
+			delete_post_meta( $post_id, $key );
+		}
+		wp_cache_delete( $post_id, 'post_meta' );
+		return ! metadata_exists( 'post', $post_id, $key );
+	}
+
+	private function persist_ordering_watermarks( $post_id, $scope, $source_version, $source_revision, $applied = false ) {
+		$post_id         = absint( $post_id );
+		$scope           = 'variant' === sanitize_key( (string) $scope ) ? 'variant' : 'product';
+		$source_version  = sanitize_text_field( (string) $source_version );
+		$source_revision = absint( $source_revision );
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		if ( '' !== $source_version && ! $this->persist_post_meta_verified( $post_id, '_mobo_' . $scope . '_seen_event_version', $source_version ) ) {
+			return false;
+		}
+		if ( $source_revision > 0 && ! $this->persist_post_meta_verified( $post_id, '_mobo_' . $scope . '_seen_revision', $source_revision ) ) {
+			return false;
+		}
+		if ( $applied && '' !== $source_version && ! $this->persist_post_meta_verified( $post_id, '_mobo_' . $scope . '_applied_event_version', $source_version ) ) {
+			return false;
+		}
+		if ( $applied && $source_revision > 0 && ! $this->persist_post_meta_verified( $post_id, '_mobo_' . $scope . '_applied_revision', $source_revision ) ) {
+			return false;
+		}
+		return true;
 	}
 
 	private function delete_post_meta_if_present( $post_id, $key ) {
@@ -3629,34 +4687,21 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function store_product_attribute_guids_if_changed( $product_id, $attributes ) {
-		$map = array();
-		if ( is_array( $attributes ) ) {
-			foreach ( $attributes as $attribute_data ) {
-				if ( ! is_array( $attribute_data ) ) {
-					continue;
-				}
-				$guid = $this->extract_attribute_guid( $attribute_data );
-				$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
-				if ( '' !== $guid && '' !== $name ) {
-					$map[ $name ] = $guid;
-				}
-			}
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return false;
 		}
-		$current = get_post_meta( absint( $product_id ), 'mobo_attribute_guid_map', true );
-		$current = is_array( $current ) ? $current : array();
-		if ( $current !== $map ) {
-			$this->store_product_attribute_guids( $product_id, $attributes );
-		}
+		return $this->store_product_attribute_guids( $product_id, is_array( $attributes ) ? $attributes : array() );
 	}
 
 	private function store_product_category_refs_if_changed( $product_id, $category_refs ) {
-		$incoming_guids = $this->normalize_category_guids_for_hash( $category_refs );
-		$current_guids  = get_post_meta( absint( $product_id ), 'mobo_product_category_guids', true );
-		$current_guids  = is_array( $current_guids ) ? array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $current_guids ) ) ) ) : array();
-		sort( $current_guids, SORT_STRING );
-		if ( $current_guids !== $incoming_guids ) {
-			$this->store_product_category_refs( $product_id, $category_refs );
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return false;
 		}
+		/* Always verify both halves of the stored category reference state. A stale
+		 * refs JSON must not survive merely because the GUID list already matches. */
+		return $this->store_product_category_refs( $product_id, is_array( $category_refs ) ? $category_refs : array() );
 	}
 
 	private function build_product_images_source_hash( $images ) {
@@ -3668,8 +4713,20 @@ class Mobo_Core_Product_Sync {
 	private function product_images_need_processing( $product_id, $images, $is_new = false ) {
 		$product_id = absint( $product_id );
 		$images     = is_array( $images ) ? $images : array();
-		if ( $product_id <= 0 || empty( $images ) ) {
+		if ( $product_id <= 0 ) {
 			return false;
+		}
+		if ( empty( $images ) ) {
+			$incoming = $this->build_product_images_source_hash( array() );
+			$stored   = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_images_source_hash', true ) );
+			$product  = wc_get_product( $product_id );
+			$has_linked_images = $product instanceof WC_Product && ( absint( $product->get_image_id() ) > 0 || ! empty( $product->get_gallery_image_ids() ) );
+			$has_queue_rows = false;
+			if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+				$queue = new Mobo_Core_Image_Queue();
+				$has_queue_rows = ! empty( $queue->get_ordered_rows_for_product( $product_id ) );
+			}
+			return $is_new || $incoming !== $stored || $has_linked_images || $has_queue_rows;
 		}
 		if ( $is_new ) {
 			return true;
@@ -3710,23 +4767,8 @@ class Mobo_Core_Product_Sync {
 				return false;
 			}
 
-			$image_guid = '';
-			foreach ( array( 'image_guid', 'img_guid', 'imageGuid', 'imageId', 'guid', 'remote_guid', 'remoteGuid', 'id' ) as $key ) {
-				$value = trim( sanitize_text_field( (string) $this->get_value( $image, $key, '' ) ) );
-				if ( '' !== $value && false === strpos( $value, '/' ) && false === strpos( $value, '\\' ) && false === strpos( $value, '://' ) ) {
-					$image_guid = $value;
-					break;
-				}
-			}
-
-			$url = '';
-			foreach ( array( 'url', 'src' ) as $key ) {
-				$value = esc_url_raw( (string) $this->get_value( $image, $key, '' ) );
-				if ( '' !== $value ) {
-					$url = $value;
-					break;
-				}
-			}
+			$image_guid = Mobo_Core_Image_Desired_State_Policy::image_guid( $image );
+			$url        = Mobo_Core_Image_Desired_State_Policy::image_url( $image );
 
 			if ( '' === $image_guid || '' === $url ) {
 				return false;
@@ -3827,15 +4869,89 @@ class Mobo_Core_Product_Sync {
 		return $current_ids === array_values( array_unique( $attachment_ids ) );
 	}
 
+	private function mark_product_images_pending( $product_id, $images ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return false;
+		}
+		$hash = $this->build_product_images_source_hash( $images );
+		if ( '' === $hash || ! $this->persist_post_meta_verified( $product_id, '_mobo_product_images_pending_source_hash', $hash ) ) {
+			return false;
+		}
+		return $this->persist_post_meta_verified( $product_id, '_mobo_product_images_pending_source_hash_updated_at', gmdate( 'c' ) );
+	}
+
 	private function mark_product_images_converged( $product_id, $images ) {
 		$product_id = absint( $product_id );
 		if ( $product_id <= 0 ) {
-			return;
+			return false;
 		}
-		$this->update_post_meta_if_changed( $product_id, '_mobo_product_images_source_hash', $this->build_product_images_source_hash( $images ) );
-		$this->update_post_meta_if_changed( $product_id, '_mobo_product_images_source_hash_updated_at', gmdate( 'c' ) );
+		$hash = $this->build_product_images_source_hash( $images );
+		if ( '' === $hash || ! $this->persist_post_meta_verified( $product_id, '_mobo_product_images_source_hash', $hash ) ) {
+			return false;
+		}
+		if ( ! $this->persist_post_meta_verified( $product_id, '_mobo_product_images_source_hash_updated_at', gmdate( 'c' ) ) ) {
+			return false;
+		}
+		return $this->delete_post_meta_verified( $product_id, '_mobo_product_images_pending_source_hash' )
+			&& $this->delete_post_meta_verified( $product_id, '_mobo_product_images_pending_source_hash_updated_at' );
 	}
 
+
+	/**
+	 * Return true only when every concrete variation in a delta is provably older
+	 * than the durable per-variation watermark. Unknown/new identities make the
+	 * answer false so we fail open to normal validation rather than drop work.
+	 *
+	 * @param int    $parent_id Parent product ID.
+	 * @param array  $variants Variant payloads.
+	 * @param string $source_version Generic event ordering watermark.
+	 * @param int    $source_revision Numeric source revision.
+	 * @return bool
+	 */
+	private function delta_variant_payload_is_fully_stale( $parent_id, $variants, $source_version = '', $source_revision = 0 ) {
+		$parent_id       = absint( $parent_id );
+		$source_version  = sanitize_text_field( (string) $source_version );
+		$source_revision = absint( $source_revision );
+		if ( $parent_id <= 0 || ! is_array( $variants ) || empty( $variants ) || ( '' === $source_version && $source_revision <= 0 ) ) {
+			return false;
+		}
+
+		$checked = 0;
+		foreach ( $variants as $variant_data ) {
+			if ( ! is_array( $variant_data ) ) {
+				return false;
+			}
+			$variant_guid = $this->extract_variant_guid( $variant_data );
+			if ( '' === $variant_guid ) {
+				return false;
+			}
+			$variation_id = $this->find_variation_id_by_guid( $variant_guid );
+			if ( $variation_id <= 0 || absint( wp_get_post_parent_id( $variation_id ) ) !== $parent_id ) {
+				return false;
+			}
+
+			$is_stale = false;
+			if ( '' !== $source_version ) {
+				$seen_version = sanitize_text_field( (string) get_post_meta( $variation_id, '_mobo_variant_seen_event_version', true ) );
+				if ( '' !== $seen_version && -1 === $this->compare_source_versions( $source_version, $seen_version ) ) {
+					$is_stale = true;
+				}
+			}
+			if ( ! $is_stale && $source_revision > 0 ) {
+				$seen_revision = absint( get_post_meta( $variation_id, '_mobo_variant_seen_revision', true ) );
+				if ( $seen_revision > $source_revision ) {
+					$is_stale = true;
+				}
+			}
+			if ( ! $is_stale ) {
+				return false;
+			}
+			$checked++;
+		}
+
+		return $checked > 0;
+	}
 
 	/**
 	 * Verify the storefront-relevant state of one existing variation.
@@ -3866,21 +4982,26 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-			$pair = $this->price_calculator->calculate_price_pair(
-				absint( $variation_id ),
-				$this->get_value( $data, 'price', null ),
-				$this->get_value( $data, 'comparePrice', null ),
-				'variation'
-			);
-			if ( ! empty( $pair['error'] ) ) {
-				return false;
-			}
-			if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $variation->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
-				return false;
-			}
-			if ( isset( $pair['sale_price'] ) && wc_format_decimal( $variation->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
-				return false;
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $this->product_price_field_present( $data ) || $this->product_compare_price_field_present( $data ) ) ) {
+			$raw_price   = $this->product_price_field_present( $data ) ? $this->get_value( $data, 'price', null ) : get_post_meta( absint( $variation_id ), 'mobo_api_price', true );
+			$raw_compare = $this->product_compare_price_field_present( $data ) ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( absint( $variation_id ), 'mobo_api_compare_price', true );
+			if ( $this->product_price_field_present( $data ) || ( null !== $raw_price && '' !== $raw_price ) ) {
+				$pair = $this->price_calculator->calculate_price_pair(
+					absint( $variation_id ),
+					$raw_price,
+					$raw_compare,
+					'variation',
+					absint( $parent_id )
+				);
+				if ( ! empty( $pair['error'] ) ) {
+					return false;
+				}
+				if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $variation->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
+					return false;
+				}
+				if ( isset( $pair['sale_price'] ) && wc_format_decimal( $variation->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+					return false;
+				}
 			}
 		}
 
@@ -3898,34 +5019,40 @@ class Mobo_Core_Product_Sync {
 
 
 	private function build_variation_source_hash( $data, $product_guid = '' ) {
-		if ( ! is_array( $data ) ) {
+		if ( ! is_array( $data ) || ! $this->variation_payload_has_complete_source_hash_state( $data ) ) {
 			return '';
 		}
 
 		$hash_data = array(
-			'variantId'       => $this->extract_variant_guid( $data ),
-			'productId'       => sanitize_text_field( (string) $product_guid ),
-			'attributes'      => $this->get_value( $data, 'attributes', array() ),
-			'updateTitle'     => $this->rules->should_update_title() ? 1 : 0,
-			'updatePrice'     => $this->rules->should_update_price() ? 1 : 0,
-			'updateCompare'   => $this->rules->should_update_compare_price() ? 1 : 0,
-			'updateStock'     => $this->rules->should_update_stock() ? 1 : 0,
-			'pricePolicyHash' => $this->build_price_policy_hash(),
+			'variantId'     => $this->extract_variant_guid( $data ),
+			'productId'     => sanitize_text_field( (string) $product_guid ),
+			'attributes'    => $this->get_value( $data, 'attributes', array() ),
+			'updateTitle'   => $this->rules->should_update_title() ? 1 : 0,
+			'updatePrice'   => $this->rules->should_update_price() ? 1 : 0,
+			'updateCompare' => $this->rules->should_update_compare_price() ? 1 : 0,
+			'updateStock'   => $this->rules->should_update_stock() ? 1 : 0,
 		);
 
-		if ( $this->rules->should_update_title() ) {
+		if ( $this->rules->should_update_title() && $this->product_title_field_present( $data ) ) {
 			$hash_data['title'] = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
 		}
 
-		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-			$hash_data['price']        = $this->get_value( $data, 'price', null );
-			$hash_data['comparePrice'] = $this->get_value( $data, 'comparePrice', null );
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $this->product_price_field_present( $data ) || $this->product_compare_price_field_present( $data ) ) ) {
+			if ( $this->product_price_field_present( $data ) ) {
+				$hash_data['price'] = $this->get_value( $data, 'price', null );
+			}
+			if ( $this->product_compare_price_field_present( $data ) ) {
+				$hash_data['comparePrice'] = $this->get_compare_price_field_value( $data, null );
+			}
+			$hash_data['pricePolicyHash'] = $this->build_price_policy_hash();
 		}
 
 		if ( $this->rules->should_update_stock() ) {
-			$stock_present      = false;
-			$hash_data['stock'] = $this->get_stock_value_from_payload( $data, $stock_present );
-			$hash_data['stockPresent'] = $stock_present ? 1 : 0;
+			$stock_present = false;
+			$stock_value   = $this->get_stock_value_from_payload( $data, $stock_present );
+			if ( $stock_present ) {
+				$hash_data['stock'] = $stock_value;
+			}
 		}
 
 		$hash_data = $this->sort_array_for_hash( $hash_data );
@@ -3962,6 +5089,35 @@ class Mobo_Core_Product_Sync {
 		}
 
 		return $value;
+	}
+
+	/**
+	 * Resolve whether the desired/current product is variable without treating an
+	 * omitted partial-payload attributes field as an explicit empty attribute set.
+	 */
+	private function product_payload_can_have_variants( $data, $product_id = 0 ) {
+		if ( $this->product_attributes_field_present( $data ) ) {
+			return $this->product_has_variation_attributes( $data );
+		}
+
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return false;
+		}
+
+		$product = wc_get_product( $product_id );
+		if ( $product instanceof WC_Product_Variable ) {
+			return true;
+		}
+		if ( $product instanceof WC_Product ) {
+			foreach ( $product->get_attributes() as $attribute ) {
+				if ( $attribute instanceof WC_Product_Attribute && $attribute->get_variation() ) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	private function product_has_variation_attributes( $data ) {
@@ -4006,7 +5162,11 @@ class Mobo_Core_Product_Sync {
 
 
 	/**
-	 * Resolve and persist the one purchasable Mobo variant of a simple product.
+	 * Fetch and validate the authoritative simple-product Variant snapshot.
+	 *
+	 * This method is deliberately read-only with respect to WooCommerce/Mobo state.
+	 * Callers that are not already under the shared product lock can therefore keep
+	 * Portal HTTP outside the critical section and serialize only the local commit.
 	 *
 	 * @param Mobo_Core_API_Client $api API client.
 	 * @param string               $product_guid Remote product GUID.
@@ -4014,7 +5174,7 @@ class Mobo_Core_Product_Sync {
 	 * @param string               $sync_id Sync ID.
 	 * @return array|WP_Error
 	 */
-	private function sync_simple_product_variant_from_api( $api, $product_guid, $product_id, $sync_id ) {
+	private function fetch_simple_product_variant_snapshot_from_api( $api, $product_guid, $product_id, $sync_id ) {
 		$product_guid = sanitize_text_field( (string) $product_guid );
 		$product_id   = absint( $product_id );
 		$sync_id      = sanitize_text_field( (string) $sync_id );
@@ -4033,6 +5193,7 @@ class Mobo_Core_Product_Sync {
 		if ( is_wp_error( $variants ) ) {
 			return $variants;
 		}
+
 		$page_has_more = $this->validated_page_has_more( $response, 1 );
 		if ( is_wp_error( $page_has_more ) ) {
 			return $page_has_more;
@@ -4040,37 +5201,216 @@ class Mobo_Core_Product_Sync {
 		if ( $page_has_more ) {
 			return new WP_Error( 'mobo_core_simple_variant_pagination_ambiguous', 'Simple product variant lookup returned additional pages; automatic selection is unsafe.' );
 		}
+
 		$total      = absint( $this->get_value( $response, 'totalCount', count( $variants ) ) );
 		$total      = max( $total, count( $variants ) );
 		$valid_rows = array_values( array_filter( $variants, array( $this, 'looks_like_variant_payload' ) ) );
 
 		if ( 1 === count( $valid_rows ) && $total <= 1 ) {
-			$result = $this->apply_simple_variant_to_product( $product_id, $valid_rows[0], $product_guid );
+			return array(
+				'mode'       => 'mapped',
+				'variant'    => $valid_rows[0],
+				'totalCount' => $total,
+			);
+		}
+
+		if ( 0 === count( $valid_rows ) && 0 === $total ) {
+			return array(
+				'mode'       => 'authoritative_missing',
+				'totalCount' => 0,
+				'message'    => 'محصول ساده در موبو هیچ Variant قابل خریدی ندارد؛ state معتبر ولی غیرقابل‌خرید به‌صورت ناموجود ثبت شد.',
+			);
+		}
+
+		return array(
+			'mode'       => 'ambiguous',
+			'totalCount' => $total,
+			'validCount' => count( $valid_rows ),
+			'message'    => sprintf( 'برای محصول ساده پاسخ Variant مبهم است (%d مورد معتبر، totalCount=%d). انتخاب خودکار ناامن است؛ محصول برای خرید مسدود شد.', count( $valid_rows ), $total ),
+		);
+	}
+
+	/**
+	 * Apply a previously validated simple-product Variant snapshot.
+	 *
+	 * The caller is responsible for holding the shared product lock whenever this
+	 * method can reach topology/quarantine mutation.
+	 *
+	 * @param int    $product_id WooCommerce product ID.
+	 * @param string $product_guid Product GUID.
+	 * @param array  $snapshot Validated snapshot.
+	 * @return array|WP_Error
+	 */
+	private function apply_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot ) {
+		$product_id   = absint( $product_id );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$mode         = is_array( $snapshot ) ? sanitize_key( (string) ( isset( $snapshot['mode'] ) ? $snapshot['mode'] : '' ) ) : '';
+
+		if ( $product_id <= 0 || '' === $product_guid || '' === $mode ) {
+			return new WP_Error( 'mobo_core_simple_variant_snapshot_invalid', 'Validated simple-product Variant snapshot is invalid.' );
+		}
+
+		if ( 'mapped' === $mode ) {
+			$variant = isset( $snapshot['variant'] ) && is_array( $snapshot['variant'] ) ? $snapshot['variant'] : array();
+			$result  = $this->apply_simple_variant_to_product( $product_id, $variant, $product_guid );
 
 			if ( is_wp_error( $result ) ) {
 				return $result;
 			}
 
 			return array(
-				'success'          => true,
-				'productId'        => $product_id,
-				'portalVariantId'  => isset( $result['portalVariantId'] ) ? absint( $result['portalVariantId'] ) : 0,
-				'variantGuid'      => isset( $result['variantGuid'] ) ? sanitize_text_field( (string) $result['variantGuid'] ) : '',
-				'message'          => 'شناسه قابل خرید محصول ساده همگام شد.',
+				'success'         => true,
+				'productId'       => $product_id,
+				'portalVariantId' => isset( $result['portalVariantId'] ) ? absint( $result['portalVariantId'] ) : 0,
+				'variantGuid'     => isset( $result['variantGuid'] ) ? sanitize_text_field( (string) $result['variantGuid'] ) : '',
+				'message'         => 'شناسه قابل خرید محصول ساده همگام شد.',
 			);
 		}
 
-		if ( 0 === count( $valid_rows ) ) {
-			$message = 'محصول ساده در موبو هیچ Variant قابل خریدی ندارد؛ برای جلوگیری از سفارش نامعتبر، ناموجود شد.';
-			$this->mark_simple_product_variant_unresolved( $product_id, 'missing', $message );
+		if ( 'authoritative_missing' === $mode ) {
+			$empty_state = $this->apply_authoritative_simple_without_purchase_variant( $product_id, $product_guid );
+			if ( is_wp_error( $empty_state ) ) {
+				return $empty_state;
+			}
 
-			return array( 'success' => false, 'message' => $message );
+			return array(
+				'success'              => true,
+				'productId'            => $product_id,
+				'portalVariantId'      => 0,
+				'variantGuid'          => '',
+				'purchasable'          => false,
+				'authoritativeMissing' => true,
+				'message'              => isset( $snapshot['message'] ) ? sanitize_text_field( (string) $snapshot['message'] ) : 'Authoritative Source topology contains no purchasable Variant.',
+			);
 		}
 
-		$message = sprintf( 'برای محصول ساده بیش از یک Variant موبو پیدا شد (%d مورد). انتخاب خودکار ناامن است؛ محصول برای خرید مسدود شد.', max( count( $valid_rows ), $total ) );
-		$this->mark_simple_product_variant_unresolved( $product_id, 'ambiguous', $message );
+		if ( 'ambiguous' === $mode ) {
+			$message = isset( $snapshot['message'] ) ? sanitize_text_field( (string) $snapshot['message'] ) : 'Simple product Variant snapshot is ambiguous.';
+			$this->mark_simple_product_variant_unresolved( $product_id, 'ambiguous', $message );
+			return new WP_Error( 'mobo_core_simple_variant_ambiguous', $message );
+		}
 
-		return array( 'success' => false, 'message' => $message );
+		return new WP_Error( 'mobo_core_simple_variant_snapshot_mode_invalid', 'Simple-product Variant snapshot mode is invalid.' );
+	}
+
+	/**
+	 * Revalidate the exact parent before a Manual/Repair Step-5 Simple commit.
+	 *
+	 * No mutation is performed here. The caller already holds the shared product
+	 * lock, so a successful proof remains stable until the subsequent commit.
+	 *
+	 * @param int    $product_id Expected WooCommerce product ID.
+	 * @param string $product_guid Expected remote product GUID.
+	 * @param array  $expected_attributes Parent attributes from the accepted snapshot.
+	 * @return true|WP_Error
+	 */
+	private function revalidate_manual_simple_product_target( $product_id, $product_guid, $expected_attributes ) {
+		$product_id          = absint( $product_id );
+		$product_guid        = sanitize_text_field( (string) $product_guid );
+		$expected_attributes = is_array( $expected_attributes ) ? $expected_attributes : array();
+
+		if ( $product_id <= 0 || '' === $product_guid ) {
+			return new WP_Error( 'mobo_core_manual_simple_revalidation_invalid', 'Manual Simple commit target identity is invalid.' );
+		}
+
+		$post = get_post( $product_id );
+		if ( ! $post instanceof WP_Post
+			|| 'product' !== (string) $post->post_type
+			|| in_array( (string) $post->post_status, array( 'trash', 'auto-draft' ), true )
+		) {
+			return new WP_Error( 'mobo_core_manual_simple_parent_missing', 'Manual Simple commit parent no longer exists as an active product.' );
+		}
+
+		$stored_guid = sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) );
+		if ( '' === $stored_guid || ! hash_equals( $product_guid, $stored_guid ) ) {
+			return new WP_Error( 'mobo_core_manual_simple_parent_identity_changed', 'Manual Simple commit parent identity changed before lock acquisition.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			$ids = Mobo_Core_Product_Concurrency::get_product_ids_by_guid( $product_guid );
+			$ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+			if ( 1 !== count( $ids ) || $product_id !== absint( $ids[0] ) ) {
+				return new WP_Error( 'mobo_core_manual_simple_parent_ownership_ambiguous', 'Manual Simple commit parent GUID ownership is no longer unique.' );
+			}
+		}
+
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			$mapped_id = absint( $this->product_map->get_product_id( $product_guid ) );
+			if ( $mapped_id > 0 && $mapped_id !== $product_id ) {
+				return new WP_Error( 'mobo_core_manual_simple_parent_map_changed', 'Manual Simple commit Product Map ownership changed before mutation.' );
+			}
+		}
+
+		$current = wc_get_product( $product_id );
+		if ( ! $current instanceof WC_Product ) {
+			return new WP_Error( 'mobo_core_manual_simple_parent_unloadable', 'Manual Simple commit parent could not be reloaded inside the product lock.' );
+		}
+
+		if ( $this->product_attribute_structure_changed( $current, $expected_attributes ) ) {
+			return new WP_Error( 'mobo_core_manual_simple_parent_topology_changed', 'Manual Simple commit parent attribute topology changed before mutation.' );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Commit Manual/Repair Step-5 Simple state under the shared parent product lock.
+	 *
+	 * @param int    $product_id WooCommerce product ID.
+	 * @param string $product_guid Product GUID.
+	 * @param array  $snapshot Validated Portal snapshot fetched outside the lock.
+	 * @param array  $expected_attributes Parent attributes from the accepted product snapshot.
+	 * @return array|WP_Error
+	 */
+	private function commit_manual_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot, $expected_attributes ) {
+		$product_id   = absint( $product_id );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+
+		if ( $product_id <= 0 || '' === $product_guid || ! is_array( $snapshot ) ) {
+			return new WP_Error( 'mobo_core_manual_simple_commit_invalid', 'Manual Simple commit context is invalid.' );
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			return new WP_Error( 'mobo_core_manual_simple_lock_unavailable', 'Shared product lock service is unavailable; Manual Simple mutation was deferred.' );
+		}
+
+		$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 5, 180 );
+		if ( false === $lock ) {
+			return new WP_Error( 'mobo_core_manual_simple_product_lock_busy', 'Shared parent product lock is busy; Manual Simple mutation was deferred.' );
+		}
+
+		try {
+			$revalidated = $this->revalidate_manual_simple_product_target( $product_id, $product_guid, $expected_attributes );
+			if ( is_wp_error( $revalidated ) ) {
+				return $revalidated;
+			}
+
+			return $this->apply_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot );
+		} finally {
+			Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+		}
+	}
+
+	/**
+	 * Resolve and persist the one purchasable Mobo variant of a simple product.
+	 *
+	 * Existing guarded webhook/variant callers already hold the shared product lock.
+	 * Manual/Repair Step 5 uses fetch_simple_product_variant_snapshot_from_api()
+	 * followed by commit_manual_simple_product_variant_snapshot() instead.
+	 *
+	 * @param Mobo_Core_API_Client $api API client.
+	 * @param string               $product_guid Remote product GUID.
+	 * @param int                  $product_id WooCommerce product ID.
+	 * @param string               $sync_id Sync ID.
+	 * @return array|WP_Error
+	 */
+	private function sync_simple_product_variant_from_api( $api, $product_guid, $product_id, $sync_id ) {
+		$snapshot = $this->fetch_simple_product_variant_snapshot_from_api( $api, $product_guid, $product_id, $sync_id );
+		if ( is_wp_error( $snapshot ) ) {
+			return $snapshot;
+		}
+
+		return $this->apply_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot );
 	}
 
 	/**
@@ -4087,6 +5427,11 @@ class Mobo_Core_Product_Sync {
 
 		if ( $product_id <= 0 || ! is_array( $variant_data ) ) {
 			return new WP_Error( 'mobo_core_simple_variant_invalid_payload', 'Simple product variant payload is invalid.' );
+		}
+
+		$money_integrity = $this->validate_money_payload_fields( $variant_data, 'simple-variant' );
+		if ( is_wp_error( $money_integrity ) ) {
+			return $money_integrity;
 		}
 
 		$portal_variant_id = $this->extract_portal_variant_id( $variant_data );
@@ -4121,7 +5466,7 @@ class Mobo_Core_Product_Sync {
 			$price_validation = $this->price_calculator->calculate_price_pair(
 				$product_id,
 				$this->get_value( $variant_data, 'price', null ),
-				$this->get_value( $variant_data, 'comparePrice', null ),
+				$this->get_compare_price_field_value( $variant_data, null ),
 				'product'
 			);
 			if ( ! empty( $price_validation['error'] ) ) {
@@ -4182,7 +5527,6 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( '_mobo_simple_variant_mapped_at', gmdate( 'c' ) );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_status', 'mapped' );
 		$product->update_meta_data( '_mobo_simple_variant_source_hash', $incoming_hash );
-		$product->update_meta_data( 'mobo_sync_incomplete', '0' );
 		$product->delete_meta_data( '_mobo_simple_variant_resolution_message' );
 		$saved_id = absint( $product->save() );
 		if ( $saved_id !== $product_id ) {
@@ -4193,7 +5537,6 @@ class Mobo_Core_Product_Sync {
 		if ( ! $fresh instanceof WC_Product_Simple
 			|| '1' !== (string) $fresh->get_meta( '_mobo_simple_variant_mapped', true )
 			|| absint( $fresh->get_meta( '_mobo_portal_variant_id', true ) ) !== $portal_variant_id
-			|| '0' !== (string) $fresh->get_meta( 'mobo_sync_incomplete', true )
 			|| ! $this->simple_product_matches_variant_payload( $fresh, $variant_data )
 		) {
 			return new WP_Error( 'mobo_core_simple_variant_postcondition_failed', 'Simple Mobo variant save failed its post-write verification.' );
@@ -4208,11 +5551,59 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
+	/**
+	 * Commit an authoritative Simple topology with no purchasable source Variant.
+	 * Old parent-level Variant identity is removed and checkout is made impossible,
+	 * while the topology itself can still converge as a complete out-of-stock state.
+	 *
+	 * @param int    $product_id Product ID.
+	 * @param string $product_guid Product GUID.
+	 * @return true|WP_Error
+	 */
+	private function apply_authoritative_simple_without_purchase_variant( $product_id, $product_guid ) {
+		$product_id   = absint( $product_id );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		if ( $product_id <= 0 ) {
+			return new WP_Error( 'mobo_core_authoritative_simple_empty_invalid', 'Authoritative empty Simple state has an invalid product ID.' );
+		}
+		$conversion = $this->force_product_simple_if_needed( $product_id );
+		if ( is_wp_error( $conversion ) ) {
+			return $conversion;
+		}
+		$cleanup = $this->clear_simple_variant_mapping_from_parent( $product_id );
+		if ( is_wp_error( $cleanup ) ) {
+			return $cleanup;
+		}
+		$product = new WC_Product_Simple( $product_id );
+		$product->set_manage_stock( true );
+		$product->set_stock_quantity( 0 );
+		$product->set_stock_status( 'outofstock' );
+		$product->update_meta_data( '_mobo_simple_variant_mapped', '0' );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_status', 'authoritative_missing' );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_message', 'Authoritative Source topology contains no purchasable Variant.' );
+		$product->update_meta_data( '_mobo_simple_variant_resolution_at', gmdate( 'c' ) );
+		if ( '' !== $product_guid ) {
+			$product->update_meta_data( 'product_guid', $product_guid );
+		}
+		$saved = absint( $product->save() );
+		$fresh = $saved === $product_id ? wc_get_product( $product_id ) : false;
+		if ( $saved !== $product_id || ! $fresh instanceof WC_Product_Simple || 'outofstock' !== (string) $fresh->get_stock_status() || absint( $fresh->get_meta( '_mobo_portal_variant_id', true ) ) > 0 || '' !== trim( (string) $fresh->get_meta( 'variant_guid', true ) ) ) {
+			return new WP_Error( 'mobo_core_authoritative_simple_empty_postcondition', 'Authoritative Simple zero-Variant state failed post-write verification.' );
+		}
+		wc_delete_product_transients( $product_id );
+		return true;
+	}
+
 	private function mark_simple_product_variant_unresolved( $product_id, $reason, $message ) {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 ) {
 			return;
+		}
+
+		$product_guid = sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) );
+		if ( '' !== $product_guid ) {
+			$this->upsert_product_map( $product_guid, $product_id, true );
 		}
 
 		$simple_conversion = $this->force_product_simple_if_needed( $product_id );
@@ -4245,6 +5636,14 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( 'mobo_sync_incomplete', '1' );
 		$product->save();
 
+		/* Stale parent-level Variant mappings are not purchase authority, but leaving
+		 * them behind can misroute future identity lookup. Remove only variation rows
+		 * pointing at this exact parent; failure stays explicitly incomplete/retryable. */
+		if ( $this->product_map instanceof Mobo_Core_Product_Map && ! $this->product_map->delete_variation_by_post_id_verified( $product_id ) ) {
+			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+			update_post_meta( $product_id, '_mobo_simple_variant_resolution_status', 'map_cleanup_failed' );
+		}
+
 		wc_delete_product_transients( $product_id );
 	}
 
@@ -4265,21 +5664,26 @@ class Mobo_Core_Product_Sync {
 				return false;
 			}
 		}
-		if ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) {
-			$pair = $this->price_calculator->calculate_price_pair(
-				absint( $product->get_id() ),
-				$this->get_value( $data, 'price', null ),
-				$this->get_value( $data, 'comparePrice', null ),
-				'product'
-			);
-			if ( ! empty( $pair['error'] ) ) {
-				return false;
-			}
-			if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $product->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
-				return false;
-			}
-			if ( isset( $pair['sale_price'] ) && wc_format_decimal( $product->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
-				return false;
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() ) && ( $this->product_price_field_present( $data ) || $this->product_compare_price_field_present( $data ) ) ) {
+			$product_id  = absint( $product->get_id() );
+			$raw_price   = $this->product_price_field_present( $data ) ? $this->get_value( $data, 'price', null ) : get_post_meta( $product_id, 'mobo_api_price', true );
+			$raw_compare = $this->product_compare_price_field_present( $data ) ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( $product_id, 'mobo_api_compare_price', true );
+			if ( $this->product_price_field_present( $data ) || ( null !== $raw_price && '' !== $raw_price ) ) {
+				$pair = $this->price_calculator->calculate_price_pair(
+					$product_id,
+					$raw_price,
+					$raw_compare,
+					'product'
+				);
+				if ( ! empty( $pair['error'] ) ) {
+					return false;
+				}
+				if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $product->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
+					return false;
+				}
+				if ( isset( $pair['sale_price'] ) && wc_format_decimal( $product->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+					return false;
+				}
 			}
 		}
 		return true;
@@ -4338,7 +5742,11 @@ class Mobo_Core_Product_Sync {
 
 		/* Storefront cart/API variant objects have id plus variant-specific fields. */
 		$id = $this->extract_positive_int_from_payload( $data, array( 'id' ) );
-		return $id > 0 && ( array_key_exists( 'status', $data ) || array_key_exists( 'min', $data ) || array_key_exists( 'max', $data ) || array_key_exists( 'price', $data ) || array_key_exists( 'type', $data ) || array_key_exists( 'attributes', $data ) );
+		$variant_detail_present = Mobo_Core_Payload_Field_Policy::is_present(
+			$data,
+			array( 'status', 'Status', 'min', 'Min', 'max', 'Max', 'price', 'Price', 'type', 'Type', 'attributes', 'Attributes' )
+		);
+		return $id > 0 && $variant_detail_present;
 	}
 
 	private function extract_simple_variant_guid( $data ) {
@@ -4381,6 +5789,85 @@ class Mobo_Core_Product_Sync {
 		return 0;
 	}
 
+	/**
+	 * Validate every child that an authoritative Simple transition may retire
+	 * before parent attributes/type are mutated. Manual/non-Mobo children are
+	 * intentionally preserved; conflicting Mobo aliases or unavailable map state
+	 * block the transition fail-closed.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return true|WP_Error
+	 */
+	private function preflight_simple_variation_cleanup( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || ! class_exists( 'Mobo_Core_Variation_Lifecycle_Policy' ) ) {
+			return new WP_Error( 'mobo_core_simple_preflight_unavailable', 'Variation lifecycle preflight is unavailable for Simple topology conversion.' );
+		}
+
+		$children = array_values( array_unique( array_merge( $this->get_live_variation_children( $product_id ), $this->get_pending_quarantine_children( $product_id ) ) ) );
+		foreach ( $children as $variation_id ) {
+			$preflight = Mobo_Core_Variation_Lifecycle_Policy::preflight_quarantine( $variation_id, $this->product_map );
+			if ( is_wp_error( $preflight ) ) {
+				return $preflight;
+			}
+			/* Non-Mobo children are outside Mobo topology ownership and remain live. */
+			if ( empty( $preflight['owned'] ) ) {
+				continue;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Verify that an authoritative Simple transition preserved the historical
+	 * quarantine object and did not mutate merchant/manual variations.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $owned_children Mobo-owned child IDs expected in Trash.
+	 * @param array $manual_children Snapshot of non-Mobo children.
+	 * @return true|WP_Error
+	 */
+	private function verify_simple_variation_preservation( $product_id, $owned_children, $manual_children ) {
+		$product_id = absint( $product_id );
+
+		foreach ( array_values( array_unique( array_map( 'absint', is_array( $owned_children ) ? $owned_children : array() ) ) ) as $variation_id ) {
+			if ( $variation_id <= 0 ) {
+				continue;
+			}
+			$post = get_post( $variation_id );
+			if ( ! $post instanceof WP_Post
+				|| 'product_variation' !== $post->post_type
+				|| 'trash' !== $post->post_status
+				|| absint( $post->post_parent ) !== $product_id
+				|| '' === trim( (string) get_post_meta( $variation_id, '_mobo_variation_quarantine_reason', true ) )
+			) {
+				return new WP_Error(
+					'mobo_core_simple_conversion_quarantine_not_preserved',
+					'Historical Mobo variation quarantine was not preserved during Simple conversion.',
+					array( 'productId' => $product_id, 'variationId' => $variation_id )
+				);
+			}
+		}
+
+		foreach ( is_array( $manual_children ) ? $manual_children : array() as $variation_id => $snapshot ) {
+			$variation_id = absint( $variation_id );
+			$post         = $variation_id > 0 ? get_post( $variation_id ) : null;
+			if ( ! $post instanceof WP_Post
+				|| 'product_variation' !== $post->post_type
+				|| (string) $post->post_status !== (string) ( isset( $snapshot['status'] ) ? $snapshot['status'] : '' )
+				|| absint( $post->post_parent ) !== absint( isset( $snapshot['parentId'] ) ? $snapshot['parentId'] : 0 )
+			) {
+				return new WP_Error(
+					'mobo_core_simple_conversion_manual_variation_changed',
+					'Manual/non-Mobo variation changed during authoritative Simple conversion; conversion safety verification failed.',
+					array( 'productId' => $product_id, 'variationId' => $variation_id )
+				);
+			}
+		}
+
+		return true;
+	}
+
 	private function force_product_simple_if_needed( $product_id ) {
 		$product_id = absint( $product_id );
 
@@ -4389,37 +5876,60 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$product = wc_get_product( $product_id );
-
 		if ( ! $product instanceof WC_Product ) {
 			return new WP_Error( 'mobo_core_simple_product_missing', 'Product could not be loaded for simple-product conversion.' );
 		}
 
-		if ( $product instanceof WC_Product_Simple && ! $product instanceof WC_Product_Variable ) {
-			return true;
+		/*
+		 * Do not trust the current parent type as proof that children are already gone.
+		 * Older builds could persist product_type=simple and leave live historical Mobo
+		 * variations behind. Query by post_parent so retries self-heal that state too.
+		 */
+		$children        = array_values( array_unique( array_merge( $this->get_live_variation_children( $product_id ), $this->get_pending_quarantine_children( $product_id ) ) ) );
+		$failed          = array();
+		$owned_children  = array();
+		$manual_children = array();
+
+		foreach ( $children as $variation_id ) {
+			$identity = class_exists( 'Mobo_Core_Variation_Lifecycle_Policy' ) ? Mobo_Core_Variation_Lifecycle_Policy::inspect_identity( $variation_id ) : new WP_Error( 'mobo_core_variation_lifecycle_missing', 'Variation lifecycle policy is unavailable.' );
+			if ( is_wp_error( $identity ) ) {
+				$failed[ $variation_id ] = $identity->get_error_message();
+				continue;
+			}
+			if ( empty( $identity['owned'] ) ) {
+				/* Manual/non-Mobo variations are outside Mobo topology ownership. Snapshot
+				 * their exact post state because WooCommerce normally force-deletes every
+				 * variation when a Variable product is saved as non-Variable. */
+				$post = get_post( $variation_id );
+				if ( $post instanceof WP_Post ) {
+					$manual_children[ absint( $variation_id ) ] = array(
+						'status'   => (string) $post->post_status,
+						'parentId' => absint( $post->post_parent ),
+					);
+				}
+				continue;
+			}
+			$owned_children[] = absint( $variation_id );
+			$retired = $this->quarantine_variation( $variation_id, 'authoritative-variable-to-simple', array( 'parentId' => $product_id ) );
+			if ( is_wp_error( $retired ) ) {
+				$failed[ $variation_id ] = $retired->get_error_message();
+			}
 		}
 
-		if ( $product instanceof WC_Product_Variable ) {
-			$children       = $product->get_children();
-			$failed_deletes = array();
+		if ( ! empty( $failed ) ) {
+			update_post_meta( $product_id, '_mobo_simple_conversion_failed_variations', wp_json_encode( $failed ) );
+			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+			return new WP_Error( 'mobo_core_simple_conversion_quarantine_failed', 'One or more Mobo variations could not be quarantined; product type was preserved for a safe retry.', array( 'variations' => $failed ) );
+		}
 
-			if ( is_array( $children ) ) {
-				foreach ( $children as $variation_id ) {
-					$variation_id = absint( $variation_id );
-					if ( $variation_id > 0 && ! $this->delete_variation_permanently( $variation_id ) ) {
-						$failed_deletes[] = $variation_id;
-					}
-				}
-			}
-
-			if ( ! empty( $failed_deletes ) ) {
-				update_post_meta( $product_id, '_mobo_simple_conversion_failed_variations', implode( ',', array_map( 'absint', $failed_deletes ) ) );
+		if ( $product instanceof WC_Product_Simple && ! $product instanceof WC_Product_Variable ) {
+			$preserved = $this->verify_simple_variation_preservation( $product_id, $owned_children, $manual_children );
+			if ( is_wp_error( $preserved ) ) {
 				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-				return new WP_Error(
-					'mobo_core_simple_conversion_delete_failed',
-					'One or more stale variations could not be deleted; product type was preserved for a safe retry.',
-					array( 'variationIds' => $failed_deletes )
-				);
+				return $preserved;
 			}
+			delete_post_meta( $product_id, '_mobo_simple_conversion_failed_variations' );
+			return true;
 		}
 
 		$type_write = wp_set_object_terms( $product_id, 'simple', 'product_type', false );
@@ -4428,15 +5938,50 @@ class Mobo_Core_Product_Sync {
 			return new WP_Error( 'mobo_core_simple_product_type_write_failed', 'WooCommerce product_type could not be changed to simple: ' . $type_write->get_error_message() );
 		}
 
-		$simple   = new WC_Product_Simple( $product_id );
-		$saved_id = absint( $simple->save() );
-		$fresh    = $saved_id === $product_id ? wc_get_product( $product_id ) : false;
+		/*
+		 * WooCommerce's woocommerce_product_type_changed handler normally calls
+		 * delete_variations( $product_id, true ) when Variable becomes non-Variable.
+		 * That force-deletes BOTH quarantined Mobo children and merchant/manual
+		 * variations. Use WooCommerce's own deletion-control filter, scoped to this
+		 * exact parent and exact Variable->Simple transition, then remove it in a
+		 * finally block so no unrelated save in this request is affected.
+		 */
+		$preserve_variations = static function( $delete_variations, $candidate, $from, $to ) use ( $product_id ) {
+			if ( $candidate instanceof WC_Product
+				&& absint( $candidate->get_id() ) === $product_id
+				&& 'variable' === (string) $from
+				&& 'simple' === (string) $to
+			) {
+				return false;
+			}
+			return $delete_variations;
+		};
+
+		add_filter( 'woocommerce_delete_variations_on_product_type_change', $preserve_variations, PHP_INT_MAX, 4 );
+		$saved_id = 0;
+		try {
+			$simple   = new WC_Product_Simple( $product_id );
+			$saved_id = absint( $simple->save() );
+		} catch ( Throwable $e ) {
+			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+			return new WP_Error( 'mobo_core_simple_product_save_exception', 'WooCommerce simple product conversion threw an exception: ' . $e->getMessage() );
+		} finally {
+			remove_filter( 'woocommerce_delete_variations_on_product_type_change', $preserve_variations, PHP_INT_MAX );
+		}
+
+		$fresh = $saved_id === $product_id ? wc_get_product( $product_id ) : false;
 		if ( $saved_id !== $product_id || ! $fresh instanceof WC_Product_Simple || $fresh instanceof WC_Product_Variable ) {
 			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
 			return new WP_Error( 'mobo_core_simple_product_save_failed', 'WooCommerce simple product conversion did not persist successfully.' );
 		}
-		delete_post_meta( $product_id, '_mobo_simple_conversion_failed_variations' );
 
+		$preserved = $this->verify_simple_variation_preservation( $product_id, $owned_children, $manual_children );
+		if ( is_wp_error( $preserved ) ) {
+			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+			return $preserved;
+		}
+
+		delete_post_meta( $product_id, '_mobo_simple_conversion_failed_variations' );
 		wc_delete_product_transients( $product_id );
 		return true;
 	}
@@ -4444,18 +5989,16 @@ class Mobo_Core_Product_Sync {
 	private function clear_simple_variant_mapping_from_parent( $product_id ) {
 		$product_id = absint( $product_id );
 		if ( $product_id <= 0 ) {
-			return;
+			return new WP_Error( 'mobo_core_simple_variant_cleanup_invalid', 'Product ID is invalid for simple-variant identity cleanup.' );
 		}
 
-		$variant_guid = sanitize_text_field( (string) get_post_meta( $product_id, 'variant_guid', true ) );
-		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
-			if ( '' !== $variant_guid ) {
-				$this->product_map->delete_variation( $variant_guid );
-			}
-			$this->product_map->delete_variation_by_post_id( $product_id );
-		}
-
-		foreach ( array(
+		/*
+		 * Checkout/purchase identity is the safety boundary. Clear and verify those
+		 * aliases before touching Product Map so a database cleanup failure can leave
+		 * an incomplete mapping to retry, but can never leave a stale purchasable
+		 * Variant identity on a now-Simple parent.
+		 */
+		$identity_keys = array(
 			'portal_variant_id',
 			'mobo_portal_variant_id',
 			'_mobo_portal_variant_id',
@@ -4468,9 +6011,28 @@ class Mobo_Core_Product_Sync {
 			'_mobo_simple_variant_resolution_message',
 			'_mobo_simple_variant_resolution_at',
 			'_mobo_simple_variant_source_hash',
-		) as $meta_key ) {
+		);
+		foreach ( $identity_keys as $meta_key ) {
 			delete_post_meta( $product_id, $meta_key );
 		}
+		foreach ( $identity_keys as $meta_key ) {
+			if ( '' !== (string) get_post_meta( $product_id, $meta_key, true ) ) {
+				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+				return new WP_Error( 'mobo_core_simple_variant_meta_cleanup_failed', 'Legacy simple-variant purchase identity metadata did not clear durably after product type conversion.' );
+			}
+		}
+
+		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
+			/* Delete only variation rows that point at this parent post and verify the
+			 * read-back. A stale remote GUID alias must not delete a row owned by another
+			 * local object. */
+			if ( ! $this->product_map->delete_variation_by_post_id_verified( $product_id ) ) {
+				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+				return new WP_Error( 'mobo_core_simple_variant_map_post_cleanup_failed', 'Could not remove and verify legacy variation mappings that still point at the parent product.' );
+			}
+		}
+
+		return true;
 	}
 
 	private function ensure_product_type_for_variants( $product_id, $variant_total_count ) {
@@ -4489,6 +6051,18 @@ class Mobo_Core_Product_Sync {
 
 		if ( $variant_total_count > 0 ) {
 			if ( $current instanceof WC_Product_Variable ) {
+				/* Older builds could persist the variable product_type while failing to
+				 * remove a parent-level simple-variant identity/map. Re-run the cleanup
+				 * when any such identity remains so retries are self-healing. */
+				$has_parent_variant_identity = '1' === (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true )
+					|| '' !== trim( (string) get_post_meta( $product_id, 'variant_guid', true ) )
+					|| absint( get_post_meta( $product_id, 'portal_variant_id', true ) ) > 0;
+				if ( $has_parent_variant_identity ) {
+					$cleanup = $this->clear_simple_variant_mapping_from_parent( $product_id );
+					if ( is_wp_error( $cleanup ) ) {
+						return $cleanup;
+					}
+				}
 				return $current;
 			}
 
@@ -4511,7 +6085,10 @@ class Mobo_Core_Product_Sync {
 			 * product_type mutation itself is durable. Removing it before the taxonomy
 			 * write succeeds can orphan a simple product after a transient DB failure. */
 			if ( $had_simple_variant_mapping ) {
-				$this->clear_simple_variant_mapping_from_parent( $product_id );
+				$cleanup = $this->clear_simple_variant_mapping_from_parent( $product_id );
+				if ( is_wp_error( $cleanup ) ) {
+					return $cleanup;
+				}
 			}
 
 			return $variable;
@@ -4662,31 +6239,10 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function get_stock_value_from_payload( $data, &$present = false ) {
-		$present = false;
+		$inspection = Mobo_Core_Payload_Field_Policy::inspect( $data, Mobo_Core_Payload_Field_Policy::stock_aliases() );
+		$present    = ! empty( $inspection['present'] );
 
-		if ( ! is_array( $data ) ) {
-			return null;
-		}
-
-		$keys = array(
-			'stock',
-			'Stock',
-			'stock_quantity',
-			'stockQuantity',
-			'quantity',
-			'Quantity',
-			'inventory',
-			'inventoryQuantity',
-		);
-
-		foreach ( $keys as $key ) {
-			if ( array_key_exists( $key, $data ) ) {
-				$present = true;
-				return $data[ $key ];
-			}
-		}
-
-		return null;
+		return $present ? $inspection['value'] : null;
 	}
 
 	private function variation_stock_matches_payload( $variation_id, $data ) {
@@ -4867,8 +6423,7 @@ class Mobo_Core_Product_Sync {
 
 		$gmt_date   = gmdate( 'Y-m-d H:i:s', $timestamp );
 		$local_date = get_date_from_gmt( $gmt_date, 'Y-m-d H:i:s' );
-		$current_created  = $product->get_date_created( 'edit' );
-		$current_modified = $product->get_date_modified( 'edit' );
+		$current_created = $product->get_date_created( 'edit' );
 
 		if ( ! $current_created instanceof WC_DateTime || (int) $current_created->getTimestamp() !== (int) $timestamp ) {
 			$date = new WC_DateTime( '@' . $timestamp );
@@ -4876,11 +6431,6 @@ class Mobo_Core_Product_Sync {
 			$product->set_date_created( $date );
 		}
 
-		if ( ! $current_modified instanceof WC_DateTime || (int) $current_modified->getTimestamp() !== (int) $timestamp ) {
-			$date_modified = new WC_DateTime( '@' . $timestamp );
-			$date_modified->setTimezone( new DateTimeZone( 'UTC' ) );
-			$product->set_date_modified( $date_modified );
-		}
 
 		$this->update_product_meta_if_changed( $product, 'published_at', $published_at );
 		$this->update_product_meta_if_changed( $product, 'mobo_published_at_gmt', $gmt_date );
@@ -4896,24 +6446,48 @@ class Mobo_Core_Product_Sync {
 			return;
 		}
 
-		$raw_price         = $this->get_value( $data, 'price', null );
-		$raw_compare_price = $this->get_value( $data, 'comparePrice', null );
+		$price_present   = $this->product_price_field_present( $data );
+		$compare_present = $this->product_compare_price_field_present( $data );
+		if ( ! $is_new_object && ! $price_present && ! $compare_present ) {
+			return;
+		}
+
+		$object_id         = absint( $product->get_id() );
+		$raw_price         = $price_present || $is_new_object ? $this->get_value( $data, 'price', null ) : get_post_meta( $object_id, 'mobo_api_price', true );
+		$raw_compare_price = $compare_present || $is_new_object ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( $object_id, 'mobo_api_compare_price', true );
 		$source_changed    = false;
 
+		if ( ! $is_new_object && ! $price_present && ( null === $raw_price || '' === $raw_price ) ) {
+			if ( $compare_present ) {
+				$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_api_compare_price', null === $raw_compare_price || '' === $raw_compare_price ? '' : wc_format_decimal( $raw_compare_price ) ) || $source_changed;
+			}
+			if ( $source_changed ) {
+				$this->update_product_meta_if_changed( $product, 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+			}
+			return;
+		}
+
+		$parent_id = 'variation' === sanitize_key( (string) $context ) ? absint( $product->get_parent_id( 'edit' ) ) : 0;
 		$pair = $this->price_calculator->calculate_price_pair(
-			absint( $product->get_id() ),
+			$object_id,
 			$raw_price,
 			$raw_compare_price,
-			$context
+			$context,
+			$parent_id
 		);
 
 		if ( ! empty( $pair['error'] ) ) {
 			throw new RuntimeException( 'Invalid Mobo price payload: ' . sanitize_text_field( (string) $pair['error'] ) );
 		}
 
-		$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_api_price', null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price ) ) || $source_changed;
-		$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_api_compare_price', null === $raw_compare_price || '' === $raw_compare_price ? '' : wc_format_decimal( $raw_compare_price ) ) || $source_changed;
-		$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_price_policy_type', (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ) ) || $source_changed;
+		if ( $price_present || $is_new_object ) {
+			$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_api_price', null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price ) ) || $source_changed;
+		}
+		if ( $compare_present || $is_new_object ) {
+			$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_api_compare_price', null === $raw_compare_price || '' === $raw_compare_price ? '' : wc_format_decimal( $raw_compare_price ) ) || $source_changed;
+		}
+		$effective_policy_type = isset( $pair['policy_type'] ) && '' !== (string) $pair['policy_type'] ? sanitize_key( (string) $pair['policy_type'] ) : (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+		$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_price_policy_type', $effective_policy_type ) || $source_changed;
 
 		if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ) {
 			$desired_regular = wc_format_decimal( $pair['regular_price'] );
@@ -4965,7 +6539,9 @@ class Mobo_Core_Product_Sync {
 			$state['nextRetryAt']           = time() + $delay_seconds;
 			$state['lastError']             = '';
 			$state['lastMessage']           = sprintf( '%s اتصال به MoboCore پس از %d تلاش برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
-			$this->save_manual_sync_state( $state );
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
 
 			return $this->result( true, $state['lastMessage'] . ' ' . $error_msg, $this->get_manual_sync_status() );
 		}
@@ -4975,7 +6551,9 @@ class Mobo_Core_Product_Sync {
 		$state['nextRetryAt'] = 0;
 		$state['lastError']   = '';
 		$state['lastMessage'] = sprintf( '%s خطای موقت؛ تلاش مجدد %d از %d. %s', $message, $try_count, $max_try, $error_msg );
-		$this->save_manual_sync_state( $state );
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+		}
 
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
@@ -4997,10 +6575,189 @@ class Mobo_Core_Product_Sync {
 		}
 	}
 
+	/**
+	 * Validate explicitly present source money fields before mutation. Absent values
+	 * preserve existing state; null/empty are explicit nullable state; malformed
+	 * numeric input fails closed instead of being wc_format_decimal()-collapsed.
+	 *
+	 * @param array  $data Payload.
+	 * @param string $context Diagnostic context.
+	 * @return true|WP_Error
+	 */
+	private function validate_money_payload_fields( $data, $context ) {
+		if ( ! is_array( $data ) ) {
+			return new WP_Error( 'mobo_core_money_payload_invalid', 'Mobo money payload is invalid.' );
+		}
+
+		if ( $this->product_price_field_present( $data ) ) {
+			$price = Mobo_Core_Payload_Field_Policy::value( $data, Mobo_Core_Payload_Field_Policy::price_aliases(), null );
+			if ( ! Mobo_Core_Money_Policy::is_valid_source_amount( $price ) ) {
+				return new WP_Error( 'mobo_core_price_payload_invalid', 'Mobo ' . sanitize_key( (string) $context ) . ' price is present but malformed.' );
+			}
+		}
+
+		if ( $this->product_compare_price_field_present( $data ) ) {
+			$compare = Mobo_Core_Payload_Field_Policy::value( $data, Mobo_Core_Payload_Field_Policy::compare_price_aliases(), null );
+			if ( ! Mobo_Core_Money_Policy::is_valid_source_amount( $compare ) ) {
+				return new WP_Error( 'mobo_core_compare_price_payload_invalid', 'Mobo ' . sanitize_key( (string) $context ) . ' comparePrice is present but malformed.' );
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Validate present authoritative Product collection fields before any WooCommerce
+	 * mutation. Explicit empty arrays are valid desired state; malformed/non-array or
+	 * partially invalid collections are not silently normalized into destructive
+	 * subsets.
+	 *
+	 * @param array $data Product payload.
+	 * @param bool  $is_new_product Whether this is a new local product.
+	 * @return true|WP_Error
+	 */
+	private function validate_product_desired_state_payload( $data, $is_new_product = false ) {
+		if ( ! is_array( $data ) ) {
+			return new WP_Error( 'mobo_core_product_payload_invalid', 'Mobo product payload must be an object/array.' );
+		}
+
+		$money_integrity = $this->validate_money_payload_fields( $data, 'product' );
+		if ( is_wp_error( $money_integrity ) ) {
+			return $money_integrity;
+		}
+
+		if ( $this->product_images_field_present( $data ) && ( $is_new_product || $this->rules->should_update_images() ) ) {
+			$images           = Mobo_Core_Payload_Field_Policy::value( $data, Mobo_Core_Payload_Field_Policy::image_aliases(), null );
+			$image_integrity  = Mobo_Core_Image_Desired_State_Policy::validate_collection( $images );
+			if ( is_wp_error( $image_integrity ) ) {
+				return $image_integrity;
+			}
+		}
+
+		if ( $this->product_attributes_field_present( $data ) ) {
+			$attributes = $this->get_value( $data, 'attributes', null );
+			if ( ! is_array( $attributes ) ) {
+				return new WP_Error( 'mobo_core_product_attributes_invalid', 'Mobo product attributes must be an array when the field is present.' );
+			}
+			$seen_names = array();
+			foreach ( $attributes as $attribute ) {
+				if ( ! is_array( $attribute ) ) {
+					return new WP_Error( 'mobo_core_product_attribute_row_invalid', 'Mobo product contains a malformed attribute row.' );
+				}
+				$name = sanitize_text_field( (string) $this->get_value( $attribute, 'name', '' ) );
+				$key  = sanitize_title( $name );
+				$values = $this->get_value( $attribute, 'values', null );
+				if ( '' === $key || ! is_array( $values ) || empty( $values ) ) {
+					return new WP_Error( 'mobo_core_product_attribute_row_invalid', 'Mobo product attribute must contain a name and at least one value.' );
+				}
+				if ( isset( $seen_names[ $key ] ) ) {
+					return new WP_Error( 'mobo_core_product_attribute_duplicate', 'Mobo product contains duplicate attribute definitions: ' . $key );
+				}
+				$seen_names[ $key ] = true;
+				$seen_values = array();
+				foreach ( $values as $value_row ) {
+					if ( ! is_array( $value_row ) ) {
+						return new WP_Error( 'mobo_core_product_attribute_value_invalid', 'Mobo product attribute contains a malformed value row.' );
+					}
+					$value = sanitize_text_field( (string) $this->get_value( $value_row, 'value', '' ) );
+					if ( '' === $value ) {
+						return new WP_Error( 'mobo_core_product_attribute_value_invalid', 'Mobo product attribute contains an empty value.' );
+					}
+					$value_key = strtolower( $value );
+					if ( isset( $seen_values[ $value_key ] ) ) {
+						return new WP_Error( 'mobo_core_product_attribute_value_duplicate', 'Mobo product attribute contains a duplicate value: ' . $name . '=' . $value );
+					}
+					$seen_values[ $value_key ] = true;
+				}
+			}
+		}
+
+		if ( $this->product_categories_field_present( $data ) ) {
+			$categories = $this->get_raw_product_categories_field( $data );
+			if ( ! is_array( $categories ) ) {
+				return new WP_Error( 'mobo_core_product_categories_invalid', 'Mobo product categories must be an array when the field is present.' );
+			}
+			$seen_categories = array();
+			foreach ( $categories as $ref ) {
+				$guid = is_array( $ref ) ? $this->extract_category_guid_for_storage( $ref ) : sanitize_text_field( (string) $ref );
+				if ( ! $this->is_remote_guid_value( $guid ) ) {
+					return new WP_Error( 'mobo_core_product_category_row_invalid', 'Mobo product contains a category row without a stable remote identity.' );
+				}
+				$key = strtolower( $guid );
+				if ( isset( $seen_categories[ $key ] ) ) {
+					return new WP_Error( 'mobo_core_product_category_duplicate', 'Mobo product category desired state contains a duplicate remote identity.' );
+				}
+				$seen_categories[ $key ] = true;
+			}
+		}
+
+		return true;
+	}
+
+	private function get_raw_product_categories_field( $data ) {
+		return Mobo_Core_Payload_Field_Policy::value(
+			$data,
+			Mobo_Core_Payload_Field_Policy::category_aliases(),
+			null
+		);
+	}
+
 	private function get_product_images_from_payload( $data ) {
-		$images = $this->get_value( $data, 'images', array() );
+		$images = Mobo_Core_Payload_Field_Policy::value(
+			$data,
+			Mobo_Core_Payload_Field_Policy::image_aliases(),
+			array()
+		);
 
 		return is_array( $images ) ? $images : array();
+	}
+
+	private function product_title_field_present( $data ) {
+		return is_array( $data ) && ( array_key_exists( 'title', $data ) || array_key_exists( 'Title', $data ) );
+	}
+
+	private function product_slug_field_present( $data ) {
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+		foreach ( array( 'slug', 'Slug', 'url', 'Url' ) as $key ) {
+			if ( array_key_exists( $key, $data ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function product_published_at_field_present( $data ) {
+		return is_array( $data ) && ( array_key_exists( 'publishedAt', $data ) || array_key_exists( 'PublishedAt', $data ) );
+	}
+
+	private function product_price_field_present( $data ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::price_aliases() );
+	}
+
+	private function product_compare_price_field_present( $data ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::compare_price_aliases() );
+	}
+
+	private function get_compare_price_field_value( $data, $default = null ) {
+		return Mobo_Core_Payload_Field_Policy::value(
+			$data,
+			Mobo_Core_Payload_Field_Policy::compare_price_aliases(),
+			$default
+		);
+	}
+
+	private function product_images_field_present( $data ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::image_aliases() );
+	}
+
+	private function product_attributes_field_present( $data ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::attribute_aliases() );
+	}
+
+	private function product_categories_field_present( $data ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::category_aliases() );
 	}
 
 	private function build_product_attributes( $attributes ) {
@@ -5067,45 +6824,28 @@ class Mobo_Core_Product_Sync {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 || ! is_array( $attributes ) ) {
-			return;
+			return false;
 		}
 
 		$map = array();
-
 		foreach ( $attributes as $attribute_data ) {
 			if ( ! is_array( $attribute_data ) ) {
 				continue;
 			}
-
 			$guid = $this->extract_attribute_guid( $attribute_data );
 			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
-
 			if ( '' !== $guid && '' !== $name ) {
 				$map[ $name ] = $guid;
 			}
 		}
 
 		if ( empty( $map ) ) {
-			if ( metadata_exists( 'post', $product_id, 'attribute_guid' ) ) {
-				delete_post_meta( $product_id, 'attribute_guid' );
-			}
-			if ( metadata_exists( 'post', $product_id, 'mobo_attribute_guid_map' ) ) {
-				delete_post_meta( $product_id, 'mobo_attribute_guid_map' );
-			}
-			return;
+			return $this->delete_post_meta_verified( $product_id, 'attribute_guid' ) && $this->delete_post_meta_verified( $product_id, 'mobo_attribute_guid_map' );
 		}
 
-		$this->update_post_meta_if_changed( $product_id, 'attribute_guid', $map );
-		$this->update_post_meta_if_changed( $product_id, 'mobo_attribute_guid_map', $map );
+		return $this->persist_post_meta_verified( $product_id, 'attribute_guid', $map ) && $this->persist_post_meta_verified( $product_id, 'mobo_attribute_guid_map', $map );
 	}
 
-
-	/**
-	 * Extract attribute GUID from an attribute payload.
-	 *
-	 * @param array $attribute_data Attribute payload.
-	 * @return string
-	 */
 	private function extract_attribute_guid( $attribute_data ) {
 		if ( ! is_array( $attribute_data ) ) {
 			return '';
@@ -5255,63 +6995,73 @@ class Mobo_Core_Product_Sync {
 			return new WP_Error( 'mobo_core_missing_variants_product_invalid', 'Product could not be loaded while finalizing missing variations.' );
 		}
 
-		$deleted_count = 0;
+		$parent_id = absint( $product->get_id() );
+		if ( $parent_id <= 0 || ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $parent_id ) ) ) {
+			return new WP_Error( 'mobo_core_missing_variants_parent_excluded', 'Excluded/invalid parent cannot be mutated during variation finalization.' );
+		}
 
-		$seen = get_option( $this->seen_option_name( $product_guid, $sync_id ), array() );
+		$seen_option = $this->seen_option_name( $product_guid, $sync_id );
+		wp_cache_delete( $seen_option, 'options' );
+		$seen = get_option( $seen_option, null );
 		if ( ! is_array( $seen ) ) {
-			$seen = array();
+			return new WP_Error( 'mobo_core_seen_variants_checkpoint_missing', 'Authoritative variation seen-set is missing or unreadable; destructive finalization was blocked.' );
 		}
 
-		$children = method_exists( $product, 'get_children' ) ? $product->get_children() : array();
-		if ( ! is_array( $children ) ) {
-			$children = array();
-		}
-		$children = array_values( array_filter( array_map( 'absint', $children ) ) );
+		$children = array_values( array_unique( array_merge( $this->get_live_variation_children( $parent_id ), $this->get_pending_quarantine_children( $parent_id ) ) ) );
 		if ( ! empty( $children ) ) {
 			update_meta_cache( 'post', $children );
 		}
 
-		$failed_deletes = array();
+		$quarantined = 0;
+		$failed      = array();
 		foreach ( $children as $variation_id ) {
-			$variation_id = absint( $variation_id );
-			if ( $variation_id <= 0 ) {
+			$identity = class_exists( 'Mobo_Core_Variation_Lifecycle_Policy' ) ? Mobo_Core_Variation_Lifecycle_Policy::inspect_identity( $variation_id ) : new WP_Error( 'mobo_core_variation_lifecycle_missing', 'Variation lifecycle policy is unavailable.' );
+			if ( is_wp_error( $identity ) ) {
+				$failed[ $variation_id ] = $identity->get_error_message();
 				continue;
 			}
-
-			$variant_guid = sanitize_text_field( (string) get_post_meta( $variation_id, 'variant_guid', true ) );
+			if ( empty( $identity['owned'] ) ) {
+				continue;
+			}
+			$variant_guid = sanitize_text_field( (string) $identity['variantGuid'] );
 			if ( '' !== $variant_guid && isset( $seen[ $variant_guid ] ) ) {
 				continue;
 			}
 
-			if ( $this->delete_variation_permanently( $variation_id ) ) {
-				$deleted_count++;
+			$result = $this->quarantine_variation(
+				$variation_id,
+				'authoritative-variant-removed',
+				array( 'parentId' => $parent_id, 'productGuid' => $product_guid, 'syncId' => $sync_id )
+			);
+			if ( is_wp_error( $result ) ) {
+				$failed[ $variation_id ] = $result->get_error_message();
 			} else {
-				$failed_deletes[] = $variation_id;
+				$quarantined++;
 			}
 		}
 
-		if ( ! empty( $failed_deletes ) ) {
+		if ( ! empty( $failed ) ) {
 			return new WP_Error(
-				'mobo_core_missing_variants_delete_failed',
-				'One or more stale local variations could not be deleted; authoritative finalization was not committed and will be retried.',
-				array( 'variationIds' => $failed_deletes )
+				'mobo_core_missing_variants_quarantine_failed',
+				'One or more stale Mobo variations could not be quarantined; authoritative finalization was not committed and will be retried.',
+				array( 'variations' => $failed )
 			);
 		}
 
-		/* Only remove orphan mapping rows after all local stale children are gone. */
+		/* Remove only stale variation mapping rows after live retirement succeeded. */
 		if ( $this->product_map instanceof Mobo_Core_Product_Map ) {
 			$mapping_error = '';
 			$this->product_map->delete_variations_for_parent( $product_guid, array_keys( $seen ), $mapping_error );
 			if ( '' !== $mapping_error ) {
 				return new WP_Error(
 					'mobo_core_missing_variants_mapping_cleanup_failed',
-					'Local stale variations were removed, but stale mapping cleanup failed; authoritative finalization was not committed and will be retried.',
+					'Stale variations were quarantined, but stale variation mapping cleanup failed; finalization will retry.',
 					array( 'mappingError' => $mapping_error )
 				);
 			}
 		}
 
-		return $deleted_count;
+		return $quarantined;
 	}
 
 	private function is_remote_product_trashed( $guid ) {
@@ -5404,7 +7154,15 @@ class Mobo_Core_Product_Sync {
 
 			if ( $canonical_id > 0 ) {
 				if ( $canonical_id !== $mapped_product_id ) {
-					$this->upsert_product_map( $guid, $canonical_id, false );
+					/*
+					 * A legacy/canonical identity fallback is bootstrap evidence only.
+					 * When no canonical Map row owns this identity yet, preserve the
+					 * durable crash marker instead of silently electing the product as
+					 * complete. Existing Map rows remain authoritative and are never
+					 * overwritten from legacy postmeta here.
+					 */
+					$canonical_incomplete = '1' === (string) get_post_meta( $canonical_id, 'mobo_sync_incomplete', true );
+					$this->upsert_product_map( $guid, $canonical_id, $canonical_incomplete );
 				}
 				return $canonical_id;
 			}
@@ -5417,7 +7175,8 @@ class Mobo_Core_Product_Sync {
 		$product_id = $this->find_post_id_by_meta( 'product', 'product_guid', $guid );
 
 		if ( $product_id > 0 ) {
-			$this->upsert_product_map( $guid, $product_id, false );
+			$legacy_incomplete = '1' === (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true );
+			$this->upsert_product_map( $guid, $product_id, $legacy_incomplete );
 		}
 
 		return $product_id;
@@ -5634,13 +7393,18 @@ class Mobo_Core_Product_Sync {
 	 */
 	private function upsert_product_map( $product_guid, $product_id, $sync_incomplete = false ) {
 		if ( ! ( $this->product_map instanceof Mobo_Core_Product_Map ) ) {
-			return;
+			return false;
 		}
 
-		$this->product_map->upsert_product( $product_guid, $product_id, '', $sync_incomplete );
+		$last_hash = sanitize_text_field( (string) get_post_meta( absint( $product_id ), '_mobo_product_source_hash', true ) );
+		$stored = (bool) $this->product_map->upsert_product( $product_guid, $product_id, $last_hash, $sync_incomplete );
+		if ( ! $stored ) {
+			return false;
+		}
 		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
 			Mobo_Core_Product_Ledger::record( $product_guid, $product_id, $this->is_repair_mode() ? 'repair' : 'sync', false );
 		}
+		return true;
 	}
 
 	/**
@@ -5657,7 +7421,8 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		return (bool) $this->product_map->upsert_variation( $variant_guid, $variation_id, $product_guid, '', $sync_incomplete );
+		$last_hash = sanitize_text_field( (string) get_post_meta( absint( $variation_id ), '_mobo_variant_source_hash', true ) );
+		return (bool) $this->product_map->upsert_variation( $variant_guid, $variation_id, $product_guid, $last_hash, $sync_incomplete );
 	}
 
 	private function find_post_id_by_meta( $post_type, $meta_key, $meta_value ) {
@@ -5691,19 +7456,35 @@ class Mobo_Core_Product_Sync {
 		return ! empty( $query->posts[0] ) ? absint( $query->posts[0] ) : 0;
 	}
 
+	private function persist_seen_variants_verified( $option_name, $seen ) {
+		$option_name = sanitize_key( (string) $option_name );
+		$seen        = is_array( $seen ) ? $seen : array();
+		if ( '' === $option_name ) {
+			return false;
+		}
+
+		update_option( $option_name, $seen, false );
+		wp_cache_delete( $option_name, 'options' );
+		$stored = get_option( $option_name, null );
+		return is_array( $stored ) && maybe_serialize( $stored ) === maybe_serialize( $seen );
+	}
+
 	private function reset_seen_variants( $product_guid, $sync_id ) {
-		update_option( $this->seen_option_name( $product_guid, $sync_id ), array(), false );
+		return $this->persist_seen_variants_verified( $this->seen_option_name( $product_guid, $sync_id ), array() );
 	}
 
 	private function initialize_seen_variants( $product_guid, $sync_id ) {
 		$option_name = $this->seen_option_name( $product_guid, $sync_id );
-		if ( false === get_option( $option_name, false ) ) {
-			add_option( $option_name, array(), '', false );
+		wp_cache_delete( $option_name, 'options' );
+		$existing = get_option( $option_name, null );
+		if ( is_array( $existing ) ) {
+			return true;
 		}
+		return $this->persist_seen_variants_verified( $option_name, array() );
 	}
 
 	private function mark_variant_seen( $product_guid, $sync_id, $variant_guid ) {
-		$this->mark_variants_seen_bulk( $product_guid, $sync_id, array( $variant_guid ) );
+		return $this->mark_variants_seen_bulk( $product_guid, $sync_id, array( $variant_guid ) );
 	}
 
 	/**
@@ -5731,15 +7512,19 @@ class Mobo_Core_Product_Sync {
 			$changed = true;
 		}
 
-		if ( $changed ) {
-			update_option( $option_name, $seen, false );
+		if ( ! $changed ) {
+			return true;
 		}
+
+		return $this->persist_seen_variants_verified( $option_name, $seen );
 	}
 
 	private function count_seen_variants( $product_guid, $sync_id ) {
-		$seen = get_option( $this->seen_option_name( $product_guid, $sync_id ), array() );
+		$option_name = $this->seen_option_name( $product_guid, $sync_id );
+		wp_cache_delete( $option_name, 'options' );
+		$seen = get_option( $option_name, null );
 
-		return is_array( $seen ) ? count( $seen ) : 0;
+		return is_array( $seen ) ? count( $seen ) : -1;
 	}
 
 
@@ -5779,7 +7564,10 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function clear_seen_variants( $product_guid, $sync_id ) {
-		delete_option( $this->seen_option_name( $product_guid, $sync_id ) );
+		$option_name = $this->seen_option_name( $product_guid, $sync_id );
+		delete_option( $option_name );
+		wp_cache_delete( $option_name, 'options' );
+		return null === get_option( $option_name, null );
 	}
 
 	private function seen_option_name( $product_guid, $sync_id ) {
@@ -5939,18 +7727,8 @@ class Mobo_Core_Product_Sync {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	/**
 	 * Return the first non-empty scalar value.
@@ -6108,36 +7886,28 @@ private function store_product_category_refs( $product_id, $category_refs ) {
 	$product_id = absint( $product_id );
 
 	if ( $product_id <= 0 ) {
-		return;
+		return false;
 	}
 
 	if ( ! is_array( $category_refs ) ) {
-		delete_post_meta( $product_id, 'mobo_product_category_refs_json' );
-		delete_post_meta( $product_id, 'mobo_product_category_guids' );
-		return;
+		return false;
 	}
 
 	$normalized = array();
 	$guids      = array();
-
 	foreach ( $category_refs as $ref ) {
 		if ( ! is_array( $ref ) ) {
 			$guid = sanitize_text_field( (string) $ref );
-
 			if ( $this->is_remote_guid_value( $guid ) ) {
 				$normalized[] = array( 'id' => $guid );
 				$guids[]      = $guid;
 			}
-
 			continue;
 		}
-
 		$guid = $this->extract_category_guid_for_storage( $ref );
-
 		if ( '' === $guid ) {
 			continue;
 		}
-
 		$normalized[] = array(
 			'id'       => $guid,
 			'title'    => sanitize_text_field( (string) $this->get_value( $ref, 'title', '' ) ),
@@ -6147,14 +7917,18 @@ private function store_product_category_refs( $product_id, $category_refs ) {
 		$guids[] = $guid;
 	}
 
-	if ( empty( $normalized ) ) {
-		delete_post_meta( $product_id, 'mobo_product_category_refs_json' );
-		delete_post_meta( $product_id, 'mobo_product_category_guids' );
-		return;
+	/* An explicit empty list is authoritative desired state, not absence of local
+	 * knowledge. Persist [] plus a marker so Recategorize can never resurrect
+	 * categories from an older webhook/API fallback after the source intentionally
+	 * cleared every category. */
+	$json = wp_json_encode( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+	if ( false === $json ) {
+		return false;
 	}
-
-	update_post_meta( $product_id, 'mobo_product_category_refs_json', wp_json_encode( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
-	update_post_meta( $product_id, 'mobo_product_category_guids', array_values( array_unique( array_filter( $guids ) ) ) );
+	$guids = array_values( array_unique( array_filter( $guids ) ) );
+	return $this->persist_post_meta_verified( $product_id, 'mobo_product_category_refs_json', $json )
+		&& $this->persist_post_meta_verified( $product_id, 'mobo_product_category_guids', $guids )
+		&& $this->persist_post_meta_verified( $product_id, '_mobo_product_category_refs_authoritative', '1' );
 }
 
 /**
@@ -6176,33 +7950,7 @@ private function extract_category_guid_for_storage( $ref ) {
  * @return array
  */
 private function collect_category_guid_candidates_for_storage( $ref ) {
-	$guids = array();
-
-	if ( ! is_array( $ref ) ) {
-		$value = sanitize_text_field( (string) $ref );
-		return $this->is_remote_guid_value( $value ) ? array( $value ) : array();
-	}
-
-	$primary_keys = array( 'category_guid', 'categoryGuid', 'categoryId', 'categoryGUID', 'guid', 'remote_guid', 'remoteGuid', 'portal_category_id', 'portalCategoryId', 'category_portal_id', 'categoryPortalId' );
-	foreach ( $primary_keys as $key ) {
-		$this->append_category_guid_candidate_for_storage( $guids, $this->get_value( $ref, $key, '' ) );
-	}
-
-	$nested = $this->get_value( $ref, 'category', null );
-	if ( is_array( $nested ) ) {
-		foreach ( $this->collect_category_guid_candidates_for_storage( $nested ) as $nested_guid ) {
-			$this->append_category_guid_candidate_for_storage( $guids, $nested_guid );
-		}
-	} else {
-		$this->append_category_guid_candidate_for_storage( $guids, $nested );
-	}
-
-	$fallback_keys = array( 'product_category_id', 'productCategoryId', 'product_category_guid', 'productCategoryGuid', 'id' );
-	foreach ( $fallback_keys as $key ) {
-		$this->append_category_guid_candidate_for_storage( $guids, $this->get_value( $ref, $key, '' ) );
-	}
-
-	return array_values( array_unique( array_filter( $guids ) ) );
+	return Mobo_Core_Remote_Identity_Policy::collect_category_guid_candidates( $ref );
 }
 
 /**
@@ -6226,87 +7974,25 @@ private function append_category_guid_candidate_for_storage( &$guids, $value ) {
  * @return bool
  */
 private function should_skip_product_by_url( $product_data ) {
-	$product_url = sanitize_text_field( (string) $this->get_value( $product_data, 'url', '' ) );
-
-	if ( '' === $product_url ) {
-		return false;
-	}
-
-	$product_url = $this->normalize_product_url_for_exclusion( $product_url );
-
-	if ( '' === $product_url ) {
-		return false;
-	}
-
-	$excluded_urls = $this->get_excluded_product_urls();
-
-	return in_array( $product_url, $excluded_urls, true );
+	return Mobo_Core_Product_Exclusions::is_payload_excluded( $product_data, true );
 }
 
 /**
- * Get excluded product URLs from settings.
+ * Get excluded product URLs from the single shared policy source of truth.
  *
  * @return array
  */
 private function get_excluded_product_urls() {
-	$raw = (string) get_option( 'mobo_core_excluded_product_urls', '' );
-
-	if ( '' === trim( $raw ) ) {
-		return array();
-	}
-
-	$lines = preg_split( '/\r\n|\r|\n/', $raw );
-
-	if ( ! is_array( $lines ) ) {
-		return array();
-	}
-
-	$urls = array();
-
-	foreach ( $lines as $line ) {
-		$url = $this->normalize_product_url_for_exclusion( $line );
-
-		if ( '' !== $url ) {
-			$urls[] = $url;
-		}
-	}
-
-	return array_values( array_unique( $urls ) );
+	return Mobo_Core_Product_Exclusions::get_excluded_urls();
 }
 
 /**
- * Normalize product URL/path for exclusion matching.
- *
- * Examples:
- * https://example.com/products/test/ => /products/test
- * /products/test/                    => /products/test
- * products/test                      => /products/test
+ * Normalize product URL/path through the single shared exclusion policy.
  *
  * @param string $url URL or path.
  * @return string
  */
 private function normalize_product_url_for_exclusion( $url ) {
-	$url = trim( sanitize_text_field( (string) $url ) );
-
-	if ( '' === $url ) {
-		return '';
-	}
-
-	$path = wp_parse_url( $url, PHP_URL_PATH );
-
-	if ( ! is_string( $path ) || '' === $path ) {
-		$path = $url;
-	}
-
-	$path = trim( $path );
-
-	if ( '' === $path ) {
-		return '';
-	}
-
-	$path = '/' . ltrim( $path, '/' );
-	$path = untrailingslashit( $path );
-
-	return strtolower( $path );
+	return Mobo_Core_Product_Exclusions::normalize_url( $url );
 }
 }

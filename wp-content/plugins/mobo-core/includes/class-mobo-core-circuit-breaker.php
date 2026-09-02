@@ -31,7 +31,7 @@ final class Mobo_Core_Circuit_Breaker {
 
 		$tracked = array(
 			'webhookQueue', 'orderSubmissions', 'parentFinalize', 'imageQueue',
-			'imageRefreshQueue', 'productSync', 'reconciliation', 'repriceQueue',
+			'imageRefreshQueue', 'productSync', 'repriceQueue',
 			'recategorizeQueue', 'cacheWarmup', 'maintenance',
 		);
 		$result = array(

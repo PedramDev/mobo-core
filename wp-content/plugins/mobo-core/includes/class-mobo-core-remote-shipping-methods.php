@@ -275,9 +275,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 
 				$mobo_count++;
 				$line_total = isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
-				$api_price  = $use_api_price ? $this->get_mobo_api_price( $variation_id, $product_id ) : null;
+				$api_price  = $use_api_price ? Mobo_Core_Money_Policy::get_mobo_api_price( $variation_id, $product_id ) : null;
 
-				$shipping_api_price = null !== $api_price ? $this->source_amount_to_store_amount( $api_price ) : null;
+				$shipping_api_price = null !== $api_price ? Mobo_Core_Money_Policy::source_amount_to_store_amount( $api_price ) : null;
 				if ( null !== $shipping_api_price ) {
 					$quantity   = isset( $item['quantity'] ) ? max( 0.0, (float) $item['quantity'] ) : 0.0;
 					$line_total = $shipping_api_price * $quantity;
@@ -856,20 +856,8 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function is_mobo_product( $product, $product_id, $variation_id ) {
-		$ids = array_filter( array( absint( $variation_id ), absint( $product_id ), $product instanceof WC_Product ? absint( $product->get_id() ) : 0 ) );
-		foreach ( $ids as $id ) {
-			if ( get_post_meta( $id, 'variant_guid', true ) || get_post_meta( $id, 'product_guid', true ) ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_variant_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_variant_id', true ) ) > 0 ) {
-				return true;
-			}
-			if ( absint( get_post_meta( $id, 'portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, 'mobo_portal_product_id', true ) ) > 0 || absint( get_post_meta( $id, '_mobo_portal_product_id', true ) ) > 0 ) {
-				return true;
-			}
-		}
-		return false;
-	}
+	return Mobo_Core_Product_Identity_Policy::is_mobo_product( $product, $product_id, $variation_id );
+}
 
 	/**
 	 * Parse an upstream changedAt value into a Unix timestamp.
@@ -1117,34 +1105,8 @@ class Mobo_Core_Remote_Shipping_Methods {
 		return is_finite( $number ) ? $number : null;
 	}
 
-	private function get_mobo_api_price( $variation_id, $product_id ) {
-		$ids = array_values( array_unique( array_filter( array( absint( $variation_id ), absint( $product_id ) ) ) ) );
-		foreach ( $ids as $id ) {
-			$value = get_post_meta( $id, 'mobo_api_price', true );
-			if ( is_numeric( $value ) && (float) $value >= 0 ) {
-				return (float) $value;
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * Convert a source/Mobo amount (Toman) to the WooCommerce store currency.
-	 *
-	 * @param float $amount Source amount.
-	 * @return float
-	 */
-	private function source_amount_to_store_amount( $amount ) {
-		$currency   = function_exists( 'get_woocommerce_currency' ) ? strtoupper( (string) get_woocommerce_currency() ) : '';
-		$multiplier = 'IRR' === $currency ? 10.0 : 1.0;
-		$multiplier = (float) apply_filters( 'mobo_core_shipping_source_to_store_multiplier', $multiplier, $currency );
-		return max( 0.0, (float) $amount * max( 0.0, $multiplier ) );
-	}
-
 	private function is_shipping_runtime_enabled() {
-		return $this->is_order_submission_enabled()
-			|| Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' )
-			|| Mobo_Core_Settings::enabled( 'mobo_core_automatic_shipping_enabled', '0' );
+		return Mobo_Core_Order_Submission_Policy::is_shipping_runtime_enabled();
 	}
 
 	private function sanitize_scenario( $scenario ) {
@@ -1158,6 +1120,6 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function is_order_submission_enabled() {
-		return Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		return Mobo_Core_Order_Submission_Policy::is_enabled();
 	}
 }

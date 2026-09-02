@@ -276,15 +276,55 @@ class Mobo_Core_Product_Map {
 		 * neither identity is resolvable, and prevents a later old-GUID event from being
 		 * routed to the migrated variation. */
 		if ( self::TYPE_VARIATION === $object_type ) {
+			/*
+			 * Reverse-map cleanup must be owned by the write that just passed the
+			 * durability read-back. A concurrent identity migration can otherwise
+			 * retire this GUID and install a newer GUID before this DELETE executes;
+			 * an unconditional `remote_guid <> current` cleanup would then erase the
+			 * newer mapping. Gate the DELETE on the expected owner row in the same SQL
+			 * statement, then re-read ownership before reporting success.
+			 */
 			$stale_deleted = $wpdb->query(
 				$wpdb->prepare(
-					"DELETE FROM {$table} WHERE wp_post_id = %d AND object_type = %s AND remote_guid <> %s",
+					"DELETE stale FROM {$table} AS stale
+					INNER JOIN {$table} AS owner
+						ON owner.remote_guid = %s
+						AND owner.object_type = %s
+						AND owner.wp_post_id = %d
+						AND owner.parent_remote_guid = %s
+						AND owner.last_hash = %s
+						AND owner.sync_incomplete = %d
+					WHERE stale.wp_post_id = %d
+						AND stale.object_type = %s
+						AND stale.remote_guid <> %s",
+					$guid,
+					self::TYPE_VARIATION,
+					$post_id,
+					$parent_guid,
+					$last_hash,
+					$incomplete,
 					$post_id,
 					self::TYPE_VARIATION,
 					$guid
 				)
 			);
 			if ( false === $stale_deleted ) {
+				return false;
+			}
+
+			$persisted_after_cleanup = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT wp_post_id, parent_remote_guid, last_hash, sync_incomplete FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$guid,
+					self::TYPE_VARIATION
+				),
+				ARRAY_A
+			);
+			if ( ! is_array( $persisted_after_cleanup )
+				|| absint( $persisted_after_cleanup['wp_post_id'] ) !== $post_id
+				|| (string) $persisted_after_cleanup['parent_remote_guid'] !== $parent_guid
+				|| (string) $persisted_after_cleanup['last_hash'] !== $last_hash
+				|| absint( $persisted_after_cleanup['sync_incomplete'] ) !== $incomplete ) {
 				return false;
 			}
 		}
@@ -430,12 +470,28 @@ class Mobo_Core_Product_Map {
 
 			$post_id = absint( $row['wp_post_id'] );
 			if ( $post_id <= 0 || get_post_type( $post_id ) !== $expected_post_type ) {
-				$this->delete_row( absint( $row['id'] ) );
-				self::$lookup_cache[ $cache_key ] = 0;
-				return 0;
-			}
+				$cleanup_result = $this->delete_stale_row_if_unchanged(
+					absint( $row['id'] ),
+					$guid,
+					$object_type,
+					$post_id
+				);
 
-			self::$lookup_cache[ $cache_key ] = $post_id;
+				if ( 1 !== $cleanup_result ) {
+					$post_id = $this->read_current_valid_post_id( $guid, $object_type, $expected_post_type );
+					if ( $post_id > 0 ) {
+						self::$lookup_cache[ $cache_key ] = $post_id;
+					} else {
+						self::$lookup_cache[ $cache_key ] = 0;
+						return 0;
+					}
+				} else {
+					self::$lookup_cache[ $cache_key ] = 0;
+					return 0;
+				}
+			} else {
+				self::$lookup_cache[ $cache_key ] = $post_id;
+			}
 		}
 
 		if ( get_post_type( $post_id ) !== $expected_post_type ) {
@@ -501,10 +557,20 @@ class Mobo_Core_Product_Map {
 
 		if ( get_post_type( $post_id ) !== $expected_post_type ) {
 			if ( $row_id > 0 ) {
-				$this->delete_row( $row_id );
+				$cleanup_result = $this->delete_stale_row_if_unchanged( $row_id, $guid, $object_type, $post_id );
+				if ( 1 !== $cleanup_result ) {
+					$post_id = $this->read_current_valid_post_id( $guid, $object_type, $expected_post_type );
+					if ( $post_id > 0 ) {
+						self::$lookup_cache[ $cache_key ] = $post_id;
+						$status = sanitize_key( (string) get_post_status( $post_id ) );
+						self::$status_cache[ $cache_key ] = $status;
+						return $status;
+					}
+				}
 			} else {
 				self::$lookup_cache[ $cache_key ] = 0;
 			}
+			self::$lookup_cache[ $cache_key ] = 0;
 			self::$status_cache[ $cache_key ] = '';
 			return '';
 		}
@@ -512,6 +578,87 @@ class Mobo_Core_Product_Map {
 		$status = sanitize_key( (string) get_post_status( $post_id ) );
 		self::$status_cache[ $cache_key ] = $status;
 		return $status;
+	}
+
+	/**
+	 * Delete a stale map row only if the identity snapshot is still unchanged.
+	 *
+	 * This prevents a lookup cleanup from deleting a row that a concurrent sync
+	 * repaired after the lookup read but before the cleanup write.
+	 *
+	 * @param int    $id Row ID.
+	 * @param string $guid Remote GUID.
+	 * @param string $object_type Object type.
+	 * @param int    $post_id Stale post ID observed by the lookup.
+	 * @return int|false Number of deleted rows, or false on SQL failure.
+	 */
+	private function delete_stale_row_if_unchanged( $id, $guid, $object_type, $post_id ) {
+		global $wpdb;
+
+		$id          = absint( $id );
+		$guid        = sanitize_text_field( (string) $guid );
+		$object_type = sanitize_key( (string) $object_type );
+		$post_id     = absint( $post_id );
+
+		if ( $id <= 0 || '' === $guid || '' === $object_type || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table  = self::table_name();
+		$result = $wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$table} WHERE id = %d AND remote_guid = %s AND object_type = %s AND wp_post_id = %d",
+				$id,
+				$guid,
+				$object_type,
+				$post_id
+			)
+		);
+
+		self::$lookup_cache = array();
+		self::$status_cache = array();
+
+		return $result;
+	}
+
+	/**
+	 * Re-read the current mapping after a compare-and-delete miss.
+	 *
+	 * The method is intentionally read-only: if the row is still stale because
+	 * the cleanup SQL failed, the caller fails closed and leaves it retryable.
+	 *
+	 * @param string $guid Remote GUID.
+	 * @param string $object_type Object type.
+	 * @param string $expected_post_type Expected WordPress post type.
+	 * @return int
+	 */
+	private function read_current_valid_post_id( $guid, $object_type, $expected_post_type ) {
+		global $wpdb;
+
+		$guid               = sanitize_text_field( (string) $guid );
+		$object_type        = sanitize_key( (string) $object_type );
+		$expected_post_type = sanitize_key( (string) $expected_post_type );
+
+		if ( '' === $guid || '' === $object_type || '' === $expected_post_type || ! self::table_exists() ) {
+			return 0;
+		}
+
+		$table   = self::table_name();
+		$post_id = absint(
+			$wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT wp_post_id FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$guid,
+					$object_type
+				)
+			)
+		);
+
+		if ( $post_id <= 0 || get_post_type( $post_id ) !== $expected_post_type ) {
+			return 0;
+		}
+
+		return $post_id;
 	}
 
 	/**
@@ -597,6 +744,147 @@ class Mobo_Core_Product_Map {
 	}
 
 	/**
+	 * Snapshot exact variation map rows for one local post before quarantine.
+	 * Product rows sharing the same wp_post_id are intentionally excluded.
+	 *
+	 * @param int $post_id WordPress post ID.
+	 * @return array|WP_Error
+	 */
+	public function snapshot_variation_rows_by_post_id( $post_id ) {
+		global $wpdb;
+
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! self::table_exists() ) {
+			return new WP_Error( 'mobo_core_product_map_snapshot_unavailable', 'Variation Product Map snapshot is unavailable.' );
+		}
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT id, remote_guid, wp_post_id, object_type, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at FROM ' . self::table_name() . ' WHERE wp_post_id = %d AND object_type = %s ORDER BY id ASC',
+				$post_id,
+				self::TYPE_VARIATION
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) ) {
+			return new WP_Error( 'mobo_core_product_map_snapshot_read_failed', '' !== (string) $wpdb->last_error ? sanitize_text_field( (string) $wpdb->last_error ) : 'Could not snapshot variation Product Map rows.' );
+		}
+		return $rows;
+	}
+
+	/**
+	 * Restore an exact variation-map snapshot after a failed quarantine transition.
+	 *
+	 * @param int   $post_id WordPress post ID.
+	 * @param array $rows Snapshot from snapshot_variation_rows_by_post_id().
+	 * @return bool
+	 */
+	public function restore_variation_rows_snapshot( $post_id, $rows ) {
+		global $wpdb;
+
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! is_array( $rows ) || ! self::table_exists() ) {
+			return false;
+		}
+
+		/*
+		 * Rollback must never erase or overwrite Product Map durability evidence
+		 * written after the snapshot was taken. In particular, REPLACE is unsafe:
+		 * the remote_guid unique key can now belong to a different parent/post.
+		 *
+		 * Restore only missing snapshot rows. A duplicate primary/remote key is an
+		 * atomic no-op, preserving the current row exactly. Rows created after an
+		 * empty snapshot are likewise left untouched.
+		 */
+		$table      = self::table_name();
+		$normalized = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || self::TYPE_VARIATION !== sanitize_key( isset( $row['object_type'] ) ? $row['object_type'] : '' ) || absint( isset( $row['wp_post_id'] ) ? $row['wp_post_id'] : 0 ) !== $post_id ) {
+				return false;
+			}
+
+			$id          = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+			$remote_guid = sanitize_text_field( (string) ( isset( $row['remote_guid'] ) ? $row['remote_guid'] : '' ) );
+			if ( $id <= 0 || '' === $remote_guid ) {
+				return false;
+			}
+
+			$normalized[] = array(
+				'id'                 => $id,
+				'remote_guid'        => $remote_guid,
+				'wp_post_id'         => $post_id,
+				'object_type'        => self::TYPE_VARIATION,
+				'parent_remote_guid' => sanitize_text_field( (string) ( isset( $row['parent_remote_guid'] ) ? $row['parent_remote_guid'] : '' ) ),
+				'last_hash'          => sanitize_text_field( (string) ( isset( $row['last_hash'] ) ? $row['last_hash'] : '' ) ),
+				'sync_incomplete'    => ! empty( $row['sync_incomplete'] ) ? 1 : 0,
+				'created_at'         => sanitize_text_field( (string) ( isset( $row['created_at'] ) ? $row['created_at'] : current_time( 'mysql', true ) ) ),
+				'updated_at'         => sanitize_text_field( (string) ( isset( $row['updated_at'] ) ? $row['updated_at'] : current_time( 'mysql', true ) ) ),
+			);
+		}
+
+		foreach ( $normalized as $snapshot ) {
+			$sql = "INSERT INTO {$table} (id, remote_guid, wp_post_id, object_type, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at) VALUES (%d, %s, %d, %s, %s, %s, %d, %s, %s) ON DUPLICATE KEY UPDATE id = id";
+			$result = $wpdb->query(
+				$wpdb->prepare(
+					$sql,
+					$snapshot['id'],
+					$snapshot['remote_guid'],
+					$snapshot['wp_post_id'],
+					$snapshot['object_type'],
+					$snapshot['parent_remote_guid'],
+					$snapshot['last_hash'],
+					$snapshot['sync_incomplete'],
+					$snapshot['created_at'],
+					$snapshot['updated_at']
+				)
+			);
+			if ( false === $result ) {
+				return false;
+			}
+		}
+
+		self::$lookup_cache = array();
+		self::$status_cache = array();
+
+		/*
+		 * Verify that every snapshot GUID still has durable variation-map evidence.
+		 * Exact snapshot state means it was restored/already present. A differing
+		 * row means a concurrent writer superseded the snapshot and must win.
+		 */
+		foreach ( $normalized as $snapshot ) {
+			$wpdb->last_error = '';
+			$current = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT id, remote_guid, wp_post_id, object_type, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$snapshot['remote_guid'],
+					self::TYPE_VARIATION
+				),
+				ARRAY_A
+			);
+			if ( ! is_array( $current ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Delete only variation rows for one post and verify no variation mapping remains.
+	 *
+	 * @param int $post_id WordPress post ID.
+	 * @return bool
+	 */
+	public function delete_variation_by_post_id_verified( $post_id ) {
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! $this->delete_variation_by_post_id( $post_id ) ) {
+			return false;
+		}
+		$rows = $this->snapshot_variation_rows_by_post_id( $post_id );
+		return is_array( $rows ) && empty( $rows );
+	}
+
+	/**
 	 * Delete variation mappings owned by one remote product, optionally keeping
 	 * the GUIDs present in the current authoritative snapshot.
 	 *
@@ -630,7 +918,7 @@ class Mobo_Core_Product_Map {
 		$table = self::table_name();
 		$rows  = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, remote_guid FROM {$table} WHERE object_type = %s AND parent_remote_guid = %s",
+				"SELECT id, remote_guid, wp_post_id, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at FROM {$table} WHERE object_type = %s AND parent_remote_guid = %s",
 				self::TYPE_VARIATION,
 				$parent_guid
 			),
@@ -646,7 +934,7 @@ class Mobo_Core_Product_Map {
 			return 0;
 		}
 
-		$delete_ids   = array();
+		$delete_rows  = array();
 		$delete_guids = array();
 		foreach ( $rows as $row ) {
 			$remote_guid = sanitize_text_field( (string) ( isset( $row['remote_guid'] ) ? $row['remote_guid'] : '' ) );
@@ -655,22 +943,43 @@ class Mobo_Core_Product_Map {
 			}
 
 			$id = absint( isset( $row['id'] ) ? $row['id'] : 0 );
-			if ( $id > 0 ) {
-				$delete_ids[] = $id;
-				if ( '' !== $remote_guid ) {
-					$delete_guids[] = $remote_guid;
-				}
+			if ( $id > 0 && '' !== $remote_guid ) {
+				$delete_rows[] = array(
+					'id'                 => $id,
+					'remote_guid'        => $remote_guid,
+					'wp_post_id'         => absint( isset( $row['wp_post_id'] ) ? $row['wp_post_id'] : 0 ),
+					'parent_remote_guid' => sanitize_text_field( (string) ( isset( $row['parent_remote_guid'] ) ? $row['parent_remote_guid'] : '' ) ),
+					'last_hash'          => sanitize_text_field( (string) ( isset( $row['last_hash'] ) ? $row['last_hash'] : '' ) ),
+					'sync_incomplete'    => ! empty( $row['sync_incomplete'] ) ? 1 : 0,
+					'created_at'         => sanitize_text_field( (string) ( isset( $row['created_at'] ) ? $row['created_at'] : '' ) ),
+					'updated_at'         => sanitize_text_field( (string) ( isset( $row['updated_at'] ) ? $row['updated_at'] : '' ) ),
+				);
+				$delete_guids[] = $remote_guid;
 			}
 		}
 
-		if ( empty( $delete_ids ) ) {
+		if ( empty( $delete_rows ) ) {
 			return 0;
 		}
 
 		$deleted = 0;
-		foreach ( array_chunk( $delete_ids, 500 ) as $chunk ) {
-			$id_sql = implode( ',', array_map( 'absint', $chunk ) );
-			$result = $wpdb->query( "DELETE FROM {$table} WHERE id IN ({$id_sql})" );
+		foreach ( array_chunk( $delete_rows, 100 ) as $chunk ) {
+			$clauses = array();
+			$args    = array( self::TYPE_VARIATION );
+			foreach ( $chunk as $snapshot ) {
+				$clauses[] = '(id = %d AND remote_guid = %s AND wp_post_id = %d AND parent_remote_guid = %s AND last_hash = %s AND sync_incomplete = %d AND created_at = %s AND updated_at = %s)';
+				$args[] = $snapshot['id'];
+				$args[] = $snapshot['remote_guid'];
+				$args[] = $snapshot['wp_post_id'];
+				$args[] = $snapshot['parent_remote_guid'];
+				$args[] = $snapshot['last_hash'];
+				$args[] = $snapshot['sync_incomplete'];
+				$args[] = $snapshot['created_at'];
+				$args[] = $snapshot['updated_at'];
+			}
+
+			$sql = "DELETE FROM {$table} WHERE object_type = %s AND (" . implode( ' OR ', $clauses ) . ')';
+			$result = $wpdb->query( $wpdb->prepare( $sql, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Clause structure is static; all snapshot values are prepared.
 			if ( false === $result ) {
 				$error = '' !== (string) $wpdb->last_error ? sanitize_text_field( (string) $wpdb->last_error ) : 'Could not delete stale variation mappings.';
 				break;
@@ -756,6 +1065,177 @@ class Mobo_Core_Product_Map {
 	}
 
 	/**
+	 * Seed one legacy mapping without overwriting a durable/current mapping.
+	 *
+	 * Legacy seeding is a bootstrap aid, not a canonical-election mechanism. Existing
+	 * rows are therefore preserved exactly. A missing row is inserted only when the
+	 * legacy GUID belongs to exactly one live post of the expected type. INSERT IGNORE
+	 * closes the race with normal sync: if another writer establishes the mapping after
+	 * our pre-check, its row wins and is preserved.
+	 *
+	 * @param string $guid Remote GUID.
+	 * @param int    $post_id Local post ID.
+	 * @param string $object_type product|variation.
+	 * @param string $parent_guid Parent product GUID for variations.
+	 * @param string $last_hash Source hash evidence from legacy post meta.
+	 * @param bool   $sync_incomplete Legacy incomplete marker.
+	 * @return bool True when safely inserted, preserved, or intentionally skipped.
+	 */
+	private function seed_legacy_mapping_if_safe( $guid, $post_id, $object_type, $parent_guid = '', $last_hash = '', $sync_incomplete = false ) {
+		global $wpdb;
+
+		$guid        = sanitize_text_field( (string) $guid );
+		$post_id     = absint( $post_id );
+		$object_type = sanitize_key( (string) $object_type );
+		$parent_guid = sanitize_text_field( (string) $parent_guid );
+		$last_hash   = sanitize_text_field( (string) $last_hash );
+		$incomplete  = $sync_incomplete ? 1 : 0;
+
+		if ( '' === $guid || $post_id <= 0 || ! in_array( $object_type, array( self::TYPE_PRODUCT, self::TYPE_VARIATION ), true ) || ! self::table_exists() ) {
+			return false;
+		}
+
+		$post_type = self::TYPE_PRODUCT === $object_type ? 'product' : 'product_variation';
+		$meta_key  = self::TYPE_PRODUCT === $object_type ? 'product_guid' : 'variant_guid';
+		$lock_guid = self::TYPE_PRODUCT === $object_type ? $guid : $parent_guid;
+
+		/* A variation without durable parent identity cannot participate in the parent lock contract. */
+		if ( '' === $lock_guid ) {
+			return self::TYPE_VARIATION === $object_type;
+		}
+		if ( ! class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			return false;
+		}
+
+		$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $lock_guid, 0, 120 );
+		if ( false === $lock ) {
+			/* Do not acknowledge the cursor while another writer owns this product. */
+			return false;
+		}
+
+		try {
+			/* Revalidate the legacy identity after acquiring the same lock used by sync/Repair. */
+			if ( get_post_type( $post_id ) !== $post_type ) {
+				return true;
+			}
+			$status = sanitize_key( (string) get_post_status( $post_id ) );
+			if ( in_array( $status, array( 'trash', 'auto-draft' ), true ) ) {
+				return true;
+			}
+			$current_guid = sanitize_text_field( (string) get_post_meta( $post_id, $meta_key, true ) );
+			if ( '' === $current_guid || ! hash_equals( $guid, $current_guid ) ) {
+				return true;
+			}
+
+			if ( self::TYPE_VARIATION === $object_type ) {
+				$parent_id = absint( wp_get_post_parent_id( $post_id ) );
+				if ( $parent_id <= 0 || 'product' !== get_post_type( $parent_id ) ) {
+					return true;
+				}
+				$actual_parent_guid = sanitize_text_field( (string) get_post_meta( $parent_id, 'product_guid', true ) );
+				$variation_parent_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
+				if ( '' === $actual_parent_guid || ! hash_equals( $parent_guid, $actual_parent_guid ) ) {
+					return true;
+				}
+				if ( '' !== $variation_parent_guid && ! hash_equals( $actual_parent_guid, $variation_parent_guid ) ) {
+					return true;
+				}
+			}
+
+			$table = self::table_name();
+
+			/* Never let migration/maintenance rewrite an existing canonical/durable row. */
+			$existing = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT wp_post_id FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$guid,
+					$object_type
+				),
+				ARRAY_A
+			);
+			if ( is_array( $existing ) ) {
+				$cache_key = self::lookup_cache_key( $guid, $object_type );
+				self::$lookup_cache[ $cache_key ] = absint( $existing['wp_post_id'] ?? 0 );
+				unset( self::$status_cache[ $cache_key ] );
+				return true;
+			}
+
+			$live_count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID)
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} gm ON gm.post_id = p.ID AND gm.meta_key = %s
+					WHERE p.post_type = %s
+					AND p.post_status NOT IN ('trash', 'auto-draft')
+					AND gm.meta_value = %s",
+					$meta_key,
+					$post_type,
+					$guid
+				)
+			);
+
+			if ( null === $live_count ) {
+				return false;
+			}
+
+			/* Duplicate legacy identity is ambiguous. Leave canonical election to Repair/sync. */
+			if ( 1 !== absint( $live_count ) ) {
+				return true;
+			}
+
+			$now = current_time( 'mysql', true );
+			$inserted = $wpdb->query(
+				$wpdb->prepare(
+					"INSERT IGNORE INTO {$table}
+					(remote_guid, wp_post_id, object_type, parent_remote_guid, last_hash, sync_incomplete, created_at, updated_at)
+					VALUES (%s, %d, %s, %s, %s, %d, %s, %s)",
+					$guid,
+					$post_id,
+					$object_type,
+					$parent_guid,
+					$last_hash,
+					$incomplete,
+					$now,
+					$now
+				)
+			);
+			if ( false === $inserted ) {
+				return false;
+			}
+
+			$persisted = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT wp_post_id, parent_remote_guid, last_hash, sync_incomplete FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					$guid,
+					$object_type
+				),
+				ARRAY_A
+			);
+			if ( ! is_array( $persisted ) ) {
+				/* Includes pathological unique-prefix collision with a different full GUID. */
+				return false;
+			}
+
+			/* If our INSERT won, its durability evidence must read back exactly. */
+			if ( absint( $inserted ) > 0
+				&& ( absint( $persisted['wp_post_id'] ?? 0 ) !== $post_id
+					|| (string) ( $persisted['parent_remote_guid'] ?? '' ) !== $parent_guid
+					|| (string) ( $persisted['last_hash'] ?? '' ) !== $last_hash
+					|| absint( $persisted['sync_incomplete'] ?? 0 ) !== $incomplete ) ) {
+				return false;
+			}
+
+			/* If a concurrent writer won, preserve its row exactly rather than overwriting it. */
+			$cache_key = self::lookup_cache_key( $guid, $object_type );
+			self::$lookup_cache[ $cache_key ] = absint( $persisted['wp_post_id'] ?? 0 );
+			unset( self::$status_cache[ $cache_key ] );
+			return true;
+		} finally {
+			Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+		}
+	}
+
+	/**
 	 * Seed product rows.
 	 *
 	 * @param int $limit Limit.
@@ -766,24 +1246,42 @@ class Mobo_Core_Product_Map {
 
 		$cursor = absint( get_option( 'mobo_core_product_map_product_cursor', 0 ) );
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT p.ID, pm.meta_value AS remote_guid
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
-				WHERE p.ID > %d
-				AND p.post_type = 'product'
-				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND pm.meta_value <> ''
-				ORDER BY p.ID ASC
-				LIMIT %d",
-				$cursor,
-				$limit
-			),
-			ARRAY_A
+		$sql = $wpdb->prepare(
+			"SELECT p.ID, pm.meta_value AS remote_guid
+			FROM {$wpdb->posts} p
+			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
+			WHERE p.ID > %d
+			AND p.post_type = 'product'
+			AND p.post_status NOT IN ('trash', 'auto-draft')
+			AND pm.meta_value <> ''
+			ORDER BY p.ID ASC
+			LIMIT %d",
+			$cursor,
+			$limit
 		);
 
-		if ( ! is_array( $rows ) || empty( $rows ) ) {
+		$query_result = $wpdb->query( $sql );
+		if ( false === $query_result ) {
+			/* get_results() normalizes SQL errors to an empty array; query() preserves failure. */
+			$this->legacy_seed_stalled = true;
+			return 0;
+		}
+
+		if ( ! is_array( $wpdb->last_result ) ) {
+			$this->legacy_seed_stalled = true;
+			return 0;
+		}
+
+		$rows = array();
+		foreach ( $wpdb->last_result as $row ) {
+			if ( is_object( $row ) ) {
+				$rows[] = get_object_vars( $row );
+			} elseif ( is_array( $row ) ) {
+				$rows[] = $row;
+			}
+		}
+
+		if ( empty( $rows ) ) {
 			return 0;
 		}
 
@@ -799,7 +1297,10 @@ class Mobo_Core_Product_Map {
 				continue;
 			}
 
-			if ( ! $this->upsert_product( $guid, $post_id ) ) {
+			$last_hash  = sanitize_text_field( (string) get_post_meta( $post_id, '_mobo_product_source_hash', true ) );
+			$incomplete = 1 === absint( get_post_meta( $post_id, 'mobo_sync_incomplete', true ) );
+
+			if ( ! $this->seed_legacy_mapping_if_safe( $guid, $post_id, self::TYPE_PRODUCT, '', $last_hash, $incomplete ) ) {
 				$this->legacy_seed_stalled = true;
 				break;
 			}
@@ -824,25 +1325,43 @@ class Mobo_Core_Product_Map {
 
 		$cursor = absint( get_option( 'mobo_core_product_map_variation_cursor', 0 ) );
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT p.ID, vm.meta_value AS remote_guid, pm.meta_value AS parent_remote_guid
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} vm ON vm.post_id = p.ID AND vm.meta_key = 'variant_guid'
-				LEFT JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
-				WHERE p.ID > %d
-				AND p.post_type = 'product_variation'
-				AND p.post_status NOT IN ('trash', 'auto-draft')
-				AND vm.meta_value <> ''
-				ORDER BY p.ID ASC
-				LIMIT %d",
-				$cursor,
-				$limit
-			),
-			ARRAY_A
+		$sql = $wpdb->prepare(
+			"SELECT p.ID, p.post_parent, vm.meta_value AS remote_guid, pm.meta_value AS parent_remote_guid
+			FROM {$wpdb->posts} p
+			INNER JOIN {$wpdb->postmeta} vm ON vm.post_id = p.ID AND vm.meta_key = 'variant_guid'
+			LEFT JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
+			WHERE p.ID > %d
+			AND p.post_type = 'product_variation'
+			AND p.post_status NOT IN ('trash', 'auto-draft')
+			AND vm.meta_value <> ''
+			ORDER BY p.ID ASC
+			LIMIT %d",
+			$cursor,
+			$limit
 		);
 
-		if ( ! is_array( $rows ) || empty( $rows ) ) {
+		$query_result = $wpdb->query( $sql );
+		if ( false === $query_result ) {
+			/* get_results() normalizes SQL errors to an empty array; query() preserves failure. */
+			$this->legacy_seed_stalled = true;
+			return 0;
+		}
+
+		if ( ! is_array( $wpdb->last_result ) ) {
+			$this->legacy_seed_stalled = true;
+			return 0;
+		}
+
+		$rows = array();
+		foreach ( $wpdb->last_result as $row ) {
+			if ( is_object( $row ) ) {
+				$rows[] = get_object_vars( $row );
+			} elseif ( is_array( $row ) ) {
+				$rows[] = $row;
+			}
+		}
+
+		if ( empty( $rows ) ) {
 			return 0;
 		}
 
@@ -859,7 +1378,17 @@ class Mobo_Core_Product_Map {
 				continue;
 			}
 
-			if ( ! $this->upsert_variation( $guid, $post_id, $parent_guid ) ) {
+			if ( '' === $parent_guid ) {
+				$parent_id = absint( $row['post_parent'] ?? 0 );
+				if ( $parent_id > 0 ) {
+					$parent_guid = sanitize_text_field( (string) get_post_meta( $parent_id, 'product_guid', true ) );
+				}
+			}
+
+			$last_hash  = sanitize_text_field( (string) get_post_meta( $post_id, '_mobo_variant_source_hash', true ) );
+			$incomplete = 1 === absint( get_post_meta( $post_id, 'mobo_sync_incomplete', true ) );
+
+			if ( ! $this->seed_legacy_mapping_if_safe( $guid, $post_id, self::TYPE_VARIATION, $parent_guid, $last_hash, $incomplete ) ) {
 				$this->legacy_seed_stalled = true;
 				break;
 			}
@@ -872,4 +1401,5 @@ class Mobo_Core_Product_Map {
 
 		return $count;
 	}
+
 }

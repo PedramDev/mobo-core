@@ -270,7 +270,12 @@ class Mobo_Core_Product_Concurrency {
 	}
 
 	/**
-	 * Choose canonical product ID for a GUID and repair the map table if needed.
+	 * Choose canonical product ID for a GUID without mutating durable map state.
+	 *
+	 * Canonical resolution is used by read/check paths as well as write paths.
+	 * It must therefore remain side-effect free. Callers that intentionally own
+	 * the product write contract may persist a mapping separately, with the real
+	 * durability evidence available to that write path.
 	 *
 	 * @param string $product_guid Product GUID.
 	 * @param int    $preferred_id Preferred product ID, usually from map table.
@@ -294,14 +299,7 @@ class Mobo_Core_Product_Concurrency {
 			return $preferred_id;
 		}
 
-		$canonical = absint( $ids[0] );
-
-		if ( $canonical > 0 && class_exists( 'Mobo_Core_Product_Map' ) ) {
-			$map = new Mobo_Core_Product_Map();
-			$map->upsert_product( $product_guid, $canonical, '', false );
-		}
-
-		return $canonical;
+		return absint( $ids[0] );
 	}
 
 	/**

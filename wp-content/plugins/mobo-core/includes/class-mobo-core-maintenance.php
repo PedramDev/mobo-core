@@ -483,9 +483,19 @@ class Mobo_Core_Maintenance {
 				$likely = false;
 				break;
 			}
-			$deleted = self::delete_ids( $table, $ids );
-			$total   += $deleted;
-			$likely   = count( $ids ) >= $limit;
+			$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+			$delete_sql      = "DELETE m FROM {$table} m
+				LEFT JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
+				WHERE m.id IN ({$id_placeholders})
+					AND m.wp_post_id > 0
+					AND m.updated_at < %s
+					AND p.ID IS NULL";
+			$delete_args     = array_merge( $ids, array( $cutoff ) );
+			$prepared_delete = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $delete_sql ), $delete_args ) );
+			$deleted_result  = $wpdb->query( $prepared_delete ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL structure is internal; IDs/cutoff are bound immediately above.
+			$deleted         = absint( false === $deleted_result ? 0 : $deleted_result );
+			$total          += $deleted;
+			$likely          = count( $ids ) >= $limit;
 			if ( count( $ids ) < $limit || $deleted <= 0 ) {
 				break;
 			}

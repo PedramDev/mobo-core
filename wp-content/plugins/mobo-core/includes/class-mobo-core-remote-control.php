@@ -142,7 +142,7 @@ class Mobo_Core_Remote_Control {
 	public static function get_status() {
 		$sync = new Mobo_Core_Product_Sync();
 		$manual = $sync->get_manual_sync_status();
-		$reconciliation = class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array();
+		$reconciliation = class_exists( 'Mobo_Core_Sync_Health' ) ? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ? Mobo_Core_Sync_Health::get_operational_dashboard_status() : Mobo_Core_Sync_Health::get_dashboard_status() ) : array();
 		$upgrade = class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array();
 		$last = get_option( self::LAST_OPERATION_OPTION, array() );
 		if ( ! is_array( $last ) ) {

@@ -1,9 +1,9 @@
 <?php
 /**
- * Legacy Mobo image refresh service.
+ * Mobo image refresh service.
  *
- * Finds Mobo-owned raster attachments, queues WebP replacement jobs, processes
- * the jobs in small batches, and removes old attachments only when safe.
+ * Finds Mobo-owned attachments, queues canonical-source WebP replacement jobs,
+ * processes them in small batches, and removes old attachments only when safe.
  *
  * PHP 7.4 compatible.
  */
@@ -29,9 +29,23 @@ class Mobo_Core_Image_Refresh_Service {
 	const SUBSIZE_REPAIR_CURSOR_OPTION = 'mobo_core_image_subsize_repair_cursor';
 	const REPLACED_SCAN_CURSOR_OPTION  = 'mobo_core_image_replaced_scan_cursor';
 	const REPLACED_DELETE_CURSOR_OPTION = 'mobo_core_image_replaced_delete_cursor';
+	const FORCE_SOURCE_REIMPORT_OPTION = 'mobo_core_image_refresh_force_source_reimport';
+	const GENERATION_ID_OPTION         = 'mobo_core_image_refresh_generation_id';
+	const GENERATION_STATS_OPTION      = 'mobo_core_image_refresh_generation_stats';
 
 	/** Cached authoritative image identities from the local image queue. @var array|null */
 	private $current_image_identity_map = null;
+
+	/**
+	 * Whether this workflow must fetch the canonical source again even when the
+	 * current local attachment is already a healthy WebP.
+	 *
+	 * @return bool
+	 */
+	public static function force_source_reimport_enabled() {
+		return '1' === (string) get_option( self::FORCE_SOURCE_REIMPORT_OPTION, '1' )
+			&& '' !== sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+	}
 
 	/**
 	 * Get combined status.
@@ -132,6 +146,8 @@ class Mobo_Core_Image_Refresh_Service {
 			'recoveredIdentity'   => $continue_cycle ? absint( isset( $previous['recoveredIdentity'] ) ? $previous['recoveredIdentity'] : 0 ) : 0,
 			'recoveredDetached'   => $continue_cycle ? absint( isset( $previous['recoveredDetached'] ) ? $previous['recoveredDetached'] : 0 ) : 0,
 			'unrelatedRaster'     => $continue_cycle ? absint( isset( $previous['unrelatedRaster'] ) ? $previous['unrelatedRaster'] : 0 ) : 0,
+			'sourceWebp'          => $continue_cycle ? absint( isset( $previous['sourceWebp'] ) ? $previous['sourceWebp'] : 0 ) : 0,
+			'sharedSkipped'       => $continue_cycle ? absint( isset( $previous['sharedSkipped'] ) ? $previous['sharedSkipped'] : 0 ) : 0,
 			'cursorStart'         => $cursor_start,
 			'cursorEnd'           => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
 			'missingCursorStart'  => $missing_cursor_start,
@@ -151,7 +167,9 @@ class Mobo_Core_Image_Refresh_Service {
 
 			$is_marked      = $this->is_mobo_attachment( $attachment_id );
 			$is_legacy      = $this->is_legacy_raster_attachment( $attachment_id );
-			$product_ids    = $is_legacy ? $this->find_products_using_attachment( $attachment_id ) : array();
+			$force_source   = self::force_source_reimport_enabled();
+			$is_webp        = $this->is_webp_attachment( $attachment_id );
+			$product_ids    = ( $is_legacy || ( $force_source && $is_marked && $is_webp ) ) ? $this->find_products_using_attachment( $attachment_id ) : array();
 
 			if ( ! $is_marked && $is_legacy && empty( $product_ids ) ) {
 				$detached_match = $this->recover_detached_legacy_identity( $attachment_id, false );
@@ -171,16 +189,25 @@ class Mobo_Core_Image_Refresh_Service {
 
 			$result['moboAttachments']++;
 
-			if ( $this->is_webp_attachment( $attachment_id ) ) {
+			if ( $is_webp ) {
 				$result['webp']++;
+				if ( ! $force_source ) {
+					continue;
+				}
+				if ( class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+					$result['sharedSkipped']++;
+					continue;
+				}
+				$result['sourceWebp']++;
+			}
+
+			if ( ! $is_legacy && ! ( $force_source && $is_marked && $is_webp ) ) {
 				continue;
 			}
 
-			if ( ! $is_legacy ) {
-				continue;
+			if ( $is_legacy ) {
+				$result['legacyRaster']++;
 			}
-
-			$result['legacyRaster']++;
 
 			$file = get_attached_file( $attachment_id );
 			if ( ! is_string( $file ) || '' === $file || ! file_exists( $file ) ) {
@@ -293,6 +320,8 @@ class Mobo_Core_Image_Refresh_Service {
 			'missingImagePending' => $continue_cycle ? absint( isset( $previous['missingImagePending'] ) ? $previous['missingImagePending'] : 0 ) : 0,
 			'recoveredIdentity'  => $continue_cycle ? absint( isset( $previous['recoveredIdentity'] ) ? $previous['recoveredIdentity'] : 0 ) : 0,
 			'detachedRecovered'  => $continue_cycle ? absint( isset( $previous['detachedRecovered'] ) ? $previous['detachedRecovered'] : 0 ) : 0,
+			'sourceWebp'         => $continue_cycle ? absint( isset( $previous['sourceWebp'] ) ? $previous['sourceWebp'] : 0 ) : 0,
+			'sharedSkipped'      => $continue_cycle ? absint( isset( $previous['sharedSkipped'] ) ? $previous['sharedSkipped'] : 0 ) : 0,
 			'cursorStart'      => $cursor_start,
 			'cursorEnd'        => isset( $batch['cursorEnd'] ) ? absint( $batch['cursorEnd'] ) : 0,
 			'missingCursorStart' => $missing_cursor_start,
@@ -311,9 +340,24 @@ class Mobo_Core_Image_Refresh_Service {
 			$attachment_id = absint( $attachment_id );
 			$result['scanned']++;
 
-			if ( ! $this->is_legacy_raster_attachment( $attachment_id ) ) {
+			$is_legacy    = $this->is_legacy_raster_attachment( $attachment_id );
+			$is_webp      = $this->is_webp_attachment( $attachment_id );
+			$force_source = self::force_source_reimport_enabled();
+			$is_full_refresh_candidate = $force_source && $is_webp && $this->is_mobo_attachment( $attachment_id );
+
+			if ( ! $is_legacy && ! $is_full_refresh_candidate ) {
 				$result['skipped']++;
 				continue;
+			}
+
+			/* A site must not create a private replacement for a worker-owned Shared
+			 * Media WebP. The central worker remains authoritative for that payload. */
+			if ( $is_full_refresh_candidate && class_exists( 'Mobo_Core_Shared_Media' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+				$result['sharedSkipped']++;
+				continue;
+			}
+			if ( $is_full_refresh_candidate ) {
+				$result['sourceWebp']++;
 			}
 
 			$product_ids = $this->find_products_using_attachment( $attachment_id );
@@ -531,19 +575,56 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 
 			$id = isset( $row['id'] ) ? absint( $row['id'] ) : 0;
+			$claim_token = '';
 
-			if ( $id <= 0 || ! $queue->lock( $id, 300 ) ) {
+			if ( $id <= 0 ) {
 				continue;
 			}
+			if ( method_exists( $queue, 'lock_with_token' ) ) {
+				$claim_token = $queue->lock_with_token( $id, 300 );
+				if ( '' === $claim_token ) {
+					continue;
+				}
+			} elseif ( ! $queue->lock( $id, 300 ) ) {
+				continue;
+			}
+			$row['_mobo_claim_token'] = $claim_token;
 
 			$product_id        = absint( isset( $row['product_id'] ) ? $row['product_id'] : 0 );
 			$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
 			$old_attachment_id = absint( isset( $row['old_attachment_id'] ) ? $row['old_attachment_id'] : 0 );
 			$new_source_url    = esc_url_raw( (string) ( isset( $row['new_source_url'] ) ? $row['new_source_url'] : '' ) );
+			$try_count         = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
 			if ( method_exists( $queue, 'is_current_identity' )
-				&& ! $queue->is_current_identity( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+				&& ! $queue->is_current_identity( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
 				if ( method_exists( $queue, 'release_if_superseded' ) ) {
-					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
+				}
+				$superseded++;
+				continue;
+			}
+			$total_try_limit = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_total_try_limit', 12, 3, 50 );
+			if ( $try_count > $total_try_limit ) {
+				/* A prior request may have terminated after begin_attempt() and before
+				 * mark_failure(). Once its stale lease is reclaimed, close the row here
+				 * instead of invoking the same fatal-prone editor forever. */
+				$committed = method_exists( $queue, 'mark_failure_if_current' )
+					? $queue->mark_failure_if_current( $id, 'Image refresh exceeded its persisted attempt limit after an interrupted worker.', $total_try_limit, true, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
+					: true;
+				if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
+					$queue->mark_failure( $id, 'Image refresh exceeded its persisted attempt limit after an interrupted worker.', $total_try_limit, true );
+				}
+				if ( $committed ) {
+					$failed++;
+				} else {
+					$superseded++;
+				}
+				continue;
+			}
+			if ( method_exists( $queue, 'begin_attempt_if_current' )
+				&& ! $queue->begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
+				if ( method_exists( $queue, 'release_if_superseded' ) ) {
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 				}
 				$superseded++;
 				continue;
@@ -552,7 +633,7 @@ class Mobo_Core_Image_Refresh_Service {
 			$result = $this->process_row( $row, $queue );
 			if ( ! empty( $result['stale'] ) ) {
 				if ( method_exists( $queue, 'release_if_superseded' ) ) {
-					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 				}
 				$superseded++;
 				continue;
@@ -562,11 +643,11 @@ class Mobo_Core_Image_Refresh_Service {
 				$note       = isset( $result['note'] ) ? $result['note'] : '';
 				$new_id     = isset( $result['newAttachmentId'] ) ? absint( $result['newAttachmentId'] ) : 0;
 				$committed  = method_exists( $queue, 'mark_done_if_current' )
-					? $queue->mark_done_if_current( $id, $new_id, $note, $product_id, $image_guid, $old_attachment_id, $new_source_url )
+					? $queue->mark_done_if_current( $id, $new_id, $note, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 					: true;
 				if ( ! $committed ) {
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
-						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 					}
 					$superseded++;
 					continue;
@@ -581,11 +662,11 @@ class Mobo_Core_Image_Refresh_Service {
 			if ( ! empty( $result['skipped'] ) ) {
 				$message   = isset( $result['message'] ) ? $result['message'] : 'این ردیف بدون تغییر رد شد.';
 				$committed = method_exists( $queue, 'mark_skipped_if_current' )
-					? $queue->mark_skipped_if_current( $id, $message, $product_id, $image_guid, $old_attachment_id, $new_source_url )
+					? $queue->mark_skipped_if_current( $id, $message, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 					: true;
 				if ( ! $committed ) {
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
-						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 					}
 					$superseded++;
 					continue;
@@ -597,15 +678,14 @@ class Mobo_Core_Image_Refresh_Service {
 				continue;
 			}
 
-			$try_count = isset( $row['try_count'] ) ? absint( $row['try_count'] ) + 1 : 1;
 			$message   = isset( $result['message'] ) ? $result['message'] : 'نوسازی تصویر ناموفق بود.';
 			/* Network/storage/worker failures are recoverable. Only an explicitly permanent result may become terminal. */
 			$committed = method_exists( $queue, 'mark_failure_if_current' )
-				? $queue->mark_failure_if_current( $id, $message, $try_count, ! empty( $result['permanent'] ), $product_id, $image_guid, $old_attachment_id, $new_source_url )
+				? $queue->mark_failure_if_current( $id, $message, $try_count, ! empty( $result['permanent'] ), $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 				: true;
 			if ( ! $committed ) {
 				if ( method_exists( $queue, 'release_if_superseded' ) ) {
-					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
+					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 				}
 				$superseded++;
 				continue;
@@ -644,6 +724,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$old_attachment_id = absint( isset( $row['old_attachment_id'] ) ? $row['old_attachment_id'] : 0 );
 		$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
 		$new_source_url    = esc_url_raw( (string) ( isset( $row['new_source_url'] ) ? $row['new_source_url'] : '' ) );
+		$claim_token       = isset( $row['_mobo_claim_token'] ) ? sanitize_text_field( (string) $row['_mobo_claim_token'] ) : '';
 
 		if ( $product_id <= 0 || $old_attachment_id <= 0 || '' === $image_guid || '' === $new_source_url ) {
 			return array( 'success' => false, 'skipped' => true, 'message' => 'اطلاعات این ردیف صف ناقص یا نامعتبر است.' );
@@ -651,13 +732,17 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$row_id = absint( isset( $row['id'] ) ? $row['id'] : 0 );
 		if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
-			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
 			return array( 'success' => false, 'stale' => true, 'message' => 'این ردیف هنگام پردازش با منبع جدید جایگزین شد.' );
 		}
 
 		$product = wc_get_product( $product_id );
 		if ( ! $product instanceof WC_Product ) {
 			return array( 'success' => false, 'skipped' => true, 'message' => 'محصول مربوط به این ردیف دیگر وجود ندارد.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+			return array( 'success' => false, 'skipped' => true, 'message' => 'محصول در فهرست عدم همگام‌سازی است؛ نوسازی تصویر آن بدون mutation خاتمه یافت.' );
 		}
 
 		$active_old_attachment_id = $old_attachment_id;
@@ -682,7 +767,7 @@ class Mobo_Core_Image_Refresh_Service {
 				}
 
 				if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
-					&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+					&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
 					return array( 'success' => false, 'stale' => true, 'message' => 'منبع تصویر در زمان بازیابی اجرای نیمه‌تمام تغییر کرد.' );
 				}
 
@@ -690,7 +775,8 @@ class Mobo_Core_Image_Refresh_Service {
 				$note = 'اجرای نیمه‌تمام قبلی شناسایی شد و بدون دانلود تکراری تکمیل شد.';
 				$shared_attachment = class_exists( 'Mobo_Core_Shared_Media' )
 					&& Mobo_Core_Shared_Media::is_shared_attachment( $recovered_id );
-				$delete_old = $old_exists && ( Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+				$delete_old = $old_exists && ( self::force_source_reimport_enabled()
+					|| Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
 					|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() ) );
 				if ( $delete_old ) {
 					$delete_check = $this->safe_delete_old_attachment( $old_attachment_id, $recovered_id );
@@ -721,7 +807,24 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'message' => 'بخش دریافت تصویر جدید در افزونه در دسترس نیست.' );
 		}
 
-		$new_attachment_id = absint( $image_sync->import_image_for_refresh( $new_source_url, $product_id, $image_guid, $active_old_attachment_id ) );
+		$force_source_reimport = self::force_source_reimport_enabled();
+		$reused_generation     = false;
+		$new_attachment_id     = $force_source_reimport ? $this->find_generation_replacement( $active_old_attachment_id, $image_guid, $new_source_url ) : 0;
+
+		if ( $new_attachment_id > 0 ) {
+			$reused_generation = true;
+		} else {
+			$new_attachment_id = absint(
+				$image_sync->import_image_for_refresh(
+					$new_source_url,
+					$product_id,
+					$image_guid,
+					$active_old_attachment_id,
+					$force_source_reimport,
+					sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) )
+				)
+			);
+		}
 
 		if ( $new_attachment_id <= 0 || 'attachment' !== get_post_type( $new_attachment_id ) ) {
 			return array( 'success' => false, 'message' => 'دریافت یا ثبت تصویر WebP ناموفق بود.' );
@@ -751,10 +854,20 @@ class Mobo_Core_Image_Refresh_Service {
 		 * Shared imports already commit their manifest atomically, but writing the
 		 * same final marker is harmless and gives both storage modes one readiness
 		 * boundary: only a fully verified replacement is complete. */
-		update_post_meta( $new_attachment_id, 'mobo_sync_incomplete', '0' );
+		if ( ! $this->persist_post_meta_verified( $new_attachment_id, 'mobo_sync_incomplete', '0' ) ) {
+			return array( 'success' => false, 'message' => 'تصویر WebP آماده شد، اما completion marker آن به‌صورت پایدار ذخیره نشد؛ محصول هنوز جایگزین نشد و اجرای بعد دوباره تلاش می‌کند.' );
+		}
+		if ( $force_source_reimport && ! $reused_generation ) {
+			$this->register_generation_candidate( $active_old_attachment_id, $new_attachment_id );
+			$this->record_generation_stats(
+				absint( isset( $row['old_file_size'] ) ? $row['old_file_size'] : $this->get_attachment_family_size( $active_old_attachment_id ) ),
+				$this->get_attachment_family_size( $new_attachment_id ),
+				false
+			);
+		}
 
 		if ( $queue instanceof Mobo_Core_Image_Refresh_Queue && method_exists( $queue, 'is_current_identity' )
-			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url ) ) {
+			&& ! $queue->is_current_identity( $row_id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
 			return array( 'success' => false, 'stale' => true, 'message' => 'منبع تصویر قبل از جایگزینی محصول تغییر کرد.' );
 		}
 
@@ -762,9 +875,13 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'success' => false, 'message' => 'تصویر جدید آماده شد، اما ذخیره Featured/Gallery محصول در WooCommerce تأیید نشد و در اجرای بعد دوباره تلاش می‌شود.' );
 		}
 		$this->mark_refresh_completed( $product_id, $active_old_attachment_id, $new_attachment_id, $image_guid, $new_source_url );
+		if ( $reused_generation ) {
+			$this->record_generation_stats( 0, 0, true );
+		}
 
 		$note       = 'تصویر قدیمی نگه داشته شد.';
-		$delete_old = Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
+		$delete_old = $force_source_reimport
+			|| Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' )
 			|| ( $shared_attachment && Mobo_Core_Shared_Media::should_delete_local_copies() );
 		if ( $delete_old ) {
 			$delete_check = $this->safe_delete_old_attachment( $active_old_attachment_id, $new_attachment_id );
@@ -840,6 +957,21 @@ class Mobo_Core_Image_Refresh_Service {
 	}
 
 
+	/** Persist correctness-critical postmeta and verify exact read-back. */
+	private function persist_post_meta_verified( $post_id, $key, $value ) {
+		$post_id = absint( $post_id );
+		$key     = sanitize_key( (string) $key );
+		if ( $post_id <= 0 || '' === $key ) {
+			return false;
+		}
+		$current = get_post_meta( $post_id, $key, true );
+		if ( maybe_serialize( $current ) !== maybe_serialize( $value ) ) {
+			update_post_meta( $post_id, $key, $value );
+		}
+		wp_cache_delete( $post_id, 'post_meta' );
+		return maybe_serialize( get_post_meta( $post_id, $key, true ) ) === maybe_serialize( $value );
+	}
+
 	/**
 	 * Persist an audit trail for completed image refresh replacements.
 	 *
@@ -852,6 +984,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	private function mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url ) {
 		$now = time();
+		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
 
 		update_post_meta( $product_id, 'mobo_image_refresh_last_completed_at', $now );
 		update_post_meta( $product_id, 'mobo_image_refresh_last_old_attachment_id', absint( $old_attachment_id ) );
@@ -861,11 +994,109 @@ class Mobo_Core_Image_Refresh_Service {
 		update_post_meta( $new_attachment_id, 'mobo_refreshed_from_attachment_id', absint( $old_attachment_id ) );
 		update_post_meta( $new_attachment_id, 'mobo_image_refresh_source_url', esc_url_raw( (string) $new_source_url ) );
 		update_post_meta( $new_attachment_id, 'mobo_image_refresh_product_id', absint( $product_id ) );
+		if ( '' !== $generation_id ) {
+			update_post_meta( $new_attachment_id, 'mobo_image_refresh_generation_id', $generation_id );
+		}
 
 		if ( $old_attachment_id > 0 && 'attachment' === get_post_type( $old_attachment_id ) ) {
 			update_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_at', $now );
 			update_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', absint( $new_attachment_id ) );
+			delete_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_candidate_id' );
+			if ( '' !== $generation_id ) {
+				update_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_id', $generation_id );
+			}
 		}
+	}
+
+	/**
+	 * Reuse the one fresh download already produced for this old attachment in the
+	 * current workflow generation. This avoids one download per product when the
+	 * same gallery attachment is referenced by several products.
+	 *
+	 * @param int    $old_attachment_id Old attachment ID.
+	 * @param string $image_guid Expected image GUID.
+	 * @param string $source_url Expected canonical source URL.
+	 * @return int
+	 */
+	private function find_generation_replacement( $old_attachment_id, $image_guid, $source_url ) {
+		$old_attachment_id = absint( $old_attachment_id );
+		$generation_id     = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$image_guid        = sanitize_text_field( (string) $image_guid );
+		$source_url        = esc_url_raw( (string) $source_url );
+		if ( $old_attachment_id <= 0 || '' === $generation_id ) {
+			return 0;
+		}
+
+		if ( $generation_id !== sanitize_text_field( (string) get_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_id', true ) ) ) {
+			return 0;
+		}
+
+		$replacement_id = absint( get_post_meta( $old_attachment_id, 'mobo_image_refresh_replaced_by_attachment_id', true ) );
+		if ( $replacement_id <= 0 ) {
+			$replacement_id = absint( get_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_candidate_id', true ) );
+		}
+		if ( $replacement_id <= 0
+			|| $generation_id !== sanitize_text_field( (string) get_post_meta( $replacement_id, 'mobo_image_refresh_generation_id', true ) )
+			|| $image_guid !== $this->get_image_guid_from_attachment( $replacement_id )
+			|| $source_url !== esc_url_raw( (string) get_post_meta( $replacement_id, 'mobo_source_url', true ) )
+			|| ! $this->is_valid_new_attachment( $replacement_id )
+			|| ! $this->is_webp_attachment( $replacement_id ) ) {
+			return 0;
+		}
+
+		$ready = $this->ensure_webp_attachment_ready( $replacement_id );
+		return ! empty( $ready['success'] ) ? $replacement_id : 0;
+	}
+
+	/**
+	 * Persist a verified but not-yet-linked generation download so a failed product
+	 * save can retry without consuming disk with another identical sideload.
+	 *
+	 * @param int $old_attachment_id Old attachment ID.
+	 * @param int $new_attachment_id New attachment ID.
+	 * @return void
+	 */
+	private function register_generation_candidate( $old_attachment_id, $new_attachment_id ) {
+		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$old_attachment_id = absint( $old_attachment_id );
+		$new_attachment_id = absint( $new_attachment_id );
+		if ( '' === $generation_id || $old_attachment_id <= 0 || $new_attachment_id <= 0 ) {
+			return;
+		}
+		update_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_id', $generation_id );
+		update_post_meta( $old_attachment_id, 'mobo_image_refresh_generation_candidate_id', $new_attachment_id );
+		update_post_meta( $new_attachment_id, 'mobo_image_refresh_generation_id', $generation_id );
+	}
+
+	/**
+	 * Store a compact, generation-scoped size report for the admin page.
+	 *
+	 * @param int  $old_bytes Previous attachment-family size.
+	 * @param int  $new_bytes New attachment-family size.
+	 * @param bool $reused Whether an existing generation download was reused.
+	 * @return void
+	 */
+	private function record_generation_stats( $old_bytes, $new_bytes, $reused ) {
+		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		if ( '' === $generation_id ) {
+			return;
+		}
+
+		$stats = get_option( self::GENERATION_STATS_OPTION, array() );
+		$stats = is_array( $stats ) ? $stats : array();
+		if ( $generation_id !== sanitize_text_field( (string) ( isset( $stats['generationId'] ) ? $stats['generationId'] : '' ) ) ) {
+			$stats = array( 'generationId' => $generation_id );
+		}
+
+		if ( $reused ) {
+			$stats['reusedLinks'] = absint( isset( $stats['reusedLinks'] ) ? $stats['reusedLinks'] : 0 ) + 1;
+		} else {
+			$stats['freshDownloads'] = absint( isset( $stats['freshDownloads'] ) ? $stats['freshDownloads'] : 0 ) + 1;
+			$stats['bytesBefore']     = absint( isset( $stats['bytesBefore'] ) ? $stats['bytesBefore'] : 0 ) + absint( $old_bytes );
+			$stats['bytesAfter']      = absint( isset( $stats['bytesAfter'] ) ? $stats['bytesAfter'] : 0 ) + absint( $new_bytes );
+		}
+		$stats['updatedAt'] = time();
+		update_option( self::GENERATION_STATS_OPTION, $stats, false );
 	}
 
 	/**
@@ -1000,6 +1231,13 @@ class Mobo_Core_Image_Refresh_Service {
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$old_url    = esc_url_raw( (string) $old_url );
+
+		/* In a full-source generation the URL intentionally stays the same. The
+		 * downloader adds a request-only cache buster while attachment identity and
+		 * stored metadata keep this canonical URL. */
+		if ( self::force_source_reimport_enabled() && '' !== $old_url && $this->is_webp_url( $old_url ) ) {
+			return $old_url;
+		}
 
 		if ( '' !== $image_guid && class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
 			$table = Mobo_Core_Image_Queue::table_name();
@@ -2581,6 +2819,18 @@ class Mobo_Core_Image_Refresh_Service {
 
 		if ( '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
 			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'فایل تصویر جایگزین وجود ندارد یا خالی است.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Image_Storage' ) ) {
+			$storage = Mobo_Core_Image_Storage::check();
+			if ( empty( $storage['ready'] ) ) {
+				return array(
+					'success'    => false,
+					'generated'  => 0,
+					'registered' => 0,
+					'message'    => 'ساخت برش‌ها به دلیل آماده نبودن فضای ذخیره‌سازی متوقف شد: ' . sanitize_text_field( isset( $storage['message'] ) ? (string) $storage['message'] : 'فضای کافی وجود ندارد.' ),
+				);
+			}
 		}
 
 		$editor = wp_get_image_editor( $file );

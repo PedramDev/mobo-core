@@ -288,6 +288,34 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		$new_id = absint( $wpdb->insert_id );
+		if ( $new_id <= 0 ) {
+			return new WP_Error( 'mobo_core_event_insert_unverified', 'Sync event insert did not return a durable row id.' );
+		}
+
+		/* event_version is part of the ordering contract, not optional diagnostics.
+		 * Read the canonical row back before accepting the enqueue so a successful
+		 * statement can never advertise an event whose durable identity/version differs
+		 * from the payload the worker will later process. */
+		$persisted = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version FROM {$table} WHERE id = %d LIMIT 1",
+				$new_id
+			),
+			ARRAY_A
+		);
+		$expected_version = sanitize_text_field( (string) $normalized['version'] );
+		if ( ! is_array( $persisted )
+			|| $event_uuid !== (string) ( isset( $persisted['event_uuid'] ) ? $persisted['event_uuid'] : '' )
+			|| $remote_event_id !== (string) ( isset( $persisted['remote_event_id'] ) ? $persisted['remote_event_id'] : '' )
+			|| $event_type !== (string) ( isset( $persisted['event_type'] ) ? $persisted['event_type'] : '' )
+			|| $entity_type !== (string) ( isset( $persisted['entity_type'] ) ? $persisted['entity_type'] : '' )
+			|| $entity_guid !== (string) ( isset( $persisted['entity_guid'] ) ? $persisted['entity_guid'] : '' )
+			|| sanitize_text_field( (string) $normalized['syncId'] ) !== (string) ( isset( $persisted['sync_id'] ) ? $persisted['sync_id'] : '' )
+			|| $expected_version !== (string) ( isset( $persisted['event_version'] ) ? $persisted['event_version'] : '' )
+		) {
+			return new WP_Error( 'mobo_core_event_insert_readback_failed', 'Sync event could not be verified after persistence.' );
+		}
+
 		self::invalidate_summary_cache();
 
 		/*
@@ -485,41 +513,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return int|null -1/0/1, or null when arrival order must be used.
 	 */
 	private function compare_event_versions( $left, $right ) {
-		$left  = trim( (string) $left );
-		$right = trim( (string) $right );
-
-		if ( '' === $left || '' === $right ) {
-			return null;
-		}
-		if ( $left === $right ) {
-			return 0;
-		}
-
-		if ( ctype_digit( $left ) && ctype_digit( $right ) ) {
-			$left_norm  = ltrim( $left, '0' );
-			$right_norm = ltrim( $right, '0' );
-			$left_norm  = '' === $left_norm ? '0' : $left_norm;
-			$right_norm = '' === $right_norm ? '0' : $right_norm;
-			if ( strlen( $left_norm ) !== strlen( $right_norm ) ) {
-				return strlen( $left_norm ) < strlen( $right_norm ) ? -1 : 1;
-			}
-			$numeric_compare = strcmp( $left_norm, $right_norm );
-			if ( 0 === $numeric_compare ) {
-				return 0;
-			}
-			return $numeric_compare < 0 ? -1 : 1;
-		}
-
-		if ( preg_match( '/^\\d{4}-\\d{2}-\\d{2}[T ]/', $left ) && preg_match( '/^\\d{4}-\\d{2}-\\d{2}[T ]/', $right ) ) {
-			$left_time  = strtotime( $left );
-			$right_time = strtotime( $right );
-			if ( false !== $left_time && false !== $right_time && $left_time !== $right_time ) {
-				return $left_time < $right_time ? -1 : 1;
-			}
-		}
-
-		return null;
-	}
+	return Mobo_Core_Ordering_Policy::compare_versions( $left, $right );
+}
 
 
 
@@ -685,7 +680,7 @@ class Mobo_Core_Sync_Event_Store {
 		$select_args = array_merge( $ids, array( $claim_token ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, claim_token,
+				"SELECT id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version, claim_token,
 					try_count, expires_at, payload_json, created_at, updated_at
 				FROM {$table}
 				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND claim_token = %s
@@ -854,8 +849,21 @@ class Mobo_Core_Sync_Event_Store {
 			$payload['entityGuid'] = sanitize_text_field( (string) $row['entity_guid'] );
 		}
 
+		$event_version = isset( $row['event_version'] ) ? sanitize_text_field( (string) $row['event_version'] ) : '';
+		if ( '' !== $event_version ) {
+			/* event_version is an ordering watermark persisted outside payload_json.
+			 * Rehydrate it for processors so delayed retries cannot lose ordering context. */
+			if ( ! isset( $payload['eventVersion'] ) ) {
+				$payload['eventVersion'] = $event_version;
+			}
+			if ( ! isset( $payload['_moboEventVersion'] ) ) {
+				$payload['_moboEventVersion'] = $event_version;
+			}
+		}
+
 		return array(
 			'id'            => isset( $row['event_uuid'] ) ? sanitize_text_field( (string) $row['event_uuid'] ) : '',
+			'eventVersion'  => $event_version,
 			'remoteEventId' => isset( $row['remote_event_id'] ) ? sanitize_text_field( (string) $row['remote_event_id'] ) : '',
 			'event'         => isset( $row['event_type'] ) ? sanitize_text_field( (string) $row['event_type'] ) : '',
 			'syncId'        => isset( $row['sync_id'] ) ? sanitize_text_field( (string) $row['sync_id'] ) : '',
@@ -921,89 +929,11 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return int Number of retired events.
 	 */
 	public function retire_stale_parent_waiting_events( $timeout_seconds = 600, $limit = 200 ) {
-		global $wpdb;
-
-		if ( ! self::table_exists() ) {
-			return 0;
-		}
-
-		$timeout_seconds = max( 60, absint( $timeout_seconds ) );
-		$limit           = max( 1, min( 1000, absint( $limit ) ) );
-		$cutoff          = gmdate( 'Y-m-d H:i:s', time() - $timeout_seconds );
-		$table           = self::table_name();
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT id, payload_json, progress_json, created_at FROM {$table}
-				WHERE status = 'pending'
-				AND event_type = 'UpdateVariant'
-				AND created_at <= %s
-				AND progress_json LIKE %s
-				ORDER BY id ASC
-				LIMIT %d",
-				$cutoff,
-				'%waitingForParent%',
-				$limit
-			),
-			ARRAY_A
-		);
-
-		if ( empty( $rows ) || ! is_array( $rows ) ) {
-			return 0;
-		}
-
-		$retired = 0;
-
-		foreach ( $rows as $row ) {
-			$progress = json_decode( isset( $row['progress_json'] ) ? (string) $row['progress_json'] : '', true );
-
-			if ( ! is_array( $progress ) || empty( $progress['waitingForParent'] ) ) {
-				continue;
-			}
-
-			$payload = json_decode( isset( $row['payload_json'] ) ? (string) $row['payload_json'] : '', true );
-			if ( ! is_array( $payload ) ) {
-				$payload = array();
-			}
-
-			$created_at = isset( $row['created_at'] ) ? strtotime( (string) $row['created_at'] . ' UTC' ) : 0;
-			$wait_age   = $created_at > 0 ? max( 0, time() - $created_at ) : $timeout_seconds;
-
-			$progress['deleteFile']               = true;
-			$progress['retiredBecause']           = 'parent_wait_timeout';
-			$progress['retiredAt']                = gmdate( 'Y-m-d H:i:s' );
-			$progress['parentWaitTimeoutSeconds'] = $timeout_seconds;
-			$progress['parentWaitAgeSeconds']     = $wait_age;
-
-			$payload_json  = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
-			$progress_json = wp_json_encode( $progress, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
-			$updated = $wpdb->update(
-				$table,
-				array(
-					'status'        => 'done',
-					'payload_json'  => false === $payload_json ? '{}' : $payload_json,
-					'progress_json' => false === $progress_json ? '{}' : $progress_json,
-					'locked_until'  => null,
-					'claim_token'   => '',
-					'next_retry_at' => null,
-					'last_error'    => null,
-					'updated_at'    => current_time( 'mysql', true ),
-				),
-				array(
-					'id'     => absint( $row['id'] ),
-					'status' => 'pending',
-				),
-				array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ),
-				array( '%d', '%s' )
-			);
-
-			if ( 1 === absint( $updated ) ) {
-				self::invalidate_summary_cache();
-				$retired++;
-			}
-		}
-
-		return $retired;
+		/* Deprecated compatibility surface. A missing parent is not evidence that the
+		 * variant event is obsolete: sites can legitimately be offline for hours or
+		 * days. Rows are now retired only by explicit supersession/deduplication. */
+		unset( $timeout_seconds, $limit );
+		return 0;
 	}
 
 	/**
@@ -1587,9 +1517,16 @@ class Mobo_Core_Sync_Event_Store {
 			'syncId'        => $sync_id,
 			'version'       => $this->first_non_empty(
 				array(
+					$this->get_value( $raw, 'sourceRevision', '' ),
+					$this->get_value( $raw, 'revision', '' ),
+					$this->get_value( $raw, 'eventVersion', '' ),
 					$this->get_value( $raw, 'version', '' ),
 					$this->get_value( $raw, 'Version', '' ),
 					$this->get_value( $raw, 'entityVersion', '' ),
+					$this->get_value( $payload, 'sourceRevision', '' ),
+					$this->get_value( $payload, 'revision', '' ),
+					$this->get_value( $payload, 'eventVersion', '' ),
+					$this->get_value( $payload, 'version', '' ),
 				)
 			),
 		);
@@ -1665,24 +1602,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return string
 	 */
 	private function detect_event( $payload ) {
-		if ( ! is_array( $payload ) ) {
-			return '';
-		}
-
-		$event = $this->first_non_empty(
-			array(
-				$this->get_value( $payload, 'event', '' ),
-				$this->get_value( $payload, 'type', '' ),
-				$this->get_value( $payload, 'Type', '' ),
-			)
-		);
-
-		if ( is_numeric( $event ) ) {
-			$event = $this->map_numeric_event_type( absint( $event ) );
-		}
-
-		return sanitize_text_field( (string) $event );
-	}
+	return Mobo_Core_Event_Type_Policy::detect( $payload );
+}
 
 	/**
 	 * Map old numeric event type if required.
@@ -1691,17 +1612,8 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return string
 	 */
 	private function map_numeric_event_type( $type ) {
-		$map = array(
-			0 => 'ProductUpdated',
-			1 => 'UpdateVariant',
-			2 => 'ProductUpdated',
-			4 => 'UpdateVariant',
-			20 => 'ShippingMethodsChanged',
-			21 => 'WebhookDeliveryStatusChanged',
-		);
-
-		return isset( $map[ $type ] ) ? $map[ $type ] : '';
-	}
+	return Mobo_Core_Event_Type_Policy::map_numeric( $type );
+}
 
 	/**
 	 * Determine whether an array is a zero-based list.

@@ -18,14 +18,17 @@ class Mobo_Core_Health_Reporter {
 	/**
 	 * Build a health report compatible with MoboCore WordPressSiteHealthReportDto.
 	 *
+	 * @param bool $non_blocking Avoid optional network probes and full-catalog
+	 *                           structure scans for wp-admin/Portal health pulls.
 	 * @return array
 	 */
-	public function build_report() {
+	public function build_report( $non_blocking = false ) {
+		$started_at  = microtime( true );
 		$sync_status = $this->get_sync_status();
 		$queue_stats = $this->get_webhook_queue_stats();
 		$image_stats = $this->get_image_queue_stats();
 		try {
-			$disk = $this->get_disk_stats();
+			$disk = $this->get_disk_stats( ! $non_blocking );
 		} catch ( Throwable $error ) {
 			$disk = $this->get_unavailable_disk_stats( 'بررسی فضای ذخیره‌سازی در دسترس نیست.' );
 		}
@@ -58,7 +61,9 @@ class Mobo_Core_Health_Reporter {
 			'siteUrl'               => home_url( '/' ),
 			'licenseToken'          => (string) get_option( 'mobo_core_token', '' ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'pluginBuildFingerprint'=> class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'webhookCredential'      => $webhook_auth,
+			'licenseInstallation'   => class_exists( 'Mobo_Core_Portal_Request_Signer' ) ? Mobo_Core_Portal_Request_Signer::get_status() : array( 'identityReady' => false, 'opensslAvailable' => function_exists( 'openssl_sign' ) ),
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,
 			'wooCommerceVersion'    => $this->get_woocommerce_version(),
@@ -141,7 +146,7 @@ class Mobo_Core_Health_Reporter {
 					: 0,
 				'lastResult'          => get_option( 'mobo_core_portal_heartbeat_last_result', array() ),
 			),
-			'syncHealth'            => class_exists( 'Mobo_Core_Reconciliation' ) ? Mobo_Core_Reconciliation::get_dashboard_status() : array(),
+			'syncHealth'            => class_exists( 'Mobo_Core_Sync_Health' ) ? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ? Mobo_Core_Sync_Health::get_operational_dashboard_status( 15, ! $non_blocking ) : Mobo_Core_Sync_Health::get_dashboard_status() ) : array(),
 			'syncStatus'            => $sync_status,
 			'remoteControl'          => class_exists( 'Mobo_Core_Remote_Control' ) ? Mobo_Core_Remote_Control::get_status() : array(),
 			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
@@ -164,10 +169,12 @@ class Mobo_Core_Health_Reporter {
 
 			'disableWpCronDefined'   => defined( 'DISABLE_WP_CRON' ),
 			'wpCronDisabled'         => defined( 'DISABLE_WP_CRON' ) && true === DISABLE_WP_CRON,
-			'imageProcessing'        => $this->get_image_processing_stats(),
+			'imageProcessing'        => $this->get_image_processing_stats( ! $non_blocking ),
 			'phpInfoSummary'         => $this->get_php_info_summary(),
 
 			'lastError'             => $last_error,
+			'healthReportMode'      => $non_blocking ? 'non-blocking' : 'full',
+			'healthReportDurationMs'=> (int) round( ( microtime( true ) - $started_at ) * 1000 ),
 		);
 	}
 
@@ -196,8 +203,9 @@ class Mobo_Core_Health_Reporter {
 			'success'       => true,
 			'status'        => 'ok',
 			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'pluginBuildFingerprint' => class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'siteTime'      => gmdate( 'c' ),
-			'data'          => $this->build_report(),
+			'data'          => $this->build_report( true ),
 			'lastReport'    => $this->get_last_report_status(),
 		);
 	}
@@ -290,7 +298,7 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @return array
 	 */
-	private function get_image_processing_stats() {
+	private function get_image_processing_stats( $allow_write_probe = true ) {
 		$gd_loaded       = extension_loaded( 'gd' );
 		$gd_webp         = $gd_loaded && function_exists( 'imagewebp' );
 		$imagick_loaded  = extension_loaded( 'imagick' ) && class_exists( 'Imagick' );
@@ -307,7 +315,7 @@ class Mobo_Core_Health_Reporter {
 
 		$wp_webp = function_exists( 'wp_image_editor_supports' ) ? wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) ) : ( $gd_webp || $imagick_webp );
 		$uploads = wp_upload_dir();
-		$probe   = $this->get_storage_write_probe();
+		$probe   = $this->get_storage_write_probe( $allow_write_probe );
 		$automation = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
 
 		$uploads_writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && wp_is_writable( $uploads['basedir'] );
@@ -425,15 +433,11 @@ class Mobo_Core_Health_Reporter {
 			$failed     += absint( isset( $summary['failedCount'] ) ? $summary['failedCount'] : 0 );
 			$oldest_at   = isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '';
 		}
-
-		$pending_files = glob( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . '*.json' );
-		if ( is_array( $pending_files ) ) {
-			$pending += count( $pending_files );
-		}
-
-		$failed_files = glob( trailingslashit( MOBO_CORE_WEBHOOK_FILE_DIR ) . 'failed/*.json' );
-		if ( is_array( $failed_files ) ) {
-			$failed += count( $failed_files );
+		/* MOBO-HEALTH-SYNC-LICENSE-HARDENING-r1: legacy file counts are collected in background. */
+		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) ) {
+			$mobo_legacy_webhook = Mobo_Core_Health_Read_Cache::get_legacy_webhook_file_stats();
+			$pending += isset( $mobo_legacy_webhook['pending'] ) ? absint( $mobo_legacy_webhook['pending'] ) : 0;
+			$failed  += isset( $mobo_legacy_webhook['failed'] ) ? absint( $mobo_legacy_webhook['failed'] ) : 0;
 		}
 
 		return array(
@@ -616,9 +620,9 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @return array
 	 */
-	private function get_disk_stats() {
+	private function get_disk_stats( $allow_remote_quota = true ) {
 		try {
-			return $this->build_disk_stats();
+			return $this->build_disk_stats( $allow_remote_quota );
 		} catch ( Throwable $error ) {
 			return $this->get_unavailable_disk_stats( 'بررسی فضای ذخیره‌سازی در دسترس نیست.' );
 		}
@@ -630,7 +634,7 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @return array
 	 */
-	private function build_disk_stats() {
+	private function build_disk_stats( $allow_remote_quota = true ) {
 		$filesystem_free    = $this->safe_disk_free_space( ABSPATH );
 		$filesystem_total   = $this->safe_disk_total_space( ABSPATH );
 		$filesystem_percent = null;
@@ -640,13 +644,13 @@ class Mobo_Core_Health_Reporter {
 		}
 
 		try {
-			$quota = $this->get_hosting_quota_stats();
+			$quota = $this->get_hosting_quota_stats( $allow_remote_quota );
 		} catch ( Throwable $error ) {
 			$quota = $this->get_unavailable_quota_stats( 'بررسی سهمیه اکانت در دسترس نیست.' );
 		}
 
 		try {
-			$probe = $this->get_storage_write_probe();
+			$probe = $this->get_storage_write_probe( $allow_remote_quota );
 		} catch ( Throwable $error ) {
 			$probe = $this->get_unavailable_write_probe( 'آزمون نوشتن در uploads در دسترس نیست.' );
 		}
@@ -715,7 +719,7 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @return array
 	 */
-	private function get_hosting_quota_stats() {
+	private function get_hosting_quota_stats( $allow_remote = true ) {
 		try {
 			$filtered = apply_filters( 'mobo_core_hosting_quota_stats', null, ABSPATH );
 			if ( is_array( $filtered ) ) {
@@ -766,6 +770,15 @@ class Mobo_Core_Health_Reporter {
 			$cached    = get_transient( $cache_key );
 			if ( is_array( $cached ) ) {
 				return $cached;
+			}
+
+			/* Optional cPanel quota lookup must never block wp-admin or Portal health. */
+			if ( ! $allow_remote ) {
+				return array(
+					'available' => false,
+					'source'    => 'cpanel_uapi_deferred',
+					'error'     => '',
+				);
 			}
 
 			$response = wp_remote_get(
@@ -897,7 +910,7 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @return array
 	 */
-	private function get_storage_write_probe() {
+	private function get_storage_write_probe( $allow_live_probe = true ) {
 		$probe_filename = '';
 
 		try {
@@ -905,6 +918,17 @@ class Mobo_Core_Health_Reporter {
 			$cached    = get_transient( $cache_key );
 			if ( is_array( $cached ) ) {
 				return $cached;
+			}
+
+			if ( ! $allow_live_probe ) {
+				return array(
+					'ok'         => null,
+					'status'     => 'deferred',
+					'error'      => '',
+					'checked_at' => 0,
+					'bytes'      => 0,
+					'path'       => '',
+				);
 			}
 
 			$checked_at = time();
@@ -1129,6 +1153,9 @@ class Mobo_Core_Health_Reporter {
 	 * @return int|null
 	 */
 	private function get_action_scheduler_count( $status, $past_due ) {
+		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && ! Mobo_Core_Health_Read_Cache::is_refreshing() ) {
+			return Mobo_Core_Health_Read_Cache::get_action_scheduler_count_snapshot( $status, $past_due );
+		}
 		if ( ! function_exists( 'as_get_scheduled_actions' ) ) {
 			return null;
 		}

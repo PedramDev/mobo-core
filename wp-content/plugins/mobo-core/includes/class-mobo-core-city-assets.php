@@ -48,7 +48,7 @@ class Mobo_Core_City_Assets {
 	 * @return void
 	 */
 	public function maybe_generate_from_cache() {
-		if ( ! class_exists( 'Mobo_Core_Settings' ) || ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
+		if ( ! class_exists( 'Mobo_Core_Settings' ) || ! Mobo_Core_Order_Submission_Policy::is_enabled() ) {
 			return;
 		}
 
@@ -279,7 +279,7 @@ class Mobo_Core_City_Assets {
 		if ( ! is_admin() || ! current_user_can( 'manage_woocommerce' ) ) {
 			return;
 		}
-		if ( ! class_exists( 'Mobo_Core_Settings' ) || ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) ) {
+		if ( ! class_exists( 'Mobo_Core_Settings' ) || ! Mobo_Core_Order_Submission_Policy::is_enabled() ) {
 			return;
 		}
 
@@ -599,7 +599,7 @@ class Mobo_Core_City_Assets {
 	}
 
 	private function is_replacement_enabled() {
-		return class_exists( 'Mobo_Core_Settings' ) && Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' );
+		return class_exists( 'Mobo_Core_Settings' ) && Mobo_Core_Order_Submission_Policy::is_enabled();
 	}
 
 	private function is_address_page() {

@@ -30,6 +30,7 @@ class Mobo_Core_Remote_Updater {
 			'success'        => true,
 			'status'         => isset( $status['status'] ) ? sanitize_key( (string) $status['status'] ) : 'idle',
 			'currentVersion' => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
+			'buildFingerprint' => self::get_build_fingerprint(),
 			'deploymentId'   => isset( $status['deploymentId'] ) ? sanitize_text_field( (string) $status['deploymentId'] ) : '',
 			'fromVersion'    => isset( $status['fromVersion'] ) ? sanitize_text_field( (string) $status['fromVersion'] ) : '',
 			'targetVersion'  => isset( $status['targetVersion'] ) ? sanitize_text_field( (string) $status['targetVersion'] ) : '',
@@ -58,6 +59,8 @@ class Mobo_Core_Remote_Updater {
 		$expected_current = self::clean_version( isset( $params['expectedCurrentVersion'] ) ? $params['expectedCurrentVersion'] : '' );
 		$package_url = isset( $params['packageUrl'] ) ? esc_url_raw( (string) $params['packageUrl'] ) : '';
 		$package_sha256 = isset( $params['packageSha256'] ) ? strtolower( trim( (string) $params['packageSha256'] ) ) : '';
+		$target_build_fingerprint = isset( $params['targetBuildFingerprint'] ) ? strtolower( trim( (string) $params['targetBuildFingerprint'] ) ) : '';
+		$signature_version = isset( $params['signatureVersion'] ) ? absint( $params['signatureVersion'] ) : 1;
 		$download_token = isset( $params['downloadToken'] ) ? trim( (string) $params['downloadToken'] ) : '';
 		$issued_at = isset( $params['issuedAt'] ) ? absint( $params['issuedAt'] ) : 0;
 		$request_signature = isset( $params['requestSignature'] ) ? strtolower( trim( (string) $params['requestSignature'] ) ) : '';
@@ -70,7 +73,7 @@ class Mobo_Core_Remote_Updater {
 			return new WP_Error( 'mobo_core_upgrade_invalid_token', 'Package download token is invalid.', array( 'status' => 400 ) );
 		}
 
-		if ( ! self::verify_portal_signature( $deployment_id, $expected_current, $target_version, $package_url, $package_sha256, $download_token, $issued_at, $request_signature ) ) {
+		if ( ! self::verify_portal_signature( $deployment_id, $expected_current, $target_version, $target_build_fingerprint, $package_url, $package_sha256, $download_token, $issued_at, $request_signature, $signature_version ) ) {
 			return new WP_Error( 'mobo_core_upgrade_signature_invalid', 'Portal deployment signature is invalid or expired.', array( 'status' => 401 ) );
 		}
 
@@ -91,12 +94,35 @@ class Mobo_Core_Remote_Updater {
 			);
 		}
 
-		if ( version_compare( $target_version, $current_version, '<=' ) ) {
+		$version_comparison = version_compare( $target_version, $current_version );
+		$current_build_fingerprint = self::get_build_fingerprint();
+		if ( $version_comparison < 0 ) {
 			return new WP_Error(
-				'mobo_core_upgrade_not_newer',
-				'Target version must be newer than the installed version.',
-				array( 'status' => 409, 'currentVersion' => $current_version )
+				'mobo_core_upgrade_downgrade_rejected',
+				'Target version is older than the installed version.',
+				array( 'status' => 409, 'currentVersion' => $current_version, 'buildFingerprint' => $current_build_fingerprint )
 			);
+		}
+		if ( 0 === $version_comparison ) {
+			if ( 2 !== $signature_version || ! preg_match( '/^[a-f0-9]{64}$/', $target_build_fingerprint ) ) {
+				return new WP_Error(
+					'mobo_core_upgrade_same_version_requires_build_identity',
+					'Same-version deployment requires signed build identity protocol v2.',
+					array( 'status' => 409, 'currentVersion' => $current_version, 'buildFingerprint' => $current_build_fingerprint )
+				);
+			}
+			if ( preg_match( '/^[a-f0-9]{64}$/', $current_build_fingerprint ) && hash_equals( $target_build_fingerprint, $current_build_fingerprint ) ) {
+				return array(
+					'success'          => true,
+					'status'           => 'already-current-build',
+					'deploymentId'     => $deployment_id,
+					'previousVersion'  => $current_version,
+					'installedVersion' => $current_version,
+					'buildFingerprint' => $current_build_fingerprint,
+					'restartRequired'  => false,
+					'queuesResumable'  => true,
+				);
+			}
 		}
 
 		$lock = Mobo_Core_Lock::acquire( 'remote_plugin_upgrade', 900 );
@@ -144,7 +170,7 @@ class Mobo_Core_Remote_Updater {
 			}
 
 			self::update_status_stage( 'validating' );
-			$validation = self::validate_package( $tmp_file, $target_version, $deployment_id );
+			$validation = self::validate_package( $tmp_file, $target_version, $deployment_id, $target_build_fingerprint );
 			if ( is_wp_error( $validation ) ) {
 				throw new RuntimeException( $validation->get_error_message() );
 			}
@@ -254,12 +280,17 @@ class Mobo_Core_Remote_Updater {
 			if ( ! hash_equals( $target_version, $disk_version ) ) {
 				throw new RuntimeException( 'Installed files do not report the requested target version.' );
 			}
+			$disk_build_fingerprint = self::get_build_fingerprint();
+			if ( '' !== $target_build_fingerprint && ! hash_equals( $target_build_fingerprint, $disk_build_fingerprint ) ) {
+				throw new RuntimeException( 'Installed files do not report the requested target build fingerprint.' );
+			}
 
 			$completed = array(
 				'status'        => 'completed',
 				'deploymentId'  => $deployment_id,
 				'fromVersion'   => $current_version,
 				'targetVersion' => $target_version,
+				'targetBuildFingerprint' => $disk_build_fingerprint,
 				'startedAt'     => self::current_status_value( 'startedAt' ),
 				'completedAt'   => gmdate( 'c' ),
 				'lastError'     => '',
@@ -275,6 +306,7 @@ class Mobo_Core_Remote_Updater {
 				'deploymentId'     => $deployment_id,
 				'previousVersion'  => $current_version,
 				'installedVersion' => $disk_version,
+				'buildFingerprint' => $disk_build_fingerprint,
 				'restartRequired'  => false,
 				'queuesResumable'  => true,
 			);
@@ -414,6 +446,19 @@ class Mobo_Core_Remote_Updater {
 		$response    = null;
 		for ( $redirects = 0; $redirects <= 3; $redirects++ ) {
 			@file_put_contents( $tmp, '' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Temp stream target must be truncated between manually validated redirects.
+			$headers = array(
+				'Accept'                => 'application/zip, application/octet-stream',
+				'Token'                 => $license_token,
+				'X-Mobo-Package-Token'  => $token,
+				'Cache-Control'          => 'no-store',
+				'X-Mobo-Plugin-Version'  => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			);
+			$headers = Mobo_Core_Portal_Request_Signer::sign_headers( 'GET', $current_url, '', $headers );
+			if ( is_wp_error( $headers ) ) {
+				wp_delete_file( $tmp );
+				return $headers;
+			}
+
 			$response = wp_remote_get(
 				$current_url,
 				array(
@@ -423,13 +468,7 @@ class Mobo_Core_Remote_Updater {
 					'stream'              => true,
 					'filename'            => $tmp,
 					'limit_response_size' => self::MAX_PACKAGE_BYTES,
-					'headers'             => array(
-						'Accept'               => 'application/zip, application/octet-stream',
-						'Token'                => $license_token,
-						'X-Mobo-Package-Token' => $token,
-						'Cache-Control'         => 'no-store',
-						'X-Mobo-Plugin-Version' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
-					),
+					'headers'             => $headers,
 				)
 			);
 
@@ -541,7 +580,7 @@ class Mobo_Core_Remote_Updater {
 		return true;
 	}
 
-	private static function validate_package( $zip_file, $target_version, $deployment_id ) {
+	private static function validate_package( $zip_file, $target_version, $deployment_id, $target_build_fingerprint = '' ) {
 		$filesystem = self::initialize_direct_filesystem();
 		if ( is_wp_error( $filesystem ) ) {
 			return $filesystem;
@@ -574,6 +613,7 @@ class Mobo_Core_Remote_Updater {
 		$required_files = array(
 			'mobo-core/includes/class-mobo-core-rest-controller.php',
 			'mobo-core/includes/class-mobo-core-remote-updater.php',
+			'mobo-core/includes/class-mobo-core-portal-request-signer.php',
 			'mobo-core/includes/class-mobo-core-upgrade-coordinator.php',
 			'mobo-core/includes/class-mobo-core-migration.php',
 			'mobo-core/mobo-core-manifest.json',
@@ -590,8 +630,12 @@ class Mobo_Core_Remote_Updater {
 			self::delete_tree( $staging );
 			return $manifest_validation;
 		}
+		if ( '' !== $target_build_fingerprint && ! hash_equals( $target_build_fingerprint, $manifest_validation ) ) {
+			self::delete_tree( $staging );
+			return new WP_Error( 'mobo_core_upgrade_build_fingerprint_mismatch', 'Plugin package build fingerprint does not match targetBuildFingerprint.' );
+		}
 
-		return array( 'stagingDir' => $staging, 'version' => $version );
+		return array( 'stagingDir' => $staging, 'version' => $version, 'buildFingerprint' => $manifest_validation );
 	}
 
 	private static function validate_manifest( $staging, $expected_version ) {
@@ -675,7 +719,7 @@ class Mobo_Core_Remote_Updater {
 			}
 		}
 
-		return true;
+		return self::build_fingerprint_from_files( $manifest['files'] );
 	}
 
 	private static function install_package( $zip_file ) {
@@ -797,8 +841,14 @@ class Mobo_Core_Remote_Updater {
 		}
 	}
 
-	private static function verify_portal_signature( $deployment_id, $expected_current, $target_version, $package_url, $package_sha256, $download_token, $issued_at, $provided_signature ) {
+	private static function verify_portal_signature( $deployment_id, $expected_current, $target_version, $target_build_fingerprint, $package_url, $package_sha256, $download_token, $issued_at, $provided_signature, $signature_version = 1 ) {
 		if ( $issued_at <= 0 || abs( time() - $issued_at ) > 300 || ! preg_match( '/^[a-f0-9]{64}$/', $provided_signature ) ) {
+			return false;
+		}
+		if ( 1 !== $signature_version && 2 !== $signature_version ) {
+			return false;
+		}
+		if ( 2 === $signature_version && ! preg_match( '/^[a-f0-9]{64}$/', $target_build_fingerprint ) ) {
 			return false;
 		}
 
@@ -807,20 +857,65 @@ class Mobo_Core_Remote_Updater {
 			return false;
 		}
 
-		$canonical = implode(
-			"\n",
-			array(
-				$deployment_id,
-				$expected_current,
-				$target_version,
-				$package_url,
-				$package_sha256,
-				$download_token,
-				(string) $issued_at,
-			)
+		$parts = array(
+			$deployment_id,
+			$expected_current,
+			$target_version,
 		);
+		if ( 2 === $signature_version ) {
+			$parts[] = $target_build_fingerprint;
+		}
+		$parts[] = $package_url;
+		$parts[] = $package_sha256;
+		$parts[] = $download_token;
+		$parts[] = (string) $issued_at;
+		$canonical = implode( "\n", $parts );
 		$expected_signature = hash_hmac( 'sha256', $canonical, $security_code );
 		return hash_equals( $expected_signature, $provided_signature );
+	}
+
+	/**
+	 * Stable installed-build identity derived only from the manifest file map.
+	 * generatedAt and ZIP bytes are deliberately excluded.
+	 *
+	 * @return string Lowercase SHA-256 hex, or empty when unavailable.
+	 */
+	public static function get_build_fingerprint() {
+		$manifest_file = untrailingslashit( MOBO_CORE_PLUGIN_DIR ) . '/mobo-core-manifest.json';
+		$raw = @file_get_contents( $manifest_file );
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return '';
+		}
+		$manifest = json_decode( $raw, true );
+		if ( ! is_array( $manifest ) || empty( $manifest['files'] ) || ! is_array( $manifest['files'] ) ) {
+			return '';
+		}
+		return self::build_fingerprint_from_files( $manifest['files'] );
+	}
+
+	/**
+	 * @param array $files Manifest files map.
+	 * @return string
+	 */
+	private static function build_fingerprint_from_files( $files ) {
+		if ( ! is_array( $files ) || empty( $files ) ) {
+			return '';
+		}
+		$normalized = array();
+		foreach ( $files as $relative => $hash ) {
+			$relative = str_replace( '\\', '/', trim( (string) $relative ) );
+			$hash = strtolower( trim( (string) $hash ) );
+			if ( '' === $relative || 0 === strpos( $relative, '/' ) || false !== strpos( $relative, '../' ) || ! preg_match( '/^[a-f0-9]{64}$/', $hash ) ) {
+				return '';
+			}
+			$normalized[ $relative ] = $hash;
+		}
+		ksort( $normalized, SORT_STRING );
+		$canonical = '';
+		foreach ( $normalized as $relative => $hash ) {
+			$canonical .= $relative . '=' . $hash . "\n";
+		}
+		return hash( 'sha256', $canonical );
 	}
 
 	private static function is_trusted_package_url( $url ) {

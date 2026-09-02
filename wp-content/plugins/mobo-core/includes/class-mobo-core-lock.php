@@ -21,6 +21,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Lock {
 
+	const RECOVERY_LOG_OPTION  = 'mobo_core_stale_lock_recovery_log';
+	const RECOVERY_LAST_OPTION = 'mobo_core_stale_lock_recovery_last';
+	const RECOVERY_LOG_LIMIT   = 20;
+
 	/**
 	 * Acquire a named lock.
 	 *
@@ -55,13 +59,10 @@ class Mobo_Core_Lock {
 		 */
 		$existing_raw = self::read_raw_option( $key );
 		if ( null !== $existing_raw ) {
-			$existing = self::decode_payload( $existing_raw );
-
-			if ( is_array( $existing ) && $existing['expires_at'] > $now ) {
+			$recovery = self::recover_raw_lock_if_stale( $name, $key, $existing_raw, $now );
+			if ( empty( $recovery['recovered'] ) ) {
 				return false;
 			}
-
-			self::delete_raw_option_if_value( $key, $existing_raw );
 		}
 
 		$payload = wp_json_encode(
@@ -125,7 +126,12 @@ class Mobo_Core_Lock {
 		$payload = self::decode_payload( $raw );
 		$now     = time();
 
-		if ( ! is_array( $payload ) || $payload['expires_at'] <= $now || ! hash_equals( $payload['token'], $token ) ) {
+		if ( ! is_array( $payload ) || $payload['expires_at'] <= $now ) {
+			self::recover_raw_lock_if_stale( $name, $key, $raw, $now );
+			return false;
+		}
+
+		if ( ! hash_equals( $payload['token'], $token ) ) {
 			return false;
 		}
 
@@ -197,8 +203,8 @@ class Mobo_Core_Lock {
 
 		$payload = self::decode_payload( $raw );
 
-		if ( ! is_array( $payload ) || $payload['expires_at'] <= $now ) {
-			self::delete_raw_option_if_value( $key, $raw );
+		$recovery = self::recover_raw_lock_if_stale( $name, $key, $raw, $now );
+		if ( ! is_array( $payload ) || $payload['expires_at'] <= $now || ! empty( $recovery['recovered'] ) ) {
 			return array(
 				'active'           => false,
 				'acquiredAt'       => 0,
@@ -241,7 +247,12 @@ class Mobo_Core_Lock {
 
 		$payload = self::decode_payload( $raw );
 
-		if ( ! is_array( $payload ) || ! hash_equals( $payload['token'], $token ) ) {
+		if ( ! is_array( $payload ) ) {
+			self::recover_raw_lock_if_stale( $name, $key, $raw, time() );
+			return false;
+		}
+
+		if ( ! hash_equals( $payload['token'], $token ) ) {
 			return false;
 		}
 
@@ -275,7 +286,8 @@ class Mobo_Core_Lock {
 
 		$payload = self::decode_payload( $raw );
 		if ( ! is_array( $payload ) || $payload['expires_at'] <= time() ) {
-			return self::delete_raw_option_if_value( $key, $raw );
+			$recovery = self::recover_raw_lock_if_stale( $name, $key, $raw, time() );
+			return ! empty( $recovery['recovered'] );
 		}
 
 		$expected_created   = isset( $snapshot['acquiredAt'] ) ? absint( $snapshot['acquiredAt'] ) : 0;
@@ -318,13 +330,105 @@ class Mobo_Core_Lock {
 		}
 
 		$payload = self::decode_payload( $raw );
+		$now     = time();
 
-		if ( is_array( $payload ) && $payload['expires_at'] > time() ) {
-			return true;
+		if ( is_array( $payload ) && $payload['expires_at'] > $now ) {
+			/* A valid, bounded live lease is never force-released. */
+			$recovery = self::recover_raw_lock_if_stale( $name, $key, $raw, $now );
+			return empty( $recovery['recovered'] );
 		}
 
-		self::delete_raw_option_if_value( $key, $raw );
+		self::recover_raw_lock_if_stale( $name, $key, $raw, $now );
 		return false;
+	}
+
+	/**
+	 * Recover stale runtime locks without ever deleting a healthy live lease.
+	 *
+	 * Normal leases are reclaimed only after expires_at. A second guard handles
+	 * corrupted far-future expiry values: the heartbeat must be older than the
+	 * lock-specific hard safety ceiling and the stored lease span itself must be
+	 * implausibly larger than that ceiling. Every deletion is compare-and-delete
+	 * against the exact raw payload that was inspected.
+	 *
+	 * @param array $names Optional lock names. Empty scans all Mobo runtime locks.
+	 * @return array Recovery summary.
+	 */
+	public static function recover_stale_locks( $names = array() ) {
+		global $wpdb;
+
+		$requested = array();
+		foreach ( is_array( $names ) ? $names : array() as $name ) {
+			$name = sanitize_key( (string) $name );
+			if ( '' !== $name ) {
+				$requested[ $name ] = true;
+			}
+		}
+
+		$rows = array();
+		if ( ! empty( $requested ) ) {
+			foreach ( array_keys( $requested ) as $name ) {
+				$key = self::option_key( $name );
+				$raw = self::read_raw_option( $key );
+				if ( null !== $raw ) {
+					$rows[] = array( 'name' => $name, 'key' => $key, 'raw' => $raw );
+				}
+			}
+		} else {
+			$prefix = 'mobo_core_runtime_lock_';
+			$like   = $wpdb->esc_like( $prefix ) . '%';
+			$found  = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_name ASC",
+					$like
+				),
+				ARRAY_A
+			);
+			foreach ( is_array( $found ) ? $found : array() as $row ) {
+				$key = isset( $row['option_name'] ) ? (string) $row['option_name'] : '';
+				if ( 0 !== strpos( $key, $prefix ) ) {
+					continue;
+				}
+				$name = sanitize_key( substr( $key, strlen( $prefix ) ) );
+				if ( '' === $name ) {
+					continue;
+				}
+				$rows[] = array( 'name' => $name, 'key' => $key, 'raw' => isset( $row['option_value'] ) ? (string) $row['option_value'] : '' );
+			}
+		}
+
+		$summary = array(
+			'scanned'   => count( $rows ),
+			'recovered' => 0,
+			'active'    => 0,
+			'raced'     => 0,
+			'items'     => array(),
+		);
+		$now = time();
+
+		foreach ( $rows as $row ) {
+			$result = self::recover_raw_lock_if_stale( $row['name'], $row['key'], $row['raw'], $now );
+			if ( ! empty( $result['recovered'] ) ) {
+				$summary['recovered']++;
+				$summary['items'][] = array( 'name' => $row['name'], 'reason' => $result['reason'] );
+			} elseif ( ! empty( $result['raced'] ) ) {
+				$summary['raced']++;
+			} else {
+				$summary['active']++;
+			}
+		}
+
+		return $summary;
+	}
+
+	/** Return non-secret stale-lock recovery diagnostics. */
+	public static function get_recovery_status() {
+		$last = get_option( self::RECOVERY_LAST_OPTION, array() );
+		$log  = get_option( self::RECOVERY_LOG_OPTION, array() );
+		return array(
+			'last' => is_array( $last ) ? $last : array(),
+			'log'  => is_array( $log ) ? array_slice( $log, 0, self::RECOVERY_LOG_LIMIT ) : array(),
+		);
 	}
 
 	/**
@@ -459,6 +563,80 @@ class Mobo_Core_Lock {
 			'deleted' => false === $deleted ? 0 : absint( $deleted ),
 			'found'   => is_array( $option_names ) ? count( $option_names ) : 0,
 		);
+	}
+
+	/** Recover one inspected row when it is provably stale. */
+	private static function recover_raw_lock_if_stale( $name, $key, $raw, $now ) {
+		$payload = self::decode_payload( $raw );
+		$reason  = '';
+
+		if ( ! is_array( $payload ) ) {
+			$reason = 'malformed';
+		} elseif ( $payload['expires_at'] <= $now ) {
+			$reason = 'expired';
+		} else {
+			$heartbeat = max( absint( $payload['created_at'] ), absint( $payload['heartbeat_at'] ) );
+			$ceiling   = self::hard_stale_ceiling( $name );
+			$span      = $heartbeat > 0 ? max( 0, absint( $payload['expires_at'] ) - $heartbeat ) : 0;
+
+			/* Only recover a still-unexpired row when both timestamps prove the
+			 * expiry itself is corrupted/far-future. This never shortens a normal TTL. */
+			if ( $heartbeat > 0 && ( $now - $heartbeat ) > $ceiling && $span > $ceiling ) {
+				$reason = 'heartbeat-stale';
+			}
+		}
+
+		if ( '' === $reason ) {
+			return array( 'recovered' => false, 'raced' => false, 'reason' => 'active' );
+		}
+
+		$deleted = self::delete_raw_option_if_value( $key, $raw );
+		if ( ! $deleted ) {
+			return array( 'recovered' => false, 'raced' => true, 'reason' => $reason );
+		}
+
+		self::record_recovery( $name, $reason, is_array( $payload ) ? $payload : array(), $now );
+		return array( 'recovered' => true, 'raced' => false, 'reason' => $reason );
+	}
+
+	/** Hard ceiling used only to detect corrupted far-future leases. */
+	private static function hard_stale_ceiling( $name ) {
+		$name = sanitize_key( (string) $name );
+		$ceilings = array(
+			'manual_sync_start'          => 120,
+			'manual_sync'                => 420,
+			'self_runner_kick'            => 180,
+			'worker_dispatcher'           => 720,
+			'real_cron_runner'            => 720,
+			'webhook_queue'               => 420,
+			'image_queue_worker'          => 420,
+			'image_refresh_queue_worker'  => 420,
+			'reprice_queue_worker'        => 420,
+			'recategorize_queue_worker'   => 420,
+			'maintenance_cleanup'         => 420,
+			'remote_plugin_upgrade'       => 1200,
+			'plugin_upgrade_barrier'      => 2100,
+		);
+		return isset( $ceilings[ $name ] ) ? absint( $ceilings[ $name ] ) : 1800;
+	}
+
+	/** Store a bounded, non-secret audit trail for automatic recovery. */
+	private static function record_recovery( $name, $reason, $payload, $now ) {
+		$event = array(
+			'name'            => sanitize_key( (string) $name ),
+			'reason'          => sanitize_key( (string) $reason ),
+			'recovered_at'    => absint( $now ),
+			'created_at'      => isset( $payload['created_at'] ) ? absint( $payload['created_at'] ) : 0,
+			'heartbeat_at'    => isset( $payload['heartbeat_at'] ) ? absint( $payload['heartbeat_at'] ) : 0,
+			'expires_at'      => isset( $payload['expires_at'] ) ? absint( $payload['expires_at'] ) : 0,
+		);
+
+		update_option( self::RECOVERY_LAST_OPTION, $event, false );
+		$log = get_option( self::RECOVERY_LOG_OPTION, array() );
+		$log = is_array( $log ) ? $log : array();
+		array_unshift( $log, $event );
+		$log = array_slice( $log, 0, self::RECOVERY_LOG_LIMIT );
+		update_option( self::RECOVERY_LOG_OPTION, $log, false );
 	}
 
 	/**

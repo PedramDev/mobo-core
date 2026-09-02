@@ -1,7 +1,7 @@
 <?php
 /**
- * Recover images for existing Mobo products that currently have no usable
- * featured image.
+ * Recover images for existing Mobo products that currently have an unusable
+ * linked featured/gallery image.
  *
  * This path intentionally ignores the customer's OnlyInStock product-list
  * filter. It fetches one already-known product by its GUID and applies images
@@ -33,7 +33,7 @@ class Mobo_Core_Missing_Image_Recovery {
 
 	/**
 	 * Return a cursor batch of existing local Mobo products and runtime-filter it
-	 * to products whose featured image is physically missing or invalid. Scanning
+	 * to products whose linked featured/gallery image is physically missing or invalid. Scanning
 	 * the full Mobo product set also catches stale attachment metadata that still
 	 * points at a deleted/corrupt file.
 	 *
@@ -100,7 +100,15 @@ class Mobo_Core_Missing_Image_Recovery {
 				$cursor_end = $product_id;
 			}
 
-			if ( $product_id <= 0 || '' === $product_guid || ! $this->product_needs_image( $product_id ) ) {
+			if ( $product_id <= 0 || '' === $product_guid ) {
+				continue;
+			}
+
+			if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+				continue;
+			}
+
+			if ( ! $this->product_needs_image( $product_id ) ) {
 				continue;
 			}
 
@@ -121,7 +129,12 @@ class Mobo_Core_Missing_Image_Recovery {
 	}
 
 	/**
-	 * Whether a local product has no usable featured image.
+	 * Whether a local product has any linked image that requires source recovery.
+	 *
+	 * Preserve the historical featured-image semantics, then extend the same
+	 * physical-file validation to gallery attachments. A gallery-only gap is
+	 * suppressed while the product already has active image-queue work because
+	 * that queue owns replacement of the complete desired image set.
 	 *
 	 * @param int $product_id Product ID.
 	 * @return bool
@@ -134,28 +147,84 @@ class Mobo_Core_Missing_Image_Recovery {
 			return false;
 		}
 
-		$attachment_id = absint( $product->get_image_id() );
-		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+		$featured_id = absint( $product->get_image_id() );
+		if ( ! $this->attachment_is_usable( $featured_id ) ) {
 			return true;
+		}
+
+		$gallery_ids = array_values(
+			array_unique(
+				array_filter(
+					array_map( 'absint', (array) $product->get_gallery_image_ids() )
+				)
+			)
+		);
+
+		$gallery_needs_recovery = false;
+		foreach ( $gallery_ids as $gallery_id ) {
+			if ( ! $this->attachment_is_usable( $gallery_id ) ) {
+				$gallery_needs_recovery = true;
+				break;
+			}
+		}
+
+		if ( ! $gallery_needs_recovery ) {
+			return false;
+		}
+
+		/*
+		 * A current image queue is product-scoped desired-state coverage. Do not
+		 * launch a second product snapshot fetch merely because an older linked
+		 * gallery attachment is still missing while replacement rows are active.
+		 * Terminal/absent queue state intentionally falls through to recovery.
+		 */
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+			$queue = new Mobo_Core_Image_Queue();
+			if ( $queue->count_pending_by_product( $product_id, false ) > 0 ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Check the same local attachment invariants used by missing-image recovery.
+	 *
+	 * Shared Media is naturally covered because get_attached_file() is filtered to
+	 * the configured shared repository when the attachment is virtual/shared.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function attachment_is_usable( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+			return false;
 		}
 
 		try {
 			$file = get_attached_file( $attachment_id );
-			if ( ! is_string( $file ) || '' === $file || ! is_file( $file ) || filesize( $file ) <= 0 ) {
-				return true;
+			if ( ! is_string( $file ) || '' === $file || ! is_file( $file ) ) {
+				return false;
+			}
+
+			$size = @filesize( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Concurrent deletion is treated as an unhealthy attachment.
+			if ( false === $size || $size <= 0 ) {
+				return false;
 			}
 
 			/* Detect non-image HTTP/error payloads that happen to be non-empty files. */
 			if ( function_exists( 'wp_get_image_mime' ) ) {
 				$mime = strtolower( (string) wp_get_image_mime( $file ) );
 				if ( '' === $mime || 0 !== strpos( $mime, 'image/' ) ) {
-					return true;
+					return false;
 				}
 			}
 
-			return false;
-		} catch ( Throwable $error ) {
 			return true;
+		} catch ( Throwable $error ) {
+			return false;
 		}
 	}
 
@@ -190,6 +259,15 @@ class Mobo_Core_Missing_Image_Recovery {
 			);
 		}
 
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+			return array(
+				'success' => true,
+				'skipped' => true,
+				'reason'  => 'excluded-url',
+				'message' => 'محصول در فهرست عدم همگام‌سازی است؛ بازیابی تصویر آن اجرا نشد.',
+			);
+		}
+
 		if ( ! $this->product_needs_image( $product_id ) ) {
 			return array(
 				'success' => true,
@@ -209,9 +287,15 @@ class Mobo_Core_Missing_Image_Recovery {
 			return $response;
 		}
 
-		$items = $this->get_value( $response, 'data', array() );
-		$items = is_array( $items ) ? $items : array();
-		$item  = array();
+		if ( ! is_array( $response ) || ! Mobo_Core_Payload_Field_Policy::is_present( $response, array( 'data', 'Data' ) ) ) {
+			return new WP_Error( 'mobo_core_missing_image_recovery_data_missing', 'Product image recovery response is missing explicit data.' );
+		}
+
+		$items = Mobo_Core_Payload_Field_Policy::value( $response, array( 'data', 'Data' ), null );
+		if ( ! is_array( $items ) ) {
+			return new WP_Error( 'mobo_core_missing_image_recovery_data_invalid', 'Product image recovery data is malformed.' );
+		}
+		$item = array();
 
 		foreach ( $items as $candidate ) {
 			if ( ! is_array( $candidate ) ) {
@@ -232,9 +316,28 @@ class Mobo_Core_Missing_Image_Recovery {
 		if ( empty( $item ) && ! empty( $items[0] ) && is_array( $items[0] ) ) {
 			$item = $items[0];
 		}
+		if ( empty( $item ) ) {
+			return new WP_Error( 'mobo_core_missing_image_recovery_product_missing', 'Product image recovery response did not contain the requested product.' );
+		}
 
-		$images = $this->get_value( $item, 'images', array() );
-		$images = is_array( $images ) ? $images : array();
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_payload_excluded( $item, true ) ) {
+			return array(
+				'success' => true,
+				'skipped' => true,
+				'reason'  => 'excluded-url',
+				'message' => 'Snapshot فعلی محصول مستثنی است؛ تصاویر آن تغییر نکرد.',
+			);
+		}
+
+		$image_field = Mobo_Core_Image_Desired_State_Policy::inspect_field( $item );
+		if ( empty( $image_field['present'] ) ) {
+			return new WP_Error( 'mobo_core_missing_image_recovery_images_missing', 'Current product snapshot omitted image desired state; existing image state was preserved.' );
+		}
+		$image_integrity = Mobo_Core_Image_Desired_State_Policy::validate_collection( $image_field['value'] );
+		if ( is_wp_error( $image_integrity ) ) {
+			return $image_integrity;
+		}
+		$images = $image_field['value'];
 
 		if ( empty( $images ) ) {
 			return array(

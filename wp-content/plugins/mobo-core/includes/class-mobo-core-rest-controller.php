@@ -191,6 +191,16 @@ class Mobo_Core_Rest_Controller {
 
 		register_rest_route(
 			'mobo-core/v1',
+			'/license-installation/challenge',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'license_installation_challenge' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
 			'/portal/webhook-test',
 			array(
 				'methods'             => 'POST',
@@ -322,6 +332,24 @@ class Mobo_Core_Rest_Controller {
 		return true;
 	}
 
+
+
+	/**
+	 * Sign a Portal challenge to prove that registration controls this exact
+	 * X-SEC protected WordPress installation. No private key material is exposed.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function license_installation_challenge( $request ) {
+		$challenge = sanitize_text_field( (string) $request->get_param( 'challenge' ) );
+		$installation_id = sanitize_text_field( (string) $request->get_param( 'installationId' ) );
+		$result = Mobo_Core_Portal_Request_Signer::create_challenge_response( $challenge, $installation_id );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+		return rest_ensure_response( $result );
+	}
 
 	/**
 	 * Explicit Portal-to-WordPress webhook credential test.

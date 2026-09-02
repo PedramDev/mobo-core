@@ -1,12 +1,13 @@
 <?php
 /**
- * Safe automation coordinator for the legacy-image refresh workflow.
+ * Safe automation coordinator for the full-source image refresh workflow.
  *
  * It advances one bounded workflow batch per cron/self-runner slice. Read-only
  * scans, queue creation, replacement, WebP subsize verification/repair and
  * post-replacement cleanup are fully autonomous. The administrator starts one
- * workflow and the coordinator performs prerequisite Repair, retry/backoff, safe
- * deletion and quarantine decisions without manual approval or pause gates.
+ * workflow and the coordinator performs storage cleanup, retry/backoff, safe
+ * deletion and quarantine decisions without manual approval or pause gates. A
+ * Product Repair is only a prerequisite and is never started by this workflow.
  *
  * PHP 7.4 compatible.
  */
@@ -31,6 +32,13 @@ class Mobo_Core_Image_Refresh_Automation {
 	const OPTION_SUBSIZE_QUARANTINED     = 'mobo_core_image_refresh_subsize_quarantined';
 	const OPTION_REPAIR_RETRY_COUNT      = 'mobo_core_image_refresh_repair_retry_count';
 	const OPTION_REPAIR_RETRY_AT         = 'mobo_core_image_refresh_repair_retry_at';
+		const OPTION_PREFLIGHT_COMPLETED_AT  = 'mobo_core_image_refresh_preflight_cleanup_completed_at';
+		const OPTION_GENERATION_ID           = 'mobo_core_image_refresh_generation_id';
+		const OPTION_GENERATION_STARTED_AT   = 'mobo_core_image_refresh_generation_started_at';
+		const OPTION_GENERATION_STATS        = 'mobo_core_image_refresh_generation_stats';
+
+	/** @var string Concrete environment preflight failure for the current request. */
+	private $last_environment_error = '';
 
 	/**
 	 * Return current automation status for admin and health reporting.
@@ -46,6 +54,8 @@ class Mobo_Core_Image_Refresh_Automation {
 		$lock_active   = class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( 'image_refresh_automation' );
 		$tick_open     = $tick_started > 0 && $tick_started > $tick_finished;
 		$tick_age      = $tick_open ? max( 0, time() - $tick_started ) : 0;
+		$generation_stats = get_option( self::OPTION_GENERATION_STATS, array() );
+		$generation_stats = is_array( $generation_stats ) ? $generation_stats : array();
 
 		return array(
 			'enabled'              => Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ),
@@ -63,8 +73,10 @@ class Mobo_Core_Image_Refresh_Automation {
 			'currentStep'          => absint( isset( $last['step'] ) ? $last['step'] : 0 ),
 			'status'               => isset( $last['status'] ) ? sanitize_key( (string) $last['status'] ) : 'idle',
 			'waitingApproval'      => isset( $last['waitingApproval'] ) ? sanitize_key( (string) $last['waitingApproval'] ) : '',
-			'message'              => isset( $last['message'] ) ? sanitize_text_field( (string) $last['message'] ) : '',
-			'lastResult'           => $last,
+				'message'              => isset( $last['message'] ) ? sanitize_text_field( (string) $last['message'] ) : '',
+				'generationId'         => sanitize_text_field( (string) get_option( self::OPTION_GENERATION_ID, '' ) ),
+				'generationStats'      => $generation_stats,
+				'lastResult'           => $last,
 		);
 	}
 
@@ -96,6 +108,32 @@ class Mobo_Core_Image_Refresh_Automation {
 			$this->reset_for_new_cycle();
 		}
 
+		$generation_id = sanitize_text_field( (string) get_option( self::OPTION_GENERATION_ID, '' ) );
+		if ( '' === $generation_id ) {
+			$generation_id = wp_generate_uuid4();
+			update_option( self::OPTION_GENERATION_ID, $generation_id, false );
+			update_option( self::OPTION_GENERATION_STARTED_AT, time(), false );
+			update_option(
+				self::OPTION_GENERATION_STATS,
+				array(
+					'generationId'   => $generation_id,
+					'freshDownloads' => 0,
+					'reusedLinks'    => 0,
+					'bytesBefore'    => 0,
+					'bytesAfter'     => 0,
+					'updatedAt'      => time(),
+				),
+				false
+			);
+		}
+		update_option( 'mobo_core_image_refresh_force_source_reimport', '1', false );
+
+		delete_option( self::OPTION_PREFLIGHT_COMPLETED_AT );
+		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
+			$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
+			$cleanup->reset( true );
+		}
+
 		$retried_legacy_failures = 0;
 		if ( class_exists( 'Mobo_Core_Image_Refresh_Queue' ) && Mobo_Core_Image_Refresh_Queue::table_exists() ) {
 			$refresh_queue            = new Mobo_Core_Image_Refresh_Queue();
@@ -118,6 +156,7 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$repair = $this->ensure_product_repair_ready();
 		if ( empty( $repair['ready'] ) ) {
+			update_option( self::OPTION_ENABLED, '0', false );
 			return $this->save_result(
 				array(
 					'success'               => true,
@@ -126,7 +165,7 @@ class Mobo_Core_Image_Refresh_Automation {
 					'needsContinuation'     => ! empty( $repair['needsContinuation'] ),
 					'progressed'            => ! empty( $repair['progressed'] ),
 					'retriedLegacyFailures' => absint( $retried_legacy_failures ),
-					'message'               => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'ترمیم پیش نیاز به صورت خودکار در حال انجام است.',
+					'message'               => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'پیش‌نیاز Repair محصولات تکمیل نشده است.',
 				)
 			);
 		}
@@ -140,8 +179,8 @@ class Mobo_Core_Image_Refresh_Automation {
 				'progressed'            => true,
 				'retriedLegacyFailures' => absint( $retried_legacy_failures ),
 				'message'               => $retried_legacy_failures > 0
-					? sprintf( 'نوسازی خودکار شروع شد و %d مورد قرنطینه شده از چرخه قبل برای تلاش تازه آزاد شد.', absint( $retried_legacy_failures ) )
-					: 'نوسازی خودکار شروع شد. از این نقطه تمام Repair، Retry، بررسی ایمنی و پاکسازی توسط سیستم انجام می شود.',
+					? sprintf( 'نوسازی کامل از منبع شروع شد و %d مورد قرنطینه‌شده از چرخه قبل برای تلاش تازه آزاد شد.', absint( $retried_legacy_failures ) )
+					: 'نوسازی کامل با پاک‌سازی اولیه شروع شد؛ تصاویر Mobo با cache-bust از منبع دوباره دریافت می‌شوند. Repair/Reconciliation خودکار نیست.',
 			)
 		);
 	}
@@ -421,13 +460,14 @@ class Mobo_Core_Image_Refresh_Automation {
 	private function run_locked( $source ) {
 		$repair = $this->ensure_product_repair_ready();
 		if ( empty( $repair['ready'] ) ) {
+			update_option( self::OPTION_ENABLED, '0', false );
 			return array(
 				'success'           => true,
 				'status'            => isset( $repair['status'] ) ? sanitize_key( (string) $repair['status'] ) : 'waiting-product-repair',
 				'step'              => 0,
 				'needsContinuation' => ! empty( $repair['needsContinuation'] ),
 				'progressed'        => ! empty( $repair['progressed'] ),
-				'message'           => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'ترمیم محصولات به صورت خودکار در حال انجام است.',
+				'message'           => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'پیش‌نیاز Repair محصولات تکمیل نشده است.',
 			);
 		}
 
@@ -437,13 +477,17 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$service    = new Mobo_Core_Image_Refresh_Service();
 		$queue      = new Mobo_Core_Image_Refresh_Queue();
-		$scan_limit = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 500, 50, 5000 );
+		$scan_limit = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_scan_limit', 50, 10, 5000 );
+		$preflight  = $this->run_preflight_storage_cleanup( $scan_limit );
+		if ( empty( $preflight['ready'] ) ) {
+			return $preflight;
+		}
 		$state      = $this->read_state( $queue );
 
-		/* 1. Read-only legacy scan. */
+		/* 1. Read-only Mobo image scan, including current WebP sources. */
 		if ( empty( $state['scanComplete'] ) ) {
 			$operation = $service->scan_legacy_images( $scan_limit );
-			return $this->operation_result( 1, 'scan-legacy', $operation, 'بررسی خودکار تصاویر قدیمی', empty( $operation['cycleComplete'] ) );
+			return $this->operation_result( 1, 'scan-source-images', $operation, 'بررسی تصاویر Mobo برای دریافت مجدد از منبع', empty( $operation['cycleComplete'] ) );
 		}
 
 		/* 2. Queue construction. */
@@ -478,7 +522,7 @@ class Mobo_Core_Image_Refresh_Automation {
 			}
 
 			if ( ! $this->image_environment_ready( true ) ) {
-				return $this->pause_for_error( 'موتور WebP، uploads یا Shared Media فعلاً آماده نیست؛ هیچ داده ای تغییر نمی کند و سیستم خودکار دوباره امتحان می کند.', 3, 'image-environment-not-ready' );
+				return $this->pause_for_error( $this->image_environment_error( 'موتور WebP، uploads یا Shared Media فعلاً آماده نیست؛ هیچ داده ای تغییر نمی کند و سیستم خودکار دوباره امتحان می کند.' ), 3, 'image-environment-not-ready' );
 			}
 
 			$limit     = Mobo_Core_Settings::get_int( 'mobo_core_image_refresh_per_run', 2, 1, 20 );
@@ -539,7 +583,7 @@ class Mobo_Core_Image_Refresh_Automation {
 
 				$local_needs_repair = absint( isset( $subsize_scan['localNeedsRepair'] ) ? $subsize_scan['localNeedsRepair'] : 0 );
 				if ( $local_needs_repair > 0 && ! $this->image_environment_ready( false ) ) {
-					return $this->pause_for_error( 'موتور WebP یا uploads فعلاً برای بازسازی برش های محلی آماده نیست؛ سیستم خودکار retry می کند.', 5, 'image-environment-not-ready' );
+					return $this->pause_for_error( $this->image_environment_error( 'موتور WebP یا uploads فعلاً برای بازسازی برش های محلی آماده نیست؛ سیستم خودکار retry می کند.' ), 5, 'image-environment-not-ready' );
 				}
 
 				$operation = $service->audit_webp_subsizes( $scan_limit, true );
@@ -653,101 +697,128 @@ class Mobo_Core_Image_Refresh_Automation {
 	}
 
 	/**
-	 * Ensure the Product Repair prerequisite without asking the administrator.
-	 * Existing sync work is never cancelled; the coordinator waits and starts its
-	 * own Repair as soon as the sync lane becomes free.
+	 * Free proven collision/orphan storage before any image download, conversion or
+	 * subsize generation. Candidate deletion is interleaved with the cursor scan so
+	 * a full disk starts recovering after the first small batch instead of waiting
+	 * for the entire media library to be scanned.
+	 *
+	 * @param int $scan_limit Configured workflow scan limit.
+	 * @return array
+	 */
+	private function run_preflight_storage_cleanup( $scan_limit ) {
+		if ( absint( get_option( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) > 0 ) {
+			return array( 'ready' => true, 'status' => 'preflight-complete' );
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
+			return array(
+				'ready'             => false,
+				'success'           => false,
+				'status'            => 'missing-preflight-cleanup',
+				'step'              => 0,
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'ماژول پاک‌سازی اولیه تصاویر در دسترس نیست؛ نوسازی برای جلوگیری از مصرف بیشتر دیسک شروع نشد.',
+			);
+		}
+
+		$cleanup   = new Mobo_Core_Orphan_Image_Cleanup();
+		$collision = get_option( Mobo_Core_Orphan_Image_Cleanup::INCOMPLETE_COLLISION_RESULT_OPTION, array() );
+		$collision = is_array( $collision ) ? $collision : array();
+		if ( empty( $collision['cycleComplete'] ) ) {
+			$limit     = min( 5, Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 100 ) );
+			$operation = $cleanup->cleanup_incomplete_collision_attachments( $limit );
+			$busy      = in_array( isset( $operation['status'] ) ? (string) $operation['status'] : '', array( 'image-queue-busy', 'image-refresh-queue-busy' ), true );
+			return array(
+				'ready'             => false,
+				'success'           => true,
+				'status'            => $busy ? 'waiting-preflight-worker' : 'preflight-collision-cleanup',
+				'step'              => 0,
+				'needsContinuation' => ! $busy,
+				'progressed'        => ! empty( $operation['processed'] ) || ! empty( $operation['deletedAttachments'] ),
+				'message'           => $busy
+					? 'یک Worker تصویر فعال است؛ پاک‌سازی collision در اجرای بعدی و بدون رقابت ادامه پیدا می‌کند.'
+					: sprintf(
+						'پاک‌سازی اولیه Attachmentهای collision ناقص: %d بررسی، %d حذف، %s مگابایت آزاد شد.',
+						absint( isset( $operation['processed'] ) ? $operation['processed'] : 0 ),
+						absint( isset( $operation['deletedAttachments'] ) ? $operation['deletedAttachments'] : 0 ),
+						number_format_i18n( absint( isset( $operation['deletedBytes'] ) ? $operation['deletedBytes'] : 0 ) / 1048576, 1 )
+					),
+				'operation'         => $operation,
+			);
+		}
+
+		$status     = $cleanup->get_status();
+		$actionable = absint( isset( $status['actionable'] ) ? $status['actionable'] : 0 );
+		if ( $actionable > 0 ) {
+			update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
+			update_option( 'mobo_core_orphan_image_cleanup_enabled', '1', false );
+			$operation = $cleanup->delete_candidates( Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 100 ) );
+			return array(
+				'ready'             => false,
+				'success'           => true,
+				'status'            => 'preflight-orphan-delete',
+				'step'              => 0,
+				'needsContinuation' => true,
+				'progressed'        => ! empty( $operation['checkedFamilies'] ),
+				'message'           => sprintf(
+					'پاک‌سازی اولیه فایل‌های collision بدون Attachment: %d فایل حذف و %s مگابایت آزاد شد.',
+					absint( isset( $operation['deletedFiles'] ) ? $operation['deletedFiles'] : 0 ),
+					number_format_i18n( absint( isset( $operation['bytes'] ) ? $operation['bytes'] : 0 ) / 1048576, 1 )
+				),
+				'operation'         => $operation,
+			);
+		}
+
+		$scan = isset( $status['lastScan'] ) && is_array( $status['lastScan'] ) ? $status['lastScan'] : array();
+		if ( empty( $scan['cycleComplete'] ) ) {
+			/* A small fixed batch avoids wildcard-reference audits monopolizing the
+			 * runner budget on media-heavy stores. Deletion is handled next tick before
+			 * the cursor advances again. */
+			$operation = $cleanup->scan( min( 50, max( 1, absint( $scan_limit ) ) ) );
+			return array(
+				'ready'             => false,
+				'success'           => true,
+				'status'            => 'preflight-orphan-scan',
+				'step'              => 0,
+				'needsContinuation' => true,
+				'progressed'        => ! empty( $operation['processedAttachments'] ) || ! empty( $operation['cycleComplete'] ),
+				'message'           => sprintf(
+					'اسکن اولیه فایل‌های collision: %d Attachment بررسی و %d خانواده قابل حذف پیدا شد.',
+					absint( isset( $operation['processedAttachments'] ) ? $operation['processedAttachments'] : 0 ),
+					absint( isset( $operation['candidateFamilies'] ) ? $operation['candidateFamilies'] : 0 )
+				),
+				'operation'         => $operation,
+			);
+		}
+
+		update_option( self::OPTION_PREFLIGHT_COMPLETED_AT, time(), false );
+		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+		return array( 'ready' => true, 'status' => 'preflight-complete' );
+	}
+
+	/**
+	 * Require an already-completed Product Repair without ever starting, retrying
+	 * or cancelling one from the image workflow. Product repair is an independent
+	 * administrator decision; image optimization must not mutate product state.
 	 *
 	 * @return array
 	 */
 	private function ensure_product_repair_ready() {
-		if ( ! class_exists( 'Mobo_Core_Product_Sync' ) ) {
-			return array(
-				'ready'             => false,
-				'status'            => 'waiting-product-repair',
-				'needsContinuation' => false,
-				'progressed'        => false,
-				'message'           => 'ماژول ترمیم محصولات فعلاً در دسترس نیست؛ سیستم در اجرای بعدی دوباره بررسی می کند.',
-			);
-		}
+		delete_option( self::OPTION_REPAIR_RETRY_COUNT );
+		delete_option( self::OPTION_REPAIR_RETRY_AT );
 
-		if ( Mobo_Core_Product_Sync::is_repair_completed() ) {
-			delete_option( self::OPTION_REPAIR_RETRY_COUNT );
-			delete_option( self::OPTION_REPAIR_RETRY_AT );
+		if ( class_exists( 'Mobo_Core_Product_Sync' ) && Mobo_Core_Product_Sync::is_repair_completed() ) {
 			return array( 'ready' => true, 'status' => 'repair-ready', 'needsContinuation' => true, 'progressed' => false );
 		}
 
-		$product_sync = new Mobo_Core_Product_Sync();
-		$status       = $product_sync->get_manual_sync_status();
-		$is_active    = ! empty( $status['isRunning'] ) || ! empty( $status['isWaitingForPortal'] );
-		$last_error   = isset( $status['lastError'] ) ? sanitize_text_field( (string) $status['lastError'] ) : '';
-
-		/* A generation with lastError is not resumable by the normal Self Runner. Do
-		 * not leave the one-click workflow stranded there: after bounded backoff,
-		 * retire that failed generation and start a fresh idempotent Repair. */
-		if ( $is_active && '' !== $last_error && empty( $status['shouldContinue'] ) ) {
-			$retry_at = absint( get_option( self::OPTION_REPAIR_RETRY_AT, 0 ) );
-			if ( $retry_at <= 0 ) {
-				$attempt = absint( get_option( self::OPTION_REPAIR_RETRY_COUNT, 0 ) ) + 1;
-				update_option( self::OPTION_REPAIR_RETRY_COUNT, $attempt, false );
-				$delay = min( 1800, max( 300, $attempt * 300 ) );
-				update_option( self::OPTION_REPAIR_RETRY_AT, time() + $delay, false );
-				return array(
-					'ready'             => false,
-					'status'            => 'waiting-product-repair-retry',
-					'needsContinuation' => false,
-					'progressed'        => true,
-					'message'           => sprintf( 'Repair محصولات با خطا پایان یافت؛ Retry خودکار شماره %d زمان بندی شد و نیازی به Resume/Cancel دستی نیست.', $attempt ),
-				);
-			}
-
-			if ( $retry_at > time() ) {
-				return array(
-					'ready'             => false,
-					'status'            => 'waiting-product-repair-retry',
-					'needsContinuation' => false,
-					'progressed'        => false,
-					'message'           => 'Repair ناموفق در backoff خودکار است؛ در زمان تعیین شده بدون دخالت مدیر از ابتدا و با state تازه اجرا می شود.',
-				);
-			}
-
-			$cancelled = $product_sync->cancel_manual_sync();
-			if ( ! is_array( $cancelled ) || empty( $cancelled['success'] ) ) {
-				return array(
-					'ready'             => false,
-					'status'            => 'waiting-product-repair-retry',
-					'needsContinuation' => false,
-					'progressed'        => false,
-					'message'           => 'نسل ناموفق Repair هنوز قابل جمع کردن نیست؛ سیستم در Cron بعدی دوباره تلاش می کند.',
-				);
-			}
-			delete_option( self::OPTION_REPAIR_RETRY_AT );
-			$status    = $product_sync->get_manual_sync_status();
-			$is_active = false;
-		}
-
-		if ( $is_active ) {
-			$is_repair = ! empty( $status['repairMode'] );
-			return array(
-				'ready'             => false,
-				'status'            => $is_repair ? 'waiting-product-repair' : 'waiting-current-product-sync',
-				'needsContinuation' => ! empty( $status['shouldContinue'] ),
-				'progressed'        => false,
-				'message'           => $is_repair
-					? 'ترمیم محصولات که برای نوسازی لازم است در حال اجراست و پس از تکمیل، تصاویر خودکار ادامه پیدا می کنند.'
-					: 'یک Sync محصول دیگر در حال اجراست؛ سیستم آن را قطع نمی کند و بلافاصله پس از آزاد شدن مسیر، Repair لازم را خودش شروع می کند.',
-			);
-		}
-
-		$started = $product_sync->start_manual_sync( '', 'image-refresh-auto-repair', true );
-		$success = is_array( $started ) && ! empty( $started['success'] );
 		return array(
 			'ready'             => false,
-			'status'            => $success ? 'waiting-product-repair' : 'waiting-product-repair-retry',
-			'needsContinuation' => $success,
-			'progressed'        => $success,
-			'message'           => $success
-				? 'Repair کامل محصولات به عنوان پیش نیاز نوسازی، خودکار شروع شد و نیازی به اقدام مدیر نیست.'
-				: 'Repair هنوز قابل شروع نیست؛ سیستم بدون لغو چرخه در اجرای بعدی دوباره تلاش می کند.',
+			'status'            => 'repair-required-but-not-started',
+			'needsContinuation' => false,
+			'progressed'        => false,
+			'message'           => 'نوسازی تصاویر به Repair تکمیل‌شده نیاز دارد، اما این Workflow طبق سیاست فعلی اجازه شروع یا Retry خودکار Repair محصولات را ندارد.',
 		);
 	}
 
@@ -791,6 +862,10 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return int
 	 */
 	private function detect_step() {
+		if ( absint( get_option( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) <= 0 ) {
+			return 0;
+		}
+
 		if ( ! class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ) {
 			return 0;
 		}
@@ -971,6 +1046,10 @@ class Mobo_Core_Image_Refresh_Automation {
 		delete_option( self::OPTION_SUBSIZE_QUARANTINED );
 		delete_option( self::OPTION_REPAIR_RETRY_COUNT );
 		delete_option( self::OPTION_REPAIR_RETRY_AT );
+		delete_option( self::OPTION_PREFLIGHT_COMPLETED_AT );
+		delete_option( self::OPTION_GENERATION_ID );
+		delete_option( self::OPTION_GENERATION_STARTED_AT );
+		delete_option( self::OPTION_GENERATION_STATS );
 		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 	}
@@ -981,6 +1060,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return bool
 	 */
 	private function image_environment_ready( $allow_shared_worker = false ) {
+		$this->last_environment_error = '';
 		$shared_configured = $allow_shared_worker
 			&& class_exists( 'Mobo_Core_Shared_Media' )
 			&& ( method_exists( 'Mobo_Core_Shared_Media', 'is_configured' ) ? Mobo_Core_Shared_Media::is_configured() : Mobo_Core_Shared_Media::is_enabled() );
@@ -994,6 +1074,17 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$uploads = wp_upload_dir();
 		$writable = empty( $uploads['error'] ) && ! empty( $uploads['basedir'] ) && wp_is_writable( $uploads['basedir'] );
+		if ( ! $writable ) {
+			$this->last_environment_error = 'پوشه uploads برای نوشتن آماده نیست.';
+		}
+
+		if ( $writable && class_exists( 'Mobo_Core_Image_Storage' ) ) {
+			$storage = Mobo_Core_Image_Storage::check();
+			if ( empty( $storage['ready'] ) ) {
+				$writable = false;
+				$this->last_environment_error = sanitize_text_field( isset( $storage['message'] ) ? (string) $storage['message'] : 'فضای ذخیره‌سازی تصویر آماده نیست.' );
+			}
+		}
 		$wp_webp = false;
 		if ( function_exists( 'wp_image_editor_supports' ) ) {
 			$wp_webp = wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) );
@@ -1011,6 +1102,18 @@ class Mobo_Core_Image_Refresh_Automation {
 			&& version_compare( PHP_VERSION, '7.4', '>=' )
 			&& $writable
 			&& (bool) $wp_webp;
+	}
+
+	/**
+	 * Return the concrete storage/editor failure captured by the latest preflight.
+	 *
+	 * @param string $fallback Generic fallback message.
+	 * @return string
+	 */
+	private function image_environment_error( $fallback ) {
+		return '' !== $this->last_environment_error
+			? $this->last_environment_error
+			: sanitize_text_field( (string) $fallback );
 	}
 
 	/**

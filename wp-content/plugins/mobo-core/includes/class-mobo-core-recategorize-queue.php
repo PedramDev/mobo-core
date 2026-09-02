@@ -68,7 +68,9 @@ class Mobo_Core_Recategorize_Queue {
 			'failureAttempts' => array(),
 		);
 
-		update_option( self::STATE_OPTION, $state, false );
+		if ( ! $this->persist_state_verified( $state ) ) {
+			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'وضعیت شروع صف به‌صورت پایدار ذخیره نشد؛ هیچ اجرای جدیدی تأیید نشد.' );
+		}
 
 		return array(
 			'success' => true,
@@ -101,7 +103,9 @@ class Mobo_Core_Recategorize_Queue {
 		$state['status']      = 'cancelled';
 		$state['lastMessage'] = 'اعمال مجدد دسته‌بندی‌ها متوقف شد.';
 		$state['updatedAt']   = time();
-		update_option( self::STATE_OPTION, $state, false );
+		if ( ! $this->persist_state_verified( $state ) ) {
+			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'وضعیت لغو صف به‌صورت پایدار ذخیره نشد.' );
+		}
 
 		return array( 'success' => true, 'message' => $state['lastMessage'] );
 		} finally {
@@ -122,6 +126,10 @@ class Mobo_Core_Recategorize_Queue {
 
 		try {
 		delete_option( self::STATE_OPTION );
+		wp_cache_delete( self::STATE_OPTION, 'options' );
+		if ( null !== get_option( self::STATE_OPTION, null ) ) {
+			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'پاک‌سازی وضعیت صف در دیتابیس تأیید نشد.' );
+		}
 
 		return array( 'success' => true, 'message' => 'وضعیت اعمال مجدد دسته‌بندی‌ها پاک شد.' );
 		} finally {
@@ -201,7 +209,9 @@ class Mobo_Core_Recategorize_Queue {
 			$state['lastMessage'] = 'اعمال مجدد دسته‌بندی‌ها کامل شد.';
 			$state['updatedAt']   = time();
 			$state['completedAt'] = time();
-			update_option( self::STATE_OPTION, $state, false );
+			if ( ! $this->persist_state_verified( $state ) ) {
+				return array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true, 'status' => 'checkpoint-failed', 'checkpointFailed' => true );
+			}
 
 			return array(
 				'processed' => 0,
@@ -222,6 +232,7 @@ class Mobo_Core_Recategorize_Queue {
 		$paused_for_upgrade = false;
 		$budget_exhausted   = false;
 		$retry_blocked      = false;
+		$checkpoint_failed  = false;
 		$last_checkpoint_at = microtime( true );
 		$checkpoint_every   = 5;
 		$checkpoint_seconds = 2.0;
@@ -242,7 +253,7 @@ class Mobo_Core_Recategorize_Queue {
 			try {
 				$result = $this->recategorize_product( $post_id );
 				$reason = is_array( $result ) && isset( $result['reason'] ) ? sanitize_key( (string) $result['reason'] ) : '';
-				if ( 'product-lock-busy' === $reason ) {
+				if ( in_array( $reason, array( 'product-sync-active', 'product-lock-busy' ), true ) ) {
 					$retry_blocked = true;
 					$state['lastMessage'] = sprintf( 'دسته‌بندی محصول %d به دلیل همگام‌سازی هم‌زمان به اجرای بعد موکول شد.', $post_id );
 					break;
@@ -287,7 +298,11 @@ class Mobo_Core_Recategorize_Queue {
 				$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
 				$checkpoint['updatedAt']   = time();
 				$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد دسته‌بندی؛ آخرین محصول بررسی‌شده: %d', $post_id );
-				update_option( self::STATE_OPTION, $checkpoint, false );
+				if ( ! $this->persist_state_verified( $checkpoint ) ) {
+					$checkpoint_failed = true;
+					$state['lastError'] = 'Queue checkpoint could not be persisted durably.';
+					break;
+				}
 				$last_checkpoint_at = microtime( true );
 			}
 		}
@@ -299,7 +314,7 @@ class Mobo_Core_Recategorize_Queue {
 		$state['updatedAt']   = time();
 		$state['lastMessage'] = sprintf( 'در این مرحله %d محصول بررسی شد؛ %d محصول تغییر کرد، %d محصول رد شد.', $processed, $updated, $skipped );
 
-		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || $checkpoint_failed || count( $ids ) >= $limit;
 
 		if ( ! $remaining ) {
 			$state['status']      = 'done';
@@ -307,7 +322,10 @@ class Mobo_Core_Recategorize_Queue {
 			$state['completedAt'] = time();
 		}
 
-		update_option( self::STATE_OPTION, $state, false );
+		if ( ! $this->persist_state_verified( $state ) ) {
+			$checkpoint_failed = true;
+			$remaining = true;
+		}
 
 		return array(
 			'processed' => $processed,
@@ -315,7 +333,8 @@ class Mobo_Core_Recategorize_Queue {
 			'skipped'   => $skipped,
 			'failed'    => $failed,
 			'remaining' => $remaining,
-			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ),
+			'status'    => $checkpoint_failed ? 'checkpoint-failed' : ( $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ) ),
+			'checkpointFailed' => $checkpoint_failed,
 			'budgetExhausted' => $budget_exhausted,
 			'retryBlocked'    => $retry_blocked,
 			'state'     => $state,
@@ -324,6 +343,12 @@ class Mobo_Core_Recategorize_Queue {
 		} finally {
 			Mobo_Core_Lock::release( 'recategorize_queue_worker', $worker_lock );
 		}
+	}
+
+
+	/** Persist queue state and verify the exact value from wp_options. */
+	private function persist_state_verified( $state ) {
+		return is_array( $state ) && Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
 	}
 
 	/**
@@ -366,9 +391,17 @@ class Mobo_Core_Recategorize_Queue {
 	 */
 	private function recategorize_product( $post_id ) {
 		$post_id = absint( $post_id );
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $post_id ) ) {
+			return false;
+		}
+
 		$product_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
 
 		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				return array( 'changed' => false, 'skipped' => true, 'reason' => 'product-sync-active' );
+			}
+
 			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 120 );
 
 			if ( false === $lock ) {
@@ -387,6 +420,10 @@ class Mobo_Core_Recategorize_Queue {
 
 	private function recategorize_product_locked( $post_id ) {
 		$post_id = absint( $post_id );
+
+		if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $post_id ) ) {
+			return array( 'changed' => false, 'skipped' => true, 'reason' => 'excluded-url' );
+		}
 
 		if ( ! $this->is_allowed_product( $post_id ) ) {
 			return array( 'changed' => false, 'skipped' => true, 'reason' => 'not-allowed' );
@@ -457,9 +494,6 @@ class Mobo_Core_Recategorize_Queue {
 				return false;
 			}
 
-			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
-				return false;
-			}
 		}
 
 		return true;
@@ -475,47 +509,56 @@ class Mobo_Core_Recategorize_Queue {
 		$post_id = absint( $post_id );
 		$refs    = array();
 
-		/*
-		 * Merge all available sources instead of returning early. Some older plugin
-		 * versions stored a wrapper/relation GUID in mobo_product_category_guids.
-		 * Recovering from the latest event lets us include the actual category GUID
-		 * as well, so partial mappings can still be applied.
-		 */
-		$stored_refs = $this->decode_refs_json( get_post_meta( $post_id, 'mobo_product_category_refs_json', true ) );
+		/* Since 10.33.44.12 Product Sync persists an explicit authoritative marker.
+		 * This is deliberately checked before any historical fallback: [] means the
+		 * source intentionally wants no categories, not that local evidence is missing. */
+		$authoritative_local = '1' === (string) get_post_meta( $post_id, '_mobo_product_category_refs_authoritative', true );
+		$stored_refs         = $this->decode_refs_json( get_post_meta( $post_id, 'mobo_product_category_refs_json', true ) );
+		$guids               = get_post_meta( $post_id, 'mobo_product_category_guids', true );
 		if ( ! empty( $stored_refs ) ) {
 			$refs = array_merge( $refs, $stored_refs );
 		}
-
-		$guids = get_post_meta( $post_id, 'mobo_product_category_guids', true );
 		if ( is_array( $guids ) && ! empty( $guids ) ) {
 			$refs = array_merge( $refs, $this->refs_from_guids( $guids ) );
 		}
+		$refs = $this->normalize_category_refs( $refs );
+		if ( $authoritative_local ) {
+			return $refs;
+		}
 
-		$event_refs = $this->recover_refs_from_latest_event( $post_id );
+		/* Legacy installs may have partial/non-authoritative local metadata. Inspect the
+		 * newest ProductUpdated evidence, but stop even on an explicit empty list. */
+		$event_known     = false;
+		$event_malformed = false;
+		$event_refs      = $this->recover_refs_from_latest_event( $post_id, $event_known, $event_malformed );
+		if ( $event_known ) {
+			$event_refs = $this->normalize_category_refs( $event_refs );
+			$this->store_category_refs_meta( $post_id, $event_refs );
+			return $event_refs;
+		}
 		if ( ! empty( $event_refs ) ) {
 			$refs = array_merge( $refs, $event_refs );
 		}
 
-		/*
-		 * Older installs may have synced the product before category GUID meta
-		 * existed and may also have no complete ProductUpdated payload left in the
-		 * local event table. In that case, backfill directly from MoboCore by the
-		 * product_guid and then apply the current mapping. This avoids forcing a
-		 * full product sync just to refresh categories.
-		 */
+		/* If no event carries category state, ask the current API snapshot. A valid
+		 * response with an explicit empty category list also becomes authoritative. */
 		if ( empty( $refs ) ) {
-			$api_refs = $this->recover_refs_from_api( $post_id );
+			$api_known = false;
+			$api_refs  = $this->recover_refs_from_api( $post_id, $api_known );
+			if ( $api_known ) {
+				$api_refs = $this->normalize_category_refs( $api_refs );
+				$this->store_category_refs_meta( $post_id, $api_refs );
+				return $api_refs;
+			}
 			if ( ! empty( $api_refs ) ) {
 				$refs = array_merge( $refs, $api_refs );
 			}
 		}
 
 		$refs = $this->normalize_category_refs( $refs );
-
 		if ( ! empty( $refs ) ) {
 			$this->store_category_refs_meta( $post_id, $refs );
 		}
-
 		return $refs;
 	}
 
@@ -530,8 +573,9 @@ class Mobo_Core_Recategorize_Queue {
 	 * @param int $post_id Product ID.
 	 * @return array
 	 */
-	private function recover_refs_from_api( $post_id ) {
-		$post_id      = absint( $post_id );
+	private function recover_refs_from_api( $post_id, &$known = false ) {
+		$known          = false;
+		$post_id        = absint( $post_id );
 		$product_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
 
 		if ( $post_id <= 0 || '' === $product_guid || ! class_exists( 'Mobo_Core_API_Client' ) ) {
@@ -554,19 +598,27 @@ class Mobo_Core_Recategorize_Queue {
 			return array();
 		}
 
-		$refs = $this->get_product_category_refs_from_payload( $result );
-
-		if ( empty( $refs ) ) {
+		$payload_with_state = $result;
+		if ( ! $this->category_refs_field_present( $payload_with_state ) ) {
 			$product_payload = $this->find_product_payload_in_event( $result, $product_guid );
-			$refs            = is_array( $product_payload ) ? $this->get_product_category_refs_from_payload( $product_payload ) : array();
+			if ( is_array( $product_payload ) ) {
+				$payload_with_state = $product_payload;
+			}
+		}
+		$inspection = Mobo_Core_Payload_Field_Policy::inspect( $payload_with_state, Mobo_Core_Payload_Field_Policy::category_aliases() );
+		$known      = ! empty( $inspection['present'] ) && is_array( $inspection['value'] );
+		if ( ! empty( $inspection['present'] ) && ! is_array( $inspection['value'] ) ) {
+			update_post_meta( $post_id, 'mobo_category_backfill_error', 'API product category desired state is present but malformed.' );
+			update_post_meta( $post_id, 'mobo_category_reapply_source', 'api-backfill-malformed' );
+			return array();
 		}
 
-		$normalized = is_array( $refs ) ? $this->normalize_category_refs( $refs ) : array();
+		$refs       = $known ? $inspection['value'] : array();
+		$normalized = $known ? $this->normalize_category_refs( $refs ) : array();
 
-		if ( ! empty( $normalized ) ) {
+		if ( $known ) {
 			delete_post_meta( $post_id, 'mobo_category_backfill_error' );
 			update_post_meta( $post_id, 'mobo_category_reapply_source', 'api-backfill' );
-			$this->store_category_refs_meta( $post_id, $normalized );
 		}
 
 		return $normalized;
@@ -594,9 +646,11 @@ class Mobo_Core_Recategorize_Queue {
 	 * @param int $post_id Product ID.
 	 * @return array
 	 */
-	private function recover_refs_from_latest_event( $post_id ) {
+	private function recover_refs_from_latest_event( $post_id, &$known = false, &$malformed = false ) {
 		global $wpdb;
 
+		$known        = false;
+		$malformed    = false;
 		$post_id      = absint( $post_id );
 		$product_guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
 
@@ -622,8 +676,8 @@ class Mobo_Core_Recategorize_Queue {
 			)
 		);
 
-		$refs = $this->extract_category_refs_from_event_rows( $rows, $product_guid );
-		if ( ! empty( $refs ) ) {
+		$refs = $this->extract_category_refs_from_event_rows( $rows, $product_guid, $known, $malformed );
+		if ( $known || $malformed ) {
 			return $refs;
 		}
 
@@ -640,7 +694,7 @@ class Mobo_Core_Recategorize_Queue {
 			)
 		);
 
-		return $this->extract_category_refs_from_event_rows( $rows, $product_guid );
+		return $this->extract_category_refs_from_event_rows( $rows, $product_guid, $known, $malformed );
 	}
 
 	/**
@@ -650,7 +704,9 @@ class Mobo_Core_Recategorize_Queue {
 	 * @param string $product_guid Product GUID.
 	 * @return array
 	 */
-	private function extract_category_refs_from_event_rows( $rows, $product_guid ) {
+	private function extract_category_refs_from_event_rows( $rows, $product_guid, &$known = false, &$malformed = false ) {
+		$known = false;
+		$malformed = false;
 		if ( empty( $rows ) || ! is_array( $rows ) ) {
 			return array();
 		}
@@ -665,55 +721,32 @@ class Mobo_Core_Recategorize_Queue {
 				continue;
 			}
 
-			$refs = $this->get_product_category_refs_from_payload( $payload );
-			if ( empty( $refs ) ) {
+			$payload_with_state = $payload;
+			if ( ! $this->category_refs_field_present( $payload_with_state ) ) {
 				$product_payload = $this->find_product_payload_in_event( $payload, $product_guid );
-				$refs = is_array( $product_payload ) ? $this->get_product_category_refs_from_payload( $product_payload ) : array();
+				if ( is_array( $product_payload ) ) {
+					$payload_with_state = $product_payload;
+				}
 			}
-
-			$normalized = is_array( $refs ) ? $this->normalize_category_refs( $refs ) : array();
-			if ( ! empty( $normalized ) ) {
-				return $normalized;
+			$inspection = Mobo_Core_Payload_Field_Policy::inspect( $payload_with_state, Mobo_Core_Payload_Field_Policy::category_aliases() );
+			if ( empty( $inspection['present'] ) ) {
+				continue;
 			}
+			if ( ! is_array( $inspection['value'] ) ) {
+				$malformed = true;
+				return array();
+			}
+			$known = true;
+			return $this->normalize_category_refs( $inspection['value'] );
 		}
 
 		return array();
 	}
 
 
-	/**
-	 * Return product category refs from all supported payload field names.
-	 *
-	 * @param array $payload Product payload or event envelope.
-	 * @return array
-	 */
-	private function get_product_category_refs_from_payload( $payload ) {
-		if ( ! is_array( $payload ) ) {
-			return array();
-		}
-
-		$keys = array(
-			'product_categories',
-			'productCategories',
-			'ProductCategories',
-			'category_refs',
-			'categoryRefs',
-			'categories',
-			'Categories',
-			'category_guids',
-			'categoryGuids',
-			'CategoryGuids',
-		);
-
-		foreach ( $keys as $key ) {
-			$value = $this->get_value( $payload, $key, null );
-
-			if ( is_array( $value ) && ! empty( $value ) ) {
-				return $value;
-			}
-		}
-
-		return array();
+	/** Whether a payload explicitly carries category desired state, including []. */
+	private function category_refs_field_present( $payload ) {
+		return Mobo_Core_Payload_Field_Policy::is_present( $payload, Mobo_Core_Payload_Field_Policy::category_aliases() );
 	}
 
 
@@ -862,12 +895,6 @@ class Mobo_Core_Recategorize_Queue {
 			return;
 		}
 
-		if ( empty( $refs ) ) {
-			delete_post_meta( $post_id, 'mobo_product_category_refs_json' );
-			delete_post_meta( $post_id, 'mobo_product_category_guids' );
-			return;
-		}
-
 		$guids = array();
 		foreach ( $refs as $ref ) {
 			$guid = $this->extract_category_guid( $ref );
@@ -878,6 +905,7 @@ class Mobo_Core_Recategorize_Queue {
 
 		update_post_meta( $post_id, 'mobo_product_category_refs_json', wp_json_encode( $refs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
 		update_post_meta( $post_id, 'mobo_product_category_guids', array_values( array_unique( $guids ) ) );
+		update_post_meta( $post_id, '_mobo_product_category_refs_authoritative', '1' );
 	}
 
 	/**
@@ -918,34 +946,8 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	private function collect_category_guid_candidates( $ref ) {
-		$guids = array();
-
-		if ( ! is_array( $ref ) ) {
-			$value = sanitize_text_field( (string) $ref );
-			return $this->is_remote_guid_value( $value ) ? array( $value ) : array();
-		}
-
-		$primary_keys = array( 'category_guid', 'categoryGuid', 'categoryId', 'categoryGUID', 'guid', 'remote_guid', 'remoteGuid', 'portal_category_id', 'portalCategoryId', 'category_portal_id', 'categoryPortalId' );
-		foreach ( $primary_keys as $key ) {
-			$this->append_category_guid_candidate( $guids, $this->get_value( $ref, $key, '' ) );
-		}
-
-		$nested = $this->get_value( $ref, 'category', null );
-		if ( is_array( $nested ) ) {
-			foreach ( $this->collect_category_guid_candidates( $nested ) as $nested_guid ) {
-				$this->append_category_guid_candidate( $guids, $nested_guid );
-			}
-		} else {
-			$this->append_category_guid_candidate( $guids, $nested );
-		}
-
-		$fallback_keys = array( 'product_category_id', 'productCategoryId', 'product_category_guid', 'productCategoryGuid', 'id' );
-		foreach ( $fallback_keys as $key ) {
-			$this->append_category_guid_candidate( $guids, $this->get_value( $ref, $key, '' ) );
-		}
-
-		return array_values( array_unique( array_filter( $guids ) ) );
-	}
+	return Mobo_Core_Remote_Identity_Policy::collect_category_guid_candidates( $ref );
+}
 
 	/**
 	 * Append a valid category GUID candidate.
@@ -969,18 +971,8 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return bool
 	 */
 	private function is_remote_guid_value( $value ) {
-		$value = trim( sanitize_text_field( (string) $value ) );
-
-		if ( '' === $value ) {
-			return false;
-		}
-
-		if ( false !== strpos( $value, '/' ) || false !== strpos( $value, '\\' ) || false !== strpos( $value, '://' ) ) {
-			return false;
-		}
-
-		return true;
-	}
+	return Mobo_Core_Remote_Identity_Policy::is_valid( $value );
+}
 
 	/**
 	 * Count products eligible for category reapply.

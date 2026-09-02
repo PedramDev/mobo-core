@@ -15,8 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Cron_Runner {
 
-	/** @var bool Recovery ran or was pending during the current runner invocation. */
-	private $recovery_touched_this_run = false;
+	const BASELINE_SUSPEND_OPTION = 'mobo_core_test_baseline_suspend_real_cron_until';
 
 	/** @var string Site-wide dispatcher lease token owned by this request. */
 	private $dispatcher_token = '';
@@ -34,12 +33,24 @@ class Mobo_Core_Cron_Runner {
 	 * @return array
 	 */
 	public function run( $source = 'real-cron', $send_health_report = false, $runtime_overrides = array() ) {
-		$this->recovery_touched_this_run = false;
 		$this->dispatcher_token = isset( $runtime_overrides['dispatcherToken'] ) ? sanitize_text_field( (string) $runtime_overrides['dispatcherToken'] ) : '';
 		$suppress_continuation_kick = ! empty( $runtime_overrides['suppressContinuationKick'] );
 
 		$source = sanitize_key( (string) $source );
 		$source = '' !== $source ? $source : 'real-cron';
+
+		/* Deterministic WAMP baseline fence. This option is intentionally ignored
+		 * outside a clearly local/development site, is time bounded, and is checked
+		 * before lastHitAt, locks or queue mutation. */
+		if ( self::is_baseline_suspended() ) {
+			return array(
+				'success'    => true,
+				'status'     => 'baseline-suspended',
+				'source'     => $source,
+				'executedAt' => time(),
+				'message'    => 'Real cron is temporarily suspended by the local deterministic test baseline.',
+			);
+		}
 
 		if ( class_exists( 'Mobo_Core_Settings' ) && method_exists( 'Mobo_Core_Settings', 'prime_runtime_options' ) ) {
 			Mobo_Core_Settings::prime_runtime_options();
@@ -160,6 +171,34 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		return $result;
+	}
+
+	/** Whether the local deterministic test runner currently fences real cron. */
+	public static function is_baseline_suspended() {
+		if ( ! self::is_local_test_environment() ) {
+			return false;
+		}
+		$until = absint( get_option( self::BASELINE_SUSPEND_OPTION, 0 ) );
+		return $until > time();
+	}
+
+	/**
+	 * Fail closed toward production: the test-only fence is honored only when the
+	 * WordPress environment or host is unambiguously local/development.
+	 */
+	private static function is_local_test_environment() {
+		if ( function_exists( 'wp_get_environment_type' ) ) {
+			$type = sanitize_key( (string) wp_get_environment_type() );
+			if ( in_array( $type, array( 'local', 'development' ), true ) ) {
+				return true;
+			}
+		}
+		$url  = function_exists( 'home_url' ) ? home_url( '/' ) : '';
+		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		if ( in_array( $host, array( 'localhost', '127.0.0.1', '::1' ), true ) ) {
+			return true;
+		}
+		return (bool) preg_match( '/(?:^|\.)(?:local|test)$/', $host );
 	}
 
 	/**
@@ -621,7 +660,6 @@ class Mobo_Core_Cron_Runner {
 		$allow_recategorize    = ! empty( $allow['recategorizeQueue'] );
 		$allow_image_refresh   = ! empty( $allow['imageRefreshQueue'] );
 		$allow_cache_warmup    = ! empty( $allow['cacheWarmup'] );
-		$allow_reconciliation  = ! empty( $allow['reconciliation'] );
 		$allow_maintenance     = ! empty( $allow['maintenance'] );
 
 		$round['scheduler'] = $scheduler;
@@ -634,7 +672,7 @@ class Mobo_Core_Cron_Runner {
 		 * immediately after the webhook pass instead of after all sync/background
 		 * queues. With enough budget, process two orders; otherwise stay at one.
 		 */
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && class_exists( 'Mobo_Core_Checkout_Validator' ) && ! isset( $disabled_stages['orderSubmissions'] ) ) {
+		if ( Mobo_Core_Order_Submission_Policy::is_enabled() && class_exists( 'Mobo_Core_Checkout_Validator' ) && ! isset( $disabled_stages['orderSubmissions'] ) ) {
 			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
 				return $round;
 			}
@@ -712,6 +750,65 @@ class Mobo_Core_Cron_Runner {
 				);
 				$round['queuePasses']['parentFinalize']++;
 			}
+		}
+
+		/*
+		 * Explicit admin maintenance queues run before image/product background work.
+		 *
+		 * These jobs are finite, user-requested operations. Keeping them behind the
+		 * image lane allowed a busy image backlog to consume the runner deadline on
+		 * every request, so a selected reprice/recategorize stage could repeatedly
+		 * receive no execution time. Product-level locks still serialize them against
+		 * webhook/manual sync writes.
+		 */
+		/* Reprice queue. */
+		$reprice_active = $this->option_state_is_running( 'mobo_core_reprice_state' );
+		if ( $reprice_active && class_exists( 'Mobo_Core_Reprice_Queue' ) && ! isset( $disabled_stages['repriceQueue'] ) && $allow_reprice_queue && ! $this->stage_circuit_open( $config, 'repriceQueue' ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$reprice_budget = $webhook_due_pressure ? 2 : $this->stage_budget_seconds( $config, 'repriceQueue', 7, 1, 10 );
+			$reprice_budget = min( $reprice_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
+			$reprice_base   = Mobo_Core_Settings::get_int( 'mobo_core_reprice_batch_size', 20, 1, 200 );
+			$reprice_limit  = isset( $config['adaptiveTuning']['limits']['repriceQueue'] ) ? max( 1, min( 200, absint( $config['adaptiveTuning']['limits']['repriceQueue'] ) ) ) : $reprice_base;
+			$reprice_limit  = $this->stage_capacity_limit( $config, 'repriceQueue', $reprice_limit );
+			$round['repriceQueue'] = $this->execute_stage(
+				'repriceQueue',
+				function () use ( $reprice_limit, $reprice_budget ) {
+					$queue = new Mobo_Core_Reprice_Queue();
+					return $queue->process_batch( $reprice_limit, $reprice_budget );
+				},
+				array( 'processed' => 0, 'updated' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['repriceQueue']++;
+		}
+
+		/* Recategorize queue. */
+		$recategorize_active = $this->option_state_is_running( 'mobo_core_recategorize_state' );
+		if ( $recategorize_active && class_exists( 'Mobo_Core_Recategorize_Queue' ) && ! isset( $disabled_stages['recategorizeQueue'] ) && $allow_recategorize && ! $this->stage_circuit_open( $config, 'recategorizeQueue' ) ) {
+			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				return $round;
+			}
+
+			$recategorize_budget = $webhook_due_pressure ? 2 : $this->stage_budget_seconds( $config, 'recategorizeQueue', 7, 1, 10 );
+			$recategorize_budget = min( $recategorize_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
+			$recategorize_base   = Mobo_Core_Settings::get_int( 'mobo_core_recategorize_batch_size', 20, 1, 200 );
+			$recategorize_limit  = isset( $config['adaptiveTuning']['limits']['recategorizeQueue'] ) ? max( 1, min( 200, absint( $config['adaptiveTuning']['limits']['recategorizeQueue'] ) ) ) : $recategorize_base;
+			$recategorize_limit  = $this->stage_capacity_limit( $config, 'recategorizeQueue', $recategorize_limit );
+			$round['recategorizeQueue'] = $this->execute_stage(
+				'recategorizeQueue',
+				function () use ( $recategorize_limit, $recategorize_budget ) {
+					$queue = new Mobo_Core_Recategorize_Queue();
+					return $queue->process_batch( $recategorize_limit, $recategorize_budget );
+				},
+				array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
+				$disabled_stages,
+				$round['stageErrors']
+			);
+			$round['queuePasses']['recategorizeQueue']++;
 		}
 
 		/* Product image queue. */
@@ -869,107 +966,6 @@ class Mobo_Core_Cron_Runner {
 		}
 
 
-		/*
-		 * One-time parent-product retention recovery.
-		 *
-		 * This is deliberately site-scoped and independent of OnlyInStock. It runs
-		 * before normal reconciliation so an upgrade can restore products deleted by
-		 * older Mobo Core builds without requiring any administrator action.
-		 */
-		$recovery_pending_now = class_exists( 'Mobo_Core_Product_Recovery' ) && Mobo_Core_Product_Recovery::is_pending();
-		if ( $recovery_pending_now ) {
-			$this->recovery_touched_this_run = true;
-		}
-
-		if ( ( ! $webhook_due_pressure || 1 === absint( $round_number ) ) && $recovery_pending_now && ! isset( $disabled_stages['productRecovery'] ) ) {
-			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
-				return $round;
-			}
-
-			$recovery_remaining = max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) );
-			$recovery_budget    = min( $webhook_due_pressure ? 3 : 8, $recovery_remaining );
-			$recovery_limit     = $webhook_due_pressure ? 1 : 3;
-			$round['productRecovery'] = $this->execute_stage(
-				'productRecovery',
-				function () use ( $recovery_budget, $recovery_limit ) {
-					$recovery = new Mobo_Core_Product_Recovery();
-					return $recovery->process_batch( $recovery_limit, $recovery_budget );
-				},
-				array( 'success' => false, 'status' => 'exception', 'processed' => 0, 'recovered' => 0, 'remaining' => true ),
-				$disabled_stages,
-				$round['stageErrors']
-			);
-			$round['queuePasses']['productRecovery']++;
-		}
-
-		/* Adaptive reconciliation / sync health. */
-		if ( 1 === absint( $round_number ) && ! $webhook_due_pressure && $allow_reconciliation && ! $this->stage_circuit_open( $config, 'reconciliation' ) && class_exists( 'Mobo_Core_Reconciliation' ) && Mobo_Core_Reconciliation::runtime_enabled() && Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' ) && ! isset( $disabled_stages['reconciliation'] ) ) {
-			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
-				return $round;
-			}
-
-			$round['reconciliation'] = $this->execute_stage(
-				'reconciliation',
-				function () use ( $source ) {
-					$reconciliation = new Mobo_Core_Reconciliation();
-					return $reconciliation->run_tick( $source, false, false );
-				},
-				array( 'success' => false, 'status' => 'exception', 'processedProducts' => 0, 'processedVariations' => 0, 'needsContinuation' => false ),
-				$disabled_stages,
-				$round['stageErrors']
-			);
-			$round['queuePasses']['reconciliation']++;
-		}
-
-		/* Reprice queue. */
-		$reprice_active = $this->option_state_is_running( 'mobo_core_reprice_state' );
-		if ( $reprice_active && class_exists( 'Mobo_Core_Reprice_Queue' ) && ! isset( $disabled_stages['repriceQueue'] ) && $allow_reprice_queue && ! $this->stage_circuit_open( $config, 'repriceQueue' ) ) {
-			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
-				return $round;
-			}
-
-			$reprice_budget = $webhook_due_pressure ? 2 : $this->stage_budget_seconds( $config, 'repriceQueue', 7, 1, 10 );
-			$reprice_budget = min( $reprice_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
-			$reprice_base   = Mobo_Core_Settings::get_int( 'mobo_core_reprice_batch_size', 20, 1, 200 );
-			$reprice_limit  = isset( $config['adaptiveTuning']['limits']['repriceQueue'] ) ? max( 1, min( 200, absint( $config['adaptiveTuning']['limits']['repriceQueue'] ) ) ) : $reprice_base;
-			$reprice_limit  = $this->stage_capacity_limit( $config, 'repriceQueue', $reprice_limit );
-			$round['repriceQueue'] = $this->execute_stage(
-				'repriceQueue',
-				function () use ( $reprice_limit, $reprice_budget ) {
-					$queue = new Mobo_Core_Reprice_Queue();
-					return $queue->process_batch( $reprice_limit, $reprice_budget );
-				},
-				array( 'processed' => 0, 'updated' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
-				$disabled_stages,
-				$round['stageErrors']
-			);
-			$round['queuePasses']['repriceQueue']++;
-		}
-
-		/* Recategorize queue. */
-		$recategorize_active = $this->option_state_is_running( 'mobo_core_recategorize_state' );
-		if ( $recategorize_active && class_exists( 'Mobo_Core_Recategorize_Queue' ) && ! isset( $disabled_stages['recategorizeQueue'] ) && $allow_recategorize && ! $this->stage_circuit_open( $config, 'recategorizeQueue' ) ) {
-			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
-				return $round;
-			}
-
-			$recategorize_budget = $webhook_due_pressure ? 2 : $this->stage_budget_seconds( $config, 'recategorizeQueue', 7, 1, 10 );
-			$recategorize_budget = min( $recategorize_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
-			$recategorize_base   = Mobo_Core_Settings::get_int( 'mobo_core_recategorize_batch_size', 20, 1, 200 );
-			$recategorize_limit  = isset( $config['adaptiveTuning']['limits']['recategorizeQueue'] ) ? max( 1, min( 200, absint( $config['adaptiveTuning']['limits']['recategorizeQueue'] ) ) ) : $recategorize_base;
-			$recategorize_limit  = $this->stage_capacity_limit( $config, 'recategorizeQueue', $recategorize_limit );
-			$round['recategorizeQueue'] = $this->execute_stage(
-				'recategorizeQueue',
-				function () use ( $recategorize_limit, $recategorize_budget ) {
-					$queue = new Mobo_Core_Recategorize_Queue();
-					return $queue->process_batch( $recategorize_limit, $recategorize_budget );
-				},
-				array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
-				$disabled_stages,
-				$round['stageErrors']
-			);
-			$round['queuePasses']['recategorizeQueue']++;
-		}
 
 		/* Due configuration syncs only need one check per invocation. */
 		if ( 1 === absint( $round_number ) ) {
@@ -1051,17 +1047,11 @@ class Mobo_Core_Cron_Runner {
 		$cache_side_effect_pressure = $webhook_due_pressure
 			|| ! empty( $round['parentFinalize']['remainingDue'] )
 			|| ! empty( $round['imageQueue']['remaining'] );
-		$recovery_still_pending = class_exists( 'Mobo_Core_Product_Recovery' ) && Mobo_Core_Product_Recovery::is_pending();
-		$post_recovery_warmup  = class_exists( 'Mobo_Core_Recovery_Coordinator' ) && Mobo_Core_Recovery_Coordinator::post_recovery_warmup_pending();
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) && ! $this->recovery_touched_this_run && ! $recovery_still_pending && $this->option_queue_has_items( 'mobo_core_cache_warmup_queue', 'items' ) && class_exists( 'Mobo_Core_Cache_Warmer' ) && ! isset( $disabled_stages['cacheWarmup'] ) && $allow_cache_warmup && ! $this->stage_circuit_open( $config, 'cacheWarmup' ) && ! $cache_side_effect_pressure ) {
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) && $this->option_queue_has_items( 'mobo_core_cache_warmup_queue', 'items' ) && class_exists( 'Mobo_Core_Cache_Warmer' ) && ! isset( $disabled_stages['cacheWarmup'] ) && $allow_cache_warmup && ! $this->stage_circuit_open( $config, 'cacheWarmup' ) && ! $cache_side_effect_pressure ) {
 			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
 				$warm_base   = Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_batch_size', 2, 1, 10 );
 				$warm_limit  = isset( $config['adaptiveTuning']['limits']['cacheWarmup'] ) ? max( 1, min( 10, absint( $config['adaptiveTuning']['limits']['cacheWarmup'] ) ) ) : $warm_base;
 				$warm_limit  = $this->stage_capacity_limit( $config, 'cacheWarmup', $warm_limit );
-				/* Post-recovery warmup is deliberately serial: one exact product URL per batch. */
-				if ( $post_recovery_warmup ) {
-					$warm_limit = 1;
-				}
 				$warm_budget = $this->stage_budget_seconds( $config, 'cacheWarmup', 5, 1, 20 );
 				$warm_budget = min( $warm_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
 				$round['cacheWarmup'] = $this->execute_stage(
@@ -1085,9 +1075,6 @@ class Mobo_Core_Cron_Runner {
 					$round['stageErrors']
 				);
 				$round['queuePasses']['cacheWarmup']++;
-				if ( $post_recovery_warmup && empty( $round['cacheWarmup']['remaining'] ) && class_exists( 'Mobo_Core_Recovery_Coordinator' ) ) {
-					Mobo_Core_Recovery_Coordinator::clear_post_recovery_warmup_pending();
-				}
 			}
 		}
 
@@ -1136,8 +1123,6 @@ class Mobo_Core_Cron_Runner {
 			'scheduler'              => array( 'webhookPressure' => false, 'backgroundCapacity' => 0, 'selectedStages' => array(), 'deferredStages' => array(), 'allow' => array(), 'scores' => array() ),
 			'productSteps'           => 0,
 			'productStatus'          => array(),
-			'productRecovery'         => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'recovered' => 0, 'remaining' => false ),
-			'reconciliation'          => array( 'success' => true, 'status' => 'skipped', 'processedProducts' => 0, 'processedVariations' => 0, 'needsContinuation' => false ),
 			'lastStep'               => null,
 			'runnerErrors'           => array(),
 			'queuePasses'            => array(
@@ -1146,8 +1131,6 @@ class Mobo_Core_Cron_Runner {
 				'imageQueue'        => 0,
 				'imageRefreshQueue' => 0,
 				'productSync'       => 0,
-				'productRecovery'   => 0,
-				'reconciliation'    => 0,
 				'repriceQueue'      => 0,
 				'recategorizeQueue' => 0,
 				'orderSubmissions'  => 0,
@@ -1226,7 +1209,7 @@ class Mobo_Core_Cron_Runner {
 		$order_queue = get_option( 'mobo_core_mobo_order_submission_queue', array() );
 		$order_count = is_array( $order_queue ) ? count( $order_queue ) : 0;
 		$snapshot['orderSubmissions'] = array(
-			'active'  => Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_submission_enabled', '0' ) && $order_count > 0,
+			'active'  => Mobo_Core_Order_Submission_Policy::is_enabled() && $order_count > 0,
 			'backlog' => $order_count,
 		);
 
@@ -1291,10 +1274,6 @@ class Mobo_Core_Cron_Runner {
 		}
 		$snapshot['cacheWarmup'] = array( 'active' => ! empty( $warm_items ), 'backlog' => max( $warm_due, count( $warm_items ) ) );
 
-		$reconciliation_active = class_exists( 'Mobo_Core_Reconciliation' )
-			&& Mobo_Core_Reconciliation::runtime_enabled()
-			&& Mobo_Core_Settings::enabled( 'mobo_core_auto_reconciliation_enabled', '0' );
-		$snapshot['reconciliation'] = array( 'active' => $reconciliation_active, 'backlog' => $reconciliation_active ? 1 : 0 );
 		$snapshot['maintenance']    = array( 'active' => true, 'backlog' => 1 );
 
 		return $snapshot;
@@ -1314,7 +1293,7 @@ class Mobo_Core_Cron_Runner {
 	private function round_active_stages( $round_number, $config, $round ) {
 		$snapshot = isset( $config['queueSnapshot'] ) && is_array( $config['queueSnapshot'] ) ? $config['queueSnapshot'] : array();
 		$active   = array();
-		foreach ( array( 'parentFinalize', 'imageQueue', 'imageRefreshQueue', 'repriceQueue', 'recategorizeQueue', 'cacheWarmup', 'reconciliation', 'maintenance' ) as $stage ) {
+		foreach ( array( 'parentFinalize', 'imageQueue', 'imageRefreshQueue', 'repriceQueue', 'recategorizeQueue', 'cacheWarmup', 'maintenance' ) as $stage ) {
 			$active[ $stage ] = ! empty( $snapshot[ $stage ]['active'] );
 		}
 
@@ -1336,7 +1315,6 @@ class Mobo_Core_Cron_Runner {
 		}
 		$active['repriceQueue']      = $this->option_state_is_running( 'mobo_core_reprice_state' );
 		$active['recategorizeQueue'] = $this->option_state_is_running( 'mobo_core_recategorize_state' );
-		$active['reconciliation']    = 1 === absint( $round_number ) && ! empty( $active['reconciliation'] );
 		$active['maintenance']       = 1 === absint( $round_number );
 
 		return $active;
@@ -1518,13 +1496,9 @@ class Mobo_Core_Cron_Runner {
 		$order_processed   = absint( isset( $round['orderSubmissions']['processed'] ) ? $round['orderSubmissions']['processed'] : 0 );
 		$warm_processed    = absint( isset( $round['cacheWarmup']['processed'] ) ? $round['cacheWarmup']['processed'] : 0 );
 		$product_steps     = absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
-		$recovery_processed = absint( isset( $round['productRecovery']['processed'] ) ? $round['productRecovery']['processed'] : 0 );
-		$recovery_recovered = absint( isset( $round['productRecovery']['recovered'] ) ? $round['productRecovery']['recovered'] : 0 );
-		$reconciliation_products = absint( isset( $round['reconciliation']['processedProducts'] ) ? $round['reconciliation']['processedProducts'] : 0 );
-		$reconciliation_variations = absint( isset( $round['reconciliation']['processedVariations'] ) ? $round['reconciliation']['processedVariations'] : 0 );
 		$automation_moved  = ! empty( $round['imageRefreshAutomation']['progressed'] );
 
-		$round['madeProgress'] = ( $webhook_processed + $parent_finalized + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $warm_processed + $product_steps + $recovery_processed + $recovery_recovered + $reconciliation_products + $reconciliation_variations ) > 0 || $automation_moved;
+		$round['madeProgress'] = ( $webhook_processed + $parent_finalized + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $warm_processed + $product_steps ) > 0 || $automation_moved;
 
 		/* Reuse the queue processor/scheduler result. Avoid a second table existence/
 		 * due-work probe at the end of every round. */
@@ -1542,8 +1516,6 @@ class Mobo_Core_Cron_Runner {
 			|| ( ! isset( $disabled_stages['imageRefreshQueue'] ) && ! empty( $round['imageRefreshQueue']['remaining'] ) )
 			|| $automation_continue
 			|| $product_continue
-			|| ( ! isset( $disabled_stages['productRecovery'] ) && ! empty( $round['productRecovery']['remaining'] ) && absint( isset( $round['productRecovery']['nextRetryAt'] ) ? $round['productRecovery']['nextRetryAt'] : 0 ) <= time() )
-			|| ( ! isset( $disabled_stages['reconciliation'] ) && ! empty( $round['reconciliation']['needsContinuation'] ) )
 			|| ( ! isset( $disabled_stages['repriceQueue'] ) && ! empty( $round['repriceQueue']['remaining'] ) )
 			|| ( ! isset( $disabled_stages['recategorizeQueue'] ) && ! empty( $round['recategorizeQueue']['remaining'] ) )
 			|| ( ! isset( $disabled_stages['orderSubmissions'] ) && ! empty( $round['orderSubmissions']['remaining'] ) )
@@ -1611,15 +1583,6 @@ class Mobo_Core_Cron_Runner {
 		$aggregate['imageRefreshAutomation'] = $round['imageRefreshAutomation'];
 		if ( isset( $round['scheduler'] ) && is_array( $round['scheduler'] ) ) {
 			$aggregate['scheduler'] = $round['scheduler'];
-		}
-		$aggregate['productRecovery'] = $this->merge_queue_counters(
-			$aggregate['productRecovery'],
-			$round['productRecovery'],
-			array( 'processed', 'recovered' ),
-			array( 'remaining' )
-		);
-		if ( isset( $round['reconciliation'] ) && is_array( $round['reconciliation'] ) && 'skipped' !== ( isset( $round['reconciliation']['status'] ) ? $round['reconciliation']['status'] : '' ) ) {
-			$aggregate['reconciliation'] = $round['reconciliation'];
 		}
 		$aggregate['productSteps'] += absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
 		$aggregate['productStatus'] = isset( $round['productStatus'] ) && is_array( $round['productStatus'] ) ? $round['productStatus'] : $aggregate['productStatus'];

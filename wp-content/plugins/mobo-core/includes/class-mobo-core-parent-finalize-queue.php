@@ -74,7 +74,9 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				$queue = array_slice( $queue, 0, self::MAX_ITEMS, true );
 			}
 
-			self::write_queue( $queue );
+			if ( ! self::write_queue( $queue ) ) {
+				return array( 'success' => false, 'status' => 'checkpoint-failed' );
+			}
 			update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
 
 			return array(
@@ -151,7 +153,26 @@ final class Mobo_Core_Parent_Finalize_Queue {
 
 				if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
 					unset( $queue[ $key ] );
-					self::write_queue( $queue );
+					if ( ! self::write_queue( $queue ) ) {
+						$result['success'] = false;
+						$result['status'] = 'checkpoint-failed';
+						$result['remaining'] = true;
+						return $result;
+					}
+					$result['processed']++;
+					$result['dropped']++;
+					continue;
+				}
+
+				if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
+					unset( $queue[ $key ] );
+					if ( ! self::write_queue( $queue ) ) {
+						$result['success'] = false;
+						$result['status'] = 'checkpoint-failed';
+						$result['remaining'] = true;
+						return $result;
+					}
+					delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
 					$result['processed']++;
 					$result['dropped']++;
 					continue;
@@ -161,7 +182,12 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				$queue[ $key ]['processingToken'] = $claim_token;
 				$queue[ $key ]['processingUntil'] = time() + 120;
 				$queue[ $key ]['updatedAt']       = time();
-				self::write_queue( $queue );
+				if ( ! self::write_queue( $queue ) ) {
+					$result['success'] = false;
+					$result['status'] = 'checkpoint-failed';
+					$result['remaining'] = true;
+					return $result;
+				}
 
 				/*
 				 * Do the potentially expensive WC variable sync with the queue mutex
@@ -181,7 +207,6 @@ final class Mobo_Core_Parent_Finalize_Queue {
 							if ( is_callable( array( 'WC_Product_Variable', 'sync' ) ) && ( $product instanceof WC_Product_Variable || $has_children ) ) {
 								WC_Product_Variable::sync( $product_id );
 							}
-							delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
 							wc_delete_product_transients( $product_id );
 						};
 
@@ -226,7 +251,14 @@ final class Mobo_Core_Parent_Finalize_Queue {
 
 				if ( null === $failure ) {
 					unset( $queue[ $key ] );
-					self::write_queue( $queue );
+					if ( ! self::write_queue( $queue ) ) {
+						update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+						$result['success'] = false;
+						$result['status'] = 'commit-failed';
+						$result['remaining'] = true;
+						return $result;
+					}
+					delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
 					$result['finalized']++;
 					continue;
 				}
@@ -240,7 +272,12 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				$queue[ $key ]['lastError']     = substr( sanitize_text_field( $failure->getMessage() ), 0, 500 );
 				unset( $queue[ $key ]['processingToken'], $queue[ $key ]['processingUntil'] );
 				update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
-				self::write_queue( $queue );
+				if ( ! self::write_queue( $queue ) ) {
+					$result['success'] = false;
+					$result['status'] = 'commit-failed';
+					$result['remaining'] = true;
+					return $result;
+				}
 			}
 
 			$queue = self::read_queue();
@@ -354,13 +391,17 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		$queue = is_array( $queue ) ? $queue : array();
 		if ( empty( $queue ) ) {
 			delete_option( self::OPTION_QUEUE );
-			return;
+			wp_cache_delete( self::OPTION_QUEUE, 'options' );
+			return null === get_option( self::OPTION_QUEUE, null );
 		}
 		if ( false === get_option( self::OPTION_QUEUE, false ) ) {
 			add_option( self::OPTION_QUEUE, $queue, '', false );
 		} else {
 			update_option( self::OPTION_QUEUE, $queue, false );
 		}
+		wp_cache_delete( self::OPTION_QUEUE, 'options' );
+		$stored = get_option( self::OPTION_QUEUE, null );
+		return is_array( $stored ) && maybe_serialize( $stored ) === maybe_serialize( $queue );
 	}
 
 	private static function acquire_lock() {
