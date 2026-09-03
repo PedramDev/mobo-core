@@ -268,7 +268,7 @@ final class Mobo_Core_Sync_Health {
 	 */
 	public static function get_operational_dashboard_status( $detail_limit = 15, $deep_structure = true ) {
 		/* MOBO-HEALTH-SYNC-LICENSE-HARDENING-r2: durable operational snapshot. */
-		$mobo_operational_limit = max( 1, absint( $detail_limit ) );
+		$mobo_operational_limit = max( 1, absint( $limit ) );
 		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && ! Mobo_Core_Health_Read_Cache::is_sync_refreshing() ) {
 			$mobo_operational_cached = Mobo_Core_Health_Read_Cache::get_sync_health_operational_snapshot( $mobo_operational_limit );
 			if ( is_array( $mobo_operational_cached ) ) {

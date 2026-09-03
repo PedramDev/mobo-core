@@ -726,8 +726,7 @@ class Mobo_Core_Checkout_Validator {
 		 * They are not optional UI settings anymore.
 		 */
 		$only_mobo_products = true;
-		/* Purchase eligibility is independent from sync convergence. Identity and authoritative cart/stock validation remain fail-closed. */
-		$block_incomplete   = false;
+		$block_incomplete   = true;
 		$require_guid       = true;
 		$check_stock        = $this->is_local_stock_check_effective() && ! $this->is_mobo_cart_validation_effective();
 
