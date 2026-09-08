@@ -92,6 +92,9 @@ class Mobo_Core_Migration {
 		self::apply_1033449_full_source_image_refresh( $previous_version );
 		self::apply_10334411_retire_automatic_recovery_runtime( $previous_version );
 		self::apply_10334412_persistence_integrity_backfill( $previous_version );
+		self::apply_103353_health_snapshot_real_cron_ownership( $previous_version );
+		self::apply_103354_health_legacy_cron_cleanup( $previous_version );
+		self::apply_103353_convergence_residue_selfheal_schedule( $previous_version );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -162,6 +165,9 @@ class Mobo_Core_Migration {
 		self::apply_1033449_full_source_image_refresh( $current );
 		self::apply_10334411_retire_automatic_recovery_runtime( $current );
 		self::apply_10334412_persistence_integrity_backfill( $current );
+		self::apply_103353_health_snapshot_real_cron_ownership( $current );
+		self::apply_103354_health_legacy_cron_cleanup( $current );
+		self::apply_103353_convergence_residue_selfheal_schedule( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
 		self::seed_category_map_from_legacy_meta();
@@ -1312,6 +1318,12 @@ class Mobo_Core_Migration {
 		 */
 		$worker_reasons = array();
 
+		if ( '1' === (string) get_option( 'mobo_core_103353_convergence_residue_selfheal_pending', '0' ) ) {
+			if ( did_action( 'woocommerce_init' ) ) {
+				self::run_103353_convergence_residue_selfheal();
+			}
+		}
+
 		if ( '1' === (string) get_option( 'mobo_core_worker_dispatch_pending', '0' ) ) {
 			$worker_reasons[] = 'pending-dispatch';
 		}
@@ -2413,6 +2425,306 @@ class Mobo_Core_Migration {
 
 			wp_clear_scheduled_hook( $hook );
 		}
+	}
+
+
+	/**
+	 * Move Health / Sync Health snapshot refresh ownership from WP-Cron to the
+	 * deterministic real-cron runner.
+	 *
+	 * 10.33.51 could keep several overdue health hooks forever on installations
+	 * with DISABLE_WP_CRON=true even though the main Mobo real cron was healthy.
+	 * Queue one durable refresh request and remove every v1/v2 health WP-Cron row.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103353_health_snapshot_real_cron_ownership( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.53', '>=' ) ) {
+			return;
+		}
+
+		foreach ( array(
+			'mobo_core_health_snapshot_refresh_v1',
+			'mobo_core_health_snapshot_refresh_v2',
+			'mobo_core_sync_health_snapshot_refresh_v1',
+			'mobo_core_sync_health_snapshot_refresh_v2',
+		) as $hook ) {
+			wp_clear_scheduled_hook( $hook );
+		}
+
+		$now = time();
+		update_option( 'mobo_core_health_snapshot_refresh_requested_at', $now, false );
+		update_option( 'mobo_core_sync_health_snapshot_refresh_requested_at', $now, false );
+		update_option( 'mobo_core_sync_health_snapshot_refresh_requested_limit', 20, false );
+		update_option( 'mobo_core_103353_health_real_cron_migrated_at', $now, false );
+	}
+
+
+	/**
+	 * Remove every legacy Health / Sync Health WP-Cron event regardless of args.
+	 *
+	 * wp_clear_scheduled_hook( $hook ) only clears events whose args match the
+	 * supplied args (empty by default). Older Sync Health schedules used non-empty
+	 * args, so 10.33.53 could leave those rows behind on DISABLE_WP_CRON installs.
+	 * This migration mutates only the four retired Mobo Health hook buckets and
+	 * preserves every unrelated cron event.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103354_health_legacy_cron_cleanup( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.54', '>=' ) ) {
+			return;
+		}
+
+		$hooks = array(
+			'mobo_core_health_snapshot_refresh_v1',
+			'mobo_core_health_snapshot_refresh_v2',
+			'mobo_core_sync_health_snapshot_refresh_v1',
+			'mobo_core_sync_health_snapshot_refresh_v2',
+		);
+
+		$cron = get_option( 'cron', array() );
+		if ( ! is_array( $cron ) ) {
+			update_option( 'mobo_core_103354_health_legacy_cron_cleanup_at', time(), false );
+			update_option( 'mobo_core_103354_health_legacy_cron_cleanup_removed', -1, false );
+			return;
+		}
+
+		$removed = 0;
+		foreach ( $cron as $timestamp => $events ) {
+			if ( 'version' === (string) $timestamp || ! is_array( $events ) ) {
+				continue;
+			}
+
+			foreach ( $hooks as $hook ) {
+				if ( ! isset( $cron[ $timestamp ][ $hook ] ) ) {
+					continue;
+				}
+
+				$removed += is_array( $cron[ $timestamp ][ $hook ] )
+					? count( $cron[ $timestamp ][ $hook ] )
+					: 1;
+				unset( $cron[ $timestamp ][ $hook ] );
+			}
+
+			if ( isset( $cron[ $timestamp ] ) && is_array( $cron[ $timestamp ] ) && empty( $cron[ $timestamp ] ) ) {
+				unset( $cron[ $timestamp ] );
+			}
+		}
+
+		if ( $removed > 0 ) {
+			update_option( 'cron', $cron );
+		}
+
+		update_option( 'mobo_core_103354_health_legacy_cron_cleanup_at', time(), false );
+		update_option( 'mobo_core_103354_health_legacy_cron_cleanup_removed', absint( $removed ), false );
+	}
+
+
+	/**
+	 * Queue a one-time post-WooCommerce repair for the exact pre-10.33.51
+	 * variable-product completion race signature.
+	 *
+	 * Migration itself runs on plugins_loaded, where wc_get_product() is not safe.
+	 * Only persist intent here; run_deferred_repairs() executes the bounded proof
+	 * after WooCommerce has registered product types and fired woocommerce_init.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103353_convergence_residue_selfheal_schedule( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.53', '>=' ) ) {
+			return;
+		}
+
+		update_option( 'mobo_core_103353_convergence_residue_selfheal_pending', '1', false );
+		update_option( 'mobo_core_103353_convergence_residue_selfheal_scheduled_at', time(), false );
+	}
+
+	/**
+	 * Heal only the exact pre-10.33.51 variable-product completion race signature.
+	 *
+	 * Safety boundary: this never guesses from a lone health row. A candidate must
+	 * have a clean local variable topology, exact Product/Variant ordering evidence,
+	 * matching source hashes, no active queue owner, and a terminal authoritative
+	 * UpdateVariant snapshot whose count equals the current local variation count.
+	 * ProductUpdated must have started first but completed after UpdateVariant,
+	 * which is the historical race fixed by 10.33.51.
+	 *
+	 * @return bool True only when the bounded scan executed to completion.
+	 */
+	private static function run_103353_convergence_residue_selfheal() {
+		global $wpdb;
+
+		if ( ! did_action( 'woocommerce_init' ) || ! function_exists( 'wc_get_product' ) || ! class_exists( 'WC_Product_Variable' ) ) {
+			return false;
+		}
+		if ( ! class_exists( 'Mobo_Core_Sync_Health' ) || ! class_exists( 'Mobo_Core_Product_Map' ) || ! class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
+			return false;
+		}
+		if ( ! Mobo_Core_Sync_Health::table_exists() || ! Mobo_Core_Product_Map::table_exists() || ! Mobo_Core_Sync_Event_Store::table_exists() ) {
+			return false;
+		}
+
+		$health_table = Mobo_Core_Sync_Health::table_name();
+		$map_table    = Mobo_Core_Product_Map::table_name();
+		$event_table  = Mobo_Core_Sync_Event_Store::table_name();
+
+		$candidates = $wpdb->get_results(
+			"SELECT h.product_guid,h.wp_product_id,h.portal_product_id,h.portal_revision,h.portal_hash,h.portal_version,
+			        m.last_hash AS map_last_hash
+			 FROM {$health_table} h
+			 INNER JOIN {$map_table} m
+			   ON m.remote_guid=h.product_guid AND m.wp_post_id=h.wp_product_id AND m.object_type='product'
+			 WHERE h.sync_status='behind' AND h.portal_revision>0 AND m.sync_incomplete=1
+			 ORDER BY h.updated_at DESC
+			 LIMIT 200",
+			ARRAY_A
+		);
+		$candidates = is_array( $candidates ) ? $candidates : array();
+
+		$product_map = new Mobo_Core_Product_Map();
+		$healed      = array();
+		$examined    = 0;
+
+		foreach ( $candidates as $row ) {
+			$examined++;
+			$guid            = sanitize_text_field( (string) ( $row['product_guid'] ?? '' ) );
+			$product_id      = absint( $row['wp_product_id'] ?? 0 );
+			$portal_id       = absint( $row['portal_product_id'] ?? 0 );
+			$portal_revision = absint( $row['portal_revision'] ?? 0 );
+			$portal_version  = sanitize_text_field( (string) ( $row['portal_version'] ?? '' ) );
+			$portal_hash     = sanitize_text_field( (string) ( $row['portal_hash'] ?? '' ) );
+			$map_hash        = sanitize_text_field( (string) ( $row['map_last_hash'] ?? '' ) );
+
+			if ( '' === $guid || $product_id <= 0 || $portal_revision <= 0 || '' === $portal_hash || ! hash_equals( $portal_hash, $map_hash ) ) {
+				continue;
+			}
+			if ( 'product' !== get_post_type( $product_id ) || 'trash' === get_post_status( $product_id ) ) {
+				continue;
+			}
+			if ( '1' !== (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true )
+				|| '1' === (string) get_post_meta( $product_id, '_mobo_desired_state_rebuild_pending', true )
+				|| '' === trim( (string) get_post_meta( $product_id, '_mobo_desired_state_last_completed_at', true ) ) ) {
+				continue;
+			}
+
+			$product = wc_get_product( $product_id );
+			if ( ! $product instanceof WC_Product_Variable || ! Mobo_Core_Sync_Health::local_product_structure_is_sane( $product_id ) ) {
+				continue;
+			}
+
+			$product_revision = absint( get_post_meta( $product_id, '_mobo_product_applied_revision', true ) );
+			$variant_revision = absint( get_post_meta( $product_id, '_mobo_variant_applied_revision', true ) );
+			$product_version  = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_applied_event_version', true ) );
+			$variant_version  = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_applied_event_version', true ) );
+			$source_hash      = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_source_hash', true ) );
+
+			if ( $product_revision !== $portal_revision || $variant_revision !== $portal_revision || ! hash_equals( $portal_hash, $source_hash ) ) {
+				continue;
+			}
+			if ( '' !== $portal_version && ( $product_version !== $portal_version || $variant_version !== $portal_version ) ) {
+				continue;
+			}
+
+			$active_count = absint( $wpdb->get_var( $wpdb->prepare(
+				"SELECT COUNT(*) FROM {$event_table} WHERE entity_guid=%s AND status IN ('pending','processing','retry','deferred')",
+				$guid
+			) ) );
+			if ( $active_count > 0 ) {
+				continue;
+			}
+
+			$variant_event = $wpdb->get_row( $wpdb->prepare(
+				"SELECT id,sync_id,event_version,payload_json,created_at,updated_at
+				 FROM {$event_table}
+				 WHERE entity_guid=%s AND event_type='UpdateVariant' AND status='done'
+				 ORDER BY id DESC LIMIT 1",
+				$guid
+			), ARRAY_A );
+			$product_event = $wpdb->get_row( $wpdb->prepare(
+				"SELECT id,sync_id,event_version,created_at,updated_at
+				 FROM {$event_table}
+				 WHERE entity_guid=%s AND event_type='ProductUpdated' AND status='done'
+				 ORDER BY id DESC LIMIT 1",
+				$guid
+			), ARRAY_A );
+			if ( ! is_array( $variant_event ) || ! is_array( $product_event ) ) {
+				continue;
+			}
+
+			$expected_version = '' !== $portal_version ? $portal_version : (string) $portal_revision;
+			$sync_id          = sanitize_text_field( (string) ( $variant_event['sync_id'] ?? '' ) );
+			if ( '' === $sync_id || $sync_id !== sanitize_text_field( (string) ( $product_event['sync_id'] ?? '' ) )
+				|| $expected_version !== sanitize_text_field( (string) ( $variant_event['event_version'] ?? '' ) )
+				|| $expected_version !== sanitize_text_field( (string) ( $product_event['event_version'] ?? '' ) ) ) {
+				continue;
+			}
+
+			$product_started  = strtotime( (string) ( $product_event['created_at'] ?? '' ) );
+			$product_finished = strtotime( (string) ( $product_event['updated_at'] ?? '' ) );
+			$variant_started  = strtotime( (string) ( $variant_event['created_at'] ?? '' ) );
+			$variant_finished = strtotime( (string) ( $variant_event['updated_at'] ?? '' ) );
+			if ( false === $product_started || false === $product_finished || false === $variant_started || false === $variant_finished
+				|| $product_started > $variant_started || $product_finished < $variant_finished ) {
+				continue;
+			}
+
+			$payload = json_decode( (string) ( $variant_event['payload_json'] ?? '' ), true );
+			$data    = is_array( $payload ) && isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : array();
+			$total   = is_array( $payload ) ? absint( $payload['totalCount'] ?? 0 ) : 0;
+			if ( ! is_array( $payload ) || empty( $payload['variantListAuthoritative'] ) || empty( $payload['isLastPage'] )
+				|| $total <= 0 || count( $data ) !== $total || count( $product->get_children() ) !== $total ) {
+				continue;
+			}
+
+			$payload_attributes_valid = true;
+			foreach ( $data as $variant_data ) {
+				if ( ! is_array( $variant_data ) || empty( $variant_data['attributes'] ) || ! is_array( $variant_data['attributes'] ) ) {
+					$payload_attributes_valid = false;
+					break;
+				}
+			}
+			if ( ! $payload_attributes_valid ) {
+				continue;
+			}
+
+			/* Map first, post marker second, Health last. Roll back durable markers
+			 * if the observational health write unexpectedly fails. */
+			if ( ! $product_map->upsert_product( $guid, $product_id, $portal_hash, false ) ) {
+				continue;
+			}
+			update_post_meta( $product_id, 'mobo_sync_incomplete', '0' );
+			if ( '0' !== (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true ) ) {
+				$product_map->upsert_product( $guid, $product_id, $portal_hash, true );
+				continue;
+			}
+			if ( ! Mobo_Core_Sync_Health::mark_synced( $guid, $product_id, $portal_revision, $portal_hash, $portal_id, $portal_version ) ) {
+				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
+				$product_map->upsert_product( $guid, $product_id, $portal_hash, true );
+				continue;
+			}
+
+			$healed[] = $guid;
+		}
+
+		update_option(
+			'mobo_core_103353_convergence_residue_selfheal',
+			array(
+				'completedAt' => time(),
+				'examined'    => $examined,
+				'healedCount' => count( $healed ),
+				'healedGuids' => $healed,
+			),
+			false
+		);
+		delete_option( 'mobo_core_103353_convergence_residue_selfheal_pending' );
+		return true;
 	}
 
 	/**

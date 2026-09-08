@@ -27,6 +27,12 @@ final class Mobo_Core_Health_Read_Cache {
 	const SYNC_CRON_HOOK          = 'mobo_core_sync_health_snapshot_refresh_v2';
 	const CRON_SCHEDULE           = 'mobo_core_health_every_minute_v2';
 
+	const HEALTH_REFRESH_REQUESTED_OPTION = 'mobo_core_health_snapshot_refresh_requested_at';
+	const HEALTH_BACKGROUND_SUCCESS_OPTION = 'mobo_core_health_snapshot_last_background_success_at';
+	const SYNC_REFRESH_REQUESTED_AT_OPTION = 'mobo_core_sync_health_snapshot_refresh_requested_at';
+	const SYNC_REFRESH_REQUESTED_LIMIT_OPTION = 'mobo_core_sync_health_snapshot_refresh_requested_limit';
+	const SYNC_BACKGROUND_SUCCESS_OPTION = 'mobo_core_sync_health_snapshot_last_background_success_at';
+
 	const SYNC_TRANSIENT_PREFIX   = 'mobo_core_sync_health_operational_snapshot_v2_';
 	const SYNC_OPTION_PREFIX      = 'mobo_core_sync_health_operational_last_good_v2_';
 
@@ -40,8 +46,12 @@ final class Mobo_Core_Health_Read_Cache {
 		}
 		self::$booted = true;
 
-		add_filter( 'cron_schedules', array( __CLASS__, 'cron_schedules' ) );
-		add_action( 'init', array( __CLASS__, 'ensure_schedule' ), 20 );
+		/*
+		 * 10.33.53: snapshot refresh ownership belongs to the deterministic Mobo
+		 * real-cron runner. Keep the hook callbacks registered only for backward
+		 * compatibility with explicit do_action() callers; this class no longer
+		 * creates WP-Cron schedules.
+		 */
 		add_action( self::CRON_HOOK, array( __CLASS__, 'refresh_now' ) );
 		add_action( self::SYNC_CRON_HOOK, array( __CLASS__, 'refresh_sync_health_snapshot' ), 10, 1 );
 
@@ -73,13 +83,9 @@ final class Mobo_Core_Health_Read_Cache {
 	}
 
 	public static function ensure_schedule() {
-		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
-			wp_schedule_event( time() + 5, self::CRON_SCHEDULE, self::CRON_HOOK );
-		}
-
-		if ( ! wp_next_scheduled( self::SYNC_CRON_HOOK, array( 20 ) ) ) {
-			wp_schedule_event( time() + 10, self::CRON_SCHEDULE, self::SYNC_CRON_HOOK, array( 20 ) );
-		}
+		/* Deprecated compatibility shim. Final architecture does not schedule WP-Cron. */
+		self::schedule_near_refresh();
+		self::schedule_sync_refresh( 20 );
 	}
 
 	public static function is_refreshing() {
@@ -213,15 +219,34 @@ final class Mobo_Core_Health_Read_Cache {
 	}
 
 	public static function capture_health_snapshot( $response, $server, $request ) {
-		if ( self::is_health_route( $request ) && $response instanceof WP_REST_Response ) {
-			self::store_health_response( $response );
+		if ( ! self::is_health_route( $request ) || ! $response instanceof WP_REST_Response ) {
+			return $response;
 		}
+
+		/*
+		 * Never re-store a response that was itself served from the last-good cache.
+		 * Re-capturing it would reset generatedAt and make stale diagnostic data look
+		 * fresh forever when WP-Cron is disabled.
+		 */
+		$headers = $response->get_headers();
+		if ( is_array( $headers ) ) {
+			foreach ( $headers as $name => $value ) {
+				if ( 0 === strcasecmp( (string) $name, 'X-Mobo-Health-Snapshot' )
+					&& '1' === trim( is_array( $value ) ? implode( ',', $value ) : (string) $value ) ) {
+					return $response;
+				}
+			}
+		}
+
+		self::store_health_response( $response );
 		return $response;
 	}
 
 	private static function schedule_near_refresh() {
-		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
-			wp_schedule_single_event( time() + 1, self::CRON_HOOK );
+		$now      = time();
+		$existing = absint( get_option( self::HEALTH_REFRESH_REQUESTED_OPTION, 0 ) );
+		if ( $existing <= 0 || ( $now - $existing ) >= 30 ) {
+			update_option( self::HEALTH_REFRESH_REQUESTED_OPTION, $now, false );
 		}
 	}
 
@@ -271,6 +296,8 @@ final class Mobo_Core_Health_Read_Cache {
 			if ( $response instanceof WP_REST_Response ) {
 				$status = absint( $response->get_status() );
 				if ( $status >= 200 && $status < 300 && self::store_health_response( $response ) ) {
+					update_option( self::HEALTH_BACKGROUND_SUCCESS_OPTION, time(), false );
+					delete_option( self::HEALTH_REFRESH_REQUESTED_OPTION );
 					return true;
 				}
 				update_option( 'mobo_core_health_snapshot_last_error', 'Health refresh HTTP ' . $status, false );
@@ -388,9 +415,14 @@ final class Mobo_Core_Health_Read_Cache {
 	}
 
 	private static function schedule_sync_refresh( $limit ) {
-		$limit = max( 1, absint( $limit ) );
-		if ( ! wp_next_scheduled( self::SYNC_CRON_HOOK, array( $limit ) ) ) {
-			wp_schedule_single_event( time() + 1, self::SYNC_CRON_HOOK, array( $limit ) );
+		$limit    = max( 1, absint( $limit ) );
+		$now      = time();
+		$existing = absint( get_option( self::SYNC_REFRESH_REQUESTED_AT_OPTION, 0 ) );
+		if ( $existing <= 0 || ( $now - $existing ) >= 30 ) {
+			update_option( self::SYNC_REFRESH_REQUESTED_AT_OPTION, $now, false );
+		}
+		if ( absint( get_option( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION, 0 ) ) !== $limit ) {
+			update_option( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION, $limit, false );
 		}
 	}
 
@@ -468,8 +500,10 @@ final class Mobo_Core_Health_Read_Cache {
 			}
 
 			$result = $method->invokeArgs( $target, $args );
-			if ( is_array( $result ) ) {
-				self::store_sync_health_operational_snapshot( $limit, $result );
+			if ( is_array( $result ) && self::store_sync_health_operational_snapshot( $limit, $result ) ) {
+				update_option( self::SYNC_BACKGROUND_SUCCESS_OPTION, time(), false );
+				delete_option( self::SYNC_REFRESH_REQUESTED_AT_OPTION );
+				delete_option( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION );
 				return true;
 			}
 
@@ -481,6 +515,67 @@ final class Mobo_Core_Health_Read_Cache {
 		} finally {
 			self::$sync_refreshing = false;
 		}
+	}
+
+
+	/**
+	 * Refresh stale/requested snapshots from the deterministic real-cron runner.
+	 *
+	 * Health refresh can include an 8-second cPanel request, so it only starts when
+	 * the caller still has at least 10 seconds of runner budget. Sync Health gets a
+	 * smaller 4-second floor. A busy runner simply carries the durable request to
+	 * the next invocation instead of falling back to WP-Cron.
+	 *
+	 * @param float $deadline Absolute microtime deadline, or 0 for no deadline.
+	 * @return array
+	 */
+	public static function refresh_due_from_real_cron( $deadline = 0.0 ) {
+		$deadline = (float) $deadline;
+		$now      = time();
+		$result   = array(
+			'success' => true,
+			'status'  => 'not-due',
+			'health'  => 'not-due',
+			'sync'    => 'not-due',
+		);
+
+		$health_requested = absint( get_option( self::HEALTH_REFRESH_REQUESTED_OPTION, 0 ) ) > 0;
+		$health_last      = absint( get_option( self::HEALTH_BACKGROUND_SUCCESS_OPTION, 0 ) );
+		$health_due       = $health_requested || $health_last <= 0 || ( $now - $health_last ) >= 120;
+
+		if ( $health_due ) {
+			if ( $deadline > 0 && microtime( true ) + 10.0 >= $deadline ) {
+				$result['health'] = 'deferred-budget';
+			} else {
+				$result['health'] = self::refresh_now() ? 'refreshed' : 'failed';
+				if ( 'failed' === $result['health'] ) {
+					$result['success'] = false;
+				}
+			}
+		}
+
+		$sync_requested = absint( get_option( self::SYNC_REFRESH_REQUESTED_AT_OPTION, 0 ) ) > 0;
+		$sync_last      = absint( get_option( self::SYNC_BACKGROUND_SUCCESS_OPTION, 0 ) );
+		$sync_due       = $sync_requested || $sync_last <= 0 || ( $now - $sync_last ) >= 300;
+		$sync_limit     = max( 1, absint( get_option( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION, 20 ) ) );
+
+		if ( $sync_due ) {
+			if ( $deadline > 0 && microtime( true ) + 4.0 >= $deadline ) {
+				$result['sync'] = 'deferred-budget';
+			} else {
+				$result['sync'] = self::refresh_sync_health_snapshot( $sync_limit ) ? 'refreshed' : 'failed';
+				if ( 'failed' === $result['sync'] ) {
+					$result['success'] = false;
+				}
+			}
+		}
+
+		if ( 'not-due' !== $result['health'] || 'not-due' !== $result['sync'] ) {
+			$result['status'] = $result['success'] ? 'processed' : 'partial';
+		}
+		$result['healthLastBackgroundSuccessAt'] = absint( get_option( self::HEALTH_BACKGROUND_SUCCESS_OPTION, 0 ) );
+		$result['syncLastBackgroundSuccessAt']   = absint( get_option( self::SYNC_BACKGROUND_SUCCESS_OPTION, 0 ) );
+		return $result;
 	}
 
 	private static function is_cpanel_health_request( $args ) {

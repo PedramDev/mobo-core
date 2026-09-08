@@ -101,7 +101,24 @@ class Mobo_Core_Image_Sync {
 		$offset     = max( 0, absint( $offset ) );
 		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
 
-		if ( $product_id <= 0 || ! is_array( $images ) || $limit <= 0 ) {
+		if ( $product_id <= 0 || ! is_array( $images ) ) {
+			return array(
+				'done'       => true,
+				'nextOffset' => 0,
+				'processed'  => 0,
+				'skipped'    => 0,
+			);
+		}
+
+		/* Cleanup ownership is mirrored on attachment metadata, so an explicit empty
+		 * desired-state retry can still converge after the owning product was deleted.
+		 * Do this before the images-per-run gate: deletion cleanup is not image import
+		 * work and must not become permanently disabled by a zero download budget. */
+		if ( empty( $images ) && ! get_post( $product_id ) ) {
+			return $this->retry_pruned_cleanup_for_deleted_owner( $product_id );
+		}
+
+		if ( $limit <= 0 ) {
 			return array(
 				'done'       => true,
 				'nextOffset' => 0,
@@ -114,17 +131,108 @@ class Mobo_Core_Image_Sync {
 			return $this->process_images_with_queue( $product_id, $images, $limit, $blocking_override );
 		}
 
-		if ( empty( $images ) ) {
-			$product = wc_get_product( $product_id );
-			if ( $product instanceof WC_Product ) {
-				$product->set_image_id( 0 );
-				$product->set_gallery_image_ids( array() );
-				$product->save();
+		return $this->process_images_direct_authoritative( $product_id, $images, $offset, $limit );
+	}
+
+	/**
+	 * Preserve authoritative queue membership and cleanup semantics even when queue
+	 * execution is disabled. Queue rows remain the durable desired-state ledger; only
+	 * asynchronous queue processing is disabled by the setting.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $images Desired images.
+	 * @param int   $offset Legacy direct offset.
+	 * @param int   $limit Direct processing limit.
+	 * @return array
+	 */
+	private function process_images_direct_authoritative( $product_id, $images, $offset, $limit ) {
+		$queue                  = null;
+		$removed_attachment_ids = array();
+		$enqueue                = array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => '' );
+
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+			$queue   = new Mobo_Core_Image_Queue();
+			$enqueue = $queue->enqueue_product_images( $product_id, $this->get_product_guid( $product_id ), $images );
+			$removed_attachment_ids = isset( $enqueue['removedAttachmentIds'] ) && is_array( $enqueue['removedAttachmentIds'] )
+				? array_values( array_unique( array_filter( array_map( 'absint', $enqueue['removedAttachmentIds'] ) ) ) )
+				: array();
+
+			$enqueue_error = isset( $enqueue['error'] ) ? sanitize_text_field( (string) $enqueue['error'] ) : '';
+			if ( '' === $enqueue_error && ( ! empty( $enqueue['skipped'] ) || ! empty( $enqueue['pruneDeferred'] ) ) ) {
+				$enqueue_error = 'Image desired state was not fully accepted; malformed or ambiguous rows were preserved for retry.';
 			}
-			return array( 'done' => true, 'nextOffset' => 0, 'processed' => 0, 'skipped' => 0 );
+			if ( '' !== $enqueue_error ) {
+				return array(
+					'done'       => false,
+					'nextOffset' => 0,
+					'processed'  => 0,
+					'failed'     => 1,
+					'skipped'    => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
+					'queued'     => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+					'removed'    => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
+					'error'      => $enqueue_error,
+				);
+			}
 		}
 
-		return $this->process_images_direct( $product_id, $images, $offset, $limit );
+		$removed_attachment_ids = array_values( array_unique( array_merge(
+			$this->get_pending_pruned_cleanup_ids( $product_id ),
+			$removed_attachment_ids
+		) ) );
+		if ( $queue instanceof Mobo_Core_Image_Queue ) {
+			$removed_attachment_ids = $this->filter_pruned_attachment_candidates( $product_id, $queue, $removed_attachment_ids, $images );
+		} else {
+			/* If the queue table itself is unavailable, derive conservative stale
+			 * candidates from the product's CURRENT Woo image linkage. Only complete
+			 * Mobo-owned GUID+URL identities are eligible, so legacy/incomplete media is
+			 * retained rather than guessed at destructively. */
+			$removed_attachment_ids = array_values( array_unique( array_merge(
+				$removed_attachment_ids,
+				$this->get_direct_pruned_attachment_candidates( $product_id, $images )
+			) ) );
+			$removed_attachment_ids = $this->filter_pruned_attachment_candidates_against_images( $removed_attachment_ids, $images );
+		}
+		$this->set_pending_pruned_cleanup_ids( $product_id, $removed_attachment_ids );
+
+		if ( ! empty( $removed_attachment_ids ) && ! $this->unlink_pruned_attachments_from_product( $product_id, $removed_attachment_ids ) ) {
+			return array(
+				'done'       => false,
+				'nextOffset' => 0,
+				'processed'  => 0,
+				'failed'     => 1,
+				'skipped'    => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
+				'queued'     => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+				'removed'    => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
+				'error'      => 'Stale image desired-state rows were pruned but WooCommerce could not safely detach their attachments.',
+			);
+		}
+
+		if ( empty( $images ) ) {
+			$product = wc_get_product( $product_id );
+			if ( ! $product instanceof WC_Product ) {
+				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'error' => 'Product could not be reloaded while committing an explicit empty image desired state.' );
+			}
+			$product->set_image_id( 0 );
+			$product->set_gallery_image_ids( array() );
+			if ( absint( $product->save() ) !== $product_id ) {
+				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'error' => 'WooCommerce did not confirm the explicit empty image desired-state save.' );
+			}
+			$result = array( 'done' => true, 'nextOffset' => 0, 'processed' => 0, 'skipped' => 0, 'failed' => 0, 'error' => '' );
+		} else {
+			$result = $this->process_images_direct( $product_id, $images, $offset, $limit );
+		}
+
+		$retry_pruned_attachment_ids = array();
+		$deleted_pruned_attachments  = $this->delete_unreferenced_pruned_attachments( $removed_attachment_ids, $retry_pruned_attachment_ids, $product_id );
+		$this->set_pending_pruned_cleanup_ids( $product_id, $retry_pruned_attachment_ids );
+
+		$result['queued']             = isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0;
+		$result['removed']            = isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0;
+		$result['deletedAttachments'] = $deleted_pruned_attachments;
+		if ( ! isset( $result['error'] ) ) {
+			$result['error'] = '';
+		}
+		return $result;
 	}
 
 	/**
@@ -290,6 +398,25 @@ class Mobo_Core_Image_Sync {
 		$product_guid = $this->get_product_guid( $product_id );
 
 		$enqueue  = $queue->enqueue_product_images( $product_id, $product_guid, $images );
+		$removed_attachment_ids = isset( $enqueue['removedAttachmentIds'] ) && is_array( $enqueue['removedAttachmentIds'] )
+			? array_values( array_unique( array_filter( array_map( 'absint', $enqueue['removedAttachmentIds'] ) ) ) )
+			: array();
+
+		/* A valid row can supersede an old attachment even when another row in the
+		 * same payload is malformed and forces the overall enqueue pass to retry.
+		 * Preserve those cleanup candidates before any early return; a later valid
+		 * pass will re-filter them against the then-current Desired State before
+		 * detach/delete, so persistence here is non-destructive. */
+		if ( ! empty( $removed_attachment_ids ) ) {
+			$this->set_pending_pruned_cleanup_ids(
+				$product_id,
+				array_values( array_unique( array_merge(
+					$this->get_pending_pruned_cleanup_ids( $product_id ),
+					$removed_attachment_ids
+				) ) )
+			);
+		}
+
 		$enqueue_error = isset( $enqueue['error'] ) ? sanitize_text_field( (string) $enqueue['error'] ) : '';
 		if ( '' === $enqueue_error && ( ! empty( $enqueue['skipped'] ) || ! empty( $enqueue['pruneDeferred'] ) ) ) {
 			$enqueue_error = 'Image desired state was not fully accepted; malformed or ambiguous rows were preserved for retry.';
@@ -310,6 +437,40 @@ class Mobo_Core_Image_Sync {
 				'error'       => $enqueue_error,
 			);
 		}
+		/* Queue pruning establishes authoritative absence. Merge durable cleanup
+		 * candidates from an earlier interrupted pass before filtering against the
+		 * CURRENT desired queue. This ordering is important: an image may have been
+		 * pruned, left pending because WooCommerce save/delete failed, and then be
+		 * reintroduced by a newer Desired State before the retry. In that case the
+		 * stale cleanup candidate must be cancelled rather than detached/deleted. */
+		$removed_attachment_ids = array_values( array_unique( array_merge(
+			$this->get_pending_pruned_cleanup_ids( $product_id ),
+			$removed_attachment_ids
+		) ) );
+		$removed_attachment_ids = $this->filter_pruned_attachment_candidates( $product_id, $queue, $removed_attachment_ids );
+
+		/* Persist only candidates that remain absent from the current Desired State
+		 * before touching WooCommerce linkage. If a transient product save/read-back
+		 * failure happens after queue rows were pruned, the next sync can retry safely. */
+		$this->set_pending_pruned_cleanup_ids( $product_id, $removed_attachment_ids );
+
+		if ( ! empty( $removed_attachment_ids ) && ! $this->unlink_pruned_attachments_from_product( $product_id, $removed_attachment_ids ) ) {
+			return array(
+				'done'        => false,
+				'nextOffset'  => 0,
+				'processed'   => 0,
+				'failed'      => 1,
+				'skipped'     => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
+				'queued'      => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+				'removed'     => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
+				'pending'     => 0,
+				'due'         => 0,
+				'blocking'    => false,
+				'queuedAsync' => false,
+				'error'       => 'Stale image queue rows were pruned but WooCommerce could not safely detach their attachments.',
+			);
+		}
+
 		$blocking = is_bool( $queue_blocking_override ) ? $queue_blocking_override : Mobo_Core_Settings::enabled( 'mobo_core_image_queue_blocking', '0' );
 
 		/*
@@ -351,6 +512,14 @@ class Mobo_Core_Image_Sync {
 			$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
 		}
 
+		/* Only after stale attachments are detached from this product do we consider
+		 * destructive Media Library cleanup. wp_delete_attachment(..., true) removes
+		 * the attachment row, original file and registered sub-sizes. Cleanup remains
+		 * conservative: any other queue/product/content reference keeps the attachment. */
+		$retry_pruned_attachment_ids = array();
+		$deleted_pruned_attachments = $this->delete_unreferenced_pruned_attachments( $removed_attachment_ids, $retry_pruned_attachment_ids, $product_id );
+		$this->set_pending_pruned_cleanup_ids( $product_id, $retry_pruned_attachment_ids );
+
 		if ( method_exists( $queue, 'get_product_summary' ) ) {
 			$product_queue_summary = $queue->get_product_summary( $product_id );
 			$pending        = absint( isset( $product_queue_summary['pending'] ) ? $product_queue_summary['pending'] : 0 );
@@ -386,8 +555,1024 @@ class Mobo_Core_Image_Sync {
 			'due'        => $due_by_product,
 			'blocking'   => $blocking,
 			'queuedAsync'=> ! $blocking,
+			'deletedAttachments' => $deleted_pruned_attachments,
 			'error'      => '',
 		);
+	}
+
+
+	/**
+	 * Read durable cleanup candidates left by an earlier interrupted prune pass.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array
+	 */
+	private function get_pending_pruned_cleanup_ids( $product_id ) {
+		global $wpdb;
+
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return array();
+		}
+
+		$value = get_post_meta( $product_id, '_mobo_pruned_cleanup_pending', true );
+		$ids   = array_values( array_unique( array_filter( array_map( 'absint', is_array( $value ) ? $value : array() ) ) ) );
+
+		/* The product post can disappear before a protected attachment is eligible for
+		 * deletion. Mirror ownership on the attachment so the cleanup identity survives
+		 * permanent owner deletion and can be recovered by product ID. */
+		$id            = (string) $product_id;
+		$serialized_i  = '%i:' . $wpdb->esc_like( $id ) . ';%';
+		$serialized_s  = '%s:' . strlen( $id ) . ':"' . $wpdb->esc_like( $id ) . '";%';
+		$mirrored_ids  = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_mobo_pruned_cleanup_owner_ids' AND (meta_value LIKE %s OR meta_value LIKE %s)",
+				$serialized_i,
+				$serialized_s
+			)
+		);
+		if ( is_array( $mirrored_ids ) ) {
+			$ids = array_merge( $ids, array_map( 'absint', $mirrored_ids ) );
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) );
+	}
+
+	/**
+	 * Persist only candidates that still need a later destructive cleanup retry.
+	 * Ownership is mirrored on each attachment so cleanup survives deletion of the
+	 * original product post. Both keys are explicitly ignored by live-reference proof.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $attachment_ids Attachment IDs.
+	 * @return void
+	 */
+	private function set_pending_pruned_cleanup_ids( $product_id, $attachment_ids ) {
+		$product_id     = absint( $product_id );
+		$attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		$previous = $this->get_pending_pruned_cleanup_ids( $product_id );
+		$all      = array_values( array_unique( array_merge( $previous, $attachment_ids ) ) );
+		foreach ( $all as $attachment_id ) {
+			if ( 'attachment' !== get_post_type( $attachment_id ) ) {
+				continue;
+			}
+			$owners = get_post_meta( $attachment_id, '_mobo_pruned_cleanup_owner_ids', true );
+			$owners = array_values( array_unique( array_filter( array_map( 'absint', is_array( $owners ) ? $owners : array() ) ) ) );
+			if ( in_array( $attachment_id, $attachment_ids, true ) ) {
+				if ( ! in_array( $product_id, $owners, true ) ) {
+					$owners[] = $product_id;
+				}
+			} else {
+				$owners = array_values( array_filter( $owners, static function ( $owner_id ) use ( $product_id ) {
+					return absint( $owner_id ) !== $product_id;
+				} ) );
+			}
+			if ( empty( $owners ) ) {
+				delete_post_meta( $attachment_id, '_mobo_pruned_cleanup_owner_ids' );
+			} else {
+				update_post_meta( $attachment_id, '_mobo_pruned_cleanup_owner_ids', $owners );
+			}
+		}
+
+		if ( get_post( $product_id ) ) {
+			if ( empty( $attachment_ids ) ) {
+				delete_post_meta( $product_id, '_mobo_pruned_cleanup_pending' );
+			} else {
+				update_post_meta( $product_id, '_mobo_pruned_cleanup_pending', $attachment_ids );
+			}
+		}
+	}
+
+	/**
+	 * Build the exact durable Mobo image identity key used for cleanup decisions.
+	 * GUID or URL alone is not sufficient because either component can be superseded.
+	 *
+	 * @param string $guid Image GUID.
+	 * @param string $url Source URL.
+	 * @return string
+	 */
+	private function pruned_identity_key( $guid, $url ) {
+		$guid = strtolower( trim( sanitize_text_field( (string) $guid ) ) );
+		$url  = esc_url_raw( (string) $url );
+		return '' !== $guid && '' !== $url ? $guid . "\n" . $url : '';
+	}
+
+	/** @return string */
+	private function pruned_attachment_identity_key( $attachment_id ) {
+		$guid = (string) get_post_meta( $attachment_id, 'image_guid', true );
+		if ( '' === trim( $guid ) ) {
+			$guid = (string) get_post_meta( $attachment_id, 'img_guid', true );
+		}
+		$url = (string) get_post_meta( $attachment_id, 'mobo_source_url', true );
+		return $this->pruned_identity_key( $guid, $url );
+	}
+
+	/** @return array<string,bool> */
+	private function pruned_desired_identity_keys_from_images( $images ) {
+		$keys = array();
+		foreach ( is_array( $images ) ? $images : array() as $image ) {
+			if ( ! is_array( $image ) ) {
+				continue;
+			}
+			$guid = '';
+			foreach ( array( 'imageGuid', 'image_guid', 'id', 'guid' ) as $key ) {
+				if ( isset( $image[ $key ] ) && '' !== trim( (string) $image[ $key ] ) ) {
+					$guid = (string) $image[ $key ];
+					break;
+				}
+			}
+			$url = '';
+			foreach ( array( 'url', 'imageUrl', 'image_url', 'sourceUrl', 'source_url' ) as $key ) {
+				if ( isset( $image[ $key ] ) && '' !== trim( (string) $image[ $key ] ) ) {
+					$url = (string) $image[ $key ];
+					break;
+				}
+			}
+			$identity = $this->pruned_identity_key( $guid, $url );
+			if ( '' !== $identity ) {
+				$keys[ $identity ] = true;
+			}
+		}
+		return $keys;
+	}
+
+	/**
+	 * Remove cleanup candidates that are exactly reintroduced in an explicit payload.
+	 *
+	 * @param array $attachment_ids Candidate IDs.
+	 * @param array $images Desired images.
+	 * @return array
+	 */
+	private function filter_pruned_attachment_candidates_against_images( $attachment_ids, $images ) {
+		$desired  = $this->pruned_desired_identity_keys_from_images( $images );
+		$filtered = array();
+		foreach ( array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) ) as $attachment_id ) {
+			$identity = $this->pruned_attachment_identity_key( $attachment_id );
+			if ( '' !== $identity && isset( $desired[ $identity ] ) ) {
+				continue;
+			}
+			$filtered[] = $attachment_id;
+		}
+		return $filtered;
+	}
+
+	/**
+	 * Derive stale image candidates from current Woo linkage when the durable image
+	 * queue table is unavailable. This fallback is intentionally fail-closed:
+	 * attachments without a complete Mobo GUID+source tuple are never inferred stale.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $images Current desired payload.
+	 * @return array
+	 */
+	private function get_direct_pruned_attachment_candidates( $product_id, $images ) {
+		$product_id = absint( $product_id );
+		$product    = $product_id > 0 ? wc_get_product( $product_id ) : false;
+		if ( ! $product instanceof WC_Product ) {
+			return array();
+		}
+
+		$current_ids = array_merge(
+			array( absint( $product->get_image_id() ) ),
+			array_map( 'absint', (array) $product->get_gallery_image_ids() )
+		);
+		$current_ids = array_values( array_unique( array_filter( $current_ids ) ) );
+		$desired     = $this->pruned_desired_identity_keys_from_images( $images );
+		$stale       = array();
+
+		foreach ( $current_ids as $attachment_id ) {
+			if ( ! $this->is_mobo_owned_attachment( $attachment_id ) ) {
+				continue;
+			}
+			$identity = $this->pruned_attachment_identity_key( $attachment_id );
+			if ( '' === $identity ) {
+				continue;
+			}
+			if ( ! isset( $desired[ $identity ] ) ) {
+				$stale[] = $attachment_id;
+			}
+		}
+
+		return array_values( array_unique( $stale ) );
+	}
+
+	/**
+	 * Remove prune candidates still represented by the exact current desired identity.
+	 * Matching only GUID or only URL is unsafe: both can independently be superseded.
+	 *
+	 * @param int                   $product_id Product ID.
+	 * @param Mobo_Core_Image_Queue $queue Image queue.
+	 * @param array                 $attachment_ids Candidate attachment IDs.
+	 * @param array|null            $images Optional current payload.
+	 * @return array
+	 */
+	private function filter_pruned_attachment_candidates( $product_id, Mobo_Core_Image_Queue $queue, $attachment_ids, $images = null ) {
+		$product_id     = absint( $product_id );
+		$attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
+		if ( $product_id <= 0 || empty( $attachment_ids ) ) {
+			return array();
+		}
+
+		$rows             = method_exists( $queue, 'get_ordered_rows_for_product' ) ? $queue->get_ordered_rows_for_product( $product_id ) : array();
+		$still_desired_id = array();
+		$desired_identity = is_array( $images ) ? $this->pruned_desired_identity_keys_from_images( $images ) : array();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$current_attachment_id = absint( isset( $row['attachment_id'] ) ? $row['attachment_id'] : 0 );
+			if ( $current_attachment_id > 0 ) {
+				$still_desired_id[ $current_attachment_id ] = true;
+			}
+			$identity = $this->pruned_identity_key(
+				isset( $row['image_guid'] ) ? $row['image_guid'] : '',
+				isset( $row['source_url'] ) ? $row['source_url'] : ''
+			);
+			if ( '' !== $identity ) {
+				$desired_identity[ $identity ] = true;
+			}
+		}
+
+		$filtered = array();
+		foreach ( $attachment_ids as $attachment_id ) {
+			if ( isset( $still_desired_id[ $attachment_id ] ) ) {
+				continue;
+			}
+			$identity = $this->pruned_attachment_identity_key( $attachment_id );
+			if ( '' !== $identity && isset( $desired_identity[ $identity ] ) ) {
+				continue;
+			}
+			$filtered[] = $attachment_id;
+		}
+
+		return array_values( array_unique( $filtered ) );
+	}
+
+	/**
+	 * Detach stale attachments from the current product before destructive cleanup.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $attachment_ids Stale attachment IDs.
+	 * @return bool
+	 */
+	private function unlink_pruned_attachments_from_product( $product_id, $attachment_ids ) {
+		$product_id     = absint( $product_id );
+		$attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
+		if ( $product_id <= 0 || empty( $attachment_ids ) ) {
+			return true;
+		}
+
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return false;
+		}
+
+		$changed  = false;
+		$image_id = absint( $product->get_image_id() );
+		if ( $image_id > 0 && in_array( $image_id, $attachment_ids, true ) ) {
+			$product->set_image_id( 0 );
+			$changed = true;
+		}
+
+		$current_gallery = array_values( array_unique( array_filter( array_map( 'absint', (array) $product->get_gallery_image_ids() ) ) ) );
+		$desired_gallery = array_values( array_filter( $current_gallery, static function ( $attachment_id ) use ( $attachment_ids ) {
+			return ! in_array( absint( $attachment_id ), $attachment_ids, true );
+		} ) );
+		if ( $desired_gallery !== $current_gallery ) {
+			$product->set_gallery_image_ids( $desired_gallery );
+			$changed = true;
+		}
+
+		if ( ! $changed ) {
+			return true;
+		}
+
+		if ( absint( $product->save() ) !== $product_id ) {
+			return false;
+		}
+
+		$fresh = wc_get_product( $product_id );
+		if ( ! $fresh instanceof WC_Product ) {
+			return false;
+		}
+		if ( in_array( absint( $fresh->get_image_id() ), $attachment_ids, true ) ) {
+			return false;
+		}
+		foreach ( (array) $fresh->get_gallery_image_ids() as $gallery_id ) {
+			if ( in_array( absint( $gallery_id ), $attachment_ids, true ) ) {
+				return false;
+			}
+		}
+
+		wc_delete_product_transients( $product_id );
+		clean_post_cache( $product_id );
+		return true;
+	}
+
+	/**
+	 * Permanently delete stale local Mobo attachments after reference proof.
+	 * WordPress removes the attachment row, original file and registered sub-sizes.
+	 * Shared Media attachments are intentionally retained because their physical
+	 * files are owned by central worker storage and may be shared across sites.
+	 *
+	 * @param array $attachment_ids Candidate attachment IDs.
+	 * @return int Deleted attachment count.
+	 */
+	private function delete_unreferenced_pruned_attachments( $attachment_ids, &$retry_attachment_ids = array(), $owner_product_id = 0 ) {
+		$attachment_ids       = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
+		$owner_product_id     = absint( $owner_product_id );
+		$retry_attachment_ids = array();
+		$deleted_count        = 0;
+
+		foreach ( $attachment_ids as $attachment_id ) {
+			if ( 'attachment' !== get_post_type( $attachment_id ) ) {
+				continue;
+			}
+
+			if ( class_exists( 'Mobo_Core_Shared_Media' ) && method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
+				continue;
+			}
+
+			if ( $owner_product_id > 0 && $this->pruned_attachment_is_current_desired_identity( $attachment_id, $owner_product_id ) ) {
+				continue;
+			}
+
+			if ( ! $this->is_mobo_owned_attachment( $attachment_id ) || $this->pruned_attachment_has_live_reference( $attachment_id ) ) {
+				$retry_attachment_ids[] = $attachment_id;
+				continue;
+			}
+
+			$file         = get_attached_file( $attachment_id );
+			$file         = is_string( $file ) ? wp_normalize_path( $file ) : '';
+			$guard_status = 'not-run';
+			$guard = function ( $check, $post, $force_delete ) use ( $attachment_id, $owner_product_id, &$guard_status ) {
+				if ( ! is_object( $post ) || ! isset( $post->ID ) || absint( $post->ID ) !== $attachment_id ) {
+					return $check;
+				}
+
+				/* Respect any earlier veto from WordPress/extensions. */
+				if ( null !== $check ) {
+					$guard_status = 'blocked-by-earlier-filter';
+					return $check;
+				}
+
+				/* This is deliberately a second reference proof at the final destructive
+				 * boundary. A newer desired state can arrive after the first proof but
+				 * while another pre_delete_attachment callback is running. */
+				if ( ( $owner_product_id > 0 && $this->pruned_attachment_is_current_desired_identity( $attachment_id, $owner_product_id ) ) || $this->pruned_attachment_has_live_reference( $attachment_id ) ) {
+					$guard_status = 'referenced-at-delete-boundary';
+					return false;
+				}
+
+				$unsafe = false;
+				$files  = $this->get_registered_pruned_attachment_files( $attachment_id, $unsafe );
+				if ( $unsafe ) {
+					$guard_status = 'unsafe-fileset';
+					return false;
+				}
+
+				/* Pre-delete the complete registered fileset while the DB attachment still
+				 * exists. If any physical removal is vetoed/fails, keep the DB identity and
+				 * durable retry candidate instead of creating an untracked orphan. */
+				foreach ( $files as $registered_file ) {
+					if ( is_file( $registered_file ) ) {
+						wp_delete_file( $registered_file );
+						clearstatcache( true, $registered_file );
+						if ( is_file( $registered_file ) ) {
+							$guard_status = 'filesystem-delete-incomplete';
+							return false;
+						}
+					}
+				}
+
+				$guard_status = 'files-converged';
+				return null;
+			};
+
+			add_filter( 'pre_delete_attachment', $guard, PHP_INT_MAX, 3 );
+			try {
+				$deleted = wp_delete_attachment( $attachment_id, true );
+			} finally {
+				remove_filter( 'pre_delete_attachment', $guard, PHP_INT_MAX );
+			}
+
+			if ( $deleted && 'attachment' !== get_post_type( $attachment_id ) ) {
+				$deleted_count++;
+				continue;
+			}
+
+			/* A same exact identity reintroduced during the race is current desired state,
+			 * not cleanup debt. Every other refusal remains durable for a later retry. */
+			if ( ( $owner_product_id <= 0 || ! $this->pruned_attachment_is_current_desired_identity( $attachment_id, $owner_product_id ) ) && 'attachment' === get_post_type( $attachment_id ) ) {
+				$retry_attachment_ids[] = $attachment_id;
+			}
+			if ( class_exists( 'Mobo_Core_Logger' ) && 'attachment' === get_post_type( $attachment_id ) ) {
+				Mobo_Core_Logger::warning(
+					'Mobo Core deferred deletion of an attachment removed from image desired state.',
+					array( 'attachment_id' => $attachment_id, 'file' => $file, 'guard_status' => $guard_status )
+				);
+			}
+		}
+
+		$retry_attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', $retry_attachment_ids ) ) ) );
+		return $deleted_count;
+	}
+
+	/**
+	 * Return all files registered to an attachment and fail closed if any path is
+	 * outside the WordPress uploads root.
+	 *
+	 * @param int  $attachment_id Attachment ID.
+	 * @param bool $unsafe Set true when destructive deletion must be refused.
+	 * @return array
+	 */
+	private function get_registered_pruned_attachment_files( $attachment_id, &$unsafe = false ) {
+		$unsafe = false;
+		$files  = array();
+		$main    = get_attached_file( $attachment_id );
+		$main    = is_string( $main ) ? wp_normalize_path( $main ) : '';
+		$uploads = wp_get_upload_dir();
+		$basedir = isset( $uploads['basedir'] ) ? trailingslashit( wp_normalize_path( (string) $uploads['basedir'] ) ) : '';
+
+		if ( '' === $basedir ) {
+			$unsafe = true;
+			return array();
+		}
+		if ( '' !== $main ) {
+			if ( ! $this->pruned_filesystem_path_is_safe( $main, $basedir ) ) {
+				$unsafe = true;
+				return array();
+			}
+			$files[] = $main;
+		}
+
+		$directory = '' !== $main ? trailingslashit( wp_normalize_path( dirname( $main ) ) ) : '';
+		$metadata  = wp_get_attachment_metadata( $attachment_id );
+		if ( is_array( $metadata ) && '' !== $directory ) {
+			if ( ! empty( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
+				foreach ( $metadata['sizes'] as $size ) {
+					if ( is_array( $size ) && ! empty( $size['file'] ) ) {
+						$files[] = $directory . ltrim( wp_normalize_path( (string) $size['file'] ), '/' );
+					}
+				}
+			}
+			if ( ! empty( $metadata['original_image'] ) ) {
+				$files[] = $directory . ltrim( wp_normalize_path( (string) $metadata['original_image'] ), '/' );
+			}
+		}
+
+		$backups = get_post_meta( $attachment_id, '_wp_attachment_backup_sizes', true );
+		if ( is_array( $backups ) && '' !== $directory ) {
+			foreach ( $backups as $backup ) {
+				if ( is_array( $backup ) && ! empty( $backup['file'] ) ) {
+					$files[] = $directory . ltrim( wp_normalize_path( (string) $backup['file'] ), '/' );
+				}
+			}
+		}
+
+		$files = array_values( array_unique( array_filter( array_map( 'wp_normalize_path', $files ) ) ) );
+		foreach ( $files as $path ) {
+			if ( ! $this->pruned_filesystem_path_is_safe( $path, $basedir ) ) {
+				$unsafe = true;
+				return array();
+			}
+		}
+		return $files;
+	}
+
+	/**
+	 * Prove a candidate file is lexically and physically contained by uploads.
+	 * Dot-segment traversal is rejected outright. Existing paths/directories are
+	 * resolved through realpath so a symlink inside uploads cannot redirect deletion
+	 * outside the uploads root.
+	 *
+	 * @param string $path Candidate path.
+	 * @param string $basedir Uploads base directory.
+	 * @return bool
+	 */
+	private function pruned_filesystem_path_is_safe( $path, $basedir ) {
+		$path    = wp_normalize_path( (string) $path );
+		$basedir = trailingslashit( wp_normalize_path( (string) $basedir ) );
+		if ( '' === $path || '' === $basedir || false !== strpos( $path, "\0" ) ) {
+			return false;
+		}
+
+		/* wp_normalize_path() does not collapse dot segments. Refuse them instead of
+		 * allowing filesystem resolution to escape the uploads tree. */
+		if ( preg_match( '#(?:^|/)\.\.?(/|$)#', $path ) ) {
+			return false;
+		}
+
+		$is_windows = 1 === preg_match( '#^[A-Za-z]:/#', $basedir );
+		$prefix_ok  = $is_windows
+			? 0 === strncasecmp( $path, $basedir, strlen( $basedir ) )
+			: 0 === strpos( $path, $basedir );
+		if ( ! $prefix_ok ) {
+			return false;
+		}
+
+		$resolved_base = realpath( untrailingslashit( $basedir ) );
+		if ( false === $resolved_base ) {
+			return false;
+		}
+		$resolved_base = trailingslashit( wp_normalize_path( $resolved_base ) );
+
+		/* Resolve the file when present, otherwise resolve its existing parent. This
+		 * catches both direct symlink files and symlinked directories. */
+		$resolved_target = realpath( $path );
+		if ( false === $resolved_target ) {
+			$resolved_parent = realpath( dirname( $path ) );
+			if ( false === $resolved_parent ) {
+				return false;
+			}
+			$resolved_target = trailingslashit( wp_normalize_path( $resolved_parent ) ) . basename( $path );
+		} else {
+			$resolved_target = wp_normalize_path( $resolved_target );
+		}
+
+		return $is_windows
+			? 0 === strncasecmp( $resolved_target, $resolved_base, strlen( $resolved_base ) )
+			: 0 === strpos( $resolved_target, $resolved_base );
+	}
+
+	/**
+	 * True when an attachment's exact GUID+source URL tuple is present anywhere in
+	 * the durable image desired-state queue, even before attachment_id is committed.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function pruned_attachment_is_current_desired_identity( $attachment_id, $product_id = 0 ) {
+		global $wpdb;
+		$product_id = absint( $product_id );
+		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
+			return false;
+		}
+		$identity = $this->pruned_attachment_identity_key( $attachment_id );
+		if ( '' === $identity ) {
+			return false;
+		}
+		$parts = explode( "\n", $identity, 2 );
+		if ( 2 !== count( $parts ) ) {
+			return false;
+		}
+		$table = Mobo_Core_Image_Queue::table_name();
+		if ( $product_id > 0 ) {
+			$row = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT id FROM {$table} WHERE product_id = %d AND LOWER(image_guid) = %s AND source_url = %s LIMIT 1",
+					$product_id,
+					$parts[0],
+					$parts[1]
+				)
+			);
+		} else {
+			$row = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT id FROM {$table} WHERE LOWER(image_guid) = %s AND source_url = %s LIMIT 1",
+					$parts[0],
+					$parts[1]
+				)
+			);
+		}
+		return absint( $row ) > 0;
+	}
+
+	/**
+	 * Retry cleanup for a product ID after its owner post was permanently deleted.
+	 *
+	 * @param int $product_id Deleted product ID.
+	 * @return array
+	 */
+	private function retry_pruned_cleanup_for_deleted_owner( $product_id ) {
+		$candidates = $this->get_pending_pruned_cleanup_ids( $product_id );
+		$retry      = array();
+		$deleted    = $this->delete_unreferenced_pruned_attachments( $candidates, $retry, $product_id );
+		$this->set_pending_pruned_cleanup_ids( $product_id, $retry );
+		return array(
+			'done'               => true,
+			'nextOffset'         => 0,
+			'processed'          => 0,
+			'failed'             => 0,
+			'skipped'            => 0,
+			'deletedAttachments' => $deleted,
+			'error'              => '',
+		);
+	}
+
+	/**
+	 * Only attachments carrying Mobo image identity are eligible for destructive
+	 * desired-state cleanup.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function is_mobo_owned_attachment( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 ) {
+			return false;
+		}
+
+		return '' !== trim( (string) get_post_meta( $attachment_id, 'image_guid', true ) )
+			|| '' !== trim( (string) get_post_meta( $attachment_id, 'img_guid', true ) )
+			|| '' !== trim( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
+	}
+
+	/**
+	 * Normalize a metadata/option/structured key for reference classification.
+	 *
+	 * @param string $key Raw key.
+	 * @return string
+	 */
+	private function pruned_normalize_reference_key( $key ) {
+		$key = trim( (string) $key );
+		if ( '' === $key ) {
+			return '';
+		}
+		$key = preg_replace( '/([a-z0-9])([A-Z])/', '$1_$2', $key );
+		return strtolower( str_replace( array( '-', '.', ':', ' ' ), '_', (string) $key ) );
+	}
+
+	/**
+	 * Whether a numeric key is known to describe business/runtime state rather than
+	 * attachment ownership. Unknown scalar keys remain fail-closed so custom fields
+	 * (for example an ACF image field named simply "hero") cannot lose media.
+	 *
+	 * @param string $key Raw key.
+	 * @return bool
+	 */
+	private function pruned_reference_key_is_nonmedia_numeric( $key ) {
+		$key = $this->pruned_normalize_reference_key( $key );
+		if ( '' === $key ) {
+			return false;
+		}
+
+		if ( in_array( $key, array( '_mobo_pruned_cleanup_pending', '_mobo_pruned_cleanup_owner_ids', 'page_on_front', 'page_for_posts', 'default_category' ), true ) ) {
+			return true;
+		}
+
+		$media_token = '(?:attachments?|images?|media|thumbnails?|galler(?:y|ies)|photos?|pictures?|icons?|logos?|avatars?|posters?|covers?|backgrounds?|banners?)';
+		$has_media   = 1 === preg_match( '/(?:^|_)' . $media_token . '(?:_|$)/', $key );
+
+		/* A media-shaped key remains ownership by default, but numeric properties/state
+		 * that occur after the media token (image_width, attachment_metadata, image_alt,
+		 * image_scan_cursor, etc.) are measurements/runtime state rather than IDs. Prefix
+		 * labels such as order_image or title_image remain media references. */
+		if ( $has_media && preg_match(
+			'/(?:^|_)' . $media_token . '(?:_[a-z0-9]+)*_(?:metadata|meta_data|dimension|dimensions|width|height|filesize|file_size|bytes|size|price|cost|amount|stock|quantity|qty|count|counter|total|revision|version|generation|cursor|offset|limit|seconds|interval|duration|timestamp|time|date|weight|length|rating|rate|percent|percentage|tax|discount|attempt|retry|scan|audit|status|result|enabled|approved|started|finished|pending|recovery|cleanup|quarantined|order|position|index|priority|alt|caption|title|description|context|expiry|expires|per_run|max_try|min_free|blocking|force|generate|delete)(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		if ( ! $has_media && preg_match(
+			'/(?:^|_)(?:metadata|meta_data|dimension|dimensions|width|height|filesize|file_size|bytes|size|price|cost|amount|stock|quantity|qty|count|counter|total|revision|version|generation|cursor|offset|limit|seconds|interval|duration|timestamp|time|date|weight|length|rating|rate|percent|percentage|tax|discount|attempt|retry|scan|audit|status|result|enabled|approved|started|finished|pending|recovery|cleanup|quarantined|order|position|index|priority|alt|caption|title|description|context|expiry|expires)(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		if ( ! $has_media && preg_match(
+			'/(?:^|_)(?:portal|product|variation|order|user|customer|term|category|tag|page|post|parent|author|attribute|shipping_class|tax_class)(?:_[a-z0-9]+)*_ids?(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		return false;
+	}
+
+
+	/**
+	 * Whether a storage key semantically represents media/attachment identity.
+	 *
+	 * Numeric values are common across WooCommerce/Portal metadata (price, revisions,
+	 * cursors, portal IDs). Treating every equal integer as an attachment reference
+	 * can permanently retain unrelated orphan media. Only media-shaped keys may turn
+	 * a plain scalar integer into a live reference; structured values are inspected
+	 * separately for nested media-shaped keys.
+	 *
+	 * @param string $key Metadata/option/structured key.
+	 * @return bool
+	 */
+	private function pruned_reference_key_is_media_semantic( $key ) {
+		$key = $this->pruned_normalize_reference_key( $key );
+		if ( '' === $key || $this->pruned_reference_key_is_nonmedia_numeric( $key ) ) {
+			return false;
+		}
+
+		/* Mobo runtime options whose names contain "image" but are execution knobs are
+		 * operational state, not attachment ownership. A nested structured media key is
+		 * still detected independently. */
+		if ( 0 === strpos( $key, 'mobo_core_' ) && preg_match(
+			'/(?:^|_)(?:per_run|max_try|min_free|blocking|force|generate|delete)(?:_|$)/',
+			$key
+		) ) {
+			return false;
+		}
+
+		return 1 === preg_match(
+			'/(?:^|_)(?:attachments?|images?|media|thumbnails?|galler(?:y|ies)|photos?|pictures?|icons?|logos?|avatars?|posters?|covers?|backgrounds?|banners?)(?:_|$)/',
+			$key
+		);
+	}
+
+	/**
+	 * Inspect a structured value for an attachment reference with media semantics.
+	 *
+	 * @param mixed $value Value or decoded structure.
+	 * @param int   $attachment_id Attachment ID.
+	 * @param bool  $semantic_parent Whether the containing key is media-shaped.
+	 * @param int   $depth Recursion depth.
+	 * @return bool
+	 */
+	private function pruned_structured_value_references_attachment( $value, $attachment_id, $semantic_parent = false, $depth = 0 ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || $depth > 12 ) {
+			return false;
+		}
+
+		if ( is_object( $value ) ) {
+			$value = (array) $value;
+		}
+		if ( is_array( $value ) ) {
+			foreach ( $value as $key => $child ) {
+				/* Named children normally establish their own media semantics. Neutral
+				 * ID/list container keys may inherit an already-media parent, and numeric
+				 * list members inherit it directly. Dimension/filesize keys never inherit,
+				 * preventing _wp_attachment_metadata integers from becoming references. */
+				if ( is_string( $key ) ) {
+					$normalized_key = $this->pruned_normalize_reference_key( $key );
+					$semantic       = $this->pruned_reference_key_is_media_semantic( $key )
+						|| ( $semantic_parent && 1 === preg_match( '/^(?:id|ids|value|values|item|items|list)$/', $normalized_key ) );
+				} else {
+					$semantic = $semantic_parent;
+				}
+				if ( $this->pruned_structured_value_references_attachment( $child, $attachment_id, $semantic, $depth + 1 ) ) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		if ( ! is_scalar( $value ) || is_bool( $value ) ) {
+			return false;
+		}
+		$text = trim( (string) $value );
+		if ( '' === $text ) {
+			return false;
+		}
+
+		/* Decode WordPress serialization and JSON before applying scalar semantics.
+		 * This keeps arbitrary option names safe when their nested key is explicitly
+		 * "attachment", "image", "media", etc. */
+		if ( is_serialized( $text ) ) {
+			$decoded = maybe_unserialize( $text );
+			if ( $decoded !== $text && $this->pruned_structured_value_references_attachment( $decoded, $attachment_id, $semantic_parent, $depth + 1 ) ) {
+				return true;
+			}
+		}
+		$first = substr( $text, 0, 1 );
+		if ( '{' === $first || '[' === $first ) {
+			$decoded = json_decode( $text, true );
+			if ( JSON_ERROR_NONE === json_last_error() && is_array( $decoded ) && $this->pruned_structured_value_references_attachment( $decoded, $attachment_id, $semantic_parent, $depth + 1 ) ) {
+				return true;
+			}
+		}
+
+		if ( ! $semantic_parent ) {
+			return false;
+		}
+
+		$id = (string) $attachment_id;
+		if ( $text === $id ) {
+			return true;
+		}
+
+		/* Media-ID fields can be stored as comma/pipe/space separated integer lists.
+		 * Do not search arbitrary text/URLs for the number: URL path segments, image
+		 * dimensions and other numeric text are not attachment ownership proof. */
+		if ( 1 !== preg_match( '/^\s*\d+(?:\s*[,|\s]\s*\d+)*\s*$/', $text ) ) {
+			return false;
+		}
+		return 1 === preg_match( '/(?<!\d)' . preg_quote( $id, '/' ) . '(?!\d)/', $text );
+	}
+
+	/**
+	 * Inspect SQL candidate rows after a narrow query has found a potential numeric
+	 * or serialized reference.
+	 *
+	 * @param array  $rows SQL result rows.
+	 * @param string $key_field Key field name.
+	 * @param string $value_field Value field name.
+	 * @param int    $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function pruned_candidate_rows_reference_attachment( $rows, $key_field, $value_field, $attachment_id ) {
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$row = is_object( $row ) ? (array) $row : $row;
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$key   = isset( $row[ $key_field ] ) ? (string) $row[ $key_field ] : '';
+			$value = isset( $row[ $value_field ] ) ? $row[ $value_field ] : '';
+			if ( $this->pruned_structured_value_references_attachment(
+				$value,
+				$attachment_id,
+				$this->pruned_reference_key_is_media_semantic( $key )
+			) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Preserve fail-closed scalar custom-field behavior without allowing known numeric
+	 * business/runtime fields to create accidental attachment ownership.
+	 *
+	 * @param array  $rows SQL result rows containing exact scalar numeric matches.
+	 * @param string $key_field Key field name.
+	 * @param string $value_field Value field name.
+	 * @param int    $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	private function pruned_unknown_scalar_rows_reference_attachment( $rows, $key_field, $value_field, $attachment_id ) {
+		$id = (string) absint( $attachment_id );
+		if ( '0' === $id ) {
+			return true;
+		}
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$row = is_object( $row ) ? (array) $row : $row;
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$key   = isset( $row[ $key_field ] ) ? (string) $row[ $key_field ] : '';
+			$value = isset( $row[ $value_field ] ) ? trim( (string) $row[ $value_field ] ) : '';
+			if ( $value === $id && ! $this->pruned_reference_key_is_nonmedia_numeric( $key ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Conservative live-reference proof for a pruned local attachment.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool True when deletion must be refused.
+	 */
+	private function pruned_attachment_has_live_reference( $attachment_id ) {
+		global $wpdb;
+
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 ) {
+			return true;
+		}
+
+		/* A queue row can reintroduce the exact desired identity before attachment_id
+		 * is committed. Treat that tuple as a live reference globally. */
+		if ( $this->pruned_attachment_is_current_desired_identity( $attachment_id ) ) {
+			return true;
+		}
+
+		if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+			$table = Mobo_Core_Image_Queue::table_name();
+			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE attachment_id = %d LIMIT 1", $attachment_id ) ) ) > 0 ) {
+				return true;
+			}
+		}
+
+		if ( class_exists( 'Mobo_Core_Image_Refresh_Queue' ) && Mobo_Core_Image_Refresh_Queue::table_exists() ) {
+			$table  = Mobo_Core_Image_Refresh_Queue::table_name();
+			$active = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT id FROM {$table} WHERE (old_attachment_id = %d OR new_attachment_id = %d) AND status IN ('pending','processing') LIMIT 1",
+					$attachment_id,
+					$attachment_id
+				)
+			);
+			if ( absint( $active ) > 0 ) {
+				return true;
+			}
+		}
+
+		$id           = (string) $attachment_id;
+		$id_like      = '%' . $wpdb->esc_like( $id ) . '%';
+		$semantic_sql            = "(LOWER(meta_key) LIKE '%%attachment%%' OR LOWER(meta_key) LIKE '%%attached%%' OR LOWER(meta_key) LIKE '%%image%%' OR LOWER(meta_key) LIKE '%%media%%' OR LOWER(meta_key) LIKE '%%thumbnail%%' OR LOWER(meta_key) LIKE '%%gallery%%' OR LOWER(meta_key) LIKE '%%photo%%' OR LOWER(meta_key) LIKE '%%picture%%' OR LOWER(meta_key) LIKE '%%icon%%' OR LOWER(meta_key) LIKE '%%logo%%' OR LOWER(meta_key) LIKE '%%avatar%%' OR LOWER(meta_key) LIKE '%%poster%%' OR LOWER(meta_key) LIKE '%%cover%%' OR LOWER(meta_key) LIKE '%%background%%' OR LOWER(meta_key) LIKE '%%featured%%' OR LOWER(meta_key) LIKE '%%file%%')";
+		$meta_value_semantic_sql = "(LOWER(meta_value) LIKE '%%attachment%%' OR LOWER(meta_value) LIKE '%%image%%' OR LOWER(meta_value) LIKE '%%media%%' OR LOWER(meta_value) LIKE '%%thumbnail%%' OR LOWER(meta_value) LIKE '%%gallery%%' OR LOWER(meta_value) LIKE '%%photo%%' OR LOWER(meta_value) LIKE '%%picture%%' OR LOWER(meta_value) LIKE '%%icon%%' OR LOWER(meta_value) LIKE '%%logo%%' OR LOWER(meta_value) LIKE '%%avatar%%' OR LOWER(meta_value) LIKE '%%poster%%' OR LOWER(meta_value) LIKE '%%cover%%' OR LOWER(meta_value) LIKE '%%background%%' OR LOWER(meta_value) LIKE '%%featured%%')";
+		$meta_rows               = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->postmeta}
+				WHERE post_id <> %d
+				AND meta_key NOT IN ('_mobo_pruned_cleanup_pending','_mobo_pruned_cleanup_owner_ids','_wp_attachment_metadata','_wp_attachment_backup_sizes')
+				AND (
+					({$semantic_sql} AND meta_value LIKE %s)
+					OR ({$meta_value_semantic_sql} AND meta_value LIKE %s)
+				)",
+				$attachment_id,
+				$id_like,
+				$id_like
+			),
+			ARRAY_A
+		);
+		if ( $this->pruned_candidate_rows_reference_attachment( $meta_rows, 'meta_key', 'meta_value', $attachment_id ) ) {
+			return true;
+		}
+
+		$unknown_meta_rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->postmeta}
+				WHERE post_id <> %d
+				AND meta_key NOT IN ('_mobo_pruned_cleanup_pending','_mobo_pruned_cleanup_owner_ids')
+				AND meta_value = %s",
+				$attachment_id,
+				$id
+			),
+			ARRAY_A
+		);
+		if ( $this->pruned_unknown_scalar_rows_reference_attachment( $unknown_meta_rows, 'meta_key', 'meta_value', $attachment_id ) ) {
+			return true;
+		}
+
+		/* Options can contain real structured media references, but many Mobo image
+		 * options are merely cursors/counters. The same semantic proof prevents an
+		 * operational integer collision from retaining an unrelated attachment. */
+		$option_semantic_sql       = "(LOWER(option_name) LIKE '%%attachment%%' OR LOWER(option_name) LIKE '%%attached%%' OR LOWER(option_name) LIKE '%%image%%' OR LOWER(option_name) LIKE '%%media%%' OR LOWER(option_name) LIKE '%%thumbnail%%' OR LOWER(option_name) LIKE '%%gallery%%' OR LOWER(option_name) LIKE '%%photo%%' OR LOWER(option_name) LIKE '%%picture%%' OR LOWER(option_name) LIKE '%%icon%%' OR LOWER(option_name) LIKE '%%logo%%' OR LOWER(option_name) LIKE '%%avatar%%' OR LOWER(option_name) LIKE '%%poster%%' OR LOWER(option_name) LIKE '%%cover%%' OR LOWER(option_name) LIKE '%%background%%' OR LOWER(option_name) LIKE '%%featured%%' OR LOWER(option_name) LIKE '%%file%%')";
+		$option_value_semantic_sql = "(LOWER(option_value) LIKE '%%attachment%%' OR LOWER(option_value) LIKE '%%image%%' OR LOWER(option_value) LIKE '%%media%%' OR LOWER(option_value) LIKE '%%thumbnail%%' OR LOWER(option_value) LIKE '%%gallery%%' OR LOWER(option_value) LIKE '%%photo%%' OR LOWER(option_value) LIKE '%%picture%%' OR LOWER(option_value) LIKE '%%icon%%' OR LOWER(option_value) LIKE '%%logo%%' OR LOWER(option_value) LIKE '%%avatar%%' OR LOWER(option_value) LIKE '%%poster%%' OR LOWER(option_value) LIKE '%%cover%%' OR LOWER(option_value) LIKE '%%background%%' OR LOWER(option_value) LIKE '%%featured%%')";
+		$option_rows               = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options}
+				WHERE (
+					({$option_semantic_sql} AND option_value LIKE %s)
+					OR ({$option_value_semantic_sql} AND option_value LIKE %s)
+				)",
+				$id_like,
+				$id_like
+			),
+			ARRAY_A
+		);
+		if ( $this->pruned_candidate_rows_reference_attachment( $option_rows, 'option_name', 'option_value', $attachment_id ) ) {
+			return true;
+		}
+
+		$unknown_option_rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_value = %s",
+				$id
+			),
+			ARRAY_A
+		);
+		if ( $this->pruned_unknown_scalar_rows_reference_attachment( $unknown_option_rows, 'option_name', 'option_value', $attachment_id ) ) {
+			return true;
+		}
+
+		$post_reference = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT ID FROM {$wpdb->posts} WHERE ID <> %d AND post_status NOT IN ('trash','auto-draft') AND post_content LIKE %s LIMIT 1",
+				$attachment_id,
+				'%' . $wpdb->esc_like( 'wp-image-' . $id ) . '%'
+			)
+		);
+		if ( absint( $post_reference ) > 0 || absint( get_option( 'site_icon', 0 ) ) === $attachment_id ) {
+			return true;
+		}
+
+		$file = get_attached_file( $attachment_id );
+		$file = is_string( $file ) ? wp_normalize_path( $file ) : '';
+		if ( '' === $file ) {
+			return false;
+		}
+
+		$uploads  = wp_get_upload_dir();
+		$basedir  = isset( $uploads['basedir'] ) ? trailingslashit( wp_normalize_path( (string) $uploads['basedir'] ) ) : '';
+		$baseurl  = isset( $uploads['baseurl'] ) ? untrailingslashit( (string) $uploads['baseurl'] ) : '';
+		$relative = '' !== $basedir && 0 === strpos( $file, $basedir ) ? ltrim( substr( $file, strlen( $basedir ) ), '/' ) : '';
+		if ( '' === $relative ) {
+			return true;
+		}
+
+		$needles = array_values( array_unique( array_filter( array(
+			$relative,
+			str_replace( '/', '\\/', $relative ),
+			basename( $relative ),
+			'' !== $baseurl ? $baseurl . '/' . $relative : '',
+		) ) ) );
+		foreach ( $needles as $needle ) {
+			$like = '%' . $wpdb->esc_like( $needle ) . '%';
+			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID <> %d AND post_status NOT IN ('trash','auto-draft') AND (post_content LIKE %s OR guid LIKE %s) LIMIT 1", $attachment_id, $like, $like ) ) ) > 0 ) {
+				return true;
+			}
+			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id <> %d AND meta_key NOT IN ('_mobo_pruned_cleanup_pending','_mobo_pruned_cleanup_owner_ids') AND meta_value LIKE %s LIMIT 1", $attachment_id, $like ) ) ) > 0 ) {
+				return true;
+			}
+			if ( absint( $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM {$wpdb->options} WHERE option_value LIKE %s LIMIT 1", $like ) ) ) > 0 ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

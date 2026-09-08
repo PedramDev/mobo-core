@@ -520,6 +520,25 @@ class Mobo_Core_Cron_Runner {
 			$stop_reason = 'max-rounds-reached';
 		}
 
+		/*
+		 * Health/read-cache refresh is owned by the same deterministic real cron as
+		 * every other Mobo background stage. Run it only from leftover budget so
+		 * webhook/product/image work keeps priority and WP-Cron is never required.
+		 */
+		if ( ! $lock_lost && ! $upgrade_paused && class_exists( 'Mobo_Core_Health_Read_Cache' )
+			&& method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_due_from_real_cron' ) ) {
+			if ( $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+				try {
+					$aggregate['healthSnapshots'] = Mobo_Core_Health_Read_Cache::refresh_due_from_real_cron( $deadline );
+				} catch ( Throwable $e ) {
+					$aggregate['healthSnapshots'] = $this->exception_result( 'health-snapshot-refresh-exception', $e );
+				}
+			} else {
+				$lock_lost   = true;
+				$stop_reason = 'lock-lost';
+			}
+		}
+
 		$elapsed_ms = max( 0, (int) round( ( microtime( true ) - $started_at ) * 1000 ) );
 
 		/*

@@ -135,18 +135,31 @@ class Mobo_Core_Image_Queue {
 
 		if ( empty( $images ) ) {
 			$wpdb->last_error = '';
+			$removed_attachment_ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT attachment_id FROM {$table} WHERE product_id = %d AND attachment_id > 0",
+					$product_id
+				)
+			);
+			if ( ! is_array( $removed_attachment_ids ) && '' !== (string) $wpdb->last_error ) {
+				return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'removedAttachmentIds' => array(), 'error' => 'Could not read obsolete image attachments before clearing the queue.' );
+			}
+
+			$removed_attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $removed_attachment_ids ) ? $removed_attachment_ids : array() ) ) ) );
+			$wpdb->last_error = '';
 			$removed = $wpdb->delete( $table, array( 'product_id' => $product_id ), array( '%d' ) );
 			if ( false === $removed ) {
-				return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => 'Could not clear obsolete image queue rows.' );
+				return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'removedAttachmentIds' => array(), 'error' => 'Could not clear obsolete image queue rows.' );
 			}
 			self::invalidate_summary_cache();
-			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => absint( $removed ), 'error' => '' );
+			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => absint( $removed ), 'removedAttachmentIds' => $removed_attachment_ids, 'error' => '' );
 		}
-		$count      = 0;
-		$skip       = 0;
-		$db_error   = '';
-		$normalized = array();
-		$seen_keys  = array();
+		$count                     = 0;
+		$skip                      = 0;
+		$db_error                  = '';
+		$normalized                = array();
+		$seen_keys                 = array();
+		$superseded_attachment_ids = array();
 
 		foreach ( array_values( $images ) as $position => $image ) {
 			if ( ! is_array( $image ) ) {
@@ -295,6 +308,7 @@ class Mobo_Core_Image_Queue {
 				'updated_at'     => $now,
 			);
 
+			$superseded_attachment_id = 0;
 			if ( is_array( $existing ) ) {
 				$source_changed = $existing_url !== $url;
 
@@ -310,6 +324,7 @@ class Mobo_Core_Image_Queue {
 						$data['next_retry_at'] = null;
 						$data['last_error']    = null;
 						$data['attachment_id'] = 0;
+						$superseded_attachment_id = $attachment_id;
 					}
 				} elseif ( $source_changed || ! $attachment_compatible ) {
 					$data['status']        = 'pending';
@@ -318,6 +333,7 @@ class Mobo_Core_Image_Queue {
 					$data['locked_until']  = null;
 					$data['last_error']    = null;
 					$data['attachment_id'] = 0;
+					$superseded_attachment_id = $attachment_id;
 				}
 
 				$write_result = $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), null, array( '%d' ) );
@@ -337,6 +353,10 @@ class Mobo_Core_Image_Queue {
 				continue;
 			}
 
+			if ( $superseded_attachment_id > 0 ) {
+				$superseded_attachment_ids[] = absint( $superseded_attachment_id );
+			}
+
 			$count++;
 		}
 
@@ -344,26 +364,33 @@ class Mobo_Core_Image_Queue {
 		 * The queue is also the durable desired image order for a product. Remove rows
 		 * that belonged to an older non-empty payload; otherwise get_ordered_rows_for_product()
 		 * keeps deleted Mobo images in the WooCommerce gallery forever. This removes
-		 * only queue state, never the attachment/file itself because another product
-		 * may legitimately reuse that attachment.
+		 * only queue state. Attachment IDs from pruned rows are returned to the image
+		 * sync layer, which performs separate reference proof before any physical delete.
 		 */
 		/* Never prune desired-state rows from a partially malformed payload. One bad
 		 * image row must not make a previously valid gallery image disappear. A fully
 		 * valid non-empty payload is required before absence is authoritative. */
-		$prune_safe  = '' === $db_error && 0 === $skip && count( $normalized ) === count( array_values( $images ) );
-		$prune_error = '';
-		$removed     = $prune_safe ? $this->prune_product_rows_except( $product_id, $keys, $prune_error ) : 0;
+		$prune_safe             = '' === $db_error && 0 === $skip && count( $normalized ) === count( array_values( $images ) );
+		$prune_error            = '';
+		$removed_attachment_ids = array();
+		$removed                = $prune_safe ? $this->prune_product_rows_except( $product_id, $keys, $prune_error, $removed_attachment_ids ) : 0;
 		if ( '' !== $prune_error ) {
 			$db_error = $prune_error;
 		}
 
+		$removed_attachment_ids = array_values( array_unique( array_merge(
+			$removed_attachment_ids,
+			array_filter( array_map( 'absint', $superseded_attachment_ids ) )
+		) ) );
+
 		self::invalidate_summary_cache();
 		return array(
-			'enqueued'      => $count,
-			'skipped'       => $skip,
-			'removed'       => $removed,
-			'pruneDeferred' => ! $prune_safe || '' !== $db_error,
-			'error'         => $db_error,
+			'enqueued'             => $count,
+			'skipped'              => $skip,
+			'removed'              => $removed,
+			'removedAttachmentIds' => $removed_attachment_ids,
+			'pruneDeferred'        => ! $prune_safe || '' !== $db_error,
+			'error'                => $db_error,
 		);
 	}
 
@@ -375,12 +402,13 @@ class Mobo_Core_Image_Queue {
 	 * @param array $keep_keys Current desired queue keys.
 	 * @return int Removed row count.
 	 */
-	private function prune_product_rows_except( $product_id, $keep_keys, &$error = '' ) {
+	private function prune_product_rows_except( $product_id, $keep_keys, &$error = '', &$removed_attachment_ids = array() ) {
 		global $wpdb;
 
-		$error      = '';
-		$product_id = absint( $product_id );
-		$keep_keys  = array_values( array_unique( array_filter( array_map( 'strval', is_array( $keep_keys ) ? $keep_keys : array() ) ) ) );
+		$error                  = '';
+		$removed_attachment_ids = array();
+		$product_id             = absint( $product_id );
+		$keep_keys              = array_values( array_unique( array_filter( array_map( 'strval', is_array( $keep_keys ) ? $keep_keys : array() ) ) ) );
 
 		if ( $product_id <= 0 || empty( $keep_keys ) || ! self::table_exists() ) {
 			return 0;
@@ -389,13 +417,23 @@ class Mobo_Core_Image_Queue {
 		$table        = self::table_name();
 		$placeholders = implode( ',', array_fill( 0, count( $keep_keys ), '%s' ) );
 		$args         = array_merge( array( $product_id ), $keep_keys );
-		$query        = "DELETE FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders})";
-		$deleted      = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
+		$select_query = "SELECT DISTINCT attachment_id FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders}) AND attachment_id > 0";
+		$wpdb->last_error = '';
+		$candidates = $wpdb->get_col( $wpdb->prepare( $select_query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
+		if ( ! is_array( $candidates ) && '' !== (string) $wpdb->last_error ) {
+			$error = 'Could not read stale image attachment candidates before pruning.';
+			return 0;
+		}
+
+		$query   = "DELETE FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders})";
+		$deleted = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
 
 		if ( false === $deleted ) {
 			$error = 'Could not prune stale image queue rows.';
 			return 0;
 		}
+
+		$removed_attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $candidates ) ? $candidates : array() ) ) ) );
 
 		return absint( $deleted );
 	}

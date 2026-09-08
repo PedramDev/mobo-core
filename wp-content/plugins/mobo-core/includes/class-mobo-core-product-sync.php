@@ -1697,6 +1697,62 @@ class Mobo_Core_Product_Sync {
 }
 
 	/**
+	 * Whether a delayed ProductUpdated can preserve an already-converged variable
+	 * product completion boundary.
+	 *
+	 * UpdateVariant and ProductUpdated for one desired-state revision may execute
+	 * out of order. If a terminal UpdateVariant for the same/newer boundary has
+	 * already committed, a later ProductUpdated must not leave the parent crash
+	 * marker/map incomplete again unless the parent topology actually changed or
+	 * local variation structure is no longer sane.
+	 *
+	 * @param int    $product_id WooCommerce parent product ID.
+	 * @param string $source_version ProductUpdated source version.
+	 * @param int    $source_revision ProductUpdated source revision.
+	 * @param bool   $attribute_structure_changed Whether ProductUpdated changed parent attribute structure.
+	 * @return bool
+	 */
+	private function variable_completion_already_covers_product_update( $product_id, $source_version, $source_revision, $attribute_structure_changed ) {
+		$product_id                 = absint( $product_id );
+		$source_version             = sanitize_text_field( (string) $source_version );
+		$source_revision            = absint( $source_revision );
+		$attribute_structure_changed = (bool) $attribute_structure_changed;
+
+		if ( $product_id <= 0 || $attribute_structure_changed ) {
+			return false;
+		}
+
+		$product = function_exists( 'wc_get_product' ) ? wc_get_product( $product_id ) : false;
+		if ( ! $product instanceof WC_Product_Variable ) {
+			return false;
+		}
+
+		if ( '1' === (string) get_post_meta( $product_id, '_mobo_desired_state_rebuild_pending', true ) ) {
+			return false;
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Sync_Health' ) || ! Mobo_Core_Sync_Health::local_product_structure_is_sane( $product_id ) ) {
+			return false;
+		}
+
+		$variant_version  = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_applied_event_version', true ) );
+		$variant_revision = absint( get_post_meta( $product_id, '_mobo_variant_applied_revision', true ) );
+
+		if ( '' !== $source_version && '' !== $variant_version ) {
+			$version_cmp = $this->compare_source_versions( $variant_version, $source_version );
+			if ( null !== $version_cmp ) {
+				return $version_cmp >= 0;
+			}
+		}
+
+		if ( $source_revision > 0 && $variant_revision > 0 ) {
+			return $variant_revision >= $source_revision;
+		}
+
+		return false;
+	}
+
+	/**
 	 * Process ProductUpdated after entering the Mobo cache mutation scope.
 	 *
 	 * @param array $payload Payload, by reference.
@@ -1979,12 +2035,17 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( ! $this->product_payload_can_have_variants( $product_data, $product_id ) ) {
+		$payload_can_have_variants = $this->product_payload_can_have_variants( $product_data, $product_id );
+		$preserve_variable_completion = $payload_can_have_variants
+			&& $this->variable_completion_already_covers_product_update( $product_id, $source_version, $source_revision, $attribute_structure_changed );
+
+		if ( ! $payload_can_have_variants || $preserve_variable_completion ) {
 			if ( ! $this->upsert_product_map( $product_guid, $product_id, false ) ) {
 				$this->update_post_meta_if_changed( $product_id, 'mobo_sync_incomplete', '1' );
 				return $this->result( true, 'ProductUpdated منتظر ثبت پایدار Product Map است.', array( 'deleteFile' => false, 'deferSeconds' => 60, 'productGuid' => $product_guid, 'productId' => $product_id ) );
 			}
 			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
+				$this->upsert_product_map( $product_guid, $product_id, true );
 				return $this->result( true, 'ProductUpdated منتظر ثبت پایدار completion marker است.', array( 'deleteFile' => false, 'deferSeconds' => 60, 'productGuid' => $product_guid, 'productId' => $product_id ) );
 			}
 		}

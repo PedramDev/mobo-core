@@ -773,6 +773,10 @@ class Mobo_Core_Maintenance {
 			'mobo_cron_hook',
 			'mobo_sync_cron_hook',
 			'mobo_webhook_cron_hook',
+			'mobo_core_health_snapshot_refresh_v1',
+			'mobo_core_health_snapshot_refresh_v2',
+			'mobo_core_sync_health_snapshot_refresh_v1',
+			'mobo_core_sync_health_snapshot_refresh_v2',
 		);
 	}
 

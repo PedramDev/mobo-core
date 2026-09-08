@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.45
+Stable tag: 10.33.54
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -144,6 +144,29 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.33.54 =
+* Fix: remove retired Health and Sync Health WP-Cron events even when legacy schedules carry non-empty arguments.
+* Safety: cleanup is restricted to the four retired Mobo Health hook names and preserves unrelated cron events.
+* Keeps the 10.33.53 real-cron snapshot ownership and deferred convergence self-heal behavior unchanged.
+
+= 10.33.53 =
+* Moves convergence-residue self-healing out of plugins_loaded and runs it only after WooCommerce initialization.
+* Re-applies Health/Sync Health real-cron ownership safely for sites partially upgraded through the 10.33.52 candidate.
+* Rebuilds package integrity metadata for the corrected candidate.
+
+= 10.33.52 =
+* Moves Health and Sync Health snapshot refresh ownership to the deterministic Mobo real-cron runner; Mobo no longer schedules these caches through WP-Cron.
+* Prevents cached/stale Health responses from being captured again as fresh snapshots.
+* Removes legacy v1/v2 Health WP-Cron rows during migration and periodic maintenance.
+* Safely self-heals only the exact pre-10.33.51 out-of-order ProductUpdated/UpdateVariant completion residue when authoritative ordering, hash, queue ownership, topology and variation-count proofs all agree.
+* Rebuilds the package integrity manifest for the actual 10.33.52 files.
+
+
+= 10.33.51 =
+* Fixes out-of-order desired-state convergence when terminal UpdateVariant for revision R completes before ProductUpdated for the same/newer-covered boundary. A delayed ProductUpdated now preserves the already-converged variable-product completion marker only when the applied Variant boundary covers it and the local variation structure remains sane.
+* Keeps failed/incomplete Sync Health escape-hatch behavior unchanged; upstream-invalid Variant payloads still remain failed/incomplete.
+
 
 = 10.33.45 =
 * Consolidates the deep-audit durability, ownership, concurrency, migration and retry-safety fixes validated through MOBO-4426 to MOBO-4451.

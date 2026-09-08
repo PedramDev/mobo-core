@@ -3771,6 +3771,57 @@ class Mobo_Core_Image_Refresh_Service {
 		return preg_replace( '/_+/', '_', $key );
 	}
 
+
+	/**
+	 * Whether a numeric metadata/option key is known to represent business/runtime
+	 * state rather than an attachment identity. This mirrors the desired-state
+	 * cleanup classifier: equal integers must not be rewritten merely because an
+	 * attachment happens to have the same auto-increment ID.
+	 *
+	 * Unknown scalar keys intentionally remain fail-closed during the final audit;
+	 * they are not auto-migrated because custom fields such as an ACF image field
+	 * may legitimately store a bare attachment ID.
+	 *
+	 * @param mixed $key Metadata/option/structure key.
+	 * @return bool
+	 */
+	private function refresh_reference_key_is_nonmedia_numeric( $key ) {
+		$key = $this->normalize_reference_key( $key );
+		if ( '' === $key ) {
+			return false;
+		}
+
+		if ( in_array( $key, array( 'page_on_front', 'page_for_posts', 'default_category' ), true ) ) {
+			return true;
+		}
+
+		$media_token = '(?:attachments?|images?|media|thumbnails?|galler(?:y|ies)|photos?|pictures?|icons?|logos?|avatars?|posters?|covers?|backgrounds?|banners?)';
+		$has_media   = 1 === preg_match( '/(?:^|_)' . $media_token . '(?:_|$)/', $key );
+
+		if ( $has_media && preg_match(
+			'/(?:^|_)' . $media_token . '(?:_[a-z0-9]+)*_(?:metadata|meta_data|dimension|dimensions|width|height|filesize|file_size|bytes|size|price|cost|amount|stock|quantity|qty|count|counter|total|revision|version|generation|cursor|offset|limit|seconds|interval|duration|timestamp|time|date|weight|length|rating|rate|percent|percentage|tax|discount|attempt|retry|scan|audit|status|result|enabled|approved|started|finished|pending|recovery|cleanup|quarantined|order|position|index|priority|alt|caption|title|description|context|expiry|expires|per_run|max_try|min_free|blocking|force|generate|delete)(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		if ( ! $has_media && preg_match(
+			'/(?:^|_)(?:metadata|meta_data|dimension|dimensions|width|height|filesize|file_size|bytes|size|price|regular_price|sale_price|cost|amount|stock|quantity|qty|count|counter|total|revision|version|generation|cursor|offset|limit|seconds|interval|duration|timestamp|time|date|weight|length|rating|rate|percent|percentage|tax|discount|attempt|retry|scan|audit|status|result|enabled|approved|started|finished|pending|recovery|cleanup|quarantined|order|position|index|priority|alt|caption|title|description|context|expiry|expires)(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		if ( ! $has_media && preg_match(
+			'/(?:^|_)(?:portal|product|variation|order|user|customer|term|category|tag|page|post|parent|author|attribute|shipping_class|tax_class)(?:_[a-z0-9]+)*_ids?(?:_|$)/',
+			$key
+		) ) {
+			return true;
+		}
+
+		return false;
+	}
+
 	/**
 	 * Whether a key explicitly represents an attachment/media ID.
 	 * Generic "id" is intentionally excluded and requires local image evidence.
@@ -3929,8 +3980,8 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		$normalized_key = $this->normalize_reference_key( $context_key );
-		$allow_exact_id = 0 === $depth
-			|| $this->is_explicit_media_id_key( $context_key )
+		$allow_exact_id = $this->is_explicit_media_id_key( $context_key )
+			|| $this->is_media_container_key( $context_key )
 			|| ( 'id' === $normalized_key && $parent_evidence )
 			|| ( $parent_media_context && ( 'id' === $normalized_key || ctype_digit( (string) $context_key ) ) );
 
@@ -4281,6 +4332,22 @@ class Mobo_Core_Image_Refresh_Service {
 		$this->migrate_reference_value( $value, $old_attachment_id, $new_attachment_id, $text_map, (string) $context_key, $changes );
 		if ( $changes > 0 ) {
 			return true;
+		}
+
+		/* A bare top-level integer in known business/runtime metadata is not media.
+		 * For an unknown custom-field key, however, keep deletion fail-closed without
+		 * rewriting the value: ACF and other integrations may store attachment IDs in
+		 * arbitrarily named scalar fields. Plain post_content containing only a number
+		 * is not treated as media evidence. */
+		if ( trim( $raw ) === (string) $old_attachment_id ) {
+			if ( $this->refresh_reference_key_is_nonmedia_numeric( $context_key ) || 'post_content' === $this->normalize_reference_key( $context_key ) ) {
+				return false;
+			}
+			return true;
+		}
+
+		if ( $this->refresh_reference_key_is_nonmedia_numeric( $context_key ) ) {
+			return false;
 		}
 
 		/* Serialized objects can contain private/inaccessible state that WordPress can
