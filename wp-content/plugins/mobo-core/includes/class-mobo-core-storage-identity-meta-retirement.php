@@ -199,22 +199,32 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 		}
 
 		if ( empty( $state['fenceActive'] ) ) {
-			/* Identity postmeta is installation-global physical state. Publishing a
-			 * new irreversible fence is safe only while the durable topology still
-			 * consists solely of the enabled Default Connection. Once any second
-			 * Connection exists, even disabled, an unscoped reverse Product Map
-			 * proof could combine identities from independent Sources. */
-			if ( class_exists( 'Mobo_Core_Connection_Repository' )
-				&& ! Mobo_Core_Connection_Repository::legacy_terminal_retirement_topology_safe() ) {
-				$state['status'] = 'blocked';
-				$state['blockers'] = array( 'multi_connection_topology' => 1 );
-				$state['lastError'] = 'multi_connection_topology';
+			/* Identity postmeta is installation-global physical state; an unscoped
+			 * proof could combine identities from independent Sources.
+			 * 10.34.77 hardening: additional Connections no longer block the Default
+			 * Connection's retirement. Objects durably owned by another Connection are
+			 * excluded from proof/cleanup (foreign_exclusion_sql), which is sound once
+			 * the ownership migration has attributed every row; wait for that proof. */
+			if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && ! Mobo_Core_Migration_Quarantine::retirement_topology_allowed() ) {
+				$state['status'] = 'waiting-connection-ownership';
+				$state['blockers'] = array( 'multi_connection_ownership_pending' => 1 );
+				$state['lastError'] = '';
 				self::persist_state( $state );
 				return false;
 			}
 			$proof = self::advance_exact_proof( $state );
 			if ( ! $proof['complete'] ) { return false; }
-			$blockers = self::global_blockers();
+			/* Collapse exact duplicates / mark unresolvable objects in bounded passes. */
+			$normalized = self::normalize_global_blockers();
+			if ( ! empty( $normalized['progress'] ) ) {
+				$state = self::load_state(); $state['status'] = 'normalizing'; $state['lastError'] = ''; $state['blockers'] = array();
+				$state['dedupedGroups'] = absint( $state['dedupedGroups'] ?? 0 ) + absint( $normalized['deduped'] ?? 0 );
+				$state['dedupedRows'] = absint( $state['dedupedRows'] ?? 0 ) + absint( $normalized['rowsRemoved'] ?? 0 );
+				$state['markedObjects'] = absint( $state['markedObjects'] ?? 0 ) + absint( $normalized['marked'] ?? 0 );
+				self::persist_state( $state );
+				return false;
+			}
+			$blockers = ! empty( $normalized['blockers'] ) ? $normalized['blockers'] : self::global_blockers();
 			if ( ! empty( $blockers ) ) {
 				$state = self::load_state(); $state['status'] = 'blocked'; $state['blockers'] = $blockers; $state['lastError'] = sanitize_key( (string) key( $blockers ) ); self::persist_state( $state ); return false;
 			}
@@ -325,10 +335,24 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 		return false;
 	}
 
-	/** @return array{complete:bool} */
+	/**
+	 * One bounded identity proof page.
+	 *
+	 * 10.34.77 hardening: deterministic per-object data problems (malformed or
+	 * conflicting identity, missing GUIDs, a GUID already owned by a different Woo
+	 * object such as a WooCommerce "Duplicate product" copy) no longer park the
+	 * whole worker. The object is marked via Mobo_Core_Migration_Quarantine, keeps
+	 * its legacy rows untouched and the page continues. Read errors still fail the
+	 * step and are retried; mirror/verify failures are retried FAILURE_THRESHOLD
+	 * times before the object is marked.
+	 *
+	 * @return array{complete:bool}
+	 */
 	private static function advance_exact_proof( $state ) {
 		global $wpdb;$cursor=absint($state['proofCursor']??0);$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$args=array_merge(array($cursor),$keys,array(self::proof_batch_size()));
-		$rows=$wpdb->get_col($wpdb->prepare("SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.post_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) ORDER BY pm.post_id ASC LIMIT %d",$args));
+		/* Objects owned by another Connection are never adopted into the Default Connection. */
+		$excl=class_exists('Mobo_Core_Migration_Quarantine')?Mobo_Core_Migration_Quarantine::foreign_exclusion_sql('pm.post_id'):'';
+		$rows=$wpdb->get_col($wpdb->prepare("SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.post_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} ORDER BY pm.post_id ASC LIMIT %d",$args));
 		if(''!==(string)$wpdb->last_error){self::record_state_error($state,'proof_query_failed','proof-error');return array('complete'=>false);}if(empty($rows)){$state['proofComplete']=true;$state['status']='proof-complete';$state['lastError']='';self::persist_state($state);return array('complete'=>true);}
 
 		/* Snapshot the bounded proof page (plus Variation parents) with set-based reads.
@@ -337,42 +361,167 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 		$proof_post_ids=array_values(array_unique(array_filter(array_map('absint',$rows))));
 		if(!self::prime_proof_batch_cache($proof_post_ids)){self::record_state_error($state,'proof_batch_prefetch_failed','proof-error');return array('complete'=>false);}
 
-		$recovered=0;$custom_recovered=0;$map_recovered=0;$stale_trashed_variation_residues=0;$proof_noops=0;$proof_mirrors=0;
-		foreach($rows as $post_id){$post_id=absint($post_id);$cursor=max($cursor,$post_id);$type=get_post_type($post_id);$status=sanitize_key((string)get_post_status($post_id));if('auto-draft'===$status){continue;}if(self::object_has_malformed_identity($post_id)){self::record_state_error($state,'malformed_identity_'.$post_id,'proof-blocked');return array('complete'=>false);}
+		$recovered=0;$custom_recovered=0;$map_recovered=0;$stale_trashed_variation_residues=0;$proof_noops=0;$proof_mirrors=0;$proof_marked=0;
+		foreach($rows as $post_id){
+			$post_id=absint($post_id);$cursor=max($cursor,$post_id);$type=get_post_type($post_id);$status=sanitize_key((string)get_post_status($post_id));
+			if('auto-draft'===$status){continue;}
+			if(class_exists('Mobo_Core_Migration_Quarantine')&&Mobo_Core_Migration_Quarantine::is_marked($post_id)){continue;}
+			if(null===self::legacy_rows_for_post($post_id)){self::record_state_error($state,'identity_rows_read_'.$post_id,'proof-error');return array('complete'=>false);}
+			if(self::object_has_malformed_identity($post_id)){
+				if(self::proof_mark($post_id,'malformed_identity','',$proof_marked)){continue;}
+				self::record_state_error($state,'malformed_identity_'.$post_id,'proof-blocked');return array('complete'=>false);
+			}
 			$identity=self::resolve_proof_identity($post_id,$type);$identity_status=sanitize_key((string)($identity['status']??''));
 			if('error'===$identity_status){self::record_state_error($state,'identity_recovery_read_'.$post_id,'proof-error');return array('complete'=>false);}
-			if('conflict'===$identity_status){self::record_state_error($state,('product'===$type?'product_identity_conflict_':'variation_identity_conflict_').$post_id,'proof-blocked');return array('complete'=>false);}
+			if('conflict'===$identity_status){
+				if(self::proof_mark($post_id,'identity_conflict','',$proof_marked)){continue;}
+				self::record_state_error($state,('product'===$type?'product_identity_conflict_':'variation_identity_conflict_').$post_id,'proof-blocked');return array('complete'=>false);
+			}
 			if('product'===$type){
 				$guid=sanitize_text_field((string)($identity['guid']??''));
-				if(!Mobo_Core_Remote_Identity_Policy::is_valid($guid)){self::record_state_error($state,'product_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);}
-				if(!empty($identity['recovered'])){$recovered++;if('map'===(string)($identity['recovered_source']??'')){$map_recovered++;}else{$custom_recovered++;}}
+				if(!Mobo_Core_Remote_Identity_Policy::is_valid($guid)){
+					if(self::proof_mark($post_id,'missing_identity','product_guid',$proof_marked)){continue;}
+					self::record_state_error($state,'product_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);
+				}
 				/* Most objects were already materialized by Operational/backfill. Verify the
 				 * set-based snapshot first and avoid replaying the heavyweight legacy bridge
 				 * when Custom identity is already exact. A mismatch still uses the original
-				 * mirror + fresh-read verification path, so crash/recovery semantics are
-				 * unchanged while the healthy path becomes read-mostly. */
+				 * mirror + fresh-read verification path. */
 				if(!self::object_matches_custom($post_id,$type,$guid,'')){
-					if(!Mobo_Core_Storage_Bridge::mirror_product_legacy_state($guid,$post_id,null)){self::record_state_error($state,'product_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);}
-					self::invalidate_product_state_cache($post_id);
-					if(!self::object_matches_custom($post_id,$type,$guid,'')){self::record_state_error($state,'product_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);}
+					/* Never let a legacy copy steal a GUID that Custom Storage or the Product
+					 * Map already binds to a different Woo object (the Custom upsert would
+					 * otherwise rebind ownership to this copy). */
+					$owner=self::guid_owned_by_other_object('product',$guid,$post_id);
+					if(null===$owner){self::record_state_error($state,'identity_owner_read_'.$post_id,'proof-error');return array('complete'=>false);}
+					if($owner>0){
+						if(self::proof_mark($post_id,'identity_owned_by_other_object','#'.$owner,$proof_marked)){continue;}
+						self::record_state_error($state,'product_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+					}
+					$mirrored=Mobo_Core_Storage_Bridge::mirror_product_legacy_state($guid,$post_id,null);
+					if($mirrored){self::invalidate_product_state_cache($post_id);$mirrored=self::object_matches_custom($post_id,$type,$guid,'');}
+					if(!$mirrored){
+						if(self::proof_failure_mark($post_id,'product_identity_proof_'.$post_id,$proof_marked)){continue;}
+						self::record_state_error($state,'product_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);
+					}
 					$proof_mirrors++;
 				}else{$proof_noops++;}
+				if(!empty($identity['recovered'])){$recovered++;if('map'===(string)($identity['recovered_source']??'')){$map_recovered++;}else{$custom_recovered++;}}
+				if(class_exists('Mobo_Core_Migration_Quarantine')){Mobo_Core_Migration_Quarantine::clear_failure($post_id);}
 			}
 			elseif('product_variation'===$type){
 				$guid=sanitize_text_field((string)($identity['guid']??''));$product_guid=sanitize_text_field((string)($identity['parent_guid']??''));
-				if(!Mobo_Core_Remote_Identity_Policy::is_valid($guid)){if('trash'===$status&&'missing'===$identity_status){$stale_status=self::trashed_variation_parent_only_residue_status($post_id);if('error'===$stale_status){self::record_state_error($state,'trash_variation_residue_read_'.$post_id,'proof-error');return array('complete'=>false);}if('conflict'===$stale_status){self::record_state_error($state,'variation_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);}if('stale'===$stale_status){$stale_trashed_variation_residues++;continue;}}self::record_state_error($state,'variation_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);}
-				if('parent-missing'===$identity_status||!Mobo_Core_Remote_Identity_Policy::is_valid($product_guid)){self::record_state_error($state,'variation_parent_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);}
-				if(!empty($identity['recovered'])){$recovered++;if('map'===(string)($identity['recovered_source']??'')){$map_recovered++;}else{$custom_recovered++;}}
-				$parent_custom=self::ensure_variation_parent_custom($post_id,$product_guid);if('conflict'===$parent_custom){self::record_state_error($state,'variation_parent_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);}if('ok'!==$parent_custom){self::record_state_error($state,'variation_parent_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);}
+				if(!Mobo_Core_Remote_Identity_Policy::is_valid($guid)){
+					if('trash'===$status&&'missing'===$identity_status){
+						$stale_status=self::trashed_variation_parent_only_residue_status($post_id);
+						if('error'===$stale_status){self::record_state_error($state,'trash_variation_residue_read_'.$post_id,'proof-error');return array('complete'=>false);}
+						if('stale'===$stale_status){$stale_trashed_variation_residues++;continue;}
+						if('conflict'===$stale_status){
+							if(self::proof_mark($post_id,'identity_conflict','trash',$proof_marked)){continue;}
+							self::record_state_error($state,'variation_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+						}
+					}
+					if(self::proof_mark($post_id,'missing_identity','variant_guid',$proof_marked)){continue;}
+					self::record_state_error($state,'variation_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);
+				}
+				if('parent-missing'===$identity_status||!Mobo_Core_Remote_Identity_Policy::is_valid($product_guid)){
+					if(self::proof_mark($post_id,'parent_identity_missing','',$proof_marked)){continue;}
+					self::record_state_error($state,'variation_parent_guid_missing_'.$post_id,'proof-blocked');return array('complete'=>false);
+				}
+				$parent_id=absint(wp_get_post_parent_id($post_id));
+				if($parent_id>0&&class_exists('Mobo_Core_Migration_Quarantine')&&Mobo_Core_Migration_Quarantine::is_marked($parent_id)){
+					if(self::proof_mark($post_id,'parent_quarantined','#'.$parent_id,$proof_marked)){continue;}
+					self::record_state_error($state,'variation_parent_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+				}
+				/* The parent may be materialized by ensure_variation_parent_custom(); guard it
+				 * against stealing exactly like a Product. */
+				if($parent_id>0&&!self::object_matches_custom($parent_id,'product',$product_guid,'')){
+					$parent_owner=self::guid_owned_by_other_object('product',$product_guid,$parent_id);
+					if(null===$parent_owner){self::record_state_error($state,'identity_owner_read_'.$post_id,'proof-error');return array('complete'=>false);}
+					if($parent_owner>0){
+						if(self::proof_mark($post_id,'parent_identity_conflict','#'.$parent_owner,$proof_marked)){continue;}
+						self::record_state_error($state,'variation_parent_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+					}
+				}
+				$parent_custom=self::ensure_variation_parent_custom($post_id,$product_guid);
+				if('conflict'===$parent_custom){
+					if(self::proof_mark($post_id,'parent_identity_conflict','',$proof_marked)){continue;}
+					self::record_state_error($state,'variation_parent_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+				}
+				if('ok'!==$parent_custom){
+					if(self::proof_failure_mark($post_id,'variation_parent_identity_proof_'.$post_id,$proof_marked)){continue;}
+					self::record_state_error($state,'variation_parent_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);
+				}
 				if(!self::object_matches_custom($post_id,$type,$guid,$product_guid)){
-					if(!Mobo_Core_Storage_Bridge::mirror_variant_legacy_state($guid,$post_id,$product_guid,null)){self::record_state_error($state,'variation_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);}
-					self::invalidate_variant_state_cache($post_id);
-					if(!self::object_matches_custom($post_id,$type,$guid,$product_guid)){self::record_state_error($state,'variation_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);}
+					$owner=self::guid_owned_by_other_object('variation',$guid,$post_id);
+					if(null===$owner){self::record_state_error($state,'identity_owner_read_'.$post_id,'proof-error');return array('complete'=>false);}
+					if($owner>0){
+						if(self::proof_mark($post_id,'identity_owned_by_other_object','#'.$owner,$proof_marked)){continue;}
+						self::record_state_error($state,'variation_identity_conflict_'.$post_id,'proof-blocked');return array('complete'=>false);
+					}
+					$mirrored=Mobo_Core_Storage_Bridge::mirror_variant_legacy_state($guid,$post_id,$product_guid,null);
+					if($mirrored){self::invalidate_variant_state_cache($post_id);$mirrored=self::object_matches_custom($post_id,$type,$guid,$product_guid);}
+					if(!$mirrored){
+						if(self::proof_failure_mark($post_id,'variation_identity_proof_'.$post_id,$proof_marked)){continue;}
+						self::record_state_error($state,'variation_identity_proof_'.$post_id,'proof-error');return array('complete'=>false);
+					}
 					$proof_mirrors++;
 				}else{$proof_noops++;}
+				if(!empty($identity['recovered'])){$recovered++;if('map'===(string)($identity['recovered_source']??'')){$map_recovered++;}else{$custom_recovered++;}}
+				if(class_exists('Mobo_Core_Migration_Quarantine')){Mobo_Core_Migration_Quarantine::clear_failure($post_id);}
 			}
 		}
-		$state['proofCursor']=$cursor;$state['status']='proof-running';$state['lastError']='';if($recovered>0){$state['durableIdentityRecoveries']=absint($state['durableIdentityRecoveries']??0)+$recovered;}if($custom_recovered>0){$state['customIdentityRecoveries']=absint($state['customIdentityRecoveries']??0)+$custom_recovered;}if($map_recovered>0){$state['mapIdentityRecoveries']=absint($state['mapIdentityRecoveries']??0)+$map_recovered;}if($stale_trashed_variation_residues>0){$state['staleTrashedVariationResidues']=absint($state['staleTrashedVariationResidues']??0)+$stale_trashed_variation_residues;}if($proof_noops>0){$state['proofNoopVerified']=absint($state['proofNoopVerified']??0)+$proof_noops;}if($proof_mirrors>0){$state['proofMirrorWrites']=absint($state['proofMirrorWrites']??0)+$proof_mirrors;}self::persist_state($state);return array('complete'=>false);
+		$state['proofCursor']=$cursor;$state['status']='proof-running';$state['lastError']='';if($recovered>0){$state['durableIdentityRecoveries']=absint($state['durableIdentityRecoveries']??0)+$recovered;}if($custom_recovered>0){$state['customIdentityRecoveries']=absint($state['customIdentityRecoveries']??0)+$custom_recovered;}if($map_recovered>0){$state['mapIdentityRecoveries']=absint($state['mapIdentityRecoveries']??0)+$map_recovered;}if($stale_trashed_variation_residues>0){$state['staleTrashedVariationResidues']=absint($state['staleTrashedVariationResidues']??0)+$stale_trashed_variation_residues;}if($proof_noops>0){$state['proofNoopVerified']=absint($state['proofNoopVerified']??0)+$proof_noops;}if($proof_mirrors>0){$state['proofMirrorWrites']=absint($state['proofMirrorWrites']??0)+$proof_mirrors;}if($proof_marked>0){$state['markedObjects']=absint($state['markedObjects']??0)+$proof_marked;}self::persist_state($state);return array('complete'=>false);
+	}
+
+	/** Mark one deterministic proof problem. @return bool False when marking is unavailable/full. */
+	private static function proof_mark( $post_id, $reason, $detail, &$marked ) {
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) || ! Mobo_Core_Migration_Quarantine::mark( $post_id, 'identity', $reason, $detail ) ) { return false; }
+		$marked++;
+		return true;
+	}
+
+	/** Count a mirror/verify failure; mark only after the retry threshold. @return bool */
+	private static function proof_failure_mark( $post_id, $code, &$marked ) {
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) || ! Mobo_Core_Migration_Quarantine::record_failure( $post_id ) ) { return false; }
+		return self::proof_mark( $post_id, 'mirror_failed', $code, $marked );
+	}
+
+	/**
+	 * Return the id of a different Woo object that already owns this GUID in the
+	 * Default Connection's Custom Storage or Product Map, 0 when none, null on a
+	 * read error.
+	 *
+	 * @param string $kind    product|variation.
+	 * @param string $guid    Remote GUID.
+	 * @param int    $post_id Object being proven.
+	 * @return int|null
+	 */
+	private static function guid_owned_by_other_object( $kind, $guid, $post_id ) {
+		global $wpdb;
+		$post_id = absint( $post_id ); $guid = sanitize_text_field( (string) $guid );
+		if ( ! Mobo_Core_Remote_Identity_Policy::is_valid( $guid ) ) { return 0; }
+		$wpdb->last_error = '';
+		if ( 'product' === $kind ) {
+			$row = ( new Mobo_Core_Product_State_Repository() )->get_by_guid( $guid );
+			if ( '' !== (string) $wpdb->last_error ) { return null; }
+			$owner = is_array( $row ) ? absint( $row['woo_product_id'] ?? 0 ) : 0;
+		} else {
+			$row = ( new Mobo_Core_Variant_State_Repository() )->get_by_guid( $guid );
+			if ( '' !== (string) $wpdb->last_error ) { return null; }
+			$owner = is_array( $row ) ? absint( $row['woo_variation_id'] ?? 0 ) : 0;
+		}
+		if ( $owner > 0 && $owner !== $post_id ) { return $owner; }
+		$map_connection = self::default_connection_id();
+		if ( $map_connection <= 0 || ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) { return 0; }
+		$table = Mobo_Core_Product_Map::table_name();
+		$object_type = 'product' === $kind ? Mobo_Core_Product_Map::TYPE_PRODUCT : Mobo_Core_Product_Map::TYPE_VARIATION;
+		$wpdb->last_error = '';
+		$mapped = $wpdb->get_var( $wpdb->prepare( "SELECT wp_post_id FROM {$table} WHERE connection_id=%d AND remote_guid=%s AND object_type=%s LIMIT 1", $map_connection, $guid, $object_type ) );
+		if ( '' !== (string) $wpdb->last_error ) { return null; }
+		$mapped = absint( $mapped );
+		/* Only a live mapped owner counts; a stale map row to a deleted post is not ownership evidence. */
+		if ( $mapped > 0 && $mapped !== $post_id && in_array( get_post_type( $mapped ), array( 'product', 'product_variation' ), true ) ) { return $mapped; }
+		return 0;
 	}
 
 	/**
@@ -509,10 +658,46 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 		$row=self::proof_variant_state_row($post_id);if(!is_array($row)){return false;}$vg=Mobo_Core_Remote_Identity_Policy::is_valid($resolved_guid)?sanitize_text_field((string)$resolved_guid):self::family_guid($post_id,array('variant_guid','mobo_variant_guid','_mobo_variant_guid'));$pid=self::family_int($post_id,array('portal_variant_id','mobo_portal_variant_id','_mobo_portal_variant_id','PortalVariantId'));$parent=absint(wp_get_post_parent_id($post_id));$pg=Mobo_Core_Remote_Identity_Policy::is_valid($resolved_parent_guid)?sanitize_text_field((string)$resolved_parent_guid):($parent>0?self::legacy_scalar($parent,'product_guid'):'');$stored_pg=self::legacy_scalar($post_id,'product_guid');if(''!==$stored_pg&&$stored_pg!==$pg){return false;}if((string)($row['variant_guid']??'')!==$vg||(string)($row['product_guid']??'')!==$pg||absint($row['woo_product_id']??0)!==$parent){return false;}if($pid>0&&absint($row['portal_variant_id']??0)!==$pid){return false;}$ppid=self::family_int($post_id,array('portal_product_id','mobo_portal_product_id','_mobo_portal_product_id','PortalProductId'));if($ppid>0){$prow=self::proof_product_state_row($parent);if(!is_array($prow)||absint($prow['portal_product_id']??0)!==$ppid){return false;}}return true;
 	}
 
+	/**
+	 * Bounded normalization before the global identity proof: collapse exact
+	 * duplicate identity rows, mark objects whose duplicate rows disagree and
+	 * objects whose alias keys carry different values.
+	 *
+	 * @return array{progress:bool,deduped:int,rowsRemoved:int,marked:int,blockers:array}
+	 */
+	private static function normalize_global_blockers() {
+		$out = array( 'progress' => false, 'deduped' => 0, 'rowsRemoved' => 0, 'marked' => 0, 'blockers' => array() );
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) ) { return $out; }
+		$limit = class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::is_accelerated_context() ? 200 : 50;
+		$dedupe = Mobo_Core_Migration_Quarantine::dedupe_exact_duplicate_meta( array_keys( self::managed_keys() ), 'identity', $limit );
+		if ( '' !== $dedupe['error'] ) { $out['blockers'] = array( 'duplicate_normalization_error' => 1 ); return $out; }
+		if ( ! empty( $dedupe['full'] ) ) { $out['blockers'] = array( 'quarantine_capacity_reached' => 1 ); return $out; }
+		$out['deduped'] = $dedupe['deduped']; $out['rowsRemoved'] = $dedupe['rowsRemoved']; $out['marked'] = $dedupe['marked'];
+		if ( $dedupe['deduped'] > 0 || $dedupe['marked'] > 0 || ! empty( $dedupe['more'] ) ) { $out['progress'] = true; return $out; }
+		foreach ( array( array( 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid' ), array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'PortalProductId' ), array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'PortalVariantId' ) ) as $family ) {
+			$ids = self::find_conflicting_alias_objects( $family, $limit );
+			if ( null === $ids ) { $out['blockers'] = array( 'alias_conflict_query_error' => 1 ); return $out; }
+			foreach ( $ids as $post_id ) {
+				if ( ! Mobo_Core_Migration_Quarantine::mark( $post_id, 'identity', 'alias_conflict', $family[0] ) ) { $out['blockers'] = array( 'quarantine_capacity_reached' => 1 ); return $out; }
+				$out['marked']++; $out['progress'] = true;
+			}
+		}
+		return $out;
+	}
+
+	/** @return int[]|null */
+	private static function find_conflicting_alias_objects( $keys, $limit ) {
+		global $wpdb;$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();
+		$sql="SELECT pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) AND TRIM(pm.meta_value)<>''{$excl} GROUP BY pm.post_id HAVING COUNT(DISTINCT TRIM(pm.meta_value))>1 ORDER BY pm.post_id ASC LIMIT %d";
+		$wpdb->last_error='';$ids=$wpdb->get_col($wpdb->prepare($sql,array_merge($keys,array(max(1,absint($limit))))));
+		if(''!==(string)$wpdb->last_error||!is_array($ids)){return null;}
+		return array_values(array_filter(array_map('absint',$ids)));
+	}
+
 	/** @return array<string,int> */
 	private static function global_blockers() {
-		global $wpdb;$out=array();$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));
-		$wpdb->last_error='';$dup=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) GROUP BY pm.post_id,pm.meta_key HAVING COUNT(*)>1 LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return array('duplicate_query_error'=>1);}if(null!==$dup){$out['duplicate_identity_meta']=1;}
+		global $wpdb;$out=array();$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();
+		$wpdb->last_error='';$dup=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} GROUP BY pm.post_id,pm.meta_key HAVING COUNT(*)>1 LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return array('duplicate_query_error'=>1);}if(null!==$dup){$out['duplicate_identity_meta']=1;}
 		/* Alias families must not disagree. Healthy databases stop at the first conflict. */
 		foreach(array(array('variant_guid','mobo_variant_guid','_mobo_variant_guid'),array('portal_product_id','mobo_portal_product_id','_mobo_portal_product_id','PortalProductId'),array('portal_variant_id','mobo_portal_variant_id','_mobo_portal_variant_id','PortalVariantId')) as $family){$conf=self::has_conflicting_alias_object($family);if(null===$conf){$out['alias_conflict_query_error']=1;break;}if($conf){$out['conflicting_identity_aliases']=1;break;}}
 		return $out;
@@ -520,7 +705,103 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 
 	/** @return bool|null */
 	private static function has_conflicting_alias_object( $keys ) {
-		global $wpdb;$ph=implode(',',array_fill(0,count($keys),'%s'));$sql="SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) AND TRIM(pm.meta_value)<>'' GROUP BY pm.post_id HAVING COUNT(DISTINCT TRIM(pm.meta_value))>1 LIMIT 1";$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare($sql,$keys));return ''!==(string)$wpdb->last_error?null:null!==$hit;
+		global $wpdb;$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();$sql="SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) AND TRIM(pm.meta_value)<>''{$excl} GROUP BY pm.post_id HAVING COUNT(DISTINCT TRIM(pm.meta_value))>1 LIMIT 1";$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare($sql,$keys));return ''!==(string)$wpdb->last_error?null:null!==$hit;
+	}
+
+	/**
+	 * Cleanup/residue scope exclusion: marked objects keep their (never proven)
+	 * legacy rows and objects owned by another Connection are not the Default
+	 * Connection's to delete. The marked count is reported separately.
+	 *
+	 * @return string
+	 */
+	private static function retirement_exclusion_sql() {
+		return class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::exclusion_sql( 'pm.post_id' ) : '';
+	}
+
+	/**
+	 * Post-fence re-probe of one marked object (only after the DB version is
+	 * stamped, under the migration lock, in the Default Connection context).
+	 *
+	 * The object is cleared when it no longer carries legacy identity rows, or
+	 * when its legacy identity is consistent and Custom Storage holds exactly the
+	 * same identity for this Woo object (e.g. after Repair, after the conflicting
+	 * copy was deleted, or after a transient mirror failure). In the last case the
+	 * terminal (non-stealing) Custom bind API is used to fill only missing values;
+	 * existing Custom values are never overwritten. Only then are the redundant
+	 * legacy identity rows of this object removed.
+	 *
+	 * @param int $post_id Woo object id.
+	 * @return string clear|keep|error
+	 */
+	public static function reprobe_quarantined_object( $post_id ) {
+		global $wpdb;
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! self::is_fenced() ) { return 'keep'; }
+		self::reset_proof_batch_cache();
+		$rows = self::legacy_rows_for_post( $post_id );
+		if ( null === $rows ) { return 'error'; }
+		if ( empty( $rows ) ) { return 'clear'; }
+		$type = get_post_type( $post_id );
+		if ( ! in_array( $type, array( 'product', 'product_variation' ), true ) ) { return 'clear'; }
+		if ( self::object_has_malformed_identity( $post_id ) ) { return 'keep'; }
+		$identity = self::resolve_proof_identity( $post_id, $type );
+		$status = sanitize_key( (string) ( $identity['status'] ?? '' ) );
+		if ( 'error' === $status ) { return 'error'; }
+		if ( 'product_variation' === $type && 'missing' === $status && 'trash' === sanitize_key( (string) get_post_status( $post_id ) ) ) {
+			$stale = self::trashed_variation_parent_only_residue_status( $post_id );
+			if ( 'error' === $stale ) { return 'error'; }
+			if ( 'stale' === $stale ) { return self::delete_legacy_identity_rows( $post_id ) ? 'clear' : 'error'; }
+		}
+		if ( 'ok' !== $status ) { return 'keep'; }
+		$guid = sanitize_text_field( (string) ( $identity['guid'] ?? '' ) );
+		if ( 'product' === $type ) {
+			if ( ! self::object_matches_custom( $post_id, 'product', $guid, '' ) ) {
+				$owner = self::guid_owned_by_other_object( 'product', $guid, $post_id );
+				if ( null === $owner ) { return 'error'; }
+				if ( $owner > 0 ) { return 'keep'; }
+				$repo = new Mobo_Core_Product_State_Repository();
+				if ( ! $repo->terminal_bind_product( $post_id, $guid ) ) { return 'keep'; }
+				$row = $repo->get_by_woo_product_id( $post_id );
+				if ( ! is_array( $row ) ) { return 'keep'; }
+				$pid = self::family_int( $post_id, array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'PortalProductId' ) );
+				if ( $pid > 0 && absint( $row['portal_product_id'] ?? 0 ) <= 0 ) { $repo->terminal_set_portal_product_id( $post_id, $pid ); }
+				$vg = self::family_guid( $post_id, array( 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid' ) );
+				$vid = self::family_int( $post_id, array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'PortalVariantId' ) );
+				$set_vg = ( '' !== $vg && '' === (string) ( $row['simple_variant_guid'] ?? '' ) ) ? $vg : null;
+				$set_vid = ( $vid > 0 && absint( $row['simple_portal_variant_id'] ?? 0 ) <= 0 ) ? $vid : null;
+				if ( null !== $set_vg || null !== $set_vid ) { $repo->terminal_set_simple_identity( $post_id, $set_vg, $set_vid ); }
+				self::invalidate_product_state_cache( $post_id );
+				if ( ! self::object_matches_custom( $post_id, 'product', $guid, '' ) ) { return 'keep'; }
+			}
+			return self::delete_legacy_identity_rows( $post_id ) ? 'clear' : 'error';
+		}
+		$product_guid = sanitize_text_field( (string) ( $identity['parent_guid'] ?? '' ) );
+		$parent = absint( wp_get_post_parent_id( $post_id ) );
+		if ( $parent <= 0 || ! Mobo_Core_Remote_Identity_Policy::is_valid( $product_guid ) ) { return 'keep'; }
+		if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::is_marked( $parent ) ) { return 'keep'; }
+		$prow = ( new Mobo_Core_Product_State_Repository() )->get_by_woo_product_id( $parent );
+		if ( ! is_array( $prow ) || (string) ( $prow['product_guid'] ?? '' ) !== $product_guid ) { return 'keep'; }
+		if ( ! self::object_matches_custom( $post_id, 'product_variation', $guid, $product_guid ) ) {
+			$owner = self::guid_owned_by_other_object( 'variation', $guid, $post_id );
+			if ( null === $owner ) { return 'error'; }
+			if ( $owner > 0 ) { return 'keep'; }
+			$vrepo = new Mobo_Core_Variant_State_Repository();
+			if ( ! $vrepo->terminal_bind_variant( $post_id, $parent, $guid, $product_guid ) ) { return 'keep'; }
+			$vrow = $vrepo->get_by_woo_variation_id( $post_id );
+			$vid = self::family_int( $post_id, array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'PortalVariantId' ) );
+			if ( is_array( $vrow ) && $vid > 0 && absint( $vrow['portal_variant_id'] ?? 0 ) <= 0 ) { $vrepo->terminal_set_portal_variant_id( $post_id, $vid ); }
+			self::invalidate_variant_state_cache( $post_id );
+			if ( ! self::object_matches_custom( $post_id, 'product_variation', $guid, $product_guid ) ) { return 'keep'; }
+		}
+		return self::delete_legacy_identity_rows( $post_id ) ? 'clear' : 'error';
+	}
+
+	/** Remove this object's (now redundant) legacy identity rows. @return bool */
+	private static function delete_legacy_identity_rows( $post_id ) {
+		global $wpdb;$post_id=absint($post_id);if($post_id<=0){return false;}$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));
+		$wpdb->last_error='';$deleted=$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key IN ({$ph})",array_merge(array($post_id),$keys)));
+		if(false===$deleted||''!==(string)$wpdb->last_error){return false;}wp_cache_delete($post_id,'post_meta');return true;
 	}
 
 	/** @return bool */
@@ -530,12 +811,12 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 
 	/** Cursor-based physical cleanup; a failed/stale checkpoint can only replay, never skip. @return array|false */
 	private static function cleanup_one_batch( $cursor ) {
-		global $wpdb;$cursor=absint($cursor);$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$args=array_merge(array($cursor),$keys,array(self::cleanup_batch_size()));$wpdb->last_error='';$rows=$wpdb->get_results($wpdb->prepare("SELECT pm.meta_id,pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.meta_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) ORDER BY pm.meta_id ASC LIMIT %d",$args),ARRAY_A);if(''!==(string)$wpdb->last_error){return false;}if(empty($rows)){return array('deleted'=>0,'cursor'=>$cursor);}$ids=array();$posts=array();$next=$cursor;foreach($rows as $row){$id=absint($row['meta_id']??0);if($id>0){$ids[]=$id;$next=max($next,$id);}$post_id=absint($row['post_id']??0);if($post_id>0){$posts[$post_id]=true;}}$ids=array_values(array_filter($ids));if(empty($ids)){return false;}$idph=implode(',',array_fill(0,count($ids),'%d'));$wpdb->last_error='';$deleted=$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->postmeta} WHERE meta_id IN ({$idph})",$ids));if(false===$deleted||''!==(string)$wpdb->last_error){return false;}foreach(array_keys($posts) as $post_id){wp_cache_delete($post_id,'post_meta');}return array('deleted'=>absint($deleted),'cursor'=>$next);
+		global $wpdb;$cursor=absint($cursor);$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$args=array_merge(array($cursor),$keys,array(self::cleanup_batch_size()));$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$rows=$wpdb->get_results($wpdb->prepare("SELECT pm.meta_id,pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.meta_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} ORDER BY pm.meta_id ASC LIMIT %d",$args),ARRAY_A);if(''!==(string)$wpdb->last_error){return false;}if(empty($rows)){return array('deleted'=>0,'cursor'=>$cursor);}$ids=array();$posts=array();$next=$cursor;foreach($rows as $row){$id=absint($row['meta_id']??0);if($id>0){$ids[]=$id;$next=max($next,$id);}$post_id=absint($row['post_id']??0);if($post_id>0){$posts[$post_id]=true;}}$ids=array_values(array_filter($ids));if(empty($ids)){return false;}$idph=implode(',',array_fill(0,count($ids),'%d'));$wpdb->last_error='';$deleted=$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->postmeta} WHERE meta_id IN ({$idph})",$ids));if(false===$deleted||''!==(string)$wpdb->last_error){return false;}foreach(array_keys($posts) as $post_id){wp_cache_delete($post_id,'post_meta');}return array('deleted'=>absint($deleted),'cursor'=>$next);
 	}
 
 	/** Fast boolean residue probe used by prerequisite/complete gates. @return bool|null */
 	private static function has_physical_residue() {
-		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return null;}return null!==$hit;
+		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return null;}return null!==$hit;
 	}
 
 	/** Durable terminal prerequisite with request-local zero-residue caching. @return bool */
@@ -545,7 +826,7 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 
 	/** @return int|null */
 	public static function physical_residue_count() {
-		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$wpdb->last_error='';$count=$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph})",$keys));return ''!==(string)$wpdb->last_error?null:absint($count);
+		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$count=$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl}",$keys));return ''!==(string)$wpdb->last_error?null:absint($count);
 	}
 
 	/** Reset request-local proof snapshot. @return void */

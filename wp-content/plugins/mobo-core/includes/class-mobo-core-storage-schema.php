@@ -22,6 +22,14 @@ final class Mobo_Core_Storage_Schema {
 	const ERROR_OPTION      = 'mobo_core_storage_schema_last_error';
 	const ERROR_TIME_OPTION = 'mobo_core_storage_schema_last_error_at';
 
+	/* Durable positive validation cache (10.34.77). validate() issues ~200
+	 * SHOW TABLES/COLUMNS/INDEX queries; is_ready() is consulted on most requests.
+	 * A successful validation for this exact schema VERSION is trusted for
+	 * VALIDATED_TTL seconds. Failures are never cached, ensure() always re-validates,
+	 * and a real table loss still surfaces as fail-closed query errors. */
+	const VALIDATED_OPTION = 'mobo_core_storage_schema_validated_v1';
+	const VALIDATED_TTL    = 21600;
+
 	/** @var bool|null */
 	private static $ready_cache = null;
 
@@ -500,6 +508,11 @@ final class Mobo_Core_Storage_Schema {
 		self::$ready_cache = null;
 		$ready             = self::validate();
 		if ( $ready ) {
+			update_option( self::VALIDATED_OPTION, array( 'version' => self::VERSION, 'at' => time() ), false );
+		} else {
+			delete_option( self::VALIDATED_OPTION );
+		}
+		if ( $ready ) {
 			update_option( self::VERSION_OPTION, self::VERSION, false );
 			delete_option( self::ERROR_OPTION );
 			delete_option( self::ERROR_TIME_OPTION );
@@ -529,8 +542,32 @@ final class Mobo_Core_Storage_Schema {
 			return false;
 		}
 
+		if ( self::validation_cache_fresh( get_option( self::VALIDATED_OPTION, array() ), time() ) ) {
+			self::$ready_cache = true;
+			return true;
+		}
+
 		self::$ready_cache = self::validate();
+		if ( self::$ready_cache ) {
+			update_option( self::VALIDATED_OPTION, array( 'version' => self::VERSION, 'at' => time() ), false );
+		} else {
+			delete_option( self::VALIDATED_OPTION );
+		}
 		return (bool) self::$ready_cache;
+	}
+
+	/**
+	 * Pure freshness check for the durable validation stamp (unit tested).
+	 *
+	 * @param mixed $stamp Stored option value.
+	 * @param int   $now   Current Unix time.
+	 * @return bool
+	 */
+	public static function validation_cache_fresh( $stamp, $now ) {
+		if ( ! is_array( $stamp ) || self::VERSION !== (string) ( $stamp['version'] ?? '' ) ) { return false; }
+		$at = absint( $stamp['at'] ?? 0 );
+		$now = absint( $now );
+		return $at > 0 && $at <= $now + 60 && ( $now - $at ) < self::VALIDATED_TTL;
 	}
 
 	/**

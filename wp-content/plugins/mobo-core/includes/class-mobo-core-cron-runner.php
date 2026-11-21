@@ -67,23 +67,42 @@ class Mobo_Core_Cron_Runner {
 
 		/* Database migration is driven by the customer's existing real cron and is no
 		 * longer coupled to storefront traffic. One cron invocation advances many
-		 * durable bounded batches inside a short wall-clock budget. Ordinary requests
-		 * still execute only the conservative single-step path on plugins_loaded. */
+		 * durable bounded batches inside a short wall-clock budget.
+		 *
+		 * 10.34.77 hardening: migration no longer monopolizes the runner. Once the
+		 * structural prerequisites are in place (Migration::normal_runtime_ready():
+		 * schema, Connections, ownership, large-runtime cutover, Product Map seed),
+		 * a bounded share of this slice advances migration and the ordinary runner
+		 * (webhooks, sync, repair, orders) still runs afterwards under the same
+		 * runner lease. Only while those prerequisites are genuinely missing does the
+		 * slice stay migration-only, and it reports the exact reason. Blocked or
+		 * marked retirement objects never stop ordinary work. */
+		$migration_mode = 'normal';
+		$runtime_blocked_reason = '';
 		if ( class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::needs_budgeted_migration_slice() ) {
-			$migration = Mobo_Core_Migration::run_budgeted_slice( $source, 12, 200 );
-			$result = array(
-				'success' => ! empty( $migration['success'] ),
-				'status' => ! empty( $migration['needsContinuation'] ) ? 'database-migration' : 'database-migration-complete',
-				'source' => $source,
-				'executedAt' => time(),
-				'needsContinuation' => ! empty( $migration['needsContinuation'] ),
-				'databaseMigration' => $migration,
-			);
-			/* Do not stack the ordinary queue runner onto the terminal migration request.
-			 * Even the completion slice stays bounded; normal work resumes on the next
-			 * scheduled Cron invocation. */
-			$this->save_last_result( $result );
-			return $result;
+			$runtime_ready = Mobo_Core_Migration::normal_runtime_ready( $runtime_blocked_reason );
+			$migration_mode = class_exists( 'Mobo_Core_Migration_Quarantine' )
+				? Mobo_Core_Migration_Quarantine::decide_runner_mode( true, $runtime_ready )
+				: ( $runtime_ready ? 'shared' : 'migration-only' );
+			$upgrade_barrier_active = class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active();
+			if ( 'migration-only' === $migration_mode && ! $upgrade_barrier_active ) {
+				$migration = Mobo_Core_Migration::run_budgeted_slice( $source, 12, 200 );
+				$progressed = 'progressed' === (string) ( $migration['status'] ?? '' );
+				$result = array(
+					'success' => ! empty( $migration['success'] ),
+					'status' => ! empty( $migration['needsContinuation'] ) ? 'database-migration' : 'database-migration-complete',
+					'source' => $source,
+					'executedAt' => time(),
+					/* Kick an immediate continuation only after real progress; a waiting
+					 * or blocked migration resumes on the next scheduled invocation
+					 * instead of spinning loopback requests. */
+					'needsContinuation' => ! empty( $migration['needsContinuation'] ) && $progressed,
+					'runtimeBlockedReason' => $runtime_blocked_reason,
+					'databaseMigration' => $migration,
+				);
+				$this->save_last_result( $result );
+				return $result;
+			}
 		}
 
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
@@ -184,7 +203,26 @@ class Mobo_Core_Cron_Runner {
 			);
 		}
 
+		$shared_migration = null;
 		try {
+			/* Shared mode: advance migration first with a bounded share of the slice,
+			 * serialized with ordinary work by the runner lease held here, then hand the
+			 * remaining budget to the normal dispatcher. */
+			if ( 'shared' === $migration_mode ) {
+				$migration_share = class_exists( 'Mobo_Core_Migration_Quarantine' )
+					? Mobo_Core_Migration_Quarantine::shared_migration_budget( $config['effectiveTimeBudgetSeconds'] )
+					: 4;
+				$migration_started = microtime( true );
+				try {
+					$shared_migration = Mobo_Core_Migration::run_budgeted_slice( $source, $migration_share, 200 );
+				} catch ( Throwable $migration_error ) {
+					/* Migration failure must never stop ordinary work. */
+					$shared_migration = array( 'success' => false, 'status' => 'migration-exception', 'exceptionClass' => get_class( $migration_error ) );
+				}
+				$spent = (int) ceil( microtime( true ) - $migration_started );
+				$config['effectiveTimeBudgetSeconds'] = max( 1, (int) $config['effectiveTimeBudgetSeconds'] - $spent );
+			}
+
 			if ( class_exists( 'Mobo_Core_API_Client' ) && method_exists( 'Mobo_Core_API_Client', 'set_runtime_deadline' ) ) {
 				Mobo_Core_API_Client::set_runtime_deadline( microtime( true ) + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ), 1.0 );
 			}
@@ -208,6 +246,14 @@ class Mobo_Core_Cron_Runner {
 				Mobo_Core_API_Client::clear_runtime_deadline();
 			}
 			$result['lockReleased'] = Mobo_Core_Lock::release( 'real_cron_runner', $lock );
+		}
+
+		if ( null !== $shared_migration && is_array( $result ) ) {
+			$result['databaseMigration'] = $shared_migration;
+			$result['migrationMode'] = 'shared';
+			if ( 'progressed' === (string) ( $shared_migration['status'] ?? '' ) && empty( $result['needsContinuation'] ) && ! empty( $result['success'] ) ) {
+				$result['needsContinuation'] = true;
+			}
 		}
 
 		if ( ! empty( $stale_lock_recovery ) ) {

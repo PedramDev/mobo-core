@@ -545,6 +545,20 @@ class Mobo_Core_Rest_Controller {
 		$params = $request->get_json_params();
 		$params = is_array( $params ) ? $params : array();
 		$token = Mobo_Core_Settings::normalize_opaque_secret( $params['token'] ?? '', 191 );
+		/* 10.34.77: provisioning a NEW (non-Default) Connection is refused until the
+		 * Default Connection's one-way storage retirement has completed. The Default
+		 * Connection itself can always be (re)provisioned, and already provisioned
+		 * extra Connections keep running; this only stops the topology from growing
+		 * mid-migration. Retryable: the Backend may try again later. */
+		$target = '' !== $token ? Mobo_Core_Connection_Repository::get_by_license_token( $token ) : null;
+		if ( is_array( $target ) && empty( $target['is_default'] ) && ! Mobo_Core_Connection_Repository::is_provisioned( $target )
+			&& class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::new_connections_blocked() ) {
+			return new WP_Error(
+				'mobo_core_connection_migration_in_progress',
+				'New Connections cannot be provisioned until the store finishes its storage migration. Retry later.',
+				array( 'status' => 409, 'retryAfter' => 900 )
+			);
+		}
 		/* Optional X-SEC proof: required only to move an already-provisioned
 		 * Connection to another Backend host. Today's Backend client does not send
 		 * it and is unaffected while its configured Backend host is unchanged. */

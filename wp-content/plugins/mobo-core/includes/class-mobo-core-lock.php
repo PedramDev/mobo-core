@@ -479,6 +479,25 @@ class Mobo_Core_Lock {
 			}
 		}
 
+		/*
+		 * The database migration mutex is not a mobo_core_runtime_lock_* row: it is a
+		 * connection-scoped GET_LOCK() (or, on hosts without advisory locks, the
+		 * mobo_core_migration_request_lock_v1 option lease). A plugin upgrade must not
+		 * replace files while a migration batch is mid-flight, so report it here as
+		 * the pseudo lock "database_migration". Read-only: never released from here.
+		 */
+		if ( class_exists( 'Mobo_Core_Migration' ) && method_exists( 'Mobo_Core_Migration', 'get_migration_request_lock_status' ) ) {
+			try {
+				$migration_lock = Mobo_Core_Migration::get_migration_request_lock_status();
+				if ( is_array( $migration_lock ) && ! empty( $migration_lock['active'] ) ) {
+					$result['database_migration'] = $migration_lock;
+				}
+			} catch ( Throwable $e ) {
+				/* Diagnostics must not break the drain loop; treat as not held. */
+				unset( $e );
+			}
+		}
+
 		ksort( $result );
 		return $result;
 	}

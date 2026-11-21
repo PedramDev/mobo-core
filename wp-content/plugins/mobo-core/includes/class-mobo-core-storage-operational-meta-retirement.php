@@ -194,10 +194,16 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 		}
 
 		if ( empty( $state['fenceActive'] ) ) {
-			if ( class_exists( 'Mobo_Core_Connection_Repository' ) && ! Mobo_Core_Connection_Repository::legacy_terminal_retirement_topology_safe() ) {
-				$state['status'] = 'blocked-multi-connection';
-				$state['blockers'] = array( 'multi_connection_terminal_retirement' => 1 );
-				$state['lastError'] = 'multi_connection_terminal_retirement';
+			/* 10.34.77 hardening: an additional (even disabled) Connection no longer
+			 * blocks retirement of the Default Connection's data. Objects durably owned
+			 * by another Connection are excluded from reconcile/proof/cleanup by
+			 * Mobo_Core_Migration_Quarantine::foreign_exclusion_sql(). That exclusion is
+			 * only sound after the ownership migration attributed every row, so wait
+			 * (transiently) for that proof instead of blocking forever. */
+			if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && ! Mobo_Core_Migration_Quarantine::retirement_topology_allowed() ) {
+				$state['status'] = 'waiting-connection-ownership';
+				$state['blockers'] = array( 'multi_connection_ownership_pending' => 1 );
+				$state['lastError'] = '';
 				self::persist_state( $state );
 				return false;
 			}
@@ -251,6 +257,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 				$state['status'] = 'reconciling-unmapped';
 				$state['lastError'] = '';
 				$state['blockers'] = array();
+				$state['markedObjects'] = absint( $state['markedObjects'] ?? 0 ) + absint( $reconcile['marked'] ?? 0 );
 				$state['reconciledUnmapped'] = absint( isset( $state['reconciledUnmapped'] ) ? $state['reconciledUnmapped'] : 0 ) + absint( isset( $reconcile['reconciled'] ) ? $reconcile['reconciled'] : 0 );
 				$state['prunedUnowned'] = absint( isset( $state['prunedUnowned'] ) ? $state['prunedUnowned'] : 0 ) + absint( isset( $reconcile['pruned'] ) ? $reconcile['pruned'] : 0 );
 				$state['reconcileCursor'] = absint( $reconcile['cursor'] ?? ( $state['reconcileCursor'] ?? 0 ) );
@@ -266,7 +273,22 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 
 			$proof = self::advance_exact_proof( $state );
 			if ( ! $proof['complete'] ) { return false; }
-			$blockers = self::global_blockers();
+			/* Normalize exact duplicates / mark unresolvable objects in bounded passes
+			 * before the global proof. Progress is persisted and the next step repeats
+			 * until the global checks are clean (or a genuine error remains). */
+			$normalized = self::normalize_global_blockers();
+			if ( ! empty( $normalized['progress'] ) ) {
+				$state = self::load_state();
+				$state['status'] = 'normalizing';
+				$state['lastError'] = '';
+				$state['blockers'] = array();
+				$state['dedupedGroups'] = absint( $state['dedupedGroups'] ?? 0 ) + absint( $normalized['deduped'] ?? 0 );
+				$state['dedupedRows'] = absint( $state['dedupedRows'] ?? 0 ) + absint( $normalized['rowsRemoved'] ?? 0 );
+				$state['markedObjects'] = absint( $state['markedObjects'] ?? 0 ) + absint( $normalized['marked'] ?? 0 );
+				self::persist_state( $state );
+				return false;
+			}
+			$blockers = ! empty( $normalized['blockers'] ) ? $normalized['blockers'] : self::global_blockers();
 			if ( ! empty( $blockers ) ) {
 				$state = self::load_state();
 				$state['status'] = 'blocked';
@@ -393,6 +415,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 		}
 		$proof_noops = 0;
 		$proof_mirrors = 0;
+		$proof_marked = 0;
 		$legacy_scope = class_exists( 'Mobo_Core_Storage_Bridge' )
 			&& method_exists( 'Mobo_Core_Storage_Bridge', 'begin_migration_pre_fence_legacy_reads' );
 		if ( $legacy_scope ) {
@@ -404,27 +427,47 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 			$row_id=absint($row['id']??0);$post_id=absint($row['wp_post_id']??0);$object_type=sanitize_key((string)($row['object_type']??''));$guid=sanitize_text_field((string)($row['remote_guid']??''));
 			$expected = Mobo_Core_Product_Map::TYPE_VARIATION === $object_type ? 'product_variation' : 'product';
 			if ( $post_id <= 0 || get_post_type( $post_id ) !== $expected ) { $cursor=$row_id; continue; }
-			if ( ! Mobo_Core_Remote_Identity_Policy::is_valid( $guid ) ) { self::record_state_error( $state, 'proof_invalid_guid_'.$row_id, 'proof-blocked' ); return array('complete'=>false); }
+			/* Marked objects keep their legacy rows and are skipped by every worker. */
+			if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::is_marked( $post_id ) ) { $cursor=$row_id; continue; }
+			if ( ! Mobo_Core_Remote_Identity_Policy::is_valid( $guid ) ) {
+				/* Deterministic data problem: mark this object and continue (formerly blocked the whole worker). */
+				if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::mark( $post_id, 'operational', 'invalid_map_guid', 'map#' . $row_id ) ) { $proof_marked++; $cursor=$row_id; continue; }
+				self::record_state_error( $state, 'proof_invalid_guid_'.$row_id, 'proof-blocked' ); return array('complete'=>false);
+			}
 			$incomplete=!empty($row['sync_incomplete']);
+			$failure='';
 			if ( Mobo_Core_Product_Map::TYPE_PRODUCT === $object_type ) {
 				$snapshot=Mobo_Core_Storage_Bridge::legacy_product_snapshot($guid,$post_id,$incomplete);
-				if(!is_array($snapshot)){self::record_state_error($state,'product_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-				if(!self::product_snapshot_matches_custom($snapshot,self::proof_product_state_row($post_id))){
-					if(!Mobo_Core_Storage_Bridge::mirror_product_legacy_state($guid,$post_id,$incomplete)){self::record_state_error($state,'product_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-					self::invalidate_proof_product_state($post_id);
-					if(!self::product_snapshot_matches_custom($snapshot)){self::record_state_error($state,'product_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-					$proof_mirrors++;
+				if(!is_array($snapshot)){$failure='product_proof_failed_'.$row_id;}
+				elseif(!self::product_snapshot_matches_custom($snapshot,self::proof_product_state_row($post_id))){
+					if(!Mobo_Core_Storage_Bridge::mirror_product_legacy_state($guid,$post_id,$incomplete)){$failure='product_proof_failed_'.$row_id;}
+					else{
+						self::invalidate_proof_product_state($post_id);
+						if(!self::product_snapshot_matches_custom($snapshot)){$failure='product_proof_failed_'.$row_id;}else{$proof_mirrors++;}
+					}
 				}else{$proof_noops++;}
 			} else {
 				$parent=sanitize_text_field((string)($row['parent_remote_guid']??''));
 				$snapshot=Mobo_Core_Storage_Bridge::legacy_variant_snapshot($guid,$post_id,$parent,$incomplete);
-				if(!is_array($snapshot)){self::record_state_error($state,'variant_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-				if(!self::variant_snapshot_matches_custom($snapshot,self::proof_variant_state_row($post_id))){
-					if(!Mobo_Core_Storage_Bridge::mirror_variant_legacy_state($guid,$post_id,(string)$snapshot['product_guid'],$incomplete)){self::record_state_error($state,'variant_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-					self::invalidate_proof_variant_state($post_id);
-					if(!self::variant_snapshot_matches_custom($snapshot)){self::record_state_error($state,'variant_proof_failed_'.$row_id,'proof-error');return array('complete'=>false);}
-					$proof_mirrors++;
+				if(!is_array($snapshot)){$failure='variant_proof_failed_'.$row_id;}
+				elseif(!self::variant_snapshot_matches_custom($snapshot,self::proof_variant_state_row($post_id))){
+					if(!Mobo_Core_Storage_Bridge::mirror_variant_legacy_state($guid,$post_id,(string)$snapshot['product_guid'],$incomplete)){$failure='variant_proof_failed_'.$row_id;}
+					else{
+						self::invalidate_proof_variant_state($post_id);
+						if(!self::variant_snapshot_matches_custom($snapshot)){$failure='variant_proof_failed_'.$row_id;}else{$proof_mirrors++;}
+					}
 				}else{$proof_noops++;}
+			}
+			if ( '' !== $failure ) {
+				/* A failed mirror/verify can be transient (e.g. a concurrent write that the
+				 * fresh verification caught), so it is retried first. Only after
+				 * FAILURE_THRESHOLD consecutive failures on the same object is it marked
+				 * and skipped so the rest of the catalog can continue. */
+				if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::record_failure( $post_id )
+					&& Mobo_Core_Migration_Quarantine::mark( $post_id, 'operational', 'mirror_failed', $failure ) ) {
+					$proof_marked++; $cursor=$row_id; continue;
+				}
+				self::record_state_error($state,$failure,'proof-error');return array('complete'=>false);
 			}
 			$cursor=$row_id;
 		}
@@ -437,6 +480,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 		$state['proofCursor']=$cursor;$state['status']='proof-running';$state['lastError']='';
 		if($proof_noops>0){$state['proofNoopVerified']=absint($state['proofNoopVerified']??0)+$proof_noops;}
 		if($proof_mirrors>0){$state['proofMirrorWrites']=absint($state['proofMirrorWrites']??0)+$proof_mirrors;}
+		if($proof_marked>0){$state['markedObjects']=absint($state['markedObjects']??0)+$proof_marked;}
 		self::persist_state($state);
 		return array('complete'=>false);
 	}
@@ -512,8 +556,12 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 	private static function reconcile_unmapped_operational_batch( $cursor = 0 ) {
 		global $wpdb;
 		$cursor = absint( $cursor );
-		$out = array( 'changed'=>0, 'reconciled'=>0, 'pruned'=>0, 'blockers'=>array(), 'error'=>'', 'cursor'=>$cursor, 'scanComplete'=>false );
+		$out = array( 'changed'=>0, 'reconciled'=>0, 'pruned'=>0, 'marked'=>0, 'blockers'=>array(), 'error'=>'', 'cursor'=>$cursor, 'scanComplete'=>false );
 		$keys = array_keys( self::managed_keys() );
+		/* Marked objects and objects owned by another Connection are not this
+		 * worker's to reconcile; without the exclusion a marked object would be
+		 * rediscovered forever after the cursor resets. */
+		$excl = class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::exclusion_sql( 'p.ID' ) : '';
 		$ph = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
 		$map = Mobo_Core_Product_Map::table_name();
 		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
@@ -527,7 +575,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 				 LEFT JOIN {$map} m ON m.connection_id=%d AND m.wp_post_id=p.ID AND m.object_type=IF(p.post_type='product','product','variation')
 				 WHERE p.post_type IN ('product','product_variation')
 				 AND p.ID>%d
-				 AND pm.meta_key IN ({$ph}) AND m.id IS NULL
+				 AND pm.meta_key IN ({$ph}) AND m.id IS NULL{$excl}
 				 GROUP BY p.ID,p.post_type,p.post_status,p.post_parent
 				 ORDER BY p.ID ASC LIMIT %d",
 				$args
@@ -548,6 +596,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 			if ( self::$reconcile_query_error ) { $out['error'] = 'unmapped_identity_read_failed'; return $out; }
 			$identity_status = sanitize_key( (string) ( isset( $identity['status'] ) ? $identity['status'] : '' ) );
 			if ( 'auto-draft' === $status && 'ok' === $identity_status ) {
+				if ( self::mark_reconcile_object( $out, $post_id, 'autodraft_with_identity' ) ) { continue; }
 				$out['blockers']['operational_autodraft_with_identity'] = absint( isset( $out['blockers']['operational_autodraft_with_identity'] ) ? $out['blockers']['operational_autodraft_with_identity'] : 0 ) + 1;
 				return $out;
 			}
@@ -560,6 +609,8 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 					continue;
 				}
 				$key = 'conflict' === $identity_status ? 'operational_identity_conflict' : ( 'parent-missing' === $identity_status ? 'operational_parent_identity_missing' : 'operational_meta_without_identity' );
+				$mark_reason = 'conflict' === $identity_status ? 'identity_conflict' : ( 'parent-missing' === $identity_status ? 'parent_identity_missing' : 'missing_identity' );
+				if ( self::mark_reconcile_object( $out, $post_id, $mark_reason ) ) { continue; }
 				$out['blockers'][ $key ] = absint( isset( $out['blockers'][ $key ] ) ? $out['blockers'][ $key ] : 0 ) + 1;
 				return $out;
 			}
@@ -568,10 +619,30 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 			if ( 'ok' === $seed ) { $out['reconciled']++; $out['changed']++; $out['cursor'] = max( absint( $out['cursor'] ), $post_id ); continue; }
 			if ( 'error' === $seed ) { $out['error'] = 'operational_map_reconcile_write_failed'; return $out; }
 			$key = 'duplicate' === $seed ? 'operational_identity_duplicate' : 'operational_map_conflict';
+			/* Typical cause: WooCommerce "Duplicate product" copied product_guid onto a
+			 * second product. The original keeps its Product Map/Custom ownership; the
+			 * copy is marked, keeps its legacy rows and is never adopted. */
+			if ( self::mark_reconcile_object( $out, $post_id, 'duplicate' === $seed ? 'identity_duplicate' : 'map_conflict' ) ) { continue; }
 			$out['blockers'][ $key ] = absint( isset( $out['blockers'][ $key ] ) ? $out['blockers'][ $key ] : 0 ) + 1;
 			return $out;
 		}
 		return $out;
+	}
+
+	/**
+	 * Mark one unresolvable reconcile object and advance the cursor past it.
+	 *
+	 * @param array  $out     Reconcile result (by reference).
+	 * @param int    $post_id Woo object id.
+	 * @param string $reason  Reason code.
+	 * @return bool False when marking is unavailable/full (caller keeps the honest blocker).
+	 */
+	private static function mark_reconcile_object( &$out, $post_id, $reason ) {
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) || ! Mobo_Core_Migration_Quarantine::mark( $post_id, 'operational', $reason ) ) { return false; }
+		$out['marked']++;
+		$out['changed']++;
+		$out['cursor'] = max( absint( $out['cursor'] ), absint( $post_id ) );
+		return true;
 	}
 
 	/** @return array{status:string,guid:string,parent_guid:string,last_hash:string,incomplete:bool} */
@@ -685,23 +756,70 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 		global $wpdb;$post_id=absint($post_id);$key=(string)$key;if(isset(self::$reconcile_legacy_scope[$post_id])){$v=self::$reconcile_legacy_first[$post_id][$key]??'';return is_scalar($v)?sanitize_text_field((string)maybe_unserialize($v)):'';}$wpdb->last_error='';$v=$wpdb->get_var($wpdb->prepare("SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s ORDER BY meta_id ASC LIMIT 1",$post_id,$key));if(''!==(string)$wpdb->last_error){self::$reconcile_query_error=true;return '';}return is_scalar($v)?sanitize_text_field((string)maybe_unserialize($v)):'';
 	}
 
+	/**
+	 * Bounded normalization before the global proof: collapse exact duplicate
+	 * rows, mark objects whose duplicates disagree, objects with duplicate Product
+	 * Map bindings and mapped live objects that still lack Custom coverage.
+	 *
+	 * @return array{progress:bool,deduped:int,rowsRemoved:int,marked:int,blockers:array}
+	 */
+	private static function normalize_global_blockers() {
+		global $wpdb;
+		$out = array( 'progress' => false, 'deduped' => 0, 'rowsRemoved' => 0, 'marked' => 0, 'blockers' => array() );
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) ) { return $out; }
+		$limit = class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::is_accelerated_context() ? 200 : 50;
+		$dedupe = Mobo_Core_Migration_Quarantine::dedupe_exact_duplicate_meta( array_keys( self::managed_keys() ), 'operational', $limit );
+		if ( '' !== $dedupe['error'] ) { $out['blockers'] = array( 'duplicate_normalization_error' => 1 ); return $out; }
+		if ( ! empty( $dedupe['full'] ) ) { $out['blockers'] = array( 'quarantine_capacity_reached' => 1 ); return $out; }
+		$out['deduped'] = $dedupe['deduped']; $out['rowsRemoved'] = $dedupe['rowsRemoved']; $out['marked'] = $dedupe['marked'];
+		if ( $dedupe['deduped'] > 0 || $dedupe['marked'] > 0 || ! empty( $dedupe['more'] ) ) { $out['progress'] = true; return $out; }
+
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 ) { return $out; }
+		$map = Mobo_Core_Product_Map::table_name();
+		$excl_map = Mobo_Core_Migration_Quarantine::marked_exclusion_sql( 'wp_post_id' );
+		$wpdb->last_error = '';
+		$dup_objects = $wpdb->get_col( $wpdb->prepare( "SELECT wp_post_id FROM {$map} WHERE connection_id=%d AND wp_post_id>0 AND object_type IN ('product','variation'){$excl_map} GROUP BY wp_post_id,object_type HAVING COUNT(*)>1 ORDER BY wp_post_id ASC LIMIT %d", $connection_id, $limit ) );
+		if ( '' !== (string) $wpdb->last_error || ! is_array( $dup_objects ) ) { $out['blockers'] = array( 'map_duplicate_query_error' => 1 ); return $out; }
+		foreach ( $dup_objects as $post_id ) {
+			if ( ! Mobo_Core_Migration_Quarantine::mark( absint( $post_id ), 'operational', 'duplicate_map_object' ) ) { $out['blockers'] = array( 'quarantine_capacity_reached' => 1 ); return $out; }
+			$out['marked']++; $out['progress'] = true;
+		}
+		if ( $out['progress'] ) { return $out; }
+
+		$pt = Mobo_Core_Storage_Schema::table_name( 'products' ); $vt = Mobo_Core_Storage_Schema::table_name( 'variants' );
+		$excl_m = Mobo_Core_Migration_Quarantine::marked_exclusion_sql( 'm.wp_post_id' );
+		$wpdb->last_error = '';
+		$uncovered = $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT m.wp_post_id FROM {$map} m INNER JOIN {$wpdb->posts} p ON p.ID=m.wp_post_id LEFT JOIN {$pt} cp ON cp.connection_id=m.connection_id AND m.object_type='product' AND cp.woo_product_id=m.wp_post_id AND cp.product_guid=m.remote_guid LEFT JOIN {$vt} cv ON cv.connection_id=m.connection_id AND m.object_type='variation' AND cv.woo_variation_id=m.wp_post_id AND cv.variant_guid=m.remote_guid WHERE m.connection_id=%d AND ((m.object_type='product' AND p.post_type='product' AND cp.id IS NULL) OR (m.object_type='variation' AND p.post_type='product_variation' AND cv.id IS NULL)){$excl_m} LIMIT %d", $connection_id, $limit ) );
+		if ( '' !== (string) $wpdb->last_error || ! is_array( $uncovered ) ) { $out['blockers'] = array( 'coverage_query_error' => 1 ); return $out; }
+		foreach ( $uncovered as $post_id ) {
+			if ( ! Mobo_Core_Migration_Quarantine::mark( absint( $post_id ), 'operational', 'custom_coverage_missing' ) ) { $out['blockers'] = array( 'quarantine_capacity_reached' => 1 ); return $out; }
+			$out['marked']++; $out['progress'] = true;
+		}
+		return $out;
+	}
+
 	/** @return array<string,int> */
 	private static function global_blockers() {
 		global $wpdb;
 		$out=array(); $keys=array_keys(self::managed_keys()); $ph=implode(',',array_fill(0,count($keys),'%s'));
 		$connection_id=class_exists('Mobo_Core_Connection_Context')?absint(Mobo_Core_Connection_Context::get_effective_connection_id()):0;
 		if($connection_id<=0){return array('connection_owner_missing'=>1);}
+		/* Marked objects and objects owned by another Connection are outside this proof. */
+		$excl=class_exists('Mobo_Core_Migration_Quarantine')?Mobo_Core_Migration_Quarantine::exclusion_sql('pm.post_id'):'';
+		$excl_m=class_exists('Mobo_Core_Migration_Quarantine')?Mobo_Core_Migration_Quarantine::marked_exclusion_sql('m.wp_post_id'):'';
+		$excl_w=class_exists('Mobo_Core_Migration_Quarantine')?Mobo_Core_Migration_Quarantine::marked_exclusion_sql('wp_post_id'):'';
 		$wpdb->last_error='';
-		$dup=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) GROUP BY pm.post_id,pm.meta_key HAVING COUNT(*)>1 LIMIT 1",$keys));
+		$dup=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} GROUP BY pm.post_id,pm.meta_key HAVING COUNT(*)>1 LIMIT 1",$keys));
 		if(''!==(string)$wpdb->last_error){return array('duplicate_query_error'=>1);} if(null!==$dup){$out['duplicate_operational_meta']=1;}
 		$map=Mobo_Core_Product_Map::table_name();
 		$unmapped_args=array_merge(array($connection_id),$keys);$wpdb->last_error='';
-		$unmapped=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id LEFT JOIN {$map} m ON m.connection_id=%d AND m.wp_post_id=pm.post_id AND m.object_type=IF(p.post_type='product','product','variation') WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) AND m.id IS NULL LIMIT 1",$unmapped_args));
+		$unmapped=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id LEFT JOIN {$map} m ON m.connection_id=%d AND m.wp_post_id=pm.post_id AND m.object_type=IF(p.post_type='product','product','variation') WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) AND m.id IS NULL{$excl} LIMIT 1",$unmapped_args));
 		if(''!==(string)$wpdb->last_error){$out['unmapped_query_error']=1;}elseif(null!==$unmapped){$out['operational_meta_without_map']=1;}
-		$wpdb->last_error='';$mapdups=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$map} WHERE connection_id=%d AND wp_post_id>0 AND object_type IN ('product','variation') GROUP BY wp_post_id,object_type HAVING COUNT(*)>1 LIMIT 1",$connection_id));
+		$wpdb->last_error='';$mapdups=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$map} WHERE connection_id=%d AND wp_post_id>0 AND object_type IN ('product','variation'){$excl_w} GROUP BY wp_post_id,object_type HAVING COUNT(*)>1 LIMIT 1",$connection_id));
 		if(''!==(string)$wpdb->last_error){$out['map_duplicate_query_error']=1;}elseif(null!==$mapdups){$out['duplicate_map_object']=1;}
 		$pt=Mobo_Core_Storage_Schema::table_name('products'); $vt=Mobo_Core_Storage_Schema::table_name('variants');$wpdb->last_error='';
-		$coverage=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$map} m INNER JOIN {$wpdb->posts} p ON p.ID=m.wp_post_id LEFT JOIN {$pt} cp ON cp.connection_id=m.connection_id AND m.object_type='product' AND cp.woo_product_id=m.wp_post_id AND cp.product_guid=m.remote_guid LEFT JOIN {$vt} cv ON cv.connection_id=m.connection_id AND m.object_type='variation' AND cv.woo_variation_id=m.wp_post_id AND cv.variant_guid=m.remote_guid WHERE m.connection_id=%d AND ((m.object_type='product' AND p.post_type='product' AND cp.id IS NULL) OR (m.object_type='variation' AND p.post_type='product_variation' AND cv.id IS NULL)) LIMIT 1",$connection_id));
+		$coverage=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$map} m INNER JOIN {$wpdb->posts} p ON p.ID=m.wp_post_id LEFT JOIN {$pt} cp ON cp.connection_id=m.connection_id AND m.object_type='product' AND cp.woo_product_id=m.wp_post_id AND cp.product_guid=m.remote_guid LEFT JOIN {$vt} cv ON cv.connection_id=m.connection_id AND m.object_type='variation' AND cv.woo_variation_id=m.wp_post_id AND cv.variant_guid=m.remote_guid WHERE m.connection_id=%d AND ((m.object_type='product' AND p.post_type='product' AND cp.id IS NULL) OR (m.object_type='variation' AND p.post_type='product_variation' AND cv.id IS NULL)){$excl_m} LIMIT 1",$connection_id));
 		if(''!==(string)$wpdb->last_error){$out['coverage_query_error']=1;}elseif(null!==$coverage){$out['custom_coverage_missing']=1;}
 		return $out;
 	}
@@ -742,13 +860,13 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 	/** Cursor-based physical cleanup. Cursor advances only after one atomic DELETE succeeds. @return array|false */
 	private static function cleanup_one_batch( $cursor ) {
 		global $wpdb;$cursor=absint($cursor);$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$args=array_merge(array($cursor),$keys,array(self::cleanup_batch_size()));
-		$wpdb->last_error='';$rows=$wpdb->get_results($wpdb->prepare("SELECT pm.meta_id,pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.meta_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) ORDER BY pm.meta_id ASC LIMIT %d",$args),ARRAY_A);if(''!==(string)$wpdb->last_error){return false;}if(empty($rows)){return array('deleted'=>0,'cursor'=>$cursor);}
+		$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$rows=$wpdb->get_results($wpdb->prepare("SELECT pm.meta_id,pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE pm.meta_id>%d AND p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} ORDER BY pm.meta_id ASC LIMIT %d",$args),ARRAY_A);if(''!==(string)$wpdb->last_error){return false;}if(empty($rows)){return array('deleted'=>0,'cursor'=>$cursor);}
 		$ids=array();$posts=array();$next=$cursor;foreach($rows as $row){$id=absint($row['meta_id']??0);if($id>0){$ids[]=$id;$next=max($next,$id);}$post_id=absint($row['post_id']??0);if($post_id>0){$posts[$post_id]=true;}}$ids=array_values(array_filter($ids));if(empty($ids)){return false;}$idph=implode(',',array_fill(0,count($ids),'%d'));$wpdb->last_error='';$deleted=$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->postmeta} WHERE meta_id IN ({$idph})",$ids));if(false===$deleted||''!==(string)$wpdb->last_error){return false;}foreach(array_keys($posts) as $post_id){wp_cache_delete($post_id,'post_meta');}return array('deleted'=>absint($deleted),'cursor'=>$next);
 	}
 
 	/** Fast boolean residue probe used by prerequisite/complete gates. @return bool|null */
 	private static function has_physical_residue() {
-		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}) LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return null;}return null!==$hit;
+		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$hit=$wpdb->get_var($wpdb->prepare("SELECT 1 FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl} LIMIT 1",$keys));if(''!==(string)$wpdb->last_error){return null;}return null!==$hit;
 	}
 
 	/** Durable terminal prerequisite with request-local zero-residue caching. @return bool */
@@ -758,7 +876,49 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 
 	/** @return int|null */
 	public static function physical_residue_count() {
-		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$wpdb->last_error='';$count=$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph})",$keys));if(''!==(string)$wpdb->last_error){return null;}return absint($count);
+		global $wpdb;$keys=array_keys(self::managed_keys());$ph=implode(',',array_fill(0,count($keys),'%s'));$excl=self::retirement_exclusion_sql();$wpdb->last_error='';$count=$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id WHERE p.post_type IN ('product','product_variation') AND pm.meta_key IN ({$ph}){$excl}",$keys));if(''!==(string)$wpdb->last_error){return null;}return absint($count);
+	}
+
+	/**
+	 * Cleanup/residue scope exclusion. Marked objects keep their legacy rows
+	 * physically (they were never proven) and rows of objects owned by another
+	 * Connection are not the Default Connection's to delete. "Physically retired"
+	 * therefore means: zero residue for every object this worker proved. The
+	 * marked count is reported separately and honestly.
+	 *
+	 * @return string
+	 */
+	private static function retirement_exclusion_sql() {
+		return class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::exclusion_sql( 'pm.post_id' ) : '';
+	}
+
+	/**
+	 * Post-fence re-probe of one marked object (called only after the DB version
+	 * is stamped, under the migration lock). Operational values are sync
+	 * checkpoints; once the object has its own Custom state row that row is the
+	 * sole authority and the shadowed legacy rows can be removed.
+	 *
+	 * @param int $post_id Woo object id.
+	 * @return string clear|keep|error
+	 */
+	public static function reprobe_quarantined_object( $post_id ) {
+		global $wpdb;
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! self::is_fenced() ) { return 'keep'; }
+		$keys = array_keys( self::managed_keys() ); $ph = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+		$wpdb->last_error = '';
+		$count = $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key IN ({$ph})", array_merge( array( $post_id ), $keys ) ) );
+		if ( '' !== (string) $wpdb->last_error ) { return 'error'; }
+		if ( absint( $count ) <= 0 ) { return 'clear'; }
+		$type = get_post_type( $post_id );
+		if ( ! in_array( $type, array( 'product', 'product_variation' ), true ) ) { return 'clear'; }
+		$wpdb->last_error = '';
+		$row = 'product' === $type
+			? ( new Mobo_Core_Product_State_Repository() )->get_by_woo_product_id( $post_id )
+			: ( new Mobo_Core_Variant_State_Repository() )->get_by_woo_variation_id( $post_id );
+		if ( '' !== (string) $wpdb->last_error ) { return 'error'; }
+		if ( ! is_array( $row ) ) { return 'keep'; }
+		return false === self::prune_operational_meta_for_object( $post_id ) ? 'error' : 'clear';
 	}
 
 	/** @return array */

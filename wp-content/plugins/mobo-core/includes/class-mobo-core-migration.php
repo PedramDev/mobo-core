@@ -44,6 +44,22 @@ class Mobo_Core_Migration {
 	 * GET_LOCK() is unavailable. */
 	const MIGRATION_LOCK_TTL    = 180;
 
+	/* Ordinary (non-cron) requests run at most one full pipeline pass per this many
+	 * seconds site-wide while the DB version is unstamped. The real runner's
+	 * budgeted slice is not throttled. */
+	const ORDINARY_PASS_INTERVAL = 60;
+
+	/* Bounds for the post-retirement convergence self-heal / singleton dedupe. */
+	const SELFHEAL_EVENT_SCAN_CAP     = 2000;
+	const SELFHEAL_PAYLOAD_LOOKUP_CAP = 100;
+	const SINGLETON_DEDUPE_WINDOW     = 5000;
+	const ORDINARY_PASS_OPTION   = 'mobo_core_migration_last_ordinary_pass_at';
+
+	/* Durable cache of the legacy runtime-table schema validation (~100 SHOW
+	 * queries) keyed by plugin version, so unstamped requests do not repeat it. */
+	const RUNTIME_SCHEMA_VALIDATED_OPTION = 'mobo_core_runtime_schema_validated_v1';
+	const RUNTIME_SCHEMA_VALIDATED_TTL    = 21600;
+
 	/** @var string Last concrete schema validation/repair failure for diagnostics. */
 	private static $schema_last_failure = '';
 
@@ -194,10 +210,22 @@ class Mobo_Core_Migration {
 		$outer_lock_owned = '' !== self::$budgeted_slice_lock_token;
 		$lock_token = '';
 		if ( ! $outer_lock_owned ) {
+			/* Never write the database while an upgrade/Unicode barrier drains or
+			 * replaces files; the pass resumes once the barrier is released. */
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+				return;
+			}
+			/* Bounded plugins_loaded work: one full pass per ORDINARY_PASS_INTERVAL
+			 * site-wide instead of ~400 queries on every storefront page view. */
+			$last_pass = absint( get_option( self::ORDINARY_PASS_OPTION, 0 ) );
+			if ( ! self::ordinary_pass_due( $last_pass, time() ) ) {
+				return;
+			}
 			$lock_token = self::acquire_migration_request_lock();
 			if ( '' === $lock_token ) {
 				return;
 			}
+			update_option( self::ORDINARY_PASS_OPTION, time(), false );
 		}
 
 		try {
@@ -294,6 +322,20 @@ class Mobo_Core_Migration {
 
 
 	/**
+	 * Pure throttle decision for ordinary-request migration passes (unit tested).
+	 *
+	 * @param int $last_pass Unix time of the last ordinary pass (0 = never).
+	 * @param int $now       Current Unix time.
+	 * @return bool
+	 */
+	public static function ordinary_pass_due( $last_pass, $now ) {
+		$last_pass = absint( $last_pass );
+		$now = absint( $now );
+		if ( $last_pass <= 0 || $last_pass > $now + 60 ) { return true; }
+		return ( $now - $last_pass ) >= self::ORDINARY_PASS_INTERVAL;
+	}
+
+	/**
 	 * Whether retirement workers may use their accelerated batch sizes.
 	 * Normal storefront/admin requests remain on the conservative batch sizes;
 	 * only the explicit budgeted migration slice enables this flag.
@@ -314,7 +356,126 @@ class Mobo_Core_Migration {
 	public static function needs_budgeted_migration_slice() {
 		if ( MOBO_CORE_VERSION !== trim( (string) get_option( 'mobo_core_db_version', '' ) ) ) { return true; }
 		if ( ! self::terminal_retirements_physically_complete() ) { return true; }
-		return self::deferred_release_repairs_pending();
+		if ( self::deferred_release_repairs_pending() ) { return true; }
+		/* Periodic re-probe of objects marked during retirement (bounded, post-stamp only). */
+		return class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::reprobe_due();
+	}
+
+	/**
+	 * Whether the ordinary runner (webhooks, sync, orders, repair) may run in this
+	 * request even though migration work is still pending.
+	 *
+	 * Safety reasoning (10.34.77 hardening):
+	 * - After the DB version is stamped every terminal fence is active, writes go
+	 *   to Custom Storage and the remaining retirement work is physical cleanup of
+	 *   rows the read/write filters already hide. Normal work is always safe.
+	 * - Before the stamp, the 10.34.77 runtime is already executing on every
+	 *   storefront/admin/REST request (the old code is gone after the update), so
+	 *   the in-between state is a designed runtime state: pre-fence workers keep
+	 *   Storage Mode at dual-write (Legacy authoritative, Custom mirrored) and each
+	 *   fence switches authority atomically through durable markers and metadata
+	 *   filters. Proof pages verify every mirror against a fresh snapshot, so a
+	 *   concurrent Mobo write causes a retry, not divergence. What the runner truly
+	 *   depends on are the structural prerequisites checked below: Custom schema,
+	 *   Connection rows/settings/ownership, the large-runtime table cutover and the
+	 *   Product Map seed (without it sync could create duplicate products).
+	 *
+	 * Options-only checks plus the cached schema validation: no catalog scan.
+	 *
+	 * @param string|null $reason Receives a short machine reason when not ready.
+	 * @return bool
+	 */
+	public static function normal_runtime_ready( &$reason = null ) {
+		$reason = '';
+		$db_version = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+		if ( MOBO_CORE_VERSION === $db_version ) { return true; }
+		if ( ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) { $reason = 'custom-storage-schema-not-ready'; return false; }
+		if ( absint( get_option( 'mobo_core_103412_connection_migrated_at', 0 ) ) <= 0 ) { $reason = 'connection-foundation-pending'; return false; }
+		if ( defined( 'MOBO_CORE_CONNECTION_SETTINGS_CONTRACT_VERSION' )
+			&& (string) MOBO_CORE_CONNECTION_SETTINGS_CONTRACT_VERSION !== (string) get_option( 'mobo_core_connection_settings_contract_version', '' ) ) { $reason = 'connection-settings-pending'; return false; }
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::connection_ownership_ready() ) { $reason = 'connection-ownership-pending'; return false; }
+		if ( ( '' === $db_version || version_compare( $db_version, '10.33.93', '<' ) )
+			&& absint( get_option( 'mobo_core_103393_large_runtime_strict_cutover_at', 0 ) ) <= 0 ) { $reason = 'large-runtime-cutover-pending'; return false; }
+		if ( absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) <= 0 ) { $reason = 'product-map-seed-pending'; return false; }
+		return true;
+	}
+
+	/**
+	 * New/extra Connections are refused while the Default Connection's terminal
+	 * retirement is unfinished (existing extra Connections keep working).
+	 *
+	 * @return bool
+	 */
+	public static function new_connections_blocked() {
+		if ( MOBO_CORE_VERSION !== trim( (string) get_option( 'mobo_core_db_version', '' ) ) ) { return true; }
+		return ! self::terminal_retirements_physically_complete();
+	}
+
+	/**
+	 * Status of the migration request mutex for the upgrade quiescence drain.
+	 *
+	 * @return array{active:bool,mode:string,expiresAt:int,remainingSeconds:int}
+	 */
+	public static function get_migration_request_lock_status() {
+		global $wpdb;
+		$out = array( 'active' => false, 'mode' => '', 'acquiredAt' => 0, 'lastHeartbeatAt' => 0, 'expiresAt' => 0, 'remainingSeconds' => 0 );
+		$wpdb->last_error = '';
+		$owner = $wpdb->get_var( $wpdb->prepare( 'SELECT IF(IS_USED_LOCK(%s)=CONNECTION_ID(),-1,IFNULL(IS_USED_LOCK(%s),0))', self::migration_lock_name(), self::migration_lock_name() ) );
+		/* -1 means this very request owns it (it cannot wait for itself). */
+		if ( '' === trim( (string) $wpdb->last_error ) && null !== $owner && (int) $owner > 0 ) {
+			$out['active'] = true;
+			$out['mode'] = 'mysql';
+			$out['expiresAt'] = time() + self::MIGRATION_LOCK_TTL;
+			$out['remainingSeconds'] = self::MIGRATION_LOCK_TTL;
+			return $out;
+		}
+		$raw = self::read_fallback_migration_lock_raw();
+		$decoded = '' !== $raw ? json_decode( $raw, true ) : null;
+		$expires = is_array( $decoded ) ? absint( $decoded['expiresAt'] ?? 0 ) : 0;
+		if ( $expires >= time() ) {
+			$out['active'] = true;
+			$out['mode'] = 'option';
+			$out['expiresAt'] = $expires;
+			$out['remainingSeconds'] = max( 0, $expires - time() );
+		}
+		return $out;
+	}
+
+	/** @return string Connection-scoped advisory lock name for this database/prefix. */
+	private static function migration_lock_name() {
+		global $wpdb;
+		$db_name = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
+		return 'mobo_mig_' . substr( sha1( $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+	}
+
+	/** Persist the compact status snapshot shown to admins and the Backend. @return void */
+	private static function save_migration_status_snapshot( $workers ) {
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) ) { return; }
+		$reason = '';
+		$ready = self::normal_runtime_ready( $reason );
+		$compact = array();
+		foreach ( (array) $workers as $name => $state ) {
+			if ( ! is_array( $state ) ) { continue; }
+			$compact[ sanitize_key( (string) $name ) ] = array(
+				'status'        => sanitize_key( (string) ( $state['status'] ?? '' ) ),
+				'fenced'        => ! empty( $state['fenced'] ),
+				'complete'      => ! empty( $state['complete'] ),
+				'lastError'     => sanitize_key( (string) ( $state['lastError'] ?? '' ) ),
+				'blockers'      => isset( $state['blockers'] ) && is_array( $state['blockers'] ) ? array_map( 'absint', $state['blockers'] ) : array(),
+				'markedObjects' => absint( $state['markedObjects'] ?? 0 ),
+				'dedupedRows'   => absint( $state['dedupedRows'] ?? 0 ),
+			);
+		}
+		Mobo_Core_Migration_Quarantine::save_status_snapshot( array(
+			'databaseVersion'    => trim( (string) get_option( 'mobo_core_db_version', '' ) ),
+			'targetVersion'      => MOBO_CORE_VERSION,
+			'runtimeReady'       => $ready,
+			'runtimeReason'      => $reason,
+			'retirementComplete' => self::terminal_retirements_physically_complete(),
+			'deferredRepairsPending' => self::deferred_release_repairs_pending(),
+			'workers'            => $compact,
+			'markedCount'        => Mobo_Core_Migration_Quarantine::count(),
+		) );
 	}
 
 	/**
@@ -350,9 +511,11 @@ class Mobo_Core_Migration {
 		$db_queries_started  = isset( $wpdb->num_queries ) ? absint( $wpdb->num_queries ) : 0;
 		$memory_started      = function_exists( 'memory_get_usage' ) ? memory_get_usage( true ) : 0;
 
+		$reprobe_due = class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::reprobe_due();
 		if ( MOBO_CORE_VERSION === trim( (string) get_option( 'mobo_core_db_version', '' ) )
 			&& self::terminal_retirements_physically_complete()
-			&& ! self::deferred_release_repairs_pending() ) {
+			&& ! self::deferred_release_repairs_pending()
+			&& ! $reprobe_due ) {
 			return array(
 				'success' => true, 'status' => 'complete', 'source' => $source,
 				'iterations' => 0, 'progressedIterations' => 0, 'elapsedMs' => 0,
@@ -382,7 +545,12 @@ class Mobo_Core_Migration {
 		);
 		$previous = self::migration_progress_fingerprint();
 		self::$accelerated_context = true;
+		$reprobe = null;
 		try {
+			/* Post-stamp only: give marked objects their periodic chance to be released. */
+			if ( $reprobe_due && self::refresh_migration_request_lock( $lock_token ) ) {
+				$reprobe = Mobo_Core_Migration_Quarantine::run_reprobe_batch();
+			}
 			while ( $iterations < $max_iterations && microtime( true ) < $work_deadline ) {
 				/* Re-validate/refresh the lease before every new unit of work. Advisory
 				 * locks are connection-owned; fallback option leases are owner-checked. */
@@ -447,9 +615,15 @@ class Mobo_Core_Migration {
 		$telemetry['dbQueries'] = max( 0, ( isset( $wpdb->num_queries ) ? absint( $wpdb->num_queries ) : 0 ) - $db_queries_started );
 		$telemetry['memoryStartBytes'] = absint( $memory_started );
 		$telemetry['memoryPeakBytes'] = function_exists( 'memory_get_peak_usage' ) ? absint( memory_get_peak_usage( true ) ) : 0;
+		$workers = self::migration_worker_statuses();
+		self::save_migration_status_snapshot( $workers );
 		return array(
 			'success'              => true,
 			'status'               => $complete ? 'complete' : ( $progressed > 0 ? 'progressed' : 'waiting' ),
+			'quarantine'           => array(
+				'marked'  => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::count() : 0,
+				'reprobe' => $reprobe,
+			),
 			'source'               => $source,
 			'iterations'           => $iterations,
 			'progressedIterations' => $progressed,
@@ -457,7 +631,7 @@ class Mobo_Core_Migration {
 			'databaseVersion'      => $version,
 			'targetVersion'        => MOBO_CORE_VERSION,
 			'needsContinuation'    => ! $complete,
-			'workers'              => self::migration_worker_statuses(),
+			'workers'              => $workers,
 			'telemetry'            => $telemetry,
 		);
 	}
@@ -479,15 +653,18 @@ class Mobo_Core_Migration {
 		if ( ! did_action( 'woocommerce_init' ) ) {
 			return false;
 		}
+		$invoked = false;
 		if ( '1' === (string) get_option( 'mobo_core_103353_convergence_residue_selfheal_pending', '0' ) ) {
-			self::run_103353_convergence_residue_selfheal();
-			return true;
+			$invoked = true;
+			/* A fail-closed (false) self-heal pass must not starve the independent
+			 * singleton normalization; fall through to it in the same step. */
+			if ( self::run_103353_convergence_residue_selfheal() ) { return true; }
 		}
 		if ( '1' === (string) get_option( 'mobo_core_103454_singleton_meta_dedupe_pending', '0' ) ) {
 			self::run_103454_singleton_meta_dedupe();
 			return true;
 		}
-		return false;
+		return $invoked;
 	}
 
 	/**
@@ -577,6 +754,8 @@ class Mobo_Core_Migration {
 			'convergenceHealed' => absint( $repair_result['healedCount'] ?? 0 ),
 			'singletonPending' => '1' === (string) get_option( 'mobo_core_103454_singleton_meta_dedupe_pending', '0' ),
 			'singletonRemaining' => absint( $singleton_result['remaining'] ?? 0 ),
+			'singletonCursor' => absint( get_option( 'mobo_core_103454_singleton_meta_dedupe_cursor', 0 ) ),
+			'marked' => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::count() : 0,
 		) );
 		return implode( '|', $parts );
 	}
@@ -631,8 +810,7 @@ class Mobo_Core_Migration {
 	private static function acquire_migration_request_lock() {
 		global $wpdb;
 
-		$db_name = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
-		$lock_name = 'mobo_mig_' . substr( sha1( $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+		$lock_name = self::migration_lock_name();
 		$wpdb->last_error = '';
 		$got = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $lock_name ) );
 		if ( '' === trim( (string) $wpdb->last_error ) ) {
@@ -1365,6 +1543,9 @@ class Mobo_Core_Migration {
 			return false;
 		}
 		if ( ! Mobo_Core_Storage_Schema::is_ready() ) {
+			/* No silent legacy fallback exists here: without the Custom schema the
+			 * version cannot stamp. The runner reports this honestly through
+			 * normal_runtime_ready() (custom-storage-schema-not-ready). */
 			update_option( 'mobo_core_103414_connection_ownership_error', 'Custom storage schema is not ready for Connection ownership adoption.', false );
 			return false;
 		}
@@ -1494,7 +1675,7 @@ class Mobo_Core_Migration {
 		if ( MOBO_CORE_VERSION === (string) get_option( 'mobo_core_schema_version', '' )
 			&& class_exists( 'Mobo_Core_Storage_Schema' )
 			&& Mobo_Core_Storage_Schema::is_ready()
-			&& self::database_schema_ready() ) {
+			&& ( self::runtime_schema_validation_cached() || self::database_schema_ready() ) ) {
 			return true;
 		}
 
@@ -1540,9 +1721,15 @@ class Mobo_Core_Migration {
 		self::drop_redundant_runtime_indexes();
 
 		/*
-		 * Phase-1 custom storage has an independent readiness/version boundary.
-		 * Never fold it into the legacy runtime schema gate: a shared-host DDL
-		 * limitation must leave the existing plugin fully operational in legacy mode.
+		 * Phase-1 custom storage has its own readiness/version boundary.
+		 *
+		 * Honest note (10.34.77): there is no legacy runtime fallback for a site whose
+		 * host rejects this DDL (missing CREATE/ALTER privilege, or a utf8mb4 probe
+		 * failure). The DB version stamp requires this schema, and the real runner
+		 * stays in migration-only mode (Migration::normal_runtime_ready()) until it is
+		 * ready. Such a site is surfaced, not hidden: admin notice, schema_last_error
+		 * and the health payload report the exact reason. Ordinary requests retry at
+		 * most once per ORDINARY_PASS_INTERVAL.
 		 */
 		if ( class_exists( 'Mobo_Core_Storage_Schema' ) ) {
 			Mobo_Core_Storage_Schema::ensure();
@@ -1555,6 +1742,9 @@ class Mobo_Core_Migration {
 		}
 
 		$ready = self::database_schema_ready();
+		if ( ! $ready ) {
+			delete_option( self::RUNTIME_SCHEMA_VALIDATED_OPTION );
+		}
 		if ( $ready ) {
 			update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION, false );
 			delete_option( 'mobo_core_schema_last_error' );
@@ -1738,7 +1928,22 @@ class Mobo_Core_Migration {
 		 * best-effort redundant-index cleanup once the covering definitions are exact. */
 		self::drop_redundant_runtime_indexes();
 
+		update_option( self::RUNTIME_SCHEMA_VALIDATED_OPTION, array( 'version' => MOBO_CORE_VERSION, 'at' => time() ), false );
 		return true;
+	}
+
+	/**
+	 * Whether this exact plugin build validated the legacy runtime schema recently.
+	 * Only a positive result is cached; any failure path re-validates. The final
+	 * DB-version stamp (finalize_database_version) still performs a fresh check.
+	 *
+	 * @return bool
+	 */
+	private static function runtime_schema_validation_cached() {
+		$stamp = get_option( self::RUNTIME_SCHEMA_VALIDATED_OPTION, array() );
+		if ( ! is_array( $stamp ) || MOBO_CORE_VERSION !== (string) ( $stamp['version'] ?? '' ) ) { return false; }
+		$at = absint( $stamp['at'] ?? 0 );
+		return $at > 0 && $at <= time() + 60 && ( time() - $at ) < self::RUNTIME_SCHEMA_VALIDATED_TTL;
 	}
 
 
@@ -2607,18 +2812,12 @@ class Mobo_Core_Migration {
 		 */
 		$worker_reasons = array();
 
-		if ( '1' === (string) get_option( 'mobo_core_103353_convergence_residue_selfheal_pending', '0' ) ) {
-			if ( did_action( 'woocommerce_init' ) ) {
-				self::run_103353_convergence_residue_selfheal();
-			}
-		}
-
-
-		if ( '1' === (string) get_option( 'mobo_core_103454_singleton_meta_dedupe_pending', '0' ) ) {
-			if ( did_action( 'woocommerce_init' ) ) {
-				self::run_103454_singleton_meta_dedupe();
-			}
-		}
+		/* The convergence-residue self-heal and the singleton-meta dedupe used to run
+		 * here, i.e. on storefront `init` of ordinary page views, without a lock. They
+		 * now run only inside the real runner's budgeted migration slice
+		 * (advance_deferred_release_repair_step(), under the migration mutex), which
+		 * needs_budgeted_migration_slice() keeps scheduling while either pending flag
+		 * is set. Nothing to do on this request. */
 
 		if ( '1' === (string) get_option( 'mobo_core_103477_revenue_ledger_backfill_pending', '0' )
 			&& did_action( 'woocommerce_init' )
@@ -4344,6 +4543,11 @@ class Mobo_Core_Migration {
 	private static function run_103353_convergence_residue_selfheal() {
 		global $wpdb;
 
+		/* Only the real runner's locked budgeted slice runs this repair. */
+		if ( '' === self::$budgeted_slice_lock_token ) {
+			return false;
+		}
+
 		if ( ! did_action( 'woocommerce_init' ) || ! function_exists( 'wc_get_product' ) || ! class_exists( 'WC_Product_Variable' ) ) {
 			return false;
 		}
@@ -4416,58 +4620,21 @@ class Mobo_Core_Migration {
 
 		/* Fail closed if any active product mutation cannot be attributed to its
 		 * canonical product. Variant events often use the variant GUID as entity_guid,
-		 * so ownership must be resolved from payload rather than entity_guid alone. */
-		$wpdb->last_error = '';
-		$ownership_rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT event_type,entity_type,entity_guid,event_version,status,try_count,payload_json,last_error
-				 FROM {$event_table}
-				 WHERE connection_id=%d
-				   AND event_type IN ('ProductUpdated','UpdateVariant')
-				   AND (
-				        status IN ('pending','processing','retry','deferred')
-				        OR (event_type='UpdateVariant' AND status='failed' AND try_count>=5 AND last_error LIKE 'Incomplete Mobo variant attributes.%%')
-				   )
-				 ORDER BY id ASC",
-				$default_id
-			),
-			ARRAY_A
-		);
-		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ownership_rows ) ) {
+		 * so ownership is resolved through Custom Variant State and, only for events
+		 * whose entity is unknown there, from that single event's payload.
+		 *
+		 * 10.34.77: this used to SELECT every pending event including payload_json
+		 * with no LIMIT (memory fatals on ordinary page views). It is now a keyset
+		 * scan of GUID columns only with a hard cap; a backlog above the cap fails
+		 * closed exactly like an unattributable event and is retried later. */
+		$busy = self::residue_selfheal_busy_guids( $default_id, wp_list_pluck( $candidates, 'product_guid' ), $event_table, $product_table, $variant_table );
+		if ( null === $busy ) {
+			update_option( 'mobo_core_103353_convergence_residue_selfheal_deferred_reason', 'event-ownership-unresolved-or-backlog', false );
 			return false;
 		}
-		$active_product_guids   = array();
-		$terminal_product_guids = array();
-		foreach ( $ownership_rows as $ownership_row ) {
-			$payload = json_decode( (string) ( $ownership_row['payload_json'] ?? '' ), true );
-			$owner_guid = is_array( $payload ) ? self::extract_product_guid_for_residue_repair( $payload ) : '';
-			if ( '' === $owner_guid ) {
-				$event_type     = sanitize_text_field( (string) ( $ownership_row['event_type'] ?? '' ) );
-				$entity_type    = sanitize_key( (string) ( $ownership_row['entity_type'] ?? '' ) );
-				$candidate_guid = sanitize_text_field( (string) ( $ownership_row['entity_guid'] ?? '' ) );
-				$entity_guid_is_product = 'ProductUpdated' === $event_type
-					|| ( 'UpdateVariant' === $event_type && 'product' === $entity_type );
-				if ( $entity_guid_is_product && preg_match( '/^[0-9a-f-]{32,36}$/i', $candidate_guid ) ) {
-					$owner_guid = $candidate_guid;
-				}
-			}
-			if ( '' === $owner_guid ) {
-				return false;
-			}
-			$status = sanitize_key( (string) ( $ownership_row['status'] ?? '' ) );
-			$error  = (string) ( $ownership_row['last_error'] ?? '' );
-			if ( 'failed' === $status
-				&& 'UpdateVariant' === sanitize_text_field( (string) ( $ownership_row['event_type'] ?? '' ) )
-				&& absint( $ownership_row['try_count'] ?? 0 ) >= 5
-				&& 0 === strpos( $error, 'Incomplete Mobo variant attributes.' ) ) {
-				/* Historical terminal evidence is deliberately treated as a conservative
-				 * exclusion here. A false-positive skip leaves the release-visible marker
-				 * intact; it can never cause this proof-only repair to clear a real gap. */
-				$terminal_product_guids[ $owner_guid ] = true;
-				continue;
-			}
-			$active_product_guids[ $owner_guid ] = true;
-		}
+		delete_option( 'mobo_core_103353_convergence_residue_selfheal_deferred_reason' );
+		$active_product_guids   = $busy['active'];
+		$terminal_product_guids = $busy['terminal'];
 
 		$product_map = new Mobo_Core_Product_Map();
 		$healed      = array();
@@ -4755,6 +4922,102 @@ class Mobo_Core_Migration {
 
 
 	/**
+	 * Which candidate products still own an active (or historically terminal
+	 * incomplete-attribute) ProductUpdated/UpdateVariant event.
+	 *
+	 * Bounded: keyset pages of GUID columns only (no payload_json bulk load), at
+	 * most SELFHEAL_EVENT_SCAN_CAP events and SELFHEAL_PAYLOAD_LOOKUP_CAP single-row
+	 * payload reads per call. Returns null (fail closed) when an event cannot be
+	 * attributed or the backlog exceeds the cap.
+	 *
+	 * @return array{active:array<string,bool>,terminal:array<string,bool>}|null
+	 */
+	private static function residue_selfheal_busy_guids( $connection_id, $candidate_guids, $event_table, $product_table, $variant_table ) {
+		global $wpdb;
+		$candidates = array();
+		foreach ( (array) $candidate_guids as $guid ) {
+			$guid = sanitize_text_field( (string) $guid );
+			if ( '' !== $guid ) { $candidates[ $guid ] = true; }
+		}
+		$out = array( 'active' => array(), 'terminal' => array() );
+		if ( empty( $candidates ) ) { return $out; }
+		$like = $wpdb->esc_like( 'Incomplete Mobo variant attributes.' ) . '%';
+		$cursor = 0;
+		$scanned = 0;
+		$payload_reads = 0;
+		do {
+			$wpdb->last_error = '';
+			$rows = $wpdb->get_results( $wpdb->prepare(
+				"SELECT id,event_type,entity_type,entity_guid,status FROM {$event_table}
+				 WHERE connection_id=%d AND id>%d AND event_type IN ('ProductUpdated','UpdateVariant')
+				   AND ( status IN ('pending','processing','retry','deferred')
+				         OR (event_type='UpdateVariant' AND status='failed' AND try_count>=5 AND last_error LIKE %s) )
+				 ORDER BY id ASC LIMIT 200",
+				absint( $connection_id ), $cursor, $like
+			), ARRAY_A );
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) { return null; }
+			if ( empty( $rows ) ) { break; }
+			$scanned += count( $rows );
+			if ( $scanned > self::SELFHEAL_EVENT_SCAN_CAP ) { return null; }
+
+			/* Resolve entity GUIDs of this page set-wise through Custom Storage. */
+			$guids = array();
+			foreach ( $rows as $row ) { $g = sanitize_text_field( (string) ( $row['entity_guid'] ?? '' ) ); if ( '' !== $g ) { $guids[ $g ] = true; } }
+			$known_products = array();
+			$variant_owner = array();
+			if ( ! empty( $guids ) ) {
+				$list = array_keys( $guids );
+				$ph = implode( ',', array_fill( 0, count( $list ), '%s' ) );
+				$wpdb->last_error = '';
+				$found = $wpdb->get_col( $wpdb->prepare( "SELECT product_guid FROM {$product_table} WHERE connection_id=%d AND product_guid IN ({$ph})", array_merge( array( absint( $connection_id ) ), $list ) ) );
+				if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $found ) ) { return null; }
+				foreach ( $found as $g ) { $known_products[ (string) $g ] = true; }
+				$wpdb->last_error = '';
+				$vrows = $wpdb->get_results( $wpdb->prepare( "SELECT variant_guid,product_guid FROM {$variant_table} WHERE connection_id=%d AND variant_guid IN ({$ph})", array_merge( array( absint( $connection_id ) ), $list ) ), ARRAY_A );
+				if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $vrows ) ) { return null; }
+				foreach ( $vrows as $vrow ) { $variant_owner[ (string) ( $vrow['variant_guid'] ?? '' ) ] = (string) ( $vrow['product_guid'] ?? '' ); }
+			}
+
+			foreach ( $rows as $row ) {
+				$cursor = max( $cursor, absint( $row['id'] ?? 0 ) );
+				$event_type = sanitize_text_field( (string) ( $row['event_type'] ?? '' ) );
+				$entity_type = sanitize_key( (string) ( $row['entity_type'] ?? '' ) );
+				$entity_guid = sanitize_text_field( (string) ( $row['entity_guid'] ?? '' ) );
+				$entity_is_product = 'ProductUpdated' === $event_type || ( 'UpdateVariant' === $event_type && 'product' === $entity_type );
+				$owner = '';
+				if ( '' !== $entity_guid && ! $entity_is_product && isset( $variant_owner[ $entity_guid ] ) ) {
+					$owner = $variant_owner[ $entity_guid ];
+				} elseif ( $entity_is_product && preg_match( '/^[0-9a-f-]{32,36}$/i', $entity_guid ) ) {
+					/* Product-level events carry the product GUID as entity_guid. */
+					$owner = $entity_guid;
+				} elseif ( '' !== $entity_guid && ( isset( $candidates[ $entity_guid ] ) || isset( $known_products[ $entity_guid ] ) ) ) {
+					$owner = $entity_guid;
+				} else {
+					/* Unknown entity: read only this one event's payload. */
+					if ( ++$payload_reads > self::SELFHEAL_PAYLOAD_LOOKUP_CAP ) { return null; }
+					$wpdb->last_error = '';
+					$payload_json = $wpdb->get_var( $wpdb->prepare( "SELECT payload_json FROM {$event_table} WHERE id=%d LIMIT 1", absint( $row['id'] ?? 0 ) ) );
+					if ( '' !== trim( (string) $wpdb->last_error ) ) { return null; }
+					$payload = json_decode( (string) $payload_json, true );
+					unset( $payload_json );
+					$owner = is_array( $payload ) ? self::extract_product_guid_for_residue_repair( $payload ) : '';
+					unset( $payload );
+					if ( '' === $owner && $entity_is_product && preg_match( '/^[0-9a-f-]{32,36}$/i', $entity_guid ) ) { $owner = $entity_guid; }
+					if ( '' === $owner ) { return null; }
+				}
+				if ( ! isset( $candidates[ $owner ] ) ) { continue; }
+				if ( 'failed' === sanitize_key( (string) ( $row['status'] ?? '' ) ) ) {
+					/* Historical terminal evidence remains a conservative exclusion. */
+					$out['terminal'][ $owner ] = true;
+				} else {
+					$out['active'][ $owner ] = true;
+				}
+			}
+		} while ( count( $rows ) >= 200 );
+		return $out;
+	}
+
+	/**
 	 * Extract the canonical product GUID from a webhook payload for release-residue ownership.
 	 *
 	 * @param mixed $data Decoded webhook payload fragment.
@@ -4801,6 +5064,10 @@ class Mobo_Core_Migration {
 		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
 			return false;
 		}
+		/* Only the locked budgeted slice may run this repair (never storefront init). */
+		if ( '' === self::$budgeted_slice_lock_token ) {
+			return false;
+		}
 
 		$default = Mobo_Core_Connection_Repository::get_default();
 		$default_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
@@ -4817,82 +5084,37 @@ class Mobo_Core_Migration {
 			} );
 		}
 
-		/* Product Map alone is no longer a complete ownership authority after the
-		 * terminal Custom Storage cutover. Discover the Default Connection's live
-		 * product ids from canonical Product State first and retain Product Map as a
-		 * compatibility union for partially migrated installations. */
-		$ownership_parts = array();
-		if ( class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
-			$product_table = preg_replace( '/[^A-Za-z0-9_]/', '', Mobo_Core_Storage_Schema::table_name( 'products' ) );
-			if ( '' !== $product_table ) {
-				$ownership_parts[] = $wpdb->prepare(
-					"SELECT s.woo_product_id AS post_id FROM `{$product_table}` s WHERE s.connection_id=%d AND s.woo_product_id>0",
-					$default_id
-				);
-			}
-			$variant_table = preg_replace( '/[^A-Za-z0-9_]/', '', Mobo_Core_Storage_Schema::table_name( 'variants' ) );
-			if ( '' !== $variant_table ) {
-				$ownership_parts[] = $wpdb->prepare(
-					"SELECT v.woo_variation_id AS post_id FROM `{$variant_table}` v WHERE v.connection_id=%d AND v.woo_variation_id>0",
-					$default_id
-				);
-			}
-		}
-		if ( class_exists( 'Mobo_Core_Product_Map' ) && Mobo_Core_Product_Map::table_exists() ) {
-			$map_table = preg_replace( '/[^A-Za-z0-9_]/', '', Mobo_Core_Product_Map::table_name() );
-			if ( '' !== $map_table ) {
-				$ownership_parts[] = $wpdb->prepare(
-					"SELECT m.wp_post_id AS post_id FROM `{$map_table}` m WHERE m.connection_id=%d AND m.object_type IN ('product','variation') AND m.wp_post_id>0",
-					$default_id
-				);
-			}
-		}
-		/*
-		 * Final compatibility authority: live products that still carry historical
-		 * Mobo identity/ownership postmeta. The release gates intentionally classify
-		 * these rows as Mobo-owned until terminal postmeta retirement has physically
-		 * removed them, so singleton repair must use the same ownership universe.
-		 *
-		 * This is discovery only. It does not revive postmeta as runtime identity
-		 * authority and it is not connection-routed; the mutation merely
-		 * canonicalizes one Woo singleton meta row on an already Mobo-owned product.
-		 */
-		$ownership_parts[] =
-			"SELECT DISTINCT pm_legacy.post_id AS post_id
-			 FROM {$wpdb->postmeta} pm_legacy
-			 INNER JOIN {$wpdb->posts} p_legacy ON p_legacy.ID=pm_legacy.post_id
-			 WHERE (
-				LEFT(pm_legacy.meta_key,6)='_mobo_'
-				OR pm_legacy.meta_key IN ('product_guid','variant_guid','portal_product_id','mobo_portal_product_id','portal_variant_id','mobo_portal_variant_id')
-			 )
-			 AND p_legacy.post_type IN ('product','product_variation')
-			 AND p_legacy.post_status NOT IN ('trash','auto-draft')";
-
-		if ( empty( $ownership_parts ) ) {
-			return false;
-		}
-		$ownership_sql = implode( ' UNION ', $ownership_parts );
-
+		/* 10.34.77: keyset scan by post-id window instead of re-running a catalog-wide
+		 * UNION/GROUP BY/HAVING (plus a second full COUNT) on every batch. Each call
+		 * inspects one bounded window of `_thumbnail_id` rows; ownership is then
+		 * checked only for the (<=100) duplicate candidates found. One full pass ends
+		 * the repair; products left untouched for review are recorded, not rescanned
+		 * forever. */
+		$cursor = absint( get_option( 'mobo_core_103454_singleton_meta_dedupe_cursor', 0 ) );
 		$wpdb->last_error = '';
-		$duplicates = $wpdb->get_col(
-			"SELECT owned.post_id
-			 FROM ({$ownership_sql}) owned
-			 INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=owned.post_id AND pm.meta_key='_thumbnail_id'
-			 INNER JOIN {$wpdb->posts} p ON p.ID=owned.post_id AND p.post_type IN ('product','product_variation') AND p.post_status NOT IN ('trash','auto-draft')
-			 GROUP BY owned.post_id
-			 HAVING COUNT(pm.meta_id)>1
-			 ORDER BY owned.post_id ASC
-			 LIMIT 100"
-		);
+		$max_id = absint( $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ) );
+		if ( '' !== trim( (string) $wpdb->last_error ) ) { return false; }
+		$window_end = $cursor + self::SINGLETON_DEDUPE_WINDOW;
+		$wpdb->last_error = '';
+		$duplicates = $wpdb->get_col( $wpdb->prepare(
+			"SELECT pm.post_id FROM {$wpdb->postmeta} pm
+			 INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id AND p.post_type IN ('product','product_variation') AND p.post_status NOT IN ('trash','auto-draft')
+			 WHERE pm.meta_key='_thumbnail_id' AND pm.post_id>%d AND pm.post_id<=%d
+			 GROUP BY pm.post_id HAVING COUNT(pm.meta_id)>1 ORDER BY pm.post_id ASC LIMIT 100",
+			$cursor,
+			$window_end
+		) );
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $duplicates ) ) {
 			return false;
 		}
+		$duplicates = array_values( array_filter( array_map( 'absint', $duplicates ) ) );
+		$next_cursor = count( $duplicates ) >= 100 ? (int) end( $duplicates ) : $window_end;
+		$owned = self::singleton_owned_post_ids( $default_id, $duplicates );
+		if ( null === $owned ) { return false; }
 
 		$normalized = 0;
 		$failed = array();
-		foreach ( $duplicates as $post_id_raw ) {
-			$post_id = absint( $post_id_raw );
-			if ( $post_id <= 0 ) { continue; }
+		foreach ( $owned as $post_id ) {
 			$meta_rows = $wpdb->get_results(
 				$wpdb->prepare(
 					"SELECT meta_id,meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key='_thumbnail_id' ORDER BY meta_id ASC",
@@ -4907,8 +5129,8 @@ class Mobo_Core_Migration {
 			if ( ! hash_equals( $oldest_value, $effective_value ) ) { $failed[] = $post_id; continue; }
 			$remove_ids = array_values( array_filter( array_map( 'absint', array_slice( $meta_ids, 1 ) ) ) );
 			if ( empty( $remove_ids ) ) { continue; }
-			$id_sql = implode( ',', $remove_ids );
-			$deleted = $wpdb->query( "DELETE FROM {$wpdb->postmeta} WHERE post_id=" . absint( $post_id ) . " AND meta_key='_thumbnail_id' AND meta_id IN ({$id_sql})" ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Integer-only ids.
+			$idph = implode( ',', array_fill( 0, count( $remove_ids ), '%d' ) );
+			$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key='_thumbnail_id' AND meta_id IN ({$idph})", array_merge( array( $post_id ), $remove_ids ) ) );
 			if ( false === $deleted ) { $failed[] = $post_id; continue; }
 			wp_cache_delete( $post_id, 'post_meta' );
 			$remaining = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key='_thumbnail_id'", $post_id ) ) );
@@ -4917,23 +5139,61 @@ class Mobo_Core_Migration {
 			$normalized++;
 		}
 
-		$wpdb->last_error = '';
-		$remaining_raw = $wpdb->get_var(
-			"SELECT COUNT(*) FROM (
-				SELECT owned.post_id FROM ({$ownership_sql}) owned
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=owned.post_id AND pm.meta_key='_thumbnail_id'
-				GROUP BY owned.post_id HAVING COUNT(pm.meta_id)>1
-			) d"
-		);
-		if ( '' !== trim( (string) $wpdb->last_error ) || null === $remaining_raw ) { return false; }
-		$remaining_duplicates = absint( $remaining_raw );
+		$previous = get_option( 'mobo_core_103454_singleton_meta_dedupe', array() );
+		$previous = is_array( $previous ) ? $previous : array();
+		$previous_failed = isset( $previous['failedProductIds'] ) && is_array( $previous['failedProductIds'] ) && 0 !== $cursor ? $previous['failedProductIds'] : array();
+		$all_failed = array_values( array_unique( array_map( 'absint', array_merge( $previous_failed, $failed ) ) ) );
+		$done = $next_cursor >= $max_id;
 		update_option( 'mobo_core_103454_singleton_meta_dedupe', array(
-			'updatedAt' => time(), 'normalizedThisRun' => $normalized,
-			'remaining' => $remaining_duplicates,
-			'failedProductIds' => array_slice( $failed, 0, 25 ),
+			'updatedAt' => time(),
+			'normalizedThisRun' => $normalized,
+			'normalizedTotal' => ( 0 !== $cursor ? absint( $previous['normalizedTotal'] ?? 0 ) : 0 ) + $normalized,
+			'cursor' => $done ? 0 : $next_cursor,
+			'maxPostId' => $max_id,
+			/* Products deliberately left for operator review (public read and oldest row disagree). */
+			'remaining' => count( $all_failed ),
+			'failedProductIds' => array_slice( $all_failed, 0, 25 ),
+			'completedAt' => $done ? time() : 0,
 		), false );
-		if ( 0 === $remaining_duplicates ) { delete_option( 'mobo_core_103454_singleton_meta_dedupe_pending' ); }
+		if ( $done ) {
+			delete_option( 'mobo_core_103454_singleton_meta_dedupe_cursor' );
+			delete_option( 'mobo_core_103454_singleton_meta_dedupe_pending' );
+		} else {
+			update_option( 'mobo_core_103454_singleton_meta_dedupe_cursor', $next_cursor, false );
+		}
 		return true;
+	}
+
+	/**
+	 * Filter candidate post ids to the Default Connection's Mobo-owned objects
+	 * (Custom Product/Variant State, Product Map, or historical identity postmeta).
+	 *
+	 * @param int   $default_id Default Connection id.
+	 * @param int[] $post_ids   Candidates (<=100).
+	 * @return int[]|null
+	 */
+	private static function singleton_owned_post_ids( $default_id, $post_ids ) {
+		global $wpdb;
+		$post_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $post_ids ) ) ) );
+		if ( empty( $post_ids ) ) { return array(); }
+		$ph = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
+		$owned = array();
+		$queries = array();
+		if ( class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			$queries[] = $wpdb->prepare( "SELECT woo_product_id FROM " . Mobo_Core_Storage_Schema::table_name( 'products' ) . " WHERE connection_id=%d AND woo_product_id IN ({$ph})", array_merge( array( $default_id ), $post_ids ) );
+			$queries[] = $wpdb->prepare( "SELECT woo_variation_id FROM " . Mobo_Core_Storage_Schema::table_name( 'variants' ) . " WHERE connection_id=%d AND woo_variation_id IN ({$ph})", array_merge( array( $default_id ), $post_ids ) );
+		}
+		if ( class_exists( 'Mobo_Core_Product_Map' ) && Mobo_Core_Product_Map::table_exists() ) {
+			$queries[] = $wpdb->prepare( "SELECT wp_post_id FROM " . Mobo_Core_Product_Map::table_name() . " WHERE connection_id=%d AND object_type IN ('product','variation') AND wp_post_id IN ({$ph})", array_merge( array( $default_id ), $post_ids ) );
+		}
+		$queries[] = $wpdb->prepare( "SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE post_id IN ({$ph}) AND ( LEFT(meta_key,6)='_mobo_' OR meta_key IN ('product_guid','variant_guid','portal_product_id','mobo_portal_product_id','portal_variant_id','mobo_portal_variant_id') )", $post_ids );
+		foreach ( $queries as $sql ) {
+			$wpdb->last_error = '';
+			$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- prepared above.
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) { return null; }
+			foreach ( $ids as $id ) { $owned[ absint( $id ) ] = true; }
+		}
+		return array_values( array_intersect( $post_ids, array_keys( $owned ) ) );
 	}
 
 	/**

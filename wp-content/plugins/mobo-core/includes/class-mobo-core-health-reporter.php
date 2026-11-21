@@ -121,6 +121,10 @@ class Mobo_Core_Health_Reporter {
 			'databaseUnicode'       => $database_unicode,
 			'databaseUnicodeMigration' => $database_unicode_migration,
 			'customStorage'         => $custom_storage,
+			/* 10.34.77: migration progress plus objects marked (quarantined) during
+			 * terminal retirement, so the Backend can see partial/blocked sites. Options
+			 * only; no catalog scan. */
+			'databaseMigration'     => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::health_payload() : array( 'status' => 'unavailable' ),
 			'activeTheme'           => $environment['active_theme'],
 			'activePluginsCount'    => $environment['active_plugins_count'],
 			'opCacheEnabled'        => $environment['opcache_enabled'],

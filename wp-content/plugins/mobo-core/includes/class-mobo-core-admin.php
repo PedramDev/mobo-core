@@ -32,6 +32,8 @@ class Mobo_Core_Admin {
 	 */
 	public function init() {
 		add_action( 'admin_init', array( $this, 'activate_admin_connection_context' ), 1 );
+		/* 10.34.77: database migration progress / marked-product notice (manage_options only). */
+		add_action( 'admin_notices', array( 'Mobo_Core_Migration_Quarantine', 'render_admin_notice' ) );
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_bar_menu', array( $this, 'register_admin_bar_menu' ), 80 );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
@@ -5807,6 +5809,10 @@ https://source.example/products/test-product/
 			</div></div>
 		</details>
 		<?php
+		/* Products marked (not deleted) during the 10.34.77 storage migration. */
+		if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) ) {
+			Mobo_Core_Migration_Quarantine::render_admin_list( 50 );
+		}
 	}
 
 	private function render_image_refresh_tab() {
@@ -9484,6 +9490,11 @@ https://source.example/products/test-product/
 		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
 			$this->redirect_with_message( 'زیرساخت چنداتصالی در دسترس نیست.', 'error', 'connection' );
 		}
+		/* Existing extra Connections keep working, but a NEW one is refused until the
+		 * Default Connection's one-way storage retirement has finished. */
+		if ( class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::new_connections_blocked() ) {
+			$this->redirect_with_message( 'افزودن اتصال جدید تا پایان انتقال داده‌های فروشگاه به ساختار ذخیره‌سازی جدید ممکن نیست. این فرایند خودکار در پس‌زمینه ادامه دارد؛ پس از اتمام دوباره تلاش کنید.', 'error', 'connection' );
+		}
 		$token = isset( $_POST['mobo_new_connection_token'] ) ? Mobo_Core_Settings::normalize_opaque_secret( wp_unslash( $_POST['mobo_new_connection_token'] ), 191 ) : '';
 		$result = Mobo_Core_Connection_Repository::create_pending_connection( $token, '' );
 		if ( is_wp_error( $result ) ) {
@@ -10284,6 +10295,11 @@ https://source.example/products/test-product/
 
 		$product_sync = new Mobo_Core_Product_Sync();
 		$result       = $product_sync->start_manual_sync( '', 'repair', true );
+
+		/* Give products marked during the storage migration a fresh re-probe. */
+		if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Migration_Quarantine' ) ) {
+			Mobo_Core_Migration_Quarantine::request_reprobe();
+		}
 
 		if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::kick( 'admin-repair-start', false );
