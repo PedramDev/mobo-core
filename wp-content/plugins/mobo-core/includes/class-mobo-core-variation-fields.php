@@ -137,6 +137,7 @@ class Mobo_Core_Variation_Fields {
 				$this->add_admin_error( 'حذف سود اختصاصی موبو قابل تأیید نبود؛ مقدار قبلی حفظ/بازبینی شود.' );
 				return;
 			}
+			$this->reprice_after_override_change( $variation_id );
 			$this->queue_cache_purge( $variation_id, 'variation-additional-price-removed' );
 			return;
 		}
@@ -164,7 +165,40 @@ class Mobo_Core_Variation_Fields {
 			return;
 		}
 
+		$this->reprice_after_override_change( $variation_id );
 		$this->queue_cache_purge( $variation_id, 'variation-additional-price-updated' );
+	}
+
+	/**
+	 * B8: saving a per-variation markup must recalculate that variation's price
+	 * immediately (and its variable parent), under the owning Connection and the
+	 * shared product lock. A busy product is reported instead of silently waiting.
+	 *
+	 * @param int $variation_id Variation ID.
+	 * @return void
+	 */
+	private function reprice_after_override_change( $variation_id ) {
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			return;
+		}
+		$variation_id = absint( $variation_id );
+		$parent_id = absint( wp_get_post_parent_id( $variation_id ) );
+		$owner = class_exists( 'Mobo_Core_Product_Pricing_Policy' ) && method_exists( 'Mobo_Core_Product_Pricing_Policy', 'owner_connection_id' )
+			? absint( Mobo_Core_Product_Pricing_Policy::owner_connection_id( $parent_id ) )
+			: 0;
+		$runner = static function () use ( $variation_id ) {
+			return ( new Mobo_Core_Reprice_Queue() )->reprice_object_now( $variation_id );
+		};
+		try {
+			$result = ( $owner > 0 && class_exists( 'Mobo_Core_Connection_Context' ) && absint( Mobo_Core_Connection_Context::get_current_connection_id() ) !== $owner )
+				? Mobo_Core_Connection_Context::run( $owner, $runner )
+				: $runner();
+		} catch ( Throwable $e ) {
+			$result = array( 'success' => false, 'reason' => 'exception' );
+		}
+		if ( ! is_array( $result ) || empty( $result['success'] ) ) {
+			$this->add_admin_error( 'سود اختصاصی واریانت ذخیره شد، اما قیمت آن هنوز دوباره محاسبه نشد (محصول در حال همگام‌سازی یا قفل است). چند دقیقه بعد دوباره ذخیره کنید یا Reprice را اجرا کنید.' );
+		}
 	}
 
 	/** @return bool */

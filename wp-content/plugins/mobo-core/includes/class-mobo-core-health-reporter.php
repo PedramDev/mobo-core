@@ -211,6 +211,9 @@ class Mobo_Core_Health_Reporter {
 			'syncHealth'            => class_exists( 'Mobo_Core_Sync_Health' ) ? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ? Mobo_Core_Sync_Health::get_operational_dashboard_status( 15, ! $non_blocking ) : Mobo_Core_Sync_Health::get_dashboard_status() ) : array(),
 			'syncStatus'            => $sync_status,
 			'remoteControl'          => class_exists( 'Mobo_Core_Remote_Control' ) ? Mobo_Core_Remote_Control::get_status() : array(),
+			/* Compact self-diagnosis of admin jobs for the Backend support page. */
+			'jobs'                   => $this->get_jobs_health(),
+			'storeCurrencyChange'    => class_exists( 'Mobo_Core_Store_Currency_Guard' ) ? Mobo_Core_Store_Currency_Guard::health_payload() : array( 'pending' => false ),
 			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
 			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : $last_cron_hit ),
@@ -240,6 +243,24 @@ class Mobo_Core_Health_Reporter {
 			'healthReportMode'      => $non_blocking ? 'non-blocking' : 'full',
 			'healthReportDurationMs'=> (int) round( ( microtime( true ) - $started_at ) * 1000 ),
 		);
+	}
+
+	/**
+	 * jobs.reprice {status, progressPct, lastProgressAt, stalledReason, lastError}.
+	 * Never throws into the report.
+	 *
+	 * @return array
+	 */
+	private function get_jobs_health() {
+		$jobs = array();
+		try {
+			$jobs['reprice'] = class_exists( 'Mobo_Core_Reprice_Queue' )
+				? ( new Mobo_Core_Reprice_Queue() )->health_payload()
+				: array( 'status' => 'unavailable' );
+		} catch ( Throwable $e ) {
+			$jobs['reprice'] = array( 'status' => 'unavailable', 'error' => sanitize_key( get_class( $e ) ) );
+		}
+		return $jobs;
 	}
 
 	/**

@@ -92,6 +92,11 @@ class Mobo_Core_Settings {
 			'global_additional_price'             => '0',
 			'global_additional_percentage'        => '0',
 			'mobo_dynamic_price'                  => '[]',
+			// B11: optional rounding after markup (store currency). 0 = none (historical output).
+			'mobo_core_price_rounding_step'       => 0,
+			'mobo_core_price_rounding_mode'       => 'up',
+			// Watchdog: minutes without progress before a running job is diagnosed as stalled.
+			'mobo_core_job_stall_minutes'         => 15,
 
 			'mobo_core_sync_time_budget_seconds'  => 8,
 			'mobo_core_webhook_files_per_run'     => 4,

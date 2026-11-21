@@ -5580,7 +5580,7 @@ class Mobo_Core_Product_Sync {
 
 		$this->apply_product_dates( $product, $data );
 
-		$url = sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
+		$url = class_exists( 'Mobo_Core_Product_Exclusions' ) ? Mobo_Core_Product_Exclusions::sanitize_source_url( $this->get_value( $data, 'url', '' ) ) : sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
 
 		if ( '' !== $url ) {
 			$this->update_product_meta_if_changed( $product, 'mobo_url', $url );
@@ -6732,6 +6732,33 @@ class Mobo_Core_Product_Sync {
 		return false === $json ? '' : md5( $json );
 	}
 
+	/**
+	 * Whether a WooCommerce object already renders the calculated price pair.
+	 * An "unavailable" pair (Source has no price) matches only an object whose
+	 * regular, sale and active prices are all empty (not purchasable).
+	 *
+	 * @param WC_Product $object Product/variation.
+	 * @param array      $pair   Calculator result.
+	 * @return bool
+	 */
+	private function price_pair_matches_object( $object, $pair ) {
+		if ( ! $object instanceof WC_Product || ! is_array( $pair ) ) {
+			return false;
+		}
+		if ( ! empty( $pair['unavailable'] ) ) {
+			return '' === (string) $object->get_regular_price( 'edit' )
+				&& '' === (string) $object->get_sale_price( 'edit' )
+				&& '' === (string) $object->get_price( 'edit' );
+		}
+		if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $object->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
+			return false;
+		}
+		if ( isset( $pair['sale_price'] ) && wc_format_decimal( $object->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+			return false;
+		}
+		return true;
+	}
+
 	private function product_frontend_state_matches_payload( $product, $data ) {
 		if ( ! $product instanceof WC_Product || ! is_array( $data ) ) {
 			return false;
@@ -6777,10 +6804,7 @@ class Mobo_Core_Product_Sync {
 			if ( ! empty( $pair['error'] ) ) {
 				return false;
 			}
-			if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $product->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
-				return false;
-			}
-			if ( isset( $pair['sale_price'] ) && wc_format_decimal( $product->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+			if ( ! $this->price_pair_matches_object( $product, $pair ) ) {
 				return false;
 			}
 			}
@@ -6965,7 +6989,7 @@ class Mobo_Core_Product_Sync {
 				}
 			}
 		}
-		$url = sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
+		$url = class_exists( 'Mobo_Core_Product_Exclusions' ) ? Mobo_Core_Product_Exclusions::sanitize_source_url( $this->get_value( $data, 'url', '' ) ) : sanitize_text_field( (string) $this->get_value( $data, 'url', '' ) );
 		if ( '' !== $url && ! $this->persist_post_meta_verified( $product_id, 'mobo_url', $url ) ) {
 			return false;
 		}
@@ -7539,10 +7563,7 @@ class Mobo_Core_Product_Sync {
 				if ( ! empty( $pair['error'] ) ) {
 					return false;
 				}
-				if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $variation->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
-					return false;
-				}
-				if ( isset( $pair['sale_price'] ) && wc_format_decimal( $variation->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+				if ( ! $this->price_pair_matches_object( $variation, $pair ) ) {
 					return false;
 				}
 			}
@@ -7612,6 +7633,11 @@ class Mobo_Core_Product_Sync {
 			'global_product_auto_compare_price' => (string) Mobo_Core_Settings::get( 'global_product_auto_compare_price', '0' ),
 			'mobo_dynamic_price'                => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
 		);
+		/* B11: optional rounding changes the written price. The fragment is empty
+		 * while rounding is "none", so historical hashes are preserved. */
+		if ( class_exists( 'Mobo_Core_Price_Rounding' ) ) {
+			$policy = array_merge( $policy, Mobo_Core_Price_Rounding::fingerprint_fragment() );
+		}
 
 		/* Currency affects the actual price written by the shared calculator.
 		 * An explicitly saved preference must therefore invalidate the Sync
@@ -8285,10 +8311,7 @@ class Mobo_Core_Product_Sync {
 				if ( ! empty( $pair['error'] ) ) {
 					return false;
 				}
-				if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] && wc_format_decimal( $product->get_regular_price() ) !== wc_format_decimal( $pair['regular_price'] ) ) {
-					return false;
-				}
-				if ( isset( $pair['sale_price'] ) && wc_format_decimal( $product->get_sale_price() ) !== wc_format_decimal( $pair['sale_price'] ) ) {
+				if ( ! $this->price_pair_matches_object( $product, $pair ) ) {
 					return false;
 				}
 			}
@@ -9118,6 +9141,29 @@ class Mobo_Core_Product_Sync {
 		}
 		$effective_policy_type = isset( $pair['policy_type'] ) && '' !== (string) $pair['policy_type'] ? sanitize_key( (string) $pair['policy_type'] ) : (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
 		$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_price_policy_type', $effective_policy_type ) || $source_changed;
+
+		/* B2/B15: the Source says "no price" (null/empty/0/negative). Clear every
+		 * WooCommerce price so the object stays visible but is NOT purchasable
+		 * until a valid price arrives; never keep a stale or zero price. */
+		if ( ! empty( $pair['unavailable'] ) ) {
+			if ( '' !== (string) $product->get_regular_price( 'edit' ) ) {
+				$product->set_regular_price( '' );
+			}
+			if ( '' !== (string) $product->get_sale_price( 'edit' ) ) {
+				$product->set_sale_price( '' );
+			}
+			if ( '' !== (string) $product->get_price( 'edit' ) ) {
+				$product->set_price( '' );
+			}
+			$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_calculated_regular_price', '' ) || $source_changed;
+			$source_changed = $this->update_product_meta_if_changed( $product, 'mobo_calculated_sale_price', '' ) || $source_changed;
+			$source_changed = $this->update_product_meta_if_changed( $product, Mobo_Core_Reprice_Queue::META_PRICE_UNAVAILABLE, isset( $pair['unavailable_reason'] ) ? sanitize_key( (string) $pair['unavailable_reason'] ) : 'source-price-missing' ) || $source_changed;
+			if ( $source_changed ) {
+				$this->update_product_meta_if_changed( $product, 'mobo_price_policy_updated_at', gmdate( 'c' ) );
+			}
+			return;
+		}
+		$source_changed = $this->delete_product_meta_if_present( $product, Mobo_Core_Reprice_Queue::META_PRICE_UNAVAILABLE ) || $source_changed;
 
 		if ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ) {
 			$desired_regular = wc_format_decimal( $pair['regular_price'] );

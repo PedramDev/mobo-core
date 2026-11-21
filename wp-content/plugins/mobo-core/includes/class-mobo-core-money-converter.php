@@ -101,6 +101,93 @@ final class Mobo_Core_Money_Converter {
         );
     }
 
+    /**
+     * C2: conversion with an explicit, documented rounding policy for PRICE
+     * INPUTS only (Product Sync / Reprice / Repair). Shipping, purchase and
+     * order review keep using convert_exact().
+     *
+     * The shift itself is exact (string arithmetic). Only when the exact result
+     * has more fraction digits than the store supports is it rounded:
+     *  - 'up'        ceiling to the store precision (default for prices: the
+     *                store price is never below the Source cost; max error is one
+     *                store minor unit, e.g. 1,234,565 IRR -> 123,457 IRT);
+     *  - 'half_up'   commercial rounding (123,456.5 -> 123,457; 123,456.4 -> 123,456);
+     *  - 'down'      truncation.
+     *
+     * Output adds 'rounded' => bool to the convert_exact() shape.
+     */
+    public static function convert_rounded( $amount, $source, $store, $source_digits, $target_digits, $mode = 'up' ) {
+        $exact = self::convert_exact( $amount, $source, $store, $source_digits, 6 );
+        if ( empty( $exact['ok'] ) ) {
+            // Retry the exact path with the real target precision for its error code.
+            $strict = self::convert_exact( $amount, $source, $store, $source_digits, $target_digits );
+            $strict['rounded'] = false;
+            return $strict;
+        }
+        if ( ! self::precision( $target_digits ) ) {
+            $result = self::result( 'invalid_precision', (string) $exact['policy'] );
+            $result['rounded'] = false;
+            return $result;
+        }
+        $parts = explode( '.', (string) $exact['amount'], 2 );
+        $whole = $parts[0];
+        $fraction = isset( $parts[1] ) ? $parts[1] : '';
+        $digits = (int) $target_digits;
+        if ( strlen( $fraction ) <= $digits ) {
+            $exact['rounded'] = false;
+            return $exact;
+        }
+        $kept = substr( $fraction, 0, $digits );
+        $dropped = substr( $fraction, $digits );
+        $mode = in_array( $mode, array( 'up', 'half_up', 'down' ), true ) ? $mode : 'up';
+        $increment = false;
+        if ( 'up' === $mode ) {
+            $increment = '' !== trim( $dropped, '0' );
+        } elseif ( 'half_up' === $mode ) {
+            $increment = (int) $dropped[0] >= 5;
+        }
+        $number = ltrim( $whole . $kept, '0' );
+        if ( '' === $number ) { $number = '0'; }
+        if ( $increment ) {
+            $number = self::increment_digits( $number );
+        }
+        if ( $digits > 0 ) {
+            $number = str_pad( $number, $digits + 1, '0', STR_PAD_LEFT );
+            $out_whole = ltrim( substr( $number, 0, -$digits ), '0' );
+            $out_fraction = rtrim( substr( $number, -$digits ), '0' );
+        } else {
+            $out_whole = ltrim( $number, '0' );
+            $out_fraction = '';
+        }
+        if ( '' === $out_whole ) { $out_whole = '0'; }
+        if ( strlen( $out_whole ) > strlen( self::SAFE_MAX_MAJOR ) ||
+            ( strlen( $out_whole ) === strlen( self::SAFE_MAX_MAJOR ) && strcmp( $out_whole, self::SAFE_MAX_MAJOR ) > 0 ) ) {
+            $result = self::result( 'amount_out_of_safe_range', (string) $exact['policy'] );
+            $result['rounded'] = false;
+            return $result;
+        }
+        return array(
+            'ok' => true, 'code' => 'ok', 'amount' => $out_whole . ( '' !== $out_fraction ? '.' . $out_fraction : '' ),
+            'policy' => (string) $exact['policy'], 'rounded' => true,
+        );
+    }
+
+    /** Add one to a non-negative decimal digit string. */
+    private static function increment_digits( $digits ) {
+        $digits = (string) $digits;
+        $i = strlen( $digits ) - 1;
+        while ( $i >= 0 ) {
+            if ( '9' === $digits[ $i ] ) {
+                $digits[ $i ] = '0';
+                $i--;
+                continue;
+            }
+            $digits[ $i ] = (string) ( (int) $digits[ $i ] + 1 );
+            return $digits;
+        }
+        return '1' . $digits;
+    }
+
     private static function precision( $value ) {
         return ( is_int( $value ) || ( is_string( $value ) && preg_match( '/^[0-9]+$/D', $value ) ) )
             && (int) $value >= 0 && (int) $value <= 6;

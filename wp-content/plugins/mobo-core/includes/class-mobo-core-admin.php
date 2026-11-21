@@ -77,6 +77,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_resume_reprice', array( $this, 'handle_resume_reprice' ) );
 		add_action( 'admin_post_mobo_core_cancel_reprice', array( $this, 'handle_cancel_reprice' ) );
 		add_action( 'admin_post_mobo_core_reset_reprice', array( $this, 'handle_reset_reprice' ) );
+		add_action( 'admin_post_mobo_core_reprice_recover', array( $this, 'handle_reprice_recover' ) );
+		add_action( 'admin_post_mobo_core_reprice_skip_item', array( $this, 'handle_reprice_skip_item' ) );
 		add_action( 'admin_post_mobo_core_start_recategorize', array( $this, 'handle_start_recategorize' ) );
 		add_action( 'admin_post_mobo_core_cancel_recategorize', array( $this, 'handle_cancel_recategorize' ) );
 		add_action( 'admin_post_mobo_core_reset_recategorize', array( $this, 'handle_reset_recategorize' ) );
@@ -5359,6 +5361,9 @@ type:{mobo_order_type_label}</textarea>
 				<fieldset class="mobo-pricing-settings-fieldset" <?php disabled( $reprice_running, true ); ?> aria-disabled="<?php echo $reprice_running ? 'true' : 'false'; ?>">
 					<?php $pricing_warning = $this->get_pricing_health_warning(); ?>
 					<?php if ( '' !== $pricing_warning ) : ?><div class="mobo-message mobo-message-warning"><strong>نیاز به بررسی:</strong> <?php echo esc_html( $pricing_warning ); ?></div><?php endif; ?>
+					<?php if ( $reprice_queue && ! $reprice_queue->price_updates_enabled() ) : ?>
+						<div class="mobo-message mobo-message-info"><strong>به‌روزرسانی قیمت از منبع خاموش است.</strong> سوئیچ‌های «بروزرسانی قیمت» و «قیمت مقایسه‌ای» در تب محصول خاموش‌اند؛ Reprice عمومی قیمت‌های دستی را تغییر نمی‌دهد. فقط سود اختصاصی که صریحاً برای یک محصول/واریانت ذخیره کنید اعمال می‌شود.</div>
+					<?php endif; ?>
 					<?php $this->pricing_rules_ui(); ?>
 					<div class="mobo-note">ترتیب اعمال قیمت: سود اختصاصی واریانت ← سود اختصاصی درصدی محصول/والد ← سیاست عمومی این صفحه. بعد از تغییر سیاست عمومی، برای اعمال روی قیمت‌های موجود از بخش «اعمال قیمت جدید روی محصولات موجود» استفاده کنید.</div>
 					<?php $this->save_button( 'ذخیره سیاست قیمت' ); ?>
@@ -5366,7 +5371,7 @@ type:{mobo_order_type_label}</textarea>
 			</div>
 		</form>
 
-		<details class="mobo-admin-details mobo-ux-secondary-details" <?php echo ( $reprice_running || $reprice_cancelled || $reprice_invalidated ) ? 'open' : ''; ?>>
+		<details class="mobo-admin-details mobo-ux-secondary-details" <?php echo ( $reprice_running || $reprice_cancelled || $reprice_invalidated || 'stalled' === $reprice_state || 'stalled' === (string) ( $reprice_status['health'] ?? '' ) ) ? 'open' : ''; ?>>
 			<summary><?php echo $reprice_running ? 'اعمال قیمت جدید در حال اجراست' : ( $reprice_invalidated ? 'اعمال قیمت جدید باید از ابتدا اجرا شود' : 'اعمال قیمت جدید روی محصولات موجود' ); ?></summary>
 			<div class="mobo-admin-details__body"><?php $this->reprice_queue_ui(); ?></div>
 		</details>
@@ -5416,6 +5421,13 @@ type:{mobo_order_type_label}</textarea>
 					<span class="mobo-admin-badge mobo-admin-badge--<?php echo $excluded_count > 0 ? 'info' : 'success'; ?>"><?php echo esc_html( $excluded_count > 0 ? number_format_i18n( $excluded_count ) . ' استثنای فعال' : 'بدون استثنا' ); ?></span>
 				</div>
 
+				<?php if ( $excluded_count > 0 && class_exists( 'Mobo_Core_Product_Exclusions' ) ) : ?>
+					<div class="mobo-message mobo-message-warning"><strong>محصولات مستثنا دیگر همگام نمی‌شوند.</strong> <?php echo esc_html( Mobo_Core_Product_Exclusions::exclusion_warning_fa() ); ?></div>
+					<?php $suspicious = Mobo_Core_Product_Exclusions::suspicious_paths( $excluded ); ?>
+					<?php if ( ! empty( $suspicious ) ) : ?>
+						<div class="mobo-message mobo-message-warning"><strong>احتمال خرابی آدرس:</strong> <?php echo esc_html( 'نسخه‌های قبلی هنگام ذخیره، بخش فارسی کدشده (%XX) آدرس را حذف می‌کردند. این مسیرها ناقص به نظر می‌رسند؛ آدرس اصلی محصول را دوباره از مرورگر کپی و ذخیره کنید: ' . implode( '، ', array_slice( $suspicious, 0, 10 ) ) ); ?></div>
+					<?php endif; ?>
+				<?php endif; ?>
 				<?php if ( $invalid_count > 0 || $duplicate_count > 0 ) : ?>
 					<div class="mobo-message mobo-message-warning"><strong>فهرست فعلی نیاز به پاک‌سازی دارد.</strong> <?php echo esc_html( sprintf( '%d خط نامعتبر و %d مورد تکراری شناسایی شد. با ذخیره بعدی فقط مسیرهای یکتای معتبر نگه داشته می‌شوند.', $invalid_count, $duplicate_count ) ); ?></div>
 				<?php elseif ( 0 === $excluded_count ) : ?>
@@ -7209,6 +7221,23 @@ https://source.example/products/test-product/
 	}
 
 	/**
+	 * B1: the value a toggle must DISPLAY is the value runtime uses. A hard-coded
+	 * '0' fallback showed "off" for every unset key of a new Connection although
+	 * runtime used the documented default ('1' for stock/price/images/...), and
+	 * one Save then really switched those updates off. Unset keys now fall back to
+	 * Mobo_Core_Settings::defaults(); unknown keys keep '0'.
+	 *
+	 * @param string $key Option key.
+	 * @return string '1' or '0'.
+	 */
+	public static function effective_bool_value( $key ) {
+		$defaults = Mobo_Core_Settings::defaults();
+		$fallback = array_key_exists( $key, $defaults ) ? $defaults[ $key ] : '0';
+		$raw = Mobo_Core_Settings::get( $key, $fallback );
+		return in_array( strtolower( trim( (string) $raw ) ), array( '1', 'yes', 'true', 'on' ), true ) ? '1' : '0';
+	}
+
+	/**
 	 * Bool field.
 	 *
 	 * @param string $label Label.
@@ -7216,7 +7245,7 @@ https://source.example/products/test-product/
 	 * @return void
 	 */
 	private function bool_field( $label, $key, $disabled = false, $disabled_reason = '', $help = '' ) {
-		$value = (string) Mobo_Core_Settings::get( $key, '0' );
+		$value = self::effective_bool_value( $key );
 		$on_id = $key . '_on';
 		$off_id = $key . '_off';
 		?>
@@ -7798,6 +7827,15 @@ https://source.example/products/test-product/
 				return 'قیمت‌گذاری داینامیک فعال است، اما هیچ بازه‌ای برای سود عمومی تعریف نشده است. سودهای اختصاصی واریانت/محصول همچنان مستقل اعمال می‌شوند.';
 			}
 
+			/* B12: coverage gaps (disabled row, capped last row). Runtime now falls
+			 * back to the nearest active rule, but the merchant must fix the table. */
+			if ( class_exists( 'Mobo_Core_Dynamic_Price_Rules' ) ) {
+				$problems = Mobo_Core_Dynamic_Price_Rules::coverage_problems( $rows );
+				if ( ! empty( $problems ) ) {
+					return 'پوشش قوانین داینامیک ناقص است: ' . implode( ' ', $problems ) . ' تا اصلاح جدول، برای قیمت‌های بدون قانون سود نزدیک‌ترین قانون فعال اعمال می‌شود.';
+				}
+			}
+
 			foreach ( $rows as $row ) {
 				if ( ! is_array( $row ) ) {
 					continue;
@@ -7824,6 +7862,8 @@ https://source.example/products/test-product/
 	 */
 	private function pricing_rules_ui() {
 		$price_type = (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+		$currency_label = $this->store_currency_label();
+		$rounding = class_exists( 'Mobo_Core_Price_Rounding' ) ? Mobo_Core_Price_Rounding::current_policy() : array( 'step' => 0, 'mode' => 'up' );
 
 		$static_price      = absint( Mobo_Core_Settings::get( 'global_additional_price', 0 ) );
 		$static_percentage = (float) Mobo_Core_Settings::get( 'global_additional_percentage', 0 );
@@ -7868,10 +7908,10 @@ https://source.example/products/test-product/
 			<div class="mobo-price-section" id="static-price" style="<?php echo 'static-price' === $price_type ? '' : 'display:none;'; ?>">
 				<div class="mobo-fields-grid">
 					<div class="mobo-field">
-						<label for="global_additional_price">مبلغ سود ثابت</label>
+						<label for="global_additional_price">مبلغ سود ثابت (<?php echo esc_html( $currency_label ); ?>)</label>
 						<input type="number" dir="ltr" style="text-align:left;" id="global_additional_price" class="mobo-money-input" name="global_additional_price" value="<?php echo esc_attr( $static_price ); ?>" min="0" step="1">
 						<div class="mobo-price-preview" data-empty="مقدار وارد نشده">—</div>
-						<div class="mobo-help">این مبلغ به قیمت محصول یا تنوع اضافه می‌شود.</div>
+						<div class="mobo-help">این مبلغ به ارز فروشگاه (<?php echo esc_html( $currency_label ); ?>) به قیمت محصول یا تنوع اضافه می‌شود.</div>
 					</div>
 				</div>
 			</div>
@@ -7896,7 +7936,7 @@ https://source.example/products/test-product/
 					<div class="mobo-dynamic-row mobo-dynamic-row-head">
 						<span>فعال</span>
 						<span>شروع بازه (خودکار)</span>
-						<span>تا قیمت</span>
+						<span>تا قیمت (<?php echo esc_html( $currency_label ); ?>)</span>
 						<span>نوع سود</span>
 						<span>مقدار سود</span>
 						<span></span>
@@ -7935,7 +7975,32 @@ https://source.example/products/test-product/
 					شروع هر بازه خودکار است: ردیف اول از ۰ شروع می‌شود و هر ردیف بعدی از عدد بعد از سقف ردیف قبل. فقط «تا قیمت» را تعیین کنید؛ سقف خالی یا ۰ در آخرین ردیف یعنی «بدون سقف». انتخاب بازه همیشه بر اساس price خام منبع است، نه comparePrice.
 				</div>
 				<div class="mobo-message mobo-message-info" id="mobo-dynamic-range-status" style="display:none;"></div>
+				<div class="mobo-note">اگر قیمتی در هیچ بازه فعالی نیفتد، به‌جای فروش بدون سود، سود نزدیک‌ترین قانون فعال اعمال می‌شود. ردیف غیرفعال یا سقف برای آخرین ردیف هنگام ذخیره پذیرفته نمی‌شود.</div>
 			</div>
+
+			<?php if ( class_exists( 'Mobo_Core_Price_Rounding' ) ) : ?>
+			<div class="mobo-fields-grid">
+				<div class="mobo-field">
+					<label for="mobo_core_price_rounding_step">گرد کردن قیمت نهایی (بعد از سود)</label>
+					<select id="mobo_core_price_rounding_step" name="mobo_core_price_rounding_step">
+						<option value="0" <?php selected( (int) $rounding['step'], 0 ); ?>>بدون گرد کردن (رفتار فعلی)</option>
+						<?php foreach ( array( 100, 1000, 10000 ) as $step_option ) : ?>
+							<option value="<?php echo esc_attr( $step_option ); ?>" <?php selected( (int) $rounding['step'], $step_option ); ?>><?php echo esc_html( 'به مضرب ' . number_format_i18n( $step_option ) . ' ' . $currency_label ); ?></option>
+						<?php endforeach; ?>
+					</select>
+					<div class="mobo-help">مضرب به ارز فروشگاه (<?php echo esc_html( $currency_label ); ?>) است و روی Sync، Reprice، سود اختصاصی محصول/واریانت و به‌روزرسانی‌های جزئی یکسان اعمال می‌شود.</div>
+				</div>
+				<div class="mobo-field">
+					<label for="mobo_core_price_rounding_mode">جهت گرد کردن</label>
+					<select id="mobo_core_price_rounding_mode" name="mobo_core_price_rounding_mode">
+						<option value="up" <?php selected( (string) $rounding['mode'], 'up' ); ?>>رو به بالا (مثلاً ۱٬۴۱۹٬۷۵۲ ← ۱٬۴۲۰٬۰۰۰)</option>
+						<option value="down" <?php selected( (string) $rounding['mode'], 'down' ); ?>>رو به پایین (۱٬۴۱۹٬۷۵۲ ← ۱٬۴۱۹٬۰۰۰)</option>
+						<option value="nearest" <?php selected( (string) $rounding['mode'], 'nearest' ); ?>>نزدیک‌ترین (۱٬۴۱۹٬۴۹۹ ← ۱٬۴۱۹٬۰۰۰ و ۱٬۴۱۹٬۵۰۰ ← ۱٬۴۲۰٬۰۰۰)</option>
+					</select>
+					<div class="mobo-help">اگر قیمت تخفیفی و عادی پس از گرد کردن برابر شوند، تخفیف حذف و همان قیمت گردشده نمایش داده می‌شود. تغییر این گزینه نیاز به اجرای Reprice دارد.</div>
+				</div>
+			</div>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
@@ -7984,6 +8049,33 @@ https://source.example/products/test-product/
 				<div class="mobo-status-box"><span>بررسی‌شده</span><strong data-mobo-reprice-field="processed"><?php echo esc_html( isset( $status['processed'] ) ? absint( $status['processed'] ) : 0 ); ?></strong></div>
 				<div class="mobo-status-box"><span>قیمت تغییرکرده</span><strong data-mobo-reprice-field="updated"><?php echo esc_html( isset( $status['updated'] ) ? absint( $status['updated'] ) : 0 ); ?></strong></div>
 			</div>
+
+			<?php
+			$health       = isset( $status['health'] ) ? (string) $status['health'] : 'idle';
+			$is_stalled   = 'stalled' === $health || 'stalled' === $state;
+			$status_line  = isset( $status['statusLine'] ) ? (string) $status['statusLine'] : '';
+			$problem_item = isset( $status['problemItemId'] ) ? absint( $status['problemItemId'] ) : 0;
+			?>
+			<div class="mobo-message <?php echo $is_stalled ? 'mobo-message-error' : 'mobo-message-info'; ?>" data-mobo-reprice-field="statusLine" style="<?php echo '' === $status_line ? 'display:none;' : ''; ?>"><?php echo esc_html( $status_line ); ?></div>
+
+			<?php if ( $is_stalled || ( ( $is_running || 'stalled' === $state ) && $problem_item > 0 ) ) : ?>
+				<div class="mobo-actions">
+					<?php if ( $is_stalled ) : ?>
+						<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
+							<input type="hidden" name="action" value="mobo_core_reprice_recover">
+							<?php wp_nonce_field( 'mobo_core_reprice_recover', 'mobo_core_nonce' ); ?>
+							<button type="submit" class="mobo-btn mobo-btn-primary">ادامه</button>
+						</form>
+					<?php endif; ?>
+					<?php if ( $problem_item > 0 ) : ?>
+						<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
+							<input type="hidden" name="action" value="mobo_core_reprice_skip_item">
+							<?php wp_nonce_field( 'mobo_core_reprice_skip_item', 'mobo_core_nonce' ); ?>
+							<button type="submit" class="mobo-btn mobo-btn-light"><?php echo esc_html( sprintf( 'رد کردن مورد مشکل‌دار (شناسه %d)', $problem_item ) ); ?></button>
+						</form>
+					<?php endif; ?>
+				</div>
+			<?php endif; ?>
 
 			<?php if ( ! $total_available ) : ?>
 				<div class="mobo-message mobo-message-warning">تعداد کاندیداهای فعلی قابل خواندن نیست. اجرای جدید تا زمانی که این شمارش معتبر نباشد شروع نمی‌شود.</div>
@@ -8048,6 +8140,17 @@ https://source.example/products/test-product/
 				<div class="mobo-note">منبع محاسبه Reprice، قیمت خام ذخیره‌شده Mobo برای هر محصول/واریانت است. شناسه‌ها، خطای خام و نوع policy فقط برای عیب‌یابی نمایش داده می‌شوند.</div>
 			</details>
 			<?php endif; ?>
+
+			<?php
+			$debug_bundle = $queue ? wp_json_encode( $queue->debug_bundle(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT ) : '';
+			?>
+			<?php if ( is_string( $debug_bundle ) && '' !== $debug_bundle ) : ?>
+				<div class="mobo-actions">
+					<button type="button" class="mobo-btn mobo-btn-light" data-mobo-copy-target="mobo-reprice-debug-bundle">کپی گزارش عیب‌یابی</button>
+					<span class="mobo-help" data-mobo-copy-status="mobo-reprice-debug-bundle"></span>
+				</div>
+				<textarea id="mobo-reprice-debug-bundle" readonly hidden aria-hidden="true"><?php echo esc_textarea( $debug_bundle ); ?></textarea>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
@@ -8068,6 +8171,8 @@ https://source.example/products/test-product/
 				return 'متوقف شده';
 			case 'invalidated':
 				return 'نیازمند اجرای جدید';
+			case 'stalled':
+				return 'گیر کرده';
 			default:
 				return 'آماده';
 		}
@@ -9062,7 +9167,40 @@ https://source.example/products/test-product/
 			Mobo_Core_Settings::update( 'mobo_price_type', $price_type, false );
 		}
 
+		/* B11: optional rounding after markup. */
+		if ( class_exists( 'Mobo_Core_Price_Rounding' ) && isset( $_POST[ Mobo_Core_Price_Rounding::OPTION_STEP ] ) ) {
+			$step = Mobo_Core_Price_Rounding::normalize_step( sanitize_text_field( wp_unslash( $_POST[ Mobo_Core_Price_Rounding::OPTION_STEP ] ) ) );
+			Mobo_Core_Settings::update( Mobo_Core_Price_Rounding::OPTION_STEP, $step, false );
+		}
+		if ( class_exists( 'Mobo_Core_Price_Rounding' ) && isset( $_POST[ Mobo_Core_Price_Rounding::OPTION_MODE ] ) ) {
+			$mode = Mobo_Core_Price_Rounding::normalize_mode( sanitize_key( wp_unslash( $_POST[ Mobo_Core_Price_Rounding::OPTION_MODE ] ) ) );
+			Mobo_Core_Settings::update( Mobo_Core_Price_Rounding::OPTION_MODE, $mode, false );
+		}
+
 		$this->save_dynamic_price_rules();
+	}
+
+	/**
+	 * C5: label of the WooCommerce store currency for money inputs. Fixed
+	 * markups and dynamic thresholds are evaluated in the STORE currency.
+	 *
+	 * @return string
+	 */
+	private function store_currency_label() {
+		$unit = class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::store_unit() : '';
+		if ( class_exists( 'Mobo_Core_Store_Currency_Guard' ) && '' !== $unit ) {
+			$label = Mobo_Core_Store_Currency_Guard::unit_label( $unit );
+			if ( $label !== $unit ) {
+				return $label;
+			}
+		}
+		if ( function_exists( 'get_woocommerce_currency_symbol' ) ) {
+			$symbol = trim( wp_strip_all_tags( html_entity_decode( (string) get_woocommerce_currency_symbol(), ENT_QUOTES, 'UTF-8' ) ) );
+			if ( '' !== $symbol ) {
+				return $symbol;
+			}
+		}
+		return '' !== $unit ? $unit : 'ارز فروشگاه';
 	}
 
 	/**
@@ -9312,8 +9450,11 @@ https://source.example/products/test-product/
 			return new WP_Error( 'mobo_core_exclusions_unavailable', 'سیاست استثنای محصولات در دسترس نیست و تغییری ذخیره نشد.' );
 		}
 
-		$raw = isset( $_POST['mobo_core_excluded_product_urls'] )
-			? sanitize_textarea_field( wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) )
+		/* B4: sanitize_textarea_field() removes %XX octets and destroyed Persian
+		 * slugs. parse_input() cleans each line with sanitize_source_url() (tags,
+		 * control characters, whitespace) and stores the decoded canonical path. */
+		$raw = isset( $_POST['mobo_core_excluded_product_urls'] ) && is_string( $_POST['mobo_core_excluded_product_urls'] )
+			? (string) wp_unslash( $_POST['mobo_core_excluded_product_urls'] ) // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitized per line by Mobo_Core_Product_Exclusions::parse_input().
 			: '';
 		$parsed = Mobo_Core_Product_Exclusions::parse_input( $raw );
 		$invalid_count = isset( $parsed['invalidCount'] ) ? absint( $parsed['invalidCount'] ) : 0;
@@ -9952,6 +10093,17 @@ https://source.example/products/test-product/
 			}
 		}
 
+		if ( 'pricing' === $tab ) {
+			$pricing_errors = $this->validate_pricing_post();
+			if ( ! empty( $pricing_errors ) ) {
+				$this->redirect_with_message(
+					'سیاست قیمت ذخیره نشد: ' . implode( ' | ', $pricing_errors ),
+					'error',
+					'pricing'
+				);
+			}
+		}
+
 		if ( 'queue' === $tab && class_exists( 'Mobo_Core_Sync_Settings_Guard' ) ) {
 			$queue_settings_lock = Mobo_Core_Sync_Settings_Guard::get_lock_state();
 			if ( ! empty( $queue_settings_lock['locked'] ) ) {
@@ -10439,6 +10591,8 @@ https://source.example/products/test-product/
 		}
 
 		$queue  = new Mobo_Core_Reprice_Queue();
+		/* Self-healing: the watchdog acts only after the stall window and is bounded. */
+		$queue->watchdog_tick( 'admin-status' );
 		$status = $queue->get_status();
 
 		/*
@@ -10447,8 +10601,11 @@ https://source.example/products/test-product/
 		 * stale authenticated status poll may advance one tiny bounded batch itself.
 		 * process_batch() still owns the global Reprice worker lease and product-level
 		 * concurrency locks, so this cannot race a live Cron/Self Runner worker.
+		 * A historical lastError must not disable this rescue: per-item failures are
+		 * already bounded by the retry limit, and blocking the rescue on any old
+		 * error was one way a Reprice stayed "running" forever with no worker.
 		 */
-		if ( ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
+		if ( ! empty( $status['shouldContinue'] ) ) {
 			$updated_at = isset( $status['updatedAt'] ) ? absint( $status['updatedAt'] ) : 0;
 			$is_stale   = $updated_at > 0 && ( time() - $updated_at ) >= 8;
 
@@ -10836,6 +10993,61 @@ https://source.example/products/test-product/
 		} catch ( Throwable $e ) {
 			Mobo_Core_Logger::error( 'Mobo Core reprice resume failed: ' . $e->getMessage() );
 			$this->redirect_with_message( 'ادامه اعمال مجدد قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+	/**
+	 * «ادامه»: resume a stalled Reprice and run one small inline batch.
+	 *
+	 * @return void
+	 */
+	public function handle_reprice_recover() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_reprice_recover', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$result = ( new Mobo_Core_Reprice_Queue() )->admin_recover();
+			$message = isset( $result['message'] ) ? (string) $result['message'] : 'اجرا ادامه یافت.';
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			Mobo_Core_Logger::error( 'Mobo Core reprice recover failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'ادامه اعمال قیمت با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
+		}
+	}
+
+	/**
+	 * «رد کردن مورد مشکل‌دار»: skip the item blocking the Reprice cursor.
+	 *
+	 * @return void
+	 */
+	public function handle_reprice_skip_item() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+
+		check_admin_referer( 'mobo_core_reprice_skip_item', 'mobo_core_nonce' );
+
+		if ( ! class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+			$this->redirect_with_message( 'صف اعمال مجدد قیمت در دسترس نیست.', 'error', 'pricing' );
+		}
+
+		try {
+			$result = ( new Mobo_Core_Reprice_Queue() )->skip_problem_item();
+			if ( ! empty( $result['success'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				Mobo_Core_Self_Runner::kick( 'admin-reprice-skip', true );
+			}
+			$message = isset( $result['message'] ) ? (string) $result['message'] : '';
+			$this->redirect_with_message( $message, ! empty( $result['success'] ) ? 'success' : 'error', 'pricing' );
+		} catch ( Throwable $e ) {
+			Mobo_Core_Logger::error( 'Mobo Core reprice skip failed: ' . $e->getMessage() );
+			$this->redirect_with_message( 'رد کردن مورد با خطا مواجه شد: ' . $e->getMessage(), 'error', 'pricing' );
 		}
 	}
 
@@ -12123,6 +12335,34 @@ https://source.example/products/test-product/
 	 * @return void
 	 */
 	private function save_dynamic_price_rules() {
+		$rows = $this->collect_dynamic_price_rows_from_post();
+
+		Mobo_Core_Settings::update(
+			'mobo_dynamic_price',
+			wp_json_encode( $rows, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
+			false
+		);
+	}
+
+	/**
+	 * B12: validate the posted pricing policy before anything is saved.
+	 *
+	 * @return array<int,string> Persian errors (empty = valid).
+	 */
+	private function validate_pricing_post() {
+		$type = isset( $_POST['mobo_price_type'] ) ? sanitize_key( wp_unslash( $_POST['mobo_price_type'] ) ) : (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
+		if ( 'dynamic-price' !== $type || ! class_exists( 'Mobo_Core_Dynamic_Price_Rules' ) ) {
+			return array();
+		}
+		return Mobo_Core_Dynamic_Price_Rules::coverage_problems( $this->collect_dynamic_price_rows_from_post() );
+	}
+
+	/**
+	 * Normalized dynamic rows from the posted form.
+	 *
+	 * @return array
+	 */
+	private function collect_dynamic_price_rows_from_post() {
 		$is_active_values    = isset( $_POST['mobo_dynamic_is_active'] ) && is_array( $_POST['mobo_dynamic_is_active'] ) ? wp_unslash( $_POST['mobo_dynamic_is_active'] ) : array();
 		$low_values          = isset( $_POST['mobo_dynamic_low'] ) && is_array( $_POST['mobo_dynamic_low'] ) ? wp_unslash( $_POST['mobo_dynamic_low'] ) : array();
 		$high_values         = isset( $_POST['mobo_dynamic_high'] ) && is_array( $_POST['mobo_dynamic_high'] ) ? wp_unslash( $_POST['mobo_dynamic_high'] ) : array();
@@ -12165,13 +12405,7 @@ https://source.example/products/test-product/
 			);
 		}
 
-		$rows = $this->normalize_dynamic_price_rows( $rows );
-
-		Mobo_Core_Settings::update(
-			'mobo_dynamic_price',
-			wp_json_encode( $rows, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ),
-			false
-		);
+		return $this->normalize_dynamic_price_rows( $rows );
 	}
 
 	/**
@@ -12417,6 +12651,34 @@ https://source.example/products/test-product/
 		?>
 		<script>
 			jQuery(function($) {
+				/* C5: money previews use the WooCommerce store currency label. */
+				var moboStoreCurrencyLabel = <?php echo wp_json_encode( $this->store_currency_label() ); ?>;
+
+				$(document).on('click', '[data-mobo-copy-target]', function(e) {
+					e.preventDefault();
+					var targetId = String($(this).data('mobo-copy-target') || '');
+					var $target = $('#' + targetId);
+					var $status = $('[data-mobo-copy-status="' + targetId + '"]');
+					var text = $target.length ? String($target.val() || '') : '';
+					function done(ok) {
+						$status.text(ok ? 'گزارش عیب‌یابی کپی شد.' : 'کپی خودکار ممکن نشد؛ متن را دستی انتخاب و کپی کنید.');
+						if (!ok) { $target.removeAttr('hidden').attr('aria-hidden', 'false').css({width: '100%', minHeight: '160px'}).trigger('select'); }
+					}
+					if (navigator.clipboard && window.isSecureContext) {
+						navigator.clipboard.writeText(text).then(function() { done(true); }, function() { done(false); });
+						return;
+					}
+					try {
+						$target.removeAttr('hidden');
+						$target.trigger('select');
+						var ok = document.execCommand('copy');
+						$target.attr('hidden', 'hidden');
+						done(ok);
+					} catch (err) {
+						done(false);
+					}
+				});
+
 				function normalizeMoboNumberInputs(context) {
 					var $context = context ? $(context) : $(document);
 					$context.find('input[type="number"]').attr('dir', 'ltr').css('text-align', 'left');
@@ -12590,7 +12852,7 @@ https://source.example/products/test-product/
 						}
 					}
 
-					$preview.text(formatted + ' تومان');
+					$preview.text(formatted + ' ' + moboStoreCurrencyLabel);
 				}
 
 				function updateAllPricePreviews(context) {
@@ -12871,6 +13133,12 @@ https://source.example/products/test-product/
 						$('[data-mobo-reprice-field="lastPostId"]').text(status.lastPostId || 0);
 						setRepriceMessage('lastMessage', status.lastMessage || '');
 						setRepriceMessage('lastError', status.lastError || '');
+						var $statusLine = $('[data-mobo-reprice-field="statusLine"]');
+						if ($statusLine.length) {
+							$statusLine.text(status.statusLine || '');
+							$statusLine.toggle(!!status.statusLine);
+							$statusLine.toggleClass('mobo-message-error', status.health === 'stalled').toggleClass('mobo-message-info', status.health !== 'stalled');
+						}
 						$('[data-mobo-reprice-updated-at]').text(status.serverTime ? 'آخرین بررسی: ' + status.serverTime : '');
 
 						var failed = parseInt(status.failed || 0, 10);

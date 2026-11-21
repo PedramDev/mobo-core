@@ -22,6 +22,7 @@ class Mobo_Core_Revenue_Ledger {
 
 	const ITEM_META_SOURCE_UNIT_COST   = '_mobo_revenue_source_unit_cost';
 	const ITEM_META_SOURCE_SNAPSHOT_AT = '_mobo_revenue_source_snapshot_at';
+	const ITEM_META_SOURCE_UNIT        = '_mobo_revenue_source_unit';
 
 	const OPTION_REVISION = 'mobo_core_revenue_ledger_revision';
 	const OPTION_CACHE    = 'mobo_core_revenue_summary_cache';
@@ -51,7 +52,7 @@ class Mobo_Core_Revenue_Ledger {
 		return array_values(
 			array_unique(
 				array_merge(
-					array( self::ITEM_META_SOURCE_UNIT_COST, self::ITEM_META_SOURCE_SNAPSHOT_AT ),
+					array( self::ITEM_META_SOURCE_UNIT_COST, self::ITEM_META_SOURCE_SNAPSHOT_AT, self::ITEM_META_SOURCE_UNIT ),
 					$identity_keys
 				)
 			)
@@ -117,14 +118,14 @@ class Mobo_Core_Revenue_Ledger {
 		}
 
 		$connection_id = absint( $identity['connectionId'] );
-		$callback = function () use ( $item, $product ) {
+		$callback = function () use ( $item, $product, $connection_id ) {
 			$cost = $this->get_source_unit_cost(
 				absint( $item->get_product_id() ),
 				absint( $item->get_variation_id() ),
 				$product
 			);
 			if ( null !== $cost ) {
-				$this->persist_item_cost_snapshot( $item, $cost );
+				$this->persist_item_cost_snapshot( $item, $cost, $connection_id );
 			}
 		};
 
@@ -216,7 +217,7 @@ class Mobo_Core_Revenue_Ledger {
 				continue;
 			}
 
-			$this->persist_item_cost_snapshot( $item, $cost );
+			$this->persist_item_cost_snapshot( $item, $cost, $connection_id );
 			$item_id = absint( $item->save() );
 			$stored_cost = $item_id > 0 && function_exists( 'wc_get_order_item_meta' )
 				? wc_get_order_item_meta( $item_id, self::ITEM_META_SOURCE_UNIT_COST, true )
@@ -316,6 +317,17 @@ class Mobo_Core_Revenue_Ledger {
 				$unit_cost = $this->get_item_cost_snapshot( $item );
 				if ( null === $unit_cost ) {
 					return new WP_Error( 'mobo_core_revenue_source_cost_missing', 'A Mobo line item has no immutable source cost snapshot.' );
+				}
+				/* C4: the snapshot is in the Source unit; the sale is in the order
+				 * currency. Legacy snapshots without a stored unit use the owning
+				 * Connection's current Source contract unit. */
+				$source_unit = (string) $item->get_meta( self::ITEM_META_SOURCE_UNIT, true );
+				if ( '' === $source_unit ) {
+					$source_unit = $this->source_unit_for_connection( $connection_id );
+				}
+				$unit_cost = self::convert_cost_to_order_currency( $unit_cost, $source_unit, (string) $order->get_currency() );
+				if ( null === $unit_cost ) {
+					return new WP_Error( 'mobo_core_revenue_currency_unconvertible', 'Source cost unit cannot be converted to the order currency.' );
 				}
 
 				$line_quantity = max( 0, (float) $item->get_quantity() );
@@ -660,9 +672,57 @@ class Mobo_Core_Revenue_Ledger {
 		);
 	}
 
-	private function persist_item_cost_snapshot( $item, $cost ) {
+	private function persist_item_cost_snapshot( $item, $cost, $connection_id = 0 ) {
 		$item->update_meta_data( self::ITEM_META_SOURCE_UNIT_COST, wc_format_decimal( $cost, 6 ) );
 		$item->update_meta_data( self::ITEM_META_SOURCE_SNAPSHOT_AT, time() );
+		/* C4: the snapshot is in the SOURCE unit; remember which one. */
+		$unit = $this->source_unit_for_connection( $connection_id );
+		if ( '' !== $unit ) {
+			$item->update_meta_data( self::ITEM_META_SOURCE_UNIT, $unit );
+		}
+	}
+
+	/** Source monetary unit of a Connection ('' when unknown). */
+	private function source_unit_for_connection( $connection_id ) {
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			return '';
+		}
+		$contract = Mobo_Core_Money_Policy::get_source_contract( absint( $connection_id ) );
+		return is_array( $contract ) ? (string) $contract['unit'] : '';
+	}
+
+	/**
+	 * C4: convert a Source-unit cost into the order currency before subtracting
+	 * it from the sale. Example: Source IRR, order IRT, cost 10,000,000 IRR ->
+	 * 1,000,000 IRT (not 10,000,000 IRT, which produced a -733% margin).
+	 *
+	 * @param float  $cost           Unit cost in the Source unit.
+	 * @param string $source_unit    Source unit ('' = unknown: unchanged).
+	 * @param string $order_currency WooCommerce order currency.
+	 * @return float|null Null when the pair cannot be converted.
+	 */
+	public static function convert_cost_to_order_currency( $cost, $source_unit, $order_currency ) {
+		$cost = max( 0, (float) $cost );
+		$normalize = static function ( $unit ) {
+			if ( class_exists( 'Mobo_Core_Money_Policy' ) ) {
+				return Mobo_Core_Money_Policy::normalize_unit( $unit );
+			}
+			$unit = strtoupper( trim( (string) $unit ) );
+			return in_array( $unit, array( 'TOMAN', 'TOMANS' ), true ) ? 'IRT' : $unit;
+		};
+		$from = $normalize( $source_unit );
+		$to = $normalize( $order_currency );
+		if ( '' === $from || '' === $to || $from === $to ) {
+			return $cost;
+		}
+		if ( ! class_exists( 'Mobo_Core_Money_Converter' ) ) {
+			return null;
+		}
+		$pair = Mobo_Core_Money_Converter::pair_definition( $from, $to );
+		if ( empty( $pair['supported'] ) || null === $pair['exponent'] ) {
+			return null;
+		}
+		return round( $cost * pow( 10, (int) $pair['exponent'] ), 6 );
 	}
 
 	private function get_item_cost_snapshot( $item ) {

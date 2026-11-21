@@ -236,6 +236,14 @@ final class Mobo_Core_Money_Policy {
 		}
 		// Distinguish unsaved default from an explicit administrator choice.
 		$chosen = get_option( Mobo_Core_Money_Target_Settings::OPTION, null );
+		/* C1: the catalog was priced in the Source unit and the store currency was
+		 * changed afterwards. Without this, every later Sync/Reprice failed closed
+		 * forever and the (now 10x wrong) prices could never be corrected. While a
+		 * detected post-sync currency change is pending, follow the WooCommerce
+		 * currency so the Reprice the admin is asked to run actually fixes prices. */
+		if ( null === $chosen && class_exists( 'Mobo_Core_Store_Currency_Guard' ) && Mobo_Core_Store_Currency_Guard::implicit_follow_store_allowed() ) {
+			$chosen = Mobo_Core_Money_Target_Settings::FOLLOW_WOO;
+		}
 		if ( null === $chosen || ! Mobo_Core_Money_Target_Settings::valid_preference( $chosen ) ) {
 			return new WP_Error( 'mobo_core_money_price_conversion_not_enabled', 'Currency conversion has not been explicitly selected.' );
 		}

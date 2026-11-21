@@ -72,6 +72,8 @@ final class Mobo_Core_Connection_Settings {
 			'global_additional_price',
 			'global_additional_percentage',
 			'mobo_dynamic_price',
+			'mobo_core_price_rounding_step',
+			'mobo_core_price_rounding_mode',
 			'mobo_core_excluded_product_urls',
 			'mobo_core_excluded_product_guid_urls',
 			'mobo_core_missing_variants_behavior',
@@ -453,6 +455,80 @@ final class Mobo_Core_Connection_Settings {
 			if ( ! self::set( $id, $key, get_option( $key, $fallback ) ) ) { return false; }
 		}
 		return self::migrate_dynamic_legacy_options( $id );
+	}
+
+	/**
+	 * Policy keys every Connection must own explicitly: product/update switches,
+	 * category mapping, pricing and order-automation policy.
+	 *
+	 * @return array<int,string>
+	 */
+	public static function policy_seed_keys() {
+		return array(
+			'mobo_core_only_in_stock',
+			'global_product_auto_stock',
+			'global_product_auto_price',
+			'global_product_auto_title',
+			'global_product_auto_compare_price',
+			'global_product_auto_slug',
+			'global_update_categories',
+			'global_update_images',
+			'global_product_auto_description',
+			'mobo_core_category_mapping_enabled',
+			'mobo_core_category_mapping_required',
+			'mobo_default_category_id',
+			'mobo_price_type',
+			'global_additional_price',
+			'global_additional_percentage',
+			'mobo_dynamic_price',
+			'mobo_core_price_rounding_step',
+			'mobo_core_price_rounding_mode',
+			'mobo_core_missing_variants_behavior',
+			'mobo_core_mobo_order_submission_enabled',
+			'mobo_core_mobo_order_auto_complete_enabled',
+		);
+	}
+
+	/**
+	 * Values a new Connection is initialized with: the documented defaults()
+	 * (what runtime already uses when a row is absent), never another
+	 * Connection's wp_options, plus explicit overrides.
+	 *
+	 * @param array $overrides key => value.
+	 * @return array<string,mixed>
+	 */
+	public static function new_connection_seed_values( $overrides = array() ) {
+		$defaults = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::defaults() : array();
+		$values = array();
+		foreach ( self::policy_seed_keys() as $key ) {
+			if ( array_key_exists( $key, $defaults ) ) {
+				$values[ $key ] = $defaults[ $key ];
+			}
+		}
+		foreach ( is_array( $overrides ) ? $overrides : array() as $key => $value ) {
+			if ( self::is_scoped_key( (string) $key ) ) {
+				$values[ (string) $key ] = $value;
+			}
+		}
+		return $values;
+	}
+
+	/**
+	 * B1: seed missing policy rows for a Connection so the admin UI and the
+	 * runtime read the same explicit values. Existing rows are never touched.
+	 *
+	 * @param int   $connection_id Connection id.
+	 * @param array $overrides     key => value.
+	 * @return bool
+	 */
+	public static function seed_policy_defaults( $connection_id, $overrides = array() ) {
+		$id = absint( $connection_id );
+		if ( $id <= 0 || ! self::table_exists() ) { return false; }
+		foreach ( self::new_connection_seed_values( $overrides ) as $key => $value ) {
+			if ( self::has( $id, $key ) ) { continue; }
+			if ( ! self::set( $id, $key, $value ) ) { return false; }
+		}
+		return true;
 	}
 
 	/** Migrate currently existing dynamic Source-owned options to Default. @return bool */

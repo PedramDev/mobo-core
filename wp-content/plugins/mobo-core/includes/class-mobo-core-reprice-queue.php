@@ -24,6 +24,15 @@ class Mobo_Core_Reprice_Queue {
 
 	const STATE_OPTION = 'mobo_core_reprice_state';
 
+	/** Durable marker: the Source has no sellable price for this object (B2/B15). */
+	const META_PRICE_UNAVAILABLE = '_mobo_price_unavailable';
+
+	/** Consecutive "product busy" defers on one item before it is skipped. */
+	const BLOCKED_SKIP_LIMIT = 20;
+
+	/** Diagnostics job key. */
+	const DIAG_JOB = 'reprice';
+
 	/**
 	 * Price calculator.
 	 *
@@ -32,10 +41,29 @@ class Mobo_Core_Reprice_Queue {
 	private $price_calculator;
 
 	/**
+	 * Price update policy (switches).
+	 *
+	 * @var Mobo_Core_Legacy_Rules
+	 */
+	private $rules;
+
+	/**
 	 * Constructor.
 	 */
 	public function __construct() {
-		$this->price_calculator = new Mobo_Core_Price_Calculator( new Mobo_Core_Legacy_Rules() );
+		$this->rules            = new Mobo_Core_Legacy_Rules();
+		$this->price_calculator = new Mobo_Core_Price_Calculator( $this->rules );
+	}
+
+	/**
+	 * B10: the global Reprice follows the same switches as Product Sync. When
+	 * both "update price" and "update compare price" are off the merchant manages
+	 * prices manually and Reprice must not overwrite them.
+	 *
+	 * @return bool
+	 */
+	public function price_updates_enabled() {
+		return $this->rules->should_update_price() || $this->rules->should_update_compare_price();
 	}
 
 	/**
@@ -51,6 +79,10 @@ class Mobo_Core_Reprice_Queue {
 			'percentage'  => (string) Mobo_Core_Settings::get( 'global_additional_percentage', '0' ),
 			'dynamic'     => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
 		);
+		/* B11: empty while rounding is "none" so existing generations stay valid. */
+		if ( class_exists( 'Mobo_Core_Price_Rounding' ) ) {
+			$policy = array_merge( $policy, Mobo_Core_Price_Rounding::fingerprint_fragment() );
+		}
 
 		/* C75B-P4G: Currency is part of a Reprice generation, not merely a
 		 * rendering preference. Read the RAW option: an unsaved default must
@@ -133,10 +165,22 @@ class Mobo_Core_Reprice_Queue {
 			'policyFingerprint' => $this->current_policy_fingerprint(),
 			'failureAttempts'   => array(),
 			'pendingParentIds' => array(),
+			'lastProgressAt'   => time(),
+			'blockedItem'      => 0,
+			'blockedCount'     => 0,
+			'budgetZeroStreak' => 0,
+			'batchLimitOverride' => 0,
+			'stalledReason'    => '',
 		);
 
 		if ( ! $this->persist_state_verified( $state ) ) {
 			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'وضعیت شروع صف به‌صورت پایدار ذخیره نشد؛ هیچ اجرای جدیدی تأیید نشد.' );
+		}
+
+		if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			$diag = Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB );
+			$diag->start_run( array( 'total' => absint( $total ), 'source' => sanitize_key( (string) $source ), 'priceUpdatesEnabled' => $this->price_updates_enabled() ) );
+			$diag->flush();
 		}
 
 		return array(
@@ -163,7 +207,7 @@ class Mobo_Core_Reprice_Queue {
 		try {
 		$state = $this->get_state();
 
-		if ( ! in_array( $state['status'], array( 'running', 'waiting' ), true ) ) {
+		if ( ! in_array( $state['status'], array( 'running', 'waiting', 'stalled' ), true ) ) {
 			return array( 'success' => true, 'message' => 'عملیات قیمت‌گذاری فعال نیست.' );
 		}
 
@@ -198,8 +242,8 @@ class Mobo_Core_Reprice_Queue {
 		try {
 			$state = $this->get_state();
 
-			if ( 'cancelled' !== $state['status'] ) {
-				return array( 'success' => false, 'status' => $state['status'], 'message' => 'فقط عملیات قیمت‌گذاری متوقف‌شده قابل ادامه است.' );
+			if ( ! in_array( $state['status'], array( 'cancelled', 'stalled' ), true ) ) {
+				return array( 'success' => false, 'status' => $state['status'], 'message' => 'فقط عملیات قیمت‌گذاری متوقف‌شده یا گیرکرده قابل ادامه است.' );
 			}
 
 			if ( ! $this->generation_matches_current_policy( $state ) ) {
@@ -214,7 +258,16 @@ class Mobo_Core_Reprice_Queue {
 			$state['status']       = 'running';
 			$state['completedAt']  = 0;
 			$state['updatedAt']    = time();
+			$state['lastProgressAt'] = time();
+			$state['stalledReason'] = '';
+			$state['budgetZeroStreak'] = 0;
 			$state['lastMessage']  = 'اعمال مجدد قیمت‌گذاری از آخرین checkpoint ادامه یافت.';
+			if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+				$diag = Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB );
+				$diag->touch_progress();
+				$diag->event( 'resume', 'Run resumed from checkpoint.', array( 'lastPostId' => absint( $state['lastPostId'] ) ) );
+				$diag->flush();
+			}
 
 			if ( ! $this->persist_state_verified( $state ) ) {
 				return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'وضعیت ادامه صف به‌صورت پایدار ذخیره نشد.' );
@@ -345,14 +398,25 @@ class Mobo_Core_Reprice_Queue {
 		if ( $limit <= 0 ) {
 			$limit = 20;
 		}
+		/* Watchdog "budget exhausted" recovery: process one item per slice until
+		 * progress resumes. */
+		if ( absint( $state['batchLimitOverride'] ) > 0 ) {
+			$limit = max( 1, min( $limit, absint( $state['batchLimitOverride'] ) ) );
+		}
 
 		$time_budget_seconds = null === $time_budget_seconds ? 0 : max( 1, min( 20, (int) $time_budget_seconds ) );
 		$deadline = $time_budget_seconds > 0 ? microtime( true ) + $time_budget_seconds : 0.0;
+
+		$diag = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB ) : null;
 
 		$ids = $this->get_next_item_ids( absint( $state['lastPostId'] ), $limit );
 
 		/* MOBO-4455: distinguish a database read failure from a genuinely empty queue. */
 		if ( is_wp_error( $ids ) ) {
+			if ( $diag ) {
+				$diag->error( $ids->get_error_message(), 0 );
+				$diag->flush();
+			}
 			return array(
 				'success'    => false,
 				'status'     => 'db-read-failed',
@@ -373,6 +437,7 @@ class Mobo_Core_Reprice_Queue {
 			if ( ! $this->persist_state_verified( $state ) ) {
 				return array( 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true, 'status' => 'checkpoint-failed', 'checkpointFailed' => true );
 			}
+			$this->on_generation_done( $state, $diag );
 
 			return array(
 				'processed' => 0,
@@ -421,10 +486,29 @@ class Mobo_Core_Reprice_Queue {
 				$reason = is_array( $result ) && isset( $result['reason'] ) ? sanitize_key( (string) $result['reason'] ) : '';
 
 				if ( in_array( $reason, array( 'product-sync-active', 'product-lock-busy' ), true ) ) {
-					/* A transient product lock must defer the cursor, not permanently skip this object. */
-					$retry_blocked = true;
-					$state['lastMessage'] = sprintf( 'قیمت‌گذاری محصول %d به دلیل همگام‌سازی هم‌زمان به اجرای بعد موکول شد.', $post_id );
-					break;
+					/* A transient product lock must defer the cursor, not permanently skip
+					 * this object. A lock that never goes away (dead sync, stale state)
+					 * must not pin the cursor forever either: after BLOCKED_SKIP_LIMIT
+					 * consecutive defers on the same item it is skipped and recorded. */
+					$state['blockedCount'] = absint( $state['blockedItem'] ) === $post_id ? absint( $state['blockedCount'] ) + 1 : 1;
+					$state['blockedItem']  = $post_id;
+					if ( absint( $state['blockedCount'] ) < self::BLOCKED_SKIP_LIMIT ) {
+						$retry_blocked = true;
+						$state['lastMessage'] = sprintf( 'قیمت‌گذاری محصول %d به دلیل همگام‌سازی هم‌زمان به اجرای بعد موکول شد (%d/%d).', $post_id, absint( $state['blockedCount'] ), self::BLOCKED_SKIP_LIMIT );
+						break;
+					}
+					if ( $diag ) {
+						$diag->poison( $post_id, 'product-busy:' . $reason, absint( $state['blockedCount'] ) );
+					}
+					$state['blockedItem']  = 0;
+					$state['blockedCount'] = 0;
+					$processed++;
+					$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
+					continue;
+				}
+				if ( absint( $state['blockedItem'] ) === $post_id ) {
+					$state['blockedItem']  = 0;
+					$state['blockedCount'] = 0;
 				}
 
 				$processed++;
@@ -444,6 +528,9 @@ class Mobo_Core_Reprice_Queue {
 			} catch ( Throwable $e ) {
 				$failed++;
 				$state['lastError'] = 'Reprice item ' . $post_id . ' failed (' . sanitize_key( get_class( $e ) ) . ').';
+				if ( $diag ) {
+					$diag->error( $e->getMessage(), $post_id, $e );
+				}
 				$key = (string) $post_id;
 				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
 				$state['failureAttempts'][ $key ] = $attempts;
@@ -455,6 +542,9 @@ class Mobo_Core_Reprice_Queue {
 				}
 
 				/* Persistent failures are surfaced but cannot block the entire store forever. */
+				if ( $diag ) {
+					$diag->poison( $post_id, 'exception:' . sanitize_key( get_class( $e ) ), $attempts );
+				}
 				unset( $state['failureAttempts'][ $key ] );
 				$processed++;
 				$state['lastPostId'] = max( absint( $state['lastPostId'] ), $post_id );
@@ -472,6 +562,9 @@ class Mobo_Core_Reprice_Queue {
 				$checkpoint['updated']     = absint( $state['updated'] ) + $updated;
 				$checkpoint['failed']      = absint( $state['failed'] ) + $failed;
 				$checkpoint['updatedAt']   = time();
+				if ( $processed > 0 ) {
+					$checkpoint['lastProgressAt'] = time();
+				}
 				$checkpoint['lastMessage'] = sprintf( 'در حال اعمال مجدد قیمت؛ آخرین شناسه بررسی‌شده: %d', $post_id );
 				if ( ! $this->persist_state_verified( $checkpoint ) ) {
 					$checkpoint_failed = true;
@@ -500,6 +593,17 @@ class Mobo_Core_Reprice_Queue {
 			$state['lastMessage'] = sprintf( 'در این مرحله %d مورد بررسی شد؛ %d مورد به‌روزرسانی شد.', $processed, $updated );
 		}
 
+		/* Watchdog bookkeeping: real forward progress vs. slices that never got to
+		 * process a single item. */
+		if ( $processed > 0 ) {
+			$state['lastProgressAt']     = time();
+			$state['budgetZeroStreak']   = 0;
+			$state['batchLimitOverride'] = 0;
+			$state['stalledReason']      = '';
+		} elseif ( $budget_exhausted ) {
+			$state['budgetZeroStreak'] = absint( $state['budgetZeroStreak'] ) + 1;
+		}
+
 		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || $checkpoint_failed || count( $ids ) >= $limit || ! empty( $state['pendingParentIds'] );
 
 		if ( $policy_changed_mid_batch && ! $checkpoint_failed && empty( $state['pendingParentIds'] ) ) {
@@ -516,6 +620,24 @@ class Mobo_Core_Reprice_Queue {
 		if ( ! $this->persist_state_verified( $state ) ) {
 			$checkpoint_failed = true;
 			$remaining = true;
+		}
+
+		if ( $diag ) {
+			$diag->progress( absint( $state['processed'] ), absint( $state['total'] ), absint( $state['lastPostId'] ), 'items' );
+			if ( $checkpoint_failed ) {
+				$diag->error( 'Queue checkpoint could not be persisted durably.', 0 );
+			}
+			if ( $retry_blocked && $processed <= 0 && '' !== (string) $state['lastMessage'] ) {
+				$diag->event( 'deferred', (string) $state['lastMessage'], array( 'lastPostId' => absint( $state['lastPostId'] ) ) );
+			}
+			if ( 'invalidated' === $state['status'] ) {
+				$diag->finish( 'invalidated' );
+			}
+		}
+		if ( 'done' === $state['status'] && ! $checkpoint_failed ) {
+			$this->on_generation_done( $state, $diag );
+		} elseif ( $diag ) {
+			$diag->flush();
 		}
 
 		return array(
@@ -625,8 +747,26 @@ class Mobo_Core_Reprice_Queue {
 		$processed = absint( $state['processed'] );
 		$percent   = $total_available && $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
 		$policy_changed = in_array( $state['status'], array( 'running', 'cancelled' ), true ) && ! $this->generation_matches_current_policy( $state );
+		$diagnosis = $this->diagnose_state( $state );
+		$diag_data = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB )->data() : array();
+		$last_error_detail = isset( $diag_data['lastError'] ) && is_array( $diag_data['lastError'] ) ? $diag_data['lastError'] : null;
+		$problem_item = absint( $diagnosis['itemId'] );
+		if ( $problem_item <= 0 ) {
+			$problem_item = $this->current_problem_item( $state );
+		}
 
 		return array(
+			'lastProgressAt'  => absint( $state['lastProgressAt'] ),
+			'stalledReason'   => 'stalled' === $diagnosis['health'] ? (string) $diagnosis['reason'] : '',
+			'health'          => (string) $diagnosis['health'],
+			'diagnosis'       => $diagnosis,
+			'statusLine'      => class_exists( 'Mobo_Core_Job_Diagnostics' )
+				? Mobo_Core_Job_Diagnostics::status_line_fa( $policy_changed ? 'invalidated' : $state['status'], $percent, $diagnosis )
+				: '',
+			'problemItemId'   => $problem_item,
+			'lastErrorDetail' => $last_error_detail,
+			'poisonCount'     => isset( $diag_data['poisonItems'] ) && is_array( $diag_data['poisonItems'] ) ? count( $diag_data['poisonItems'] ) : 0,
+			'priceUpdatesEnabled' => $this->price_updates_enabled(),
 			'status'          => $policy_changed ? 'invalidated' : $state['status'],
 			'total'           => $total,
 			'totalAvailable'  => $total_available,
@@ -646,6 +786,344 @@ class Mobo_Core_Reprice_Queue {
 			'policyChanged'   => $policy_changed,
 			'shouldContinue'  => ! $policy_changed && 'running' === $state['status'],
 		);
+	}
+
+	/**
+	 * Generation completed: close diagnostics and tell the currency guard (C1).
+	 *
+	 * @param array                          $state State.
+	 * @param Mobo_Core_Job_Diagnostics|null $diag  Diagnostics.
+	 */
+	private function on_generation_done( $state, $diag ) {
+		if ( $diag ) {
+			$diag->progress( absint( $state['processed'] ), absint( $state['total'] ), absint( $state['lastPostId'] ), 'items' );
+			$diag->finish( 'done' );
+			$diag->flush();
+		}
+		if ( class_exists( 'Mobo_Core_Store_Currency_Guard' ) && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			Mobo_Core_Store_Currency_Guard::note_reprice_completed(
+				absint( Mobo_Core_Connection_Context::get_effective_connection_id() ),
+				absint( $state['startedAt'] )
+			);
+		}
+	}
+
+	/** Item currently blocking the cursor (repeated failure or busy product). */
+	private function current_problem_item( $state ) {
+		$failing = 0;
+		$max = 0;
+		foreach ( is_array( $state['failureAttempts'] ) ? $state['failureAttempts'] : array() as $id => $attempts ) {
+			if ( absint( $attempts ) > $max ) {
+				$max = absint( $attempts );
+				$failing = absint( $id );
+			}
+		}
+		if ( $failing > 0 ) {
+			return $failing;
+		}
+		return absint( $state['blockedItem'] );
+	}
+
+	/**
+	 * Environment signals for the watchdog. Cheap: options and one lock read.
+	 *
+	 * @param array $state State.
+	 * @return array
+	 */
+	private function collect_watchdog_signals( $state ) {
+		$cron_last = absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'get_status' ) ) {
+			$self = Mobo_Core_Self_Runner::get_status();
+			$cron_last = max( $cron_last, absint( is_array( $self ) && isset( $self['lastRunAt'] ) ? $self['lastRunAt'] : 0 ) );
+		}
+		$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'reprice_queue_worker' ) : array();
+		$failing = 0;
+		$failing_attempts = 0;
+		foreach ( is_array( $state['failureAttempts'] ) ? $state['failureAttempts'] : array() as $id => $attempts ) {
+			if ( absint( $attempts ) > $failing_attempts ) {
+				$failing_attempts = absint( $attempts );
+				$failing = absint( $id );
+			}
+		}
+		$diag_data = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB )->data() : array();
+		return array(
+			'cronLastHitAt'    => $cron_last,
+			'lockActive'       => ! empty( $lock['active'] ),
+			'lockHeartbeatAt'  => absint( $lock['lastHeartbeatAt'] ?? 0 ),
+			'lockExpiresAt'    => absint( $lock['expiresAt'] ?? 0 ),
+			'failingItem'      => $failing,
+			'failingAttempts'  => $failing_attempts,
+			'blockedItem'      => absint( $state['blockedItem'] ),
+			'blockedCount'     => absint( $state['blockedCount'] ),
+			'blockedLimit'     => self::BLOCKED_SKIP_LIMIT,
+			'budgetZeroStreak' => absint( $state['budgetZeroStreak'] ),
+			'waitingBackend'   => false,
+			'upgradeActive'    => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active(),
+			'recoveries'       => isset( $diag_data['recoveries'] ) && is_array( $diag_data['recoveries'] ) ? $diag_data['recoveries'] : array(),
+		);
+	}
+
+	/** @return array Diagnosis for the stored state. */
+	private function diagnose_state( $state ) {
+		$fallback = array( 'health' => 'ok', 'reason' => '', 'action' => 'none', 'secondsSinceProgress' => 0, 'itemId' => 0, 'giveUp' => false );
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return $fallback;
+		}
+		$status = (string) $state['status'];
+		if ( ! in_array( $status, array( 'running', 'stalled' ), true ) ) {
+			return array_merge( $fallback, array( 'health' => 'idle' ) );
+		}
+		return Mobo_Core_Job_Diagnostics::diagnose( $state, $this->collect_watchdog_signals( $state ), time(), Mobo_Core_Job_Diagnostics::stall_seconds() );
+	}
+
+	/**
+	 * Self-healing watchdog. Safe to call often (cron round, admin status poll).
+	 * Acts only when a running generation made no progress for the configured
+	 * stall window; every automatic action is bounded: after MAX_AUTO_RECOVERIES
+	 * attempts of one reason without progress the generation becomes 'stalled'
+	 * with a precise reason instead of looping forever.
+	 *
+	 * @param string $context Caller label.
+	 * @return array Diagnosis plus the action performed.
+	 */
+	public function watchdog_tick( $context = 'cron' ) {
+		$state = $this->get_state();
+		if ( 'running' !== $state['status'] || ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return array( 'health' => 'idle', 'performed' => 'none' );
+		}
+		$diagnosis = $this->diagnose_state( $state );
+		if ( 'stalled' !== $diagnosis['health'] ) {
+			return array_merge( $diagnosis, array( 'performed' => 'none' ) );
+		}
+
+		if ( 'release_lock' === $diagnosis['action'] && class_exists( 'Mobo_Core_Lock' ) ) {
+			// A dead holder's lease: compare-and-delete only, never a live lease.
+			Mobo_Core_Lock::recover_stale_locks( array( 'reprice_queue_worker' ) );
+		}
+
+		$control_lock = Mobo_Core_Lock::acquire( 'reprice_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array_merge( $diagnosis, array( 'performed' => 'worker-busy' ) );
+		}
+		try {
+			$state = $this->get_state();
+			if ( 'running' !== $state['status'] ) {
+				return array( 'health' => 'idle', 'performed' => 'none' );
+			}
+			$diag = Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB );
+			$count = $diag->count_recovery( $diagnosis['reason'] );
+			$performed = 'none';
+
+			if ( ! empty( $diagnosis['giveUp'] ) || $count > Mobo_Core_Job_Diagnostics::MAX_AUTO_RECOVERIES ) {
+				$state['status']        = 'stalled';
+				$state['stalledReason'] = (string) $diagnosis['reason'];
+				$state['lastMessage']   = 'گیر کرده: ' . Mobo_Core_Job_Diagnostics::reason_fa( $diagnosis['reason'], $diagnosis['itemId'] );
+				$state['updatedAt']     = time();
+				$diag->set_stalled( $diagnosis['reason'] );
+				$diag->event( 'stalled', 'Automatic recovery gave up; operator action required.', array( 'reason' => $diagnosis['reason'], 'attempts' => $count, 'context' => $context ) );
+				$performed = 'marked-stalled';
+			} else {
+				switch ( $diagnosis['action'] ) {
+					case 'skip_item':
+						$item = absint( $diagnosis['itemId'] );
+						if ( $item > 0 ) {
+							$this->skip_item_in_state( $state, $item, $diagnosis['reason'], $diag );
+							$performed = 'skipped-item';
+						}
+						break;
+					case 'shrink_batch':
+						$state['batchLimitOverride'] = 1;
+						$state['budgetZeroStreak']   = 0;
+						$performed = 'shrunk-batch';
+						break;
+					case 'release_lock':
+						$performed = 'released-stale-lock';
+						break;
+					default:
+						if ( class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+							Mobo_Core_Self_Runner::kick( 'reprice-watchdog', false );
+						}
+						$performed = 'kicked-worker';
+						break;
+				}
+				$state['updatedAt'] = time();
+				$diag->event( 'watchdog', 'Automatic recovery: ' . $performed . '.', array( 'reason' => $diagnosis['reason'], 'attempt' => $count, 'itemId' => absint( $diagnosis['itemId'] ), 'context' => $context ) );
+			}
+			$this->persist_state_verified( $state );
+			$diag->flush();
+			return array_merge( $diagnosis, array( 'performed' => $performed ) );
+		} finally {
+			Mobo_Core_Lock::release( 'reprice_queue_worker', $control_lock );
+		}
+	}
+
+	/** Advance the cursor past one item and record it as skipped. */
+	private function skip_item_in_state( &$state, $item, $reason, $diag ) {
+		$item = absint( $item );
+		$attempts = absint( $state['failureAttempts'][ (string) $item ] ?? 0 );
+		unset( $state['failureAttempts'][ (string) $item ] );
+		if ( absint( $state['blockedItem'] ) === $item ) {
+			$attempts = max( $attempts, absint( $state['blockedCount'] ) );
+			$state['blockedItem']  = 0;
+			$state['blockedCount'] = 0;
+		}
+		/* The cursor is "last processed ID"; the next read starts after it. */
+		$state['lastPostId'] = max( absint( $state['lastPostId'] ), $item );
+		$state['processed']  = absint( $state['processed'] ) + 1;
+		$state['lastProgressAt'] = time();
+		if ( $diag ) {
+			$diag->poison( $item, (string) $reason, $attempts );
+		}
+	}
+
+	/**
+	 * Admin action «رد کردن مورد مشکل‌دار»: skip the item that blocks the
+	 * cursor and resume a stalled generation.
+	 *
+	 * @return array
+	 */
+	public function skip_problem_item() {
+		$control_lock = Mobo_Core_Lock::acquire( 'reprice_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'message' => 'Worker قیمت‌گذاری در حال پردازش است؛ چند ثانیه بعد دوباره تلاش کنید.' );
+		}
+		try {
+			$state = $this->get_state();
+			if ( ! in_array( $state['status'], array( 'running', 'stalled' ), true ) ) {
+				return array( 'success' => false, 'message' => 'اجرای فعالی برای رد کردن مورد وجود ندارد.' );
+			}
+			$item = $this->current_problem_item( $state );
+			if ( $item <= 0 ) {
+				return array( 'success' => false, 'message' => 'مورد مشکل‌داری شناسایی نشد.' );
+			}
+			$diag = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB ) : null;
+			$this->skip_item_in_state( $state, $item, 'skipped-by-admin', $diag );
+			$state['status']        = 'running';
+			$state['stalledReason'] = '';
+			$state['updatedAt']     = time();
+			$state['lastMessage']   = sprintf( 'محصول %d به درخواست مدیر رد شد و اجرا ادامه یافت.', $item );
+			if ( ! $this->persist_state_verified( $state ) ) {
+				return array( 'success' => false, 'message' => 'وضعیت صف ذخیره نشد.' );
+			}
+			if ( $diag ) {
+				$diag->touch_progress();
+				$diag->flush();
+			}
+			return array( 'success' => true, 'message' => $state['lastMessage'], 'itemId' => $item );
+		} finally {
+			Mobo_Core_Lock::release( 'reprice_queue_worker', $control_lock );
+		}
+	}
+
+	/**
+	 * Admin action «ادامه»: resume a stalled generation (or nudge a running one
+	 * that is stuck), then run one small inline batch so progress does not
+	 * depend on a cron that may not be firing.
+	 *
+	 * @return array
+	 */
+	public function admin_recover() {
+		$state = $this->get_state();
+		if ( 'stalled' === $state['status'] ) {
+			$resumed = $this->resume();
+			if ( empty( $resumed['success'] ) ) {
+				return $resumed;
+			}
+		} elseif ( 'running' !== $state['status'] ) {
+			return array( 'success' => false, 'message' => 'اجرای فعالی برای ادامه وجود ندارد.' );
+		}
+		$this->watchdog_tick( 'admin' );
+		$result = $this->process_batch( 5, 5 );
+		if ( class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+			Mobo_Core_Self_Runner::kick( 'admin-reprice-recover', true );
+		}
+		$processed = is_array( $result ) ? absint( $result['processed'] ?? 0 ) : 0;
+		return array(
+			'success' => true,
+			'message' => $processed > 0
+				? sprintf( 'اجرا ادامه یافت؛ %d مورد همین حالا پردازش شد.', $processed )
+				: 'اجرا ادامه یافت؛ اگر پیشرفتی دیده نشد، گزارش عیب‌یابی را کپی کنید.',
+		);
+	}
+
+	/** JSON-able support bundle for «کپی گزارش عیب‌یابی». No secrets. */
+	public function debug_bundle() {
+		$state = $this->get_state();
+		$status = $this->get_status();
+		$diag = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB )->data() : array();
+		$override = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( Mobo_Core_Product_Pricing_Policy::DIAG_JOB )->data() : array();
+		$extra = array(
+			'signals'          => $this->collect_watchdog_signals( $state ),
+			'stallSeconds'     => class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::stall_seconds() : 0,
+			'policyMatches'    => $this->generation_matches_current_policy( $state ),
+			'priceUpdatesOn'   => $this->price_updates_enabled(),
+			'rounding'         => class_exists( 'Mobo_Core_Price_Rounding' ) ? Mobo_Core_Price_Rounding::current_policy() : array(),
+			'currencyChange'   => class_exists( 'Mobo_Core_Store_Currency_Guard' ) ? Mobo_Core_Store_Currency_Guard::health_payload() : array(),
+			'storeUnit'        => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::store_unit() : '',
+			'pricingOverrides' => $override,
+			'cursor'           => array( 'lastPostId' => absint( $state['lastPostId'] ), 'failureAttempts' => $state['failureAttempts'], 'pendingParents' => array_values( (array) $state['pendingParentIds'] ) ),
+		);
+		return class_exists( 'Mobo_Core_Job_Diagnostics' )
+			? Mobo_Core_Job_Diagnostics::bundle( self::DIAG_JOB, $status, $diag, isset( $status['diagnosis'] ) ? $status['diagnosis'] : array(), $extra )
+			: array( 'status' => $status );
+	}
+
+	/** Compact payload for the health report (jobs.reprice). */
+	public function health_payload() {
+		/* State-only: no catalog COUNT query on every health build. */
+		$state = $this->get_state();
+		$diagnosis = $this->diagnose_state( $state );
+		$diag_data = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB )->data() : array();
+		$error = isset( $diag_data['lastError'] ) && is_array( $diag_data['lastError'] ) ? $diag_data['lastError'] : null;
+		$total = absint( $state['total'] );
+		$stalled = 'stalled' === $diagnosis['health'];
+		return array(
+			'status'         => $stalled ? 'stalled' : (string) $state['status'],
+			'progressPct'    => $total > 0 ? (float) min( 100, round( ( absint( $state['processed'] ) / $total ) * 100, 2 ) ) : 0.0,
+			'lastProgressAt' => absint( $state['lastProgressAt'] ) > 0 ? gmdate( 'c', absint( $state['lastProgressAt'] ) ) : null,
+			'stalledReason'  => $stalled ? (string) $diagnosis['reason'] : '',
+			'lastError'      => null === $error ? ( '' !== (string) $state['lastError'] ? array( 'message' => (string) $state['lastError'] ) : null ) : array(
+				'message'        => (string) ( $error['message'] ?? '' ),
+				'itemId'         => absint( $error['itemId'] ?? 0 ),
+				'exceptionClass' => (string) ( $error['exceptionClass'] ?? '' ),
+				'at'             => absint( $error['at'] ?? 0 ) > 0 ? gmdate( 'c', absint( $error['at'] ) ) : null,
+			),
+		);
+	}
+
+	/**
+	 * B8: reprice one product/variation now (admin edit of a per-variation
+	 * markup). Uses the same busy/lock checks as the queue and synchronizes the
+	 * variable parent afterwards.
+	 *
+	 * @param int $post_id Product or variation ID.
+	 * @return array{success:bool,reason:string,updated:bool}
+	 */
+	public function reprice_object_now( $post_id ) {
+		$post_id = absint( $post_id );
+		try {
+			$result = $this->reprice_object( $post_id, true );
+		} catch ( Throwable $e ) {
+			return array( 'success' => false, 'reason' => 'exception', 'updated' => false, 'message' => sanitize_text_field( $e->getMessage() ) );
+		}
+		$reason = is_array( $result ) && isset( $result['reason'] ) ? sanitize_key( (string) $result['reason'] ) : '';
+		if ( in_array( $reason, array( 'product-sync-active', 'product-lock-busy' ), true ) ) {
+			return array( 'success' => false, 'reason' => $reason, 'updated' => false );
+		}
+		$parent_id = is_array( $result ) ? absint( $result['parentId'] ?? 0 ) : 0;
+		if ( $parent_id > 0 && class_exists( 'WC_Product_Variable' ) ) {
+			$guid = $this->get_product_guid_for_lock( $parent_id );
+			$lock = '' !== $guid && class_exists( 'Mobo_Core_Product_Concurrency' ) ? Mobo_Core_Product_Concurrency::acquire_product_lock( $guid, 0, 60 ) : false;
+			if ( false !== $lock ) {
+				try {
+					WC_Product_Variable::sync( $parent_id );
+					wc_delete_product_transients( $parent_id );
+				} finally {
+					Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+				}
+			}
+		}
+		return array( 'success' => true, 'reason' => $reason, 'updated' => ! empty( $result['updated'] ) );
 	}
 
 	/**
@@ -701,7 +1179,7 @@ class Mobo_Core_Reprice_Queue {
 		/* Validate the entire desired family before changing the first storefront price. */
 		foreach ( $targets as $target_id ) {
 			$raw_price = get_post_meta( $target_id, 'mobo_api_price', true );
-			if ( '' === $raw_price || null === $raw_price ) {
+			if ( ( '' === $raw_price || null === $raw_price ) && '' === (string) get_post_meta( $target_id, self::META_PRICE_UNAVAILABLE, true ) ) {
 				return new WP_Error( 'mobo_core_family_reprice_source_missing', 'Stored Mobo source price is missing for object ' . $target_id . '.' );
 			}
 			$product = wc_get_product( $target_id );
@@ -730,7 +1208,7 @@ class Mobo_Core_Reprice_Queue {
 		$updated = 0;
 		try {
 			foreach ( $targets as $target_id ) {
-				$result = $this->reprice_object_locked( $target_id );
+				$result = $this->reprice_object_locked( $target_id, true );
 				if ( ! empty( $result['updated'] ) ) { $updated++; }
 			}
 			if ( $parent->is_type( 'variable' ) && class_exists( 'WC_Product_Variable' ) ) {
@@ -803,7 +1281,7 @@ class Mobo_Core_Reprice_Queue {
 	 * @param int $post_id Product/variation ID.
 	 * @return array
 	 */
-	private function reprice_object( $post_id ) {
+	private function reprice_object( $post_id, $explicit = false ) {
 		$post_id = absint( $post_id );
 
 		/*
@@ -848,16 +1326,16 @@ class Mobo_Core_Reprice_Queue {
 			}
 
 			try {
-				return $this->reprice_object_locked( $post_id );
+				return $this->reprice_object_locked( $post_id, $explicit );
 			} finally {
 				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
 			}
 		}
 
-		return $this->reprice_object_locked( $post_id );
+		return $this->reprice_object_locked( $post_id, $explicit );
 	}
 
-	private function reprice_object_locked( $post_id ) {
+	private function reprice_object_locked( $post_id, $explicit = false ) {
 		$post_id = absint( $post_id );
 
 		if ( ! $this->is_reprice_allowed_post( $post_id ) ) {
@@ -886,9 +1364,20 @@ class Mobo_Core_Reprice_Queue {
 			);
 		}
 
-		$raw_price = get_post_meta( $post_id, 'mobo_api_price', true );
+		/* B10: the global queue honours the "update price / compare price"
+		 * switches exactly like Product Sync, so manually managed prices are not
+		 * overwritten. Explicit per-object admin actions (product/variation markup
+		 * override) still apply because the admin asked for that object. */
+		if ( ! $explicit && ! $this->price_updates_enabled() ) {
+			return array( 'updated' => false, 'skipped' => true, 'reason' => 'price-sync-disabled' );
+		}
 
-		if ( '' === $raw_price || null === $raw_price ) {
+		$raw_price = get_post_meta( $post_id, 'mobo_api_price', true );
+		$unavailable_flag = (string) get_post_meta( $post_id, self::META_PRICE_UNAVAILABLE, true );
+
+		/* Legacy objects without a stored Source price are left untouched; an
+		 * object the Source explicitly marked "no price" is kept unpurchasable. */
+		if ( ( '' === $raw_price || null === $raw_price ) && '' === $unavailable_flag ) {
 			return array( 'updated' => false );
 		}
 
@@ -907,10 +1396,13 @@ class Mobo_Core_Reprice_Queue {
 			throw new RuntimeException( 'Stored Mobo source price is invalid for object ' . $post_id . ': ' . sanitize_text_field( (string) $pair['error'] ) );
 		}
 
+		/* B2/B15: zero/missing Source price => empty WooCommerce prices (not
+		 * purchasable), never a zero or stale price. */
+		$unavailable      = ! empty( $pair['unavailable'] );
 		$frontend_changed = false;
-		$desired_regular  = null !== $pair['regular_price'] && '' !== $pair['regular_price'] ? wc_format_decimal( $pair['regular_price'] ) : null;
-		$desired_sale     = isset( $pair['sale_price'] ) ? wc_format_decimal( $pair['sale_price'] ) : '';
-		$desired_active   = '' !== $desired_sale ? $desired_sale : $desired_regular;
+		$desired_regular  = $unavailable ? '' : ( null !== $pair['regular_price'] && '' !== $pair['regular_price'] ? wc_format_decimal( $pair['regular_price'] ) : null );
+		$desired_sale     = $unavailable ? '' : ( isset( $pair['sale_price'] ) ? wc_format_decimal( $pair['sale_price'] ) : '' );
+		$desired_active   = $unavailable ? '' : ( '' !== $desired_sale ? $desired_sale : $desired_regular );
 
 		if ( null !== $desired_regular && wc_format_decimal( $product->get_regular_price( 'edit' ) ) !== $desired_regular ) {
 			$product->set_regular_price( $pair['regular_price'] );
@@ -943,6 +1435,8 @@ class Mobo_Core_Reprice_Queue {
 			'mobo_calculated_regular_price' => null !== $desired_regular ? $pair['regular_price'] : '',
 			'mobo_calculated_sale_price'    => isset( $pair['sale_price'] ) ? $pair['sale_price'] : '',
 			'mobo_price_policy_type'         => $policy_type,
+			/* '' (no row written for never-flagged objects) once a valid price exists. */
+			self::META_PRICE_UNAVAILABLE    => $unavailable ? ( isset( $pair['unavailable_reason'] ) ? sanitize_key( (string) $pair['unavailable_reason'] ) : 'source-price-missing' ) : '',
 		);
 
 		$meta_changed = false;
@@ -1386,6 +1880,12 @@ class Mobo_Core_Reprice_Queue {
 			'policyFingerprint' => '',
 			'failureAttempts'   => array(),
 			'pendingParentIds' => array(),
+			'lastProgressAt'   => 0,
+			'blockedItem'      => 0,
+			'blockedCount'     => 0,
+			'budgetZeroStreak' => 0,
+			'batchLimitOverride' => 0,
+			'stalledReason'    => '',
 		);
 
 		return array_merge( $defaults, $state );

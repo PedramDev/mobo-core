@@ -485,6 +485,14 @@ add_action( 'untrashed_post', array( 'Mobo_Core_Storage_Reconciler', 'handle_unt
 /* Durable retry hook for per-product pricing overrides. The class stays lazy-loaded. */
 add_action( 'mobo_core_apply_product_pricing_override', array( 'Mobo_Core_Product_Pricing_Policy', 'handle_retry_action' ), 10, 2 );
 
+/* C1: notify-only guard for a WooCommerce currency change after prices were synced. Lazy-loaded. */
+add_action( 'update_option_woocommerce_currency', array( 'Mobo_Core_Store_Currency_Guard', 'on_currency_option_updated' ), 10, 2 );
+add_action( 'admin_notices', array( 'Mobo_Core_Store_Currency_Guard', 'render_notice' ) );
+add_action( 'admin_post_mobo_core_dismiss_currency_change', array( 'Mobo_Core_Store_Currency_Guard', 'handle_dismiss' ) );
+
+/* B23: excluded products keep selling with frozen price/stock; warn on their edit screen. */
+add_action( 'admin_notices', array( 'Mobo_Core_Product_Exclusions', 'render_product_edit_notice' ) );
+
 /**
  * Detect a REST request early enough for plugins_loaded gating.
  * REST_REQUEST itself is defined later during parse_request, so the URI fallback

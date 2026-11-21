@@ -15,6 +15,11 @@
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 final class Mobo_Core_Money_Price_Input_Plan {
+    /** Exact conversion only (staged preview / legacy behavior). */
+    const ROUNDING_EXACT = 'exact';
+    /** C2: ceiling to WooCommerce precision; store price never below Source cost. */
+    const ROUNDING_UP = 'up';
+
     private static function rejected( $code ) {
         return array( 'ok' => false, 'code' => $code, 'price' => null,
             'comparePrice' => null, 'sourceUnit' => '', 'targetUnit' => '',
@@ -36,9 +41,10 @@ final class Mobo_Core_Money_Price_Input_Plan {
      * @param string $woo_unit Actual WooCommerce checkout currency.
      * @param string $preference Validated store target preference.
      * @param int $woo_digits WooCommerce store price decimal precision (0..6).
+     * @param string $rounding ROUNDING_EXACT (reject inexact) or ROUNDING_UP.
      * @return array Canonical strings or a non-destructive rejection.
      */
-    public static function prepare( $price, $compare, $owner_id, $row, $woo_unit, $preference, $woo_digits ) {
+    public static function prepare( $price, $compare, $owner_id, $row, $woo_unit, $preference, $woo_digits, $rounding = self::ROUNDING_EXACT ) {
         if ( ! self::valid_id( $owner_id ) || ! is_array( $row ) ||
             ! isset( $row['id'] ) || ! self::valid_id( $row['id'] ) || (int) $row['id'] !== (int) $owner_id ) {
             return self::rejected( 'owner_connection_mismatch' );
@@ -69,23 +75,34 @@ final class Mobo_Core_Money_Price_Input_Plan {
         $target = (string) $check['target'];
         $src_unit = (string) $contract['unit'];
         $src_digits = (int) $contract['fractionDigits'];
-        $converted = Mobo_Core_Money_Converter::convert_exact( $price, $src_unit, $target, $src_digits, $woo_digits );
+        $round_up = self::ROUNDING_UP === $rounding;
+        /* C2: an IRR Source price that is not a multiple of 10 used to be rejected
+         * in a Toman store (1,234,565 IRR -> 123,456.5 IRT with 0 decimals), which
+         * kept the previous (stale) storefront price. Price inputs now round UP to
+         * the store precision: 123,456.5 -> 123,457 IRT (never below Source cost). */
+        $converted = $round_up
+            ? Mobo_Core_Money_Converter::convert_rounded( $price, $src_unit, $target, $src_digits, $woo_digits, 'up' )
+            : Mobo_Core_Money_Converter::convert_exact( $price, $src_unit, $target, $src_digits, $woo_digits );
         if ( empty( $converted['ok'] ) ) {
             return self::rejected( 'price_' . (string) $converted['code'] );
         }
         $compare_converted = null;
+        $compare_rounded = false;
         if ( null !== $compare && '' !== $compare ) {
-            $second = Mobo_Core_Money_Converter::convert_exact( $compare, $src_unit, $target, $src_digits, $woo_digits );
+            $second = $round_up
+                ? Mobo_Core_Money_Converter::convert_rounded( $compare, $src_unit, $target, $src_digits, $woo_digits, 'up' )
+                : Mobo_Core_Money_Converter::convert_exact( $compare, $src_unit, $target, $src_digits, $woo_digits );
             if ( empty( $second['ok'] ) ) {
                 return self::rejected( 'compare_' . (string) $second['code'] );
             }
             $compare_converted = (string) $second['amount'];
+            $compare_rounded = ! empty( $second['rounded'] );
         }
-        /* The current legacy calculator uses intval() for its base and dynamic
-         * range checks. Never let a fractional store-price be silently truncated.
-         * Decimal pricing needs a separate audited calculator migration. */
-        if ( false !== strpos( (string) $converted['amount'], '.' ) ||
-            ( null !== $compare_converted && false !== strpos( $compare_converted, '.' ) ) ) {
+        /* C3: the calculator keeps decimal precision (no intval truncation), so a
+         * fractional store amount within WooCommerce precision is valid input. The
+         * strict exact mode keeps its historical rejection for staged previews. */
+        if ( ! $round_up && ( false !== strpos( (string) $converted['amount'], '.' ) ||
+            ( null !== $compare_converted && false !== strpos( $compare_converted, '.' ) ) ) ) {
             return self::rejected( 'fractional_calculator_not_supported' );
         }
         return array(
@@ -97,6 +114,7 @@ final class Mobo_Core_Money_Price_Input_Plan {
             'targetUnit' => $target,
             'ownerConnectionId' => (int) $owner_id,
             'conversionPolicy' => (string) $converted['policy'],
+            'rounded' => ! empty( $converted['rounded'] ) || $compare_rounded,
             'runtimeEnabled' => false,
         );
     }

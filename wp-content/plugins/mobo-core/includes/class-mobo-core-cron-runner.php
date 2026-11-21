@@ -1231,6 +1231,22 @@ class Mobo_Core_Cron_Runner {
 		 * receive no execution time. Product-level locks still serialize them against
 		 * webhook/manual sync writes.
 		 */
+		/* Pricing self-healing (cheap; once per invocation): Reprice watchdog and
+		 * the per-product pricing override sweeper (B9). Both are bounded and
+		 * rate-limited and never throw into the runner. */
+		if ( 1 === absint( $round_number ) ) {
+			try {
+				if ( $this->option_state_is_running( 'mobo_core_reprice_state' ) && class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
+					$round['repriceWatchdog'] = ( new Mobo_Core_Reprice_Queue() )->watchdog_tick( 'cron' );
+				}
+				if ( class_exists( 'Mobo_Core_Product_Pricing_Policy' ) && method_exists( 'Mobo_Core_Product_Pricing_Policy', 'sweep_stuck_requests' ) ) {
+					$round['pricingOverrideSweep'] = Mobo_Core_Product_Pricing_Policy::sweep_stuck_requests( 20 );
+				}
+			} catch ( Throwable $e ) {
+				$round['pricingSelfHealError'] = sanitize_key( get_class( $e ) );
+			}
+		}
+
 		/* Reprice queue. */
 		$reprice_active = $this->option_state_is_running( 'mobo_core_reprice_state' );
 		if ( $reprice_active && class_exists( 'Mobo_Core_Reprice_Queue' ) && ! isset( $disabled_stages['repriceQueue'] ) && $allow_reprice_queue && ! $this->stage_circuit_open( $config, 'repriceQueue' ) ) {

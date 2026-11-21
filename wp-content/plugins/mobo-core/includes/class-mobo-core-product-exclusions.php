@@ -26,7 +26,11 @@ final class Mobo_Core_Product_Exclusions {
 	 * @return string
 	 */
 	public static function normalize_url( $url ) {
-		$url = trim( sanitize_text_field( (string) $url ) );
+		/* B4: sanitize_text_field() strips every %XX octet, so a Persian slug
+		 * copied from the browser (/product/%DA%AF...-a12) became /product/-a12.
+		 * Keep octets, then decode them so encoded and raw-Unicode spellings of
+		 * the same path produce one canonical key. */
+		$url = self::sanitize_source_url( $url );
 
 		if ( '' === $url ) {
 			return '';
@@ -53,10 +57,103 @@ final class Mobo_Core_Product_Exclusions {
 			return '';
 		}
 
+		$path = self::decode_path( $path );
+		if ( '' === $path ) {
+			return '';
+		}
+
 		$path = '/' . ltrim( $path, '/' );
 		$path = untrailingslashit( $path );
 
-		return strtolower( $path );
+		return self::lower( $path );
+	}
+
+	/**
+	 * Clean a Source URL/path for storage and comparison WITHOUT destroying
+	 * percent-encoded octets or Unicode letters. Removes tags, control characters
+	 * and surrounding/inner whitespace only.
+	 *
+	 * @param mixed $url Raw URL/path.
+	 * @return string
+	 */
+	public static function sanitize_source_url( $url ) {
+		if ( ! is_scalar( $url ) || is_bool( $url ) ) {
+			return '';
+		}
+		$url = (string) $url;
+		if ( function_exists( 'wp_check_invalid_utf8' ) ) {
+			$url = wp_check_invalid_utf8( $url, true );
+		}
+		$url = strip_tags( $url );
+		$url = preg_replace( '/[\x00-\x1F\x7F]+/', '', $url );
+		$url = trim( (string) $url );
+		/* Spaces are not valid inside a URL path; tolerate a copy/paste artefact. */
+		return (string) preg_replace( '/\s+/u', '', $url );
+	}
+
+	/**
+	 * Percent-decode a path when the result is valid UTF-8 and apply Unicode NFC
+	 * normalization when available. Undecodable input keeps its original octets
+	 * (lower-cased later), which still compares consistently.
+	 *
+	 * @param string $path Path.
+	 * @return string
+	 */
+	public static function decode_path( $path ) {
+		$path = (string) $path;
+		if ( false !== strpos( $path, '%' ) ) {
+			$decoded = rawurldecode( $path );
+			$valid = function_exists( 'mb_check_encoding' ) ? mb_check_encoding( $decoded, 'UTF-8' ) : (bool) preg_match( '//u', $decoded );
+			if ( $valid && false === strpos( $decoded, "\0" ) ) {
+				$path = $decoded;
+			}
+		}
+		if ( class_exists( 'Normalizer' ) ) {
+			$normalized = Normalizer::normalize( $path, Normalizer::FORM_C );
+			if ( is_string( $normalized ) && '' !== $normalized ) {
+				$path = $normalized;
+			}
+		}
+		return $path;
+	}
+
+	/** Unicode-safe lower-casing (ASCII-only strtolower on PHP 7.4 locales). */
+	private static function lower( $value ) {
+		return function_exists( 'mb_strtolower' ) ? mb_strtolower( (string) $value, 'UTF-8' ) : strtolower( (string) $value );
+	}
+
+	/**
+	 * Entries that look damaged by the historical sanitizer (octets removed):
+	 * a segment that starts/ends with '-' or contains '--'. Shown as an admin
+	 * warning so the merchant re-enters the original URL.
+	 *
+	 * @param array $paths Canonical paths.
+	 * @return array<int,string>
+	 */
+	public static function suspicious_paths( $paths ) {
+		$out = array();
+		foreach ( (array) $paths as $path ) {
+			foreach ( explode( '/', trim( (string) $path, '/' ) ) as $segment ) {
+				if ( '' !== $segment && ( '-' === $segment[0] || '-' === substr( $segment, -1 ) || false !== strpos( $segment, '--' ) ) ) {
+					$out[] = (string) $path;
+					break;
+				}
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Decoded last path segment, used to match an exclusion against the local
+	 * WooCommerce slug (WordPress stores Persian slugs percent-encoded).
+	 *
+	 * @param string $path Canonical path.
+	 * @return string
+	 */
+	public static function last_segment( $path ) {
+		$parts = explode( '/', trim( (string) $path, '/' ) );
+		$last = end( $parts );
+		return false === $last ? '' : (string) $last;
 	}
 
 	/**
@@ -91,7 +188,7 @@ final class Mobo_Core_Product_Exclusions {
 		$invalid_count = 0;
 
 		foreach ( $lines as $line ) {
-			$line = trim( sanitize_text_field( (string) $line ) );
+			$line = self::sanitize_source_url( $line );
 			if ( '' === $line ) {
 				continue;
 			}
@@ -151,8 +248,8 @@ final class Mobo_Core_Product_Exclusions {
 		}
 
 		foreach ( array( 'url', 'Url', 'productUrl', 'ProductUrl', 'product_url', 'path', 'Path' ) as $key ) {
-			if ( array_key_exists( $key, $payload ) ) {
-				$value = sanitize_text_field( (string) $payload[ $key ] );
+			if ( array_key_exists( $key, $payload ) && is_scalar( $payload[ $key ] ) ) {
+				$value = self::sanitize_source_url( $payload[ $key ] );
 				if ( '' !== trim( $value ) ) {
 					return $value;
 				}
@@ -233,7 +330,7 @@ final class Mobo_Core_Product_Exclusions {
 			return false;
 		}
 
-		$url = sanitize_text_field( (string) get_post_meta( $post_id, 'mobo_url', true ) );
+		$url = self::sanitize_source_url( get_post_meta( $post_id, 'mobo_url', true ) );
 		if ( '' !== $url && self::is_url_excluded( $url ) ) {
 			$guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
 			if ( $remember && '' !== $guid ) {
@@ -243,7 +340,64 @@ final class Mobo_Core_Product_Exclusions {
 		}
 
 		$guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
-		return '' !== $guid && self::is_product_guid_excluded( $guid );
+		if ( '' !== $guid && self::is_product_guid_excluded( $guid ) ) {
+			return true;
+		}
+
+		/* B4: older releases stored mobo_url through sanitize_text_field(), which
+		 * removed the percent-encoded Persian part. Compare the exclusion's decoded
+		 * last segment with the local WooCommerce slug as a second identity. */
+		return self::local_slug_matches_exclusion( $post_id );
+	}
+
+	/**
+	 * Whether the decoded local product slug equals the decoded last segment of
+	 * an exclusion that has at least two characters.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return bool
+	 */
+	public static function local_slug_matches_exclusion( $product_id ) {
+		$paths = self::get_excluded_urls();
+		if ( empty( $paths ) ) {
+			return false;
+		}
+		$post = get_post( absint( $product_id ) );
+		if ( ! $post instanceof WP_Post || '' === (string) $post->post_name ) {
+			return false;
+		}
+		$slug = self::lower( self::decode_path( (string) $post->post_name ) );
+		if ( function_exists( 'mb_strlen' ) ? mb_strlen( $slug, 'UTF-8' ) < 2 : strlen( $slug ) < 2 ) {
+			return false;
+		}
+		foreach ( $paths as $path ) {
+			if ( $slug === self::last_segment( $path ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** B23: warning on the edit screen of an excluded product. */
+	public static function render_product_edit_notice() {
+		if ( ! function_exists( 'get_current_screen' ) || ! current_user_can( 'edit_products' ) ) {
+			return;
+		}
+		$screen = get_current_screen();
+		if ( ! $screen || 'product' !== $screen->id || 'post' !== $screen->base ) {
+			return;
+		}
+		$post_id = isset( $_GET['post'] ) ? absint( wp_unslash( $_GET['post'] ) ) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only screen context.
+		if ( $post_id <= 0 || ! self::is_local_product_excluded( $post_id, false ) ) {
+			return;
+		}
+		echo '<div class="notice notice-warning"><p><strong>' . esc_html( 'MoboCore: این محصول در فهرست استثناهای همگام‌سازی است.' ) . '</strong> ';
+		echo esc_html( self::exclusion_warning_fa() ) . '</p></div>';
+	}
+
+	/** Persian explanation of what an exclusion does (and does not) do. */
+	public static function exclusion_warning_fa() {
+		return 'قیمت و موجودی این محصول دیگر از منبع به‌روزرسانی نمی‌شود و در آخرین مقدار منجمد می‌ماند، ولی محصول همچنان قابل خرید است. اگر قیمت یا موجودی منبع تغییر کند، سفارش ممکن است با قیمت قدیمی ثبت شود یا خرید از منبع شکست بخورد. قیمت و موجودی را دستی مدیریت کنید یا محصول را از استثنا خارج کنید.';
 	}
 
 	/**

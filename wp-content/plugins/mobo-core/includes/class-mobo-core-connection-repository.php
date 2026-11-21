@@ -387,8 +387,15 @@ final class Mobo_Core_Connection_Repository {
 		 * the safer defaults from day one: do not overwrite a store-managed title or
 		 * slug unless the administrator explicitly enables those settings later. */
 		if ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::table_exists() ) {
-			$title_seeded = Mobo_Core_Connection_Settings::set( $id, 'global_product_auto_title', '0' );
-			$slug_seeded  = Mobo_Core_Connection_Settings::set( $id, 'global_product_auto_slug', '0' );
+			/* B1: initialize EVERY policy setting explicitly (stock/price/compare/
+			 * image/category/order switches from the documented defaults), not only
+			 * title/slug. Admin tabs and runtime then read the same stored values,
+			 * so saving a tab without changes cannot silently switch updates off. */
+			$seeded = method_exists( 'Mobo_Core_Connection_Settings', 'seed_policy_defaults' )
+				? Mobo_Core_Connection_Settings::seed_policy_defaults( $id, array( 'global_product_auto_title' => '0', 'global_product_auto_slug' => '0' ) )
+				: ( Mobo_Core_Connection_Settings::set( $id, 'global_product_auto_title', '0' ) && Mobo_Core_Connection_Settings::set( $id, 'global_product_auto_slug', '0' ) );
+			$title_seeded = $seeded;
+			$slug_seeded  = $seeded;
 			if ( ! $title_seeded || ! $slug_seeded ) {
 				Mobo_Core_Connection_Settings::delete_all_for_connection( $id );
 				$wpdb->delete( self::table_name(), array( 'id' => $id ), array( '%d' ) );

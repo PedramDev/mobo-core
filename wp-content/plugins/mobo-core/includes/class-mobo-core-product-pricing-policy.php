@@ -20,6 +20,15 @@ final class Mobo_Core_Product_Pricing_Policy {
 	const META_PENDING_ERROR = '_mobo_pricing_override_pending_error';
 	const ACTION_RETRY = 'mobo_core_apply_product_pricing_override';
 	const TYPE_PERCENTAGE = 'percentage';
+	/* B9: bounded, crash-safe apply. Attempts are counted only once the shared
+	 * product lock is held (a busy lock is not a failed attempt). */
+	const META_ATTEMPTS = '_mobo_pricing_override_attempts';
+	const MAX_ATTEMPTS = 8;
+	/** Crash guard: a retry is scheduled BEFORE applying, so a killed PHP request resumes. */
+	const CRASH_GUARD_DELAY = 300;
+	const SWEEP_OPTION = 'mobo_core_pricing_override_last_sweep_at';
+	const SWEEP_INTERVAL = 300;
+	const DIAG_JOB = 'pricing_override';
 
 	public static function active_meta_keys() {
 		return array( self::META_ENABLED, self::META_TYPE, self::META_VALUE, self::META_UPDATED_AT );
@@ -165,7 +174,92 @@ final class Mobo_Core_Product_Pricing_Policy {
 		if ( ! self::persist_meta_verified( $product_id, self::META_PENDING, $payload ) ) {
 			return new WP_Error( 'mobo_core_pricing_override_request_persist_failed', 'Pricing override request could not be persisted durably.' );
 		}
+		delete_post_meta( $product_id, self::META_ATTEMPTS );
+		/* B9: register the durable retry BEFORE applying. If PHP is killed in the
+		 * middle of the family apply, this retry (and the cron sweeper) resumes the
+		 * same idempotent generation instead of leaving it pending forever. */
+		self::schedule_retry( $product_id, $connection_id, self::CRASH_GUARD_DELAY );
 		return self::apply_pending_request( $product_id, $token );
+	}
+
+	/** Number of real apply attempts for the current pending generation. */
+	public static function attempts( $product_id ) {
+		return absint( get_post_meta( absint( $product_id ), self::META_ATTEMPTS, true ) );
+	}
+
+	/** Schedule a retry only while the attempt budget is not exhausted. */
+	private static function schedule_retry_bounded( $product_id, $delay = 60 ) {
+		if ( self::attempts( $product_id ) >= self::MAX_ATTEMPTS ) {
+			self::set_pending_error( $product_id, sprintf( 'اعمال سود اختصاصی پس از %d تلاش ناموفق متوقف شد؛ خطای بالا را رفع و دوباره ذخیره کنید.', self::MAX_ATTEMPTS ) );
+			self::diag_event( 'gave-up', 'Pricing override apply stopped after the attempt limit.', array( 'productId' => absint( $product_id ), 'attempts' => self::attempts( $product_id ) ) );
+			return false;
+		}
+		return self::schedule_retry( $product_id, 0, $delay );
+	}
+
+	/**
+	 * B9 sweeper (cron): find pending requests of the current Connection that
+	 * have no scheduled retry (lost action, killed request) and re-schedule them.
+	 * Bounded per run and rate limited; exhausted requests are left for the admin.
+	 *
+	 * @param int  $limit Max products per run.
+	 * @param bool $force Ignore the rate limit.
+	 * @return array Summary.
+	 */
+	public static function sweep_stuck_requests( $limit = 20, $force = false ) {
+		global $wpdb;
+		$now = time();
+		$last = absint( get_option( self::SWEEP_OPTION, 0 ) );
+		if ( ! $force && $last > 0 && ( $now - $last ) < self::SWEEP_INTERVAL ) {
+			return array( 'status' => 'skipped-not-due' );
+		}
+		update_option( self::SWEEP_OPTION, $now, false );
+		$current_connection = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$limit = max( 1, min( 100, absint( $limit ) ) );
+		$wpdb->last_error = '';
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- bounded indexed meta_key probe.
+		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY meta_id ASC LIMIT %d", self::META_PENDING, $limit ) );
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			return array( 'status' => 'read-failed' );
+		}
+		$summary = array( 'status' => 'ok', 'pending' => count( $ids ), 'rescheduled' => 0, 'exhausted' => 0, 'otherConnection' => 0 );
+		foreach ( array_map( 'absint', $ids ) as $product_id ) {
+			$owner = self::resolve_owner_connection_id( $product_id );
+			if ( $current_connection > 0 && $owner > 0 && $owner !== $current_connection ) {
+				$summary['otherConnection']++;
+				continue;
+			}
+			if ( self::attempts( $product_id ) >= self::MAX_ATTEMPTS ) {
+				$summary['exhausted']++;
+				continue;
+			}
+			if ( self::has_scheduled_retry( $product_id, $owner ) ) {
+				continue;
+			}
+			if ( self::schedule_retry( $product_id, $owner, 30 ) ) {
+				$summary['rescheduled']++;
+				self::diag_event( 'rescheduled', 'Stuck pricing override request re-scheduled by the sweeper.', array( 'productId' => $product_id, 'attempts' => self::attempts( $product_id ) ) );
+			}
+		}
+		return $summary;
+	}
+
+	private static function has_scheduled_retry( $product_id, $connection_id ) {
+		$legacy_args = array( absint( $product_id ) );
+		$owned_args = array( absint( $product_id ), absint( $connection_id ) );
+		if ( function_exists( 'as_has_scheduled_action' ) ) {
+			return as_has_scheduled_action( self::ACTION_RETRY, $legacy_args, 'mobo-core' ) || as_has_scheduled_action( self::ACTION_RETRY, $owned_args, 'mobo-core' );
+		}
+		return false !== wp_next_scheduled( self::ACTION_RETRY, $legacy_args ) || false !== wp_next_scheduled( self::ACTION_RETRY, $owned_args );
+	}
+
+	private static function diag_event( $type, $message, $context = array() ) {
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return;
+		}
+		$diag = Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB );
+		$diag->event( $type, $message, $context );
+		$diag->flush();
 	}
 
 	/** Apply the currently pending generation under the durable owning Connection. */
@@ -229,6 +323,21 @@ final class Mobo_Core_Product_Pricing_Policy {
 			}
 			$mode = $current['mode'];
 			$value = $current['value'];
+
+			/* B9: count real attempts. A previous attempt that never cleared its
+			 * pending request was killed mid-apply; the family apply below is
+			 * idempotent (recomputes every member from the stored Source price), so
+			 * resuming converges the half-applied family. */
+			$previous_attempts = self::attempts( $product_id );
+			if ( $previous_attempts >= self::MAX_ATTEMPTS ) {
+				self::schedule_retry_bounded( $product_id );
+				return array( 'success' => false, 'status' => 'attempts-exhausted', 'queued' => false, 'message' => 'Pricing override attempt limit reached.' );
+			}
+			self::persist_meta_verified( $product_id, self::META_ATTEMPTS, (string) ( $previous_attempts + 1 ) );
+			if ( $previous_attempts > 0 ) {
+				self::diag_event( 'resume', 'Resuming a pricing override generation after an earlier failed or interrupted attempt.', array( 'productId' => $product_id, 'attempt' => $previous_attempts + 1 ) );
+			}
+
 			$active_snapshot = self::snapshot_meta( $product_id, self::active_meta_keys() );
 
 			$active_result = self::write_active_state( $product_id, $mode, $value );
@@ -236,7 +345,7 @@ final class Mobo_Core_Product_Pricing_Policy {
 				$active_restored = self::restore_meta_snapshot( $product_id, $active_snapshot );
 				$restore_suffix = $active_restored ? '' : ' Active pricing policy rollback could not be verified.';
 				self::set_pending_error( $product_id, $active_result->get_error_message() . $restore_suffix );
-				self::schedule_retry( $product_id );
+				self::schedule_retry_bounded( $product_id );
 				return array( 'success' => false, 'status' => 'persist-failed', 'queued' => true, 'message' => $active_result->get_error_message() . $restore_suffix );
 			}
 
@@ -247,7 +356,8 @@ final class Mobo_Core_Product_Pricing_Policy {
 				$message = is_wp_error( $repriced ) ? $repriced->get_error_message() : ( isset( $repriced['message'] ) ? (string) $repriced['message'] : 'Product repricing failed.' );
 				if ( ! $active_restored ) { $message .= ' Active pricing policy rollback could not be verified.'; }
 				self::set_pending_error( $product_id, $message );
-				self::schedule_retry( $product_id );
+				self::diag_event( 'error', $message, array( 'productId' => $product_id, 'attempt' => $previous_attempts + 1 ) );
+				self::schedule_retry_bounded( $product_id );
 				return array( 'success' => false, 'status' => 'reprice-failed', 'queued' => true, 'message' => $message );
 			}
 
@@ -261,10 +371,11 @@ final class Mobo_Core_Product_Pricing_Policy {
 				delete_post_meta( $product_id, self::META_PENDING );
 				if ( '' !== trim( (string) get_post_meta( $product_id, self::META_PENDING, true ) ) ) {
 					self::set_pending_error( $product_id, 'Pending request cleanup could not be verified.' );
-					self::schedule_retry( $product_id );
+					self::schedule_retry_bounded( $product_id );
 					return array( 'success' => false, 'status' => 'cleanup-failed', 'queued' => true );
 				}
 				delete_post_meta( $product_id, self::META_PENDING_ERROR );
+				delete_post_meta( $product_id, self::META_ATTEMPTS );
 			} elseif ( is_array( $after ) ) {
 				self::schedule_retry( $product_id );
 			}
@@ -286,12 +397,12 @@ final class Mobo_Core_Product_Pricing_Policy {
 		self::apply_pending_request( $product_id );
 	}
 
-	public static function schedule_retry( $product_id, $connection_id = 0 ) {
+	public static function schedule_retry( $product_id, $connection_id = 0, $delay = 60 ) {
 		$product_id = absint( $product_id );
 		$connection_id = absint( $connection_id );
 		if ( $connection_id <= 0 ) { $connection_id = self::resolve_owner_connection_id( $product_id ); }
 		if ( $product_id <= 0 || $connection_id <= 0 ) { return false; }
-		$timestamp = time() + 60;
+		$timestamp = time() + max( 1, absint( $delay ) );
 		$legacy_args = array( $product_id );
 		$owned_args = array( $product_id, $connection_id );
 		if ( function_exists( 'as_has_scheduled_action' ) && function_exists( 'as_schedule_single_action' ) ) {
@@ -336,6 +447,11 @@ final class Mobo_Core_Product_Pricing_Policy {
 			return new WP_Error( 'mobo_core_pricing_override_pending_owner_mismatch', 'Pending product pricing request does not match durable Connection ownership.' );
 		}
 		return array( 'token' => $token, 'mode' => $mode, 'value' => $value, 'connectionId' => $connection_id );
+	}
+
+	/** Public owner lookup (variation markup save, sweeper). */
+	public static function owner_connection_id( $product_id ) {
+		return self::resolve_owner_connection_id( $product_id );
 	}
 
 	/** Resolve the installation-global Woo Product owner without Default fallback in ready Multi-Connection runtime. */

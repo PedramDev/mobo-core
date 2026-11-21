@@ -64,12 +64,15 @@ class Mobo_Core_Price_Calculator {
 	 * @return array
 	 */
 	public function calculate_price_pair( $object_id, $price, $compare_price, $context, $parent_id = 0 ) {
-		if ( null === $price || '' === $price ) {
-			return array(
-				'regular_price' => null,
-				'sale_price'    => '',
-				'error'         => '',
-			);
+		/* B2/B15: a missing (null/empty), zero or negative Source price means the
+		 * Source has no sellable price. The object must become NOT purchasable
+		 * (empty WooCommerce price) until a valid price arrives. It must never be
+		 * sold at 0, at "markup only", or at a stale previous price. */
+		if ( self::is_unavailable_source_price( $price ) ) {
+			return self::unavailable_price_pair( null === $price || '' === $price ? 'source-price-missing' : 'source-price-not-positive' );
+		}
+		if ( self::is_unavailable_source_price( $compare_price ) ) {
+			$compare_price = null;
 		}
 
 		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
@@ -91,7 +94,8 @@ class Mobo_Core_Price_Calculator {
 			}
 			$plan = Mobo_Core_Money_Price_Input_Plan::prepare(
 				$price, $compare_price, $pricing_context['id'], $pricing_context['row'],
-				$pricing_context['store'], $pricing_context['preference'], $pricing_context['digits']
+				$pricing_context['store'], $pricing_context['preference'], $pricing_context['digits'],
+				Mobo_Core_Money_Price_Input_Plan::ROUNDING_UP
 			);
 			if ( empty( $plan['ok'] ) ) {
 				return $this->invalid_price_pair( 'Price input conversion rejected: ' . sanitize_key( (string) ( $plan['code'] ?? 'unknown' ) ) );
@@ -104,7 +108,7 @@ class Mobo_Core_Price_Calculator {
 				$object_id, $store_price, $store_compare, $context, $parent_id,
 				(float) $store_price, null === $store_compare ? null : (float) $store_compare
 			);
-			if ( empty( $pair['error'] ) ) {
+			if ( empty( $pair['error'] ) && empty( $pair['unavailable'] ) ) {
 				$pair['money_source_unit'] = (string) $plan['sourceUnit'];
 				$pair['money_store_unit'] = (string) $plan['targetUnit'];
 				$pair['money_converted_once'] = true;
@@ -181,7 +185,13 @@ class Mobo_Core_Price_Calculator {
 			? (string) $options['global_product_auto_compare_price']
 			: '0';
 
-		$base_price   = intval( $normalized_price );
+		/* C3: keep Source precision. The historical intval() silently truncated
+		 * decimal Source prices (19.99 -> 19) in the same-unit path. Integer prices
+		 * produce exactly the same output as before. */
+		if ( null === $normalized_price || (float) $normalized_price <= 0 ) {
+			return self::unavailable_price_pair( 'source-price-not-positive' );
+		}
+		$base_price   = (float) $normalized_price;
 		$regular_base = $base_price;
 		$sale_base    = '';
 
@@ -198,7 +208,7 @@ class Mobo_Core_Price_Calculator {
 			 * active price and sale is empty.
 			 */
 			if ( $normalized_compare_price > $normalized_price ) {
-				$regular_base = intval( $normalized_compare_price );
+				$regular_base = (float) $normalized_compare_price;
 				$sale_base    = $base_price;
 			}
 		}
@@ -216,11 +226,11 @@ class Mobo_Core_Price_Calculator {
 		$additional_price = $this->get_object_additional_price( $object_id );
 
 		if ( null !== $additional_price ) {
-			$regular_price = intval( $regular_base ) + $additional_price;
+			$regular_price = (float) $regular_base + $additional_price;
 			$sale_price    = '';
 
 			if ( '' !== $sale_base ) {
-				$sale_price = intval( $sale_base ) + $additional_price;
+				$sale_price = (float) $sale_base + $additional_price;
 			}
 
 			return $this->format_pair(
@@ -310,11 +320,11 @@ class Mobo_Core_Price_Calculator {
 			? intval( $options['global_additional_price'] )
 			: 0;
 
-		$regular_price = intval( $regular_base ) + $static_price;
+		$regular_price = (float) $regular_base + $static_price;
 		$sale_price    = '';
 
 		if ( '' !== $sale_base ) {
-			$sale_price = intval( $sale_base ) + $static_price;
+			$sale_price = (float) $sale_base + $static_price;
 		}
 
 		return $this->format_pair(
@@ -423,34 +433,23 @@ class Mobo_Core_Price_Calculator {
 			);
 		}
 
+		/* Range selection keeps the historical integer semantics: rows are
+		 * contiguous integers (next.low = previous.high + 1), a high of 0 means
+		 * "no upper limit" and the first active matching row wins. */
 		$api_price     = intval( $raw_price );
-		$regular_price = intval( $regular_base );
+		$regular_price = (float) $regular_base;
 		$sale_price    = $sale_base;
+		$applied_type  = 'dynamic-price';
 
-		foreach ( $conditions as $condition ) {
-			if ( ! is_array( $condition ) ) {
-				continue;
-			}
+		$condition = class_exists( 'Mobo_Core_Dynamic_Price_Rules' ) ? Mobo_Core_Dynamic_Price_Rules::match( $conditions, $api_price ) : null;
+		if ( null === $condition && class_exists( 'Mobo_Core_Dynamic_Price_Rules' ) ) {
+			/* B12: a gap (disabled row, capped last row) must not silently sell at
+			 * cost. Fall back to the base markup: the nearest active rule. */
+			$condition    = Mobo_Core_Dynamic_Price_Rules::fallback( $conditions, $api_price );
+			$applied_type = 'dynamic-price-fallback';
+		}
 
-			$is_active = isset( $condition['is_active'] )
-				? sanitize_text_field( (string) $condition['is_active'] )
-				: 'false';
-
-			$low  = isset( $condition['low'] ) ? intval( $condition['low'] ) : 0;
-			$high = isset( $condition['high'] ) ? intval( $condition['high'] ) : 0;
-
-			if ( 'true' !== $is_active ) {
-				continue;
-			}
-
-			/*
-			 * A high value of 0 means "no upper limit".
-			 * Dynamic rows are inclusive, so the next row should start from previous high + 1.
-			 */
-			if ( $api_price < $low || ( $high > 0 && $api_price > $high ) ) {
-				continue;
-			}
-
+		if ( is_array( $condition ) ) {
 			$benefit_type = isset( $condition['benefit_type'] )
 				? sanitize_key( (string) $condition['benefit_type'] )
 				: 'static';
@@ -481,7 +480,7 @@ class Mobo_Core_Price_Calculator {
 				$raw_price,
 				$raw_compare_price,
 				$options,
-				'dynamic-price',
+				$applied_type,
 				$context
 			);
 		}
@@ -547,6 +546,14 @@ class Mobo_Core_Price_Calculator {
 		$regular_price = is_numeric( $regular_price ) ? max( 0, (float) $regular_price ) : null;
 		$sale_price    = is_numeric( $sale_price ) ? max( 0, (float) $sale_price ) : '';
 
+		/* B11: optional rounding after markup, in store currency. The default
+		 * ("none") keeps the historical output unchanged. */
+		if ( class_exists( 'Mobo_Core_Price_Rounding' ) ) {
+			$rounded       = Mobo_Core_Price_Rounding::round_pair( $regular_price, $sale_price );
+			$regular_price = $rounded[0];
+			$sale_price    = $rounded[1];
+		}
+
 		$pair = array(
 			'regular_price' => null === $regular_price ? null : wc_format_decimal( $regular_price ),
 			'sale_price'    => '' === $sale_price ? '' : wc_format_decimal( $sale_price ),
@@ -610,6 +617,50 @@ class Mobo_Core_Price_Calculator {
 		return class_exists( 'Mobo_Core_Money_Policy' )
 			? Mobo_Core_Money_Policy::normalize_source_number( $value )
 			: null;
+	}
+
+	/**
+	 * Whether a raw Source price means "no sellable price": null, empty, a
+	 * numeric zero or a numeric negative value. Malformed text is NOT treated as
+	 * unavailable; it remains a fail-closed validation error.
+	 *
+	 * @param mixed $value Raw Source price.
+	 * @return bool
+	 */
+	public static function is_unavailable_source_price( $value ) {
+		if ( null === $value ) {
+			return true;
+		}
+		if ( is_bool( $value ) || ! is_scalar( $value ) ) {
+			return false;
+		}
+		$raw = trim( str_replace( array( "\xC2\xA0", ' ' ), '', (string) $value ) );
+		if ( '' === $raw ) {
+			return true;
+		}
+		$candidate = str_replace( ',', '.', $raw );
+		if ( ! is_numeric( $candidate ) ) {
+			return false;
+		}
+		return (float) $candidate <= 0;
+	}
+
+	/**
+	 * Pair that clears every WooCommerce price: the object stays visible but is
+	 * not purchasable (WooCommerce requires a non-empty price to sell).
+	 *
+	 * @param string $reason Reason code.
+	 * @return array
+	 */
+	public static function unavailable_price_pair( $reason = 'source-price-missing' ) {
+		return array(
+			'regular_price'      => '',
+			'sale_price'         => '',
+			'error'              => '',
+			'unavailable'        => true,
+			'unavailable_reason' => sanitize_key( (string) $reason ),
+			'policy_type'        => 'source-price-unavailable',
+		);
 	}
 
 	/** @return array */

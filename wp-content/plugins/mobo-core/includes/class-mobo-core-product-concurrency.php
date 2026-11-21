@@ -217,7 +217,25 @@ class Mobo_Core_Product_Concurrency {
 
 		$updated_at = isset( $state['updatedAt'] ) ? absint( $state['updatedAt'] ) : 0;
 
-		return 0 === $updated_at || ( time() - $updated_at ) < HOUR_IN_SECONDS;
+		/* B27: a state without a heartbeat (updatedAt = 0) is stale, not busy.
+		 * Treating it as busy pinned Reprice/Recategorize on this product forever. */
+		return self::sync_heartbeat_is_fresh( $updated_at, time() );
+	}
+
+	/**
+	 * Whether a manual-sync heartbeat proves an active worker.
+	 *
+	 * @param int $updated_at Heartbeat timestamp (0 = none).
+	 * @param int $now        Current time.
+	 * @return bool
+	 */
+	public static function sync_heartbeat_is_fresh( $updated_at, $now ) {
+		$updated_at = absint( $updated_at );
+		if ( $updated_at <= 0 ) {
+			return false;
+		}
+		$age = absint( $now ) - $updated_at;
+		return $age >= -300 && $age < HOUR_IN_SECONDS;
 	}
 
 	/**
