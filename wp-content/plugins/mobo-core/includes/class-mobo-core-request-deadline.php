@@ -208,6 +208,42 @@ final class Mobo_Core_Request_Deadline {
 	}
 
 	/**
+	 * Free request-local caches (memory pressure only): Mobo's row cache, the
+	 * WordPress runtime object cache (only when no persistent object cache is in
+	 * use, so a shared Redis/Memcached is never wiped) and PHP cycles.
+	 *
+	 * @return void
+	 */
+	public static function release_request_memory() {
+		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
+			Mobo_Core_Storage_Row_Cache::flush_all();
+		}
+		$external = function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache();
+		if ( ! $external && function_exists( 'wp_cache_flush_runtime' ) ) {
+			wp_cache_flush_runtime();
+		}
+		if ( function_exists( 'gc_collect_cycles' ) ) {
+			gc_collect_cycles();
+		}
+	}
+
+	/**
+	 * Memory guard for long per-item loops: at >= $soft of memory_limit release the
+	 * request caches once; report true (stop now) only if still >= $hard afterwards.
+	 *
+	 * @param float $soft Share that triggers a cache release.
+	 * @param float $hard Share that stops the loop.
+	 * @return bool True when the caller must stop.
+	 */
+	public static function memory_guard( $soft = 0.6, $hard = 0.75 ) {
+		if ( ! self::memory_pressure( $soft ) ) {
+			return false;
+		}
+		self::release_request_memory();
+		return self::memory_pressure( $hard );
+	}
+
+	/**
 	 * php.ini shorthand bytes ("256M") to bytes; -1/empty/unparseable => 0 (unlimited/unknown).
 	 *
 	 * @param mixed $value Raw value.

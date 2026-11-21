@@ -647,12 +647,9 @@ class Mobo_Core_Migration {
 				/* Runtime-30s: never start another unit at >= 75 % of memory_limit (two
 				 * 256 MB fatals on griffinstore). Drop request-local caches once and stop
 				 * if that does not help; the durable cursors resume next request. */
-				if ( $iterations > 0 && class_exists( 'Mobo_Core_Request_Deadline' ) && Mobo_Core_Request_Deadline::memory_pressure( 0.75 ) ) {
-					self::release_request_memory();
-					if ( Mobo_Core_Request_Deadline::memory_pressure( 0.75 ) ) {
-						$memory_stopped = true;
-						break;
-					}
+				if ( $iterations > 0 && class_exists( 'Mobo_Core_Request_Deadline' ) && Mobo_Core_Request_Deadline::memory_guard( 0.6, 0.75 ) ) {
+					$memory_stopped = true;
+					break;
 				}
 				$iterations++;
 				if ( 1 === $iterations ) {
@@ -736,26 +733,6 @@ class Mobo_Core_Migration {
 	}
 
 
-
-	/**
-	 * Free request-local caches between migration units (memory pressure only).
-	 * The WordPress runtime cache is flushed only when no persistent object cache
-	 * is in use, so a shared Redis/Memcached cache is never wiped.
-	 *
-	 * @return void
-	 */
-	private static function release_request_memory() {
-		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
-			Mobo_Core_Storage_Row_Cache::flush_all();
-		}
-		$external = function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache();
-		if ( ! $external && function_exists( 'wp_cache_flush_runtime' ) ) {
-			wp_cache_flush_runtime();
-		}
-		if ( function_exists( 'gc_collect_cycles' ) ) {
-			gc_collect_cycles();
-		}
-	}
 
 	/** @return bool */
 	private static function deferred_release_repairs_pending() {

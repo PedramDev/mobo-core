@@ -535,5 +535,19 @@ check( 'a write to the table invalidates the cached row (fresh read after write)
 $GLOBALS['wpdb'] = $saved_wpdb;
 Mobo_Core_Storage_Row_Cache::reset();
 
+
+echo "\n[18] memory guard used by the scan / migration loops\n";
+$old_limit = Mobo_Core_Environment::ini( 'memory_limit', '256M' );
+$usage     = Mobo_Core_Environment::memory_usage( true );
+if ( $usage > 0 ) {
+	ini_set( 'memory_limit', (string) (int) ceil( $usage * 1.1 ) );
+	check( 'usage ~90 % of the limit -> guard says stop (after releasing caches)', true === $D::memory_guard( 0.6, 0.75 ) );
+	ini_set( 'memory_limit', (string) (int) ceil( $usage * 4 ) );
+	check( 'usage 25 % of the limit -> guard lets the loop continue', false === $D::memory_guard( 0.6, 0.75 ) );
+	ini_set( 'memory_limit', $old_limit );
+}
+check( 'unlimited memory_limit -> never stops', ( ini_set( 'memory_limit', '-1' ) || true ) && false === $D::memory_guard( 0.6, 0.75 ) );
+ini_set( 'memory_limit', $old_limit );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed (PHP " . PHP_VERSION . ")\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );

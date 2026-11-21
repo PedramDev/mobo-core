@@ -1140,6 +1140,14 @@ global $wpdb;
 					$deadline_hit = true;
 					break;
 				}
+				/* Structure checks load WooCommerce product objects (+ children, terms,
+				 * posts) into the runtime cache: ~18 MB/s on griffinstore until the 256 MB
+				 * fatal. Release caches at 60 % and stop the slice at 75 %. */
+				if ( $done_in_chunk > 0 && class_exists( 'Mobo_Core_Request_Deadline' ) && Mobo_Core_Request_Deadline::memory_guard( 0.6, 0.75 ) ) {
+					$deadline_hit = true;
+					$out['memoryStopped'] = true;
+					break;
+				}
 				$operational['currentProducts']++;
 				self::classify_operational_rows( array( $row ), $context, false, $limit, $operational, $lists );
 				$cursor = max( $cursor, absint( $row['map_id'] ?? 0 ) );
