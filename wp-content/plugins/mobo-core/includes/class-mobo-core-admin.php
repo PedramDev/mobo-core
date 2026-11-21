@@ -34,6 +34,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_init', array( $this, 'activate_admin_connection_context' ), 1 );
 		/* 10.34.77: database migration progress / marked-product notice (manage_options only). */
 		add_action( 'admin_notices', array( 'Mobo_Core_Migration_Quarantine', 'render_admin_notice' ) );
+		/* utf8mb3 tables: recommend the manual utf8mb4 conversion tool. */
+		add_action( 'admin_notices', array( $this, 'render_db_charset_notice' ) );
 		/* Support access: "پشتیبانی" tab handlers, request/Source notices, expiry. */
 		Mobo_Core_Support_Admin::register_hooks();
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
@@ -56,6 +58,7 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_start_database_unicode_migration', array( $this, 'handle_start_database_unicode_migration' ) );
 		add_action( 'admin_post_mobo_core_resume_database_unicode_migration', array( $this, 'handle_resume_database_unicode_migration' ) );
 		add_action( 'admin_post_mobo_core_pause_database_unicode_migration', array( $this, 'handle_pause_database_unicode_migration' ) );
+		add_action( 'admin_post_mobo_core_precheck_database_unicode_migration', array( $this, 'handle_precheck_database_unicode_migration' ) );
 		add_action( 'admin_post_mobo_core_tool_test_mobo_login', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_clear_mobo_debug_log', array( $this, 'handle_admin_tool_action' ) );
 		add_action( 'admin_post_mobo_core_tool_clear_shipping_diagnostics', array( $this, 'handle_admin_tool_action' ) );
@@ -3980,6 +3983,69 @@ type:{mobo_order_type_label}</textarea>
 
 
 	/**
+	 * Pre-check report, downtime warning, progress bar and per-table results.
+	 *
+	 * @param array $migration Migration status.
+	 * @return void
+	 */
+	private function render_unicode_conversion_panel( $migration ) {
+		$migration = is_array( $migration ) ? $migration : array();
+		$precheck  = class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ? Mobo_Core_Database_Unicode_Migration::get_precheck() : array();
+		$server    = isset( $precheck['server'] ) && is_array( $precheck['server'] ) ? $precheck['server'] : array();
+		$total     = absint( $migration['totalTables'] ?? 0 );
+		$cursor    = absint( $migration['cursor'] ?? 0 );
+		$percent   = $total > 0 ? min( 100, (int) round( $cursor * 100 / $total ) ) : 0;
+		$labels    = array( 'converted' => 'تبدیل شد', 'already' => 'از قبل utf8mb4', 'skipped' => 'رد شد', 'failed' => 'خطا' );
+		?>
+		<div class="mobo-alert mobo-alert-warning" style="margin-top:12px">
+			<strong>هشدار توقف موقت (Downtime):</strong> تبدیل هر جدول با <code dir="ltr">ALTER TABLE … CONVERT</code> یک نسخه کامل از جدول می‌سازد و در این مدت نوشتن روی همان جدول (مثلاً ثبت سفارش یا ویرایش محصول) مسدود می‌شود. روی MySQL 5.7 و MariaDB قدیمی این زمان طولانی‌تر است. تبدیل را در ساعات کم‌بازدید انجام دهید.
+			<br><strong>Backup:</strong> افزونه روی این هاست نمی‌تواند از دیتابیس نسخه پشتیبان بگیرد؛ قبل از شروع از طریق پنل هاست (phpMyAdmin / cPanel / DirectAdmin) Backup کامل بگیرید.
+			<br>تبدیل فقط با کلیک شما و جدول‌به‌جدول انجام می‌شود (اول جدول‌های دسته‌بندی و جدول‌های Mobo، سپس کوچک‌ترها) و هیچ تبدیل خودکاری وجود ندارد. wp-config.php ویرایش نمی‌شود؛ اگر DB_CHARSET هنوز utf8 است پس از تبدیل آن را دستی روی <code dir="ltr">utf8mb4</code> بگذارید.
+		</div>
+		<?php if ( $total > 0 ) : ?>
+			<div style="margin-top:12px;background:#eee;border-radius:4px;height:14px;overflow:hidden" aria-label="پیشرفت تبدیل"><div style="background:#2271b1;height:14px;width:<?php echo esc_attr( (string) $percent ); ?>%"></div></div>
+			<p class="mobo-help"><?php echo esc_html( sprintf( 'پیشرفت: %d از %d جدول (%d%%).', $cursor, $total, $percent ) ); ?></p>
+		<?php endif; ?>
+		<?php if ( ! empty( $migration['tableResults'] ) && is_array( $migration['tableResults'] ) ) : ?>
+			<table class="widefat striped" style="margin-top:8px"><thead><tr><th>جدول</th><th>نتیجه</th><th>ردیف قبل/بعد</th><th>زمان (ثانیه)</th><th>توضیح/خطا</th></tr></thead><tbody>
+			<?php foreach ( array_slice( $migration['tableResults'], -100, null, true ) as $table => $row ) : ?>
+				<tr>
+					<td dir="ltr"><?php echo esc_html( (string) $table ); ?></td>
+					<td><?php echo esc_html( $labels[ (string) ( $row['status'] ?? '' ) ] ?? (string) ( $row['status'] ?? '' ) ); ?></td>
+					<td dir="ltr"><?php echo esc_html( isset( $row['rowsBefore'] ) ? (string) $row['rowsBefore'] . ' / ' . (string) ( $row['rowsAfter'] ?? '—' ) : '—' ); ?></td>
+					<td dir="ltr"><?php echo esc_html( isset( $row['seconds'] ) ? (string) $row['seconds'] : '—' ); ?></td>
+					<td><?php echo esc_html( (string) ( $row['error'] ?? '' ) . ( ! empty( $row['rowFormatDynamic'] ) ? ' (ROW_FORMAT=DYNAMIC)' : '' ) ); ?></td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody></table>
+		<?php endif; ?>
+		<?php if ( ! empty( $precheck['success'] ) ) : ?>
+			<details class="mobo-collapsible-log" style="margin-top:12px" <?php echo in_array( (string) ( $migration['status'] ?? 'idle' ), array( 'idle', '' ), true ) ? 'open' : ''; ?>>
+				<summary><?php echo esc_html( sprintf( 'نتیجه پیش‌بررسی (%s)', wp_date( 'Y-m-d H:i', absint( $precheck['checkedAt'] ?? 0 ) ) ) ); ?></summary>
+				<p><?php echo esc_html( sprintf( 'سرور: %s | charset اتصال: %s | DB_CHARSET: %s | charset پیش‌فرض دیتابیس: %s', (string) ( $server['version'] ?? '—' ), (string) ( $precheck['connectionCharset'] ?? '—' ), (string) ( $precheck['configCharset'] ?? '—' ), (string) ( $precheck['databaseCharset'] ?? '—' ) ) ); ?></p>
+				<p><?php echo esc_html( sprintf( 'جدول‌های نیازمند تبدیل: %d | از قبل utf8mb4: %d | غیرقابل تبدیل به‌خاطر طول ایندکس: %d | حجم: %s | زمان تقریبی کل: %s', absint( $precheck['tablesToConvert'] ?? 0 ), absint( $precheck['tablesAlreadyUtf8mb4'] ?? 0 ), absint( $precheck['tablesSkippedByIndex'] ?? 0 ), size_format( absint( $precheck['totalBytes'] ?? 0 ) ), human_time_diff( 0, max( 1, absint( $precheck['totalEstimatedSeconds'] ?? 0 ) ) ) ) ); ?></p>
+				<?php if ( ! empty( $server['oldServer'] ) ) : ?><div class="mobo-alert mobo-alert-error">این سرور MySQL/MariaDB قدیمی است (قبل از MySQL 5.7.7 / MariaDB 10.2.2)؛ تبدیل کندتر است و جدول‌ها در طول تبدیل قفل می‌شوند.</div><?php endif; ?>
+				<table class="widefat striped"><thead><tr><th>#</th><th>جدول</th><th>Engine / Row format</th><th>Collation فعلی</th><th>ستون‌های غیر utf8mb4</th><th>حجم</th><th>ردیف (تقریبی)</th><th>زمان تقریبی</th><th>روش</th></tr></thead><tbody>
+				<?php foreach ( (array) ( $precheck['entries'] ?? array() ) as $i => $entry ) : ?>
+					<tr>
+						<td><?php echo esc_html( (string) ( $i + 1 ) ); ?></td>
+						<td dir="ltr"><?php echo esc_html( (string) $entry['table'] ); ?></td>
+						<td dir="ltr"><?php echo esc_html( (string) $entry['engine'] . ' / ' . (string) $entry['rowFormat'] ); ?></td>
+						<td dir="ltr"><?php echo esc_html( (string) $entry['collation'] ); ?></td>
+						<td dir="ltr"><?php echo esc_html( implode( ', ', array_slice( (array) $entry['badColumns'], 0, 6 ) ) ); ?></td>
+						<td dir="ltr"><?php echo esc_html( size_format( absint( $entry['bytes'] ) ) ); ?></td>
+						<td dir="ltr"><?php echo esc_html( number_format_i18n( absint( $entry['rows'] ) ) ); ?></td>
+						<td dir="ltr"><?php echo esc_html( absint( $entry['estimatedSeconds'] ) . 's' ); ?></td>
+						<td><?php echo esc_html( 'skip' === $entry['strategy'] ? 'رد می‌شود: ' . (string) $entry['reason'] : ( 'convert_dynamic' === $entry['strategy'] ? 'تبدیل + ROW_FORMAT=DYNAMIC' : 'تبدیل' ) ); ?></td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody></table>
+			</details>
+		<?php endif; ?>
+		<?php
+	}
+
+	/**
 	 * Start the explicit utf8mb4 database remediation workflow.
 	 *
 	 * @return void
@@ -3992,6 +4058,12 @@ type:{mobo_order_type_label}</textarea>
 
 		if ( ! class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ) {
 			$this->redirect_with_message( 'موتور تبدیل Unicode دیتابیس در دسترس نیست.', 'error', 'health' );
+		}
+		if ( ! Mobo_Core_Database_Unicode_Migration::precheck_is_fresh() ) {
+			$this->redirect_with_message( 'ابتدا «پیش‌بررسی دیتابیس» را اجرا و نتیجه را مطالعه کنید (اعتبار پیش‌بررسی یک ساعت است).', 'warning', 'health' );
+		}
+		if ( empty( $_POST['mobo_backup_confirmed'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Nonce verified above.
+			$this->redirect_with_message( 'برای شروع، تأیید کنید که از دیتابیس نسخه پشتیبان (Backup) گرفته‌اید.', 'warning', 'health' );
 		}
 
 		$current = Mobo_Core_Database_Unicode_Migration::get_status();
@@ -4016,7 +4088,7 @@ type:{mobo_order_type_label}</textarea>
 		if ( 'awaiting-config' === $status ) {
 			$this->redirect_with_message( 'تبدیل فیزیکی دیتابیس کامل شد. اکنون DB_CHARSET را در wp-config.php روی utf8mb4 قرار دهید و سپس «بررسی مجدد» را اجرا کنید.', 'warning', 'health' );
 		}
-		$this->redirect_with_message( 'فرآیند تبدیل utf8mb4 شروع شد. هر اجرا فقط یک مرز DDL را انجام می‌دهد و ادامه توسط Cron کنترل‌شده انجام می‌شود.', 'success', 'health' );
+		$this->redirect_with_message( $this->unicode_step_message( $result ), ! empty( $result['blocked'] ) ? 'warning' : 'success', 'health' );
 	}
 
 	/**
@@ -4046,7 +4118,93 @@ type:{mobo_order_type_label}</textarea>
 		if ( 'awaiting-config' === $status ) {
 			$this->redirect_with_message( 'دیتابیس تبدیل شده است اما wp-config.php/اتصال جاری هنوز utf8mb4 نیست. DB_CHARSET را اصلاح و دوباره بررسی کنید.', 'warning', 'health' );
 		}
-		$this->redirect_with_message( 'Checkpoint تبدیل Unicode ادامه پیدا کرد.', 'success', 'health' );
+		$this->redirect_with_message( $this->unicode_step_message( $result ), ! empty( $result['blocked'] ) || ! empty( $result['stepLocked'] ) ? 'warning' : 'success', 'health' );
+	}
+
+	/**
+	 * Persian summary of one manual conversion step.
+	 *
+	 * @param array $result Step result.
+	 * @return string
+	 */
+	private function unicode_step_message( $result ) {
+		$result = is_array( $result ) ? $result : array();
+		$status = sanitize_key( (string) ( $result['status'] ?? '' ) );
+		if ( ! empty( $result['blocked'] ) || ! empty( $result['stepLocked'] ) ) {
+			return (string) ( $result['lastError'] ?? 'مرحله اجرا نشد؛ دوباره تلاش کنید.' );
+		}
+		if ( 'partial' === $status ) {
+			return 'تبدیل به پایان رسید اما بعضی جدول‌ها تبدیل نشدند؛ خطای هر جدول در جدول نتایج آمده است.';
+		}
+		if ( 'paused' === $status ) {
+			return 'تبدیل متوقف شد؛ هر زمان خواستید «ادامه» را بزنید.';
+		}
+		return sprintf(
+			'مرحله انجام شد: %d از %d جدول. %s',
+			absint( $result['cursor'] ?? 0 ),
+			absint( $result['totalTables'] ?? 0 ),
+			! empty( $result['nextTable'] ) ? 'جدول بعدی: ' . sanitize_text_field( (string) $result['nextTable'] ) . ' — برای ادامه «تبدیل جدول بعدی» را بزنید.' : ''
+		);
+	}
+
+	/**
+	 * Run the read-only pre-check (charset, sizes, server version, estimate).
+	 *
+	 * @return void
+	 */
+	public function handle_precheck_database_unicode_migration() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ), '', array( 'response' => 403 ) );
+		}
+		check_admin_referer( 'mobo_core_precheck_database_unicode_migration', 'mobo_core_nonce' );
+		if ( ! class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ) {
+			$this->redirect_with_message( 'موتور تبدیل Unicode دیتابیس در دسترس نیست.', 'error', 'health' );
+		}
+		$precheck = Mobo_Core_Database_Unicode_Migration::precheck();
+		if ( empty( $precheck['success'] ) ) {
+			$this->redirect_with_message( 'پیش‌بررسی ناموفق بود: ' . sanitize_text_field( (string) ( $precheck['error'] ?? '' ) ), 'error', 'health' );
+		}
+		$this->redirect_with_message( 'پیش‌بررسی انجام شد؛ نتیجه را در بخش «تبدیل دیتابیس به utf8mb4» مطالعه کنید.', 'success', 'health' );
+	}
+
+	/**
+	 * Admin notice on Mobo pages + dashboard when WP tables cannot hold
+	 * four-byte characters. Uses the 6h cached column snapshot (cheap).
+	 *
+	 * @return void
+	 */
+	public function render_db_charset_notice() {
+		if ( ! current_user_can( 'manage_options' ) || ! class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			return;
+		}
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+		$screen_id = is_object( $screen ) && isset( $screen->id ) ? (string) $screen->id : '';
+		if ( 'dashboard' !== $screen_id && false === strpos( $screen_id, self::MENU_SLUG ) ) {
+			return;
+		}
+		try {
+			$snapshot = Mobo_Core_Unicode_Guard::snapshot();
+		} catch ( Throwable $e ) {
+			return;
+		}
+		if ( 'ok' === $snapshot['status'] ) {
+			return;
+		}
+		$url = $this->admin_page_url( array( 'tab' => 'health' ) );
+		?>
+		<div class="notice notice-warning">
+			<p><strong>MoboCore:</strong>
+			<?php
+			echo esc_html(
+				sprintf(
+					'%d ستون از جدول‌های دیتابیس وردپرس از ایموجی/کاراکترهای ۴ بایتی پشتیبانی نمی‌کند (utf8/utf8mb3). همگام‌سازی متوقف نمی‌شود و این کاراکترها موقتاً جایگزین می‌شوند، اما برای نمایش دقیق عنوان‌ها توصیه می‌شود پس از گرفتن Backup، ابزار «تبدیل دیتابیس به utf8mb4» را دستی اجرا کنید.',
+					count( $snapshot['unsupportedColumns'] )
+				)
+			);
+			?>
+			<a href="<?php echo esc_url( $url ); ?>">باز کردن ابزار تبدیل</a></p>
+		</div>
+		<?php
 	}
 
 	/**
@@ -4158,6 +4316,8 @@ type:{mobo_order_type_label}</textarea>
 			'paused' => 'متوقف‌شده با حفظ Checkpoint',
 			'failed' => 'متوقف‌شده به‌علت خطا',
 			'awaiting-config' => 'منتظر اصلاح wp-config.php',
+			'ready' => 'آماده تبدیل جدول بعدی (دستی)',
+			'partial' => 'کامل با خطا در بعضی جدول‌ها',
 			'completed' => 'کامل و تأییدشده',
 			'unavailable' => 'در دسترس نیست',
 		);
@@ -4227,6 +4387,10 @@ type:{mobo_order_type_label}</textarea>
 		}
 		if ( 'failed' === $database_unicode_migration_status ) {
 			$danger_notices[] = 'فرآیند تبدیل utf8mb4 در یک checkpoint متوقف شده است. خطای ثبت‌شده را بررسی و فقط پس از رفع علت، Resume کنید.';
+		} elseif ( 'partial' === $database_unicode_migration_status ) {
+			$warning_notices[] = 'تبدیل utf8mb4 تمام شد اما بعضی جدول‌ها تبدیل نشدند؛ جدول نتایج را بررسی کنید. همگام‌سازی با جایگزینی کاراکترهای ۴ بایتی ادامه دارد.';
+		} elseif ( 'ready' === $database_unicode_migration_status ) {
+			$warning_notices[] = 'تبدیل utf8mb4 نیمه‌کاره است و فقط با کلیک دستی ادامه پیدا می‌کند («تبدیل جدول بعدی»).';
 		} elseif ( 'awaiting-config' === $database_unicode_migration_status ) {
 			$warning_notices[] = 'تبدیل فیزیکی دیتابیس انجام شده اما wp-config.php/اتصال جاری هنوز utf8mb4 را اثبات نمی‌کند.';
 		} elseif ( 'paused' === $database_unicode_migration_status ) {
@@ -4637,38 +4801,44 @@ type:{mobo_order_type_label}</textarea>
 							<?php $this->status_box( 'آخرین جدول کامل‌شده', ! empty( $database_unicode_migration['lastCompletedTable'] ) ? (string) $database_unicode_migration['lastCompletedTable'] : '—' ); ?>
 						</div>
 
-						<div class="mobo-alert mobo-alert-warning" style="margin-top:12px">
-							<strong>قبل از شروع:</strong> Backup معتبر دیتابیس توصیه می‌شود. ALTER TABLE روی جدول بزرگ می‌تواند زمان‌بر باشد. افزونه wp-config.php را ویرایش نمی‌کند؛ اگر DB_CHARSET هنوز utf8/utf8mb3 باشد، بعد از تبدیل فیزیکی باید آن را دستی روی <code dir="ltr">utf8mb4</code> قرار دهید.
-						</div>
+						<?php $this->render_unicode_conversion_panel( $database_unicode_migration ); ?>
 
 						<?php if ( ! empty( $database_unicode_migration['lastError'] ) ) : ?>
 							<div class="mobo-alert mobo-alert-error" style="margin-top:12px"><strong>آخرین وضعیت/خطا:</strong> <?php echo esc_html( (string) $database_unicode_migration['lastError'] ); ?></div>
 						<?php endif; ?>
 
 						<div class="mobo-actions" style="margin-top:12px">
-							<?php if ( $database_unicode_migration_active ) : ?>
+							<?php if ( $database_unicode_migration_active || 'ready' === $database_unicode_migration_status ) : ?>
 								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
 									<input type="hidden" name="action" value="mobo_core_resume_database_unicode_migration">
 									<?php wp_nonce_field( 'mobo_core_resume_database_unicode_migration', 'mobo_core_nonce' ); ?>
-									<button type="submit" class="mobo-btn mobo-btn-light">اجرای یک مرحله الآن</button>
+									<button type="submit" class="mobo-btn mobo-btn-primary">تبدیل جدول بعدی<?php echo ! empty( $database_unicode_migration['nextTable'] ) ? ' (' . esc_html( (string) $database_unicode_migration['nextTable'] ) . ')' : ''; ?></button>
 								</form>
 								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
 									<input type="hidden" name="action" value="mobo_core_pause_database_unicode_migration">
 									<?php wp_nonce_field( 'mobo_core_pause_database_unicode_migration', 'mobo_core_nonce' ); ?>
-									<button type="submit" class="mobo-btn mobo-btn-light">Pause در مرز امن</button>
+									<button type="submit" class="mobo-btn mobo-btn-light">توقف (Pause)</button>
 								</form>
-							<?php elseif ( in_array( $database_unicode_migration_status, array( 'paused', 'failed', 'awaiting-config' ), true ) ) : ?>
+							<?php elseif ( in_array( $database_unicode_migration_status, array( 'paused', 'failed', 'partial', 'awaiting-config' ), true ) ) : ?>
 								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
 									<input type="hidden" name="action" value="mobo_core_resume_database_unicode_migration">
 									<?php wp_nonce_field( 'mobo_core_resume_database_unicode_migration', 'mobo_core_nonce' ); ?>
 									<button type="submit" class="mobo-btn mobo-btn-primary"><?php echo 'awaiting-config' === $database_unicode_migration_status ? 'بررسی مجدد بعد از اصلاح wp-config.php' : 'ادامه از Checkpoint'; ?></button>
 								</form>
 							<?php elseif ( ! $database_unicode_ok ) : ?>
-								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('تبدیل دیتابیس به utf8mb4 شروع شود؟ قبل از ادامه داشتن Backup معتبر توصیه می‌شود.');">
+								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1">
+									<input type="hidden" name="action" value="mobo_core_precheck_database_unicode_migration">
+									<?php wp_nonce_field( 'mobo_core_precheck_database_unicode_migration', 'mobo_core_nonce' ); ?>
+									<button type="submit" class="mobo-btn mobo-btn-light">پیش‌بررسی دیتابیس</button>
+								</form>
+								<?php if ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) && Mobo_Core_Database_Unicode_Migration::precheck_is_fresh() ) : ?>
+								<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('تبدیل دیتابیس به utf8mb4 شروع شود؟ در حین تبدیل هر جدول، نوشتن روی همان جدول مسدود است.');">
 									<input type="hidden" name="action" value="mobo_core_start_database_unicode_migration">
 									<?php wp_nonce_field( 'mobo_core_start_database_unicode_migration', 'mobo_core_nonce' ); ?>
-									<button type="submit" class="mobo-btn mobo-btn-primary">شروع تبدیل کنترل‌شده utf8mb4</button>
+									<label style="display:block;margin-bottom:6px"><input type="checkbox" name="mobo_backup_confirmed" value="1" required> از دیتابیس نسخه پشتیبان (Backup) کامل گرفته‌ام.</label>
+									<button type="submit" class="mobo-btn mobo-btn-primary">شروع تبدیل دستی utf8mb4 (اولین جدول)</button>
 								</form>
+								<?php endif; ?>
 							<?php else : ?>
 								<span class="mobo-admin-badge mobo-admin-badge--success">نیازی به Migration نیست</span>
 							<?php endif; ?>
@@ -8774,6 +8944,12 @@ https://source.example/products/test-product/
 			}
 
 			$category_map->update_manual_mapping( $remote_guid, $term_id );
+		}
+
+		/* Products that received a temporary category while their Source category
+		 * was unmapped get the newly mapped category now (bounded, cron-driven). */
+		if ( class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			Mobo_Core_Recategorize_Queue::maybe_start_pending_reapply( 'manual-mapping-save' );
 		}
 	}
 

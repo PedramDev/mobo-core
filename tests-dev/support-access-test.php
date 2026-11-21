@@ -280,7 +280,7 @@ unset( $GLOBALS['mobo_test_filters']['mobo_core_support_public_key'] );
 
 /* ------------------------------------------------------------------ */
 echo "Readiness computation\n";
-$keys = array( 'support_access', 'source_account', 'hosting_access', 'cron', 'loopback', 'php_version', 'migration', 'plugin_integrity' );
+$keys = array( 'support_access', 'source_account', 'hosting_access', 'cron', 'loopback', 'php_version', 'migration', 'plugin_integrity', 'db_charset' );
 $good = $S::compute_readiness(
 	array(
 		'now' => $now, 'supportStatus' => 'granted', 'sourceStatus' => 'ok', 'hostingStatus' => 'provided',
@@ -288,11 +288,12 @@ $good = $S::compute_readiness(
 		'loopbackLastAttemptAt' => $now - 50, 'loopbackLastRunSuccessAt' => $now - 40,
 		'phpVersion' => '8.3.14', 'phpMinimum' => '7.4', 'php64bit' => true,
 		'migrationStamped' => true, 'migrationMarked' => 0, 'integrity' => true,
+		'dbCharset' => array( 'status' => 'ok' ),
 	)
 );
 mobo_assert_same( $keys, array_column( $good, 'key' ), 'readiness keys and order match the contract' );
-mobo_assert_same( array_fill( 0, 8, true ), array_column( $good, 'ok' ), 'healthy inputs -> all ok' );
-mobo_assert( 8 === count( array_filter( array_column( $good, 'message' ), 'strlen' ) ), 'every item has a message' );
+mobo_assert_same( array_fill( 0, 9, true ), array_column( $good, 'ok' ), 'healthy inputs -> all ok' );
+mobo_assert( 9 === count( array_filter( array_column( $good, 'message' ), 'strlen' ) ), 'every item has a message' );
 $bad = $S::compute_readiness(
 	array(
 		'now' => $now, 'supportStatus' => 'expired', 'sourceStatus' => 'invalid_credentials', 'hostingStatus' => 'send_failed',
@@ -300,12 +301,15 @@ $bad = $S::compute_readiness(
 		'loopbackLastAttemptAt' => $now - 50, 'loopbackLastRunSuccessAt' => $now - 2 * 86400,
 		'phpVersion' => '7.3.33', 'phpMinimum' => '7.4', 'php64bit' => true,
 		'migrationStamped' => true, 'migrationMarked' => 3, 'integrity' => false,
+		'dbCharset' => array( 'status' => 'degraded', 'unsupportedColumns' => array( 'wp_terms.name', 'wp_posts.post_title' ), 'replacements' => 4, 'migrationStatus' => 'partial' ),
 	)
 );
-mobo_assert_same( array_fill( 0, 8, false ), array_column( $bad, 'ok' ), 'broken inputs -> all not ok' );
+mobo_assert_same( array_fill( 0, 9, false ), array_column( $bad, 'ok' ), 'broken inputs -> all not ok' );
 $by_key = array_combine( array_column( $bad, 'key' ), $bad );
 mobo_assert( false !== strpos( $by_key['migration']['message'], '3' ), 'migration message mentions marked count' );
 mobo_assert( false !== strpos( $by_key['php_version']['message'], '7.3.33' ), 'php message mentions current version' );
+mobo_assert( false !== strpos( $by_key['db_charset']['message'], 'utf8mb4' ) && false !== strpos( $by_key['db_charset']['message'], 'Backup' ), 'db_charset message recommends backup + conversion tool' );
+mobo_assert( false !== strpos( $by_key['db_charset']['message'], '4' ), 'db_charset message mentions replacement count' );
 $mixed = $S::compute_readiness( array( 'now' => $now, 'cronLastSuccessAt' => 0, 'selfRunLastSuccessAt' => $now - 60, 'loopbackEnabled' => false, 'php64bit' => false, 'phpVersion' => '8.1.0', 'integrity' => null ) );
 $by_key = array_combine( array_column( $mixed, 'key' ), $mixed );
 mobo_assert( true === $by_key['cron']['ok'], 'self-runner success counts for cron' );
@@ -313,6 +317,7 @@ mobo_assert( true === $by_key['loopback']['ok'], 'disabled loopback is not a fai
 mobo_assert( false === $by_key['php_version']['ok'], '32-bit PHP is not ready' );
 mobo_assert( false === $by_key['plugin_integrity']['ok'], 'missing manifest is not ok' );
 mobo_assert( false === $by_key['migration']['ok'], 'unstamped migration is not ok' );
+mobo_assert( true === $by_key['db_charset']['ok'], 'unknown db charset (not yet checked) is not a failure' );
 
 echo "Manifest integrity\n";
 $dir = sys_get_temp_dir() . '/mobo-support-manifest-' . bin2hex( random_bytes( 4 ) );

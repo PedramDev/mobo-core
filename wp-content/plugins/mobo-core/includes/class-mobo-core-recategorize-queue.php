@@ -24,6 +24,12 @@ class Mobo_Core_Recategorize_Queue {
 
 	const STATE_OPTION = 'mobo_core_recategorize_state';
 
+	/** Targeted mode: only products that carry a temporary fallback category. */
+	const MODE_PENDING = 'pending';
+
+	/** @var string Current run mode (all|pending). */
+	private $mode = 'all';
+
 	/**
 	 * Category sync service.
 	 *
@@ -66,6 +72,7 @@ class Mobo_Core_Recategorize_Queue {
 			'updatedAt'   => time(),
 			'completedAt' => 0,
 			'failureAttempts' => array(),
+			'mode'        => 'all',
 		);
 
 		if ( ! $this->persist_state_verified( $state ) ) {
@@ -77,6 +84,55 @@ class Mobo_Core_Recategorize_Queue {
 			'message' => $state['lastMessage'],
 			'status'  => $this->get_status(),
 		);
+		} finally {
+			Mobo_Core_Lock::release( 'recategorize_queue_worker', $control_lock );
+		}
+	}
+
+	/**
+	 * Start a targeted re-apply for products that received a temporary fallback
+	 * category because their Source category was not yet synced/mapped. Called
+	 * after category snapshots and manual mapping saves. Never interrupts an
+	 * active run (a full run already covers every product).
+	 *
+	 * @param string $source Source label.
+	 * @return array
+	 */
+	public static function maybe_start_pending_reapply( $source = 'category-sync' ) {
+		$queue = new self();
+		$state = $queue->get_state();
+		if ( in_array( $state['status'], array( 'running', 'waiting' ), true ) ) {
+			return array( 'success' => true, 'status' => 'already-running' );
+		}
+		$queue->mode = self::MODE_PENDING;
+		$total = $queue->count_items();
+		if ( $total <= 0 ) {
+			return array( 'success' => true, 'status' => 'nothing-pending' );
+		}
+		$control_lock = Mobo_Core_Lock::acquire( 'recategorize_queue_worker', 30 );
+		if ( false === $control_lock ) {
+			return array( 'success' => false, 'status' => 'locked' );
+		}
+		try {
+			$state = array(
+				'status'          => 'running',
+				'source'          => sanitize_key( (string) $source ),
+				'mode'            => self::MODE_PENDING,
+				'lastPostId'      => 0,
+				'processed'       => 0,
+				'updated'         => 0,
+				'skipped'         => 0,
+				'failed'          => 0,
+				'total'           => $total,
+				'lastError'       => '',
+				'lastMessage'     => sprintf( 'اعمال دسته‌بندی صحیح روی %d محصولی که دسته موقت گرفته بودند شروع شد.', $total ),
+				'startedAt'       => time(),
+				'updatedAt'       => time(),
+				'completedAt'     => 0,
+				'failureAttempts' => array(),
+			);
+			$ok = $queue->persist_state_verified( $state );
+			return array( 'success' => $ok, 'status' => $ok ? 'started' : 'checkpoint-failed', 'total' => $total );
 		} finally {
 			Mobo_Core_Lock::release( 'recategorize_queue_worker', $control_lock );
 		}
@@ -180,6 +236,7 @@ class Mobo_Core_Recategorize_Queue {
 
 		try {
 			$state = $this->get_state();
+			$this->mode = self::MODE_PENDING === (string) $state['mode'] ? self::MODE_PENDING : 'all';
 
 		if ( 'running' !== $state['status'] ) {
 			return array(
@@ -384,6 +441,7 @@ class Mobo_Core_Recategorize_Queue {
 			'lastError'      => (string) $state['lastError'],
 			'updatedAt'      => absint( $state['updatedAt'] ),
 			'shouldContinue' => 'running' === $state['status'],
+			'mode'           => (string) $state['mode'],
 		);
 	}
 
@@ -437,10 +495,38 @@ class Mobo_Core_Recategorize_Queue {
 
 		if ( empty( $category_refs ) ) {
 			update_post_meta( $post_id, 'mobo_category_reapply_source', 'no-category-refs' );
+			if ( self::MODE_PENDING === $this->mode ) {
+				delete_post_meta( $post_id, Mobo_Core_Category_Sync::FALLBACK_PENDING_META );
+			}
 			return array( 'changed' => false, 'skipped' => true, 'reason' => 'no-category-refs' );
 		}
 
 		$before = $this->get_product_term_ids( $post_id );
+
+		if ( self::MODE_PENDING === $this->mode ) {
+			/*
+			 * Targeted fallback re-apply: the product got a temporary category only
+			 * because its Source category was not ready. Use the merchant's real
+			 * policy (automatic sync on/off, manual mapping, mapping required) so the
+			 * correct category replaces the temporary one. assign_product_categories()
+			 * clears the pending marker once nothing remains unresolved.
+			 */
+			$policy = Mobo_Core_Category_Assignment_Policy::settings();
+			$result = $this->category_sync->assign_product_categories(
+				$post_id,
+				$category_refs,
+				! empty( $policy['auto_categories_enabled'] ),
+				false,
+				true
+			);
+			if ( is_array( $result ) && ! empty( $result['error'] ) ) {
+				throw new RuntimeException( 'Category assignment failed for product ' . $post_id . ': ' . sanitize_text_field( (string) $result['error'] ) );
+			}
+			$after = $this->get_product_term_ids( $post_id );
+			update_post_meta( $post_id, 'mobo_category_reapply_at', gmdate( 'c' ) );
+			update_post_meta( $post_id, 'mobo_category_reapply_source', 'pending-' . ( isset( $result['source'] ) ? sanitize_key( (string) $result['source'] ) : '' ) );
+			return array( 'changed' => $before !== $after, 'skipped' => $before === $after, 'result' => $result );
+		}
 
 		/*
 		 * This tool is intentionally mapping-only.
@@ -913,7 +999,10 @@ class Mobo_Core_Recategorize_Queue {
 			}
 		}
 
-		update_post_meta( $post_id, 'mobo_product_category_refs_json', wp_json_encode( $refs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+		$json = class_exists( 'Mobo_Core_Unicode_Guard' )
+			? Mobo_Core_Unicode_Guard::json_for_meta( $refs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES, 'category-refs' )
+			: wp_json_encode( $refs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		update_post_meta( $post_id, 'mobo_product_category_refs_json', $json );
 		update_post_meta( $post_id, 'mobo_product_category_guids', array_values( array_unique( $guids ) ) );
 		update_post_meta( $post_id, '_mobo_product_category_refs_authoritative', '1' );
 	}
@@ -992,6 +1081,13 @@ class Mobo_Core_Recategorize_Queue {
 	private function count_items() {
 		global $wpdb;
 
+		if ( self::MODE_PENDING === $this->mode ) {
+			return absint( $wpdb->get_var( $wpdb->prepare(
+				"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} fp ON fp.post_id = p.ID AND fp.meta_key = %s AND fp.meta_value = '1' WHERE p.post_type = 'product' AND p.post_status = 'publish'",
+				Mobo_Core_Category_Sync::FALLBACK_PENDING_META
+			) ) );
+		}
+
 		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced() ) {
 			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
 			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
@@ -1027,6 +1123,16 @@ class Mobo_Core_Recategorize_Queue {
 
 		$last_id = absint( $last_id );
 		$limit   = max( 1, absint( $limit ) );
+
+		if ( self::MODE_PENDING === $this->mode ) {
+			$ids = $wpdb->get_col( $wpdb->prepare(
+				"SELECT DISTINCT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} fp ON fp.post_id = p.ID AND fp.meta_key = %s AND fp.meta_value = '1' WHERE p.post_type = 'product' AND p.post_status = 'publish' AND p.ID > %d ORDER BY p.ID ASC LIMIT %d",
+				Mobo_Core_Category_Sync::FALLBACK_PENDING_META,
+				$last_id,
+				$limit
+			) );
+			return is_array( $ids ) ? array_map( 'absint', $ids ) : array();
+		}
 
 		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced() ) {
 			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
@@ -1092,6 +1198,7 @@ class Mobo_Core_Recategorize_Queue {
 			'updatedAt'   => 0,
 			'completedAt' => 0,
 			'failureAttempts' => array(),
+			'mode'        => 'all',
 		);
 
 		return array_merge( $defaults, $state );

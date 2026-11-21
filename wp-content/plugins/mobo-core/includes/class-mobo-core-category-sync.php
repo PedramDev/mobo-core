@@ -11,6 +11,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Category_Sync {
 
+	/** Product meta: product carries a temporary category until its Source category resolves. */
+	const FALLBACK_PENDING_META = 'mobo_category_fallback_pending';
+
+	/** Option: unresolved Source category GUIDs asking for an early category refresh. */
+	const SYNC_REQUEST_OPTION = 'mobo_core_category_sync_request';
+
 	private $category_map;
 
 	/** @var array Request-local remote category GUID => WooCommerce term ID cache, including misses. */
@@ -95,7 +101,39 @@ class Mobo_Core_Category_Sync {
 	 * @return array
 	 */
 	public function load_categories_for_mapping_payload( $payload, $snapshot_started_us = 0 ) {
-		return $this->apply_fenced_snapshot( $payload, $snapshot_started_us, true );
+		$requested_before = time();
+		$result = $this->apply_fenced_snapshot( $payload, $snapshot_started_us, true );
+		$this->after_category_snapshot( $result, $requested_before );
+		return $result;
+	}
+
+	/**
+	 * After any category snapshot: clear the early-refresh request and let the
+	 * Recategorize queue re-apply categories to products that received a
+	 * temporary fallback category while their Source category was missing.
+	 *
+	 * @param array $result Snapshot result.
+	 * @param int   $requested_before Snapshot start time.
+	 * @return void
+	 */
+	private function after_category_snapshot( $result, $requested_before ) {
+		if ( ! is_array( $result ) || ! empty( $result['stale'] ) ) {
+			return;
+		}
+		$progress = ! empty( $result['complete'] ) || absint( $result['created'] ?? 0 ) > 0 || absint( $result['updated'] ?? 0 ) > 0;
+		if ( ! $progress ) {
+			return;
+		}
+		if ( ! empty( $result['complete'] ) ) {
+			self::clear_category_sync_request( $requested_before );
+		}
+		if ( class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+			try {
+				Mobo_Core_Recategorize_Queue::maybe_start_pending_reapply( 'category-snapshot' );
+			} catch ( Throwable $e ) {
+				/* Re-apply is best effort; the snapshot itself already committed. */
+			}
+		}
 	}
 
 	/** Source payload application; caller holds the optional HTTP-snapshot lease. */
@@ -172,7 +210,10 @@ class Mobo_Core_Category_Sync {
 	}
 
 	public function sync_categories_payload( $payload, $snapshot_started_us = 0 ) {
-		return $this->apply_fenced_snapshot( $payload, $snapshot_started_us, false );
+		$requested_before = time();
+		$result = $this->apply_fenced_snapshot( $payload, $snapshot_started_us, false );
+		$this->after_category_snapshot( $result, $requested_before );
+		return $result;
 	}
 
 	/** Source payload application; caller holds the optional HTTP-snapshot lease. */
@@ -342,6 +383,11 @@ class Mobo_Core_Category_Sync {
 					$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'manual-mapping' );
 				}
 				$this->store_missing_category_guids_if_changed( $product_id, $manual_result['missing_guids'] );
+				$this->apply_category_pending_state(
+					$product_id,
+					$manual_result['missing_guids'],
+					$this->category_fallback_decision( $product_id, $is_new_product, $policy, count( $term_ids ), $manual_result['missing_guids'] )
+				);
 
 				return array(
 					'assigned'     => count( $term_ids ),
@@ -356,12 +402,15 @@ class Mobo_Core_Category_Sync {
 		if ( $mapping_required && ! empty( $manual_result['missing_guids'] ) ) {
 			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
 			$this->store_missing_category_guids_if_changed( $product_id, $manual_result['missing_guids'] );
+			$fallback = $this->apply_missing_category_fallback( $product_id, $is_new_product, $policy, 0, $manual_result['missing_guids'] );
 
 			return array(
-				'assigned'     => 0,
+				'assigned'     => $fallback['assigned'],
 				'source'       => 'mapping-required-missing',
-				'changed'      => false,
+				'changed'      => $fallback['changed'],
 				'missingGuids' => array_values( array_unique( $manual_result['missing_guids'] ) ),
+				'fallback'     => $fallback['kind'],
+				'error'        => $fallback['error'],
 			);
 		}
 
@@ -372,6 +421,12 @@ class Mobo_Core_Category_Sync {
 		 * - Existing product without mapping remains untouched.
 		 */
 		if ( ! $auto_categories_enabled ) {
+			/* Only a later manual mapping can change this product (auto off). */
+			$this->apply_category_pending_state(
+				$product_id,
+				$manual_result['missing_guids'],
+				$this->category_fallback_decision( $product_id, $is_new_product, $policy, 0, $manual_result['missing_guids'] )
+			);
 			if ( $is_new_product ) {
 				$result = $this->assign_default_category( $product_id );
 				if ( ! empty( $result['changed'] ) ) {
@@ -395,6 +450,7 @@ class Mobo_Core_Category_Sync {
 		 */
 		if ( $authoritative_state_present && empty( $category_refs ) ) {
 			$this->store_missing_category_guids_if_changed( $product_id, array() );
+			$this->apply_category_pending_state( $product_id, array(), array( 'pending' => false, 'request_category_sync' => false ) );
 			$assignment_error = '';
 			$changed = $this->set_product_categories_if_changed( $product_id, array(), $assignment_error );
 			if ( '' === $assignment_error ) {
@@ -473,6 +529,11 @@ class Mobo_Core_Category_Sync {
 		$this->store_missing_category_guids_if_changed( $product_id, $missing_guids );
 
 		if ( ! empty( $term_ids ) ) {
+			$this->apply_category_pending_state(
+				$product_id,
+				$missing_guids,
+				$this->category_fallback_decision( $product_id, $is_new_product, $policy, count( $term_ids ), $missing_guids )
+			);
 			$assignment_error = '';
 			$changed = $this->set_product_categories_if_changed( $product_id, $term_ids, $assignment_error );
 			if ( '' === $assignment_error ) {
@@ -490,12 +551,15 @@ class Mobo_Core_Category_Sync {
 
 		if ( $mapping_required && ! empty( $missing_guids ) ) {
 			$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', 'mapping-required-missing' );
+			$fallback = $this->apply_missing_category_fallback( $product_id, $is_new_product, $policy, 0, $missing_guids );
 
 			return array(
-				'assigned'     => 0,
+				'assigned'     => $fallback['assigned'],
 				'source'       => 'mapping-required-missing',
-				'changed'      => false,
+				'changed'      => $fallback['changed'],
 				'missingGuids' => array_values( array_unique( $missing_guids ) ),
+				'fallback'     => $fallback['kind'],
+				'error'        => $fallback['error'],
 			);
 		}
 
@@ -503,6 +567,29 @@ class Mobo_Core_Category_Sync {
 		 * No resolved category. Do not overwrite categories on existing products.
 		 * New products can still receive the configured default category.
 		 */
+		if ( ! empty( $missing_guids ) ) {
+			/* Never wait for the category: assign the merchant fallback (or
+			 * Uncategorized) temporarily, mark pending and request a category sync.
+			 * An existing product that already has categories keeps them. */
+			$fallback = $this->apply_missing_category_fallback( $product_id, $is_new_product, $policy, 0, $missing_guids );
+			if ( $fallback['assigned'] > 0 || '' !== $fallback['error'] ) {
+				$source = 'default' === $fallback['kind'] ? 'new-product-default' : 'temporary-uncategorized';
+				if ( '' === $fallback['error'] ) {
+					$this->update_post_meta_if_changed( $product_id, 'mobo_category_assign_source', $source );
+				}
+				return array(
+					'assigned'     => $fallback['assigned'],
+					'source'       => $source,
+					'changed'      => $fallback['changed'],
+					'missingGuids' => array_values( array_unique( $missing_guids ) ),
+					'fallback'     => $fallback['kind'],
+					'error'        => $fallback['error'],
+				);
+			}
+		} else {
+			$this->apply_category_pending_state( $product_id, array(), array( 'pending' => false, 'request_category_sync' => false ) );
+		}
+
 		if ( $is_new_product ) {
 			$result = $this->assign_default_category( $product_id );
 
@@ -661,9 +748,18 @@ class Mobo_Core_Category_Sync {
 			}
 		}
 
+		/* wp_terms.name may still be utf8/utf8mb3 on shared hosts: a four-byte
+		 * character (emoji) would make wp_insert_term()/wp_update_term() fail and
+		 * keep the whole category snapshot incomplete forever. The guard returns
+		 * the title unchanged when the column supports utf8mb4. The Mobo category
+		 * map (utf8mb4 custom table) keeps the original Source title. */
+		$term_title = ( '' !== $title && class_exists( 'Mobo_Core_Unicode_Guard' ) )
+			? (string) Mobo_Core_Unicode_Guard::prepare_term_name( $title, 'category-title' )
+			: $title;
+
 		$args = array();
-		if ( '' !== $title ) {
-			$args['name'] = $title;
+		if ( '' !== $term_title ) {
+			$args['name'] = $term_title;
 		}
 
 		$slug = $this->slug_from_url( $url );
@@ -736,7 +832,7 @@ class Mobo_Core_Category_Sync {
 				&& $current_term instanceof WP_Term
 				&& $this->is_placeholder_category_title( $current_term->name, $category_guid )
 			) {
-				$updated_term = wp_update_term( $term_id, 'product_cat', array( 'name' => $title ) );
+				$updated_term = wp_update_term( $term_id, 'product_cat', array( 'name' => $term_title ) );
 				$placeholder_repaired = ! is_wp_error( $updated_term );
 			}
 
@@ -809,16 +905,32 @@ class Mobo_Core_Category_Sync {
 			$insert_args['parent'] = $parent_term_id;
 		}
 
-		$result = wp_insert_term( $title, 'product_cat', $insert_args );
+		$result = wp_insert_term( $term_title, 'product_cat', $insert_args );
 		if ( is_wp_error( $result ) && isset( $insert_args['slug'] ) ) {
 			unset( $insert_args['slug'] );
-			$result = wp_insert_term( $title, 'product_cat', $insert_args );
+			$result = wp_insert_term( $term_title, 'product_cat', $insert_args );
+		}
+
+		/*
+		 * B19: if PHP was killed between wp_insert_term() and the category_guid
+		 * bootstrap below, the term exists without any Source identity. Every retry
+		 * then hit "term_exists" and returned term_id=0, so this GUID never resolved
+		 * again. Adopt such an orphan (same name, same parent, no or same GUID).
+		 */
+		$adopted = false;
+		if ( is_wp_error( $result ) ) {
+			$orphan_id = $this->find_adoptable_orphan_term( $result, $term_title, $parent_term_id, $category_guid, isset( $args['slug'] ) ? (string) $args['slug'] : '' );
+			if ( $orphan_id > 0 ) {
+				$result  = array( 'term_id' => $orphan_id );
+				$adopted = true;
+			}
 		}
 
 		if ( is_wp_error( $result ) || empty( $result['term_id'] ) ) {
 			return array(
 				'term_id' => 0,
 				'created' => false,
+				'error'   => is_wp_error( $result ) ? sanitize_text_field( $result->get_error_message() ) : 'Category term could not be created.',
 			);
 		}
 
@@ -834,6 +946,11 @@ class Mobo_Core_Category_Sync {
 		 */
 		$identity_bootstrapped = $this->set_term_meta_verified( $term_id, 'category_guid', $category_guid )
 			&& $this->set_term_meta_verified( $term_id, 'mobo_sync_incomplete', '1' );
+
+		if ( ! $identity_bootstrapped && $adopted ) {
+			/* Never delete a term this call did not create. */
+			return array( 'term_id' => 0, 'created' => false, 'incomplete' => true, 'error' => 'Orphan category term could not be adopted (identity metadata did not persist).' );
+		}
 
 		if ( ! $identity_bootstrapped ) {
 			$deleted = wp_delete_term( $term_id, 'product_cat' );
@@ -958,6 +1075,213 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return $term_id;
+	}
+
+	/**
+	 * Build the pure fallback decision for one product.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param bool  $is_new_product New product.
+	 * @param array $policy Category policy snapshot.
+	 * @param int   $resolved_count Resolved term count.
+	 * @param array $missing_guids Unresolved Source category GUIDs.
+	 * @return array
+	 */
+	private function category_fallback_decision( $product_id, $is_new_product, $policy, $resolved_count, $missing_guids ) {
+		$missing_guids = is_array( $missing_guids ) ? array_filter( $missing_guids, 'strlen' ) : array();
+		$needs_terms   = ! empty( $missing_guids ) && 0 === absint( $resolved_count );
+		return Mobo_Core_Category_Assignment_Policy::decide_missing_category_fallback(
+			array(
+				'is_new_product'          => (bool) $is_new_product,
+				'auto_categories_enabled' => ! empty( $policy['auto_categories_enabled'] ),
+				'mapping_enabled'         => ! empty( $policy['mapping_enabled'] ),
+				'mapping_required'        => ! empty( $policy['mapping_required'] ),
+				'resolved_count'          => absint( $resolved_count ),
+				'missing_count'           => count( $missing_guids ),
+				'current_count'           => $needs_terms ? count( $this->get_product_category_ids( $product_id ) ) : 0,
+				'default_term_id'         => $needs_terms ? Mobo_Core_Category_Assignment_Policy::default_term_id() : 0,
+				'uncategorized_term_id'   => $needs_terms ? Mobo_Core_Category_Assignment_Policy::uncategorized_term_id() : 0,
+			)
+		);
+	}
+
+	/**
+	 * Apply the temporary fallback (if the decision asks for one) plus the
+	 * pending marker / category sync request.
+	 *
+	 * @return array assigned, changed, kind, error.
+	 */
+	private function apply_missing_category_fallback( $product_id, $is_new_product, $policy, $resolved_count, $missing_guids ) {
+		$decision = $this->category_fallback_decision( $product_id, $is_new_product, $policy, $resolved_count, $missing_guids );
+		$out      = array( 'assigned' => 0, 'changed' => false, 'kind' => '', 'error' => '' );
+		if ( 'assign_fallback' === $decision['action'] && absint( $decision['term_id'] ) > 0 ) {
+			$error          = '';
+			$out['changed'] = $this->set_product_categories_if_changed( $product_id, array( absint( $decision['term_id'] ) ), $error );
+			$out['error']   = $error;
+			$out['kind']    = (string) $decision['kind'];
+			$out['assigned'] = '' === $error ? 1 : 0;
+		}
+		$this->apply_category_pending_state( $product_id, $missing_guids, $decision );
+		return $out;
+	}
+
+	/**
+	 * Persist/clear the "temporary category, re-apply later" marker and request
+	 * a category sync for unresolved GUIDs.
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $missing_guids Unresolved GUIDs.
+	 * @param array $decision Decision (pending, request_category_sync).
+	 * @return void
+	 */
+	private function apply_category_pending_state( $product_id, $missing_guids, $decision ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return;
+		}
+		if ( ! empty( $decision['pending'] ) ) {
+			$this->update_post_meta_if_changed( $product_id, self::FALLBACK_PENDING_META, '1' );
+		} elseif ( metadata_exists( 'post', $product_id, self::FALLBACK_PENDING_META ) ) {
+			delete_post_meta( $product_id, self::FALLBACK_PENDING_META );
+		}
+		if ( ! empty( $decision['request_category_sync'] ) ) {
+			self::request_category_sync( is_array( $missing_guids ) ? $missing_guids : array() );
+		}
+	}
+
+	/**
+	 * Ask the next category refresh to run even if its interval has not elapsed.
+	 * Throttled: the option is rewritten at most once per 10 minutes unless new
+	 * GUIDs appear, so a large catalogue sync does not write it per product.
+	 *
+	 * @param array $guids Unresolved Source category GUIDs.
+	 * @return void
+	 */
+	public static function request_category_sync( $guids ) {
+		$guids   = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', is_array( $guids ) ? $guids : array() ), 'strlen' ) ) );
+		$current = get_option( self::SYNC_REQUEST_OPTION, array() );
+		$current = is_array( $current ) ? $current : array();
+		$known   = isset( $current['guids'] ) && is_array( $current['guids'] ) ? $current['guids'] : array();
+		$new     = array_diff( $guids, $known );
+		$at      = absint( $current['at'] ?? 0 );
+		if ( empty( $new ) && $at > 0 && ( time() - $at ) < 600 ) {
+			return;
+		}
+		update_option(
+			self::SYNC_REQUEST_OPTION,
+			array(
+				'at'    => time(),
+				'guids' => array_slice( array_values( array_unique( array_merge( $known, $guids ) ) ), -200 ),
+			),
+			false
+		);
+	}
+
+	/**
+	 * Pending category sync request, or an empty array.
+	 *
+	 * @return array
+	 */
+	public static function get_category_sync_request() {
+		$current = get_option( self::SYNC_REQUEST_OPTION, array() );
+		return is_array( $current ) ? $current : array();
+	}
+
+	/**
+	 * Clear the request after a category snapshot was applied (only when no newer
+	 * request arrived while the snapshot was running).
+	 *
+	 * @param int $applied_at Time the snapshot fetch started.
+	 * @return void
+	 */
+	public static function clear_category_sync_request( $applied_at ) {
+		$current = self::get_category_sync_request();
+		if ( ! empty( $current ) && absint( $current['at'] ?? 0 ) <= absint( $applied_at ) ) {
+			delete_option( self::SYNC_REQUEST_OPTION );
+		}
+	}
+
+	/**
+	 * Pure adoption rule for an existing term that blocks wp_insert_term().
+	 *
+	 * @param string $existing_guid category_guid meta of the existing term ('' = none).
+	 * @param int    $existing_parent Existing term parent.
+	 * @param int    $desired_parent Desired parent.
+	 * @param string $category_guid Source GUID being created.
+	 * @param bool   $names_match Existing name equals the desired name (guard-aware).
+	 * @param bool   $retired Existing term is a retired Mobo term.
+	 * @return bool
+	 */
+	public static function orphan_term_is_adoptable( $existing_guid, $existing_parent, $desired_parent, $category_guid, $names_match, $retired = false ) {
+		$existing_guid = trim( (string) $existing_guid );
+		$category_guid = trim( (string) $category_guid );
+		if ( '' === $category_guid || ! $names_match || absint( $existing_parent ) !== absint( $desired_parent ) ) {
+			return false;
+		}
+		/* A term owned by another Source category is never stolen. */
+		if ( '' !== $existing_guid ) {
+			return hash_equals( $existing_guid, $category_guid ) && ! $retired;
+		}
+		return true;
+	}
+
+	/**
+	 * Locate a term that blocks creation and may be adopted for this GUID.
+	 *
+	 * @param WP_Error $error wp_insert_term() error.
+	 * @param string   $name Desired (guarded) term name.
+	 * @param int      $parent_term_id Desired parent.
+	 * @param string   $category_guid Source GUID.
+	 * @param string   $slug Desired slug.
+	 * @return int
+	 */
+	private function find_adoptable_orphan_term( $error, $name, $parent_term_id, $category_guid, $slug = '' ) {
+		$candidates = array();
+		if ( $error instanceof WP_Error ) {
+			$data = $error->get_error_data( 'term_exists' );
+			if ( is_numeric( $data ) && absint( $data ) > 0 ) {
+				$candidates[] = absint( $data );
+			}
+		}
+		if ( empty( $candidates ) && '' !== (string) $name ) {
+			$found = get_terms(
+				array(
+					'taxonomy'   => 'product_cat',
+					'hide_empty' => false,
+					'name'       => (string) $name,
+					'parent'     => absint( $parent_term_id ),
+					'number'     => 3,
+					'fields'     => 'ids',
+				)
+			);
+			if ( is_array( $found ) ) {
+				$candidates = array_merge( $candidates, array_map( 'absint', $found ) );
+			}
+		}
+		if ( empty( $candidates ) && '' !== (string) $slug ) {
+			$by_slug = get_term_by( 'slug', (string) $slug, 'product_cat' );
+			if ( $by_slug instanceof WP_Term ) {
+				$candidates[] = absint( $by_slug->term_id );
+			}
+		}
+		foreach ( array_unique( $candidates ) as $term_id ) {
+			$term = get_term( $term_id, 'product_cat' );
+			if ( ! $term instanceof WP_Term ) {
+				continue;
+			}
+			$names_match = class_exists( 'Mobo_Core_Unicode_Guard' )
+				? Mobo_Core_Unicode_Guard::equivalent( html_entity_decode( (string) $name, ENT_QUOTES, 'UTF-8' ), html_entity_decode( (string) $term->name, ENT_QUOTES, 'UTF-8' ) )
+				: html_entity_decode( (string) $name, ENT_QUOTES, 'UTF-8' ) === html_entity_decode( (string) $term->name, ENT_QUOTES, 'UTF-8' );
+			$existing_guid = sanitize_text_field( (string) get_term_meta( $term_id, 'category_guid', true ) );
+			$retired       = '1' === (string) get_term_meta( $term_id, 'mobo_category_retired', true );
+			if ( self::orphan_term_is_adoptable( $existing_guid, absint( $term->parent ), $parent_term_id, $category_guid, $names_match, $retired ) ) {
+				if ( class_exists( 'Mobo_Core_Logger' ) ) {
+					Mobo_Core_Logger::warning( 'Mobo Core adopted an orphan WooCommerce category term for a Source category.', array( 'termId' => $term_id, 'categoryGuid' => $category_guid ) );
+				}
+				return absint( $term_id );
+			}
+		}
+		return 0;
 	}
 
 	private function assign_default_category( $product_id ) {
@@ -1257,7 +1581,7 @@ class Mobo_Core_Category_Sync {
 		}
 
 		return $this->set_term_meta_verified( $term_id, 'category_guid', sanitize_text_field( (string) $category_guid ) )
-			&& $this->set_term_meta_verified( $term_id, 'mobo_category_url', sanitize_text_field( (string) $url ) )
+			&& $this->set_term_meta_verified( $term_id, 'mobo_category_url', $this->termmeta_text( sanitize_text_field( (string) $url ) ) )
 			&& $this->set_term_meta_verified( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) )
 			&& $this->set_term_meta_verified( $term_id, 'mobo_category_retired', '0' );
 	}
@@ -1274,6 +1598,20 @@ class Mobo_Core_Category_Sync {
 	 */
 	private function set_term_meta_verified( $term_id, $key, $value ) {
 		return Mobo_Core_Durable_State_Policy::update_term_meta_verified( $term_id, $key, $value );
+	}
+
+	/**
+	 * Guard Source text stored in wp_termmeta (may be utf8mb3 on old installs).
+	 *
+	 * @param string $value Value.
+	 * @return string
+	 */
+	private function termmeta_text( $value ) {
+		global $wpdb;
+		if ( ! class_exists( 'Mobo_Core_Unicode_Guard' ) || ! is_object( $wpdb ) ) {
+			return (string) $value;
+		}
+		return (string) Mobo_Core_Unicode_Guard::prepare_for_column( (string) $value, $wpdb->termmeta, 'meta_value', 'category-url' );
 	}
 
 	private function slug_from_url( $url ) {

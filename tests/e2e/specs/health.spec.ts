@@ -53,34 +53,40 @@ test.describe('Site health tab', () => {
     expect(await res.text()).not.toContain('PHP Extensions');
   });
 
-  test('"شروع تبدیل کنترل‌شده utf8mb4" starts the Unicode migration', async ({ page }) => {
+  test('"پیش‌بررسی دیتابیس" then "شروع تبدیل دستی utf8mb4" starts the Unicode migration', async ({ page }) => {
     test.setTimeout(600_000);
     await gotoTab(page, 'health');
-    const start = actionForm(page, 'mobo_core_start_database_unicode_migration').locator('button[type="submit"]');
-    await requireRendered(start, 'database already utf8mb4-compatible ("نیازی به Migration نیست") or a migration is already active');
+    const precheck = actionForm(page, 'mobo_core_precheck_database_unicode_migration').locator('button[type="submit"]');
+    await requireRendered(precheck, 'database already utf8mb4-compatible ("نیازی به Migration نیست") or a migration is already active');
+    const p = await clickAndReadNotice(page, precheck, 120_000);
+    expect(p.type, p.message).toBe('success');
+    const form = actionForm(page, 'mobo_core_start_database_unicode_migration');
+    const start = form.locator('button[type="submit"]');
+    await requireRendered(start, 'start form not rendered after pre-check');
+    await form.locator('input[name="mobo_backup_confirmed"]').check();
     const n = await clickAndReadNotice(page, start, 540_000);
     expect(['success', 'warning'], n.message).toContain(n.type);
     expect(n.message).toMatch(/تبدیل/);
     expect(migrationStatus(), 'migration checkpoint persisted').toBeTruthy();
   });
 
-  test('"Pause در مرز امن" pauses an active Unicode migration', async ({ page }) => {
+  test('"توقف (Pause)" pauses an active Unicode migration', async ({ page }) => {
     await gotoTab(page, 'health');
     const pause = actionForm(page, 'mobo_core_pause_database_unicode_migration').locator('button[type="submit"]');
     await requireRendered(pause, 'no active Unicode migration');
     const n = await clickAndReadNotice(page, pause);
     expect(n.type).toBe('warning');
     expect(n.message).toMatch(/Pause|متوقف/);
-    expect(['paused', 'running', 'pausing']).toContain(String(migrationStatus()));
+    expect(['paused', 'ready', 'migrating']).toContain(String(migrationStatus()));
   });
 
-  test('"ادامه از Checkpoint" / "اجرای یک مرحله الآن" resumes the Unicode migration', async ({ page }) => {
+  test('"ادامه از Checkpoint" / "تبدیل جدول بعدی" resumes the Unicode migration', async ({ page }) => {
     test.setTimeout(600_000);
     await gotoTab(page, 'health');
     const resume = actionForm(page, 'mobo_core_resume_database_unicode_migration').locator('button[type="submit"]').first();
     await requireRendered(resume, 'no paused/failed/awaiting-config/active Unicode migration to resume');
     const n = await clickAndReadNotice(page, resume, 540_000);
     expect(['success', 'warning'], n.message).toContain(n.type);
-    expect(n.message).toMatch(/Unicode|utf8mb4|wp-config/);
+    expect(n.message).toMatch(/Unicode|utf8mb4|wp-config|مرحله|جدول|تبدیل/);
   });
 });

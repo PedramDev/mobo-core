@@ -123,6 +123,8 @@ class Mobo_Core_Health_Reporter {
 			'databaseSchemaLastErrorAt' => $this->format_timestamp( $schema_last_error_at ),
 			'databaseUnicode'       => $database_unicode,
 			'databaseUnicodeMigration' => $database_unicode_migration,
+			/* Per-column four-byte support + transparent replacement counters. */
+			'databaseUnicodeGuard'  => class_exists( 'Mobo_Core_Unicode_Guard' ) ? Mobo_Core_Unicode_Guard::health_payload() : array( 'status' => 'unavailable' ),
 			'customStorage'         => $custom_storage,
 			/* 10.34.77: migration progress plus objects marked (quarantined) during
 			 * terminal retirement, so the Backend can see partial/blocked sites. Options

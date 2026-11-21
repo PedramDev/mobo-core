@@ -1455,7 +1455,37 @@ final class Mobo_Core_Support_Access {
 				: ( null === $integrity ? 'سلامت فایل‌های افزونه قابل بررسی نیست (فایل manifest موجود نیست).' : 'برخی فایل‌های افزونه تغییر کرده یا ناقص است؛ افزونه را دوباره نصب کنید.' ),
 		);
 
+		$out[] = self::db_charset_readiness_item( isset( $in['dbCharset'] ) && is_array( $in['dbCharset'] ) ? $in['dbCharset'] : array() );
+
 		return $out;
+	}
+
+	/**
+	 * Pure db_charset readiness item.
+	 *
+	 * @param array $db status (ok|degraded|unknown), unsupportedColumns (list), replacements (int), migrationStatus.
+	 * @return array
+	 */
+	public static function db_charset_readiness_item( $db ) {
+		$status      = isset( $db['status'] ) ? (string) $db['status'] : 'unknown';
+		$columns     = isset( $db['unsupportedColumns'] ) && is_array( $db['unsupportedColumns'] ) ? $db['unsupportedColumns'] : array();
+		$replaced    = absint( isset( $db['replacements'] ) ? $db['replacements'] : 0 );
+		$migration   = isset( $db['migrationStatus'] ) ? (string) $db['migrationStatus'] : '';
+		if ( 'ok' === $status ) {
+			return array( 'key' => 'db_charset', 'ok' => true, 'message' => 'جدول‌های دیتابیس از ایموجی و کاراکترهای ۴ بایتی پشتیبانی می‌کنند (utf8mb4).' );
+		}
+		if ( 'degraded' !== $status ) {
+			return array( 'key' => 'db_charset', 'ok' => true, 'message' => 'پشتیبانی دیتابیس از کاراکترهای ۴ بایتی هنوز بررسی نشده است.' );
+		}
+		$message = sprintf(
+			'%d ستون از جدول‌های وردپرس (مثل wp_terms/wp_posts) هنوز utf8/utf8mb3 است و ایموجی/کاراکتر ۴ بایتی را نمی‌پذیرد. افزونه این کاراکترها را موقتاً جایگزین می‌کند تا همگام‌سازی متوقف نشود%s. پیشنهاد: ابتدا از دیتابیس Backup بگیرید و سپس از «سلامت سایت» ابزار «تبدیل دیتابیس به utf8mb4» را به‌صورت دستی اجرا کنید.',
+			count( $columns ),
+			$replaced > 0 ? sprintf( ' (تاکنون %d مورد جایگزین شده)', $replaced ) : ''
+		);
+		if ( in_array( $migration, array( 'ready', 'paused', 'partial', 'failed' ), true ) ) {
+			$message .= ' تبدیل شروع شده ولی کامل نشده است؛ «تبدیل جدول بعدی» را ادامه دهید.';
+		}
+		return array( 'key' => 'db_charset', 'ok' => false, 'message' => $message );
 	}
 
 	/**
@@ -1494,6 +1524,30 @@ final class Mobo_Core_Support_Access {
 			'migrationStamped'         => defined( 'MOBO_CORE_VERSION' ) && MOBO_CORE_VERSION === $db_version,
 			'migrationMarked'          => $marked,
 			'integrity'                => self::plugin_integrity(),
+			'dbCharset'                => self::collect_db_charset_input(),
+		);
+	}
+
+	/**
+	 * db_charset readiness input (column support is cached for 6 hours).
+	 *
+	 * @return array
+	 */
+	private static function collect_db_charset_input() {
+		if ( ! class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			return array( 'status' => 'unknown' );
+		}
+		try {
+			$snapshot = Mobo_Core_Unicode_Guard::snapshot();
+		} catch ( Throwable $e ) {
+			return array( 'status' => 'unknown' );
+		}
+		$migration = class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ? Mobo_Core_Database_Unicode_Migration::get_status() : array();
+		return array(
+			'status'             => (string) $snapshot['status'],
+			'unsupportedColumns' => $snapshot['unsupportedColumns'],
+			'replacements'       => $snapshot['replacements'],
+			'migrationStatus'    => isset( $migration['status'] ) ? (string) $migration['status'] : '',
 		);
 	}
 

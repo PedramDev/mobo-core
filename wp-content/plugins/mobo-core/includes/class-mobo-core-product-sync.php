@@ -1702,6 +1702,13 @@ class Mobo_Core_Product_Sync {
 					return $this->quarantine_repair_parent_conflict( $state, $conflict, $product_guid, 0 );
 				}
 				throw $conflict;
+			} catch ( Throwable $parent_failure ) {
+				/* The product was shifted from the queue only in memory. Re-throwing
+				 * used to discard that checkpoint, so the next tick re-read the same
+				 * product, failed the same way (e.g. a utf8mb3 write rejection) and the
+				 * whole Sync/Repair was stuck forever. Retry it a bounded number of
+				 * times, then mark only this product failed/retryable and continue. */
+				return $this->isolate_failed_parent_product( $state, $product_data, $product_guid, $parent_failure );
 			} finally {
 				if ( false !== $product_lock && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
 					Mobo_Core_Product_Concurrency::release_product_lock( $product_lock );
@@ -4160,6 +4167,28 @@ class Mobo_Core_Product_Sync {
 	 * @return array
 	 */
 	public function ensure_categories_synced_if_due( $sync_id = '', $force = false ) {
+		/* A product that could not resolve its Source category asked for an early
+		 * refresh (Mobo_Core_Category_Sync::request_category_sync). Honour it at
+		 * most every 5 minutes so products waiting on a temporary category get the
+		 * correct one soon instead of after the 12h interval. */
+		$early_request = array();
+		if ( class_exists( 'Mobo_Core_Category_Sync' ) ) {
+			$early_request = Mobo_Core_Category_Sync::get_category_sync_request();
+		}
+		$early_at = absint( $early_request['at'] ?? 0 );
+		$early_last = max( absint( Mobo_Core_Settings::get( 'mobo_core_categories_last_sync_at', 0 ) ), absint( Mobo_Core_Settings::get( 'mobo_core_categories_mapping_loaded_at', 0 ) ) );
+		$early_attempt = absint( get_option( 'mobo_core_category_early_refresh_attempt_at', 0 ) );
+		$early_due = $early_at > 0 && $early_at > $early_last && ( time() - $early_last ) >= 300 && ( time() - $early_attempt ) >= 300;
+		if ( $early_due ) {
+			update_option( 'mobo_core_category_early_refresh_attempt_at', time(), false );
+		}
+
+		if ( ! $force && ! $this->rules->should_update_categories() && $early_due && Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_enabled', '1' ) ) {
+			/* Automatic categories off: refresh only the mapping list so the merchant
+			 * can map the new Source category (no WooCommerce term is created). */
+			return $this->preload_categories_for_mapping( $sync_id );
+		}
+
 		if ( ! $force && ! $this->rules->should_update_categories() ) {
 			return $this->result(
 				true,
@@ -4190,7 +4219,7 @@ class Mobo_Core_Product_Sync {
 		$interval_seconds = $interval_hours * HOUR_IN_SECONDS;
 		$now              = time();
 
-		if ( ! $force && $last_sync_at > 0 && ( $now - $last_sync_at ) < $interval_seconds ) {
+		if ( ! $force && ! $early_due && $last_sync_at > 0 && ( $now - $last_sync_at ) < $interval_seconds ) {
 			return $this->result(
 				true,
 				'هنوز زمان بروزرسانی دوره‌ای دسته‌بندی‌ها نرسیده است.',
@@ -5005,6 +5034,82 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * Bounded retry + isolation for a parent product whose upsert threw.
+	 *
+	 * Attempts 1..N-1 put the payload back at the head of the queue (durable
+	 * checkpoint, so the failure counter survives). Attempt N marks the product
+	 * failed/retryable (incomplete marker, incomplete map row, Sync Health failed
+	 * entry) and advances, so one bad item can never block the other products.
+	 * Webhooks/next Sync retry the product later through the normal paths.
+	 *
+	 * @param array      $state Manual sync state (by reference).
+	 * @param array      $product_data Payload.
+	 * @param string     $product_guid Product GUID.
+	 * @param Throwable  $failure Failure.
+	 * @return array
+	 */
+	private function isolate_failed_parent_product( &$state, $product_data, $product_guid, $failure ) {
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$message      = substr( sanitize_text_field( (string) $failure->getMessage() ), 0, 300 );
+		if ( '' === $message ) {
+			$message = 'Product upsert failed (' . sanitize_key( get_class( $failure ) ) . ').';
+		}
+		$key = '' !== $product_guid ? $product_guid : md5( (string) wp_json_encode( $product_data ) );
+
+		$failures = isset( $state['productFailureAttempts'] ) && is_array( $state['productFailureAttempts'] ) ? $state['productFailureAttempts'] : array();
+		$attempts = absint( $failures[ $key ] ?? 0 ) + 1;
+		$max      = max( 1, min( 10, absint( apply_filters( 'mobo_core_manual_sync_product_failure_retry_limit', 3, $product_guid ) ) ) );
+
+		if ( class_exists( 'Mobo_Core_Logger' ) ) {
+			Mobo_Core_Logger::error( 'Mobo Core manual sync product upsert failed.', array( 'productGuid' => $product_guid, 'attempt' => $attempts, 'max' => $max, 'error' => $message ) );
+		}
+
+		if ( $attempts < $max ) {
+			$failures[ $key ] = $attempts;
+			$state['productFailureAttempts'] = array_slice( $failures, -50, null, true );
+			array_unshift( $state['productQueue'], $product_data );
+			$state['lastError']   = $message;
+			$state['lastMessage'] = sprintf( 'ذخیره محصول %s ناموفق بود و در مرحله بعد دوباره تلاش می‌شود (%d/%d).', '' !== $product_guid ? $product_guid : '—', $attempts, $max );
+			$state['updatedAt']   = time();
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		unset( $failures[ $key ] );
+		$state['productFailureAttempts'] = $failures;
+		$product_id = '' !== $product_guid ? $this->find_product_id_by_guid( $product_guid ) : 0;
+		if ( $product_id > 0 ) {
+			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $product_guid, $product_id, true );
+		}
+		if ( '' !== $product_guid && class_exists( 'Mobo_Core_Sync_Health' ) ) {
+			Mobo_Core_Sync_Health::mark_failed( $product_guid, $product_id, $message );
+		}
+
+		$state['failedProducts'] = absint( $state['failedProducts'] ?? 0 ) + 1;
+		if ( ! isset( $state['failedProductSamples'] ) || ! is_array( $state['failedProductSamples'] ) ) {
+			$state['failedProductSamples'] = array();
+		}
+		if ( count( $state['failedProductSamples'] ) < 25 ) {
+			$state['failedProductSamples'][] = array( 'productGuid' => $product_guid, 'productId' => $product_id, 'error' => $message, 'at' => time() );
+		}
+		$state['processedProducts'] = absint( $state['processedProducts'] ?? 0 ) + 1;
+		$state['lastError']         = $message;
+		$state['lastMessage']       = sprintf( 'محصول %s پس از %d تلاش ناموفق به‌عنوان «ناموفق/قابل تلاش مجدد» علامت خورد و همگام‌سازی سایر محصولات ادامه یافت.', '' !== $product_guid ? $product_guid : '—', $max );
+		$state['updatedAt']         = time();
+		if ( absint( $state['productTotalCount'] ?? 0 ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) && empty( $state['productQueue'] ) ) {
+			$state['status']      = 'done';
+			$state['completedAt'] = time();
+		}
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+		}
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+	}
+
+	/**
 	 * Quarantine one definitive cross-parent identity mismatch without changing
 	 * Woo post_parent, variation IDs, order items or Product Map parent IDs.
 	 * Unlike a transient fetch failure, this conflict must not be retried on
@@ -5236,6 +5341,9 @@ class Mobo_Core_Product_Sync {
 			return;
 		}
 		$description = wp_kses_post( (string) $inspection['value'] );
+		if ( class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			$description = (string) Mobo_Core_Unicode_Guard::prepare_post_field( $description, 'post_content', 'product-description' );
+		}
 		if ( (string) $product->get_description( 'edit' ) !== $description ) {
 			$product->set_description( $description );
 			$product->save();
@@ -5388,7 +5496,7 @@ class Mobo_Core_Product_Sync {
 		 * preserving crash detection without paying for a second WC save/hook cycle.
 		 */
 		if ( $is_new_product ) {
-			$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$initial_title = $this->source_post_title( $data );
 
 			if ( '' === $initial_title ) {
 				$initial_title = 'Mobo Product ' . $product_guid;
@@ -5413,7 +5521,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $is_new_product || $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$title = $this->source_post_title( $data );
 
 			if ( '' !== $title && (string) $product->get_name( 'edit' ) !== $title ) {
 				$product->set_name( $title );
@@ -5754,7 +5862,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $is_new_variation ) {
-			$initial_title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$initial_title = $this->source_post_title( $data );
 
 			if ( '' === $initial_title ) {
 				$initial_title = 'Mobo Variant ' . $variant_guid;
@@ -5778,7 +5886,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $is_new_variation || $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$title = $this->source_post_title( $data );
 
 			if ( '' !== $title && (string) $variation->get_name( 'edit' ) !== $title ) {
 				$variation->set_name( $title );
@@ -6603,7 +6711,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$title = $this->source_post_title( $data );
 			if ( '' !== $title && (string) $product->get_name() !== $title ) {
 				return false;
 			}
@@ -6711,7 +6819,7 @@ class Mobo_Core_Product_Sync {
 			if ( ! is_array( $attribute_data ) ) {
 				continue;
 			}
-			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
+			$name = $this->source_attribute_text( $this->get_value( $attribute_data, 'name', '' ) );
 			if ( '' === $name ) {
 				continue;
 			}
@@ -6725,7 +6833,7 @@ class Mobo_Core_Product_Sync {
 				if ( ! is_array( $value_data ) ) {
 					continue;
 				}
-				$value = sanitize_text_field( (string) $this->get_value( $value_data, 'value', '' ) );
+				$value = $this->source_attribute_text( $this->get_value( $value_data, 'value', '' ) );
 				if ( '' !== $value ) {
 					$options[] = $value;
 				}
@@ -7372,7 +7480,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$title = $this->source_post_title( $data );
 			if ( '' !== $title && (string) $variation->get_name() !== $title ) {
 				return false;
 			}
@@ -7546,7 +7654,7 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
-			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
+			$name = $this->source_attribute_text( $this->get_value( $attribute_data, 'name', '' ) );
 
 			if ( '' === $name ) {
 				continue;
@@ -7563,7 +7671,7 @@ class Mobo_Core_Product_Sync {
 					continue;
 				}
 
-				$value = sanitize_text_field( (string) $this->get_value( $value_data, 'value', '' ) );
+				$value = $this->source_attribute_text( $this->get_value( $value_data, 'value', '' ) );
 
 				if ( '' !== $value ) {
 					return true;
@@ -8110,7 +8218,7 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 		if ( $this->rules->should_update_title() ) {
-			$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+			$title = $this->source_post_title( $data );
 			if ( '' !== $title && (string) $product->get_name() !== $title ) {
 				return false;
 			}
@@ -9130,7 +9238,7 @@ class Mobo_Core_Product_Sync {
 				if ( ! is_array( $attribute ) ) {
 					return new WP_Error( 'mobo_core_product_attribute_row_invalid', 'Mobo product contains a malformed attribute row.' );
 				}
-				$name = sanitize_text_field( (string) $this->get_value( $attribute, 'name', '' ) );
+				$name = $this->source_attribute_text( $this->get_value( $attribute, 'name', '' ) );
 				$key  = sanitize_title( $name );
 				$values = $this->get_value( $attribute, 'values', null );
 				if ( '' === $key || ! is_array( $values ) || empty( $values ) ) {
@@ -9145,7 +9253,7 @@ class Mobo_Core_Product_Sync {
 					if ( ! is_array( $value_row ) ) {
 						return new WP_Error( 'mobo_core_product_attribute_value_invalid', 'Mobo product attribute contains a malformed value row.' );
 					}
-					$value = sanitize_text_field( (string) $this->get_value( $value_row, 'value', '' ) );
+					$value = $this->source_attribute_text( $this->get_value( $value_row, 'value', '' ) );
 					if ( '' === $value ) {
 						return new WP_Error( 'mobo_core_product_attribute_value_invalid', 'Mobo product attribute contains an empty value.' );
 					}
@@ -9253,6 +9361,40 @@ class Mobo_Core_Product_Sync {
 		return Mobo_Core_Payload_Field_Policy::is_present( $data, Mobo_Core_Payload_Field_Policy::category_aliases() );
 	}
 
+	/**
+	 * Source product/variation title exactly as it will be stored in
+	 * wp_posts.post_title. On utf8/utf8mb3 tables four-byte characters become
+	 * numeric entities (deterministic), so the stored-vs-Source compare used by
+	 * the change detection is stable and never reports a perpetual change.
+	 *
+	 * @param array $data Payload.
+	 * @return string
+	 */
+	private function source_post_title( $data ) {
+		$title = sanitize_text_field( (string) $this->get_value( $data, 'title', '' ) );
+		if ( '' === $title || ! class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			return $title;
+		}
+		return (string) Mobo_Core_Unicode_Guard::prepare_post_field( $title, 'post_title', 'product-title' );
+	}
+
+	/**
+	 * Source attribute name/value/option as it will be stored inside
+	 * wp_postmeta (_product_attributes, attribute_* and attribute GUID maps).
+	 * Every attribute read site uses this helper so derived keys
+	 * (sanitize_title), compares and stored values stay mutually consistent.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return string
+	 */
+	private function source_attribute_text( $value ) {
+		$value = sanitize_text_field( (string) $value );
+		if ( '' === $value || ! class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			return $value;
+		}
+		return (string) Mobo_Core_Unicode_Guard::prepare_meta_text( $value, 'product-attribute' );
+	}
+
 	private function build_product_attributes( $attributes ) {
 		$result   = array();
 		$position = 0;
@@ -9266,7 +9408,7 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
-			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
+			$name = $this->source_attribute_text( $this->get_value( $attribute_data, 'name', '' ) );
 
 			if ( '' === $name ) {
 				continue;
@@ -9285,7 +9427,7 @@ class Mobo_Core_Product_Sync {
 					continue;
 				}
 
-				$value = sanitize_text_field( (string) $this->get_value( $value_data, 'value', '' ) );
+				$value = $this->source_attribute_text( $this->get_value( $value_data, 'value', '' ) );
 
 				if ( '' !== $value ) {
 					$options[] = $value;
@@ -9326,7 +9468,7 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 			$guid = $this->extract_attribute_guid( $attribute_data );
-			$name = sanitize_text_field( (string) $this->get_value( $attribute_data, 'name', '' ) );
+			$name = $this->source_attribute_text( $this->get_value( $attribute_data, 'name', '' ) );
 			if ( '' !== $guid && '' !== $name ) {
 				$map[ $name ] = $guid;
 			}
@@ -9384,8 +9526,8 @@ class Mobo_Core_Product_Sync {
 				return new WP_Error( 'mobo_core_variant_attribute_row_invalid', 'Mobo variant contains a malformed attribute row.' );
 			}
 
-			$name   = sanitize_text_field( (string) $this->get_value( $attribute, 'name', '' ) );
-			$option = sanitize_text_field( (string) $this->get_value( $attribute, 'option', '' ) );
+			$name   = $this->source_attribute_text( $this->get_value( $attribute, 'name', '' ) );
+			$option = $this->source_attribute_text( $this->get_value( $attribute, 'option', '' ) );
 			$key    = sanitize_title( $name );
 
 			if ( '' === $key || '' === $option ) {
@@ -9466,8 +9608,8 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 
-			$name   = sanitize_text_field( (string) $this->get_value( $attribute, 'name', '' ) );
-			$option = sanitize_text_field( (string) $this->get_value( $attribute, 'option', '' ) );
+			$name   = $this->source_attribute_text( $this->get_value( $attribute, 'name', '' ) );
+			$option = $this->source_attribute_text( $this->get_value( $attribute, 'option', '' ) );
 
 			if ( '' === $name || '' === $option ) {
 				continue;
@@ -10608,7 +10750,14 @@ private function store_product_category_refs( $product_id, $category_refs ) {
 	 * knowledge. Persist [] plus a marker so Recategorize can never resurrect
 	 * categories from an older webhook/API fallback after the source intentionally
 	 * cleared every category. */
-	$json = wp_json_encode( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+	/* A category title with an emoji used to make this utf8mb3 postmeta write
+	 * fail, which threw "Could not durably persist product category reference
+	 * metadata" and stalled the product forever. json_for_meta() escapes only
+	 * supplementary characters (😀) when the column needs it; the
+	 * decoded refs are identical. */
+	$json = class_exists( 'Mobo_Core_Unicode_Guard' )
+		? Mobo_Core_Unicode_Guard::json_for_meta( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES, 'category-refs' )
+		: wp_json_encode( $normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 	if ( false === $json ) {
 		return false;
 	}
