@@ -729,6 +729,10 @@ class Mobo_Core_Rest_Controller {
 			array( 'security_code' => (string) $request->get_header( 'X-SEC' ) )
 		);
 		if ( is_wp_error( $result ) ) { return $result; }
+		/* S1: a signed Backend provisioning delivered to this site is the only event
+		 * that (re)binds the canonical site address and clears a clone suspicion
+		 * (explicit domain move). It is never updated automatically. */
+		$site_bound = class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::bind_current_site( 'provision' ) : false;
 		$money_status = class_exists( 'Mobo_Core_Money_Policy' )
 			? Mobo_Core_Money_Policy::compatibility_status_for_row( $result )
 			: array( 'compatible' => false, 'code' => 'money_policy_unavailable' );
@@ -747,6 +751,9 @@ class Mobo_Core_Rest_Controller {
 					'money_contract_version' => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::normalize_contract_version( $result['money_contract_version'] ?? 0 ) : 0,
 					'money_compatible' => ! empty( $money_status['compatible'] ),
 				),
+				'siteBinding' => class_exists( 'Mobo_Core_Clone_Guard' )
+					? array_merge( Mobo_Core_Clone_Guard::health_payload(), array( 'boundNow' => (bool) $site_bound ) )
+					: array( 'boundNow' => false ),
 			)
 		);
 	}

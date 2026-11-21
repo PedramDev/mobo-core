@@ -539,6 +539,9 @@ add_action( 'update_option_woocommerce_currency', array( 'Mobo_Core_Store_Curren
 add_action( 'admin_notices', array( 'Mobo_Core_Store_Currency_Guard', 'render_notice' ) );
 add_action( 'admin_post_mobo_core_dismiss_currency_change', array( 'Mobo_Core_Store_Currency_Guard', 'handle_dismiss' ) );
 
+/* S1: clone/staging copy guard notice (Source purchases and wallet payments blocked). Lazy-loaded. */
+add_action( 'admin_notices', array( 'Mobo_Core_Clone_Guard', 'render_admin_notice' ) );
+
 /* B23: excluded products keep selling with frozen price/stock; warn on their edit screen. */
 add_action( 'admin_notices', array( 'Mobo_Core_Product_Exclusions', 'render_product_edit_notice' ) );
 

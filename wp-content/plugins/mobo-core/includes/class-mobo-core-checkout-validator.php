@@ -1235,6 +1235,11 @@ class Mobo_Core_Checkout_Validator {
 	 * @return bool
 	 */
 	private function is_mobo_cart_validation_effective() {
+		/* S1: a clone/staging copy must not clear/rebuild the original site's shared
+		 * Source cart during its own checkout; its orders are held for review. */
+		if ( $this->clone_guard_blocks_purchase() ) {
+			return false;
+		}
 		/*
 		 * Remote Mobo-cart validation is an optional pre-payment checkout check.
 		 * Automatic order submission performs its own mandatory authenticated
@@ -3690,6 +3695,11 @@ class Mobo_Core_Checkout_Validator {
 			$connection_id,
 			function () use ( $order_id, $old_status, $new_status, $connection_id ) {
 				if ( ! $this->is_order_submission_enabled() ) { return; }
+				if ( $this->clone_guard_blocks_purchase() ) {
+					/* S1: never queue a real Source purchase from a clone/staging copy. */
+					$this->hold_order_for_clone_review( absint( $order_id ), 'status_processing' );
+					return;
+				}
 				$this->queue_mobo_order_id_for_later(
 					absint( $order_id ),
 					array(
@@ -4097,6 +4107,11 @@ class Mobo_Core_Checkout_Validator {
 			return false;
 		}
 
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$this->hold_order_for_clone_review( $order, 'queue_request' );
+			return new WP_Error( 'mobo_core_clone_guard_blocked', Mobo_Core_Clone_Guard::blocked_message() );
+		}
+
 		$scope = $this->get_order_mobo_item_scope( $order );
 		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->mark_order_as_not_mobo( $order, $scope, 'queue_request' );
@@ -4334,6 +4349,18 @@ class Mobo_Core_Checkout_Validator {
 				continue;
 			}
 
+			/* S1: on a clone/staging copy (or an un-reprovisioned domain move) no queued,
+			 * running or uncertain order copied from the original may reach the Source,
+			 * not even for reconciliation. Hold it for manual review and retire the
+			 * queue marker so a later re-provisioning cannot silently replay it. */
+			if ( $this->clone_guard_blocks_purchase() ) {
+				$this->hold_order_for_clone_review( $order, 'queue_processor' );
+				$result['skipped']++;
+				$result['status'] = 'clone_guard_blocked';
+				$this->cleanup_order_queue_item( $queue_item );
+				continue;
+			}
+
 			if ( 'processing' !== sanitize_key( (string) $order->get_status() ) ) {
 				$nonprocessing_attempt_state = $this->get_order_submission_attempt_state( $order );
 				if ( 'running_recent' === $nonprocessing_attempt_state ) {
@@ -4388,7 +4415,7 @@ class Mobo_Core_Checkout_Validator {
 			 * Only a separately authorized administrator action may retry it.
 			 * A price-review order is terminal for automation in the same way. */
 			$durable_submit_status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
-			if ( in_array( $durable_submit_status, array( 'failed', 'aborted', 'price_review' ), true ) ) {
+			if ( in_array( $durable_submit_status, array( 'failed', 'aborted', 'price_review', 'blocked_clone' ), true ) ) {
 				$result['skipped']++;
 				$this->cleanup_order_queue_item( $queue_item );
 				continue;
@@ -5216,6 +5243,52 @@ class Mobo_Core_Checkout_Validator {
 		$this->append_order_log( $order, 'order_submission_blocked_scope', array( 'source' => sanitize_key( (string) $source ), 'scope' => $scope ) );
 	}
 
+	/** @return bool Whether the S1 clone guard currently refuses Source purchases. */
+	private function clone_guard_blocks_purchase() {
+		return class_exists( 'Mobo_Core_Clone_Guard' ) && Mobo_Core_Clone_Guard::is_purchase_blocked();
+	}
+
+	/**
+	 * S1: hold one paid order for manual review because this installation is a
+	 * suspected clone/staging copy (or a domain move that was not re-provisioned).
+	 * Nothing is sent to the Source. Running/uncertain/sent evidence copied from
+	 * the original site is never overwritten; only an idle/queued status becomes
+	 * the terminal "blocked_clone" (only an administrator retry can submit it).
+	 *
+	 * @param WC_Order|int $order Order or id.
+	 * @param string       $source Caller.
+	 * @return bool Whether a hold was recorded.
+	 */
+	private function hold_order_for_clone_review( $order, $source = '' ) {
+		if ( ! $order instanceof WC_Order ) {
+			$order = absint( $order ) > 0 && function_exists( 'wc_get_order' ) ? wc_get_order( absint( $order ) ) : null;
+		}
+		if ( ! $order instanceof WC_Order || ! class_exists( 'Mobo_Core_Clone_Guard' ) ) {
+			return false;
+		}
+		if ( 'yes' === (string) $order->get_meta( Mobo_Core_Clone_Guard::ORDER_META_BLOCKED, true ) ) {
+			return false; /* Already held: no duplicate notes on every worker pass. */
+		}
+		$status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
+		$order->update_meta_data( Mobo_Core_Clone_Guard::ORDER_META_BLOCKED, 'yes' );
+		$order->update_meta_data( '_mobo_order_requires_review', 'yes' );
+		if ( in_array( $status, array( '', 'queued' ), true ) ) {
+			$order->delete_meta_data( '_mobo_order_submit_queued' );
+			$order->delete_meta_data( '_mobo_order_submit_context' );
+			$order->update_meta_data( '_mobo_order_submit_status', Mobo_Core_Clone_Guard::SUBMIT_STATUS );
+		}
+		$order->update_meta_data( '_mobo_order_last_error_code', Mobo_Core_Clone_Guard::ERROR_CODE );
+		$order->update_meta_data( '_mobo_order_last_error', Mobo_Core_Clone_Guard::blocked_message() );
+		$order->save();
+		$order->add_order_note( Mobo_Core_Clone_Guard::order_note() );
+		$this->append_order_log( $order, 'order_submission_blocked_clone_guard', array(
+			'source'  => sanitize_key( (string) $source ),
+			'status'  => $status,
+			'reasons' => Mobo_Core_Clone_Guard::health_payload()['reasons'],
+		) );
+		return true;
+	}
+
 	/** Human-readable explanation for the current fail-closed order policy. */
 	private function build_unsubmittable_order_message( $scope ) {
 		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
@@ -5382,6 +5455,13 @@ class Mobo_Core_Checkout_Validator {
 	 * @return true|WP_Error
 	 */
 	private function fresh_checkout_route_preflight() {
+		/* S1: a clone/staging copy or an un-reprovisioned domain move never talks to
+		 * the Source (login, shared cart, checkout, Wallet, balance). Every outbound
+		 * Source request passes through this fence, so it is the hard backstop for
+		 * the entry-point holds below. */
+		if ( class_exists( 'Mobo_Core_Clone_Guard' ) && Mobo_Core_Clone_Guard::is_purchase_blocked() ) {
+			return Mobo_Core_Clone_Guard::blocked_error();
+		}
 		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
 			return true; // Only for pre-Connection-table upgrade compatibility.
 		}
@@ -5445,6 +5525,11 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$order_id = absint( $order->get_id() );
+		if ( $this->clone_guard_blocks_purchase() ) {
+			/* S1 entry fence for every purchase path (queue worker, admin retry, CLI). */
+			$this->hold_order_for_clone_review( $order, 'submit_entry' );
+			return new WP_Error( 'mobo_core_clone_guard_blocked', Mobo_Core_Clone_Guard::blocked_message(), array( 'requestMayHaveReachedServer' => false ) );
+		}
 		if ( $order_id <= 0 || ! class_exists( 'Mobo_Core_Lock' ) ) {
 			return new WP_Error( 'mobo_core_order_submission_lock_unavailable', 'Per-order submission lock is unavailable.' );
 		}
@@ -5573,6 +5658,11 @@ class Mobo_Core_Checkout_Validator {
 				$fresh->delete_meta_data( '_mobo_order_last_error' );
 				$fresh->delete_meta_data( '_mobo_order_failed_at' );
 				$fresh->delete_meta_data( '_mobo_order_uncertain_at' );
+				if ( 'yes' === (string) $fresh->get_meta( '_mobo_order_clone_blocked', true ) ) {
+					/* The administrator reviewed an S1 clone hold on the re-provisioned site. */
+					$fresh->delete_meta_data( '_mobo_order_clone_blocked' );
+					$fresh->delete_meta_data( '_mobo_order_requires_review' );
+				}
 				$this->clear_order_defer_backoff_meta( $fresh );
 				$fresh->save();
 			}
@@ -6830,7 +6920,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$error_code = (string) $error->get_error_code();
-		if ( in_array( $error_code, array( 'mobo_core_shared_cart_lock_lost', 'mobo_core_order_submission_lock_lost', 'mobo_core_shared_cart_lock_unavailable', 'mobo_core_shared_cart_upgrade_barrier', 'mobo_core_mobo_json_error', 'mobo_core_mobo_credentials_missing', 'mobo_core_mobo_login_http_error', 'mobo_core_mobo_login_missing_cookie', 'mobo_core_order_auth_retry_failed' ), true ) ) {
+		if ( in_array( $error_code, array( 'mobo_core_shared_cart_lock_lost', 'mobo_core_order_submission_lock_lost', 'mobo_core_shared_cart_lock_unavailable', 'mobo_core_shared_cart_upgrade_barrier', 'mobo_core_mobo_json_error', 'mobo_core_mobo_credentials_missing', 'mobo_core_mobo_login_http_error', 'mobo_core_mobo_login_missing_cookie', 'mobo_core_order_auth_retry_failed', 'mobo_core_clone_guard_blocked' ), true ) ) {
 			return false;
 		}
 
@@ -7407,6 +7497,12 @@ class Mobo_Core_Checkout_Validator {
 			exit;
 		}
 
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$order->add_order_note( 'ارسال دستی به موبو انجام نشد. ' . Mobo_Core_Clone_Guard::blocked_message() );
+			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+			exit;
+		}
+
 		$attempt_state    = $this->get_order_submission_attempt_state( $order );
 		$submit_status    = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
 		$verified_absent  = isset( $_POST['verified_absent'] ) && '1' === sanitize_text_field( wp_unslash( $_POST['verified_absent'] ) );
@@ -7652,11 +7748,27 @@ class Mobo_Core_Checkout_Validator {
 			return $state;
 		}
 
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$state['label']   = 'سایت کپی/staging؛ خرید متوقف';
+			$state['tone']    = 'error';
+			$state['message'] = Mobo_Core_Clone_Guard::blocked_message();
+			return $state;
+		}
+
 		$connection_block_reason = $this->get_order_submission_connection_block_reason( $scope );
 		if ( '' !== $connection_block_reason ) {
 			$state['label']   = 'اتصال مالک آماده نیست';
 			$state['tone']    = 'error';
 			$state['message'] = $connection_block_reason;
+			return $state;
+		}
+
+		if ( 'blocked_clone' === $submit_status && 'processing' === sanitize_key( (string) $order->get_status() ) && ! in_array( $attempt_state, array( 'running_recent', 'running_stale', 'uncertain' ), true ) ) {
+			$state['label']      = 'نگه‌داشته‌شده (سایت کپی)؛ نیازمند بررسی';
+			$state['tone']       = 'warning';
+			$state['message']    = 'این سفارش زمانی پرداخت شد که سایت نسخه کپی یا دامنه آن تغییرکرده تشخیص داده شده بود و خودکار ارسال نشد. پیش از ارسال دستی بررسی کنید که این سفارش قبلاً از سایت اصلی در موبو ثبت نشده باشد.';
+			$state['canRetry']   = true;
+			$state['retryLabel'] = 'بررسی کردم؛ ارسال دستی به موبو';
 			return $state;
 		}
 

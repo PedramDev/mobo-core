@@ -110,6 +110,11 @@ class Mobo_Core_Health_Reporter {
 			'webhookCredential'      => $webhook_auth,
 			'moneyContract'          => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::compatibility_status( 0, true ) : array( 'compatible' => false, 'code' => 'money_policy_unavailable', 'requiresReprovision' => true ),
 			'licenseInstallation'   => class_exists( 'Mobo_Core_Portal_Request_Signer' ) ? Mobo_Core_Portal_Request_Signer::get_status() : array( 'identityReady' => false, 'opensslAvailable' => function_exists( 'openssl_sign' ) ),
+			/* S1: clone/staging copy or un-reprovisioned domain move. While true, Source
+			 * purchases and wallet payments are refused locally; the Backend should flag
+			 * the installation and must not treat it as the original site. */
+			'cloneSuspected'        => class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::is_clone_suspected() : false,
+			'siteBinding'           => class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::health_payload() : array( 'cloneSuspected' => false, 'purchaseBlocked' => false, 'bound' => false ),
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,
 			'wooCommerceVersion'    => $this->get_woocommerce_version(),
