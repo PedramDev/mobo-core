@@ -63,7 +63,9 @@ test.describe('Site health tab', () => {
     const form = actionForm(page, 'mobo_core_start_database_unicode_migration');
     const start = form.locator('button[type="submit"]');
     await requireRendered(start, 'start form not rendered after pre-check');
-    await form.locator('input[name="mobo_backup_confirmed"]').check();
+    const backup = form.locator('input[name="mobo_backup_confirmed"]');
+    await reveal(backup); // the utf8mb4 card sits in the "گزارش فنی کامل" <details>
+    await backup.check();
     const n = await clickAndReadNotice(page, start, 540_000);
     expect(['success', 'warning'], n.message).toContain(n.type);
     expect(n.message).toMatch(/تبدیل/);

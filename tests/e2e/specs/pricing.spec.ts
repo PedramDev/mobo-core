@@ -3,7 +3,7 @@
  * A:10375/10412/10444/10472 and ajax reprice status A:10032.
  * Reprice state lives in wp_mobo_state (mobo_core_reprice_state).
  */
-import { Page } from '@playwright/test';
+import { Locator, Page } from '@playwright/test';
 import { test, expect } from '../lib/fixtures';
 import { actionForm, cardAjax, clickAndReadNotice, gotoTab, postAjax, requireRendered, reveal, settingsForm, submitForm } from '../lib/admin';
 import { getSetting, getState, serializedField } from '../lib/db';
@@ -20,6 +20,28 @@ async function repriceStatus(page: Page): Promise<any> {
 
 const repriceDbStatus = () => serializedField(getState('mobo_core_reprice_state'), 'status');
 
+/**
+ * Pick a price type the way an admin does: the radios are visually hidden
+ * (`.mobo-price-types input { display:none }`) and the segmented label is the control.
+ */
+async function choosePriceType(form: Locator, value: string): Promise<void> {
+  const radio = form.locator(`input[name="mobo_price_type"][value="${value}"]`);
+  await form.locator('.mobo-price-types label', { has: form.page().locator(`input[name="mobo_price_type"][value="${value}"]`) }).click();
+  await expect(radio).toBeChecked();
+}
+
+/**
+ * Hold the page's live reprice-status poll. On a tiny catalog the poll itself may run
+ * the last bounded batch and then reload the page, racing the click on a control that
+ * only renders while the run is active. The control under test is unaffected.
+ */
+async function freezeRepricePoll(page: Page): Promise<void> {
+  await page.route('**/admin-ajax.php', (route) =>
+    (route.request().postData() || '').includes('mobo_core_get_reprice_status') ? route.abort() : route.fallback());
+}
+
+const REPRICE_NOT_ACTIVE = 'عملیات قیمت‌گذاری فعال نیست';
+
 test.describe('Pricing tab', () => {
   test('"ذخیره سیاست قیمت" persists price type and percentage', async ({ page }) => {
     await gotoTab(page, 'pricing');
@@ -29,7 +51,7 @@ test.describe('Pricing tab', () => {
     const originalPct = await form.locator('#global_additional_percentage').inputValue();
     const newPct = originalPct === '17.5' ? '18.25' : '17.5';
     try {
-      await form.locator('input[name="mobo_price_type"][value="static-percentage"]').check({ force: true });
+      await choosePriceType(form, 'static-percentage');
       await expect(form.locator('#static-percentage')).toBeVisible();
       await form.locator('#global_additional_percentage').fill(newPct);
       const n = await submitForm(page, form);
@@ -41,9 +63,9 @@ test.describe('Pricing tab', () => {
     } finally {
       await gotoTab(page, 'pricing');
       const f = settingsForm(page, 'pricing');
-      await f.locator('input[name="mobo_price_type"][value="static-percentage"]').check({ force: true });
+      await choosePriceType(f, 'static-percentage');
       await f.locator('#global_additional_percentage').fill(originalPct || '0');
-      await f.locator(`input[name="mobo_price_type"][value="${originalType}"]`).check({ force: true });
+      await choosePriceType(f, originalType);
       expect((await submitForm(page, f)).type).toBe('success');
       expect(getSetting('mobo_price_type')).toBe(originalType);
     }
@@ -67,15 +89,23 @@ test.describe('Pricing tab', () => {
   });
 
   test('"توقف اعمال قیمت" cancels the running reprice', async ({ page }) => {
+    await freezeRepricePoll(page);
     await gotoTab(page, 'pricing');
     const cancel = actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
     await requireRendered(cancel, 'reprice is not running (small catalogs finish within the first batch)');
     const n = await clickAndReadNotice(page, cancel);
     expect(n.type, n.message).toBe('success');
-    expect(repriceDbStatus()).toBe('cancelled');
+    if (n.message.includes(REPRICE_NOT_ACTIVE)) {
+      // A Cron/Self-Runner worker finished the run between render and click: the
+      // handler truthfully reports "not active" and leaves the finished state alone.
+      expect(['done', 'completed']).toContain(String(repriceDbStatus()));
+    } else {
+      expect(repriceDbStatus()).toBe('cancelled');
+    }
   });
 
   test('"ادامه از checkpoint" resumes a cancelled reprice', async ({ page }) => {
+    await freezeRepricePoll(page);
     await gotoTab(page, 'pricing');
     const resume = actionForm(page, 'mobo_core_resume_reprice').locator('button[type="submit"]');
     await requireRendered(resume, 'resume is only offered for a cancelled reprice run');
