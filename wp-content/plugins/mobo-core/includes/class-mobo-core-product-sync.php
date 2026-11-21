@@ -2556,14 +2556,19 @@ class Mobo_Core_Product_Sync {
 			return $this->result( true, 'Delta recorded for a quarantined product; not applied.', array( 'deleteFile' => true, 'needFullSnapshot' => false, 'note' => Mobo_Core_Product_Delta::NOTE_QUARANTINED, 'productGuid' => $guid, 'reason' => sanitize_key( $pre['reason'] ), 'healthSkipped' => true ) );
 		}
 		if ( 'ok' !== $pre['status'] ) {
-			$this->record_delta_full_snapshot_request( $guid, absint( $pre['product']['id'] ?? 0 ), $pre['reason'] );
+			$requested      = $this->record_delta_full_snapshot_request( $guid, absint( $pre['product']['id'] ?? 0 ), $pre['reason'] );
 			$interrupted_id = absint( $pre['product']['id'] ?? 0 );
 			if ( $interrupted_id > 0 && class_exists( 'Mobo_Core_Delta_Inflight' ) && Mobo_Core_Delta_Inflight::is_marked( $interrupted_id ) ) {
 				/* M5: under the product lock a leftover in-flight marker is certainly
 				 * from a killed delta: hand over to the incomplete marker + snapshot. */
-				$this->persist_post_meta_verified( $interrupted_id, 'mobo_sync_incomplete', '1' );
+				$marked = $this->persist_post_meta_verified( $interrupted_id, 'mobo_sync_incomplete', '1' );
 				$this->upsert_product_map( $guid, $interrupted_id, true );
-				Mobo_Core_Delta_Inflight::clear( $interrupted_id );
+				if ( $marked && $requested ) {
+					Mobo_Core_Delta_Inflight::clear( $interrupted_id );
+				}
+			}
+			if ( ! $requested ) {
+				return $this->result( false, 'Full snapshot request could not be written (database write failure); delta event kept for retry.', array( 'deleteFile' => false, 'productGuid' => $guid, 'error' => 'snapshot_request_unrecorded' ) );
 			}
 			return $this->result( true, 'Delta cannot be applied safely; a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid, 'reason' => sanitize_key( $pre['reason'] ), 'healthSkipped' => true ) );
 		}
@@ -2583,7 +2588,9 @@ class Mobo_Core_Product_Sync {
 		$fields  = $this->delta_canonical_fields( $logical );
 		$product = wc_get_product( $product_id );
 		if ( ! $product instanceof WC_Product ) {
-			$this->record_delta_full_snapshot_request( $guid, $product_id, 'product_unloadable' );
+			if ( ! $this->record_delta_full_snapshot_request( $guid, $product_id, 'product_unloadable' ) ) {
+				return $this->result( false, 'Full snapshot request could not be written (database write failure); delta event kept for retry.', array( 'deleteFile' => false, 'productGuid' => $guid, 'error' => 'snapshot_request_unrecorded' ) );
+			}
 			return $this->result( true, 'Delta product could not be loaded; a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid ) );
 		}
 		$is_variable = $product->is_type( 'variable' );
@@ -2675,9 +2682,16 @@ class Mobo_Core_Product_Sync {
 				throw new RuntimeException( 'Product delta applied watermark could not be persisted.' );
 			}
 		} catch ( Throwable $e ) {
-			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$marked    = $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
 			$this->upsert_product_map( $guid, $product_id, true );
-			$this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_write_failed' );
+			$requested = $this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_write_failed' );
+			if ( ! $marked || ! $requested ) {
+				/* Disk full / database write failure: the recovery evidence itself
+				 * was not persisted. Never acknowledge the event in that state; keep
+				 * the in-flight crash marker (the interrupted-delta sweep still owns
+				 * the product) and let the queue retry with transient backoff. */
+				return $this->result( false, 'Delta write failed and the recovery markers could not be written (database write failure); event kept for retry.', array( 'deleteFile' => false, 'productGuid' => $guid, 'productId' => $product_id, 'error' => 'delta_write_failed_unrecorded' ) );
+			}
 			if ( class_exists( 'Mobo_Core_Delta_Inflight' ) ) {
 				Mobo_Core_Delta_Inflight::clear( $product_id ); // Superseded by the incomplete marker + snapshot request.
 			}
@@ -2741,10 +2755,13 @@ class Mobo_Core_Product_Sync {
 				continue;
 			}
 			try {
-				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$marked = $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
 				$this->upsert_product_map( $guid, $product_id, true );
-				$this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_interrupted' );
-				Mobo_Core_Delta_Inflight::clear( $product_id );
+				$requested = $this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_interrupted' );
+				if ( $marked && $requested ) {
+					/* Clear the crash marker only once its replacement evidence is durable. */
+					Mobo_Core_Delta_Inflight::clear( $product_id );
+				}
 			} catch ( Throwable $error ) {
 				if ( class_exists( 'Mobo_Core_Logger' ) ) {
 					Mobo_Core_Logger::warning( 'Interrupted delta recovery deferred.', array( 'productId' => $product_id, 'error' => $error->getMessage() ) );
@@ -2756,7 +2773,7 @@ class Mobo_Core_Product_Sync {
 	private function record_delta_full_snapshot_request( $guid, $product_id, $reason ) {
 		$guid = sanitize_text_field( (string) $guid );
 		if ( '' === $guid ) {
-			return;
+			return false;
 		}
 		$requests = Mobo_Core_Settings::get( 'mobo_core_delta_full_snapshot_requests', array() );
 		$requests = is_array( $requests ) ? $requests : array();
@@ -2765,10 +2782,16 @@ class Mobo_Core_Product_Sync {
 		if ( count( $requests ) > 200 ) {
 			$requests = array_slice( $requests, -200, null, true );
 		}
-		Mobo_Core_Settings::update( 'mobo_core_delta_full_snapshot_requests', $requests, false );
+		$stored = Mobo_Core_Settings::update( 'mobo_core_delta_full_snapshot_requests', $requests, false );
+		if ( ! $stored ) {
+			/* update_option() is also false for an unchanged value. */
+			$current = Mobo_Core_Settings::get( 'mobo_core_delta_full_snapshot_requests', array() );
+			$stored  = is_array( $current ) && isset( $current[ $guid ] );
+		}
 		if ( absint( $product_id ) > 0 && class_exists( 'Mobo_Core_Sync_Health' ) && method_exists( 'Mobo_Core_Sync_Health', 'mark_behind' ) ) {
 			Mobo_Core_Sync_Health::mark_behind( $guid, absint( $product_id ) );
 		}
+		return (bool) $stored;
 	}
 
 	/**
@@ -9171,7 +9194,7 @@ class Mobo_Core_Product_Sync {
 			return;
 		}
 
-		$timestamp = strtotime( $published_at );
+		$timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $published_at ) : strtotime( $published_at ) );
 
 		if ( false === $timestamp || $timestamp <= 0 ) {
 			$this->update_product_meta_if_changed( $product, 'published_at', $published_at );

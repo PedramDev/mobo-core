@@ -21,6 +21,140 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Sync_Event_Store {
 
+	/*
+	 * S2 retry policy.
+	 *
+	 * - Every claim is an attempt: claiming increments try_count. A transition
+	 *   that is not a failure (deferral, partial progress, a claim released at a
+	 *   time budget) gives the attempt back.
+	 * - A claim whose lease expires (fatal error, OOM, kill, timeout) is
+	 *   reclaimed alone, never together with other rows, and at most
+	 *   CRASH_RECLAIM_LIMIT times; then the row is failed instead of crashing
+	 *   the runner again for the two-day event lifetime.
+	 * - Failures back off exponentially (BACKOFF_BASE_SECONDS doubling, capped
+	 *   at BACKOFF_CAP_SECONDS).
+	 * - A transient failure (database write error, full disk/table, lost
+	 *   connection, network/Backend outage) is not final after the ordinary
+	 *   max-try budget; it keeps retrying up to TRANSIENT_MAX_TRY attempts
+	 *   (about five hours), and failed transient rows are re-armed automatically
+	 *   every AUTO_RETRY_INTERVAL for AUTO_RETRY_MAX_AGE after creation unless a
+	 *   newer event superseded them.
+	 */
+	const BACKOFF_BASE_SECONDS     = 30;
+	const BACKOFF_CAP_SECONDS      = 3600;
+	const TRANSIENT_MAX_TRY        = 12;
+	const CRASH_RECLAIM_LIMIT      = 3;
+	const NULL_LOCK_STALE_SECONDS  = 900;
+	const AUTO_RETRY_INTERVAL      = 1800;
+	const AUTO_RETRY_MAX_AGE       = 604800; // 7 days.
+	const AUTO_RETRY_OPTION        = 'mobo_core_sync_event_auto_retry_at';
+	const RECLAIM_MARKER           = 'Previous processing attempt ended abnormally (fatal error, timeout or kill); reclaimed ';
+	const CRASH_FAILED_MESSAGE     = 'Event processing ended abnormally repeatedly (fatal error, timeout or kill); stopped to protect the site. Retry after fixing the cause.';
+
+	/**
+	 * Pure: does a failure message describe a temporary condition of the site or
+	 * the network rather than a defect of the event?
+	 *
+	 * @param string $message Failure message.
+	 * @return bool
+	 */
+	public static function is_transient_failure( $message ) {
+		$message = strtolower( (string) $message );
+		if ( '' === $message ) {
+			return false;
+		}
+		$needles = array(
+			// Database / storage.
+			'database error', 'db error', 'db write', 'database write', 'could not write', 'could not be written',
+			'write failed', 'failed to write', 'insert failed', 'update failed', 'could not insert', 'could not update',
+			'could not be saved', 'could not save', 'deadlock', 'lock wait timeout', 'gone away', 'lost connection',
+			'too many connections', 'is full', 'disk full', 'no space left', 'errno: 28', 'errno 28', 'quota',
+			'read-only', 'read only file', 'storage is not ready', 'storage not ready',
+			// Network / Backend availability.
+			'timed out', 'timeout', 'curl error', 'could not resolve', 'connection refused', 'connection reset',
+			'http 500', 'http 502', 'http 503', 'http 504', 'http_request_failed', 'service unavailable', 'bad gateway',
+			'payload pull',
+		);
+		foreach ( $needles as $needle ) {
+			if ( false !== strpos( $message, $needle ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Pure: exponential backoff with a small deterministic jitter.
+	 *
+	 * @param int $try_count Attempts so far (>= 1).
+	 * @param int $id Row ID (jitter seed).
+	 * @return int Seconds.
+	 */
+	public static function retry_delay( $try_count, $id = 0 ) {
+		$try_count = max( 1, absint( $try_count ) );
+		$delay     = self::BACKOFF_BASE_SECONDS;
+		for ( $i = 1; $i < $try_count && $delay < self::BACKOFF_CAP_SECONDS; $i++ ) {
+			$delay *= 2;
+		}
+		$delay  = min( self::BACKOFF_CAP_SECONDS, $delay );
+		$jitter = absint( absint( $id ) * 7 + $try_count * 13 ) % max( 1, (int) floor( $delay / 10 ) );
+		return $delay + $jitter;
+	}
+
+	/**
+	 * Pure: final failure or retry, and when.
+	 *
+	 * An explicit final request before the try budget is spent (non-retryable
+	 * ordering conflict, expired or undecodable event) is honoured. A final
+	 * request caused only by the exhausted budget is overridden for transient
+	 * failures until TRANSIENT_MAX_TRY.
+	 *
+	 * @param int    $try_count Attempts so far.
+	 * @param int    $max_try Ordinary budget.
+	 * @param bool   $final_requested Caller's decision.
+	 * @param string $message Failure message.
+	 * @param int    $id Row ID.
+	 * @return array{final:bool,delay:int,transient:bool}
+	 */
+	public static function failure_policy( $try_count, $max_try, $final_requested, $message, $id = 0 ) {
+		$try_count = absint( $try_count );
+		$max_try   = max( 1, absint( $max_try ) );
+		$transient = self::is_transient_failure( $message );
+		$final     = (bool) $final_requested;
+		if ( $final && $transient && $try_count >= $max_try ) {
+			$final = $try_count >= max( $max_try, self::TRANSIENT_MAX_TRY );
+		}
+		return array(
+			'final'     => $final,
+			'delay'     => $final ? 0 : self::retry_delay( max( 1, $try_count ), $id ),
+			'transient' => $transient,
+		);
+	}
+
+	/**
+	 * Pure: how many times a row was already reclaimed after an abnormal end.
+	 *
+	 * @param string $last_error Row last_error.
+	 * @return int
+	 */
+	public static function reclaim_count( $last_error ) {
+		$last_error = (string) $last_error;
+		if ( 0 !== strpos( $last_error, self::RECLAIM_MARKER ) ) {
+			return 0;
+		}
+		return absint( substr( $last_error, strlen( self::RECLAIM_MARKER ) ) );
+	}
+
+	/** @param int $count Reclaims. @return string */
+	public static function reclaim_message( $count ) {
+		return self::RECLAIM_MARKER . absint( $count ) . ' time(s).';
+	}
+
+	/** Ordinary attempt budget. @return int */
+	private static function max_try() {
+		return class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 ) : 5;
+	}
+
 	/** Resolve active/default Connection for every queue operation. */
 	private static function connection_id() {
 		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
@@ -704,6 +838,8 @@ class Mobo_Core_Sync_Event_Store {
 			return false;
 		}
 
+		$this->maybe_auto_retry_failed_events();
+
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$connection_id = self::connection_id();
@@ -712,11 +848,13 @@ class Mobo_Core_Sync_Event_Store {
 			$wpdb->prepare(
 				"SELECT id FROM {$table}
 				WHERE connection_id = %d AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+					OR (status = 'processing' AND locked_until IS NULL AND updated_at < %s))
 				LIMIT 1",
 				$connection_id,
 				$now,
-				$now
+				$now,
+				self::null_lock_cutoff()
 			)
 		);
 
@@ -929,19 +1067,64 @@ class Mobo_Core_Sync_Event_Store {
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$connection_id = self::connection_id();
-		$ids   = $wpdb->get_col(
+		$null_cutoff   = self::null_lock_cutoff();
+
+		/* S2: a row whose lease expired was being processed when PHP died (fatal,
+		 * OOM, kill, timeout). Reclaim it alone so a poison event cannot take
+		 * innocent rows of the same batch down with it, and fail it after
+		 * CRASH_RECLAIM_LIMIT abnormal ends. */
+		$reclaim_error = '';
+		$ids           = array();
+		$stale         = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id FROM {$table}
-				WHERE connection_id = %d AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))
-				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
-				LIMIT %d",
+				"SELECT id, last_error FROM {$table}
+				WHERE connection_id = %d AND status = 'processing'
+					AND ((locked_until IS NOT NULL AND locked_until < %s) OR (locked_until IS NULL AND updated_at < %s))
+				ORDER BY id ASC
+				LIMIT 1",
 				$connection_id,
 				$now,
-				$now,
-				$limit
-			)
+				$null_cutoff
+			),
+			ARRAY_A
 		);
+		if ( is_array( $stale ) && absint( isset( $stale['id'] ) ? $stale['id'] : 0 ) > 0 ) {
+			$reclaims = self::reclaim_count( isset( $stale['last_error'] ) ? $stale['last_error'] : '' ) + 1;
+			if ( $reclaims > self::CRASH_RECLAIM_LIMIT ) {
+				$wpdb->query(
+					$wpdb->prepare(
+						"UPDATE {$table}
+						SET status = 'failed', locked_until = NULL, claim_token = '', next_retry_at = NULL, last_error = %s, progress_json = '{}', updated_at = %s
+						WHERE connection_id = %d AND id = %d AND status = 'processing'
+							AND ((locked_until IS NOT NULL AND locked_until < %s) OR (locked_until IS NULL AND updated_at < %s))",
+						self::CRASH_FAILED_MESSAGE,
+						$now,
+						$connection_id,
+						absint( $stale['id'] ),
+						$now,
+						$null_cutoff
+					)
+				);
+				self::invalidate_summary_cache();
+			} else {
+				$ids           = array( absint( $stale['id'] ) );
+				$reclaim_error = self::reclaim_message( $reclaims );
+			}
+		}
+
+		if ( empty( $ids ) ) {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT id FROM {$table}
+					WHERE connection_id = %d AND status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s)
+					ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
+					LIMIT %d",
+					$connection_id,
+					$now,
+					$limit
+				)
+			);
+		}
 
 		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
 		if ( empty( $ids ) ) {
@@ -951,14 +1134,21 @@ class Mobo_Core_Sync_Event_Store {
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
 		$claim_token     = str_replace( '-', '', wp_generate_uuid4() );
-		$update_args     = array_merge( array( $locked_until, $claim_token, $now, $connection_id ), $ids, array( $now, $now ) );
+		$error_sql       = '' !== $reclaim_error ? ', last_error = %s' : '';
+		$update_args     = array( $locked_until, $claim_token, $now );
+		if ( '' !== $reclaim_error ) {
+			$update_args[] = $reclaim_error;
+		}
+		$update_args     = array_merge( $update_args, array( $connection_id ), $ids, array( $now, $now, $null_cutoff ) );
+		/* Every claim is an attempt (try_count + 1). */
 		$updated         = $wpdb->query(
-			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains fixed values, dynamic %d ID replacements, and trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
-				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
+				SET status = 'processing', try_count = try_count + 1, locked_until = %s, claim_token = %s, updated_at = %s{$error_sql}
 				WHERE connection_id = %d AND id IN ({$id_placeholders})
 					AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
+						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+						OR (status = 'processing' AND locked_until IS NULL AND updated_at < %s))",
 				$update_args
 			)
 		);
@@ -988,6 +1178,11 @@ class Mobo_Core_Sync_Event_Store {
 
 		foreach ( $rows as &$row ) {
 			$row['_mobo_bulk_claimed'] = 1;
+			/* try_count already includes this claim. Callers historically compute
+			 * "this attempt" as try_count + 1 from an unclaimed row, so expose the
+			 * pre-claim value and keep the claimed attempt number separately. */
+			$row['_mobo_claim_attempt'] = absint( isset( $row['try_count'] ) ? $row['try_count'] : 0 );
+			$row['try_count']           = max( 0, $row['_mobo_claim_attempt'] - 1 );
 		}
 		unset( $row );
 
@@ -1019,7 +1214,7 @@ class Mobo_Core_Sync_Event_Store {
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'pending', locked_until = NULL, claim_token = '', updated_at = %s
+				SET try_count = IF(try_count > 0, try_count - 1, 0), status = 'pending', locked_until = NULL, claim_token = '', updated_at = %s
 				WHERE connection_id = %d AND status = 'processing' AND claim_token = %s AND id IN ({$id_sql})",
 				$now,
 				$connection_id,
@@ -1064,12 +1259,18 @@ class Mobo_Core_Sync_Event_Store {
 					status = 'processing'
 					AND locked_until IS NOT NULL
 					AND locked_until < %s
+				)
+				OR (
+					status = 'processing'
+					AND locked_until IS NULL
+					AND updated_at < %s
 				))
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
 				LIMIT %d",
 				$connection_id,
 				$now,
 				$now,
+				self::null_lock_cutoff(),
 				$limit
 			),
 			ARRAY_A
@@ -1103,18 +1304,20 @@ class Mobo_Core_Sync_Event_Store {
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
+				SET status = 'processing', try_count = try_count + 1, locked_until = %s, claim_token = %s, updated_at = %s
 				WHERE id = %d AND connection_id = %d
 				AND (
 					status = 'pending'
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+					OR (status = 'processing' AND locked_until IS NULL AND updated_at < %s)
 				)",
 				$locked_until,
 				$claim_token,
 				$now,
 				$id,
 				$connection_id,
-				$now
+				$now,
+				self::null_lock_cutoff()
 			)
 		);
 
@@ -1167,9 +1370,9 @@ class Mobo_Core_Sync_Event_Store {
 			'event'         => isset( $row['event_type'] ) ? sanitize_text_field( (string) $row['event_type'] ) : '',
 			'syncId'        => isset( $row['sync_id'] ) ? sanitize_text_field( (string) $row['sync_id'] ) : '',
 			'try'       => isset( $row['try_count'] ) ? absint( $row['try_count'] ) : 0,
-			'createdAt' => isset( $row['created_at'] ) ? strtotime( (string) $row['created_at'] ) : time(),
-			'updatedAt' => isset( $row['updated_at'] ) ? strtotime( (string) $row['updated_at'] ) : time(),
-			'expiresAt' => isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0,
+			'createdAt' => isset( $row['created_at'] ) ? self::utc_timestamp( $row['created_at'], time() ) : time(),
+			'updatedAt' => isset( $row['updated_at'] ) ? self::utc_timestamp( $row['updated_at'], time() ) : time(),
+			'expiresAt' => isset( $row['expires_at'] ) ? self::utc_timestamp( $row['expires_at'], 0 ) : 0,
 			'payload'   => $payload,
 		);
 	}
@@ -1257,6 +1460,8 @@ class Mobo_Core_Sync_Event_Store {
 			$id,
 			'pending',
 			array(
+				/* Deferral / partial progress is not a failed attempt. */
+				'try_count'     => self::TRY_COUNT_UNCLAIM,
 				'payload_json'  => $payload_json,
 				'progress_json' => $progress_json,
 				'locked_until'  => null,
@@ -1278,8 +1483,9 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return bool
 	 */
 	public function mark_failure( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
-		$status = $final_failed ? 'failed' : 'pending';
-		$delay  = $final_failed ? null : min( 300, max( 30, absint( $try_count ) * 30 ) );
+		$policy = self::failure_policy( $try_count, self::max_try(), $final_failed, $message, $id );
+		$status = $policy['final'] ? 'failed' : 'pending';
+		$delay  = $policy['final'] ? null : $policy['delay'];
 
 		return $this->update_status(
 			$id,
@@ -1309,12 +1515,16 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return bool
 	 */
 	public function mark_retry_now( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
+		/* Immediate for the first two attempts (no cron may wake the site later);
+		 * afterwards the same exponential/transient policy as mark_failure(). */
+		$policy = self::failure_policy( $try_count, self::max_try(), $final_failed, $message, $id );
+		$delay  = ( $policy['final'] || absint( $try_count ) <= 2 ) ? 0 : $policy['delay'];
 		return $this->update_status(
 			$id,
-			$final_failed ? 'failed' : 'pending',
+			$policy['final'] ? 'failed' : 'pending',
 			array(
 				'try_count'     => absint( $try_count ),
-				'next_retry_at' => null,
+				'next_retry_at' => $delay > 0 ? gmdate( 'Y-m-d H:i:s', time() + $delay ) : null,
 				'locked_until'  => null,
 				'claim_token'   => '',
 				'last_error'    => sanitize_text_field( (string) $message ),
@@ -1405,7 +1615,7 @@ class Mobo_Core_Sync_Event_Store {
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'pending', try_count = 0, next_retry_at = NULL,
+				SET try_count = IF(status = 'processing', try_count, 0), status = 'pending', next_retry_at = NULL,
 					locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
 				WHERE connection_id = %d AND id IN ({$id_sql})
 					AND ((status = 'processing' AND (locked_until IS NULL OR locked_until < %s))
@@ -1649,6 +1859,114 @@ class Mobo_Core_Sync_Event_Store {
 		return false === $updated ? 0 : absint( $updated );
 	}
 
+	/** Sentinel for update_status(): give the current claim's attempt back. */
+	const TRY_COUNT_UNCLAIM = '__mobo_unclaim__';
+
+	/** UTC cutoff before which a processing row without a lease is abandoned. */
+	private static function null_lock_cutoff() {
+		return gmdate( 'Y-m-d H:i:s', time() - self::NULL_LOCK_STALE_SECONDS );
+	}
+
+	/**
+	 * Parse a UTC MySQL DATETIME regardless of the PHP default timezone.
+	 *
+	 * @param string $value DATETIME (UTC).
+	 * @param int    $fallback Returned when unparsable.
+	 * @return int
+	 */
+	public static function utc_timestamp( $value, $fallback = 0 ) {
+		$value = trim( (string) $value );
+		if ( '' === $value || 0 === strpos( $value, '0000-00-00' ) ) {
+			return (int) $fallback;
+		}
+		$ts = class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $value ) : strtotime( $value . ' UTC' );
+		return false === $ts ? (int) $fallback : (int) $ts;
+	}
+
+	/** Throttled automatic re-arm of transient failures (S2). @return int */
+	public function maybe_auto_retry_failed_events() {
+		$connection_id = self::connection_id();
+		$state         = get_option( self::AUTO_RETRY_OPTION, array() );
+		$state         = is_array( $state ) ? $state : array();
+		$last          = absint( isset( $state[ $connection_id ] ) ? $state[ $connection_id ] : 0 );
+		if ( $last > 0 && ( time() - $last ) < self::AUTO_RETRY_INTERVAL ) {
+			return 0;
+		}
+		$state[ $connection_id ] = time();
+		update_option( self::AUTO_RETRY_OPTION, $state, false );
+		return $this->auto_retry_failed_events( 100 );
+	}
+
+	/**
+	 * Re-arm failed rows whose failure was transient, that are younger than
+	 * AUTO_RETRY_MAX_AGE and that no newer event superseded. The attempt counter
+	 * is kept (a still-broken site fails the row again after one attempt), the
+	 * row's expiry is extended because it was proven to be still relevant.
+	 * The re-arm UPDATE itself is the storage-recovery probe: while the
+	 * database cannot write, nothing changes.
+	 *
+	 * @param int $limit Max rows.
+	 * @return int Rows re-armed.
+	 */
+	public function auto_retry_failed_events( $limit = 100 ) {
+		global $wpdb;
+		if ( ! self::table_exists() ) {
+			return 0;
+		}
+		$limit         = max( 1, min( 500, absint( $limit ) ) );
+		$table         = self::table_name();
+		$connection_id = self::connection_id();
+		$now           = current_time( 'mysql', true );
+		$min_created   = gmdate( 'Y-m-d H:i:s', time() - self::AUTO_RETRY_MAX_AGE );
+
+		$wpdb->last_error = '';
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, event_type, entity_type, entity_guid, event_version, last_error
+				 FROM {$table}
+				 WHERE connection_id = %d AND status = 'failed' AND created_at >= %s
+				 ORDER BY id ASC LIMIT %d",
+				$connection_id,
+				$min_created,
+				$limit
+			),
+			ARRAY_A
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) || empty( $rows ) ) {
+			return 0;
+		}
+		$transient_rows = array();
+		foreach ( $rows as $row ) {
+			if ( self::is_transient_failure( isset( $row['last_error'] ) ? $row['last_error'] : '' ) ) {
+				$transient_rows[] = $row;
+			}
+		}
+		if ( empty( $transient_rows ) ) {
+			return 0;
+		}
+		$classification = $this->classify_failed_rows_for_retry( $transient_rows, $table, $connection_id );
+		if ( ! empty( $classification['readFailed'] ) || empty( $classification['retryIds'] ) ) {
+			return 0;
+		}
+		$ids          = $classification['retryIds'];
+		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$expire_days  = class_exists( 'Mobo_Core_Settings' ) ? Mobo_Core_Settings::get_int( 'mobo_core_webhook_expire_days', 2, 1, 30 ) : 2;
+		$expires_at   = gmdate( 'Y-m-d H:i:s', time() + ( $expire_days * 86400 ) );
+		$params       = array_merge( array( $expires_at, $now, $connection_id ), $ids );
+		$updated      = $wpdb->query(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- dynamic integer ID placeholders.
+				"UPDATE {$table}
+				 SET status = 'pending', next_retry_at = NULL, locked_until = NULL, claim_token = '', expires_at = %s, updated_at = %s
+				 WHERE connection_id = %d AND status = 'failed' AND id IN ({$placeholders})",
+				$params
+			)
+		);
+		if ( false !== $updated && absint( $updated ) > 0 ) {
+			self::invalidate_summary_cache();
+		}
+		return false === $updated ? 0 : absint( $updated );
+	}
+
 	/**
 	 * Count statuses.
 	 *
@@ -1713,6 +2031,16 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		$claim_token = sanitize_text_field( (string) $claim_token );
+		$unclaim     = isset( $data['try_count'] ) && self::TRY_COUNT_UNCLAIM === $data['try_count'];
+		if ( $unclaim && '' === $claim_token ) {
+			/* No claim to give back without an exact lease: keep the counter. */
+			unset( $data['try_count'] );
+			$formats = array();
+			foreach ( $data as $value ) {
+				$formats[] = '%s';
+			}
+			$unclaim = false;
+		}
 		if ( '' !== $claim_token ) {
 			$table = self::table_name();
 			$sets  = array();
@@ -1720,6 +2048,11 @@ class Mobo_Core_Sync_Event_Store {
 			foreach ( $data as $key => $value ) {
 				$key = sanitize_key( (string) $key );
 				if ( '' === $key ) {
+					continue;
+				}
+				if ( 'try_count' === $key && $unclaim ) {
+					/* Must precede the status assignment (left-to-right SET). */
+					array_unshift( $sets, 'try_count = IF(try_count > 0, try_count - 1, 0)' );
 					continue;
 				}
 				$sets[] = $key . ' = ' . ( null === $value ? 'NULL' : ( 'try_count' === $key ? '%d' : '%s' ) );
