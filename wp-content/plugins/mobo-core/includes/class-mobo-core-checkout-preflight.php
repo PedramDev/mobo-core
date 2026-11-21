@@ -124,6 +124,28 @@ final class Mobo_Core_Checkout_Preflight {
 	}
 
 	/**
+	 * Checkout Block / Store API place-order POST (M9): validate the destination the
+	 * shopper SUBMITTED in this request (country/state/city), with the draft order's
+	 * shipping method. Run inside the owning Connection context.
+	 *
+	 * @param WC_Order $order Draft order (shipping method).
+	 * @param array    $values Submitted country/state/city.
+	 * @return true|WP_Error
+	 */
+	public static function validate_order_destination_values( $order, $values ) {
+		$shipping = self::shipping_status( $order );
+		$values   = is_array( $values ) ? $values : array();
+		$clean    = array();
+		foreach ( array( 'country', 'state', 'city' ) as $part ) {
+			$clean[ $part ] = isset( $values[ $part ] ) && is_scalar( $values[ $part ] ) ? sanitize_text_field( (string) $values[ $part ] ) : '';
+		}
+		return self::evaluate( $shipping, static function () use ( $clean ) {
+			$mapping = new Mobo_Core_Address_Mapping();
+			return $mapping->resolve_values_via_backend( $clean );
+		} );
+	}
+
+	/**
 	 * @param WC_Order|null $order Order for Store API, null for the classic cart.
 	 * @return true|WP_Error
 	 */

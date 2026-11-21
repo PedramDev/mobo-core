@@ -386,7 +386,10 @@ class Mobo_Core_Product_Concurrency {
 
 		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
 			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
-			return absint(
+			/* M8: after the identity migration a duplicate copy has no Custom row; it is
+			 * visible only as a quarantined object owned by another product. */
+			$quarantined_groups = class_exists( 'Mobo_Core_Quarantine_Sale_Guard' ) ? Mobo_Core_Quarantine_Sale_Guard::count_duplicate_groups() : 0;
+			return $quarantined_groups + absint(
 				$wpdb->get_var(
 					$wpdb->prepare(
 						"SELECT COUNT(*) FROM (
@@ -464,6 +467,14 @@ class Mobo_Core_Product_Concurrency {
 				),
 				ARRAY_A
 			);
+			/* M8: post-migration quarantined copies, grouped by their canonical owner. */
+			if ( class_exists( 'Mobo_Core_Quarantine_Sale_Guard' ) ) {
+				$rows = is_array( $rows ) ? $rows : array();
+				$room = $limit - count( $rows );
+				if ( $room > 0 ) {
+					$rows = array_merge( $rows, Mobo_Core_Quarantine_Sale_Guard::duplicate_groups( $room ) );
+				}
+			}
 		} else {
 			$rows = $wpdb->get_results(
 				$wpdb->prepare(
@@ -517,12 +528,16 @@ class Mobo_Core_Product_Concurrency {
 		foreach ( $groups as $group ) {
 			$product_guid = isset( $group['product_guid'] ) ? sanitize_text_field( (string) $group['product_guid'] ) : '';
 
-			if ( '' === $product_guid ) {
+			if ( '' === $product_guid && absint( $group['canonical_id'] ?? 0 ) <= 0 ) {
 				continue;
 			}
 
-			$preferred_id = $map instanceof Mobo_Core_Product_Map ? absint( $map->get_product_id( $product_guid ) ) : 0;
 			$ids = array_values( array_filter( array_map( 'absint', explode( ',', (string) ( $group['ids'] ?? '' ) ) ) ) );
+			/* M8: a quarantine group names the proven canonical owner explicitly. */
+			$explicit_id  = absint( $group['canonical_id'] ?? 0 );
+			$preferred_id = $explicit_id > 0 && in_array( $explicit_id, $ids, true )
+				? $explicit_id
+				: ( $map instanceof Mobo_Core_Product_Map ? absint( $map->get_product_id( $product_guid ) ) : 0 );
 			$canonical_id = $preferred_id > 0 && in_array( $preferred_id, $ids, true )
 				? $preferred_id
 				: ( ! empty( $ids ) ? absint( $ids[0] ) : 0 );
