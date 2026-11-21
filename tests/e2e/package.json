@@ -1,0 +1,15 @@
+{
+  "name": "mobo-core-admin-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Browser E2E suite for the MoboCore WordPress admin UI (local staging only; never shipped with the plugin).",
+  "scripts": {
+    "test": "playwright test",
+    "test:no-backend": "playwright test --grep-invert @backend",
+    "list": "playwright test --list",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}
