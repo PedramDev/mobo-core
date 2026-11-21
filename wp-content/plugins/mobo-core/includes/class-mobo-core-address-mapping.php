@@ -725,10 +725,37 @@ class Mobo_Core_Address_Mapping {
 			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
 		}
 		$group = 'shipping' === $group ? 'shipping' : 'billing';
-		$values = $this->get_order_group_values( $order, $group );
+		return $this->resolve_values_via_backend( $this->get_order_group_values( $order, $group ) );
+	}
+
+	/**
+	 * Resolve raw country/state/city values (order or checkout) through the central
+	 * resolver. A numeric city whose origin cannot be proven is never translated into
+	 * a city name (A1): it returns a local "pending" error without calling the
+	 * Backend, so the order is deferred for a manual address decision.
+	 *
+	 * Error data: action=defer for every unresolved outcome; backendStatus carries the
+	 * Backend's explicit status (e.g. "pending") when the Backend answered.
+	 *
+	 * @param array $values country/state/city.
+	 * @return array|WP_Error
+	 */
+	public function resolve_values_via_backend( $values ) {
+		$values = is_array( $values ) ? $values : array();
+		foreach ( array( 'country', 'state', 'city' ) as $part ) {
+			$values[ $part ] = Mobo_Core_Address_Normalizer::text( sanitize_text_field( (string) ( $values[ $part ] ?? '' ) ) );
+		}
 		$country_code = $this->resolve_local_country_code( $values['country'] );
 		$state_code   = $this->resolve_local_state_code( $country_code, $values['state'] );
 		$city_name    = $this->resolve_local_city_name( $country_code, $state_code, $values['city'] );
+
+		if ( '' === $city_name && Mobo_Core_Address_Normalizer::is_numeric_code( $values['city'] ) ) {
+			return new WP_Error(
+				'mobo_core_location_numeric_city_unknown',
+				'شهر این آدرس به‌صورت کد عددی ذخیره شده و منبع کد قابل اثبات نیست؛ برای جلوگیری از ارسال به شهر اشتباه، نام شهر سفارش باید دستی اصلاح یا در پنل مرکزی تعیین تکلیف شود.',
+				array( 'action' => 'defer', 'reason' => 'numeric_city_unknown' )
+			);
+		}
 
 		$countries = $this->get_woocommerce_countries();
 		$states    = $this->get_woocommerce_states( $country_code );
@@ -738,11 +765,11 @@ class Mobo_Core_Address_Mapping {
 		$api = new Mobo_Core_API_Client();
 		$result = $api->resolve_location( array(
 			'countryCode' => sanitize_text_field( (string) $country_code ),
-			'countryName' => $country_name,
+			'countryName' => Mobo_Core_Address_Normalizer::text( $country_name ),
 			'stateCode'   => sanitize_text_field( (string) $state_code ),
-			'stateName'   => $state_name,
-			'cityCode'    => sanitize_text_field( (string) $values['city'] ),
-			'cityName'    => sanitize_text_field( (string) $city_name ),
+			'stateName'   => Mobo_Core_Address_Normalizer::text( $state_name ),
+			'cityCode'    => sanitize_text_field( Mobo_Core_Address_Normalizer::digits( $values['city'] ) ),
+			'cityName'    => sanitize_text_field( Mobo_Core_Address_Normalizer::text( $city_name ) ),
 		) );
 		if ( is_wp_error( $result ) ) {
 			return $result;
@@ -754,7 +781,7 @@ class Mobo_Core_Address_Mapping {
 			return new WP_Error(
 				'mobo_core_location_resolution_pending',
 				'آدرس سفارش هنوز در Resolver مرکزی به Location Provider متصل نشده است؛ سفارش بدون پرداخت در صف می‌ماند تا مورد استثنا یک‌بار در پنل مرکزی تعیین تکلیف شود.',
-				array( 'action' => 'defer', 'resolutionKey' => sanitize_text_field( (string) ( $result['resolutionKey'] ?? '' ) ) )
+				array( 'action' => 'defer', 'resolutionKey' => sanitize_text_field( (string) ( $result['resolutionKey'] ?? '' ) ), 'backendStatus' => $status )
 			);
 		}
 
@@ -1183,9 +1210,11 @@ class Mobo_Core_Address_Mapping {
 			return $upper;
 		}
 
-		$target = $this->normalize_address_token( $value );
+		/* Matching key folds Arabic/Persian letters, ZWNJ, digits and a leading
+		 * «استان» so "استان تهران" / "تهران" / "تهران" (Arabic ی) all match. */
+		$target = Mobo_Core_Address_Normalizer::match_key( $value );
 		foreach ( $states as $code => $name ) {
-			if ( $this->normalize_address_token( $name ) === $target ) {
+			if ( '' !== $target && Mobo_Core_Address_Normalizer::match_key( $name ) === $target ) {
 				return (string) $code;
 			}
 		}
@@ -1209,17 +1238,26 @@ class Mobo_Core_Address_Mapping {
 	 * @return string
 	 */
 	private function resolve_local_city_name( $country_code, $state_code, $city ) {
-		$value = sanitize_text_field( (string) $city );
-		if ( '' === trim( $value ) ) {
+		$value = Mobo_Core_Address_Normalizer::text( sanitize_text_field( (string) $city ) );
+		if ( '' === $value ) {
 			return '';
 		}
 
+		/* A1: a numeric city is a foreign key into SOME plugin's table. Translate it via
+		 * the bundled Persian WooCommerce code table only when that plugin provably
+		 * stores codes in the city field; otherwise return '' (unknown, never guess). */
+		$is_numeric = Mobo_Core_Address_Normalizer::is_numeric_code( $value );
+		if ( $is_numeric && ! $this->numeric_city_values_are_persian_woocommerce_codes() ) {
+			return '';
+		}
+		$numeric_value = $is_numeric ? Mobo_Core_Address_Normalizer::digits( $value ) : '';
+
 		/* Persian WooCommerce stores the visible Persian city label as the field value. */
-		if ( ! is_numeric( $value ) && preg_match( '/[\x{0600}-\x{06FF}]/u', $value ) ) {
+		if ( ! $is_numeric && preg_match( '/[\x{0600}-\x{06FF}]/u', $value ) ) {
 			return $value;
 		}
 
-		$target = $this->normalize_address_token( $value );
+		$target = Mobo_Core_Address_Normalizer::match_key( $value );
 		foreach ( $this->get_local_city_candidates() as $candidate ) {
 			if ( ! is_array( $candidate ) ) {
 				continue;
@@ -1231,12 +1269,50 @@ class Mobo_Core_Address_Mapping {
 			if ( $candidate_country !== strtoupper( $country_code ) || $this->resolve_local_state_code( $country_code, $candidate_state ) !== $state_code ) {
 				continue;
 			}
-			if ( $this->normalize_address_token( $candidate_name ) === $target || ( '' !== $candidate_value && $this->normalize_address_token( $candidate_value ) === $target ) ) {
+			if ( $is_numeric ) {
+				if ( '' !== $candidate_value && $candidate_value === $numeric_value ) {
+					return $candidate_name;
+				}
+				continue;
+			}
+			if ( '' !== $target && Mobo_Core_Address_Normalizer::match_key( $candidate_name ) === $target ) {
 				return $candidate_name;
 			}
 		}
 
-		return $value;
+		return $is_numeric ? '' : $value;
+	}
+
+	/**
+	 * Whether a numeric city value provably is a Persian WooCommerce city code.
+	 *
+	 * Persian WooCommerce (Persian_Woocommerce_Address, include/class-address.php)
+	 * renders the city select from iran_cities.js rows array( name, code ) and uses
+	 * row[ apply_filters( 'iran_cities_value_index', 0 ) ] as the option value. By
+	 * default (index 0) it stores the city NAME; it stores the numeric code that the
+	 * bundled includes/data/iran-cities.php mirrors only when that filter returns 1.
+	 * "Persian WooCommerce Shipping" (PWS) replaces the city field with its own
+	 * site-specific term IDs, so a numeric value is never trusted while PWS() exists.
+	 * Any other plugin's numeric IDs are unknown. Integrators that can prove the
+	 * origin may opt in with the mobo_core_numeric_city_is_persian_woocommerce_code filter.
+	 *
+	 * @return bool
+	 */
+	private function numeric_city_values_are_persian_woocommerce_codes() {
+		$trusted = false;
+		if ( class_exists( 'Persian_Woocommerce_Address' ) && function_exists( 'PW' ) && ! function_exists( 'PWS' ) ) {
+			$enabled = true;
+			try {
+				$pw = PW();
+				if ( is_object( $pw ) && method_exists( $pw, 'get_options' ) ) {
+					$enabled = 'yes' === (string) $pw->get_options( 'enable_iran_cities', 'yes' );
+				}
+			} catch ( Throwable $e ) {
+				$enabled = false;
+			}
+			$trusted = $enabled && 1 === (int) apply_filters( 'iran_cities_value_index', 0 );
+		}
+		return (bool) apply_filters( 'mobo_core_numeric_city_is_persian_woocommerce_code', $trusted );
 	}
 
 	/**
@@ -1308,11 +1384,35 @@ class Mobo_Core_Address_Mapping {
 		$state_method   = 'shipping' === $group ? 'get_shipping_state' : 'get_billing_state';
 		$city_method    = 'shipping' === $group ? 'get_shipping_city' : 'get_billing_city';
 
-		return array(
+		$values = array(
 			'country' => is_object( $order ) && method_exists( $order, $country_method ) ? sanitize_text_field( (string) $order->$country_method() ) : '',
 			'state'   => is_object( $order ) && method_exists( $order, $state_method ) ? sanitize_text_field( (string) $order->$state_method() ) : '',
 			'city'    => is_object( $order ) && method_exists( $order, $city_method ) ? sanitize_text_field( (string) $order->$city_method() ) : '',
 		);
+
+		/* Fallback only for EMPTY standard fields: the raw checkout value this plugin
+		 * captured at order creation (_mobo_{group}_source_{part}, written from the
+		 * classic POST and from Store API billing_address/shipping_address). Arbitrary
+		 * third-party meta keys are not guessed; sites with a custom city field map it
+		 * explicitly through the mobo_core_order_address_values filter. */
+		if ( is_object( $order ) && method_exists( $order, 'get_meta' ) ) {
+			foreach ( $values as $part => $value ) {
+				if ( '' === trim( $value ) ) {
+					$values[ $part ] = sanitize_text_field( (string) $order->get_meta( '_mobo_' . $group . '_source_' . $part, true ) );
+				}
+			}
+		}
+
+		$filtered = apply_filters( 'mobo_core_order_address_values', $values, $order, $group );
+		if ( is_array( $filtered ) ) {
+			foreach ( array( 'country', 'state', 'city' ) as $part ) {
+				if ( isset( $filtered[ $part ] ) && is_scalar( $filtered[ $part ] ) ) {
+					$values[ $part ] = sanitize_text_field( (string) $filtered[ $part ] );
+				}
+			}
+		}
+
+		return $values;
 	}
 
 	private function get_woocommerce_mapping_country_candidates() {

@@ -6719,7 +6719,7 @@ class Mobo_Core_Product_Sync {
 
 		if ( $this->rules->should_update_slug() ) {
 			$slug = $this->expected_product_slug( $data );
-			if ( '' !== $slug && (string) $product->get_slug() !== $slug ) {
+			if ( '' !== $slug && ! $this->product_slug_matches_expected( $product, $slug ) ) {
 				return false;
 			}
 		}
@@ -6785,22 +6785,34 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		/* Keep read-side convergence consistent with apply_api_stock(): nullable stock
-		 * means the source does not manage a numeric quantity for this item. */
-		if ( null === $stock || '' === $stock ) {
-			return ! $product->get_manage_stock()
-				&& null === $product->get_stock_quantity()
-				&& 'instock' === (string) $product->get_stock_status();
-		}
-
-		$normalized = $this->normalize_api_stock_quantity( $stock );
-		if ( null === $normalized ) {
+		/* Read-side convergence mirrors apply_api_stock() exactly and reads the
+		 * PERSISTED ('edit') props: the view-context Source visibility filter must not
+		 * make a hidden product look permanently divergent (B14). */
+		$normalized = null;
+		if ( null !== $stock && '' !== $stock ) {
+			$normalized = $this->normalize_api_stock_quantity( $stock );
+			if ( null === $normalized ) {
+				return false;
+			}
+		} elseif ( ! $this->product_has_known_stock_state( $product ) ) {
 			return false;
 		}
-		return $product->get_manage_stock()
-			&& null !== $product->get_stock_quantity()
-			&& (int) $product->get_stock_quantity() === (int) $normalized
-			&& (string) $product->get_stock_status() === ( $normalized > 0 ? 'instock' : 'outofstock' );
+
+		$natural = Mobo_Core_Stock_Policy::natural_state( $normalized, true, $this->current_natural_stock_state( $product ) );
+		$blocked = Mobo_Core_Source_Visibility::is_blocked( $product );
+		$stored  = Mobo_Core_Source_Visibility::stored_natural_stock( $product );
+		if ( $blocked ? ( null === $stored || Mobo_Core_Stock_Policy::normalize_state( $natural ) !== $stored ) : null !== $stored ) {
+			return false;
+		}
+		return Mobo_Core_Stock_Policy::props_match(
+			array(
+				'manage'     => (bool) $product->get_manage_stock( 'edit' ),
+				'qty'        => $product->get_stock_quantity( 'edit' ),
+				'status'     => (string) $product->get_stock_status( 'edit' ),
+				'backorders' => (string) $product->get_backorders( 'edit' ),
+			),
+			Mobo_Core_Stock_Policy::persisted_state( $natural, $blocked )
+		);
 	}
 
 	private function expected_product_slug( $data ) {
@@ -8143,6 +8155,7 @@ class Mobo_Core_Product_Sync {
 		$product = new WC_Product_Simple( $product_id );
 		$product->set_manage_stock( true );
 		$product->set_stock_quantity( 0 );
+		$product->set_backorders( 'no' ); /* B13: zero must never become onbackorder. */
 		$product->set_stock_status( 'outofstock' );
 		$product->update_meta_data( '_mobo_simple_variant_mapped', '0' );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_status', 'authoritative_missing' );
@@ -8194,6 +8207,7 @@ class Mobo_Core_Product_Sync {
 
 		$product->set_manage_stock( true );
 		$product->set_stock_quantity( 0 );
+		$product->set_backorders( 'no' ); /* B13: zero must never become onbackorder. */
 		$product->set_stock_status( 'outofstock' );
 		$product->update_meta_data( '_mobo_simple_variant_mapped', '0' );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_status', sanitize_key( (string) $reason ) );
@@ -8855,70 +8869,85 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		if ( null === $stock || '' === $stock ) {
-			$changed = false;
-			if ( (bool) $product->get_manage_stock( 'edit' ) ) {
-				$product->set_manage_stock( false );
-				$changed = true;
+		$stock_quantity  = null;
+		$sanitized_stock = '';
+		if ( null !== $stock && '' !== $stock ) {
+			$raw_stock       = is_scalar( $stock ) ? trim( (string) $stock ) : '';
+			$stock_quantity  = $this->normalize_api_stock_quantity( $stock );
+			$sanitized_stock = sanitize_text_field( $raw_stock );
+
+			if ( null === $stock_quantity ) {
+				$changed = false;
+				$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', $sanitized_stock ) || $changed;
+				$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-invalid-stock-skipped' ) || $changed;
+				if ( $changed ) {
+					$this->update_product_meta_if_changed( $product, '_mobo_stock_update_skipped_at', gmdate( 'c' ) );
+				}
+				return false;
 			}
-			if ( null !== $product->get_stock_quantity( 'edit' ) ) {
-				$product->set_stock_quantity( null );
-				$changed = true;
-			}
-			if ( 'instock' !== (string) $product->get_stock_status( 'edit' ) ) {
-				$product->set_stock_status( 'instock' );
-				$changed = true;
-			}
-			$changed = $this->delete_product_meta_if_present( $product, '_mobo_stock_payload_missing' ) || $changed;
-			$changed = $this->delete_product_meta_if_present( $product, '_mobo_last_api_stock_quantity' ) || $changed;
-			$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', '' ) || $changed;
-			$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-empty-stock' ) || $changed;
-			if ( $changed ) {
-				$this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_applied_at', gmdate( 'c' ) );
-			}
-			return true;
 		}
 
-		$raw_stock       = is_scalar( $stock ) ? trim( (string) $stock ) : '';
-		$stock_quantity  = $this->normalize_api_stock_quantity( $stock );
-		$sanitized_stock = sanitize_text_field( $raw_stock );
-
-		if ( null === $stock_quantity ) {
-			$changed = false;
-			$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', $sanitized_stock ) || $changed;
-			$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-invalid-stock-skipped' ) || $changed;
-			if ( $changed ) {
-				$this->update_product_meta_if_changed( $product, '_mobo_stock_update_skipped_at', gmdate( 'c' ) );
-			}
-			return false;
-		}
-
-		$expected_status = $stock_quantity > 0 ? 'instock' : 'outofstock';
-		$changed         = false;
-
-		if ( ! (bool) $product->get_manage_stock( 'edit' ) ) {
-			$product->set_manage_stock( true );
-			$changed = true;
-		}
-		if ( null === $product->get_stock_quantity( 'edit' ) || (int) $product->get_stock_quantity( 'edit' ) !== $stock_quantity ) {
-			$product->set_stock_quantity( $stock_quantity );
-			$changed = true;
-		}
-		if ( (string) $product->get_stock_status( 'edit' ) !== $expected_status ) {
-			$product->set_stock_status( $expected_status );
-			$changed = true;
+		/* B13/B14/B16: decisions live in Mobo_Core_Stock_Policy. Zero is always out of
+		 * stock with backorders 'no'; unknown stock never makes a NEW object purchasable
+		 * and keeps the last known state of an existing one; a Source-hidden/inactive
+		 * object is persisted out of stock while its Source state is remembered. */
+		$natural = Mobo_Core_Stock_Policy::natural_state( $stock_quantity, $this->product_has_known_stock_state( $product ), $this->current_natural_stock_state( $product ) );
+		$blocked = Mobo_Core_Source_Visibility::is_blocked( $product );
+		$changed = Mobo_Core_Source_Visibility::set_stock_props( $product, Mobo_Core_Stock_Policy::persisted_state( $natural, $blocked ) );
+		if ( $blocked ) {
+			$changed = Mobo_Core_Source_Visibility::remember_natural_stock( $product, $natural ) || $changed;
+		} else {
+			$changed = Mobo_Core_Source_Visibility::forget_natural_stock( $product ) || $changed;
 		}
 
 		$changed = $this->delete_product_meta_if_present( $product, '_mobo_stock_payload_missing' ) || $changed;
 		$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_raw', $sanitized_stock ) || $changed;
-		$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_quantity', $stock_quantity ) || $changed;
-		$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', 'api-stock' ) || $changed;
+		if ( null !== $stock_quantity ) {
+			$changed = $this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_quantity', $stock_quantity ) || $changed;
+		}
+		$changed = $this->update_product_meta_if_changed( $product, '_mobo_stock_update_source', $natural['source'] ) || $changed;
 
 		if ( $changed ) {
 			$this->update_product_meta_if_changed( $product, '_mobo_last_api_stock_applied_at', gmdate( 'c' ) );
 		}
 
 		return true;
+	}
+
+	/**
+	 * Whether Mobo (or the merchant, with a managed quantity) already gave this object a
+	 * stock state. Only an object WITHOUT one is "new" for unknown-stock decisions.
+	 *
+	 * @param WC_Product $product Product or variation.
+	 * @return bool
+	 */
+	private function product_has_known_stock_state( $product ) {
+		if ( absint( $product->get_id() ) <= 0 ) {
+			return false;
+		}
+		if ( '' !== (string) $product->get_meta( '_mobo_stock_update_source', true, 'edit' ) ) {
+			return true;
+		}
+		return (bool) $product->get_manage_stock( 'edit' ) && null !== $product->get_stock_quantity( 'edit' );
+	}
+
+	/**
+	 * Natural (Source) stock state: the remembered one while the blocked overlay is
+	 * persisted, otherwise the current WooCommerce props.
+	 *
+	 * @param WC_Product $product Product or variation.
+	 * @return array
+	 */
+	private function current_natural_stock_state( $product ) {
+		$stored = Mobo_Core_Source_Visibility::stored_natural_stock( $product );
+		if ( is_array( $stored ) ) {
+			return $stored;
+		}
+		return array(
+			'manage' => (bool) $product->get_manage_stock( 'edit' ),
+			'qty'    => $product->get_stock_quantity( 'edit' ),
+			'status' => (string) $product->get_stock_status( 'edit' ),
+		);
 	}
 
 	private function apply_product_slug( $product, $data ) {
@@ -8936,11 +8965,45 @@ class Mobo_Core_Product_Sync {
 			$slug = sanitize_title( trim( (string) $this->get_value( $data, 'url', '' ), '/' ) );
 		}
 
-		if ( '' === $slug || (string) $product->get_slug( 'edit' ) === $slug ) {
+		if ( '' === $slug || $this->product_slug_matches_expected( $product, $slug ) ) {
 			return;
 		}
 
 		$product->set_slug( $slug );
+	}
+
+	/**
+	 * B17: a slug WordPress uniquified ("x" -> "x-2" because another post owns "x") is
+	 * the converged state. Re-setting "x" would be uniquified again on every Sync and
+	 * the product would never converge. Accept "x-N" only when wp_unique_post_slug()
+	 * still produces exactly that value for this post; once "x" is free again the
+	 * check fails and the next Sync moves the product back to "x".
+	 *
+	 * @param WC_Product $product Product.
+	 * @param string     $expected Expected (sanitized) slug.
+	 * @return bool
+	 */
+	private function product_slug_matches_expected( $product, $expected ) {
+		$current  = (string) $product->get_slug( 'edit' );
+		$expected = (string) $expected;
+		if ( $current === $expected ) {
+			return true;
+		}
+		$product_id = absint( $product->get_id() );
+		if ( '' === $expected || $product_id <= 0 || 0 !== strpos( $current, $expected . '-' ) || ! function_exists( 'wp_unique_post_slug' ) ) {
+			return false;
+		}
+		if ( ! preg_match( '/^[2-9][0-9]*$|^[1-9][0-9]+$/D', substr( $current, strlen( $expected ) + 1 ) ) ) {
+			return false;
+		}
+		$status = function_exists( 'get_post_status' ) ? (string) get_post_status( $product_id ) : '';
+		$parent = function_exists( 'wp_get_post_parent_id' ) ? absint( wp_get_post_parent_id( $product_id ) ) : 0;
+		/* Draft/pending posts are not uniquified by WordPress; treat them as published so
+		 * the comparison answers "what would publishing this slug yield". */
+		if ( in_array( $status, array( '', 'draft', 'pending', 'auto-draft' ), true ) ) {
+			$status = 'publish';
+		}
+		return wp_unique_post_slug( $expected, $product_id, $status, 'product', $parent ) === $current;
 	}
 
 	private function apply_product_dates( $product, $data ) {

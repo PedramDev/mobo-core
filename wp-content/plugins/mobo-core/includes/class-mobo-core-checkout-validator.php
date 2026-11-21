@@ -326,6 +326,9 @@ class Mobo_Core_Checkout_Validator {
 			if ( class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
 				Mobo_Core_Order_Price_Review::register_admin_hooks();
 			}
+			if ( class_exists( 'Mobo_Core_Address_Attention' ) ) {
+				Mobo_Core_Address_Attention::register_admin_hooks();
+			}
 		}
 		/*
 		 * Single shared Mobo cart mode: do not mirror live WooCommerce cart
@@ -593,6 +596,16 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
+		/* B6: unmapped shipping method / unresolvable destination are rejected before
+		 * payment for Mobo-only auto-order carts (fails open on our outage). */
+		if ( empty( $errors->get_error_codes() ) ) {
+			$destination_error = $this->validate_auto_order_destination_pre_payment( is_array( $data ) ? $data : array(), null );
+			if ( is_wp_error( $destination_error ) ) {
+				$errors->add( 'mobo_core_checkout_destination', sanitize_text_field( (string) $destination_error->get_error_message() ) );
+				return;
+			}
+		}
+
 		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
 			return;
 		}
@@ -631,6 +644,11 @@ class Mobo_Core_Checkout_Validator {
 		$scope_error = $this->validate_auto_order_order_scope_pre_payment( $order );
 		if ( is_wp_error( $scope_error ) ) {
 			throw new Exception( sanitize_text_field( (string) $scope_error->get_error_message() ) );
+		}
+
+		$destination_error = $this->validate_auto_order_destination_pre_payment( array(), $order );
+		if ( is_wp_error( $destination_error ) ) {
+			throw new Exception( sanitize_text_field( (string) $destination_error->get_error_message() ) );
 		}
 
 		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
@@ -1035,6 +1053,37 @@ class Mobo_Core_Checkout_Validator {
 		$scope = $this->get_current_cart_order_scope();
 		if ( ! $this->auto_order_enabled_for_connection_ids( $scope['connectionIds'] ?? array() ) ) { return true; }
 		return $this->auto_order_scope_pre_payment_error( $scope );
+	}
+
+	/**
+	 * B6 pre-payment destination guard for a Mobo-only cart/order whose single owning
+	 * Connection submits orders automatically. Runs inside that Connection. Any
+	 * failure to evaluate allows checkout (see Mobo_Core_Checkout_Preflight).
+	 *
+	 * @param array         $data Classic posted data.
+	 * @param WC_Order|null $order Store API draft order, null for classic checkout.
+	 * @return true|WP_Error
+	 */
+	private function validate_auto_order_destination_pre_payment( $data, $order ) {
+		if ( ! class_exists( 'Mobo_Core_Checkout_Preflight' ) ) {
+			return true;
+		}
+		try {
+			$scope = $order instanceof WC_Order ? $this->get_order_mobo_item_scope( $order ) : $this->get_current_cart_order_scope();
+			$connection_id = absint( $scope['connectionId'] ?? 0 );
+			if ( 'all_mobo' !== ( $scope['status'] ?? '' ) || $connection_id <= 0 || ! $this->auto_order_enabled_for_connection_ids( array( $connection_id ) ) ) {
+				return true;
+			}
+			$run = function () use ( $data, $order ) {
+				return $order instanceof WC_Order
+					? Mobo_Core_Checkout_Preflight::validate_order( $order, $this->get_order_address_group_for_mobo( $order ) )
+					: Mobo_Core_Checkout_Preflight::validate_checkout_data( $data );
+			};
+			$result = class_exists( 'Mobo_Core_Connection_Context' ) ? Mobo_Core_Connection_Context::run( $connection_id, $run ) : $run();
+			return is_wp_error( $result ) ? $result : true;
+		} catch ( Throwable $e ) {
+			return true;
+		}
 	}
 
 	/** Checkout Block/Store API equivalent using the already-frozen order identity. */
@@ -6150,6 +6199,11 @@ class Mobo_Core_Checkout_Validator {
 			return $contact;
 		}
 
+		/* Review item A6 (kept deliberately): the Portal.ir dropship checkout body uses
+		 * name/mobile for the SENDER (store) and phone/email for the RECIPIENT name and
+		 * mobile. The mapping is unchanged since the first release and the recorded
+		 * Source fixtures carry it; there is no Source contract evidence that it is
+		 * wrong, so do not change it without a Source API contract change. */
 		$cart['description'] = '';
 		$cart['name']        = $contact['senderName'];
 		$cart['mobile']      = $contact['senderMobile'];
@@ -6212,6 +6266,12 @@ class Mobo_Core_Checkout_Validator {
 				$recipient_mobile = $shipping_phone;
 			}
 		}
+		if ( '' === $recipient_mobile ) {
+			$recipient_mobile = $this->order_recipient_mobile_fallback( $order, $group );
+		}
+		/* A5: normalize before sending (Persian/Arabic digits, separators, +98/0098). */
+		$recipient_mobile = Mobo_Core_Address_Normalizer::phone( $recipient_mobile );
+		$recipient_name   = Mobo_Core_Address_Normalizer::text( $recipient_name );
 
 		if ( ! class_exists( 'Mobo_Core_Address_Mapping' ) ) {
 			return new WP_Error( 'mobo_core_location_resolver_unavailable', 'Central location resolver integration is unavailable.', array( 'action' => 'defer' ) );
@@ -6233,8 +6293,8 @@ class Mobo_Core_Checkout_Validator {
 
 		$address_1 = 'shipping' === $group ? $order->get_shipping_address_1() : $order->get_billing_address_1();
 		$address_2 = 'shipping' === $group ? $order->get_shipping_address_2() : $order->get_billing_address_2();
-		$postcode  = 'shipping' === $group ? $order->get_shipping_postcode() : $order->get_billing_postcode();
-		$address   = trim( trim( (string) $address_1 ) . ' ' . trim( (string) $address_2 ) );
+		$postcode  = Mobo_Core_Address_Normalizer::postcode( 'shipping' === $group ? $order->get_shipping_postcode() : $order->get_billing_postcode() );
+		$address   = Mobo_Core_Address_Normalizer::text( trim( trim( (string) $address_1 ) . ' ' . trim( (string) $address_2 ) ) );
 
 		if ( '' === $recipient_name ) {
 			return new WP_Error( 'mobo_core_recipient_name_missing', 'نام گیرنده برای ثبت سفارش در موبو خالی است.' );
@@ -6266,6 +6326,36 @@ class Mobo_Core_Checkout_Validator {
 			'latitude'        => $this->order_meta_float_or_null( $order, '_mobo_' . $group . '_city_latitude' ),
 			'longitude'       => $this->order_meta_float_or_null( $order, '_mobo_' . $group . '_city_longitude' ),
 		);
+	}
+
+	/**
+	 * Recipient mobile when the standard billing/shipping phone is empty. Only keys
+	 * that unambiguously hold the customer's mobile are read:
+	 * - order meta _{group}_mobile / _billing_mobile (the "mobile" field that Iranian
+	 *   checkout-field editors add next to the core fields);
+	 * - Digits (digits_phone user meta of the order's customer, E.164 e.g. +98912...).
+	 * Anything else must be mapped explicitly with the mobo_core_order_recipient_mobile filter.
+	 *
+	 * @param WC_Order $order Order.
+	 * @param string   $group billing|shipping.
+	 * @return string
+	 */
+	private function order_recipient_mobile_fallback( $order, $group ) {
+		$mobile = '';
+		$keys   = array_unique( array( '_' . $group . '_mobile', '_billing_mobile' ) );
+		foreach ( $keys as $key ) {
+			$value = trim( sanitize_text_field( (string) $order->get_meta( $key, true ) ) );
+			if ( '' !== $value ) {
+				$mobile = $value;
+				break;
+			}
+		}
+		$customer_id = method_exists( $order, 'get_customer_id' ) ? absint( $order->get_customer_id() ) : 0;
+		if ( '' === $mobile && $customer_id > 0 && function_exists( 'get_user_meta' ) ) {
+			$mobile = trim( sanitize_text_field( (string) get_user_meta( $customer_id, 'digits_phone', true ) ) );
+		}
+		$filtered = apply_filters( 'mobo_core_order_recipient_mobile', $mobile, $order, $group );
+		return is_scalar( $filtered ) ? trim( sanitize_text_field( (string) $filtered ) ) : $mobile;
 	}
 
 	/**
@@ -6835,8 +6925,18 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_submit_defer_reason', $code );
 		$order->update_meta_data( '_mobo_order_submit_defer_count', $defer_count );
 		$order->update_meta_data( '_mobo_order_submit_next_attempt_at', $next_attempt_at );
+		if ( 1 === $defer_count || absint( $order->get_meta( '_mobo_order_submit_defer_first_at', true ) ) <= 0 ) {
+			$order->update_meta_data( '_mobo_order_submit_defer_first_at', time() );
+		}
 		$order->delete_meta_data( '_mobo_order_failed_at' );
 		$order->save();
+
+		/* B7: an unresolvable address must not stay silent forever. Escalate once
+		 * (note + one email + admin notice); retries continue with backoff. */
+		if ( 'location_resolution_pending' === $code && class_exists( 'Mobo_Core_Address_Attention' )
+			&& Mobo_Core_Address_Attention::should_notify( $defer_count, absint( $order->get_meta( '_mobo_order_submit_defer_first_at', true ) ), time(), '' !== (string) $order->get_meta( Mobo_Core_Address_Attention::META_NOTIFIED_AT, true ) ) ) {
+			Mobo_Core_Address_Attention::notify( $order, $message );
+		}
 
 		if ( 1 === $defer_count ) {
 			/* One note per (new) reason keeps the reason visible without hourly note spam. */
@@ -6860,6 +6960,11 @@ class Mobo_Core_Checkout_Validator {
 		$order->delete_meta_data( '_mobo_order_submit_defer_reason' );
 		$order->delete_meta_data( '_mobo_order_submit_defer_count' );
 		$order->delete_meta_data( '_mobo_order_submit_next_attempt_at' );
+		$order->delete_meta_data( '_mobo_order_submit_defer_first_at' );
+		if ( class_exists( 'Mobo_Core_Address_Attention' ) ) {
+			$order->delete_meta_data( Mobo_Core_Address_Attention::META_NOTIFIED_AT );
+			Mobo_Core_Address_Attention::clear( absint( $order->get_id() ) );
+		}
 	}
 
 	/**

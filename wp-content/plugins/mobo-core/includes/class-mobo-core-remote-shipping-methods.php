@@ -461,6 +461,63 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	/**
+	 * Pre-payment (classic checkout): does every shipping rate the shopper selected
+	 * have a Source mapping? Uses the same mapping lookup as resolve_shipping_id_for_order().
+	 * Anything that cannot be evaluated returns true (fail open).
+	 *
+	 * @return true|WP_Error
+	 */
+	public function checkout_shipping_mapping_status() {
+		if ( ! function_exists( 'WC' ) || ! WC()->session || ! is_callable( array( WC(), 'shipping' ) ) || ! WC()->shipping() ) {
+			return true;
+		}
+		$chosen   = WC()->session->get( 'chosen_shipping_methods', array() );
+		$chosen   = is_array( $chosen ) ? $chosen : array();
+		$packages = WC()->shipping()->get_packages();
+		foreach ( is_array( $packages ) ? $packages : array() as $index => $package ) {
+			$rate_id = isset( $chosen[ $index ] ) ? (string) $chosen[ $index ] : '';
+			if ( '' === $rate_id || ! is_array( $package ) || empty( $package['rates'][ $rate_id ] ) || ! is_object( $package['rates'][ $rate_id ] ) ) {
+				continue;
+			}
+			$rate        = $package['rates'][ $rate_id ];
+			$method_id   = method_exists( $rate, 'get_method_id' ) ? sanitize_key( (string) $rate->get_method_id() ) : '';
+			$instance_id = method_exists( $rate, 'get_instance_id' ) ? absint( $rate->get_instance_id() ) : 0;
+			if ( '' === $method_id || 'mobo_core_shipping' === $method_id ) {
+				continue;
+			}
+			$zone    = class_exists( 'WC_Shipping_Zones' ) ? WC_Shipping_Zones::get_zone_matching_package( $package ) : null;
+			$zone_id = $zone && method_exists( $zone, 'get_id' ) ? absint( $zone->get_id() ) : 0;
+			$mapped  = $this->get_mapped_mobo_shipping_id_for_wc_method( $zone_id, $method_id, $instance_id );
+			if ( absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 ) <= 0 ) {
+				$title = method_exists( $rate, 'get_label' ) ? sanitize_text_field( (string) $rate->get_label() ) : $method_id;
+				return new WP_Error( 'mobo_core_shipping_method_mapping_missing', sprintf( 'برای روش ارسال ووکامرس «%s» در منطقه ارسال #%s هیچ روش ارسال موبویی نگاشت نشده است.', $title, $zone_id ) );
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Pre-payment (Checkout Block / Store API draft order) mapping check. Only a
+	 * definite missing mapping is reported; ambiguity or a missing shipping line is
+	 * left to the post-payment path (fail open).
+	 *
+	 * @param WC_Order $order Order.
+	 * @return true|WP_Error
+	 */
+	public function order_shipping_mapping_status( $order ) {
+		$wc_method = $this->get_order_wc_shipping_method_context( $order );
+		if ( is_wp_error( $wc_method ) || 'mobo_core_shipping' === $wc_method['methodId'] ) {
+			return true;
+		}
+		$zone_id = $this->determine_order_shipping_zone_id( $order );
+		$mapped  = $this->get_mapped_mobo_shipping_id_for_wc_method( $zone_id, $wc_method['methodId'], $wc_method['instanceId'] );
+		if ( absint( isset( $mapped['shippingId'] ) ? $mapped['shippingId'] : 0 ) <= 0 ) {
+			return new WP_Error( 'mobo_core_shipping_method_mapping_missing', sprintf( 'برای روش ارسال ووکامرس «%s» در منطقه ارسال #%s هیچ روش ارسال موبویی نگاشت نشده است.', $wc_method['title'], absint( $zone_id ) ) );
+		}
+		return true;
+	}
+
+	/**
 	 * Get configured shipping rules for admin/debug.
 	 *
 	 * @return array
