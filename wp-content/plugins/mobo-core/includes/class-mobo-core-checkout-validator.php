@@ -6274,27 +6274,15 @@ class Mobo_Core_Checkout_Validator {
 			return $contact;
 		}
 
-		/* Review item A6 (kept deliberately): the Portal.ir dropship checkout body uses
-		 * name/mobile for the SENDER (store) and phone/email for the RECIPIENT name and
-		 * mobile. The mapping is unchanged since the first release and the recorded
-		 * Source fixtures carry it; there is no Source contract evidence that it is
-		 * wrong, so do not change it without a Source API contract change. */
-		$cart['description'] = '';
-		$cart['name']        = $contact['senderName'];
-		$cart['mobile']      = $contact['senderMobile'];
-		$cart['phone']       = $contact['billingName'];
-		$cart['email']       = $contact['billingMobile'];
-		$cart['country']     = null;
-		$cart['state']       = null;
-		$cart['city']        = null;
-		$cart['zipcode']     = $contact['zipcode'];
-		$cart['address']     = $contact['address'];
-		$cart['latitude']    = $contact['latitude'];
-		$cart['longitude']   = $contact['longitude'];
-
 		$provider = $this->get_mobo_provider();
 		if ( ! $provider instanceof Mobo_Core_Provider_Interface ) {
 			return new WP_Error( 'mobo_core_provider_unavailable', 'No supported provider is bound to the active Connection Source.' );
+		}
+		/* Contact field naming (e.g. Portal.ir's recipient name in `phone` and
+		 * recipient mobile in `email`) is provider contract knowledge: see
+		 * Mobo_Core_Provider_Portal::build_order_contact_payload(). */
+		foreach ( (array) $provider->build_order_contact_payload( $contact ) as $field => $value ) {
+			$cart[ $field ] = $value;
 		}
 		$location_fields = $provider->build_order_location_payload( isset( $contact['resolvedLocation'] ) ? $contact['resolvedLocation'] : array() );
 		if ( is_wp_error( $location_fields ) ) {
@@ -6765,6 +6753,10 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function build_mobo_order_stage_payload( $details, $shipping_id, $mode, $gateway_id ) {
+		$provider = $this->get_mobo_provider();
+		if ( $provider instanceof Mobo_Core_Provider_Interface ) {
+			return $provider->build_order_stage_payload( $details, $shipping_id, $mode, $gateway_id );
+		}
 		$payload = is_array( $details ) ? $details : array();
 		$payload['shipping_id'] = absint( $shipping_id );
 		$payload['mode']        = sanitize_key( (string) $mode );

@@ -65,4 +65,26 @@ interface Mobo_Core_Provider_Interface {
 	 * @return array
 	 */
 	public function interpret_order_reconciliation_details( $payload, $expected_order_id = 0 );
+
+	/**
+	 * Map the generic order contact (sender store + recipient) onto the
+	 * provider's checkout body fields. Field naming is platform knowledge and
+	 * must never live in core checkout orchestration.
+	 *
+	 * @param array $contact Generic contact: senderName, senderMobile, recipientName,
+	 *                       recipientMobile, zipcode, address, latitude, longitude.
+	 * @return array Field => value merged into the provider checkout body.
+	 */
+	public function build_order_contact_payload( $contact );
+
+	/**
+	 * Build the body for a post-checkout stage (shipping selection, payment).
+	 *
+	 * @param array    $details     Provider cart details response.
+	 * @param int      $shipping_id Selected provider shipping method id.
+	 * @param string   $mode        Payment mode, e.g. wallet.
+	 * @param int|null $gateway_id  Optional payment gateway id.
+	 * @return array
+	 */
+	public function build_order_stage_payload( $details, $shipping_id, $mode, $gateway_id );
 }

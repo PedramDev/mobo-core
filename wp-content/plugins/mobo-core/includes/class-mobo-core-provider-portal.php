@@ -141,4 +141,39 @@ final class Mobo_Core_Provider_Portal implements Mobo_Core_Provider_Interface {
 			'city_id'    => $city_id,
 		);
 	}
+
+	/**
+	 * Portal.ir dropship checkout body (kept byte-identical to every release since
+	 * the first one; proven against the live Source): name/mobile carry the SENDER
+	 * (store), phone carries the RECIPIENT NAME and email carries the RECIPIENT
+	 * MOBILE. This is intentional Portal.ir contract knowledge - never "fix" it and
+	 * never copy it into another provider.
+	 */
+	public function build_order_contact_payload( $contact ) {
+		$contact = is_array( $contact ) ? $contact : array();
+		$recipient_name   = isset( $contact['recipientName'] ) ? $contact['recipientName'] : ( $contact['billingName'] ?? '' );
+		$recipient_mobile = isset( $contact['recipientMobile'] ) ? $contact['recipientMobile'] : ( $contact['billingMobile'] ?? '' );
+		return array(
+			'description' => '',
+			'name'        => $contact['senderName'] ?? '',
+			'mobile'      => $contact['senderMobile'] ?? '',
+			'phone'       => $recipient_name,
+			'email'       => $recipient_mobile,
+			'country'     => null,
+			'state'       => null,
+			'city'        => null,
+			'zipcode'     => $contact['zipcode'] ?? '',
+			'address'     => $contact['address'] ?? '',
+			'latitude'    => $contact['latitude'] ?? null,
+			'longitude'   => $contact['longitude'] ?? null,
+		);
+	}
+
+	public function build_order_stage_payload( $details, $shipping_id, $mode, $gateway_id ) {
+		$payload = is_array( $details ) ? $details : array();
+		$payload['shipping_id'] = absint( $shipping_id );
+		$payload['mode']        = sanitize_key( (string) $mode );
+		$payload['gateway_id']  = null === $gateway_id ? null : absint( $gateway_id );
+		return $payload;
+	}
 }
