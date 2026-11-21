@@ -23,6 +23,7 @@ const TAB_MARKER: Record<string, string> = {
   cron: 'form:has(input[name="mobo_active_tab"][value="cron"])',
   checkout: 'form:has(input[name="mobo_active_tab"][value="checkout"])',
   sms: 'form:has(input[name="mobo_active_tab"][value="sms"])',
+  support: 'form:has(input[name="action"][value="mobo_core_support_grant"])',
 };
 
 const LABELS: Record<string, string> = {
@@ -40,6 +41,7 @@ const LABELS: Record<string, string> = {
   cron: 'Cron و Worker',
   checkout: 'سفارش موبو',
   sms: 'پیامک',
+  support: 'پشتیبانی',
 };
 
 async function expectTab(page: Page, tab: string): Promise<void> {

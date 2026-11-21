@@ -34,6 +34,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_init', array( $this, 'activate_admin_connection_context' ), 1 );
 		/* 10.34.77: database migration progress / marked-product notice (manage_options only). */
 		add_action( 'admin_notices', array( 'Mobo_Core_Migration_Quarantine', 'render_admin_notice' ) );
+		/* Support access: "پشتیبانی" tab handlers, request/Source notices, expiry. */
+		Mobo_Core_Support_Admin::register_hooks();
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_bar_menu', array( $this, 'register_admin_bar_menu' ), 80 );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
@@ -313,6 +315,7 @@ class Mobo_Core_Admin {
 			'pricing'     => 'قیمت‌گذاری',
 			'sync-health' => 'سلامت همگام‌سازی',
 			'health'      => 'سلامت سایت',
+			'support'     => 'پشتیبانی',
 		);
 
 		if ( $include_advanced ) {
@@ -903,7 +906,7 @@ class Mobo_Core_Admin {
 			);
 		}
 
-		$remaining_tabs = array( 'categories', 'pricing', 'filters', 'queue', 'sync-health', 'image-refresh', 'cron', 'checkout', 'sms', 'health' );
+		$remaining_tabs = array( 'categories', 'pricing', 'filters', 'queue', 'sync-health', 'image-refresh', 'cron', 'checkout', 'sms', 'health', 'support' );
 		if ( in_array( $active_tab, $remaining_tabs, true ) ) {
 			$remaining_style = 'assets/admin/css/pages/remaining.css';
 			wp_enqueue_style(
@@ -967,6 +970,7 @@ class Mobo_Core_Admin {
 			'checkout',
 			'sms',
 			'health',
+			'support',
 		);
 
 		if ( ! in_array( $active_tab, $allowed_tabs, true ) ) {
@@ -991,6 +995,7 @@ class Mobo_Core_Admin {
 			'checkout'    => array( 'سفارش موبو', 'کنترل ثبت خودکار، اعتبارسنجی، آدرس و روش ارسال سفارش موبویی.' ),
 			'sms'         => array( 'پیامک', 'مدیریت پیامک سفارش و هشدار موجودی کیف پول.' ),
 			'health'      => array( 'سلامت سایت', 'بررسی پیش‌نیازهای فنی اثرگذار بر اجرای MoboCore.' ),
+			'support'     => array( 'پشتیبانی', 'دسترسی امن پشتیبانی موبو بدون رد و بدل کردن رمز عبور، و بررسی مواردی که باید قبل از پشتیبانی اصلاح شوند.' ),
 		);
 		$page_heading = isset( $page_titles[ $active_tab ] ) ? $page_titles[ $active_tab ] : $page_titles['dashboard'];
 
@@ -1061,6 +1066,8 @@ class Mobo_Core_Admin {
 					<?php $this->render_sms_tab(); ?>
 				<?php elseif ( 'health' === $active_tab ) : ?>
 					<?php $this->render_health_tab(); ?>
+				<?php elseif ( 'support' === $active_tab ) : ?>
+					<?php Mobo_Core_Support_Admin::render_tab(); ?>
 				<?php endif; ?>
 			</div>
 		</div>
@@ -9666,6 +9673,16 @@ https://source.example/products/test-product/
 		$was_order_submission_enabled = Mobo_Core_Order_Submission_Policy::is_enabled();
 
 		$this->save_current_tab_settings( $tab );
+
+		/* Support access: one Source login check when the Source credentials changed
+		 * on save (never on unrelated saves, to avoid locking the Source account). */
+		if ( 'checkout' === $tab && class_exists( 'Mobo_Core_Support_Access' ) ) {
+			try {
+				Mobo_Core_Support_Access::check_after_settings_save();
+			} catch ( Throwable $support_error ) {
+				unset( $support_error );
+			}
+		}
 
         if ( null !== $money_target_posted ) {
             // Global store-owned option; never write Backend-signed Connection fields.

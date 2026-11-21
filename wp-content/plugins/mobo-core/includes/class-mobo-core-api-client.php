@@ -677,6 +677,19 @@ class Mobo_Core_API_Client {
 	}
 
 	/**
+	 * Support access: submit sealed hosting-panel credentials to the Backend.
+	 * POST {api_base_url}/api/support/hosting-access with the normal Token + X-SEC
+	 * headers and request signing (post_json). The payload carries only the
+	 * RSA-OAEP sealed password; this client never logs request bodies.
+	 *
+	 * @param array $payload panelType, panelUrl, username, keyId, sealedPassword.
+	 * @return array|WP_Error Expected {"success":true,"receivedAt":"ISO"}.
+	 */
+	public function submit_support_hosting_access( $payload ) {
+		return $this->post_json( 'api/support/hosting-access', is_array( $payload ) ? $payload : array() );
+	}
+
+	/**
 	 * Get API base URL from the active Connection Source Registry entry.
 	 * Legacy filter/option fallbacks remain only for interrupted pre-10.34.13 upgrades.
 	 *

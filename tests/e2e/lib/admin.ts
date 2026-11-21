@@ -9,7 +9,7 @@ import { expect } from './fixtures';
 export type Notice = { type: string; message: string; tab: string | null };
 
 export const ADVANCED_TABS = ['filters', 'queue', 'image-refresh', 'cron', 'checkout', 'sms'] as const;
-export const MAIN_TABS = ['dashboard', 'connection', 'purchase', 'product', 'categories', 'pricing', 'sync-health', 'health'] as const;
+export const MAIN_TABS = ['dashboard', 'connection', 'purchase', 'product', 'categories', 'pricing', 'sync-health', 'health', 'support'] as const;
 
 /** Persian/Arabic-Indic digits -> ASCII; strips thousands separators. */
 export function toAsciiDigits(s: string): string {

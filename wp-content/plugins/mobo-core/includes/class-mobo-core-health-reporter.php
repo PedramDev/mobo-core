@@ -55,6 +55,7 @@ class Mobo_Core_Health_Reporter {
 			? (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', get_option( 'mobo_core_token', '' ) )
 			: (string) get_option( 'mobo_core_token', '' );
 		$license_token = trim( $license_token );
+		$support       = self::support_access_payload();
 
 		$plugin_db_version      = sanitize_text_field( (string) get_option( 'mobo_core_db_version', '' ) );
 		$schema_version         = sanitize_text_field( (string) get_option( 'mobo_core_schema_version', '' ) );
@@ -127,6 +128,12 @@ class Mobo_Core_Health_Reporter {
 			 * terminal retirement, so the Backend can see partial/blocked sites. Options
 			 * only; no catalog scan. */
 			'databaseMigration'     => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::health_payload() : array( 'status' => 'unavailable' ),
+			/* Support access: what the customer must fix before support can help.
+			 * Never contains passwords, tokens or the hosting username. */
+			'supportAccess'         => $support['supportAccess'],
+			'sourceAccount'         => $support['sourceAccount'],
+			'hostingAccess'         => $support['hostingAccess'],
+			'readiness'             => $support['readiness'],
 			'activeTheme'           => $environment['active_theme'],
 			'activePluginsCount'    => $environment['active_plugins_count'],
 			'opCacheEnabled'        => $environment['opcache_enabled'],
@@ -244,6 +251,38 @@ class Mobo_Core_Health_Reporter {
 			'status'  => 'portal-pull-only',
 			'message' => 'ارسال گزارش سلامت غیرفعال است؛ Portal گزارش را مستقیماً از endpoint سلامت دریافت می‌کند.',
 		);
+	}
+
+	/**
+	 * Support access health objects (supportAccess, sourceAccount, hostingAccess,
+	 * readiness). Options/file-hash only; never throws into the health report.
+	 *
+	 * @return array
+	 */
+	public static function support_access_payload() {
+		$fallback = array(
+			'supportAccess' => array( 'status' => 'not_granted', 'user' => '', 'grantedAt' => null, 'expiresAt' => null, 'pendingRequest' => false ),
+			'sourceAccount' => array( 'status' => 'unknown', 'checkedAt' => null, 'message' => 'وضعیت حساب منبع در دسترس نیست.', 'walletLow' => null ),
+			'hostingAccess' => array( 'status' => 'not_provided', 'panelType' => null, 'panelUrl' => null, 'submittedAt' => null ),
+			'readiness'     => array(),
+		);
+		if ( ! class_exists( 'Mobo_Core_Support_Access' ) ) {
+			return $fallback;
+		}
+		$out = $fallback;
+		foreach ( array(
+			'supportAccess' => 'health_support_access',
+			'sourceAccount' => 'health_source_account',
+			'hostingAccess' => 'health_hosting_access',
+			'readiness'     => 'health_readiness',
+		) as $key => $method ) {
+			try {
+				$out[ $key ] = call_user_func( array( 'Mobo_Core_Support_Access', $method ) );
+			} catch ( Throwable $error ) {
+				$out[ $key ] = $fallback[ $key ];
+			}
+		}
+		return $out;
 	}
 
 	/**

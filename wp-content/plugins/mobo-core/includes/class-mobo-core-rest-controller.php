@@ -304,6 +304,129 @@ class Mobo_Core_Rest_Controller {
 				'permission_callback' => array( $this, 'check_security' ),
 			)
 		);
+
+		/* Support access (Backend -> plugin). Creating the support user is never
+		 * possible through REST; these routes only use an access granted in wp-admin. */
+		register_rest_route(
+			'mobo-core/v1',
+			'/support/login-link',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'create_support_login_link' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/support/login',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'support_login' ),
+				'permission_callback' => '__return_true', // Public: authenticated by the one-time token itself.
+				'args'                => array(
+					'token' => array(
+						'type'              => 'string',
+						'required'          => false,
+						'sanitize_callback' => 'sanitize_text_field',
+					),
+				),
+			)
+		);
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/support/request-access',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'support_request_access' ),
+				'permission_callback' => array( $this, 'check_security' ),
+			)
+		);
+	}
+
+	/**
+	 * POST /support/login-link
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function create_support_login_link( $request ) {
+		$body = $request->get_json_params();
+		$body = is_array( $body ) ? $body : array();
+		$requested_by = isset( $body['requestedBy'] ) ? $body['requestedBy'] : $request->get_param( 'requestedBy' );
+		$ttl          = isset( $body['ttlSeconds'] ) ? $body['ttlSeconds'] : $request->get_param( 'ttlSeconds' );
+
+		$result = Mobo_Core_Support_Access::create_login_link( $requested_by, null === $ttl ? Mobo_Core_Support_Access::TOKEN_TTL_DEFAULT : $ttl );
+		if ( empty( $result['success'] ) ) {
+			if ( isset( $result['code'] ) && 'support_access_not_granted' === $result['code'] ) {
+				return new WP_REST_Response(
+					array(
+						'success' => false,
+						'code'    => 'support_access_not_granted',
+						'status'  => isset( $result['status'] ) ? (string) $result['status'] : 'not_granted',
+					),
+					409
+				);
+			}
+			return new WP_REST_Response( array( 'success' => false, 'code' => 'support_link_unavailable' ), 503 );
+		}
+
+		return new WP_REST_Response(
+			array(
+				'success'   => true,
+				'url'       => (string) $result['url'],
+				'expiresAt' => (string) $result['expiresAt'],
+			),
+			200
+		);
+	}
+
+	/**
+	 * GET /support/login?token=... (public, single use, rate limited).
+	 * Success: auth cookie for the support user + redirect to wp-admin.
+	 * Failure: generic HTML page, HTTP 403, no details.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return void
+	 */
+	public function support_login( $request ) {
+		$ip     = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : ''; // Proxy headers are spoofable; never trusted here.
+		$result = Mobo_Core_Support_Access::consume_login_token( (string) $request->get_param( 'token' ), $ip );
+
+		nocache_headers();
+		if ( empty( $result['ok'] ) || ! ( $result['user'] instanceof WP_User ) ) {
+			status_header( 403 );
+			header( 'Content-Type: text/html; charset=utf-8' );
+			header( 'X-Robots-Tag: noindex, nofollow' );
+			echo '<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>لینک ورود نامعتبر است</title>'
+				. '<style>body{font-family:Tahoma,Arial,sans-serif;background:#f6f7f7;color:#1d2327;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{background:#fff;border:1px solid #dcdcde;border-radius:8px;padding:32px;max-width:420px;text-align:center}h1{font-size:20px}</style></head>'
+				. '<body><main><h1>لینک ورود نامعتبر یا منقضی شده است</h1><p>این لینک فقط یک بار و برای مدت کوتاهی معتبر است. لطفاً از پشتیبانی موبو لینک جدید بخواهید.</p></main></body></html>';
+			exit;
+		}
+
+		$user = $result['user'];
+		wp_set_current_user( $user->ID );
+		wp_set_auth_cookie( $user->ID, false, is_ssl() );
+		do_action( 'wp_login', $user->user_login, $user );
+		wp_safe_redirect( admin_url() );
+		exit;
+	}
+
+	/**
+	 * POST /support/request-access
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function support_request_access( $request ) {
+		$body = $request->get_json_params();
+		$body = is_array( $body ) ? $body : array();
+		Mobo_Core_Support_Access::record_access_request(
+			isset( $body['message'] ) ? $body['message'] : (string) $request->get_param( 'message' ),
+			isset( $body['requestedBy'] ) ? $body['requestedBy'] : (string) $request->get_param( 'requestedBy' )
+		);
+		return new WP_REST_Response( array( 'success' => true ), 200 );
 	}
 
 	/**

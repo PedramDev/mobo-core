@@ -702,6 +702,20 @@ function mobo_core_activate() {
 register_activation_hook( __FILE__, 'mobo_core_activate' );
 
 /**
+ * Deactivation: an active support access is revoked (role removed, password
+ * rotated, sessions destroyed) so no support administrator outlives the plugin.
+ *
+ * @return void
+ */
+function mobo_core_deactivate_support_access() {
+	$state = get_option( 'mobo_core_support_access_state', array() );
+	if ( is_array( $state ) && 'granted' === (string) ( $state['status'] ?? '' ) && class_exists( 'Mobo_Core_Support_Access' ) ) {
+		Mobo_Core_Support_Access::revoke( 'revoked', 'deactivation' );
+	}
+}
+register_deactivation_hook( __FILE__, 'mobo_core_deactivate_support_access' );
+
+/**
  * Bootstrap plugin.
  */
 add_action(
@@ -932,6 +946,28 @@ add_action(
 			},
 			20,
 			2
+		);
+
+		/* Support access expiry guard: only logged-in requests read the small
+		 * autoloaded state option; the support class is parsed only when an
+		 * access has actually expired. Cron and wp-admin enforce expiry too. */
+		add_action(
+			'init',
+			function () {
+				if ( ! function_exists( 'is_user_logged_in' ) || ! is_user_logged_in() ) {
+					return;
+				}
+				$state = get_option( 'mobo_core_support_access_state', array() );
+				if ( ! is_array( $state ) || 'granted' !== (string) ( $state['status'] ?? '' ) || absint( $state['expiresAt'] ?? 0 ) > time() ) {
+					return;
+				}
+				Mobo_Core_Support_Access::maybe_expire();
+				if ( get_current_user_id() === absint( $state['userId'] ?? 0 ) ) {
+					wp_clear_auth_cookie();
+					wp_set_current_user( 0 );
+				}
+			},
+			1
 		);
 
 		/* REST controller is parsed only on actual REST requests. */

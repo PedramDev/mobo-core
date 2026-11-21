@@ -1506,6 +1506,24 @@ class Mobo_Core_Cron_Runner {
 					$round['stageErrors']
 				);
 			}
+
+			/* Support access: enforce expiry and run at most one cheap Source
+			 * login check per 6 hours (Default Connection only, never retried). */
+			if ( class_exists( 'Mobo_Core_Support_Access' ) && ! isset( $disabled_stages['supportAccess'] ) ) {
+				if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+					return $round;
+				}
+
+				$round['supportAccess'] = $this->execute_stage(
+					'supportAccess',
+					function () use ( $source ) {
+						return Mobo_Core_Support_Access::cron_tick( $source );
+					},
+					array( 'success' => false, 'status' => 'exception' ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
 		}
 
 
@@ -1796,6 +1814,7 @@ class Mobo_Core_Cron_Runner {
 			'recategorizeQueue'      => array( 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'status' => 'skipped', 'remaining' => false ),
 			'addressMapping'         => array( 'status' => 'skipped' ),
 			'remoteShipping'         => array( 'status' => 'skipped' ),
+			'supportAccess'          => array( 'status' => 'skipped' ),
 			'orderSubmissions'       => array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => false ),
 			'cacheWarmup'           => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'warmed' => 0, 'failed' => 0, 'dropped' => 0, 'deferred' => 0, 'remaining' => false, 'remainingDue' => false, 'pendingCount' => 0, 'lastError' => '' ),
 			'storageBackfill'        => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'mirrored' => 0, 'skipped' => 0, 'failed' => 0, 'gaps' => 0, 'cursor' => 0, 'remaining' => false ),
@@ -2387,7 +2406,7 @@ class Mobo_Core_Cron_Runner {
 			$aggregate['lastStep'] = $round['lastStep'];
 		}
 
-		foreach ( array( 'addressMapping', 'remoteShipping', 'maintenance' ) as $key ) {
+		foreach ( array( 'addressMapping', 'remoteShipping', 'supportAccess', 'maintenance' ) as $key ) {
 			if ( isset( $round[ $key ] ) && is_array( $round[ $key ] ) && 'skipped' !== ( isset( $round[ $key ]['status'] ) ? $round[ $key ]['status'] : '' ) ) {
 				$aggregate[ $key ] = $round[ $key ];
 			}
