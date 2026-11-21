@@ -22,6 +22,10 @@ final class Mobo_Core_Logger {
 	 * @return void
 	 */
 	public static function error( $message, $context = array() ) {
+		/* Plugin errors also feed the scrubbed support ring buffer (deduplicated). */
+		if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+			Mobo_Core_Error_Log::capture( 'error', 'logger', (string) $message, is_array( $context ) ? $context : array() );
+		}
 		if ( ! function_exists( 'wc_get_logger' ) ) {
 			return;
 		}

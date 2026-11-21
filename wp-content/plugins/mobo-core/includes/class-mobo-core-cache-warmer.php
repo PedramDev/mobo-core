@@ -393,7 +393,7 @@ final class Mobo_Core_Cache_Warmer {
 		$last = (float) get_option( self::GLOBAL_RATE_OPTION, 0 );
 		$wait = $last + $gap - microtime( true );
 		if ( $wait > 0 && microtime( true ) + $wait + 1.0 >= $deadline ) { return false; }
-		if ( $wait > 0 ) { usleep( (int) min( 3000000, ceil( $wait * 1000000 ) ) ); }
+		if ( $wait > 0 ) { Mobo_Core_Environment::sleep_us( (int) min( 3000000, ceil( $wait * 1000000 ) ) ); }
 		$reserved_at = (string) microtime( true );
 		if ( ! update_option( self::GLOBAL_RATE_OPTION, $reserved_at, false ) && (string) get_option( self::GLOBAL_RATE_OPTION, '' ) !== $reserved_at ) {
 			return false; // Never run a GET when the shared installation budget cannot be durably reserved.

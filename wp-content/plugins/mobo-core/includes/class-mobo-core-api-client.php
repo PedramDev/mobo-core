@@ -894,7 +894,7 @@ class Mobo_Core_API_Client {
 	 */
 	private static function clamp_to_request_budget( $configured ) {
 		$configured = max( 2, absint( $configured ) );
-		$limit      = absint( ini_get( 'max_execution_time' ) );
+		$limit      = absint( Mobo_Core_Environment::ini( 'max_execution_time', '0' ) );
 		if ( $limit <= 0 ) {
 			return $configured;
 		}
@@ -1084,6 +1084,27 @@ class Mobo_Core_API_Client {
 	 * @return mixed|WP_Error
 	 */
 	private function get_json_url( $url, $timeout = 20, $require_array = true ) {
+		$result = $this->get_json_url_uncaptured( $url, $timeout, $require_array );
+		self::capture_backend_error( $result, 'GET', $url );
+		return $result;
+	}
+
+	/**
+	 * Feed a Backend WP_Error into the support error log (path only).
+	 *
+	 * @param mixed  $result Result.
+	 * @param string $method HTTP method.
+	 * @param string $url    URL (query string is never stored).
+	 * @return void
+	 */
+	private static function capture_backend_error( $result, $method, $url ) {
+		if ( is_wp_error( $result ) && class_exists( 'Mobo_Core_Error_Log' ) ) {
+			Mobo_Core_Error_Log::capture_wp_error( 'backend', $result, array( 'method' => (string) $method, 'endpoint' => (string) $url ) );
+		}
+	}
+
+	/** get_json_url() without error capture. */
+	private function get_json_url_uncaptured( $url, $timeout = 20, $require_array = true ) {
 		$url = $this->validate_trusted_api_url( $url );
 		if ( is_wp_error( $url ) ) {
 			return $url;
@@ -1200,6 +1221,13 @@ class Mobo_Core_API_Client {
 	 * @return array|WP_Error
 	 */
 	private function post_json( $path, $payload ) {
+		$result = $this->post_json_uncaptured( $path, $payload );
+		self::capture_backend_error( $result, 'POST', (string) $path );
+		return $result;
+	}
+
+	/** post_json() without error capture. */
+	private function post_json_uncaptured( $path, $payload ) {
 		$base_url = $this->get_base_url();
 		if ( '' === $base_url ) {
 			return new WP_Error( 'mobo_core_missing_api_base_url', 'API base URL is missing.' );

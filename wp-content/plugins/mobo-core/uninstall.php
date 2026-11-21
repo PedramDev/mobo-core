@@ -86,6 +86,9 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_cache_warmup_queue' );
 	delete_option( 'mobo_core_cache_warmup_request_started_at' );
 	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . $wpdb->options . ' WHERE option_name LIKE %s', $wpdb->esc_like( 'mobo_core_warmup_admission_' ) . '%' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- uninstall cleanup.
+	/* Support diagnostics: error ring buffer, recent events, integrity cache, capability probe. */
+	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . $wpdb->options . ' WHERE option_name LIKE %s', $wpdb->esc_like( 'mobo_core_diag_' ) . '%' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- uninstall cleanup.
+	delete_option( 'mobo_core_env_capabilities' );
 	/* Preserve mobo_core_parent_finalize_queue until verified migration. */
 	delete_option( 'mobo_core_reprice_state' );
 	delete_option( 'mobo_core_recategorize_state' );

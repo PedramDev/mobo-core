@@ -2134,7 +2134,7 @@ class Mobo_Core_Image_Sync {
 			return true;
 		}
 
-		$ip = filter_var( $host, FILTER_VALIDATE_IP ) ? $host : gethostbyname( $host );
+		$ip = filter_var( $host, FILTER_VALIDATE_IP ) ? $host : Mobo_Core_Environment::resolve_host( $host );
 
 		if ( ! is_string( $ip ) || '' === $ip || $ip === $host && ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
 			return false;

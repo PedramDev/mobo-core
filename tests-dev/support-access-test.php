@@ -85,6 +85,7 @@ class Mobo_Test_Wpdb {
 
 $GLOBALS['wpdb'] = new Mobo_Test_Wpdb();
 
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-environment.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-support-access.php';
 
 $S   = 'Mobo_Core_Support_Access';

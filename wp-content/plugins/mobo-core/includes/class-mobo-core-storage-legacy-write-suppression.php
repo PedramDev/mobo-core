@@ -232,7 +232,7 @@ final class Mobo_Core_Storage_Legacy_Write_Suppression {
 	}
 
 	/** @return void */
-	private static function register_shutdown(){if(self::$shutdown_registered){return;}self::$shutdown_registered=true;register_shutdown_function(array(__CLASS__,'flush'));}
+	private static function register_shutdown(){if(self::$shutdown_registered){return;}self::$shutdown_registered=true;Mobo_Core_Environment::on_shutdown(array(__CLASS__,'flush'));}
 	/** @return void */
 	private static function clear_request_buffer(){self::$buckets=array();self::$shutdown_registered=false;}
 }

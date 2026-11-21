@@ -155,13 +155,13 @@ class Mobo_Core_Health_Reporter {
 			'cachePurge'            => $cache_purge,
 			'runtimeDiagnostics'     => $runtime_diagnostics,
 
-			'phpMemoryLimitRaw'     => (string) ini_get( 'memory_limit' ),
-			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( (string) ini_get( 'memory_limit' ) ),
-			'phpMemoryUsageBytes'   => memory_get_usage( true ),
-			'phpMemoryPeakUsageBytes'=> memory_get_peak_usage( true ),
-			'phpMaxExecutionTime'   => absint( ini_get( 'max_execution_time' ) ),
-			'phpUploadMaxFilesize'  => (string) ini_get( 'upload_max_filesize' ),
-			'phpPostMaxSize'        => (string) ini_get( 'post_max_size' ),
+			'phpMemoryLimitRaw'     => Mobo_Core_Environment::ini( 'memory_limit' ),
+			'phpMemoryLimitBytes'   => $this->parse_size_to_bytes( Mobo_Core_Environment::ini( 'memory_limit' ) ),
+			'phpMemoryUsageBytes'   => Mobo_Core_Environment::memory_usage( true ),
+			'phpMemoryPeakUsageBytes'=> Mobo_Core_Environment::memory_peak( true ),
+			'phpMaxExecutionTime'   => absint( Mobo_Core_Environment::ini( 'max_execution_time', '0' ) ),
+			'phpUploadMaxFilesize'  => Mobo_Core_Environment::ini( 'upload_max_filesize' ),
+			'phpPostMaxSize'        => Mobo_Core_Environment::ini( 'post_max_size' ),
 			'wpMemoryLimitRaw'      => $wp_memory['wp_memory_limit_raw'],
 			'wpMemoryLimitBytes'    => $wp_memory['wp_memory_limit_bytes'],
 			'wpMaxMemoryLimitRaw'   => $wp_memory['wp_max_memory_limit_raw'],
@@ -213,6 +213,10 @@ class Mobo_Core_Health_Reporter {
 			'remoteControl'          => class_exists( 'Mobo_Core_Remote_Control' ) ? Mobo_Core_Remote_Control::get_status() : array(),
 			/* Compact self-diagnosis of admin jobs for the Backend support page. */
 			'jobs'                   => $this->get_jobs_health(),
+			/* Host capability probe (cached daily) + small error-log summary; the full
+			 * bundle is served on demand by POST /support/diagnostics. */
+			'environment'            => array( 'capabilities' => $this->get_environment_capabilities() ),
+			'diagnosticsSummary'     => $this->get_diagnostics_summary(),
 			'storeCurrencyChange'    => class_exists( 'Mobo_Core_Store_Currency_Guard' ) ? Mobo_Core_Store_Currency_Guard::health_payload() : array( 'pending' => false ),
 			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
@@ -260,7 +264,59 @@ class Mobo_Core_Health_Reporter {
 		} catch ( Throwable $e ) {
 			$jobs['reprice'] = array( 'status' => 'unavailable', 'error' => sanitize_key( get_class( $e ) ) );
 		}
+		try {
+			$jobs['recategorize'] = class_exists( 'Mobo_Core_Recategorize_Queue' )
+				? ( new Mobo_Core_Recategorize_Queue() )->health_payload()
+				: array( 'status' => 'unavailable' );
+		} catch ( Throwable $e ) {
+			$jobs['recategorize'] = array( 'status' => 'unavailable', 'error' => sanitize_key( get_class( $e ) ) );
+		}
+		try {
+			if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) && class_exists( 'Mobo_Core_Product_Sync' ) ) {
+				$sync    = ( new Mobo_Core_Product_Sync() )->get_manual_sync_status();
+				$current = Mobo_Core_Job_Diagnostics::manual_sync_job( $sync );
+				foreach ( array( 'sync', 'repair' ) as $job ) {
+					$is_current   = $job === $current;
+					$jobs[ $job ] = Mobo_Core_Job_Diagnostics::health_payload_for(
+						$job,
+						$is_current ? (string) ( $sync['status'] ?? 'idle' ) : 'idle',
+						$is_current ? absint( $sync['processedProducts'] ?? 0 ) : 0,
+						$is_current ? absint( $sync['productTotalCount'] ?? 0 ) : 0,
+						Mobo_Core_Job_Diagnostics::MANUAL_SYNC_LOCK
+					);
+				}
+			}
+		} catch ( Throwable $e ) {
+			$jobs['sync'] = array( 'status' => 'unavailable', 'error' => sanitize_key( get_class( $e ) ) );
+		}
 		return $jobs;
+	}
+
+	/**
+	 * environment.capabilities (daily cached probe). Never throws.
+	 *
+	 * @return array
+	 */
+	private function get_environment_capabilities() {
+		try {
+			return class_exists( 'Mobo_Core_Environment_Probe' ) ? Mobo_Core_Environment_Probe::get() : array();
+		} catch ( Throwable $e ) {
+			return array( 'error' => sanitize_key( get_class( $e ) ) );
+		}
+	}
+
+	/**
+	 * diagnosticsSummary {errors24h, lastErrorAt, lastErrorCode, topErrors, disabledFunctionsImpact}.
+	 *
+	 * @return array
+	 */
+	private function get_diagnostics_summary() {
+		try {
+			$impact = class_exists( 'Mobo_Core_Environment_Probe' ) ? Mobo_Core_Environment_Probe::impact_summary() : array();
+			return class_exists( 'Mobo_Core_Error_Log' ) ? Mobo_Core_Error_Log::summary( $impact ) : array( 'errors24h' => 0, 'lastErrorAt' => null, 'lastErrorCode' => '', 'topErrors' => array(), 'disabledFunctionsImpact' => $impact );
+		} catch ( Throwable $e ) {
+			return array( 'errors24h' => 0, 'lastErrorAt' => null, 'lastErrorCode' => '', 'topErrors' => array(), 'disabledFunctionsImpact' => array(), 'error' => sanitize_key( get_class( $e ) ) );
+		}
 	}
 
 	/**
@@ -466,12 +522,12 @@ class Mobo_Core_Health_Reporter {
 		return array(
 			'sapi'               => PHP_SAPI,
 			'os'                 => PHP_OS_FAMILY,
-			'iniFile'            => (string) php_ini_loaded_file(),
-			'memoryLimit'        => (string) ini_get( 'memory_limit' ),
-			'maxExecutionTime'   => (string) ini_get( 'max_execution_time' ),
-			'maxInputVars'       => (string) ini_get( 'max_input_vars' ),
-			'postMaxSize'        => (string) ini_get( 'post_max_size' ),
-			'uploadMaxFilesize'  => (string) ini_get( 'upload_max_filesize' ),
+			'iniFile'            => Mobo_Core_Environment::ini_file(),
+			'memoryLimit'        => Mobo_Core_Environment::ini( 'memory_limit' ),
+			'maxExecutionTime'   => Mobo_Core_Environment::ini( 'max_execution_time' ),
+			'maxInputVars'       => Mobo_Core_Environment::ini( 'max_input_vars' ),
+			'postMaxSize'        => Mobo_Core_Environment::ini( 'post_max_size' ),
+			'uploadMaxFilesize'  => Mobo_Core_Environment::ini( 'upload_max_filesize' ),
 			'extensions'         => array_values( $extensions ),
 		);
 	}
@@ -740,7 +796,7 @@ class Mobo_Core_Health_Reporter {
 	 */
 	private function get_log_stats() {
 		$debug_path = $this->resolve_debug_log_path();
-		$error_path = (string) ini_get( 'error_log' );
+		$error_path = Mobo_Core_Environment::ini( 'error_log' );
 
 		return array(
 			'debug_log_path'          => $debug_path,

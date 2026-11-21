@@ -167,7 +167,7 @@ final class Mobo_Core_Storage_Primary_Read {
 		}
 		if ( ! self::$shutdown_registered ) {
 			self::$shutdown_registered = true;
-			register_shutdown_function( array( __CLASS__, 'flush' ) );
+			Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'flush' ) );
 		}
 	}
 

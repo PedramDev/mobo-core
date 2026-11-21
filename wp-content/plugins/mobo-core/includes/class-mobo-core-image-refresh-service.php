@@ -3093,7 +3093,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 		if ( '' !== $stem && is_dir( $dir ) && is_readable( $dir ) ) {
 			$pattern = '/^' . preg_quote( $stem, '/' ) . '(?:-\d+)?(?:(?:-e\d{6,})|(?:-\d+x\d+)|(?:-scaled)|(?:-rotated))*\.(?:jpe?g|png)$/i';
-			foreach ( (array) scandir( $dir ) as $item ) {
+			foreach ( Mobo_Core_Environment::scandir( $dir ) as $item ) {
 				if ( 1 !== preg_match( $pattern, (string) $item ) ) {
 					continue;
 				}

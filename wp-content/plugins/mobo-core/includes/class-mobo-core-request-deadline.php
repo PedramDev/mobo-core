@@ -50,7 +50,7 @@ final class Mobo_Core_Request_Deadline {
 	 * @return int
 	 */
 	public static function php_time_limit( $raw = null ) {
-		$raw   = null === $raw ? ini_get( 'max_execution_time' ) : $raw;
+		$raw   = null === $raw ? Mobo_Core_Environment::ini( 'max_execution_time', '0' ) : $raw;
 		$limit = is_numeric( $raw ) ? (int) $raw : 0;
 		return $limit > 0 ? $limit : self::ASSUMED_LIMIT_SECONDS;
 	}
@@ -114,7 +114,7 @@ final class Mobo_Core_Request_Deadline {
 			}
 			$raw   = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? $_SERVER['REQUEST_TIME_FLOAT'] : null; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- numeric server timestamp, validated below.
 			$start = self::resolve_request_start( $raw, $now );
-			self::$memo = self::compute( null === $start ? self::$fallback_start : $start, ini_get( 'max_execution_time' ), $now );
+			self::$memo = self::compute( null === $start ? self::$fallback_start : $start, Mobo_Core_Environment::ini( 'max_execution_time', '0' ), $now );
 		}
 		return self::$memo;
 	}

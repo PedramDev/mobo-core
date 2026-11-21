@@ -153,6 +153,18 @@ class Mobo_Core_Rest_Controller {
 			)
 		);
 
+		/* Remote diagnostics bundle for support (installation-level auth only;
+		 * a Source Connection X-SEC alone is not enough). */
+		register_rest_route(
+			'mobo-core/v1',
+			'/support/diagnostics',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'get_support_diagnostics' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
+			)
+		);
+
 		register_rest_route(
 			'mobo-core/v1',
 			'/health/report-now',
@@ -1163,7 +1175,7 @@ class Mobo_Core_Rest_Controller {
 	 * @return float
 	 */
 	private function inline_webhook_budget_seconds() {
-		$limit = absint( ini_get( 'max_execution_time' ) );
+		$limit = absint( Mobo_Core_Environment::ini( 'max_execution_time', '0' ) );
 		$limit = $limit > 0 ? $limit : 30;
 		$spent = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? max( 0.0, microtime( true ) - (float) $_SERVER['REQUEST_TIME_FLOAT'] ) : 0.0; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- numeric server timestamp.
 		$budget = min( 10.0, $limit * 0.4 ) - $spent;
@@ -1467,6 +1479,27 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
+	 * POST /support/diagnostics: on-demand diagnostics bundle (scrubbed, <= 512 KB).
+	 * Body: {"sections":[...],"sinceMinutes":1440}.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public function get_support_diagnostics( $request ) {
+		$body = is_object( $request ) && method_exists( $request, 'get_json_params' ) ? $request->get_json_params() : array();
+		if ( ! is_array( $body ) || empty( $body ) ) {
+			$body = is_object( $request ) && method_exists( $request, 'get_body_params' ) ? (array) $request->get_body_params() : array();
+		}
+		$params = Mobo_Core_Diagnostics_Bundle::normalize_request( $body );
+		$bundle = Mobo_Core_Diagnostics_Bundle::build( $params['sections'], $params['sinceMinutes'] );
+		$response = rest_ensure_response( $bundle );
+		if ( is_object( $response ) && method_exists( $response, 'header' ) ) {
+			$response->header( 'Cache-Control', 'no-store, private' );
+		}
+		return $response;
+	}
+
+	/**
 	 * Return a local health snapshot for backward-compatible diagnostics.
 	 *
 	 * @param WP_REST_Request $request Request.
@@ -1558,7 +1591,20 @@ class Mobo_Core_Rest_Controller {
 	 */
 	public function run_product_sync( $request ) {
 		$sync   = new Mobo_Core_Product_Sync();
-		$result = $sync->run_manual_sync_step();
+		$before = class_exists( 'Mobo_Core_Job_Diagnostics' ) ? $sync->get_manual_sync_status() : array();
+		$scope  = class_exists( 'Mobo_Core_Correlation' ) && '' !== (string) ( $before['syncId'] ?? '' )
+			? Mobo_Core_Correlation::push( Mobo_Core_Job_Diagnostics::manual_sync_job( $before ), (string) $before['syncId'] )
+			: 0;
+		try {
+			$result = $sync->run_manual_sync_step();
+			if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+				Mobo_Core_Job_Diagnostics::observe_manual_sync( $sync->get_manual_sync_status() );
+			}
+		} finally {
+			if ( $scope > 0 ) {
+				Mobo_Core_Correlation::pop( $scope );
+			}
+		}
 
 		return rest_ensure_response( $result );
 	}

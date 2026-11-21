@@ -64,7 +64,7 @@ final class Mobo_Core_Portal_Request_Signer {
 		}
 
 		$timestamp = time();
-		$nonce     = bin2hex( random_bytes( 24 ) );
+		$nonce     = Mobo_Core_Environment::random_hex( 24 );
 		$body_hash = hash( 'sha256', $body );
 		$target    = self::request_target( $url );
 		if ( is_wp_error( $target ) ) {
@@ -186,7 +186,7 @@ final class Mobo_Core_Portal_Request_Signer {
 		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'installation_keygen', 30 ) : false;
 		if ( false === $lock_token ) {
 			for ( $attempt = 0; $attempt < 25; $attempt++ ) {
-				usleep( 100000 );
+				Mobo_Core_Environment::sleep_us( 100000 );
 				$existing = self::read_complete_identity();
 				if ( is_array( $existing ) ) {
 					self::$identity_cache = $existing;
@@ -444,8 +444,8 @@ final class Mobo_Core_Portal_Request_Signer {
 	private static function openssl_config_candidates() {
 		$candidates = array();
 
-		$env_openssl = getenv( 'OPENSSL_CONF' );
-		$env_ssleay  = getenv( 'SSLEAY_CONF' );
+		$env_openssl = Mobo_Core_Environment::env( 'OPENSSL_CONF' );
+		$env_ssleay  = Mobo_Core_Environment::env( 'SSLEAY_CONF' );
 		if ( is_string( $env_openssl ) && '' !== trim( $env_openssl ) ) {
 			$candidates[] = $env_openssl;
 		}
@@ -453,7 +453,7 @@ final class Mobo_Core_Portal_Request_Signer {
 			$candidates[] = $env_ssleay;
 		}
 
-		$ini_file = php_ini_loaded_file();
+		$ini_file = Mobo_Core_Environment::ini_file();
 		if ( is_string( $ini_file ) && '' !== trim( $ini_file ) ) {
 			$ini_dir      = dirname( $ini_file );
 			$candidates[] = $ini_dir . DIRECTORY_SEPARATOR . 'openssl.cnf';
@@ -468,7 +468,7 @@ final class Mobo_Core_Portal_Request_Signer {
 			$candidates[] = dirname( $binary_dir ) . DIRECTORY_SEPARATOR . 'conf' . DIRECTORY_SEPARATOR . 'openssl.cnf';
 		}
 
-		$extension_dir = (string) ini_get( 'extension_dir' );
+		$extension_dir = Mobo_Core_Environment::ini( 'extension_dir' );
 		if ( '' !== trim( $extension_dir ) ) {
 			$php_dir      = dirname( $extension_dir );
 			$candidates[] = $php_dir . DIRECTORY_SEPARATOR . 'openssl.cnf';
@@ -595,7 +595,7 @@ final class Mobo_Core_Portal_Request_Signer {
 	}
 
 	private static function fallback_uuid4() {
-		$data = random_bytes( 16 );
+		$data = Mobo_Core_Environment::random_raw( 16 );
 		$data[6] = chr( ( ord( $data[6] ) & 0x0f ) | 0x40 );
 		$data[8] = chr( ( ord( $data[8] ) & 0x3f ) | 0x80 );
 		$hex = bin2hex( $data );

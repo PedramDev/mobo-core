@@ -155,6 +155,7 @@ class Mobo_Core_Connection_Repository {
 	public static function get_default() { return array( 'id' => 1 ); }
 }
 $plugin = dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/';
+require $plugin . 'class-mobo-core-environment.php';
 require $plugin . 'class-mobo-core-request-deadline.php';
 require $plugin . 'class-mobo-core-lock.php';
 require $plugin . 'class-mobo-core-self-runner.php';

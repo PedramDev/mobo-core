@@ -148,6 +148,51 @@ require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-autoloader.php';
 Mobo_Core_Autoloader::register();
 
 /*
+ * Disabled-function-safe wrappers (+ ctype polyfill) must exist before any other
+ * Mobo code runs. Plugin-scoped error capture is wired with two tiny hooks; the
+ * Mobo_Core_Error_Log class itself is only loaded when there is something to
+ * record (a capture in this request, a fatal in a plugin file, a failing Mobo
+ * REST route), so ordinary storefront requests stay lean.
+ */
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-environment.php';
+Mobo_Core_Environment::on_shutdown( 'mobo_core_diagnostics_shutdown' );
+add_filter( 'rest_request_after_callbacks', 'mobo_core_diagnostics_rest_observer', 999, 3 );
+
+/**
+ * Shutdown: persist captured problems and record a fatal raised in plugin code.
+ *
+ * @return void
+ */
+function mobo_core_diagnostics_shutdown() {
+	if ( class_exists( 'Mobo_Core_Error_Log', false ) ) {
+		Mobo_Core_Error_Log::on_shutdown();
+		return;
+	}
+	$error = function_exists( 'error_get_last' ) ? error_get_last() : null;
+	$fatal = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR;
+	if ( is_array( $error ) && isset( $error['type'], $error['file'] ) && ( (int) $error['type'] & $fatal )
+		&& 0 === strpos( str_replace( '\\', '/', (string) $error['file'] ), rtrim( str_replace( '\\', '/', MOBO_CORE_PLUGIN_DIR ), '/' ) . '/' ) ) {
+		Mobo_Core_Error_Log::on_shutdown();
+	}
+}
+
+/**
+ * rest_request_after_callbacks: failing Mobo routes feed the support error log.
+ *
+ * @param mixed $response Response.
+ * @param mixed $handler  Handler.
+ * @param mixed $request  Request.
+ * @return mixed
+ */
+function mobo_core_diagnostics_rest_observer( $response, $handler = null, $request = null ) {
+	if ( is_object( $request ) && method_exists( $request, 'get_route' ) && 0 === strpos( (string) $request->get_route(), '/mobo-core/' )
+		&& ( is_wp_error( $response ) || ( is_object( $response ) && method_exists( $response, 'get_status' ) && (int) $response->get_status() >= 400 ) ) ) {
+		return Mobo_Core_Error_Log::observe_rest_response( $response, $handler, $request );
+	}
+	return $response;
+}
+
+/*
  * 10.33.95 terminal identity authority. Product/Variation identity reads are
  * virtualized from Custom Storage after the durable identity fence; mutations
  * are intercepted at priority 1 so retired wp_postmeta rows cannot reappear.
@@ -626,7 +671,7 @@ function mobo_core_bootstrap_enabled( $name, $default = '0' ) {
  */
 function mobo_core_shared_media_configured() {
 	$name = 'MOBO_CORE_SHARED_MEDIA_ENABLED';
-	$value = defined( $name ) ? constant( $name ) : getenv( $name );
+	$value = defined( $name ) ? constant( $name ) : Mobo_Core_Environment::env( $name );
 	return in_array( strtolower( trim( false === $value || null === $value ? '' : (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
 }
 

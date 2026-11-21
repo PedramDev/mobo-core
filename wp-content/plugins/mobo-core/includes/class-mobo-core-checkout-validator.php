@@ -122,7 +122,17 @@ class Mobo_Core_Checkout_Validator {
 	/** Operational candidate sink: explicit caller method, unchanged WP response/error semantics. */
 	private function production_candidate_transport( $method, $url, array $args ) {
 		$args['method'] = $method;
-		return wp_remote_request( $url, $args );
+		$response = wp_remote_request( $url, $args );
+		/* Source failures feed the support error log (path only, never the query,
+		 * headers or body). The response itself is returned unchanged. */
+		if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+			if ( is_wp_error( $response ) ) {
+				Mobo_Core_Error_Log::capture_wp_error( 'source', $response, array( 'method' => (string) $method, 'endpoint' => (string) $url ) );
+			} elseif ( function_exists( 'wp_remote_retrieve_response_code' ) && absint( wp_remote_retrieve_response_code( $response ) ) >= 500 ) {
+				Mobo_Core_Error_Log::capture( 'warning', 'source.http_' . absint( wp_remote_retrieve_response_code( $response ) ), 'Source returned HTTP ' . absint( wp_remote_retrieve_response_code( $response ) ) . '.', array( 'method' => (string) $method, 'endpoint' => Mobo_Core_Error_Log::endpoint_path( $url ), 'status' => absint( wp_remote_retrieve_response_code( $response ) ) ) );
+			}
+		}
+		return $response;
 	}
 
 	/**
@@ -1581,7 +1591,7 @@ class Mobo_Core_Checkout_Validator {
 			if ( ( time() - $started_at ) >= $wait ) {
 				break;
 			}
-			usleep( 250000 );
+			Mobo_Core_Environment::sleep_us( 250000 );
 		} while ( true );
 
 		return new WP_Error( 'mobo_core_shared_cart_locked', 'Shared Mobo cart is locked by another checkout.' );
@@ -4447,7 +4457,23 @@ class Mobo_Core_Checkout_Validator {
 			$context['processor'] = $source;
 
 			$result['processed']++;
-			$submit = $this->submit_order_to_mobo( $order, $context );
+			/* Correlate every purchase step (eligibility, checkout, wallet, details) of
+			 * this order; record the outcome for the remote diagnostics bundle. */
+			$order_scope   = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::push( 'order', $order_id ) : 0;
+			$order_started = microtime( true );
+			try {
+				$submit = $this->submit_order_to_mobo( $order, $context );
+				if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+					Mobo_Core_Error_Log::record_event( 'order', (string) $order_id, true === $submit ? 'submitted' : ( is_wp_error( $submit ) ? (string) $submit->get_error_code() : 'not_submitted' ), (int) round( ( microtime( true ) - $order_started ) * 1000 ) );
+					if ( is_wp_error( $submit ) && ! in_array( $submit->get_error_code(), array( 'mobo_core_order_submission_busy', 'mobo_core_order_submission_deferred', 'mobo_core_order_submission_superseded', 'mobo_core_order_not_processing' ), true ) ) {
+						Mobo_Core_Error_Log::capture_wp_error( 'order', $submit, array( 'orderId' => $order_id ) );
+					}
+				}
+			} finally {
+				if ( $order_scope > 0 ) {
+					Mobo_Core_Correlation::pop( $order_scope );
+				}
+			}
 
 			if ( is_wp_error( $submit ) && in_array( $submit->get_error_code(), array( 'mobo_core_order_submission_busy', 'mobo_core_order_submission_lock_unavailable', 'mobo_core_order_submission_state_persist_failed', 'mobo_core_order_submission_deferred' ), true ) ) {
 				$result['skipped']++;

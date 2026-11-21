@@ -1106,7 +1106,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return array();
 		}
 
-		$items    = scandir( $dir );
+		$items    = Mobo_Core_Environment::scandir( $dir );
 		$patterns = array_map( array( $this, 'legacy_family_pattern' ), $bases );
 		$paths    = array();
 		$current_registered = array_fill_keys( $this->get_registered_attachment_relative_paths( $webp_attachment_id ), true );

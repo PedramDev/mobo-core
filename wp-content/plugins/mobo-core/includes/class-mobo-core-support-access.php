@@ -453,7 +453,7 @@ final class Mobo_Core_Support_Access {
 	 * @return string
 	 */
 	private static function random_password() {
-		return bin2hex( random_bytes( 24 ) ) . wp_generate_password( 16, true, true );
+		return Mobo_Core_Environment::random_hex( 24 ) . wp_generate_password( 16, true, true );
 	}
 
 	/**
@@ -507,7 +507,7 @@ final class Mobo_Core_Support_Access {
 		}
 
 		$ttl     = self::clamp_ttl( $ttl );
-		$token   = bin2hex( random_bytes( 32 ) );
+		$token   = Mobo_Core_Environment::random_hex( 32 );
 		$hash    = hash( 'sha256', $token );
 		$expires = $now + $ttl;
 		$name    = self::token_option_name( $hash );
@@ -853,7 +853,7 @@ final class Mobo_Core_Support_Access {
 		$requested_by = self::clean_requested_by( $requested_by );
 		$requests     = self::get_requests();
 		$request      = array(
-			'id'          => bin2hex( random_bytes( 8 ) ),
+			'id'          => Mobo_Core_Environment::random_hex( 8 ),
 			'at'          => time(),
 			'message'     => $message,
 			'requestedBy' => $requested_by,
@@ -1755,7 +1755,17 @@ final class Mobo_Core_Support_Access {
 	 * @return array
 	 */
 	public static function health_readiness() {
-		return self::compute_readiness( self::collect_readiness_inputs() );
+		$items = self::compute_readiness( self::collect_readiness_inputs() );
+		/* Host capabilities that actually impact a feature (disabled functions,
+		 * missing extensions, open_basedir, low limits), with the Persian impact. */
+		if ( class_exists( 'Mobo_Core_Environment_Probe' ) ) {
+			try {
+				$items = array_merge( $items, Mobo_Core_Environment_Probe::readiness_items() );
+			} catch ( Throwable $e ) {
+				unset( $e );
+			}
+		}
+		return $items;
 	}
 
 	/**

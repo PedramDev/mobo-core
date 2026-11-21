@@ -349,6 +349,9 @@ class Mobo_Core_Reprice_Queue {
 			return array( 'success' => true, 'status' => 'locked', 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true );
 		}
 
+		$correlation = class_exists( 'Mobo_Core_Correlation' ) && class_exists( 'Mobo_Core_Job_Diagnostics' )
+			? Mobo_Core_Correlation::push_id( Mobo_Core_Job_Diagnostics::open( self::DIAG_JOB )->correlation_id() )
+			: 0;
 		try {
 			$state = $this->get_state();
 
@@ -653,6 +656,9 @@ class Mobo_Core_Reprice_Queue {
 		);
 	
 		} finally {
+			if ( $correlation > 0 ) {
+				Mobo_Core_Correlation::pop( $correlation );
+			}
 			Mobo_Core_Lock::release( 'reprice_queue_worker', $worker_lock );
 		}
 	}

@@ -517,7 +517,7 @@ class Mobo_Core_Self_Runner {
 		 * error; shutdown callbacks do. release() is owner-checked compare-and-delete,
 		 * so this is a no-op after the normal release or once another request owns
 		 * the lease. If the host SIGKILLs the process, the short TTL bounds the gap. */
-		register_shutdown_function( array( __CLASS__, 'release_worker_request' ), $token );
+		Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'release_worker_request' ), $token );
 
 		update_option( self::OPTION_WORKER_STARTED_AT, time(), false );
 		delete_option( self::OPTION_DISPATCH_PENDING );

@@ -29,6 +29,7 @@ final class Mobo_Core_Support_Admin {
 		add_action( 'admin_post_mobo_core_support_check_source', array( __CLASS__, 'handle_check_source' ) );
 		add_action( 'admin_post_mobo_core_support_hosting', array( __CLASS__, 'handle_hosting' ) );
 		add_action( 'admin_post_mobo_core_support_dismiss_source', array( __CLASS__, 'handle_dismiss_source' ) );
+		Mobo_Core_Diagnostics_Admin::register_hooks();
 	}
 
 	/* =====================================================================
@@ -450,6 +451,8 @@ final class Mobo_Core_Support_Admin {
 				</div>
 			<?php endif; ?>
 		</div>
+
+		<?php Mobo_Core_Diagnostics_Admin::render_section(); ?>
 		<?php
 	}
 }

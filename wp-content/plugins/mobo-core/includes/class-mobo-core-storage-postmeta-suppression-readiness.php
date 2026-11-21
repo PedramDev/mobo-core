@@ -344,7 +344,7 @@ final class Mobo_Core_Storage_Postmeta_Suppression_Readiness {
 	/** @return bool */
 	private static function managed_object($object_id){$type=get_post_type(absint($object_id)); return 'product'===$type||'product_variation'===$type;}
 	/** @return void */
-	private static function register_shutdown(){if(self::$shutdown_registered){return;} self::$shutdown_registered=true; register_shutdown_function(array(__CLASS__,'flush'));}
+	private static function register_shutdown(){if(self::$shutdown_registered){return;} self::$shutdown_registered=true; Mobo_Core_Environment::on_shutdown(array(__CLASS__,'flush'));}
 	/** @return void */
 	private static function clear_request_buffer(){self::$buckets=array();self::$shutdown_registered=false;}
 	/** @return array */

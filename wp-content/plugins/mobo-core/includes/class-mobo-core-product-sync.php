@@ -217,7 +217,7 @@ final class Mobo_Core_Parent_Identity_Fence {
 			$log_key = $cid . ':' . $guid . ':' . $decision['reason'];
 			if ( ! isset( $logged[ $log_key ] ) ) {
 				$logged[ $log_key ] = true;
-				error_log( '[MOBO Q2 PARENT IDENTITY FENCE] connection=' . $cid . ' guid=' . $guid . ' reason=' . $decision['reason'] . ' legacy=' . $legacy_id . ' custom=' . $custom_id . ' candidate=' . $candidate_id . ' variantParents=' . implode( ',', $decision['variationParents'] ) );
+				Mobo_Core_Environment::log( '[MOBO Q2 PARENT IDENTITY FENCE] connection=' . $cid . ' guid=' . $guid . ' reason=' . $decision['reason'] . ' legacy=' . $legacy_id . ' custom=' . $custom_id . ' candidate=' . $candidate_id . ' variantParents=' . implode( ',', $decision['variationParents'] ) );
 			}
 			if ( Mobo_Core_Parent_Identity_Conflict::is_definitive_reason( $decision['reason'] ) ) {
 				throw new Mobo_Core_Parent_Identity_Conflict( $guid, $cid, $decision );

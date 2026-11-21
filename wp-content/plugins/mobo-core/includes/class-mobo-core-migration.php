@@ -535,6 +535,34 @@ class Mobo_Core_Migration {
 	 * @return array
 	 */
 	public static function run_budgeted_slice( $source = 'real-cron', $time_budget_seconds = 12, $max_iterations = 200 ) {
+		/* One correlation id per slice so errors and events of this slice can be
+		 * followed in the remote diagnostics bundle. */
+		$slice_id    = ( defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '0' ) . '-' . time();
+		$correlation = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::push( 'migration', $slice_id ) : 0;
+		$started     = microtime( true );
+		try {
+			$result = self::run_budgeted_slice_scoped( $source, $time_budget_seconds, $max_iterations );
+			if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+				Mobo_Core_Error_Log::record_event( 'migration', $slice_id, is_array( $result ) && isset( $result['status'] ) ? (string) $result['status'] : 'unknown', (int) round( ( microtime( true ) - $started ) * 1000 ), array( 'source' => sanitize_key( (string) $source ) ) );
+				Mobo_Core_Error_Log::capture_db_error( 'migration-slice' );
+			}
+			return $result;
+		} finally {
+			if ( $correlation > 0 ) {
+				Mobo_Core_Correlation::pop( $correlation );
+			}
+		}
+	}
+
+	/**
+	 * Body of run_budgeted_slice() (inside its correlation scope).
+	 *
+	 * @param string $source Source label.
+	 * @param int    $time_budget_seconds Budget.
+	 * @param int    $max_iterations Cap.
+	 * @return array
+	 */
+	private static function run_budgeted_slice_scoped( $source, $time_budget_seconds, $max_iterations ) {
 		global $wpdb;
 		$source              = sanitize_key( (string) $source );
 		$time_budget_seconds = max( 2, min( 25, absint( $time_budget_seconds ) ) );
@@ -880,7 +908,7 @@ class Mobo_Core_Migration {
 		if ( '' === trim( (string) $wpdb->last_error ) ) {
 			if ( '1' === (string) $got ) {
 				$token = 'mysql:' . $lock_name;
-				register_shutdown_function( array( __CLASS__, 'release_migration_request_lock' ), $token );
+				Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'release_migration_request_lock' ), $token );
 				return $token;
 			}
 			/* GET_LOCK() returning 0 means another live connection owns the mutex.
@@ -894,7 +922,7 @@ class Mobo_Core_Migration {
 		if ( ! is_string( $value ) ) { return ''; }
 		if ( add_option( self::MIGRATION_LOCK_OPTION, $value, '', false ) ) {
 			$token = 'option:' . $owner;
-			register_shutdown_function( array( __CLASS__, 'release_migration_request_lock' ), $token );
+			Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'release_migration_request_lock' ), $token );
 			return $token;
 		}
 
@@ -916,7 +944,7 @@ class Mobo_Core_Migration {
 		}
 		if ( add_option( self::MIGRATION_LOCK_OPTION, $value, '', false ) ) {
 			$token = 'option:' . $owner;
-			register_shutdown_function( array( __CLASS__, 'release_migration_request_lock' ), $token );
+			Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'release_migration_request_lock' ), $token );
 			return $token;
 		}
 		return '';

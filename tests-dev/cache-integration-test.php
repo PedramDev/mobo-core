@@ -208,6 +208,7 @@ final class Mobo_Core_Work_Queue_Store {
 }
 
 $inc = dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/';
+require $inc . 'class-mobo-core-environment.php';
 require $inc . 'class-mobo-core-cache-mutation-guard.php';
 require $inc . 'class-mobo-core-cache-purger.php';
 require $inc . 'class-mobo-core-cache-warmer.php';

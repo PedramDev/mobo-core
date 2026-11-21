@@ -185,7 +185,7 @@ class Mobo_Core_Cron_Runner {
 		 * release() verifies the token, so it cannot delete a newer owner's lease.
 		 * If shutdown itself is skipped, the finite lease expires automatically.
 		 */
-		register_shutdown_function( array( 'Mobo_Core_Lock', 'release' ), 'real_cron_runner', $lock );
+		Mobo_Core_Environment::on_shutdown( array( 'Mobo_Core_Lock', 'release' ), 'real_cron_runner', $lock );
 
 		/*
 		 * Interrupted requests can leave finite product/runtime lease rows behind.
@@ -569,7 +569,7 @@ class Mobo_Core_Cron_Runner {
 	private function get_runtime_config( $overrides = array() ) {
 		$configured_budget = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_time_budget_seconds', 25, 5, 55 );
 		$safety_margin     = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_safety_margin_seconds', 3, 1, 10 );
-		$php_limit         = absint( ini_get( 'max_execution_time' ) );
+		$php_limit         = absint( Mobo_Core_Environment::ini( 'max_execution_time', '0' ) );
 		$effective_budget  = $configured_budget;
 
 		if ( $php_limit > 0 ) {
@@ -1239,6 +1239,15 @@ class Mobo_Core_Cron_Runner {
 				if ( $this->option_state_is_running( 'mobo_core_reprice_state' ) && class_exists( 'Mobo_Core_Reprice_Queue' ) ) {
 					$round['repriceWatchdog'] = ( new Mobo_Core_Reprice_Queue() )->watchdog_tick( 'cron' );
 				}
+				/* Same bounded watchdog for Recategorize and Sync/Repair (diagnostics only:
+				 * stale-lease release or a worker kick; their state machines stay intact). */
+				if ( $this->option_state_is_running( 'mobo_core_recategorize_state' ) && class_exists( 'Mobo_Core_Recategorize_Queue' ) ) {
+					$round['recategorizeWatchdog'] = ( new Mobo_Core_Recategorize_Queue() )->watchdog_tick( 'cron' );
+				}
+				if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) && class_exists( 'Mobo_Core_Product_Sync' ) && $this->sync_state_should_continue() ) {
+					$sync_status = ( new Mobo_Core_Product_Sync() )->get_manual_sync_status();
+					$round['syncWatchdog'] = Mobo_Core_Job_Diagnostics::generic_watchdog( Mobo_Core_Job_Diagnostics::manual_sync_job( $sync_status ), (string) ( $sync_status['status'] ?? 'idle' ), Mobo_Core_Job_Diagnostics::MANUAL_SYNC_LOCK, 'cron' );
+				}
 				if ( class_exists( 'Mobo_Core_Product_Pricing_Policy' ) && method_exists( 'Mobo_Core_Product_Pricing_Policy', 'sweep_stuck_requests' ) ) {
 					$round['pricingOverrideSweep'] = Mobo_Core_Product_Pricing_Policy::sweep_stuck_requests( 20 );
 				}
@@ -1411,6 +1420,12 @@ class Mobo_Core_Cron_Runner {
 				$product_sync->begin_checkpoint_coalescing( 3, 2.0 );
 			}
 
+			/* One correlation scope per Sync/Repair run: errors, events and job
+			 * diagnostics of every step share 'sync:<syncId>' / 'repair:<syncId>'. */
+			$sync_correlation = class_exists( 'Mobo_Core_Correlation' ) && class_exists( 'Mobo_Core_Job_Diagnostics' ) && '' !== (string) ( $status['syncId'] ?? '' )
+				? Mobo_Core_Correlation::push( Mobo_Core_Job_Diagnostics::manual_sync_job( $status ), (string) $status['syncId'] )
+				: 0;
+
 			try {
 				while ( ! empty( $status['shouldContinue'] ) && $steps < $product_step_limit && microtime( true ) < ( $product_deadline - 0.15 ) ) {
 					if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
@@ -1439,6 +1454,9 @@ class Mobo_Core_Cron_Runner {
 						}
 
 						$steps++;
+						if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+							Mobo_Core_Error_Log::record_event( Mobo_Core_Job_Diagnostics::manual_sync_job( $status ), (string) ( $status['syncId'] ?? '' ), empty( $round['lastStep']['success'] ) ? 'step_failed' : (string) ( $status['status'] ?? 'running' ), (int) round( ( microtime( true ) - $step_started_at ) * 1000 ), array( 'processed' => absint( $status['processedProducts'] ?? 0 ) ) );
+						}
 						if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 							Mobo_Core_Runtime_Diagnostics::record_stage(
 								'productSync',
@@ -1473,6 +1491,9 @@ class Mobo_Core_Cron_Runner {
 						}
 						$disabled_stages['productSync'] = true;
 						$round['stageErrors'][] = $this->compact_stage_error( 'productSync', $e );
+						if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+							Mobo_Core_Error_Log::capture_exception( 'cron_stage.productsync', $e, array( 'stage' => 'productSync' ) );
+						}
 						break;
 					}
 				}
@@ -1481,6 +1502,12 @@ class Mobo_Core_Cron_Runner {
 					$product_sync->end_checkpoint_coalescing();
 				}
 				$status = $product_sync->get_manual_sync_status();
+				if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+					Mobo_Core_Job_Diagnostics::observe_manual_sync( $status );
+				}
+				if ( $sync_correlation > 0 ) {
+					Mobo_Core_Correlation::pop( $sync_correlation );
+				}
 			}
 
 			$round['productSteps']  = $steps;
@@ -2313,9 +2340,16 @@ class Mobo_Core_Cron_Runner {
 		try {
 			$result = call_user_func( $callback );
 			$result = is_array( $result ) ? $result : $fallback;
+			/* A failed Mobo query inside the stage ($wpdb->last_error) is recorded once. */
+			if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+				Mobo_Core_Error_Log::capture_db_error( 'stage:' . sanitize_key( (string) $stage ), true );
+			}
 		} catch ( Throwable $e ) {
 			$disabled_stages[ (string) $stage ] = true;
 			$errors[] = $this->compact_stage_error( $stage, $e );
+			if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+				Mobo_Core_Error_Log::capture_exception( 'cron_stage.' . sanitize_key( (string) $stage ), $e, array( 'stage' => (string) $stage ) );
+			}
 			$fallback['exceptionClass'] = get_class( $e );
 			$fallback['message']        = 'Cron stage failed; see the stage and exception type in diagnostics.';
 			$result = $fallback;
@@ -2545,7 +2579,7 @@ class Mobo_Core_Cron_Runner {
 	 * @return int
 	 */
 	private function get_memory_limit_bytes() {
-		$raw = trim( (string) ini_get( 'memory_limit' ) );
+		$raw = trim( Mobo_Core_Environment::ini( 'memory_limit', '' ) );
 		if ( '' === $raw || '-1' === $raw ) {
 			return 0;
 		}

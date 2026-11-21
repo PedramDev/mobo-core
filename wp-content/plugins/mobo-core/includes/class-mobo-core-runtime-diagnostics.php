@@ -40,7 +40,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 			return;
 		}
 		self::$shutdown_registered = true;
-		register_shutdown_function( array( __CLASS__, 'flush' ) );
+		Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'flush' ) );
 	}
 
 	/** Increment a compact named counter. */

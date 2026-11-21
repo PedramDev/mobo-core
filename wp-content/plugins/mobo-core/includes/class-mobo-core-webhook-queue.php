@@ -1575,6 +1575,32 @@ class Mobo_Core_Webhook_Queue {
 	 * @return array
 	 */
 	private function process_item_safely( $item, $payload_timeout = null ) {
+		/* Correlate everything this event causes (API calls, product writes, errors)
+		 * with its event id; record the outcome as a recent event for support. */
+		$event_ref = is_array( $item ) ? (string) ( ! empty( $item['remoteEventId'] ) ? $item['remoteEventId'] : ( $item['id'] ?? '' ) ) : '';
+		$scope     = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::push( 'webhook', $event_ref ) : 0;
+		$started   = microtime( true );
+		try {
+			$result = $this->process_item_safely_scoped( $item, $payload_timeout );
+			if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+				Mobo_Core_Error_Log::record_event( 'webhook', $event_ref, ! empty( $result['success'] ) ? 'done' : ( ! empty( $result['data']['processorException'] ) ? 'exception' : 'not_done' ), (int) round( ( microtime( true ) - $started ) * 1000 ), array( 'event' => is_array( $item ) ? (string) ( $item['event'] ?? '' ) : '' ) );
+			}
+			return $result;
+		} finally {
+			if ( $scope > 0 ) {
+				Mobo_Core_Correlation::pop( $scope );
+			}
+		}
+	}
+
+	/**
+	 * process_item_safely() body inside the event correlation scope.
+	 *
+	 * @param array    $item Queue item.
+	 * @param int|null $payload_timeout Optional payload pull timeout.
+	 * @return array
+	 */
+	private function process_item_safely_scoped( $item, $payload_timeout = null ) {
 		try {
 			$result = $this->process_item( $item, $payload_timeout );
 		} catch ( Mobo_Core_Product_Creation_Deferred $deferred ) {
@@ -1587,6 +1613,9 @@ class Mobo_Core_Webhook_Queue {
 			/* Throwable messages can embed signed URLs, X-SEC or an absolute path;
 			 * neither the queue's last_error nor Logger may retain them. */
 			$message = 'Unhandled webhook processor exception (' . sanitize_key( get_class( $throwable ) ) . ').';
+			if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+				Mobo_Core_Error_Log::capture_exception( 'webhook.processor', $throwable, array( 'event' => is_array( $item ) ? (string) ( $item['event'] ?? '' ) : '' ) );
+			}
 
 			try {
 				Mobo_Core_Logger::error( 'Mobo Core webhook processor exception: ' . $message );

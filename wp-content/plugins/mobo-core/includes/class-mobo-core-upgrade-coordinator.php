@@ -274,7 +274,7 @@ class Mobo_Core_Upgrade_Coordinator {
 				return true;
 			}
 
-			usleep( 250000 );
+			Mobo_Core_Environment::sleep_us( 250000 );
 		} while ( microtime( true ) < $deadline );
 
 		return new WP_Error(

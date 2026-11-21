@@ -1111,7 +1111,7 @@ class Mobo_Core_Shared_Media {
 		if ( defined( $name ) ) {
 			$value = constant( $name );
 		} else {
-			$value = getenv( $name );
+			$value = Mobo_Core_Environment::env( $name );
 		}
 		return false === $value || null === $value ? (string) $default : trim( (string) $value );
 	}

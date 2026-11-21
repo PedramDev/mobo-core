@@ -1193,7 +1193,9 @@ final class Mobo_Core_Connection_Repository {
 					|| preg_match( '/\.(localhost|local|localdomain|internal|lan|home|arpa)$/', $host ) ) {
 					return $local;
 				}
-				if ( false !== $resolve ) {
+				/* Hosts that disable every PHP DNS function cannot run this check; the
+				 * name-level guards above still apply (readiness reports dns_disabled). */
+				if ( false !== $resolve && ( is_callable( $resolve ) || Mobo_Core_Environment::can( 'gethostbynamel' ) || Mobo_Core_Environment::can( 'dns_get_record' ) ) ) {
 					$ips = is_callable( $resolve ) ? call_user_func( $resolve, $host ) : self::resolve_host_addresses( $host );
 					if ( ! is_array( $ips ) || empty( $ips ) ) {
 						return new WP_Error( 'mobo_core_backend_url_unresolvable', 'Backend URL host could not be resolved.' );
@@ -1227,7 +1229,7 @@ final class Mobo_Core_Connection_Repository {
 	 * @return string[]
 	 */
 	private static function resolve_host_addresses( $host ) {
-		$ips = @gethostbynamel( $host ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- failure handled by caller.
+		$ips = Mobo_Core_Environment::resolve_ipv4( $host );
 		$ips = is_array( $ips ) ? $ips : array();
 		if ( function_exists( 'dns_get_record' ) && defined( 'DNS_AAAA' ) ) {
 			$records = @dns_get_record( $host, DNS_AAAA ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged

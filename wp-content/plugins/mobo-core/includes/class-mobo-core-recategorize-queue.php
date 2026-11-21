@@ -234,9 +234,11 @@ class Mobo_Core_Recategorize_Queue {
 			return array( 'success' => true, 'status' => 'locked', 'processed' => 0, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'remaining' => true );
 		}
 
+		$correlation = 0;
 		try {
 			$state = $this->get_state();
 			$this->mode = self::MODE_PENDING === (string) $state['mode'] ? self::MODE_PENDING : 'all';
+			$correlation = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::push( 'recategorize', self::run_key( $state ) ) : 0;
 
 		if ( 'running' !== $state['status'] ) {
 			return array(
@@ -332,6 +334,9 @@ class Mobo_Core_Recategorize_Queue {
 				$failed++;
 				$state['lastError'] = 'Recategorize internal exception (' . sanitize_key( get_class( $e ) ) . ').';
 				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': internal exception (' . sanitize_key( get_class( $e ) ) . ').' );
+				if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+					Mobo_Core_Error_Log::capture_exception( 'job.recategorize', $e, array( 'itemId' => $post_id ) );
+				}
 				$key = (string) $post_id;
 				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
 				$state['failureAttempts'][ $key ] = $attempts;
@@ -399,6 +404,9 @@ class Mobo_Core_Recategorize_Queue {
 		);
 	
 		} finally {
+			if ( $correlation > 0 ) {
+				Mobo_Core_Correlation::pop( $correlation );
+			}
 			Mobo_Core_Lock::release( 'recategorize_queue_worker', $worker_lock );
 		}
 	}
@@ -406,10 +414,76 @@ class Mobo_Core_Recategorize_Queue {
 
 	/** Persist queue state in the current Connection-owned state row. */
 	private function persist_state_verified( $state ) {
-		return is_array( $state )
+		$ok = is_array( $state )
 			&& class_exists( 'Mobo_Core_State_Store' )
 			&& Mobo_Core_State_Store::is_available()
 			&& Mobo_Core_State_Store::set( self::STATE_OPTION, $state );
+		if ( $ok ) {
+			$this->observe_diagnostics( $state );
+		}
+		return $ok;
+	}
+
+	/** Diagnostics run key: one run = one start stamp + mode. */
+	private static function run_key( $state ) {
+		return absint( $state['startedAt'] ?? 0 ) . '-' . sanitize_key( (string) ( $state['mode'] ?? 'all' ) );
+	}
+
+	/**
+	 * Mirror durable state transitions into the shared job diagnostics (watchdog,
+	 * Persian status line, support bundle). Never blocks the queue.
+	 *
+	 * @param array $state Persisted state.
+	 * @return void
+	 */
+	private function observe_diagnostics( $state ) {
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return;
+		}
+		try {
+			Mobo_Core_Job_Diagnostics::observe(
+				'recategorize',
+				array(
+					'runKey'    => self::run_key( $state ),
+					'status'    => (string) $state['status'],
+					'source'    => (string) ( $state['source'] ?? '' ),
+					'processed' => absint( $state['processed'] ?? 0 ),
+					'total'     => absint( $state['total'] ?? 0 ),
+					'cursor'    => absint( $state['lastPostId'] ?? 0 ),
+					'lastError' => (string) ( $state['lastError'] ?? '' ),
+					'step'      => 'items',
+				)
+			);
+		} catch ( Throwable $e ) {
+			unset( $e );
+		}
+	}
+
+	/** Watchdog tick (cron round): bounded self-healing for a running run. */
+	public function watchdog_tick( $context = 'cron' ) {
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return array( 'health' => 'idle', 'performed' => 'none' );
+		}
+		$state = $this->get_state();
+		return Mobo_Core_Job_Diagnostics::generic_watchdog( 'recategorize', (string) $state['status'], 'recategorize_queue_worker', $context );
+	}
+
+	/** JSON-able support bundle for «کپی گزارش عیب‌یابی». No secrets. */
+	public function debug_bundle() {
+		$state  = $this->get_state();
+		$status = $this->get_status();
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return array( 'status' => $status );
+		}
+		return Mobo_Core_Job_Diagnostics::job_bundle( 'recategorize', $status, 'recategorize_queue_worker', array( 'cursor' => array( 'lastPostId' => absint( $state['lastPostId'] ), 'failureAttempts' => $state['failureAttempts'], 'mode' => (string) $state['mode'] ) ) );
+	}
+
+	/** Compact payload for the health report (jobs.recategorize). */
+	public function health_payload() {
+		$state = $this->get_state();
+		return class_exists( 'Mobo_Core_Job_Diagnostics' )
+			? Mobo_Core_Job_Diagnostics::health_payload_for( 'recategorize', (string) $state['status'], absint( $state['processed'] ), absint( $state['total'] ), 'recategorize_queue_worker' )
+			: array( 'status' => (string) $state['status'] );
 	}
 
 	/**
@@ -442,7 +516,7 @@ class Mobo_Core_Recategorize_Queue {
 			'updatedAt'      => absint( $state['updatedAt'] ),
 			'shouldContinue' => 'running' === $state['status'],
 			'mode'           => (string) $state['mode'],
-		);
+		) + ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ? Mobo_Core_Job_Diagnostics::status_extras( 'recategorize', (string) $state['status'], $percent, 'recategorize_queue_worker' ) : array() );
 	}
 
 	/**

@@ -2,8 +2,9 @@
 /**
  * Reusable watchdog + diagnostics helper for long-running Mobo jobs.
  *
- * First consumer: Reprice and the per-product pricing override flow. Sync,
- * Repair and Recategorize can adopt it later with the same API:
+ * Consumers: Reprice and the per-product pricing override flow (explicit API),
+ * Sync, Repair and Recategorize (observe() + generic_watchdog() from a status
+ * snapshot, so their state machines stay untouched):
  *
  *   $diag = Mobo_Core_Job_Diagnostics::open( 'reprice' );
  *   $diag->start_run( array( 'total' => 120 ) );
@@ -77,6 +78,8 @@ final class Mobo_Core_Job_Diagnostics {
 			'events'         => array(),
 			'stalledReason'  => '',
 			'recoveries'     => array(),
+			'correlationId'  => '',
+			'runKey'         => '',
 		);
 	}
 
@@ -97,6 +100,7 @@ final class Mobo_Core_Job_Diagnostics {
 		$now = time();
 		$this->data = self::defaults();
 		$this->data['runId'] = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : uniqid( 'run-', true );
+		$this->data['correlationId'] = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::make( $this->job, $this->data['runId'] ) : $this->job . ':' . $this->data['runId'];
 		$this->data['startedAt'] = $now;
 		$this->data['lastProgressAt'] = $now;
 		$this->data['status'] = 'running';
@@ -136,6 +140,7 @@ final class Mobo_Core_Job_Diagnostics {
 			'type'    => sanitize_key( (string) $type ),
 			'message' => self::clip( $message, 300 ),
 			'context' => self::sanitize_context( $context ),
+			'cid'     => $this->correlation_id(),
 		);
 		if ( count( $this->data['events'] ) > self::MAX_EVENTS ) {
 			$this->data['events'] = array_slice( $this->data['events'], -self::MAX_EVENTS );
@@ -166,6 +171,9 @@ final class Mobo_Core_Job_Diagnostics {
 			}
 		}
 		$this->data['lastError'] = $error;
+		if ( class_exists( 'Mobo_Core_Error_Log' ) ) {
+			Mobo_Core_Error_Log::capture( 'error', 'job.' . $this->job, $error['message'], array( 'itemId' => $error['itemId'], 'exceptionClass' => $error['exceptionClass'] ), $throwable instanceof Throwable ? $throwable->getFile() : '', $error['line'], $this->correlation_id() );
+		}
 		$this->event( 'error', $error['message'], array( 'itemId' => $error['itemId'], 'exceptionClass' => $error['exceptionClass'] ) );
 	}
 
@@ -222,6 +230,304 @@ final class Mobo_Core_Job_Diagnostics {
 			$this->dirty = false;
 		}
 		return $ok;
+	}
+
+	/** @return string Correlation id of the current run ('<job>:<runId>'). */
+	public function correlation_id() {
+		$cid = (string) ( $this->data['correlationId'] ?? '' );
+		if ( '' === $cid && '' !== (string) ( $this->data['runId'] ?? '' ) ) {
+			$cid = $this->job . ':' . (string) $this->data['runId'];
+		}
+		return $cid;
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * Snapshot-driven diagnostics for Sync, Repair and Recategorize.
+	 * ------------------------------------------------------------------ */
+
+	/** Statuses that mean "work outstanding". */
+	const ACTIVE_STATUSES = array( 'running', 'queued', 'waiting', 'waiting_for_portal' );
+
+	/** Terminal statuses. */
+	const TERMINAL_STATUSES = array( 'done', 'cancelled', 'needs_attention', 'failed', 'idle' );
+
+	/**
+	 * Record start/progress/error/finish transitions from a status snapshot.
+	 * Idempotent: calling it repeatedly with the same snapshot changes nothing
+	 * but lastProgressAt bookkeeping, so it can run after every step/poll.
+	 *
+	 * @param string $job      sync|repair|recategorize.
+	 * @param array  $snapshot runKey, status, processed, total, cursor, lastError, step.
+	 * @param bool   $flush    Persist immediately.
+	 * @return self
+	 */
+	public static function observe( $job, $snapshot, $flush = true ) {
+		$diag     = self::open( $job );
+		$snapshot = is_array( $snapshot ) ? $snapshot : array();
+		$status   = sanitize_key( (string) ( $snapshot['status'] ?? 'idle' ) );
+		$run_key  = substr( sanitize_text_field( (string) ( $snapshot['runKey'] ?? '' ) ), 0, 80 );
+		$active   = in_array( $status, self::ACTIVE_STATUSES, true );
+
+		if ( $active && '' !== $run_key && $run_key !== (string) $diag->data['runKey'] ) {
+			$diag->start_run( array( 'total' => absint( $snapshot['total'] ?? 0 ), 'runKey' => $run_key, 'source' => sanitize_key( (string) ( $snapshot['source'] ?? '' ) ) ) );
+			/* The run key (syncId, start stamp) is the run id, so callers can open the
+			 * same correlation scope without reading diagnostics first. */
+			$diag->data['runKey']        = $run_key;
+			$diag->data['runId']         = $run_key;
+			$diag->data['correlationId'] = class_exists( 'Mobo_Core_Correlation' ) ? Mobo_Core_Correlation::make( $job, $run_key ) : $job . ':' . $run_key;
+		}
+		if ( $active ) {
+			$diag->progress( absint( $snapshot['processed'] ?? 0 ), absint( $snapshot['total'] ?? 0 ), absint( $snapshot['cursor'] ?? 0 ), (string) ( $snapshot['step'] ?? '' ) );
+			if ( 'running' !== $status ) {
+				$diag->data['status'] = 'waiting';
+			}
+		}
+		$last_error = trim( (string) ( $snapshot['lastError'] ?? '' ) );
+		$known      = is_array( $diag->data['lastError'] ) ? (string) ( $diag->data['lastError']['message'] ?? '' ) : '';
+		if ( '' !== $last_error && self::clip( $last_error, 500 ) !== $known ) {
+			$diag->error( $last_error, absint( $snapshot['itemId'] ?? 0 ) );
+		}
+		if ( in_array( $status, self::TERMINAL_STATUSES, true ) && 'idle' !== $status
+			&& in_array( (string) $diag->data['status'], array( 'running', 'waiting', 'stalled' ), true ) ) {
+			$diag->finish( $status );
+		}
+		if ( $flush ) {
+			$diag->flush();
+		}
+		return $diag;
+	}
+
+	/** Worker lock of the manual Sync/Repair state machine. */
+	const MANUAL_SYNC_LOCK = 'manual_sync';
+
+	/**
+	 * Job name of a manual sync status payload (Repair is a Sync in repair mode).
+	 *
+	 * @param array $status get_manual_sync_status() payload.
+	 * @return string sync|repair
+	 */
+	public static function manual_sync_job( $status ) {
+		return is_array( $status ) && ! empty( $status['repairMode'] ) ? 'repair' : 'sync';
+	}
+
+	/**
+	 * Observe a Mobo_Core_Product_Sync::get_manual_sync_status() payload.
+	 *
+	 * @param array $status Status payload.
+	 * @return void
+	 */
+	public static function observe_manual_sync( $status ) {
+		if ( ! is_array( $status ) || '' === (string) ( $status['syncId'] ?? '' ) ) {
+			return;
+		}
+		try {
+			$step = 'products';
+			if ( ! empty( $status['repairMode'] ) ) {
+				if ( empty( $status['repairIntegrityComplete'] ) ) {
+					$step = 'integrity_' . sanitize_key( (string) ( $status['repairIntegrityPhase'] ?? '' ) );
+				} elseif ( ! empty( $status['repairProductsComplete'] ) && empty( $status['postSyncIntegrityComplete'] ) ) {
+					$step = 'post_sync_' . sanitize_key( (string) ( $status['postSyncIntegrityPhase'] ?? '' ) );
+				}
+			}
+			self::observe(
+				self::manual_sync_job( $status ),
+				array(
+					'runKey'    => (string) $status['syncId'],
+					'status'    => (string) ( $status['status'] ?? 'idle' ),
+					'source'    => (string) ( $status['source'] ?? '' ),
+					'processed' => absint( $status['processedProducts'] ?? 0 ),
+					'total'     => absint( $status['productTotalCount'] ?? 0 ),
+					'cursor'    => absint( $status['processedProducts'] ?? 0 ) + absint( $status['repairIntegrityCursor'] ?? 0 ) + absint( $status['postSyncIntegrityCursor'] ?? 0 ),
+					'lastError' => (string) ( $status['lastError'] ?? '' ),
+					'itemId'    => absint( $status['currentProductId'] ?? 0 ),
+					'step'      => $step,
+				)
+			);
+		} catch ( Throwable $e ) {
+			unset( $e );
+		}
+	}
+
+	/**
+	 * Admin/AJAX additions for a manual sync status payload.
+	 *
+	 * @param array $status Status payload.
+	 * @return array
+	 */
+	public static function manual_sync_extras( $status ) {
+		$status = is_array( $status ) ? $status : array();
+		return self::status_extras( self::manual_sync_job( $status ), (string) ( $status['status'] ?? 'idle' ), (float) ( $status['progressPercent'] ?? 0 ), self::MANUAL_SYNC_LOCK );
+	}
+
+	/**
+	 * Watchdog signals shared by every job (options + one lock read).
+	 *
+	 * @param string $lock_name Worker lock name.
+	 * @param array  $data      Diagnostics data.
+	 * @param array  $extra     Job-specific signal overrides.
+	 * @return array
+	 */
+	public static function generic_signals( $lock_name, $data, $extra = array() ) {
+		$cron_last = absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
+		$cron_last = max( $cron_last, absint( get_option( 'mobo_core_self_runner_last_run_success_at', 0 ) ) );
+		$lock = '' !== (string) $lock_name && class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( (string) $lock_name ) : array();
+		return array_merge(
+			array(
+				'cronLastHitAt'   => $cron_last,
+				'lockActive'      => ! empty( $lock['active'] ),
+				'lockHeartbeatAt' => absint( $lock['lastHeartbeatAt'] ?? 0 ),
+				'lockExpiresAt'   => absint( $lock['expiresAt'] ?? 0 ),
+				'upgradeActive'   => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active(),
+				'recoveries'      => isset( $data['recoveries'] ) && is_array( $data['recoveries'] ) ? $data['recoveries'] : array(),
+			),
+			is_array( $extra ) ? $extra : array()
+		);
+	}
+
+	/**
+	 * Diagnosis of a job from its snapshot status + stored diagnostics.
+	 *
+	 * @param string $job       Job.
+	 * @param string $status    Job status.
+	 * @param string $lock_name Worker lock.
+	 * @param array  $extra     Extra signals.
+	 * @return array
+	 */
+	public static function diagnose_job( $job, $status, $lock_name, $extra = array() ) {
+		$data   = self::open( $job )->data();
+		$status = sanitize_key( (string) $status );
+		$extra  = is_array( $extra ) ? $extra : array();
+		if ( 'waiting_for_portal' === $status ) {
+			$extra['waitingBackend'] = true;
+		}
+		$mapped = in_array( $status, self::ACTIVE_STATUSES, true ) ? 'running' : $status;
+		if ( 'stalled' === (string) $data['status'] && in_array( $status, self::ACTIVE_STATUSES, true ) ) {
+			$mapped = 'stalled';
+		}
+		$state = array(
+			'status'         => $mapped,
+			'stalledReason'  => (string) $data['stalledReason'],
+			'lastProgressAt' => absint( $data['lastProgressAt'] ),
+			'updatedAt'      => absint( $extra['updatedAt'] ?? 0 ),
+		);
+		return self::diagnose( $state, self::generic_signals( $lock_name, $data, $extra ), time(), self::stall_seconds() );
+	}
+
+	/**
+	 * Bounded self-healing for snapshot jobs: release a dead holder's lease or
+	 * kick the background worker; after MAX_AUTO_RECOVERIES attempts of one
+	 * reason without progress the diagnostics are marked stalled with the reason
+	 * (the job's own state machine is never rewritten here).
+	 *
+	 * @param string $job       Job.
+	 * @param string $status    Job status.
+	 * @param string $lock_name Worker lock.
+	 * @param string $context   Caller label.
+	 * @return array Diagnosis + performed.
+	 */
+	public static function generic_watchdog( $job, $status, $lock_name, $context = 'cron' ) {
+		if ( ! in_array( sanitize_key( (string) $status ), self::ACTIVE_STATUSES, true ) ) {
+			return array( 'health' => 'idle', 'performed' => 'none' );
+		}
+		$diagnosis = self::diagnose_job( $job, $status, $lock_name );
+		/* Not stalled, or recovery already gave up (operator action required). */
+		if ( 'stalled' !== $diagnosis['health'] || ( 'resume' === $diagnosis['action'] && 'stalled' === (string) self::open( $job )->data['status'] ) ) {
+			return array_merge( $diagnosis, array( 'performed' => 'none' ) );
+		}
+		$diag  = self::open( $job );
+		$count = $diag->count_recovery( $diagnosis['reason'] );
+		if ( ! empty( $diagnosis['giveUp'] ) || $count > self::MAX_AUTO_RECOVERIES ) {
+			$diag->set_stalled( $diagnosis['reason'] );
+			$diag->event( 'stalled', 'Automatic recovery gave up; operator action required.', array( 'reason' => $diagnosis['reason'], 'attempts' => $count, 'context' => $context ) );
+			$performed = 'marked-stalled';
+		} else {
+			$performed = 'none';
+			if ( 'release_lock' === $diagnosis['action'] && '' !== (string) $lock_name && class_exists( 'Mobo_Core_Lock' ) && method_exists( 'Mobo_Core_Lock', 'recover_stale_locks' ) ) {
+				Mobo_Core_Lock::recover_stale_locks( array( (string) $lock_name ) );
+				$performed = 'released-stale-lock';
+			} elseif ( in_array( $diagnosis['action'], array( 'resume', 'shrink_batch', 'skip_item' ), true ) && class_exists( 'Mobo_Core_Self_Runner' ) && method_exists( 'Mobo_Core_Self_Runner', 'kick' ) ) {
+				Mobo_Core_Self_Runner::kick( sanitize_key( (string) $job ) . '-watchdog', false );
+				$performed = 'kicked-worker';
+			}
+			$diag->event( 'watchdog', 'Automatic recovery: ' . $performed . '.', array( 'reason' => $diagnosis['reason'], 'attempt' => $count, 'context' => $context ) );
+		}
+		$diag->flush();
+		return array_merge( $diagnosis, array( 'performed' => $performed ) );
+	}
+
+	/**
+	 * Status-payload additions for the admin UI/AJAX of a snapshot job.
+	 *
+	 * @param string $job       Job.
+	 * @param string $status    Job status.
+	 * @param float  $percent   Percent.
+	 * @param string $lock_name Worker lock.
+	 * @return array{health:string,diagnosis:array,statusLine:string,lastErrorDetail:?array,correlationId:string}
+	 */
+	public static function status_extras( $job, $status, $percent, $lock_name ) {
+		$data      = self::open( $job )->data();
+		$diagnosis = self::diagnose_job( $job, $status, $lock_name );
+		$line_status = in_array( sanitize_key( (string) $status ), self::ACTIVE_STATUSES, true ) ? 'running' : sanitize_key( (string) $status );
+		return array(
+			'health'          => (string) $diagnosis['health'],
+			'diagnosis'       => $diagnosis,
+			'statusLine'      => self::status_line_fa( $line_status, $percent, $diagnosis ),
+			'lastErrorDetail' => isset( $data['lastError'] ) && is_array( $data['lastError'] ) ? $data['lastError'] : null,
+			'correlationId'   => ( new self( sanitize_key( (string) $job ), $data ) )->correlation_id(),
+		);
+	}
+
+	/**
+	 * Compact health payload (jobs.<job>), same shape as jobs.reprice.
+	 *
+	 * @param string $job       Job.
+	 * @param string $status    Job status.
+	 * @param int    $processed Processed.
+	 * @param int    $total     Total.
+	 * @param string $lock_name Worker lock.
+	 * @return array
+	 */
+	public static function health_payload_for( $job, $status, $processed, $total, $lock_name ) {
+		$data      = self::open( $job )->data();
+		$diagnosis = self::diagnose_job( $job, $status, $lock_name );
+		$stalled   = 'stalled' === $diagnosis['health'];
+		$error     = isset( $data['lastError'] ) && is_array( $data['lastError'] ) ? $data['lastError'] : null;
+		$total     = absint( $total );
+		return array(
+			'status'         => $stalled ? 'stalled' : sanitize_key( (string) $status ),
+			'progressPct'    => $total > 0 ? (float) min( 100, round( ( absint( $processed ) / $total ) * 100, 2 ) ) : 0.0,
+			'lastProgressAt' => absint( $data['lastProgressAt'] ) > 0 ? gmdate( 'c', absint( $data['lastProgressAt'] ) ) : null,
+			'stalledReason'  => $stalled ? (string) $diagnosis['reason'] : '',
+			'correlationId'  => ( new self( sanitize_key( (string) $job ), $data ) )->correlation_id(),
+			'lastError'      => null === $error ? null : array(
+				'message'        => (string) ( $error['message'] ?? '' ),
+				'itemId'         => absint( $error['itemId'] ?? 0 ),
+				'exceptionClass' => (string) ( $error['exceptionClass'] ?? '' ),
+				'at'             => absint( $error['at'] ?? 0 ) > 0 ? gmdate( 'c', absint( $error['at'] ) ) : null,
+			),
+		);
+	}
+
+	/**
+	 * «کپی گزارش عیب‌یابی» bundle for a snapshot job.
+	 *
+	 * @param string $job       Job.
+	 * @param array  $status    Status payload.
+	 * @param string $lock_name Worker lock.
+	 * @param array  $extra     Extra.
+	 * @return array
+	 */
+	public static function job_bundle( $job, $status, $lock_name, $extra = array() ) {
+		$status    = is_array( $status ) ? $status : array();
+		$data      = self::open( $job )->data();
+		$diagnosis = self::diagnose_job( $job, (string) ( $status['status'] ?? 'idle' ), $lock_name );
+		$extra     = is_array( $extra ) ? $extra : array();
+		$extra['signals']      = self::generic_signals( $lock_name, $data );
+		$extra['stallSeconds'] = self::stall_seconds();
+		$extra['recentErrors'] = class_exists( 'Mobo_Core_Error_Log' ) && '' !== (string) ( $data['correlationId'] ?? '' )
+			? Mobo_Core_Error_Log::recent( 0, '', (string) $data['correlationId'], 20 )
+			: array();
+		return self::bundle( $job, $status, $data, $diagnosis, $extra );
 	}
 
 	/** Configured stall threshold in seconds (default 15 minutes). */
@@ -378,6 +684,8 @@ final class Mobo_Core_Job_Diagnostics {
 			'cancelled'   => 'متوقف شده',
 			'invalidated' => 'نیازمند اجرای جدید',
 			'idle'        => 'آماده',
+			'needs_attention' => 'نیازمند بررسی',
+			'failed'      => 'ناموفق',
 		);
 		return isset( $labels[ $status ] ) ? $labels[ $status ] : $status;
 	}

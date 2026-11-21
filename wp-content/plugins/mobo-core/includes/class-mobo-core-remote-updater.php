@@ -211,16 +211,21 @@ class Mobo_Core_Remote_Updater {
 			);
 		}
 
+		/* copy_tree()/backup/rollback enumerate directories with scandir(); fail
+		 * closed before touching any file when the host disabled it. */
+		if ( ! Mobo_Core_Environment::can( 'scandir' ) ) {
+			return new WP_Error( 'mobo_core_upgrade_host_unsupported', 'The host disabled scandir(); remote upgrade cannot run safely.', array( 'status' => 409, 'reason' => 'scandir_disabled' ) );
+		}
+
 		$lock = Mobo_Core_Lock::acquire( 'remote_plugin_upgrade', 900 );
 		if ( false === $lock ) {
 			return new WP_Error( 'mobo_core_upgrade_locked', 'Another plugin upgrade is already running.', array( 'status' => 423, 'retryAfter' => 60 ) );
 		}
 
-		ignore_user_abort( true );
-		if ( function_exists( 'set_time_limit' ) ) {
-			// phpcs:ignore Squiz.PHP.DiscouragedFunctions.Discouraged -- remote deployment must survive hosts with a short default execution limit.
-			@set_time_limit( 360 );
-		}
+		Mobo_Core_Environment::ignore_user_abort( true );
+		/* Remote deployment should survive a short default execution limit; when the
+		 * host disables set_time_limit() the bounded upgrade still runs within it. */
+		Mobo_Core_Environment::try_set_time_limit( 360 );
 
 		$tmp_file = '';
 		$staging_dir = '';
@@ -1245,7 +1250,7 @@ class Mobo_Core_Remote_Updater {
 		if ( ! is_dir( $destination ) && ! wp_mkdir_p( $destination ) ) {
 			return false;
 		}
-		$items = scandir( $source );
+		$items = Mobo_Core_Environment::can( 'scandir' ) ? scandir( $source ) : false;
 		if ( false === $items ) {
 			return false;
 		}

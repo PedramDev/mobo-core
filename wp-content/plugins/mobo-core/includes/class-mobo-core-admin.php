@@ -1364,6 +1364,8 @@ class Mobo_Core_Admin {
 					<?php echo esc_html( $status['lastTransientError'] ); ?>
 				</div>
 
+				<?php $this->render_job_diagnostics_block( Mobo_Core_Job_Diagnostics::manual_sync_job( $status ), $status, 'sync' ); ?>
+
 				<?php if ( ! empty( $status['repairMode'] ) && ( ! empty( $status['categorySyncDegraded'] ) || absint( $status['repairProductLockQuarantined'] ?? 0 ) > 0 ) ) : ?>
 					<div class="mobo-message mobo-message-warning">
 						Repair برای جلوگیری از توقف بی‌نهایت از بعضی موارد عبور محافظه‌کارانه کرده است. دسته‌بندی‌های unresolved و محصولات lock-quarantined در شمارنده‌های بالا باقی می‌مانند و به‌عنوان convergence کامل پنهان نمی‌شوند.
@@ -4257,12 +4259,12 @@ type:{mobo_order_type_label}</textarea>
 		$settings = array(
 			'PHP Version'        => PHP_VERSION,
 			'SAPI'               => PHP_SAPI,
-			'Memory Limit'       => (string) ini_get( 'memory_limit' ),
-			'Max Execution Time' => (string) ini_get( 'max_execution_time' ),
-			'Upload Max Filesize'=> (string) ini_get( 'upload_max_filesize' ),
-			'Post Max Size'      => (string) ini_get( 'post_max_size' ),
-			'Max Input Vars'     => (string) ini_get( 'max_input_vars' ),
-			'Default Socket Timeout' => (string) ini_get( 'default_socket_timeout' ),
+			'Memory Limit'       => Mobo_Core_Environment::ini( 'memory_limit' ),
+			'Max Execution Time' => Mobo_Core_Environment::ini( 'max_execution_time' ),
+			'Upload Max Filesize'=> Mobo_Core_Environment::ini( 'upload_max_filesize' ),
+			'Post Max Size'      => Mobo_Core_Environment::ini( 'post_max_size' ),
+			'Max Input Vars'     => Mobo_Core_Environment::ini( 'max_input_vars' ),
+			'Default Socket Timeout' => Mobo_Core_Environment::ini( 'default_socket_timeout' ),
 			'WordPress Version'  => get_bloginfo( 'version' ),
 			'WooCommerce Version'=> defined( 'WC_VERSION' ) ? WC_VERSION : 'not loaded',
 			'Mobo Core Version'  => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
@@ -8275,8 +8277,51 @@ https://source.example/products/test-product/
 			<?php if ( ! $is_idle && ( absint( $status['skipped'] ?? 0 ) > 0 || absint( $status['lastPostId'] ?? 0 ) > 0 ) ) : ?>
 			<details class="mobo-admin-inline-details"><summary>جزئیات فنی اجرا</summary><div class="mobo-status-grid"><div class="mobo-status-box"><span>بدون تغییر / ردشده</span><strong data-mobo-recategorize-field="skipped"><?php echo esc_html( absint( $status['skipped'] ?? 0 ) ); ?></strong></div><div class="mobo-status-box"><span>آخرین شناسه محصول</span><strong data-mobo-recategorize-field="lastPostId"><?php echo esc_html( absint( $status['lastPostId'] ?? 0 ) ); ?></strong></div></div></details>
 			<?php endif; ?>
+			<?php $this->render_job_diagnostics_block( 'recategorize', $status, 'recategorize', $queue ); ?>
 			<div class="mobo-note">این عملیات فقط محصولات اصلی منتشرشده‌ای را بررسی می‌کند که قبلاً با MoboCore همگام شده‌اند. واریانت‌ها دسته مستقل ندارند.</div>
 		</div>
+		<?php
+	}
+
+	/**
+	 * Persian watchdog status line + «کپی گزارش عیب‌یابی» for Sync/Repair and
+	 * Recategorize (same contract as the Reprice card).
+	 *
+	 * @param string     $job    sync|repair|recategorize.
+	 * @param array      $status Status payload of the job.
+	 * @param string     $ui     UI key (sync|recategorize).
+	 * @param object|null $queue Queue instance providing debug_bundle() (recategorize).
+	 * @return void
+	 */
+	private function render_job_diagnostics_block( $job, $status, $ui, $queue = null ) {
+		if ( ! class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			return;
+		}
+		$status = is_array( $status ) ? $status : array();
+		try {
+			if ( 'recategorize' === $job ) {
+				$extras = $status;
+				$bundle = $queue && method_exists( $queue, 'debug_bundle' ) ? $queue->debug_bundle() : array();
+			} else {
+				$extras = Mobo_Core_Job_Diagnostics::manual_sync_extras( $status );
+				$bundle = Mobo_Core_Job_Diagnostics::job_bundle( $job, $status, Mobo_Core_Job_Diagnostics::MANUAL_SYNC_LOCK );
+			}
+		} catch ( Throwable $e ) {
+			return;
+		}
+		$line    = isset( $extras['statusLine'] ) ? (string) $extras['statusLine'] : '';
+		$stalled = isset( $extras['health'] ) && 'stalled' === $extras['health'];
+		$json    = wp_json_encode( $bundle, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT );
+		$target  = 'mobo-' . sanitize_key( $ui ) . '-debug-bundle';
+		?>
+		<div class="mobo-message <?php echo $stalled ? 'mobo-message-error' : 'mobo-message-info'; ?>" data-mobo-job-status-line="<?php echo esc_attr( $ui ); ?>" style="<?php echo '' === $line ? 'display:none;' : ''; ?>"><?php echo esc_html( $line ); ?></div>
+		<?php if ( is_string( $json ) && '' !== $json ) : ?>
+			<div class="mobo-actions">
+				<button type="button" class="mobo-btn mobo-btn-light" data-mobo-copy-target="<?php echo esc_attr( $target ); ?>">کپی گزارش عیب‌یابی</button>
+				<span class="mobo-help" data-mobo-copy-status="<?php echo esc_attr( $target ); ?>"></span>
+			</div>
+			<textarea id="<?php echo esc_attr( $target ); ?>" readonly hidden aria-hidden="true"><?php echo esc_textarea( $json ); ?></textarea>
+		<?php endif; ?>
 		<?php
 	}
 
@@ -10491,6 +10536,9 @@ https://source.example/products/test-product/
 					$step   = $product_sync->run_manual_sync_step();
 					$admin_fallback['steps']++;
 					$status = $product_sync->get_manual_sync_status();
+					if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+						Mobo_Core_Job_Diagnostics::observe_manual_sync( $status );
+					}
 
 					if ( empty( $step['success'] ) || ! empty( $status['lastError'] ) ) {
 						$admin_fallback['stopReason'] = 'error';
@@ -10568,6 +10616,9 @@ https://source.example/products/test-product/
 
 		$status['statusLabel']          = $this->sync_status_label_for_display( $status );
 		$status['progressPercentLabel'] = $this->format_percent( $status['progressPercent'] );
+		if ( class_exists( 'Mobo_Core_Job_Diagnostics' ) ) {
+			$status += Mobo_Core_Job_Diagnostics::manual_sync_extras( $status );
+		}
 		$status['nextRetryAtLabel']     = ! empty( $status['nextRetryAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextRetryAt'] ) ) : '—';
 		$status['serverTime']           = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s' );
 
@@ -13089,6 +13140,10 @@ https://source.example/products/test-product/
 						setMessage('lastMessage', status.lastMessage || '');
 						setMessage('lastError', status.lastError || '');
 						setMessage('lastTransientError', status.lastTransientError || '');
+						var $syncLine = $('[data-mobo-job-status-line="sync"]');
+						if ($syncLine.length) {
+							$syncLine.text(status.statusLine || '').toggle(!!status.statusLine).toggleClass('mobo-message-error', status.health === 'stalled').toggleClass('mobo-message-info', status.health !== 'stalled');
+						}
 						$('[data-mobo-sync-updated-at]').text(status.serverTime ? 'آخرین بررسی: ' + status.serverTime : '');
 
 						var $hero = $('[data-mobo-sync-hero-status]');
@@ -13285,6 +13340,10 @@ https://source.example/products/test-product/
 						$('[data-mobo-recategorize-field="lastPostId"]').text(status.lastPostId || 0);
 						setRecategorizeMessage('lastMessage', status.lastMessage || '');
 						setRecategorizeMessage('lastError', status.lastError || '');
+						var $recatLine = $('[data-mobo-job-status-line="recategorize"]');
+						if ($recatLine.length) {
+							$recatLine.text(status.statusLine || '').toggle(!!status.statusLine).toggleClass('mobo-message-error', status.health === 'stalled').toggleClass('mobo-message-info', status.health !== 'stalled');
+						}
 						$('[data-mobo-recategorize-updated-at]').text(status.serverTime ? 'آخرین بررسی: ' + status.serverTime : '');
 					}
 
