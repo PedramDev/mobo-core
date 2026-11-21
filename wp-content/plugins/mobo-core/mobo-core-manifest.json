@@ -1,7 +1,7 @@
 {
   "version": "10.34.77",
   "algorithm": "sha256",
-  "generatedAt": "2026-11-21T21:01:55Z",
+  "generatedAt": "2026-11-21T21:28:05Z",
   "files": {
     "assets/admin/css/mobo-admin-components.css": "0a0589e2a37a5eee4e54e2008c41409ea4f9e5d44b6a614fc0409e8e8da360ed",
     "assets/admin/css/mobo-admin-core.css": "da27e853a70f179326d3a054d2ea2948afe5922abb79cc01c79910c431af263b",
@@ -286,7 +286,7 @@
     "includes/class-mobo-core-dependencies.php": "dfdc413ccdca280d415323b69970b757a4b6b50292e78ff95882c95a6ebcb2c7",
     "includes/class-mobo-core-diagnostics-admin.php": "6ef900c11c8ab64802ccc19dc9c49c89ef26bed03abdda879adc835f8521959e",
     "includes/class-mobo-core-diagnostics-bundle.php": "f2eeff769e3f6fde366e9735fe8cd946cbe2fe909553ece74fd74107fe845bf5",
-    "includes/class-mobo-core-durable-state-policy.php": "9a680e9b2c12615b22baded0e5b2aaf9617abd90f07722b3b5f2fbe3bff58881",
+    "includes/class-mobo-core-durable-state-policy.php": "a4be9950a695e5a2d7648a77959820e82638462f5e7a03c2644ac020d83e99a5",
     "includes/class-mobo-core-dynamic-price-rules.php": "a2fdab3e8c18754534e9c884608beb2ab3b2147e9bfbc91d00a366a3741114cc",
     "includes/class-mobo-core-environment-probe.php": "41ba8f0f6eea197465a0085b90493a594dcc949c88315e2a2d2325fe9f6fd0ff",
     "includes/class-mobo-core-environment.php": "5a0b59fa915f3460d65fd5552f017ce999097a55bbc7f552decd8ab839e9fcaa",
