@@ -727,7 +727,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @param array $row Row.
 	 * @return array
 	 */
-	private function process_row( $row, Mobo_Core_Image_Refresh_Queue $queue = null ) {
+	private function process_row( $row, ?Mobo_Core_Image_Refresh_Queue $queue = null ) {
 		$product_id        = absint( isset( $row['product_id'] ) ? $row['product_id'] : 0 );
 		$old_attachment_id = absint( isset( $row['old_attachment_id'] ) ? $row['old_attachment_id'] : 0 );
 		$image_guid        = sanitize_text_field( (string) ( isset( $row['image_guid'] ) ? $row['image_guid'] : '' ) );
@@ -2859,6 +2859,7 @@ class Mobo_Core_Image_Refresh_Service {
 			if ( empty( $storage['ready'] ) ) {
 				return array(
 					'success'    => false,
+					'code'       => 'storage_not_ready',
 					'generated'  => 0,
 					'registered' => 0,
 					'message'    => 'ساخت برش‌ها به دلیل آماده نبودن فضای ذخیره‌سازی متوقف شد.',

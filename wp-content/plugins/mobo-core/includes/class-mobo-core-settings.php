@@ -125,6 +125,7 @@ class Mobo_Core_Settings {
 			'mobo_core_image_retry_base_seconds'  => 120,
 			'mobo_core_image_long_retry_seconds'  => 21600,
 			'mobo_core_image_min_free_bytes'      => 268435456,
+			'mobo_core_image_prune_physical_delete' => '0',
 			'mobo_core_image_refresh_enabled'     => '0',
 			'mobo_core_image_refresh_delete_old'  => '0',
 			'mobo_core_image_refresh_generate_subsizes' => '1',

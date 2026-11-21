@@ -1144,7 +1144,7 @@ class Mobo_Core_Webhook_Queue {
 					continue;
 				}
 
-				$expires_at = isset( $row['expires_at'] ) ? strtotime( (string) $row['expires_at'] ) : 0;
+				$expires_at = isset( $row['expires_at'] ) ? (int) Mobo_Core_Sync_Event_Store::utc_timestamp( $row['expires_at'], 0 ) : 0;
 				if ( $expires_at > 0 && time() > $expires_at ) {
 					if ( ! $store->mark_failure( $event_id, 'Webhook event expired.', absint( $row['try_count'] ), true, $claim_token ) ) {
 						$messages[] = 'commit وضعیت expired وب‌هوک به دلیل از دست رفتن claim یا خطای DB انجام نشد.';

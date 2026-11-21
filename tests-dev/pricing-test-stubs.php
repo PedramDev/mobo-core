@@ -76,6 +76,11 @@ function wp_schedule_single_event( $ts, $hook, $args = array(), $wp_error = fals
 	$GLOBALS['t_scheduled'][] = array( 'ts' => $ts, 'hook' => $hook, 'args' => $args );
 	return true;
 }
+function wp_clear_scheduled_hook( $hook, $args = array() ) {
+	$before = count( $GLOBALS['t_scheduled'] );
+	$GLOBALS['t_scheduled'] = array_values( array_filter( $GLOBALS['t_scheduled'], static function ( $e ) use ( $hook, $args ) { return ! ( $e['hook'] === $hook && $e['args'] === $args ); } ) );
+	return $before - count( $GLOBALS['t_scheduled'] );
+}
 
 /** Simplified wc_format_decimal: floats to plain decimal strings, optional dp. */
 function wc_format_decimal( $number, $dp = false, $trim_zeros = false ) {

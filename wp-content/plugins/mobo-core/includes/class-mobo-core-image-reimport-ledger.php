@@ -30,6 +30,15 @@ final class Mobo_Core_Image_Reimport_Ledger {
 	const MAX_ENTRIES             = 5000;
 	/** Marker inside a queue row's last_error for a terminal readiness failure. */
 	const TERMINAL_MARKER         = 'image readiness failed repeatedly';
+	/**
+	 * Prefix of a transient storage/quota failure. It is never counted as a
+	 * readiness failure, never triggers the fresh-reimport escape hatch and
+	 * never becomes terminal: the row stays pending and is expedited as soon as
+	 * the storage probe passes again.
+	 */
+	const STORAGE_NOT_READY_PREFIX = 'Image storage is not ready:';
+	/** A terminal readiness failure is re-checked (bounded) after this long. */
+	const REVIVE_AFTER_SECONDS    = 604800; // 7 days.
 
 	/** @var array|null Request cache of the stored map. */
 	private static $map = null;
@@ -78,6 +87,75 @@ final class Mobo_Core_Image_Reimport_Ledger {
 			return true;
 		}
 		return $reimport >= self::MAX_FRESH_REIMPORTS && absint( $try_count ) > absint( $fresh_attempt );
+	}
+
+	/**
+	 * Pure: does a failure message describe a temporary storage/quota/disk-full
+	 * condition rather than a defect of the image itself?
+	 *
+	 * @param string $message Failure message (queue last_error or service message).
+	 * @return bool
+	 */
+	public static function is_storage_transient_message( $message ) {
+		$message = (string) $message;
+		if ( '' === $message ) {
+			return false;
+		}
+		if ( false !== strpos( $message, self::STORAGE_NOT_READY_PREFIX ) ) {
+			return true;
+		}
+		$needles = array(
+			'فضای ذخیره‌سازی', // Subsize storage gate (refresh service).
+			'سهمیه فضا',
+			'فضای آزاد uploads',
+			'no space left',
+			'disk full',
+			'disk quota',
+			'quota exceeded',
+			'errno: 28',
+			'errno 28',
+			'is full',
+		);
+		$lower = function_exists( 'mb_strtolower' ) ? mb_strtolower( $message, 'UTF-8' ) : strtolower( $message );
+		foreach ( $needles as $needle ) {
+			if ( false !== strpos( $lower, $needle ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Pure: what to do with a terminal ("Permanent") readiness failure row.
+	 *
+	 * - 'forget': the terminal decision was caused by a storage/quota failure
+	 *   (rows written by releases that counted disk-full as permanent). Once the
+	 *   storage probe passes the identity gets a completely fresh ledger entry.
+	 * - 'reset_failures': the row has been terminal for REVIVE_AFTER_SECONDS.
+	 *   The failure counter is cleared so the image is re-checked, but the
+	 *   fresh-reimport counter is kept: no additional attachment can be created,
+	 *   so a genuinely broken image becomes terminal again after a few tries.
+	 * - 'keep': nothing to do yet.
+	 *
+	 * @param string $last_error Queue row last_error.
+	 * @param int    $updated_at Unix time of the last row update.
+	 * @param int    $now Unix time.
+	 * @param bool   $storage_ready Whether the storage probe currently passes.
+	 * @return string forget|reset_failures|keep
+	 */
+	public static function revival_action( $last_error, $updated_at, $now, $storage_ready ) {
+		$last_error = (string) $last_error;
+		if ( ! $storage_ready || false === strpos( $last_error, self::TERMINAL_MARKER ) ) {
+			return 'keep';
+		}
+		if ( self::is_storage_transient_message( $last_error ) ) {
+			return 'forget';
+		}
+		$updated_at = absint( $updated_at );
+		if ( $updated_at > 0 && ( absint( $now ) - $updated_at ) >= self::REVIVE_AFTER_SECONDS ) {
+			return 'reset_failures';
+		}
+		return 'keep';
 	}
 
 	/**
@@ -148,6 +226,22 @@ final class Mobo_Core_Image_Reimport_Ledger {
 		$map = self::load();
 		if ( isset( $map[ $key ] ) ) {
 			unset( $map[ $key ] );
+			self::store( $map );
+		}
+	}
+
+	/**
+	 * Clear only the readiness-failure counter of an identity (bounded revival).
+	 * The fresh-reimport counter is kept so no extra attachment can be created.
+	 *
+	 * @param string $key Key.
+	 * @return void
+	 */
+	public static function reset_failures( $key ) {
+		$map = self::load();
+		if ( isset( $map[ $key ] ) && is_array( $map[ $key ] ) ) {
+			$map[ $key ]['f'] = 0;
+			$map[ $key ]['t'] = time();
 			self::store( $map );
 		}
 	}

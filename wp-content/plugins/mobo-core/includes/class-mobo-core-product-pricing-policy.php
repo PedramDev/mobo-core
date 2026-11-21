@@ -28,6 +28,10 @@ final class Mobo_Core_Product_Pricing_Policy {
 	const CRASH_GUARD_DELAY = 300;
 	const SWEEP_OPTION = 'mobo_core_pricing_override_last_sweep_at';
 	const SWEEP_INTERVAL = 300;
+	/** A retry this overdue is not being run by WP-Cron/Action Scheduler (DISABLE_WP_CRON, no traffic). */
+	const RUNNER_DRIVE_GRACE = 120;
+	/** Overdue retries applied inline by the plugin's own runner per sweep (bounded work). */
+	const RUNNER_DRIVE_PER_SWEEP = 2;
 	const DIAG_JOB = 'pricing_override';
 
 	public static function active_meta_keys() {
@@ -222,7 +226,7 @@ final class Mobo_Core_Product_Pricing_Policy {
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
 			return array( 'status' => 'read-failed' );
 		}
-		$summary = array( 'status' => 'ok', 'pending' => count( $ids ), 'rescheduled' => 0, 'exhausted' => 0, 'otherConnection' => 0 );
+		$summary = array( 'status' => 'ok', 'pending' => count( $ids ), 'rescheduled' => 0, 'exhausted' => 0, 'otherConnection' => 0, 'driven' => 0 );
 		foreach ( array_map( 'absint', $ids ) as $product_id ) {
 			$owner = self::resolve_owner_connection_id( $product_id );
 			if ( $current_connection > 0 && $owner > 0 && $owner !== $current_connection ) {
@@ -233,7 +237,21 @@ final class Mobo_Core_Product_Pricing_Policy {
 				$summary['exhausted']++;
 				continue;
 			}
-			if ( self::has_scheduled_retry( $product_id, $owner ) ) {
+			$next_at = self::next_scheduled_retry_at( $product_id, $owner );
+			if ( $next_at > 0 ) {
+				/* The runner (Backend cron/run, heartbeat, server cron) drives a retry
+				 * that WP-Cron/Action Scheduler left overdue, so pricing overrides also
+				 * converge with DISABLE_WP_CRON and no visitor traffic. */
+				if ( $next_at <= $now - self::RUNNER_DRIVE_GRACE && $summary['driven'] < self::RUNNER_DRIVE_PER_SWEEP ) {
+					self::unschedule_retry( $product_id, $owner );
+					try {
+						self::handle_retry_action( $product_id, $owner );
+						$summary['driven']++;
+						self::diag_event( 'runner-driven', 'Overdue pricing override retry applied by the Mobo runner (WP-Cron did not run it).', array( 'productId' => $product_id, 'attempts' => self::attempts( $product_id ) ) );
+					} catch ( Throwable $e ) {
+						self::schedule_retry_bounded( $product_id );
+					}
+				}
 				continue;
 			}
 			if ( self::schedule_retry( $product_id, $owner, 30 ) ) {
@@ -244,13 +262,43 @@ final class Mobo_Core_Product_Pricing_Policy {
 		return $summary;
 	}
 
-	private static function has_scheduled_retry( $product_id, $connection_id ) {
-		$legacy_args = array( absint( $product_id ) );
-		$owned_args = array( absint( $product_id ), absint( $connection_id ) );
-		if ( function_exists( 'as_has_scheduled_action' ) ) {
-			return as_has_scheduled_action( self::ACTION_RETRY, $legacy_args, 'mobo-core' ) || as_has_scheduled_action( self::ACTION_RETRY, $owned_args, 'mobo-core' );
+	/**
+	 * Earliest scheduled retry timestamp for a product (0 = none scheduled).
+	 * An Action Scheduler action that is running right now reports PHP_INT_MAX.
+	 *
+	 * @param int $product_id Product.
+	 * @param int $connection_id Owner Connection.
+	 * @return int
+	 */
+	private static function next_scheduled_retry_at( $product_id, $connection_id ) {
+		$candidates = array( array( absint( $product_id ) ), array( absint( $product_id ), absint( $connection_id ) ) );
+		$next       = 0;
+		foreach ( $candidates as $args ) {
+			if ( function_exists( 'as_next_scheduled_action' ) ) {
+				$ts = as_next_scheduled_action( self::ACTION_RETRY, $args, 'mobo-core' );
+				$ts = true === $ts ? PHP_INT_MAX : absint( $ts );
+			} elseif ( function_exists( 'as_has_scheduled_action' ) ) {
+				$ts = as_has_scheduled_action( self::ACTION_RETRY, $args, 'mobo-core' ) ? PHP_INT_MAX : 0;
+			} else {
+				$ts = absint( wp_next_scheduled( self::ACTION_RETRY, $args ) );
+			}
+			if ( $ts > 0 && ( 0 === $next || $ts < $next ) ) {
+				$next = $ts;
+			}
 		}
-		return false !== wp_next_scheduled( self::ACTION_RETRY, $legacy_args ) || false !== wp_next_scheduled( self::ACTION_RETRY, $owned_args );
+		return $next;
+	}
+
+	/** Remove scheduled retries before the runner applies one inline. */
+	private static function unschedule_retry( $product_id, $connection_id ) {
+		foreach ( array( array( absint( $product_id ) ), array( absint( $product_id ), absint( $connection_id ) ) ) as $args ) {
+			if ( function_exists( 'as_unschedule_all_actions' ) ) {
+				as_unschedule_all_actions( self::ACTION_RETRY, $args, 'mobo-core' );
+			}
+			if ( function_exists( 'wp_clear_scheduled_hook' ) ) {
+				wp_clear_scheduled_hook( self::ACTION_RETRY, $args );
+			}
+		}
 	}
 
 	private static function diag_event( $type, $message, $context = array() ) {

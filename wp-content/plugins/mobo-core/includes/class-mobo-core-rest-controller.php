@@ -28,6 +28,151 @@ class Mobo_Core_Rest_Controller {
 	public function init() {
 		add_action( 'rest_api_init', array( $this, 'register_routes' ) );
 		add_filter( 'rest_post_dispatch', array( $this, 'harden_rest_response_cache' ), 10, 3 );
+		/* Late priority: runs after security plugins that block REST for anonymous
+		 * users, and only ever lifts their block for this plugin's own Backend
+		 * routes whose machine credential is valid. */
+		add_filter( 'rest_authentication_errors', array( __CLASS__, 'filter_rest_authentication_errors' ), 999 );
+	}
+
+	/**
+	 * Backend (machine-to-machine) routes and the credential each one uses.
+	 * Browser-facing routes (support/login) are deliberately absent.
+	 */
+	const BACKEND_ROUTE_CREDENTIALS = array(
+		'/mobo-core/v1/categories/ensure-sync'           => 'xsec',
+		'/mobo-core/v1/cron/run'                         => 'cron',
+		'/mobo-core/v1/cron/status'                      => 'xsec',
+		'/mobo-core/v1/worker/run'                       => 'cron',
+		'/mobo-core/v1/worker/status'                    => 'xsec',
+		'/mobo-core/v1/health'                           => 'xsec',
+		'/mobo-core/v1/heartbeat'                        => 'xsec',
+		'/mobo-core/v1/upgrade/status'                   => 'xsec',
+		'/mobo-core/v1/upgrade/apply'                    => 'xsec',
+		'/mobo-core/v1/support/diagnostics'              => 'xsec',
+		'/mobo-core/v1/health/report-now'                => 'xsec',
+		'/mobo-core/v1/webhook'                          => 'xsec',
+		'/mobo-core/v1/webhook/run'                      => 'xsec',
+		'/mobo-core/v1/sync/start'                       => 'xsec',
+		'/mobo-core/v1/sync/run'                         => 'xsec',
+		'/mobo-core/v1/sync/status'                      => 'xsec',
+		'/mobo-core/v1/sync/cancel'                      => 'xsec',
+		'/mobo-core/v1/connection/provision'             => 'provision',
+		'/mobo-core/v1/license-installation/challenge'   => 'xsec',
+		'/mobo-core/v1/portal/webhook-test'              => 'xsec',
+		'/mobo-core/v1/portal/revenue-summary'           => 'xsec',
+		'/mobo-core/v1/portal/settings'                  => 'xsec',
+		'/mobo-core/v1/portal/operations/start'          => 'xsec',
+		'/mobo-core/v1/portal/operations/status'         => 'xsec',
+		'/mobo-core/v1/portal/operations/cancel'         => 'xsec',
+		'/mobo-core/v1/support/login-link'               => 'xsec',
+		'/mobo-core/v1/support/request-access'           => 'xsec',
+	);
+
+	/**
+	 * Pure: credential kind of a Backend route ('' = not a Backend route).
+	 *
+	 * @param string $route REST route ("/mobo-core/v1/health").
+	 * @return string xsec|cron|provision|''
+	 */
+	public static function backend_route_credential_kind( $route ) {
+		$route = '/' . trim( strtolower( (string) $route ), '/' );
+		return isset( self::BACKEND_ROUTE_CREDENTIALS[ $route ] ) ? self::BACKEND_ROUTE_CREDENTIALS[ $route ] : '';
+	}
+
+	/** Current REST route from the request globals ('' when unknown). */
+	private static function current_rest_route() {
+		if ( isset( $GLOBALS['wp'] ) && is_object( $GLOBALS['wp'] ) && isset( $GLOBALS['wp']->query_vars['rest_route'] ) ) {
+			return (string) $GLOBALS['wp']->query_vars['rest_route'];
+		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- routing only, no state change.
+		if ( isset( $_GET['rest_route'] ) ) {
+			return sanitize_text_field( wp_unslash( (string) $_GET['rest_route'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		}
+		$uri    = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+		$path   = (string) wp_parse_url( $uri, PHP_URL_PATH );
+		$prefix = '/' . trim( function_exists( 'rest_get_url_prefix' ) ? rest_get_url_prefix() : 'wp-json', '/' ) . '/';
+		$pos    = strpos( $path, $prefix );
+		return false === $pos ? '' : '/' . substr( $path, $pos + strlen( $prefix ) );
+	}
+
+	/** @param string $name Header name (X-SEC). @return string */
+	private static function request_header( $name ) {
+		$key = 'HTTP_' . strtoupper( str_replace( '-', '_', (string) $name ) );
+		return isset( $_SERVER[ $key ] ) ? trim( (string) wp_unslash( $_SERVER[ $key ] ) ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- opaque credential, compared only.
+	}
+
+	/**
+	 * Security plugins ("Disable REST API", Wordfence/iThemes REST hardening)
+	 * often reject every unauthenticated REST request in rest_authentication_errors.
+	 * The Backend never has a WordPress user: it authenticates with X-SEC, the
+	 * cron token or a License-Token HMAC. Lift a foreign block only when:
+	 *   - the route is one of this plugin's Backend routes, and
+	 *   - the request carries that route's machine credential and it validates.
+	 * Everything else (other plugins' routes, wp/v2, support/login, requests
+	 * without a valid credential) keeps the original error. The route's own
+	 * permission_callback still authenticates the request again.
+	 *
+	 * @param mixed $result Previous filter result.
+	 * @return mixed
+	 */
+	public static function filter_rest_authentication_errors( $result ) {
+		if ( ! is_wp_error( $result ) ) {
+			return $result;
+		}
+		$kind = self::backend_route_credential_kind( self::current_rest_route() );
+		if ( '' === $kind || ! self::backend_credential_valid( $kind ) ) {
+			return $result;
+		}
+		/* A Backend route never acts as a browser user. */
+		if ( function_exists( 'wp_set_current_user' ) ) {
+			wp_set_current_user( 0 );
+		}
+		return null;
+	}
+
+	/**
+	 * Validate a machine credential without trusting anything else.
+	 *
+	 * @param string $kind xsec|cron|provision.
+	 * @return bool
+	 */
+	private static function backend_credential_valid( $kind ) {
+		if ( 'cron' === $kind ) {
+			$expected = (string) get_option( 'mobo_core_cron_token', '' );
+			// phpcs:ignore WordPress.Security.NonceVerification -- machine token, compared in constant time.
+			$provided = isset( $_REQUEST['token'] ) ? trim( (string) wp_unslash( $_REQUEST['token'] ) ) : '';
+			if ( '' === $provided ) {
+				$provided = self::request_header( 'X-SEC' );
+			}
+			return '' !== trim( $expected ) && '' !== $provided && hash_equals( $expected, $provided );
+		}
+		if ( 'xsec' === $kind ) {
+			$provided = self::request_header( 'X-SEC' );
+			if ( '' === $provided || ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
+				return false;
+			}
+			$connection = Mobo_Core_Connection_Repository::authenticate_inbound( self::request_header( 'X-Mobo-Webhook-Id' ), $provided );
+			return ! is_wp_error( $connection ) && is_array( $connection );
+		}
+		if ( 'provision' === $kind ) {
+			$timestamp = self::request_header( 'X-Mobo-Provision-Timestamp' );
+			$nonce     = self::request_header( 'X-Mobo-Provision-Nonce' );
+			$signature = strtolower( self::request_header( 'X-Mobo-Provision-Signature' ) );
+			if ( ! ctype_digit( $timestamp ) || '' === $nonce || strlen( $nonce ) > 128 || ! preg_match( '/^[a-f0-9]{64}$/', $signature ) || abs( time() - (int) $timestamp ) > 300 ) {
+				return false;
+			}
+			if ( ! class_exists( 'WP_REST_Server' ) || ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
+				return false;
+			}
+			$raw    = (string) WP_REST_Server::get_raw_data();
+			$params = json_decode( $raw, true );
+			$token  = is_array( $params ) ? Mobo_Core_Settings::normalize_opaque_secret( isset( $params['token'] ) ? $params['token'] : '', 191 ) : '';
+			if ( '' === $token || ! is_array( Mobo_Core_Connection_Repository::get_by_license_token( $token ) ) ) {
+				return false;
+			}
+			return hash_equals( hash_hmac( 'sha256', $timestamp . "\n" . $nonce . "\n" . $raw, $token ), $signature );
+		}
+		return false;
 	}
 
 	/**

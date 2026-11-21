@@ -324,6 +324,65 @@ if ( ! class_exists( 'Mobo_Core_Environment', false ) ) {
 		}
 
 		/**
+		 * strtotime() for timestamps that Mobo stores/exchanges in UTC.
+		 *
+		 * A bare "Y-m-d H:i:s" (MySQL DATETIME, ISO without offset) is read as UTC
+		 * instead of the PHP default timezone, which plugins or hosts may set to
+		 * e.g. Asia/Tehran (3.5 h shift of every lease, expiry and window). Values
+		 * carrying an explicit zone (Z, +03:30, GMT, ...) are parsed unchanged.
+		 *
+		 * @param string $value Date/time string.
+		 * @return int|false
+		 */
+		public static function utc_strtotime( $value ) {
+			$value = trim( (string) $value );
+			if ( '' === $value ) {
+				return false;
+			}
+			if ( preg_match( '/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?$/', $value ) ) {
+				$value .= ' UTC';
+			}
+			return strtotime( $value );
+		}
+
+		/**
+		 * memory_limit in bytes (0 = unlimited or unknown).
+		 *
+		 * @return int
+		 */
+		public static function memory_limit_bytes() {
+			$raw = trim( self::ini( 'memory_limit', '' ) );
+			if ( '' === $raw || '-1' === $raw ) {
+				return 0;
+			}
+			$unit  = strtolower( substr( $raw, -1 ) );
+			$value = (float) $raw;
+			if ( 'g' === $unit ) {
+				$value *= 1073741824;
+			} elseif ( 'm' === $unit ) {
+				$value *= 1048576;
+			} elseif ( 'k' === $unit ) {
+				$value *= 1024;
+			}
+			return max( 0, (int) $value );
+		}
+
+		/**
+		 * Bytes still available below memory_limit (PHP_INT_MAX when unlimited or
+		 * unknown, i.e. when the host does not let us measure).
+		 *
+		 * @return int
+		 */
+		public static function memory_headroom_bytes() {
+			$limit = self::memory_limit_bytes();
+			$used  = self::memory_usage( true );
+			if ( $limit <= 0 || $used <= 0 ) {
+				return PHP_INT_MAX;
+			}
+			return max( 0, $limit - $used );
+		}
+
+		/**
 		 * Functions disabled by php.ini disable_functions or Suhosin's blacklist.
 		 *
 		 * @return string[] Lower-case names.

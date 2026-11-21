@@ -225,8 +225,8 @@ final class Mobo_Core_Ordering_Policy {
 		}
 
 		if ( preg_match( '/^\d{4}-\d{2}-\d{2}[T ]/', $left ) && preg_match( '/^\d{4}-\d{2}-\d{2}[T ]/', $right ) ) {
-			$lt = strtotime( $left );
-			$rt = strtotime( $right );
+			$lt = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $left ) : strtotime( $left ) );
+			$rt = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $right ) : strtotime( $right ) );
 			if ( false !== $lt && false !== $rt ) {
 				return $lt === $rt ? 0 : ( $lt < $rt ? -1 : 1 );
 			}

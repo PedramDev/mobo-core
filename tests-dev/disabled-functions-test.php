@@ -320,6 +320,11 @@ $suites = array(
 	'image-refresh-stop-test.php'    => array(),
 	'legacy-image-cleanup-test.php'  => array( 'getmypid' ), // the harness itself names its temp dir with getmypid().
 	'cache-integration-test.php'     => array(),
+	/* 10.34.77 pre-release gaps: image integrity/storage revival, prune guard,
+	 * event retry policy, environment fallbacks (memory helpers, UTC parsing). */
+	'image-storage-resilience-test.php' => array(),
+	'sync-event-retry-test.php'         => array(),
+	'environment-gaps-test.php'         => array( 'exec' ), // the harness spawns the mobo-cron.php child with exec().
 );
 foreach ( $suites as $suite => $except ) {
 	list( $code, $output ) = run_php( disabled_flag( $except ), __DIR__ . '/' . $suite );

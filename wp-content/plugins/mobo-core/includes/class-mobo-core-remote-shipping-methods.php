@@ -1000,7 +1000,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		if ( is_numeric( $value ) ) {
 			return absint( $value );
 		}
-		$timestamp = strtotime( (string) $value );
+		$timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( (string) $value ) : strtotime( (string) $value ) );
 		return false === $timestamp ? 0 : absint( $timestamp );
 	}
 

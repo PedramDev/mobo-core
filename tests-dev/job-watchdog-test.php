@@ -163,4 +163,21 @@ t_same( 'skipped-not-due', Mobo_Core_Product_Pricing_Policy::sweep_stuck_request
 $events = Mobo_Core_Job_Diagnostics::open( Mobo_Core_Product_Pricing_Policy::DIAG_JOB )->data();
 t_check( ! empty( $events['events'] ) && 'rescheduled' === $events['events'][0]['type'], 'sweeper action recorded in diagnostics' );
 
+echo "\nDISABLE_WP_CRON: the Mobo runner drives overdue pricing override retries\n";
+t_reset();
+$GLOBALS['wpdb']->pending_meta_ids = array( '13', '14', '15', '16' );
+foreach ( array( 13, 14, 15 ) as $overdue_id ) {
+	wp_schedule_single_event( time() - 600, Mobo_Core_Product_Pricing_Policy::ACTION_RETRY, array( $overdue_id, 1 ) );
+}
+wp_schedule_single_event( time() - 30, Mobo_Core_Product_Pricing_Policy::ACTION_RETRY, array( 16, 1 ) );
+$sweep = Mobo_Core_Product_Pricing_Policy::sweep_stuck_requests( 20, true );
+t_same( Mobo_Core_Product_Pricing_Policy::RUNNER_DRIVE_PER_SWEEP, $sweep['driven'], 'overdue WP-Cron retries are applied inline by the runner (bounded per sweep)' );
+t_same( false, wp_next_scheduled( Mobo_Core_Product_Pricing_Policy::ACTION_RETRY, array( 13, 1 ) ), '  the driven retry is removed from WP-Cron (no double apply)' );
+t_check( false !== wp_next_scheduled( Mobo_Core_Product_Pricing_Policy::ACTION_RETRY, array( 15, 1 ) ), '  work beyond the per-sweep bound stays scheduled for the next sweep' );
+t_check( false !== wp_next_scheduled( Mobo_Core_Product_Pricing_Policy::ACTION_RETRY, array( 16, 1 ) ), '  a retry inside the grace window is left to WP-Cron/Action Scheduler' );
+$events = Mobo_Core_Job_Diagnostics::open( Mobo_Core_Product_Pricing_Policy::DIAG_JOB )->data();
+$driven_logged = false;
+foreach ( (array) ( $events['events'] ?? array() ) as $event ) { $driven_logged = $driven_logged || 'runner-driven' === ( $event['type'] ?? '' ); }
+t_check( $driven_logged, '  runner-driven retry recorded in diagnostics' );
+
 t_done();

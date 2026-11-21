@@ -127,7 +127,7 @@ final class Mobo_Core_Diagnostics_Admin {
 						<thead><tr><th>آخرین وقوع</th><th>سطح</th><th>کد</th><th>پیام</th><th>محل</th><th>شناسه پیگیری</th><th>تعداد</th></tr></thead>
 						<tbody>
 							<?php foreach ( $errors as $error ) : ?>
-								<?php $seen = $error['lastSeen'] ? strtotime( (string) $error['lastSeen'] ) : 0; ?>
+								<?php $seen = $error['lastSeen'] ? (int) ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( (string) $error['lastSeen'] ) : strtotime( (string) $error['lastSeen'] ) ) : 0; ?>
 								<tr>
 									<td><?php echo esc_html( $seen > 0 && class_exists( 'Mobo_Core_Iran_Date' ) ? Mobo_Core_Iran_Date::format( 'Y/m/d H:i', $seen ) : (string) $error['lastSeen'] ); ?></td>
 									<td><?php echo esc_html( isset( $labels[ $error['level'] ] ) ? $labels[ $error['level'] ] : $error['level'] ); ?></td>
