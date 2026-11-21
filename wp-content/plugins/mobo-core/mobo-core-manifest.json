@@ -1,7 +1,7 @@
 {
   "version": "10.34.77",
   "algorithm": "sha256",
-  "generatedAt": "2026-11-21T19:07:28Z",
+  "generatedAt": "2026-11-21T21:01:55Z",
   "files": {
     "assets/admin/css/mobo-admin-components.css": "0a0589e2a37a5eee4e54e2008c41409ea4f9e5d44b6a614fc0409e8e8da360ed",
     "assets/admin/css/mobo-admin-core.css": "da27e853a70f179326d3a054d2ea2948afe5922abb79cc01c79910c431af263b",
@@ -261,7 +261,7 @@
     "includes/class-mobo-core-address-attention.php": "006a0573e4a72a4825c86e4db99e3c14c048e5fb5ac273e257d724dab6259481",
     "includes/class-mobo-core-address-mapping.php": "6eb2a9381a6bd8c5c4027138f9fc817bf98693e958a1d1ca333a07e7c3e235e7",
     "includes/class-mobo-core-address-normalizer.php": "8ff74fabdaa1be3caa49a983f0848f2da4bd8940aab090e26bf480abe73bb86c",
-    "includes/class-mobo-core-admin.php": "6cdc4bae7edc5b6e13fe240c5ce2a72f8abab1b89c124ad03fc6a0551cba81ef",
+    "includes/class-mobo-core-admin.php": "26c54b2cb27713fcaa65b21c8ded056326a961d2e4a3f8b1e593b59f8af5c384",
     "includes/class-mobo-core-api-client.php": "b8a86ec57ba4ab4f67565d1f01a432d819032e41011eeb7dbb13c246add22af9",
     "includes/class-mobo-core-autoloader.php": "f675db75ccadcbdffb9078709c4f2d313d127c8b42d12d13b9f48e759d5b6f64",
     "includes/class-mobo-core-automatic-shipping.php": "abce93f49f9393c5765ec079d29435e2a96cb6ab9d09f8c18b5753dc0f3054e1",
@@ -428,7 +428,7 @@
     "includes/class-wc-mobo-core-shipping-method.php": "9bc7b1743edc8c1bbe4097815f3794f80cdb5a426c6cee741c153e1554f1a405",
     "includes/data/iran-cities.php": "7d8cdd4e33b625b848e52dd945951ca4d20c1ea8000f2e15cf6ee2b830c1a7f6",
     "LICENSE": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
-    "mobo-core.php": "a0b45f31f0ba10115919664fd70b0453203f32d1e812fab1f07cd55e7e2eeba0",
+    "mobo-core.php": "34a34691c62d3f7f0936c97ed52df4b7e72e8cccc9b7abca6930ceb84106d24b",
     "mobo-cron.php": "d39200208891edd41f08665fb99d10cdadebe0303ff037c16d8c4270e1c022e0",
     "README_FULL.MD": "e7c5e37424d4a5dd118a20bc0c217f2d3add78ae4697eb5894116f9c1becde9a",
     "README.md": "54fc9b04a1cbbedcbd48521bd4ab18f9ef18fda5955375ab55eeab7d08e2be2f",

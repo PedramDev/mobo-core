@@ -251,4 +251,13 @@ t_setting( 'global_product_auto_stock', '0', 4 );
 Mobo_Core_Connection_Settings::seed_policy_defaults( 4 );
 t_same( '0', Mobo_Core_Connection_Settings::get( 4, 'global_product_auto_stock' ), 'seeding never overwrites an existing Connection choice' );
 
+echo "
+Admin verified-save read-back (unchanged re-save of a wp_options int)
+";
+t_check( Mobo_Core_Admin::admin_setting_read_back_matches( '8', 8 ), 'DB string "8" matches posted int 8 (unchanged re-save is not a failure)' );
+t_check( Mobo_Core_Admin::admin_setting_read_back_matches( '0', '0' ) && Mobo_Core_Admin::admin_setting_read_back_matches( 0, '0' ), 'bool-like "0" matches' );
+t_check( ! Mobo_Core_Admin::admin_setting_read_back_matches( '7', 8 ), 'a different stored value is still a failure' );
+t_check( ! Mobo_Core_Admin::admin_setting_read_back_matches( null, 8 ), 'missing read-back is a failure' );
+t_check( Mobo_Core_Admin::admin_setting_read_back_matches( array( 'a' => 1 ), array( 'a' => 1 ) ) && ! Mobo_Core_Admin::admin_setting_read_back_matches( array( 'a' => '1' ), array( 'a' => 2 ) ), 'arrays keep serialized comparison' );
+
 t_done();

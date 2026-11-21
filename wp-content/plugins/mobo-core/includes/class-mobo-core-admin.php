@@ -4311,29 +4311,7 @@ type:{mobo_order_type_label}</textarea>
 		$pending_webhooks = absint( isset( $local['pendingWebhookJobs'] ) ? $local['pendingWebhookJobs'] : 0 );
 		$failed_images = absint( isset( $local['failedImageJobs'] ) ? $local['failedImageJobs'] : 0 );
 		$image_ok = ! empty( $image['uploadsWritable'] ) && ( ! empty( $image['imagickLoaded'] ) || ! empty( $image['gdLoaded'] ) );
-		$database_unicode = isset( $local['databaseUnicode'] ) && is_array( $local['databaseUnicode'] ) ? $local['databaseUnicode'] : array();
-		$database_unicode_ok = ! empty( $database_unicode['ready'] );
-		$database_unicode_message = isset( $database_unicode['message'] ) ? sanitize_text_field( (string) $database_unicode['message'] ) : '';
-		$database_unicode_migration = isset( $local['databaseUnicodeMigration'] ) && is_array( $local['databaseUnicodeMigration'] )
-			? $local['databaseUnicodeMigration']
-			: ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ? Mobo_Core_Database_Unicode_Migration::get_status() : array( 'status' => 'unavailable' ) );
-		$database_unicode_migration_status = sanitize_key( (string) ( $database_unicode_migration['status'] ?? 'idle' ) );
-		$database_unicode_migration_active = ! empty( $database_unicode_migration['active'] );
-		$database_unicode_migration_labels = array(
-			'idle' => 'شروع نشده',
-			'draining' => 'در حال Drain Workerها',
-			'migrating' => 'در حال تبدیل',
-			'paused' => 'متوقف‌شده با حفظ Checkpoint',
-			'failed' => 'متوقف‌شده به‌علت خطا',
-			'awaiting-config' => 'منتظر اصلاح wp-config.php',
-			'ready' => 'آماده تبدیل جدول بعدی (دستی)',
-			'partial' => 'کامل با خطا در بعضی جدول‌ها',
-			'completed' => 'کامل و تأییدشده',
-			'unavailable' => 'در دسترس نیست',
-		);
-		$database_unicode_migration_label = isset( $database_unicode_migration_labels[ $database_unicode_migration_status ] )
-			? $database_unicode_migration_labels[ $database_unicode_migration_status ]
-			: $database_unicode_migration_status;
+		list( $database_unicode, $database_unicode_ok, $database_unicode_message, $database_unicode_migration, $database_unicode_migration_status, $database_unicode_migration_active, $database_unicode_migration_label ) = $this->health_database_unicode_view( $local );
 		$schema_ok = ! empty( $local['databaseSchemaReady'] );
 		$php_ok = version_compare( PHP_VERSION, '7.4', '>=' );
 		$wp_version = isset( $local['wordpressVersion'] ) ? (string) $local['wordpressVersion'] : get_bloginfo( 'version' );
@@ -4475,11 +4453,55 @@ type:{mobo_order_type_label}</textarea>
 			<?php if ( empty( $danger_notices ) && empty( $warning_notices ) ) : ?><div class="mobo-message mobo-message-success">در حال حاضر در پیش‌نیازهای فنی بررسی‌شده موردی نیازمند اقدام دیده نشد.</div><?php endif; ?>
 			<div class="mobo-note"><strong>نکته:</strong> وضعیت «پیکربندی Health» فقط آمادگی محلی احراز هویت/Connection را نشان می‌دهد و reachability شبکه از Portal را اثبات نمی‌کند. GET <code dir="ltr">/health</code> فقط وضعیت را به‌صورت read-only گزارش می‌کند؛ Recovery/اجرای bounded worker از endpoint جداگانه POST <code dir="ltr">/heartbeat</code> انجام می‌شود و نتیجه Heartbeat معیار دسترس‌پذیری خود Health نیست.</div>
 		</div>
-		<details class="mobo-admin-details mobo-ux-secondary-details">
+		<?php
+		/* The manual utf8mb4 card lives in this report: keep it open while a pre-check
+		 * result is waiting for the start step or a migration needs the next action,
+		 * so the pre-check notice ("read the result in the utf8mb4 section") points
+		 * at something the admin can actually see. */
+		$health_details_open = $database_unicode_migration_active
+			|| in_array( $database_unicode_migration_status, array( 'ready', 'paused', 'failed', 'partial', 'awaiting-config' ), true )
+			|| ( ! $database_unicode_ok && class_exists( 'Mobo_Core_Database_Unicode_Migration' ) && Mobo_Core_Database_Unicode_Migration::precheck_is_fresh() );
+		?>
+		<details class="mobo-admin-details mobo-ux-secondary-details"<?php echo $health_details_open ? ' open' : ''; ?>>
 			<summary>گزارش فنی کامل و جزئیات تشخیصی</summary>
 			<div class="mobo-admin-details__body"><?php $this->render_health_technical_tab( $local ); ?></div>
 		</details>
 		<?php
+	}
+
+	/**
+	 * Database Unicode (utf8mb4) guard + manual migration view model shared by the
+	 * Health summary and the technical report (which renders the migration card).
+	 *
+	 * @param array $local Health report.
+	 * @return array Positional: unicode, ok, message, migration, status, active, label.
+	 */
+	private function health_database_unicode_view( $local ) {
+		$local = is_array( $local ) ? $local : array();
+		$database_unicode = isset( $local['databaseUnicode'] ) && is_array( $local['databaseUnicode'] ) ? $local['databaseUnicode'] : array();
+		$database_unicode_ok = ! empty( $database_unicode['ready'] );
+		$database_unicode_message = isset( $database_unicode['message'] ) ? sanitize_text_field( (string) $database_unicode['message'] ) : '';
+		$database_unicode_migration = isset( $local['databaseUnicodeMigration'] ) && is_array( $local['databaseUnicodeMigration'] )
+			? $local['databaseUnicodeMigration']
+			: ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ? Mobo_Core_Database_Unicode_Migration::get_status() : array( 'status' => 'unavailable' ) );
+		$database_unicode_migration_status = sanitize_key( (string) ( $database_unicode_migration['status'] ?? 'idle' ) );
+		$database_unicode_migration_active = ! empty( $database_unicode_migration['active'] );
+		$database_unicode_migration_labels = array(
+			'idle' => 'شروع نشده',
+			'draining' => 'در حال Drain Workerها',
+			'migrating' => 'در حال تبدیل',
+			'paused' => 'متوقف‌شده با حفظ Checkpoint',
+			'failed' => 'متوقف‌شده به‌علت خطا',
+			'awaiting-config' => 'منتظر اصلاح wp-config.php',
+			'ready' => 'آماده تبدیل جدول بعدی (دستی)',
+			'partial' => 'کامل با خطا در بعضی جدول‌ها',
+			'completed' => 'کامل و تأییدشده',
+			'unavailable' => 'در دسترس نیست',
+		);
+		$database_unicode_migration_label = isset( $database_unicode_migration_labels[ $database_unicode_migration_status ] )
+			? $database_unicode_migration_labels[ $database_unicode_migration_status ]
+			: $database_unicode_migration_status;
+		return array( $database_unicode, $database_unicode_ok, $database_unicode_message, $database_unicode_migration, $database_unicode_migration_status, $database_unicode_migration_active, $database_unicode_migration_label );
 	}
 
 	private function render_health_technical_tab( $local = null ) {
@@ -4488,6 +4510,7 @@ type:{mobo_order_type_label}</textarea>
 			/* Keep wp-admin rendering non-blocking; full probes belong to explicit diagnostics. */
 			$local = $reporter->build_report( true );
 		}
+		list( $database_unicode, $database_unicode_ok, $database_unicode_message, $database_unicode_migration, $database_unicode_migration_status, $database_unicode_migration_active, $database_unicode_migration_label ) = $this->health_database_unicode_view( $local );
 		$image          = isset( $local['imageProcessing'] ) && is_array( $local['imageProcessing'] ) ? $local['imageProcessing'] : array();
 		$cache_purge    = isset( $local['cachePurge'] ) && is_array( $local['cachePurge'] ) ? $local['cachePurge'] : array();
 		$archive_cache_queue = isset( $cache_purge['archiveQueue'] ) && is_array( $cache_purge['archiveQueue'] ) ? $cache_purge['archiveQueue'] : array();
@@ -9366,7 +9389,37 @@ https://source.example/products/test-product/
 	private function save_verified_admin_setting( $key, $value ) {
 		Mobo_Core_Settings::update( $key, $value, false );
 		$stored = Mobo_Core_Settings::get( $key, null );
-		return maybe_serialize( $stored ) === maybe_serialize( $value );
+		return self::admin_setting_read_back_matches( $stored, $value );
+	}
+
+	/**
+	 * Compare a read-back setting with the value that was written.
+	 *
+	 * wp_options returns scalars as strings once the value comes from the
+	 * database (e.g. "8"), while a fresh update_option() caches the written type
+	 * (int 8). When the posted value is unchanged, update_option() writes nothing
+	 * and the read-back is the DB string, so a strict int/string comparison would
+	 * report a false failure on every re-save. Scalars are therefore compared by
+	 * their stored string form; arrays/objects keep the serialized comparison.
+	 *
+	 * @param mixed $stored   Value read back through Mobo_Core_Settings::get().
+	 * @param mixed $expected Value that was written.
+	 * @return bool
+	 */
+	public static function admin_setting_read_back_matches( $stored, $expected ) {
+		if ( null === $stored || null === $expected ) {
+			return $stored === $expected;
+		}
+		if ( is_scalar( $stored ) && is_scalar( $expected ) ) {
+			$normalize = static function ( $v ) {
+				if ( is_bool( $v ) ) {
+					return $v ? '1' : '';
+				}
+				return (string) $v;
+			};
+			return $normalize( $stored ) === $normalize( $expected );
+		}
+		return maybe_serialize( $stored ) === maybe_serialize( $expected );
 	}
 
 	/**
@@ -13199,6 +13252,19 @@ https://source.example/products/test-product/
 					var busy = false;
 					var timer = null;
 					var reloadScheduled = false;
+					var formSubmitting = false;
+
+					/* A reload scheduled when the run ends must never cancel an admin's own
+					 * form submission (e.g. «توقف اعمال قیمت» clicked as the last batch
+					 * finishes): the newer navigation would silently drop the POST result. */
+					$(document).on('submit', 'form', function(event) {
+						if (! event.isDefaultPrevented()) {
+							formSubmitting = true;
+							if (timer) {
+								window.clearInterval(timer);
+							}
+						}
+					});
 
 					function setRepriceMessage(name, value) {
 						var $message = $('[data-mobo-reprice-message="' + name + '"]');
@@ -13258,12 +13324,16 @@ https://source.example/products/test-product/
 								window.clearInterval(timer);
 							}
 							$('[data-mobo-reprice-refresh-state]').text('اجرای قیمت‌گذاری پایان یافته است؛ وضعیت نهایی در حال بارگذاری است.');
-							window.setTimeout(function(){ window.location.reload(); }, 600);
+							window.setTimeout(function(){
+								if (! formSubmitting) {
+									window.location.reload();
+								}
+							}, 600);
 						}
 					}
 
 					function refreshRepriceStatus() {
-						if (busy || reloadScheduled) {
+						if (busy || reloadScheduled || formSubmitting) {
 							return;
 						}
 

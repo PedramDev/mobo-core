@@ -51,6 +51,10 @@ define( 'MOBO_CORE_LEGACY_WEBHOOK_FILE_DIR', MOBO_CORE_PLUGIN_DIR . 'webhook-fil
  * @return array<int|string,string>
  */
 function mobo_core_plugin_action_links( $links ) {
+	/* Persian labels sit inside an LTR (e.g. English) wp-admin row. Without dir="rtl"
+	 * (an isolated bidi run) adjacent RTL links and WordPress' " | " separators are
+	 * reordered into one RTL run and Chromium hit-tests the second link as its parent
+	 * span, so a click on "سلامت سایت" did nothing. */
 	if ( ! is_array( $links ) ) {
 		$links = array();
 	}
@@ -68,12 +72,12 @@ function mobo_core_plugin_action_links( $links ) {
 
 	$prepend = array();
 	if ( $platform_ready && empty( $missing ) && $can_manage_site ) {
-		$prepend[] = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core' ) ) . '">تنظیمات موبو</a>';
-		$prepend[] = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core&tab=health' ) ) . '">سلامت سایت</a>';
+		$prepend['mobo_settings'] = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core' ) ) . '" dir="rtl">تنظیمات موبو</a>';
+		$prepend['mobo_health']   = '<a href="' . esc_url( admin_url( 'admin.php?page=mobo-core&tab=health' ) ) . '" dir="rtl">سلامت سایت</a>';
 	}
 
 	if ( ! $platform_ready && $can_manage_plugins ) {
-		$prepend[] = '<span aria-label="' . esc_attr__( 'Mobo Core requires 64-bit PHP.', 'mobo-core' ) . '">' . esc_html__( 'نیازمند PHP 64-bit', 'mobo-core' ) . '</span>';
+		$prepend[] = '<span dir="rtl" aria-label="' . esc_attr__( 'Mobo Core requires 64-bit PHP.', 'mobo-core' ) . '">' . esc_html__( 'نیازمند PHP 64-bit', 'mobo-core' ) . '</span>';
 	}
 
 	if ( $can_manage_plugins && ! empty( $missing ) ) {
@@ -86,7 +90,7 @@ function mobo_core_plugin_action_links( $links ) {
 			}
 
 			if ( $installed || ! current_user_can( 'install_plugins' ) || '' === $slug ) {
-				$prepend[] = '<a href="' . esc_url( self_admin_url( 'plugins.php' ) ) . '">' . esc_html( 'مدیریت پیش‌نیاز: ' . $name ) . '</a>';
+				$prepend[] = '<a href="' . esc_url( self_admin_url( 'plugins.php' ) ) . '" dir="rtl">' . esc_html( 'مدیریت پیش‌نیاز: ' . $name ) . '</a>';
 				continue;
 			}
 
@@ -98,7 +102,7 @@ function mobo_core_plugin_action_links( $links ) {
 				),
 				self_admin_url( 'plugin-install.php' )
 			);
-			$prepend[] = '<a href="' . esc_url( $url ) . '">' . esc_html( 'نصب پیش‌نیاز: ' . $name ) . '</a>';
+			$prepend[] = '<a href="' . esc_url( $url ) . '" dir="rtl">' . esc_html( 'نصب پیش‌نیاز: ' . $name ) . '</a>';
 		}
 	}
 
