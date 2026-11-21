@@ -99,6 +99,8 @@ class Mobo_Core_Checkout_Validator {
 	private $order_recovery_read_failed = false;
 	/** @var array<int,bool> M9: Store API orders already validated in this request (order id => true). */
 	private $store_api_validated_order_ids = array();
+	/** @var array|null Held order-queue advisory lock: name + owning MySQL CONNECTION_ID(). */
+	private $active_order_queue_lock = null;
 
 	/**
 	 * Register validation hooks.
@@ -3905,10 +3907,12 @@ class Mobo_Core_Checkout_Validator {
 				}
 				if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
 					return $this->primary_order_row_store_ready()
+						&& $this->order_queue_lock_still_owned()
 						&& Mobo_Core_Work_Queue_Store::put( self::ORDER_QUEUE_TYPE, (string) $order_id, $item );
 				}
 				$queue = $this->get_option_backed_order_queue();
 				$queue[ (string) $order_id ] = $item;
+				if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
@@ -4115,16 +4119,61 @@ class Mobo_Core_Checkout_Validator {
 		if ( $connection_id <= 0 ) { return false; }
 		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
 		$lock_name = 'mobo_order_q_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $connection_id ), 0, 40 );
-		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 2 ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic option queue guard.
-		if ( '1' !== (string) $acquired ) {
+		/* GET_LOCK() belongs to the MySQL session. wpdb silently reconnects after
+		 * "server has gone away" (wait_timeout, proxy idle kill, max_allowed_packet),
+		 * and the new session no longer owns the lock while another worker may take
+		 * it. Record the owning CONNECTION_ID() with the acquisition and re-prove it
+		 * with IS_USED_LOCK() before every queue write and after the callback. */
+		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d) AS acquired, CONNECTION_ID() AS cid', $lock_name, 2 ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic option queue guard.
+		$acquired = is_array( $row ) && array_key_exists( 'acquired', $row ) ? (string) $row['acquired'] : '';
+		$owner    = is_array( $row ) && isset( $row['cid'] ) ? absint( $row['cid'] ) : 0;
+		if ( '1' !== $acquired ) {
+			return false;
+		}
+		if ( $owner <= 0 ) {
+			/* Ownership cannot be proven later: never run the queue mutation. */
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the unprovable guard.
 			return false;
 		}
 
+		$previous_lock = $this->active_order_queue_lock;
+		$this->active_order_queue_lock = array( 'name' => $lock_name, 'cid' => $owner );
 		try {
-			return call_user_func( $callback );
+			$result = call_user_func( $callback );
+			if ( ! $this->order_queue_lock_still_owned() ) {
+				/* A reconnect happened during the mutation: report failure so callers
+				 * fall back to their durable recovery path instead of assuming the
+				 * read-modify-write was exclusive. */
+				return false;
+			}
+			return $result;
 		} finally {
-			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the connection-scoped queue guard.
+			if ( $this->order_queue_lock_still_owned() ) {
+				$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the connection-scoped queue guard.
+			}
+			$this->active_order_queue_lock = $previous_lock;
 		}
+	}
+
+	/**
+	 * Whether this request's MySQL session still owns the held order-queue lock.
+	 * False after a silent wpdb reconnect (new CONNECTION_ID()) or when no lock is
+	 * held. Never throws; any read failure counts as lost ownership.
+	 *
+	 * @return bool
+	 */
+	private function order_queue_lock_still_owned() {
+		global $wpdb;
+		$lock = $this->active_order_queue_lock;
+		if ( ! is_array( $lock ) || empty( $lock['name'] ) || absint( $lock['cid'] ?? 0 ) <= 0 || ! is_object( $wpdb ) ) {
+			return false;
+		}
+		$holder = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', (string) $lock['name'] ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Ownership proof for the queue guard.
+		$owned  = null !== $holder && '' !== (string) $holder && absint( $holder ) === absint( $lock['cid'] );
+		if ( ! $owned ) {
+			$this->debug_log( 'order_queue_lock_lost', array( 'expectedConnection' => absint( $lock['cid'] ), 'holder' => null === $holder ? 'none' : absint( $holder ) ) );
+		}
+		return $owned;
 	}
 
 	/**
@@ -4166,6 +4215,7 @@ class Mobo_Core_Checkout_Validator {
 					if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
 					$hash = (string) $read['row']['payload_hash'];
 					if ( '' !== $snapshot_hash && ! hash_equals( (string) $snapshot_hash, $hash ) ) { return false; }
+					if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 					return Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::ORDER_QUEUE_TYPE, $key, $hash );
 				}
 				$queue = $this->get_option_backed_order_queue();
@@ -4173,6 +4223,7 @@ class Mobo_Core_Checkout_Validator {
 				$current_token = $this->order_queue_item_token( $queue[ $key ], $key );
 				if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
 				unset( $queue[ $key ] );
+				if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
