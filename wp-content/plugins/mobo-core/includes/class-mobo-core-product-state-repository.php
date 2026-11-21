@@ -21,9 +21,39 @@ final class Mobo_Core_Product_State_Repository {
 		return null !== $owner && absint( $owner ) !== $connection_id;
 	}
 
+	/** Request-local row-cache bucket (see Mobo_Core_Storage_Row_Cache). */
+	const ROW_CACHE_BUCKET = 'products';
+
 	/** @return string */
 	public static function table_name() {
 		return Mobo_Core_Storage_Schema::table_name( 'products' );
+	}
+
+	/**
+	 * Read one row through the request-local cache. Any write to the Products
+	 * table (from any code path) invalidates the bucket via the `query` filter,
+	 * so a read after a write always reaches the database. Errors are not cached.
+	 *
+	 * @param string $cache_key Cache key.
+	 * @param string $prepared Prepared SELECT.
+	 * @return array|null
+	 */
+	private static function cached_row( $cache_key, $prepared, $object_id = 0 ) {
+		global $wpdb;
+		$hit    = false;
+		$cached = Mobo_Core_Storage_Row_Cache::get( self::ROW_CACHE_BUCKET, $cache_key, $hit );
+		if ( $hit ) {
+			return is_array( $cached ) ? $cached : null;
+		}
+		$wpdb->last_error = '';
+		$row = $wpdb->get_row( $prepared, ARRAY_A );
+		$row = is_array( $row ) ? $row : null;
+		if ( '' === trim( (string) $wpdb->last_error ) ) {
+			$object_id = is_array( $row ) ? absint( $row['woo_product_id'] ?? 0 ) : absint( $object_id );
+			Mobo_Core_Storage_Row_Cache::register_table( self::ROW_CACHE_BUCKET, self::table_name() );
+			Mobo_Core_Storage_Row_Cache::set( self::ROW_CACHE_BUCKET, $cache_key, $row, $object_id );
+		}
+		return $row;
 	}
 
 	/**
@@ -465,8 +495,7 @@ final class Mobo_Core_Product_State_Repository {
 			return null;
 		}
 		$table = self::table_name();
-		$row   = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND product_guid = %s LIMIT 1", $connection_id, $product_guid ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'g|' . $connection_id . '|' . $product_guid, $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND product_guid = %s LIMIT 1", $connection_id, $product_guid ) );
 	}
 
 	/** Read one Product row by Woo ID for Custom-only state reads. @return array|null */
@@ -476,8 +505,7 @@ final class Mobo_Core_Product_State_Repository {
 		$woo_product_id = absint( $woo_product_id );
 		if ( $connection_id <= 0 || $woo_product_id <= 0 || ! Mobo_Core_Storage_Schema::is_ready() ) { return null; }
 		$table = Mobo_Core_Storage_Schema::table_name( 'products' );
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND woo_product_id=%d LIMIT 1", $connection_id, $woo_product_id ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'w|' . $connection_id . '|' . $woo_product_id, $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND woo_product_id=%d LIMIT 1", $connection_id, $woo_product_id ), $woo_product_id );
 	}
 
 	/** Read the global Woo Product owner without depending on current Connection context. @return array|null */
@@ -486,8 +514,7 @@ final class Mobo_Core_Product_State_Repository {
 		$woo_product_id = absint( $woo_product_id );
 		if ( $woo_product_id <= 0 || ! Mobo_Core_Storage_Schema::is_ready() ) { return null; }
 		$table = self::table_name();
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE woo_product_id=%d LIMIT 1", $woo_product_id ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'o|' . $woo_product_id, $wpdb->prepare( "SELECT * FROM {$table} WHERE woo_product_id=%d LIMIT 1", $woo_product_id ), $woo_product_id );
 	}
 
 	/** @return string */

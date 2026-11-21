@@ -1132,8 +1132,7 @@ class Mobo_Core_Product_Sync {
 		$api            = new Mobo_Core_API_Client();
 		$state          = $this->get_manual_sync_state();
 		$this->repair_mode = ! empty( $state['repairMode'] );
-		$products_limit = Mobo_Core_Settings::get_int( 'mobo_core_products_per_page', 1, 1, 20 );
-		$variants_limit = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
+		list( $products_limit, $variants_limit ) = self::effective_page_sizes();
 
 		if ( 'idle' === $state['status'] || '' === $state['syncId'] ) {
 			return $this->result( false, 'همگام‌سازی شروع نشده است.', $this->get_manual_sync_status() );
@@ -2315,6 +2314,448 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * product-delta-v1 resolver: local state of the delta's product.
+	 *
+	 * @param string $guid Remote product GUID.
+	 * @return array{id:int,state:string,type?:string,excluded?:bool}
+	 */
+	public function resolve_delta_product( $guid ) {
+		$guid       = sanitize_text_field( (string) $guid );
+		$product_id = '' !== $guid ? absint( $this->find_product_id_by_guid( $guid ) ) : 0;
+		if ( $product_id <= 0 ) {
+			return array( 'id' => 0, 'state' => 'missing' );
+		}
+		$state = $this->delta_object_state( $product_id, 'product' );
+		if ( 'ok' !== $state ) {
+			return array( 'id' => $product_id, 'state' => $state );
+		}
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return array( 'id' => $product_id, 'state' => 'inconsistent' );
+		}
+		$type = $product->is_type( 'variable' ) ? 'variable' : ( $product->is_type( 'simple' ) ? 'simple' : 'other' );
+		if ( 'other' === $type ) {
+			return array( 'id' => $product_id, 'state' => 'inconsistent' );
+		}
+		return array(
+			'id'       => $product_id,
+			'state'    => 'ok',
+			'type'     => $type,
+			'excluded' => class_exists( 'Mobo_Core_Product_Exclusions' ) && method_exists( 'Mobo_Core_Product_Exclusions', 'is_local_product_excluded' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ),
+		);
+	}
+
+	/**
+	 * product-delta-v1 resolver: local target of one changed variant.
+	 *
+	 * @param string $guid Remote variant GUID.
+	 * @param array  $product resolve_delta_product() result.
+	 * @return array{id:int,state:string,context?:string}
+	 */
+	public function resolve_delta_variant( $guid, $product ) {
+		$guid       = sanitize_text_field( (string) $guid );
+		$product_id = absint( is_array( $product ) && isset( $product['id'] ) ? $product['id'] : 0 );
+		$type       = is_array( $product ) && isset( $product['type'] ) ? (string) $product['type'] : '';
+		if ( '' === $guid || $product_id <= 0 ) {
+			return array( 'id' => 0, 'state' => 'missing' );
+		}
+		if ( 'simple' === $type ) {
+			/* A simple Mobo product embeds exactly one Source variant. */
+			$stored = sanitize_text_field( (string) get_post_meta( $product_id, 'variant_guid', true ) );
+			if ( '' !== $stored && 0 === strcasecmp( $stored, $guid ) ) {
+				return array( 'id' => $product_id, 'state' => 'ok', 'context' => 'product' );
+			}
+			return array( 'id' => 0, 'state' => 'missing' );
+		}
+		if ( 'variable' !== $type ) {
+			return array( 'id' => 0, 'state' => 'inconsistent' );
+		}
+		$variation_id = absint( $this->find_variation_id_by_guid( $guid ) );
+		if ( $variation_id <= 0 ) {
+			return array( 'id' => 0, 'state' => 'missing' );
+		}
+		if ( absint( wp_get_post_parent_id( $variation_id ) ) !== $product_id ) {
+			return array( 'id' => $variation_id, 'state' => 'inconsistent' );
+		}
+		return array( 'id' => $variation_id, 'state' => $this->delta_object_state( $variation_id, 'product_variation' ), 'context' => 'variation' );
+	}
+
+	/** @return string ok|quarantined|inconsistent */
+	private function delta_object_state( $object_id, $post_type ) {
+		$object_id = absint( $object_id );
+		if ( $post_type !== get_post_type( $object_id ) ) {
+			return 'inconsistent';
+		}
+		$status = sanitize_key( (string) get_post_status( $object_id ) );
+		if ( in_array( $status, array( '', 'trash', 'auto-draft' ), true ) ) {
+			return 'inconsistent';
+		}
+		if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::is_marked( $object_id ) ) {
+			return 'quarantined';
+		}
+		if ( '1' === (string) get_post_meta( $object_id, 'mobo_sync_incomplete', true )
+			|| '1' === (string) get_post_meta( $object_id, '_mobo_desired_state_rebuild_pending', true ) ) {
+			return 'inconsistent';
+		}
+		return 'ok';
+	}
+
+	/**
+	 * Apply one product-delta-v1 payload (inline from the webhook route or from the
+	 * durable queue). Same product lock, ordering watermarks, price policy, stock
+	 * normalization and Source visibility helpers as full payloads.
+	 *
+	 * Result data keys: deleteFile, needFullSnapshot, staleSkipped, deltaApplied.
+	 *
+	 * @param array $payload Delta payload.
+	 * @return array
+	 */
+	public function apply_product_delta( $payload ) {
+		$item = class_exists( 'Mobo_Core_Product_Delta' ) ? Mobo_Core_Product_Delta::product_item( $payload ) : null;
+		$guid = is_array( $item ) ? Mobo_Core_Product_Delta::product_guid( $item ) : '';
+		if ( '' === $guid ) {
+			return $this->result( false, 'Delta payload has no product identifier.', array( 'deleteFile' => true, 'nonRetryable' => true, 'error' => 'delta_product_guid_missing' ) );
+		}
+		/* Ordering: a delta never overtakes an older open event of the same product or
+		 * variants (that event's revision would otherwise look stale and be skipped). */
+		$queue_uuid = isset( $payload['_moboQueueEventUuid'] ) ? sanitize_text_field( (string) $payload['_moboQueueEventUuid'] ) : '';
+		if ( ( '' !== $queue_uuid || ! empty( $payload['_moboDeltaInline'] ) ) && class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
+			$variant_guids = array();
+			$delta_variants = Mobo_Core_Product_Delta::variants( $item, $payload );
+			foreach ( is_array( $delta_variants ) ? $delta_variants : array() as $delta_variant ) {
+				$variant_guids[] = Mobo_Core_Product_Delta::variant_guid( $delta_variant );
+			}
+			$event_store = new Mobo_Core_Sync_Event_Store();
+			if ( $event_store->has_open_events_before( $guid, $variant_guids, $queue_uuid ) ) {
+				return class_exists( 'Mobo_Core_Product_Concurrency' )
+					? Mobo_Core_Product_Concurrency::defer_result( $guid, 'older_events_pending', 20 )
+					: $this->result( true, 'Delta deferred behind older events.', array( 'deleteFile' => false, 'waitingForProduct' => true, 'deferSeconds' => 20 ) );
+			}
+		}
+
+		$lock = false;
+		if ( class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $guid ) ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $guid, 'manual_sync_active', 30 );
+			}
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $guid, 0, 120 );
+			if ( false === $lock || is_wp_error( $lock ) ) {
+				return Mobo_Core_Product_Concurrency::defer_result( $guid, 'product_lock_busy', 20 );
+			}
+		}
+		try {
+			$run = function () use ( $payload ) {
+				return $this->apply_product_delta_locked( $payload );
+			};
+			return class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ? Mobo_Core_Cache_Mutation_Guard::run( $run, 'webhook-product' ) : $run();
+		} finally {
+			if ( false !== $lock && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+				Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+			}
+		}
+	}
+
+	/**
+	 * Canonical field names understood by the existing price/stock/visibility
+	 * readers, built only from the logical delta fields that are present.
+	 *
+	 * @param array $logical Logical delta fields.
+	 * @return array
+	 */
+	private function delta_canonical_fields( $logical ) {
+		$map = array(
+			'price'          => 'price',
+			'compareAtPrice' => 'comparePrice',
+			'stock'          => 'stock',
+			'publishedAt'    => 'publishedAt',
+			'sourceStatus'   => 'sourceStatus',
+			'visibility'     => 'visibility',
+			'purchasable'    => 'purchasable',
+		);
+		$out = array();
+		foreach ( $map as $field => $key ) {
+			if ( is_array( $logical ) && array_key_exists( $field, $logical ) ) {
+				$out[ $key ] = $logical[ $field ];
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Stage price/stock changes on an in-memory WC object (no save).
+	 *
+	 * @param WC_Product $object Product or variation.
+	 * @param array      $fields Canonical delta fields.
+	 * @param string     $context product|variation.
+	 * @param string     $money_context Money validation context.
+	 * @return bool Whether something was staged.
+	 */
+	private function stage_delta_commerce_fields( $object, $fields, $context, $money_context ) {
+		$staged = false;
+		$money  = $this->validate_money_payload_fields( $fields, $money_context );
+		if ( is_wp_error( $money ) ) {
+			throw new RuntimeException( 'Invalid delta money field: ' . sanitize_text_field( $money->get_error_message() ) );
+		}
+		if ( ( $this->rules->should_update_price() || $this->rules->should_update_compare_price() )
+			&& ( $this->product_price_field_present( $fields ) || $this->product_compare_price_field_present( $fields ) ) ) {
+			$this->apply_price_to_product( $object, $fields, $context, false );
+			$staged = true;
+		}
+		if ( $this->rules->should_update_stock() ) {
+			$stock_present = false;
+			$stock_value   = $this->get_stock_value_from_payload( $fields, $stock_present );
+			if ( $stock_present ) {
+				if ( ! $this->is_valid_api_stock_payload_value( $stock_value ) || ! $this->apply_api_stock( $object, $stock_value ) ) {
+					throw new RuntimeException( 'Invalid delta stock value.' );
+				}
+				$staged = true;
+			}
+		}
+		return $staged;
+	}
+
+	/**
+	 * Delta application under the product lock. Phase 1 validates and stages every
+	 * change in memory; phase 2 saves. A failure in phase 1 applies nothing; a
+	 * failure in phase 2 marks the product incomplete and asks for a full snapshot.
+	 *
+	 * @param array $payload Delta payload.
+	 * @return array
+	 */
+	private function apply_product_delta_locked( $payload ) {
+		$pre  = Mobo_Core_Product_Delta::precheck( $payload, $this );
+		$guid = (string) $pre['productGuid'];
+		if ( 'invalid' === $pre['status'] ) {
+			return $this->result( false, 'Delta payload is malformed: ' . sanitize_key( $pre['reason'] ), array( 'deleteFile' => true, 'nonRetryable' => true, 'productGuid' => $guid, 'error' => sanitize_key( $pre['reason'] ) ) );
+		}
+		if ( 'ok' !== $pre['status'] ) {
+			$this->record_delta_full_snapshot_request( $guid, absint( $pre['product']['id'] ?? 0 ), $pre['reason'] );
+			return $this->result( true, 'Delta cannot be applied safely; a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid, 'reason' => sanitize_key( $pre['reason'] ), 'healthSkipped' => true ) );
+		}
+
+		$product_id = absint( $pre['product']['id'] );
+		$revision   = absint( $pre['revision'] );
+		if ( ! empty( $pre['product']['excluded'] ) ) {
+			return $this->result( true, 'Delta skipped for an excluded product.', array( 'deleteFile' => true, 'productGuid' => $guid, 'productId' => $product_id, 'healthSkipped' => true, 'skippedBecause' => 'excluded_url' ) );
+		}
+		$seen_revision = absint( get_post_meta( $product_id, '_mobo_product_seen_revision', true ) );
+		if ( $seen_revision > $revision ) {
+			return $this->result( true, 'Stale product delta revision skipped.', array( 'deleteFile' => true, 'productGuid' => $guid, 'productId' => $product_id, 'sourceRevision' => $revision, 'staleSkipped' => true ) );
+		}
+
+		$item    = Mobo_Core_Product_Delta::product_item( $payload );
+		$logical = Mobo_Core_Product_Delta::logical_fields( Mobo_Core_Product_Delta::present_fields( $item, Mobo_Core_Product_Delta::PRODUCT_FIELD_ALIASES ), Mobo_Core_Product_Delta::PRODUCT_FIELD_ALIASES );
+		$fields  = $this->delta_canonical_fields( $logical );
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			$this->record_delta_full_snapshot_request( $guid, $product_id, 'product_unloadable' );
+			return $this->result( true, 'Delta product could not be loaded; a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid ) );
+		}
+		$is_variable = $product->is_type( 'variable' );
+
+		/* Phase 1: validate + stage in memory. Nothing is persisted here. */
+		$staged_objects = array();
+		$flag_updates   = array();
+		$watermarks     = array();
+		try {
+			$product_staged = false;
+			if ( ! $is_variable ) {
+				$product_staged = $this->stage_delta_commerce_fields( $product, $fields, 'product', 'product' ) || $product_staged;
+				/* Product-level sourceStatus is visibility (applied below); only an
+				 * explicit product-level purchasable drives the simple product flag. */
+				if ( array_key_exists( 'purchasable', $fields ) ) {
+					$flag_updates[ $product_id ] = Mobo_Core_Source_Visibility::payload_variant_purchasable( array( 'purchasable' => $fields['purchasable'] ) );
+				}
+			}
+			if ( array_key_exists( 'publishedAt', $fields ) && '' !== sanitize_text_field( (string) $fields['publishedAt'] ) ) {
+				$this->apply_product_dates( $product, $fields );
+				$product_staged = true;
+			}
+			$applied_variants = 0;
+			$stale_variants   = 0;
+			foreach ( $pre['targets'] as $target ) {
+				$target_id = absint( $target['id'] );
+				$vlogical  = Mobo_Core_Product_Delta::logical_fields( $target['fields'], Mobo_Core_Product_Delta::variant_field_aliases() );
+				$vfields   = $this->delta_canonical_fields( $vlogical );
+				if ( 'product' === $target['context'] ) {
+					/* Simple product: the embedded variant's fields live on the product. */
+					$product_staged = $this->stage_delta_commerce_fields( $product, $vfields, 'product', 'simple-variant' ) || $product_staged;
+					if ( array_key_exists( 'purchasable', $vfields ) || array_key_exists( 'sourceStatus', $vfields ) ) {
+						$flag_updates[ $product_id ] = Mobo_Core_Source_Visibility::payload_variant_purchasable( $vfields );
+					}
+					$applied_variants++;
+					continue;
+				}
+				$variant_seen = absint( get_post_meta( $target_id, '_mobo_variant_seen_revision', true ) );
+				if ( $variant_seen > absint( $target['revision'] ) ) {
+					$stale_variants++;
+					continue;
+				}
+				$variation = wc_get_product( $target_id );
+				if ( ! $variation instanceof WC_Product_Variation ) {
+					throw new RuntimeException( 'Delta variation could not be loaded.' );
+				}
+				if ( $this->stage_delta_commerce_fields( $variation, $vfields, 'variation', 'variation' ) ) {
+					$staged_objects[ $target_id ] = $variation;
+				}
+				if ( array_key_exists( 'purchasable', $vfields ) || array_key_exists( 'sourceStatus', $vfields ) ) {
+					$flag_updates[ $target_id ] = Mobo_Core_Source_Visibility::payload_variant_purchasable( $vfields );
+				}
+				$watermarks[ $target_id ] = absint( $target['revision'] );
+				$applied_variants++;
+			}
+		} catch ( Throwable $e ) {
+			return $this->result( false, 'Delta rejected before any write: ' . sanitize_text_field( $e->getMessage() ), array( 'deleteFile' => true, 'nonRetryable' => true, 'productGuid' => $guid, 'productId' => $product_id, 'error' => 'delta_validation_failed' ) );
+		}
+
+		/* Phase 2: persist. */
+		try {
+			if ( ! $this->persist_ordering_watermarks( $product_id, 'product', '', $revision, false ) ) {
+				throw new RuntimeException( 'Product delta revision watermark could not be persisted.' );
+			}
+			foreach ( $staged_objects as $variation ) {
+				$variation->save();
+			}
+			if ( $product_staged ) {
+				$product->save();
+			}
+			foreach ( $flag_updates as $flag_object_id => $purchasable ) {
+				Mobo_Core_Source_Visibility::apply_inactive_flag( $flag_object_id, $purchasable );
+			}
+			$visibility = Mobo_Core_Source_Visibility::payload_visibility( $fields );
+			if ( Mobo_Core_Source_Visibility::UNKNOWN !== $visibility ) {
+				Mobo_Core_Source_Visibility::apply_to_product( $product_id, $visibility, Mobo_Core_Source_Visibility::normalize_status( isset( $fields['sourceStatus'] ) ? $fields['sourceStatus'] : '' ) );
+			}
+			foreach ( $watermarks as $variation_id => $variant_revision ) {
+				if ( ! $this->persist_ordering_watermarks( $variation_id, 'variant', '', $variant_revision, true ) ) {
+					throw new RuntimeException( 'Variant delta revision watermark could not be persisted.' );
+				}
+			}
+			if ( ! $this->persist_ordering_watermarks( $product_id, 'product', '', $revision, true ) || ! $this->mark_webhook_product_applied( $product_id ) ) {
+				throw new RuntimeException( 'Product delta applied watermark could not be persisted.' );
+			}
+		} catch ( Throwable $e ) {
+			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+			$this->upsert_product_map( $guid, $product_id, true );
+			$this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_write_failed' );
+			return $this->result( true, 'Delta write failed; product marked incomplete and a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid, 'productId' => $product_id, 'error' => 'delta_write_failed' ) );
+		}
+
+		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+			Mobo_Core_Runtime_Diagnostics::increment( 'product_delta_applied' );
+		}
+		return $this->result(
+			true,
+			'Product delta applied.',
+			array(
+				'deleteFile'      => true,
+				'deltaApplied'    => true,
+				'productGuid'     => $guid,
+				'productId'       => $product_id,
+				'sourceRevision'  => $revision,
+				'appliedVariants' => $applied_variants,
+				'staleVariants'   => $stale_variants,
+			)
+		);
+	}
+
+	/**
+	 * Remember products whose delta could not be applied, so the health report can
+	 * ask the Backend for full snapshots even when the delta was processed from the
+	 * queue after the HTTP response. Bounded to 200 entries.
+	 *
+	 * @param string $guid Product GUID.
+	 * @param int    $product_id Local product ID (0 when unknown).
+	 * @param string $reason Reason code.
+	 * @return void
+	 */
+	private function record_delta_full_snapshot_request( $guid, $product_id, $reason ) {
+		$guid = sanitize_text_field( (string) $guid );
+		if ( '' === $guid ) {
+			return;
+		}
+		$requests = Mobo_Core_Settings::get( 'mobo_core_delta_full_snapshot_requests', array() );
+		$requests = is_array( $requests ) ? $requests : array();
+		unset( $requests[ $guid ] );
+		$requests[ $guid ] = array( 'at' => time(), 'reason' => sanitize_key( (string) $reason ) );
+		if ( count( $requests ) > 200 ) {
+			$requests = array_slice( $requests, -200, null, true );
+		}
+		Mobo_Core_Settings::update( 'mobo_core_delta_full_snapshot_requests', $requests, false );
+		if ( absint( $product_id ) > 0 && class_exists( 'Mobo_Core_Sync_Health' ) && method_exists( 'Mobo_Core_Sync_Health', 'mark_behind' ) ) {
+			Mobo_Core_Sync_Health::mark_behind( $guid, absint( $product_id ) );
+		}
+	}
+
+	/**
+	 * Adaptive Sync/Repair page sizes.
+	 *
+	 * The old fixed defaults (1 product / 5 variants per HTTP page) cost one Backend
+	 * round trip plus one durable checkpoint per product. Pages now default to 10
+	 * products / 25 variants and are scaled by the adaptive tuner's learned host
+	 * speed (0.25x..4x, damped under memory/time pressure). The merchant settings act
+	 * as a floor; the hard ceilings stay 20 / 100. Products are still applied one per
+	 * cooperative step, so a larger page never lengthens a single step's write work.
+	 * Mode `fixed` (option mobo_core_sync_page_size_mode) restores exact settings.
+	 *
+	 * @return array{0:int,1:int}
+	 */
+	public static function effective_page_sizes() {
+		$configured_products = Mobo_Core_Settings::get_int( 'mobo_core_products_per_page', 1, 1, 20 );
+		$configured_variants = Mobo_Core_Settings::get_int( 'mobo_core_variants_per_page', 5, 1, 100 );
+		if ( 'fixed' === sanitize_key( (string) Mobo_Core_Settings::get( 'mobo_core_sync_page_size_mode', 'adaptive' ) ) ) {
+			return array( $configured_products, $configured_variants );
+		}
+		$products = class_exists( 'Mobo_Core_Adaptive_Tuner' ) ? Mobo_Core_Adaptive_Tuner::page_size( 10, $configured_products, 20 ) : max( 10, $configured_products );
+		$variants = class_exists( 'Mobo_Core_Adaptive_Tuner' ) ? Mobo_Core_Adaptive_Tuner::page_size( 25, $configured_variants, 100 ) : max( 25, $configured_variants );
+		$sizes    = apply_filters( 'mobo_core_sync_page_sizes', array( $products, $variants ), $configured_products, $configured_variants );
+		$products = is_array( $sizes ) && isset( $sizes[0] ) ? max( 1, min( 20, absint( $sizes[0] ) ) ) : $products;
+		$variants = is_array( $sizes ) && isset( $sizes[1] ) ? max( 1, min( 100, absint( $sizes[1] ) ) ) : $variants;
+		return array( $products, $variants );
+	}
+
+	/**
+	 * Whether a converged-object no-op fast path may run.
+	 *
+	 * Normal Sync: always (each caller still verifies storefront state). Repair used
+	 * to disable every no-op path, forcing a full WooCommerce save + cache purge for
+	 * every product. Repair now keeps no-op detection and only forces the full save
+	 * for structural drift: the stored source hash must equal the incoming hash
+	 * exactly (no source change since the last complete apply) and the post must be
+	 * in its expected live status. Anything else falls through to the full save.
+	 *
+	 * @param int    $object_id Product/variation ID.
+	 * @param string $old_hash Stored source hash.
+	 * @param string $incoming_hash Incoming source hash.
+	 * @param string $kind product|variation.
+	 * @return bool
+	 */
+	private function noop_fast_path_allowed( $object_id, $old_hash, $incoming_hash, $kind = 'product' ) {
+		if ( ! $this->is_repair_mode() ) {
+			return true;
+		}
+		$object_id = absint( $object_id );
+		if ( $object_id <= 0 || '' === (string) $incoming_hash || ! hash_equals( (string) $incoming_hash, (string) $old_hash ) ) {
+			return false;
+		}
+		if ( (bool) apply_filters( 'mobo_core_repair_force_full_save', false, $object_id, $kind ) ) {
+			return false;
+		}
+		$status  = sanitize_key( (string) get_post_status( $object_id ) );
+		$allowed = 'variation' === $kind ? array( 'publish', 'private' ) : array( 'publish' );
+		if ( ! in_array( $status, $allowed, true ) ) {
+			return false;
+		}
+		if ( '1' === (string) get_post_meta( $object_id, '_mobo_desired_state_rebuild_pending', true ) ) {
+			return false;
+		}
+		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+			Mobo_Core_Runtime_Diagnostics::increment( 'repair_noop' );
+		}
+		return true;
+	}
+
+	/**
 	 * Get repair completion timestamp.
 	 *
 	 * @return int
@@ -2333,6 +2774,11 @@ class Mobo_Core_Product_Sync {
 	}
 
 	public function process_product_updated_payload( &$payload ) {
+		/* product-delta-v1: a delta never enters the full-snapshot pipeline (whose
+		 * absent-field and variant-list semantics assume a complete payload). */
+		if ( class_exists( 'Mobo_Core_Product_Delta' ) && Mobo_Core_Product_Delta::is_delta( $payload ) ) {
+			return $this->apply_product_delta( $payload );
+		}
 		$context = $this->extract_product_updated_result_context( $payload );
 		if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
 			$result = Mobo_Core_Cache_Mutation_Guard::run(
@@ -4860,9 +5306,11 @@ class Mobo_Core_Product_Sync {
 		 * repaired below without running WC_Product::save(), so no page-cache purge is
 		 * generated for an internal-only change.
 		 */
-		if ( ! $is_new_product && ! $this->is_repair_mode() && '' !== $incoming_hash ) {
+		if ( ! $is_new_product && '' !== $incoming_hash ) {
 			$old_hash       = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_source_hash', true ) );
 			$old_incomplete = sanitize_text_field( (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true ) );
+		}
+		if ( ! $is_new_product && '' !== $incoming_hash && $this->noop_fast_path_allowed( $product_id, $old_hash, $incoming_hash, 'product' ) ) {
 
 			/*
 			 * Frontend dirty classification: the source hash may change because policy
@@ -5253,7 +5701,7 @@ class Mobo_Core_Product_Sync {
 			$current_parent_id = absint( wp_get_post_parent_id( $variation_id ) );
 			$current_parent_ok = 0 === $current_parent_id || $current_parent_id === $parent_id;
 
-			if ( ! $this->is_repair_mode() && '' !== $incoming_hash && '1' !== $old_incomplete && $current_parent_ok && $this->variation_frontend_state_matches_payload( $variation_id, $parent_id, $data ) ) {
+			if ( '' !== $incoming_hash && '1' !== $old_incomplete && $current_parent_ok && $this->noop_fast_path_allowed( $variation_id, $old_hash, $incoming_hash, 'variation' ) && $this->variation_frontend_state_matches_payload( $variation_id, $parent_id, $data ) ) {
 				/*
 				 * A remote variant may be recreated with a new GUID while keeping the
 				 * exact same storefront attribute signature. In that case the existing
@@ -6624,10 +7072,39 @@ class Mobo_Core_Product_Sync {
 		return $this->store_product_category_refs( $product_id, is_array( $category_refs ) ? $category_refs : array() );
 	}
 
+	/**
+	 * Image convergence hash. 10.34.78: URLs are reduced to their canonical path
+	 * (Mobo_Core_Image_Source_Identity) so a CDN host / query-string change no longer
+	 * re-enters image processing. Hashes persisted by older builds stay accepted.
+	 */
 	private function build_product_images_source_hash( $images ) {
+		$images = is_array( $images ) ? $images : array();
+		if ( class_exists( 'Mobo_Core_Image_Source_Identity' ) ) {
+			$images = Mobo_Core_Image_Source_Identity::canonicalize_for_hash( $images );
+		}
+		$json   = wp_json_encode( $this->sort_array_for_hash( $images ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		return false === $json ? '' : md5( $json );
+	}
+
+	/** Pre-10.34.78 raw-URL image hash, accepted as an equivalent stored value. */
+	private function build_legacy_product_images_source_hash( $images ) {
 		$images = is_array( $images ) ? $images : array();
 		$json   = wp_json_encode( $this->sort_array_for_hash( $images ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		return false === $json ? '' : md5( $json );
+	}
+
+	/** Whether a stored image hash matches the incoming images (new or legacy form). */
+	private function product_images_hash_matches( $images, $stored ) {
+		$stored = (string) $stored;
+		if ( '' === $stored ) {
+			return false;
+		}
+		$incoming = $this->build_product_images_source_hash( $images );
+		if ( '' !== $incoming && hash_equals( $incoming, $stored ) ) {
+			return true;
+		}
+		$legacy = $this->build_legacy_product_images_source_hash( $images );
+		return '' !== $legacy && hash_equals( $legacy, $stored );
 	}
 
 	private function product_images_need_processing( $product_id, $images, $is_new = false ) {
@@ -6637,8 +7114,8 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 		if ( empty( $images ) ) {
-			$incoming = $this->build_product_images_source_hash( array() );
 			$stored   = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_images_source_hash', true ) );
+			$incoming = $this->product_images_hash_matches( array(), $stored ) ? $stored : $this->build_product_images_source_hash( array() );
 			$product  = wc_get_product( $product_id );
 			$has_linked_images = $product instanceof WC_Product && ( absint( $product->get_image_id() ) > 0 || ! empty( $product->get_gallery_image_ids() ) );
 			$has_queue_rows = false;
@@ -6651,9 +7128,8 @@ class Mobo_Core_Product_Sync {
 		if ( $is_new ) {
 			return true;
 		}
-		$incoming = $this->build_product_images_source_hash( $images );
 		$stored   = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_product_images_source_hash', true ) );
-		if ( '' === $incoming || $incoming !== $stored ) {
+		if ( ! $this->product_images_hash_matches( $images, $stored ) ) {
 			return true;
 		}
 
@@ -7413,7 +7889,7 @@ class Mobo_Core_Product_Sync {
 		$old_mapped    = '1' === sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true ) );
 		$old_incomplete = sanitize_text_field( (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true ) );
 
-		if ( ! $this->is_repair_mode() && $old_mapped && '1' !== $old_incomplete && '' !== $incoming_hash && $old_hash === $incoming_hash && $current instanceof WC_Product_Simple && $this->simple_product_matches_variant_payload( $current, $variant_data ) ) {
+		if ( $old_mapped && '1' !== $old_incomplete && '' !== $incoming_hash && $old_hash === $incoming_hash && $this->noop_fast_path_allowed( $product_id, $old_hash, $incoming_hash, 'product' ) && $current instanceof WC_Product_Simple && $this->simple_product_matches_variant_payload( $current, $variant_data ) ) {
 			$this->store_simple_variant_identity_meta_fast( $product_id, $variant_data, $product_guid );
 			return array(
 				'productId'         => $product_id,

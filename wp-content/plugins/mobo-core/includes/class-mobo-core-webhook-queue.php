@@ -1425,6 +1425,22 @@ class Mobo_Core_Webhook_Queue {
 		$event   = sanitize_text_field( (string) $item['event'] );
 		$payload = isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array();
 
+		/* product-delta-v1 carried inline: apply as-is. EventModel unwrapping would
+		 * drop the envelope-level `delta` flag and route it into the full pipeline. */
+		$raw_is_delta = 'ProductUpdated' === $event && class_exists( 'Mobo_Core_Product_Delta' ) && Mobo_Core_Product_Delta::is_delta( $payload );
+		if ( $raw_is_delta ) {
+			$delta_item = Mobo_Core_Product_Delta::product_item( $payload );
+			if ( is_array( $delta_item ) && '' !== Mobo_Core_Product_Delta::product_guid( $delta_item ) ) {
+				$payload['_moboQueueEventUuid'] = isset( $item['id'] ) ? sanitize_text_field( (string) $item['id'] ) : '';
+				$product_sync = new Mobo_Core_Product_Sync();
+				$result       = $product_sync->apply_product_delta( $payload );
+				if ( is_array( $result ) ) {
+					$result['payload'] = $payload;
+				}
+				return $result;
+			}
+		}
+
 		$payload_result = $this->resolve_lightweight_payload( $event, $payload, $payload_timeout );
 
 		if ( is_wp_error( $payload_result ) ) {
@@ -1447,6 +1463,13 @@ class Mobo_Core_Webhook_Queue {
 
 		if ( is_array( $payload_result ) ) {
 			$payload = $payload_result;
+			if ( $raw_is_delta && ! Mobo_Core_Product_Delta::is_delta( $payload ) ) {
+				/* A pulled delta keeps its delta semantics after unwrapping. */
+				$payload['delta'] = true;
+			}
+			if ( $raw_is_delta ) {
+				$payload['_moboQueueEventUuid'] = isset( $item['id'] ) ? sanitize_text_field( (string) $item['id'] ) : '';
+			}
 		}
 
 		/*

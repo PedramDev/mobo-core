@@ -856,7 +856,7 @@ class Mobo_Core_API_Client {
 		$configured = max( 2, absint( $configured ) );
 
 		if ( self::$runtime_deadline <= 0 ) {
-			return $configured;
+			return self::clamp_to_request_budget( $configured );
 		}
 
 		$remaining = self::$runtime_deadline - microtime( true ) - self::$runtime_deadline_reserve;
@@ -868,6 +868,26 @@ class Mobo_Core_API_Client {
 		}
 
 		return max( 1, min( $configured, (int) floor( $remaining ) ) );
+	}
+
+	/**
+	 * Outside a runner slice (webhook receive, admin fallback, REST), keep a blocking
+	 * request inside the PHP request's own wall-clock budget minus a margin so a
+	 * slow Backend cannot push the request past max_execution_time / proxy timeouts.
+	 * Never below 5 s and never an error: this path only shortens the wait.
+	 *
+	 * @param int $configured Configured timeout seconds.
+	 * @return int
+	 */
+	private static function clamp_to_request_budget( $configured ) {
+		$configured = max( 2, absint( $configured ) );
+		$limit      = absint( ini_get( 'max_execution_time' ) );
+		if ( $limit <= 0 ) {
+			return $configured;
+		}
+		$started   = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? (float) $_SERVER['REQUEST_TIME_FLOAT'] : microtime( true ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- numeric server timestamp.
+		$remaining = ( $started + $limit ) - microtime( true ) - 3.0;
+		return max( min( $configured, 5 ), min( $configured, (int) floor( $remaining ) ) );
 	}
 
 	/**

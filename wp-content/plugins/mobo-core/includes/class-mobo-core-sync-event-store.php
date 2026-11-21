@@ -390,6 +390,12 @@ class Mobo_Core_Sync_Event_Store {
 			return false;
 		}
 
+		/* product-delta-v1 events are partial desired state: they must never
+		 * supersede an older (possibly full) pending event of the same product. */
+		if ( class_exists( 'Mobo_Core_Product_Delta' ) && Mobo_Core_Product_Delta::is_delta( $payload ) ) {
+			return false;
+		}
+
 		$data = $this->get_value( $payload, 'data', array() );
 		if ( is_array( $data ) && ! $this->is_list_array( $data ) ) {
 			$nested = $this->get_value( $data, 'data', null );
@@ -714,6 +720,60 @@ class Mobo_Core_Sync_Event_Store {
 			)
 		);
 
+		return absint( $id ) > 0;
+	}
+
+	/**
+	 * Whether older ProductUpdated/UpdateVariant events for a product (or for any of
+	 * the given variants) are still pending/processing. A delta must be applied after
+	 * them; otherwise its newer revision would make the older complete event look
+	 * stale. Read errors answer true (defer, never reorder).
+	 *
+	 * @param string $product_guid Product GUID.
+	 * @param array  $variant_guids Variant GUIDs touched by the delta.
+	 * @param string $current_event_uuid Queue UUID of the delta itself ('' = inline).
+	 * @return bool
+	 */
+	public function has_open_events_before( $product_guid, $variant_guids = array(), $current_event_uuid = '' ) {
+		global $wpdb;
+
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		if ( '' === $product_guid || ! self::table_exists() ) {
+			return false;
+		}
+
+		$table         = self::table_name();
+		$connection_id = self::connection_id();
+		$guids         = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', array_map( 'strval', (array) $variant_guids ) ) ) ) );
+		$args          = array( $connection_id, $product_guid );
+		$variant_sql   = '';
+		if ( ! empty( $guids ) ) {
+			$variant_sql = " OR (entity_type = 'variant' AND entity_guid IN (" . implode( ',', array_fill( 0, count( $guids ), '%s' ) ) . '))';
+			$args        = array_merge( $args, $guids );
+		}
+		$before_sql         = '';
+		$current_event_uuid = sanitize_text_field( (string) $current_event_uuid );
+		if ( '' !== $current_event_uuid ) {
+			$before_sql = " AND id < COALESCE((SELECT x.id FROM {$table} x WHERE x.connection_id = %d AND x.event_uuid = %s LIMIT 1), 18446744073709551615)";
+			$args[]     = $connection_id;
+			$args[]     = $current_event_uuid;
+		}
+
+		$wpdb->last_error = '';
+		$id = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table}
+				WHERE connection_id = %d
+					AND status IN ('pending','processing')
+					AND event_type IN ('ProductUpdated','UpdateVariant')
+					AND ((entity_type = 'product' AND entity_guid = %s){$variant_sql}){$before_sql}
+				LIMIT 1",
+				$args
+			)
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) ) {
+			return true;
+		}
 		return absint( $id ) > 0;
 	}
 

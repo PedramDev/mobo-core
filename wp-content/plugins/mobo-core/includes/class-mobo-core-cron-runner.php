@@ -224,7 +224,9 @@ class Mobo_Core_Cron_Runner {
 			}
 
 			if ( class_exists( 'Mobo_Core_API_Client' ) && method_exists( 'Mobo_Core_API_Client', 'set_runtime_deadline' ) ) {
-				Mobo_Core_API_Client::set_runtime_deadline( microtime( true ) + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ), 1.0 );
+				/* Every blocking API call is clamped to the remaining slice minus a
+				 * checkpoint margin, never to the configured 60 s default. */
+				Mobo_Core_API_Client::set_runtime_deadline( microtime( true ) + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ), 1.5 );
 			}
 
 			$result = $this->run_connection_dispatcher_locked( $source, $lock, $config );
@@ -604,9 +606,15 @@ class Mobo_Core_Cron_Runner {
 			}
 		}
 
+		/* 10.34.78: runner HTTP requests are clamped to the slice deadline by
+		 * Mobo_Core_API_Client::set_runtime_deadline(); a 60 s configured timeout can
+		 * no longer outlive a ~25 s budget, so size the lease from the clamped value. */
+		$http_timeout_cap = max( 5, $effective_budget );
+		$blocking_timeout = max( 15, min( $blocking_timeout, $http_timeout_cap ) );
 		$lock_ttl = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
 
 		return array(
+			'httpTimeoutCapSeconds'       => $http_timeout_cap,
 			'configuredTimeBudgetSeconds' => $configured_budget,
 			'effectiveTimeBudgetSeconds'  => $effective_budget,
 			'safetyMarginSeconds'         => $safety_margin,

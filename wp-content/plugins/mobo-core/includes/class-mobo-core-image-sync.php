@@ -1702,9 +1702,15 @@ class Mobo_Core_Image_Sync {
 
 			add_filter( 'http_request_args', $secure_image_request_args, 10, 2 );
 
+			if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
+				Mobo_Core_Image_Size_Policy::begin_sideload();
+			}
 			try {
 				$attachment_id = media_sideload_image( $request_url, $product_id, null, 'id' );
 			} finally {
+				if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
+					Mobo_Core_Image_Size_Policy::end_sideload();
+				}
 				remove_filter( 'http_request_args', $secure_image_request_args, 10 );
 				$this->unregister_attachment_identity_bootstrap( $identity_bootstrap );
 			}
@@ -1978,9 +1984,15 @@ class Mobo_Core_Image_Sync {
 		$identity_bootstrap = $this->register_attachment_identity_bootstrap( $product_id, $image_guid, $url );
 		add_filter( 'upload_mimes', $allow_webp, 10, 1 );
 
+		if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
+			Mobo_Core_Image_Size_Policy::begin_sideload();
+		}
 		try {
 			$attachment_id = media_handle_sideload( $file, $product_id );
 		} finally {
+			if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
+				Mobo_Core_Image_Size_Policy::end_sideload();
+			}
 			remove_filter( 'upload_mimes', $allow_webp, 10 );
 			$this->unregister_attachment_identity_bootstrap( $identity_bootstrap );
 		}

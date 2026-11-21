@@ -39,6 +39,9 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @var bool Request-local cache: terminal zero-residue was already proven. */
 	private static $zero_residue_verified = false;
 
+	/** Request-local row-cache bucket for mobo_entity_meta. */
+	const ROW_CACHE_BUCKET = 'entity_meta';
+
 	/**
 	 * Explicit non-namespaced Product metadata owned by MoboCore.
 	 *
@@ -132,12 +135,24 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 			? Mobo_Core_Storage_Schema::table_name( 'products' )
 			: Mobo_Core_Storage_Schema::table_name( 'variants' );
 		$column = 'product' === $post_type ? 'woo_product_id' : 'woo_variation_id';
+		/* 10.34.78: ownership is re-checked on every published_at read. Cache only a
+		 * positive proof for this request; any write to the typed table flushes it. */
+		$bucket = 'product' === $post_type ? 'entity_own_product' : 'entity_own_variant';
+		$hit    = false;
+		if ( true === Mobo_Core_Storage_Row_Cache::get( $bucket, (string) $object_id, $hit ) && $hit ) {
+			return true;
+		}
 		$wpdb->last_error = '';
 		$found = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE {$column}=%d LIMIT 1", $object_id ) );
 		if ( '' !== trim( (string) $wpdb->last_error ) ) {
 			return null;
 		}
-		return absint( $found ) > 0;
+		$owned = absint( $found ) > 0;
+		if ( $owned ) {
+			Mobo_Core_Storage_Row_Cache::register_table( $bucket, $table );
+			Mobo_Core_Storage_Row_Cache::set( $bucket, (string) $object_id, true, $object_id );
+		}
+		return $owned;
 	}
 
 	/**
@@ -231,6 +246,9 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		self::$fenced        = null;
 		self::$transitioning = null;
 		self::$zero_residue_verified = false;
+		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
+			Mobo_Core_Storage_Row_Cache::flush_bucket( self::ROW_CACHE_BUCKET );
+		}
 	}
 
 
@@ -374,20 +392,26 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 			$filtered[] = $row;
 		}
 
-		global $wpdb;
-		$table = self::table_name();
-		$wpdb->last_error = '';
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT id,meta_key,meta_value FROM {$table} WHERE woo_object_id=%d ORDER BY sort_order ASC,id ASC",
-				$object_id
-			)
-		);
-		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+		$grouped = self::object_rows( $object_id );
+		if ( null === $grouped ) {
 			/* Fail closed: native Woo meta survives, retired Mobo meta never falls back. */
 			return $filtered;
 		}
+		$rows = array();
+		foreach ( $grouped as $key_rows ) {
+			foreach ( $key_rows as $key_row ) {
+				$rows[] = $key_row;
+			}
+		}
+		usort(
+			$rows,
+			static function ( $a, $b ) {
+				$cmp = absint( $a['sort_order'] ?? 0 ) <=> absint( $b['sort_order'] ?? 0 );
+				return 0 !== $cmp ? $cmp : ( absint( $a['id'] ?? 0 ) <=> absint( $b['id'] ?? 0 ) );
+			}
+		);
 		foreach ( $rows as $row ) {
+			$row       = (object) $row;
 			$custom_id = absint( $row->id ?? 0 );
 			$key       = (string) ( $row->meta_key ?? '' );
 			if ( $custom_id <= 0 || ! self::is_managed_key( $key ) || ! self::key_applies_to_object( $object_id, $key ) ) {
@@ -1059,11 +1083,66 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		return max( 1, absint( $max ) + 1 );
 	}
 
-	/** @return array|null */
-	private static function read_custom_rows( $object_id, $meta_key ) {
+	/**
+	 * Request-local snapshot of every Custom row of one object, grouped by key in
+	 * sort order. One SELECT serves all subsequent _mobo_* reads of that object until
+	 * a write invalidates it (see Mobo_Core_Storage_Row_Cache).
+	 *
+	 * @param int $object_id Woo object ID.
+	 * @return array<string,array<int,array>>|null Null on read error (never cached).
+	 */
+	private static function object_rows( $object_id ) {
+		global $wpdb;
+		$object_id = absint( $object_id );
+		if ( $object_id <= 0 || ! self::storage_ready() ) {
+			return null;
+		}
+		$hit    = false;
+		$cached = Mobo_Core_Storage_Row_Cache::get( self::ROW_CACHE_BUCKET, (string) $object_id, $hit );
+		if ( $hit && is_array( $cached ) ) {
+			return $cached;
+		}
+		$table = self::table_name();
+		$wpdb->last_error = '';
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id,meta_key,meta_value,sort_order,legacy_meta_id FROM {$table} WHERE woo_object_id=%d ORDER BY sort_order ASC,id ASC",
+				$object_id
+			),
+			ARRAY_A
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			return null;
+		}
+		$grouped = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$grouped[ (string) ( $row['meta_key'] ?? '' ) ][] = $row;
+		}
+		Mobo_Core_Storage_Row_Cache::register_table( self::ROW_CACHE_BUCKET, $table );
+		Mobo_Core_Storage_Row_Cache::set( self::ROW_CACHE_BUCKET, (string) $object_id, $grouped, $object_id );
+		return $grouped;
+	}
+
+	/**
+	 * Rows of one key. Read paths use the request-local object snapshot; write
+	 * decisions pass $fresh=true and always read the database.
+	 *
+	 * @return array|null
+	 */
+	private static function read_custom_rows( $object_id, $meta_key, $fresh = false ) {
 		global $wpdb;
 		if ( ! self::storage_ready() ) {
 			return null;
+		}
+		if ( ! $fresh && Mobo_Core_Storage_Row_Cache::enabled() ) {
+			$grouped = self::object_rows( $object_id );
+			if ( null === $grouped ) {
+				return null;
+			}
+			return isset( $grouped[ (string) $meta_key ] ) ? $grouped[ (string) $meta_key ] : array();
 		}
 		$table = self::table_name();
 		$wpdb->last_error = '';
@@ -1084,7 +1163,7 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @return int|false */
 	private static function add_custom( $object_id, $meta_key, $meta_value, $unique ) {
 		global $wpdb;
-		$rows = self::read_custom_rows( $object_id, $meta_key );
+		$rows = self::read_custom_rows( $object_id, $meta_key, true );
 		if ( null === $rows || ( $unique && ! empty( $rows ) ) ) {
 			return false;
 		}
@@ -1097,6 +1176,8 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$sort  = self::next_sort_order( $object_id, $meta_key );
+		Mobo_Core_Storage_Row_Cache::begin_scoped_write( self::ROW_CACHE_BUCKET );
+		try {
 		$ok = $wpdb->insert(
 			$table,
 			array(
@@ -1111,6 +1192,10 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 			),
 			array( '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s' )
 		);
+		} finally {
+			Mobo_Core_Storage_Row_Cache::end_scoped_write( self::ROW_CACHE_BUCKET );
+			Mobo_Core_Storage_Row_Cache::forget_object( $object_id, self::ROW_CACHE_BUCKET );
+		}
 		if ( false === $ok ) {
 			return false;
 		}
@@ -1121,7 +1206,7 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @return bool */
 	private static function update_custom( $object_id, $meta_key, $meta_value, $prev_value ) {
 		global $wpdb;
-		$rows = self::read_custom_rows( $object_id, $meta_key );
+		$rows = self::read_custom_rows( $object_id, $meta_key, true );
 		if ( null === $rows ) {
 			return false;
 		}
@@ -1154,7 +1239,13 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		/* Detach source identity in the SAME statement as the authoritative Custom
 		 * value change. A kill can therefore expose either the old linked value or the
 		 * new detached value, never new-value + stale source-link. */
-		$ok = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET meta_value=%s,value_hash=%s,legacy_meta_id=NULL,updated_at=%s WHERE id IN ({$ph})", $args ) );
+		Mobo_Core_Storage_Row_Cache::begin_scoped_write( self::ROW_CACHE_BUCKET );
+		try {
+			$ok = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET meta_value=%s,value_hash=%s,legacy_meta_id=NULL,updated_at=%s WHERE id IN ({$ph})", $args ) );
+		} finally {
+			Mobo_Core_Storage_Row_Cache::end_scoped_write( self::ROW_CACHE_BUCKET );
+			Mobo_Core_Storage_Row_Cache::forget_object( $object_id, self::ROW_CACHE_BUCKET );
+		}
 		if ( false === $ok ) {
 			return false;
 		}
@@ -1165,7 +1256,7 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @return bool */
 	private static function delete_custom( $object_id, $meta_key, $meta_value = '' ) {
 		global $wpdb;
-		$rows = self::read_custom_rows( $object_id, $meta_key );
+		$rows = self::read_custom_rows( $object_id, $meta_key, true );
 		if ( null === $rows || empty( $rows ) ) {
 			return false;
 		}
@@ -1184,7 +1275,13 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		}
 		$table = self::table_name();
 		$ph    = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-		$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE id IN ({$ph})", $ids ) );
+		Mobo_Core_Storage_Row_Cache::begin_scoped_write( self::ROW_CACHE_BUCKET );
+		try {
+			$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE id IN ({$ph})", $ids ) );
+		} finally {
+			Mobo_Core_Storage_Row_Cache::end_scoped_write( self::ROW_CACHE_BUCKET );
+			Mobo_Core_Storage_Row_Cache::forget_object( $object_id, self::ROW_CACHE_BUCKET );
+		}
 		if ( false === $deleted ) {
 			return false;
 		}
@@ -1213,6 +1310,7 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @return void */
 	private static function clear_meta_cache( $object_id ) {
 		wp_cache_delete( absint( $object_id ), 'post_meta' );
+		Mobo_Core_Storage_Row_Cache::forget_object( absint( $object_id ), self::ROW_CACHE_BUCKET );
 	}
 
 	/**

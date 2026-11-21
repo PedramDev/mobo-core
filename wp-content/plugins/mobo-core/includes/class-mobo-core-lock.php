@@ -106,6 +106,12 @@ class Mobo_Core_Lock {
 			return false;
 		}
 
+		/* 10.34.78: a new lease holder must never act on Custom Storage rows cached
+		 * before another process committed under the same lock. */
+		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
+			Mobo_Core_Storage_Row_Cache::flush_all();
+		}
+
 		return $token;
 	}
 
@@ -888,8 +894,8 @@ class Mobo_Core_Lock {
 			)
 		);
 
-		self::clear_option_cache( $value_option );
-		self::clear_option_cache( $timeout_option );
+		self::clear_option_cache( $value_option, true );
+		self::clear_option_cache( $timeout_option, true );
 		wp_cache_delete( $transient_name, 'transient' );
 	}
 
@@ -899,9 +905,27 @@ class Mobo_Core_Lock {
 	 * @param string $key Option key.
 	 * @return void
 	 */
-	private static function clear_option_cache( $key ) {
-		wp_cache_delete( (string) $key, 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
+	private static function clear_option_cache( $key, $may_be_autoloaded = false ) {
+		$key = (string) $key;
+		wp_cache_delete( $key, 'options' );
+
+		/* 10.34.78: lease rows are inserted with autoload='no', so they never live in
+		 * `alloptions`. Deleting the whole alloptions/notoptions entries on every
+		 * acquire/renew/release forced WordPress (and Redis/Memcached object caches)
+		 * to reload every autoloaded option several times per product. Remove only
+		 * this key from notoptions, and touch alloptions only for legacy transient
+		 * rows that may have been autoloaded. */
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+		if ( is_array( $notoptions ) && isset( $notoptions[ $key ] ) ) {
+			unset( $notoptions[ $key ] );
+			wp_cache_set( 'notoptions', $notoptions, 'options' );
+		}
+		if ( $may_be_autoloaded ) {
+			$alloptions = wp_cache_get( 'alloptions', 'options' );
+			if ( is_array( $alloptions ) && array_key_exists( $key, $alloptions ) ) {
+				unset( $alloptions[ $key ] );
+				wp_cache_set( 'alloptions', $alloptions, 'options' );
+			}
+		}
 	}
 }

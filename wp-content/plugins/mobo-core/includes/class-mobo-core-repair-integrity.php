@@ -35,6 +35,9 @@ class Mobo_Core_Repair_Integrity {
 	/** @var Mobo_Core_Price_Calculator|null */
 	private $price_calculator;
 
+	/** @var bool Whether the current trashed-row decision stayed local (no network/lock). */
+	private $trashed_row_local_only = true;
+
 	public function __construct() {
 		$this->product_map = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
 		$this->price_calculator = class_exists( 'Mobo_Core_Price_Calculator' ) && class_exists( 'Mobo_Core_Legacy_Rules' )
@@ -647,14 +650,52 @@ class Mobo_Core_Repair_Integrity {
 
 
 	/**
-	 * Restore a trashed Mobo parent only when the current Portal endpoint confirms
-	 * the exact GUID. This is intentionally one network lookup per slice so an
-	 * explicit Repair remains bounded even when an old store has many Trash rows.
+	 * Trashed-product phase driver.
+	 *
+	 * 10.34.78: the default policy keeps every trashed product in Trash, so most
+	 * rows are a purely local decision (log + cursor advance). Those rows are now
+	 * batched (up to `mobo_core_repair_trashed_batch_size`, default 50, within a
+	 * ~2 s slice budget) instead of costing one cooperative step + checkpoint each.
+	 * A row that needs a network lookup or product lock (explicit untrash opt-in)
+	 * still ends the slice, preserving the one-network-lookup-per-slice bound.
 	 *
 	 * @param array $state Manual sync state.
 	 * @return array|WP_Error
 	 */
 	private function run_trashed_product_recovery_slice( &$state ) {
+		$max      = max( 1, min( 500, absint( apply_filters( 'mobo_core_repair_trashed_batch_size', 50 ) ) ) );
+		$deadline = microtime( true ) + 2.0;
+		$handled  = 0;
+		$result   = null;
+		do {
+			$this->trashed_row_local_only = true;
+			$result = $this->run_trashed_product_recovery_one( $state );
+			$handled++;
+			if ( is_wp_error( $result ) || ! is_array( $result ) || empty( $result['success'] ) || ! empty( $result['done'] ) ) {
+				break;
+			}
+			if ( self::PHASE_TRASHED_PRODUCTS !== ( isset( $state['repairIntegrityPhase'] ) ? sanitize_key( (string) $state['repairIntegrityPhase'] ) : '' ) ) {
+				break;
+			}
+			if ( ! $this->trashed_row_local_only ) {
+				break;
+			}
+		} while ( $handled < $max && microtime( true ) < $deadline );
+
+		if ( is_array( $result ) && $handled > 1 && ! empty( $result['success'] ) ) {
+			$result['batchedRows'] = $handled;
+		}
+		return $result;
+	}
+
+	/**
+	 * Restore a trashed Mobo parent only when the current Portal endpoint confirms
+	 * the exact GUID. One row per call; see run_trashed_product_recovery_slice().
+	 *
+	 * @param array $state Manual sync state.
+	 * @return array|WP_Error
+	 */
+	private function run_trashed_product_recovery_one( &$state ) {
 		global $wpdb;
 
 		$cursor = absint( isset( $state['repairIntegrityCursor'] ) ? $state['repairIntegrityCursor'] : 0 );
@@ -693,6 +734,10 @@ class Mobo_Core_Repair_Integrity {
 			}
 			return array( 'success' => true, 'done' => false, 'message' => 'محصول در سطل زباله است و برای حفظ تصمیم مدیر فروشگاه به‌صورت خودکار بازیابی نشد.' );
 		}
+
+		/* Everything below may reach the network or a product lock: end the batch
+		 * after this row. */
+		$this->trashed_row_local_only = false;
 
 		/* If the GUID already has another active local parent, this Trash row is a
 		 * local duplicate/history record and must never be auto-restored. */

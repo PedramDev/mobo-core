@@ -21,11 +21,52 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class Mobo_Core_Adaptive_Tuner {
 
 	const DIAGNOSTICS_OPTION         = 'mobo_core_runtime_diagnostics';
-	const COOLDOWN_SECONDS           = 600;
+	/* 10.34.78: 600 s made a fresh fast host need ~20 minutes to reach 2x. */
+	const COOLDOWN_SECONDS           = 300;
+	const FAST_COOLDOWN_SECONDS      = 120;
 	const HYSTERESIS_PERMILLE        = 200;
 	const UPSHIFT_CONFIDENCE         = 600;
 	const DOWNSHIFT_CONFIDENCE       = 350;
 	const MAX_UPSHIFT_STEP_PERMILLE  = 500;
+	const FAST_UPSHIFT_STEP_PERMILLE = 1000;
+	const MAX_MULTIPLIER_PERMILLE    = 2000;
+	const FAST_MULTIPLIER_PERMILLE   = 4000;
+	const PROVEN_FAST_CONFIDENCE     = 800;
+	/* Fraction of the request budget one stage may ever be predicted to consume. */
+	const STAGE_BUDGET_CAP_PERMILLE  = 800;
+
+	/**
+	 * Settings-derived baseline (merchant configuration) and the effective values
+	 * of this invocation. Runtime overrides (heartbeat/cron budgets) only cap the
+	 * applied limit; they are excluded from the learning fingerprint.
+	 *
+	 * @param array $config Runner config.
+	 * @return array{0:array,1:array} [configured, effective]
+	 */
+	private static function baselines( $config ) {
+		$specs = array(
+			'webhookQueue'      => array( 'mobo_core_webhook_files_per_run', 4, 1, 10 ),
+			'parentFinalize'    => array( 'mobo_core_parent_finalize_batch_size', 10, 1, 50 ),
+			'imageQueue'        => array( 'mobo_core_images_per_run', 3, 1, 10 ),
+			'repriceQueue'      => array( 'mobo_core_reprice_batch_size', 20, 1, 200 ),
+			'recategorizeQueue' => array( 'mobo_core_recategorize_batch_size', 20, 1, 200 ),
+			'cacheWarmup'       => array( 'mobo_core_cache_warmup_batch_size', 2, 1, 10 ),
+		);
+		$configured = array();
+		$effective  = array();
+		$has_configured_reader = method_exists( 'Mobo_Core_Settings', 'get_int_configured' );
+		foreach ( $specs as $stage => $spec ) {
+			$effective[ $stage ]  = max( 1, Mobo_Core_Settings::get_int( $spec[0], $spec[1], $spec[2], $spec[3] ) );
+			$configured[ $stage ] = $has_configured_reader
+				? max( 1, Mobo_Core_Settings::get_int_configured( $spec[0], $spec[1], $spec[2], $spec[3] ) )
+				: $effective[ $stage ];
+		}
+		$effective['productStepsPerRound']  = max( 1, min( 20, absint( isset( $config['productStepsPerRound'] ) ? $config['productStepsPerRound'] : 3 ) ) );
+		$configured['productStepsPerRound'] = $has_configured_reader
+			? max( 1, Mobo_Core_Settings::get_int_configured( 'mobo_core_real_cron_max_sync_steps', 3, 1, 20 ) )
+			: $effective['productStepsPerRound'];
+		return array( $configured, $effective );
+	}
 
 	/**
 	 * Build one immutable tuning profile for the current runner invocation.
@@ -37,15 +78,19 @@ final class Mobo_Core_Adaptive_Tuner {
 		$config  = is_array( $config ) ? $config : array();
 		$enabled = Mobo_Core_Settings::enabled( 'mobo_core_adaptive_execution_enabled', '1' );
 
-		$baseline = array(
-			'webhookQueue'   => Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 ),
-			'parentFinalize' => Mobo_Core_Settings::get_int( 'mobo_core_parent_finalize_batch_size', 10, 1, 50 ),
-			'imageQueue'     => max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 1, 10 ) ),
-			'repriceQueue'   => Mobo_Core_Settings::get_int( 'mobo_core_reprice_batch_size', 20, 1, 200 ),
-			'recategorizeQueue' => Mobo_Core_Settings::get_int( 'mobo_core_recategorize_batch_size', 20, 1, 200 ),
-			'cacheWarmup'    => Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_batch_size', 2, 1, 10 ),
-			'productStepsPerRound' => max( 1, min( 20, absint( isset( $config['productStepsPerRound'] ) ? $config['productStepsPerRound'] : 3 ) ) ),
-		);
+		list( $baseline, $effective ) = self::baselines( $config );
+		/* A runtime override lower than the merchant setting is a hard cap for this
+		 * invocation only (e.g. heartbeat productStepsPerRound=1). */
+		$runtime_caps = array();
+		foreach ( $effective as $key => $value ) {
+			if ( absint( $value ) < absint( $baseline[ $key ] ) ) {
+				$runtime_caps[ $key ] = absint( $value );
+			}
+		}
+		$initial_limits = $baseline;
+		foreach ( $runtime_caps as $key => $cap ) {
+			$initial_limits[ $key ] = min( $initial_limits[ $key ], $cap );
+		}
 
 		$profile = array(
 			'enabled'      => $enabled,
@@ -53,7 +98,9 @@ final class Mobo_Core_Adaptive_Tuner {
 			'reason'       => $enabled ? 'insufficient-history' : 'disabled-by-setting',
 			'generatedAt'  => time(),
 			'baseline'     => $baseline,
-			'limits'       => $baseline,
+			'runtimeCaps'  => $runtime_caps,
+			'limits'       => $initial_limits,
+			'learnedLimits'=> $baseline,
 			'samples'      => array(),
 			'decisions'    => array(),
 			'memory'       => self::memory_snapshot( $config ),
@@ -72,7 +119,9 @@ final class Mobo_Core_Adaptive_Tuner {
 			return $profile;
 		}
 
-		$diagnostics = Mobo_Core_Settings::get( self::DIAGNOSTICS_OPTION, array() );
+		$diagnostics = isset( $config['diagnosticsSnapshot'] ) && is_array( $config['diagnosticsSnapshot'] )
+			? $config['diagnosticsSnapshot']
+			: Mobo_Core_Settings::get( self::DIAGNOSTICS_OPTION, array() );
 		$diagnostics = is_array( $diagnostics ) ? $diagnostics : array();
 		$stages      = isset( $diagnostics['stages'] ) && is_array( $diagnostics['stages'] ) ? $diagnostics['stages'] : array();
 		$runner      = isset( $diagnostics['runner'] ) && is_array( $diagnostics['runner'] ) ? $diagnostics['runner'] : array();
@@ -81,7 +130,7 @@ final class Mobo_Core_Adaptive_Tuner {
 		$last_stop_at = isset( $runner['lastStopAt'] ) && is_array( $runner['lastStopAt'] ) ? $runner['lastStopAt'] : array();
 		$runner_runs = absint( isset( $runner['runs'] ) ? $runner['runs'] : 0 );
 
-		$now             = time();
+		$now             = isset( $config['nowOverride'] ) ? absint( $config['nowOverride'] ) : time();
 		$memory_pressure = absint( isset( $stops['memory-pressure'] ) ? $stops['memory-pressure'] : 0 );
 		$time_pressure   = absint( isset( $stops['time-budget-exhausted'] ) ? $stops['time-budget-exhausted'] : 0 );
 		$memory_stop_at  = absint( isset( $last_stop_at['memory-pressure'] ) ? $last_stop_at['memory-pressure'] : 0 );
@@ -149,24 +198,31 @@ final class Mobo_Core_Adaptive_Tuner {
 			$target_ms = max( 250, (int) round( $target_ms * $global_scale ) );
 			$ideal     = max( 1, (int) floor( $target_ms / max( 1, $sample['msPerItem'] ) ) );
 			$min_limit = 'productSync' === $stage ? 1 : max( 1, (int) ceil( $base * 0.50 ) );
-			$max_limit = min( absint( $hard_max[ $stage ] ), max( $base, (int) floor( $base * 2.0 ) ) );
+
+			$recent_failure_guard = $sample['recentFailPermille'] >= 100 || ( $sample['failed'] > 0 && $sample['runs'] <= 3 );
+			$raw_anchor = self::previous_limit( $previous, $baseline, $limit_key, $base );
+			$proven_fast = self::is_proven_fast( $sample, $minimum_samples, $global_scale, $recent_failure_guard, $ideal, $raw_anchor );
+			$multiplier  = ( $proven_fast ? self::FAST_MULTIPLIER_PERMILLE : self::MAX_MULTIPLIER_PERMILLE ) / 1000;
+			$max_limit = min( absint( $hard_max[ $stage ] ), max( $base, (int) floor( $base * $multiplier ) ) );
 			if ( $global_scale < 1.0 ) {
 				$max_limit = max( $min_limit, min( $max_limit, (int) floor( $base * $global_scale ) ) );
 			}
-
-			$recent_failure_guard = $sample['recentFailPermille'] >= 100 || ( $sample['failed'] > 0 && $sample['runs'] <= 3 );
 			if ( $recent_failure_guard ) {
 				$max_limit = min( $max_limit, $base );
 			}
+			/* Never let one stage be predicted to consume most of the request budget. */
+			$budget_cap = max( 1, (int) floor( ( $budget_ms * self::STAGE_BUDGET_CAP_PERMILLE / 1000 ) / max( 1, $sample['msPerItem'] ) ) );
+			$max_limit  = max( 1, min( $max_limit, $budget_cap ) );
+			$min_limit  = min( $min_limit, $max_limit );
 
-			$anchor = self::previous_limit( $previous, $baseline, $limit_key, $base );
-			$anchor = max( $min_limit, min( $max_limit, $anchor ) );
+			$anchor = max( $min_limit, min( $max_limit, $raw_anchor ) );
 			if ( isset( $sample['latencyTrendPermille'] ) && (int) $sample['latencyTrendPermille'] >= 500 ) {
 				$max_limit = min( $max_limit, $anchor );
 			}
 			$candidate = max( $min_limit, min( $max_limit, $ideal ) );
 			$previous_changed_at = self::previous_changed_at( $previous, $baseline, $limit_key, $base );
-			$cooldown_active = $previous_changed_at > 0 && ( $now - $previous_changed_at ) < self::COOLDOWN_SECONDS;
+			$cooldown_seconds = $proven_fast ? self::FAST_COOLDOWN_SECONDS : self::COOLDOWN_SECONDS;
+			$cooldown_active = $previous_changed_at > 0 && ( $now - $previous_changed_at ) < $cooldown_seconds;
 			$predicted_ms = $anchor * $sample['msPerItem'];
 			$hysteresis_low  = (int) round( $target_ms * ( 1000 - self::HYSTERESIS_PERMILLE ) / 1000 );
 			$hysteresis_high = (int) round( $target_ms * ( 1000 + self::HYSTERESIS_PERMILLE ) / 1000 );
@@ -182,7 +238,17 @@ final class Mobo_Core_Adaptive_Tuner {
 			$is_upshift = $candidate > $anchor;
 			$is_downshift = $candidate < $anchor;
 			$severe_slowdown = $predicted_ms > (int) round( $target_ms * 1.50 );
-			$safety_downshift = $global_scale < 1.0 || $recent_failure_guard || $severe_slowdown;
+			$p95_pressure    = $sample['p95Ms'] > 0 && ( $sample['p95Ms'] * $anchor ) > (int) round( $budget_ms * 0.60 );
+			$safety_downshift = $global_scale < 1.0 || $recent_failure_guard || $severe_slowdown || $p95_pressure;
+
+			/* Fast backoff: errors or tail-latency pressure halve an elevated anchor at
+			 * once instead of creeping down through cooldown/confidence holds. */
+			if ( ( $recent_failure_guard || $p95_pressure ) && $anchor > $min_limit ) {
+				$candidate = min( $candidate, max( $min_limit, (int) floor( $anchor / 2 ) ) );
+				$is_upshift   = false;
+				$is_downshift = $candidate < $anchor;
+				$decision_reason = $recent_failure_guard ? 'fast-backoff-errors' : 'fast-backoff-time-pressure';
+			}
 
 			if ( $is_upshift && $sample['confidencePermille'] < self::UPSHIFT_CONFIDENCE ) {
 				$candidate = $anchor;
@@ -202,7 +268,8 @@ final class Mobo_Core_Adaptive_Tuner {
 			/* Ramp upward by at most 50% of the previous stable anchor per accepted
 			 * decision. This keeps fast hosts from jumping from baseline to 2x in one run. */
 			if ( $candidate > $anchor ) {
-				$max_step = max( 1, (int) ceil( $anchor * self::MAX_UPSHIFT_STEP_PERMILLE / 1000 ) );
+				$step_permille = $proven_fast ? self::FAST_UPSHIFT_STEP_PERMILLE : self::MAX_UPSHIFT_STEP_PERMILLE;
+				$max_step = max( 1, (int) ceil( $anchor * $step_permille / 1000 ) );
 				$candidate = min( $candidate, $anchor + $max_step );
 				if ( $candidate < $ideal ) {
 					$decision_reason = 'bounded-upshift';
@@ -210,7 +277,8 @@ final class Mobo_Core_Adaptive_Tuner {
 			}
 
 			$applied = max( $min_limit, min( $max_limit, $candidate ) );
-			$profile['limits'][ $limit_key ] = $applied;
+			$profile['learnedLimits'][ $limit_key ] = $applied;
+			$profile['limits'][ $limit_key ] = isset( $runtime_caps[ $limit_key ] ) ? min( $applied, $runtime_caps[ $limit_key ] ) : $applied;
 			if ( $applied !== $anchor ) {
 				$profile['stability']['lastChangedAt'][ $limit_key ] = $now;
 				$profile['stability']['changedStages'][] = $limit_key;
@@ -232,6 +300,9 @@ final class Mobo_Core_Adaptive_Tuner {
 				'predictedMsAtAnchor' => $predicted_ms,
 				'confidencePermille'  => $sample['confidencePermille'],
 				'cooldownActive'      => $cooldown_active,
+				'provenFast'          => $proven_fast,
+				'maxLimit'            => $max_limit,
+				'runtimeCap'          => isset( $runtime_caps[ $limit_key ] ) ? $runtime_caps[ $limit_key ] : 0,
 				'reason'              => $decision_reason,
 			);
 		}
@@ -240,6 +311,9 @@ final class Mobo_Core_Adaptive_Tuner {
 		 * Product Sync timing samples exist to make a measured decision. */
 		if ( $global_scale < 1.0 && ! $product_sync_learned ) {
 			$profile['limits']['productStepsPerRound'] = max( 1, (int) floor( $baseline['productStepsPerRound'] * $global_scale ) );
+			if ( isset( $runtime_caps['productStepsPerRound'] ) ) {
+				$profile['limits']['productStepsPerRound'] = min( $profile['limits']['productStepsPerRound'], $runtime_caps['productStepsPerRound'] );
+			}
 		}
 
 		if ( 0 === $learned && 'balanced' === $mode ) {
@@ -248,7 +322,7 @@ final class Mobo_Core_Adaptive_Tuner {
 		} elseif ( ( $learned >= 2 || $product_sync_learned ) && 'balanced' === $mode ) {
 			$increased = false;
 			$decreased = false;
-			foreach ( $profile['limits'] as $key => $value ) {
+			foreach ( $profile['learnedLimits'] as $key => $value ) {
 				if ( ! isset( $baseline[ $key ] ) ) {
 					continue;
 				}
@@ -324,11 +398,84 @@ final class Mobo_Core_Adaptive_Tuner {
 		);
 	}
 
+	/**
+	 * A stage is "proven fast" when a confident, error-free, non-degrading sample
+	 * shows clear headroom. Only such stages may scale to 4x with a faster ramp.
+	 */
+	private static function is_proven_fast( $sample, $minimum_samples, $global_scale, $recent_failure_guard, $ideal, $anchor ) {
+		return $global_scale >= 1.0
+			&& ! $recent_failure_guard
+			&& absint( $sample['confidencePermille'] ) >= self::PROVEN_FAST_CONFIDENCE
+			&& absint( $sample['processed'] ) >= max( 1, absint( $minimum_samples ) ) * 6
+			&& absint( $sample['runs'] ) >= 6
+			&& 0 === absint( $sample['recentFailPermille'] )
+			&& (int) $sample['latencyTrendPermille'] < 250
+			&& absint( $ideal ) >= max( 2, absint( $anchor ) * 2 );
+	}
+
+	/**
+	 * Scale a page/HTTP batch size by the host speed the tuner has learned.
+	 *
+	 * Uses the persisted profile of the last runner invocation (no extra query on
+	 * most requests: runtime diagnostics are already loaded by Settings). Factor =
+	 * learned/baseline product steps (0.25x..4x), damped in conservative/cautious
+	 * modes. The result is always clamped to [$min, $max].
+	 *
+	 * @param int        $default Default page size on an unlearned host.
+	 * @param int        $min Floor.
+	 * @param int        $max Ceiling.
+	 * @param array|null $profile Optional profile (tests).
+	 * @return int
+	 */
+	public static function page_size( $default, $min, $max, $profile = null ) {
+		if ( null === $profile ) {
+			$profile = array();
+			if ( class_exists( 'Mobo_Core_Settings' ) && Mobo_Core_Settings::enabled( 'mobo_core_adaptive_execution_enabled', '1' ) ) {
+				$diagnostics = Mobo_Core_Settings::get( self::DIAGNOSTICS_OPTION, array() );
+				$profile     = is_array( $diagnostics ) && isset( $diagnostics['adaptiveTuning'] ) && is_array( $diagnostics['adaptiveTuning'] ) ? $diagnostics['adaptiveTuning'] : array();
+			}
+		}
+		return self::compute_page_size( $profile, $default, $min, $max );
+	}
+
+	/**
+	 * Pure page-size math (unit tested).
+	 *
+	 * @param array $profile Tuning profile.
+	 * @param int   $default Default.
+	 * @param int   $min Floor.
+	 * @param int   $max Ceiling.
+	 * @return int
+	 */
+	public static function compute_page_size( $profile, $default, $min, $max ) {
+		$min     = max( 1, absint( $min ) );
+		$max     = max( $min, absint( $max ) );
+		$default = max( 1, absint( $default ) );
+		$profile = is_array( $profile ) ? $profile : array();
+		$factor  = 1.0;
+		$base    = isset( $profile['baseline']['productStepsPerRound'] ) ? absint( $profile['baseline']['productStepsPerRound'] ) : 0;
+		$learned = isset( $profile['learnedLimits']['productStepsPerRound'] )
+			? absint( $profile['learnedLimits']['productStepsPerRound'] )
+			: ( isset( $profile['limits']['productStepsPerRound'] ) ? absint( $profile['limits']['productStepsPerRound'] ) : 0 );
+		if ( $base > 0 && $learned > 0 ) {
+			$factor = max( 0.25, min( 4.0, $learned / $base ) );
+		}
+		$mode = isset( $profile['mode'] ) ? (string) $profile['mode'] : '';
+		if ( 'conservative' === $mode ) {
+			$factor = min( $factor, 0.60 );
+		} elseif ( 'cautious' === $mode ) {
+			$factor = min( $factor, 0.75 );
+		}
+		return max( $min, min( $max, (int) round( $default * $factor ) ) );
+	}
+
 	/** Return a previous stage limit only while its configured baseline is unchanged. */
 	private static function previous_limit( $previous, $baseline, $limit_key, $fallback ) {
 		$previous = is_array( $previous ) ? $previous : array();
 		$previous_baseline = isset( $previous['baseline'] ) && is_array( $previous['baseline'] ) ? $previous['baseline'] : array();
-		$previous_limits   = isset( $previous['limits'] ) && is_array( $previous['limits'] ) ? $previous['limits'] : array();
+		$previous_limits   = isset( $previous['learnedLimits'] ) && is_array( $previous['learnedLimits'] )
+			? $previous['learnedLimits']
+			: ( isset( $previous['limits'] ) && is_array( $previous['limits'] ) ? $previous['limits'] : array() );
 		if ( ! isset( $previous_baseline[ $limit_key ], $baseline[ $limit_key ] ) || absint( $previous_baseline[ $limit_key ] ) !== absint( $baseline[ $limit_key ] ) ) {
 			return absint( $fallback );
 		}
@@ -351,7 +498,9 @@ final class Mobo_Core_Adaptive_Tuner {
 		/* Bootstrap from 10.33.16.17/18: only a previously non-baseline adaptive
 		 * limit is treated as a recent change. Baseline values do not create a fake
 		 * cooldown on first 10.33.16.19 execution. */
-		$limits = isset( $previous['limits'] ) && is_array( $previous['limits'] ) ? $previous['limits'] : array();
+		$limits = isset( $previous['learnedLimits'] ) && is_array( $previous['learnedLimits'] )
+			? $previous['learnedLimits']
+			: ( isset( $previous['limits'] ) && is_array( $previous['limits'] ) ? $previous['limits'] : array() );
 		if ( isset( $limits[ $limit_key ] ) && absint( $limits[ $limit_key ] ) !== absint( $fallback ) ) {
 			return absint( isset( $previous['generatedAt'] ) ? $previous['generatedAt'] : 0 );
 		}

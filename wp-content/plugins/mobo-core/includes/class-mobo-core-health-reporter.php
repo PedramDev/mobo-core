@@ -104,6 +104,8 @@ class Mobo_Core_Health_Reporter {
 			'licenseTokenLast4'     => self::mask_secret( $license_token ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'pluginBuildFingerprint'=> class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
+			'capabilities'          => self::capabilities(),
+			'needFullSnapshotProducts' => self::full_snapshot_requests(),
 			'webhookCredential'      => $webhook_auth,
 			'moneyContract'          => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::compatibility_status( 0, true ) : array( 'compatible' => false, 'code' => 'money_policy_unavailable', 'requiresReprovision' => true ),
 			'licenseInstallation'   => class_exists( 'Mobo_Core_Portal_Request_Signer' ) ? Mobo_Core_Portal_Request_Signer::get_status() : array( 'identityReady' => false, 'opensslAvailable' => function_exists( 'openssl_sign' ) ),
@@ -245,6 +247,40 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
+	 * Delta/batch capabilities advertised to the Backend.
+	 *
+	 * @return array
+	 */
+	public static function capabilities() {
+		return array( 'product-delta-v1', 'webhook-batch-v1' );
+	}
+
+	/**
+	 * Product GUIDs whose delta could not be applied locally (bounded list), so the
+	 * Backend can send full snapshots for deltas that were resolved from the queue.
+	 *
+	 * @return array
+	 */
+	private static function full_snapshot_requests() {
+		if ( ! class_exists( 'Mobo_Core_Settings' ) ) {
+			return array();
+		}
+		$requests = Mobo_Core_Settings::get( 'mobo_core_delta_full_snapshot_requests', array() );
+		if ( ! is_array( $requests ) ) {
+			return array();
+		}
+		$cutoff = time() - DAY_IN_SECONDS;
+		$out    = array();
+		foreach ( $requests as $guid => $row ) {
+			$at = is_array( $row ) && isset( $row['at'] ) ? absint( $row['at'] ) : 0;
+			if ( $at >= $cutoff ) {
+				$out[] = array( 'productGuid' => (string) $guid, 'reason' => is_array( $row ) && isset( $row['reason'] ) ? (string) $row['reason'] : '', 'at' => gmdate( 'c', $at ) );
+			}
+		}
+		return array_slice( $out, -200 );
+	}
+
+	/**
 	 * Mask a secret to its last four characters ("****abcd"); '' stays ''.
 	 *
 	 * @param string $value Secret.
@@ -267,6 +303,7 @@ class Mobo_Core_Health_Reporter {
 			'success'       => true,
 			'status'        => 'ok',
 			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'capabilities'  => self::capabilities(),
 			'pluginBuildFingerprint' => class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'siteTime'      => gmdate( 'c' ),
 			'data'          => $this->build_report( true, (bool) $include_license_token ),

@@ -230,6 +230,7 @@ class Mobo_Core_Image_Queue {
 				'position'  => absint( $position ),
 				'imageGuid' => $image_guid,
 				'url'       => $url,
+				'token'     => class_exists( 'Mobo_Core_Image_Source_Identity' ) ? Mobo_Core_Image_Source_Identity::content_token( $image ) : '',
 			);
 		}
 
@@ -316,26 +317,48 @@ class Mobo_Core_Image_Queue {
 			$attachment_id         = is_array( $existing ) ? absint( $existing['attachment_id'] ) : 0;
 			$existing_url          = is_array( $existing ) ? esc_url_raw( (string) $existing['source_url'] ) : '';
 			$status                = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
-			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_identity( $attachment_id, $image_guid, $url );
+			$token                 = isset( $item['token'] ) ? (string) $item['token'] : '';
+			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_identity( $attachment_id, $image_guid, $url, $token );
+			/* 10.34.78: a host/query-only URL change (same path + file name) or an equal
+			 * content token is the same image; refresh bookkeeping instead of
+			 * re-downloading and regenerating every thumbnail. */
+			$stored_token = $attachment_id > 0 ? (string) get_post_meta( $attachment_id, 'mobo_image_content_token', true ) : '';
+			$same_source  = $existing_url === $url
+				|| ( class_exists( 'Mobo_Core_Image_Source_Identity' ) && Mobo_Core_Image_Source_Identity::same_source( $existing_url, $url, $stored_token, $token ) );
 
-			if ( 'done' === $status && $attachment_compatible && $existing_url === $url ) {
+			if ( 'done' === $status && $attachment_compatible && $same_source ) {
+				$refresh = array(
+					'queue_key'      => $key,
+					'product_id'     => $product_id,
+					'product_guid'   => $product_guid,
+					'image_guid'     => $image_guid,
+					'position_index' => $position,
+					'updated_at'     => $now,
+				);
+				$refresh_formats = array( '%s', '%d', '%s', '%s', '%d', '%s' );
+				if ( $existing_url !== $url ) {
+					$refresh['source_url'] = $url;
+					$refresh_formats[]     = '%s';
+				}
 				$write_result = $wpdb->update(
 					$table,
-					array(
-						'queue_key'      => $key,
-						'product_id'     => $product_id,
-						'product_guid'   => $product_guid,
-						'image_guid'     => $image_guid,
-						'position_index' => $position,
-						'updated_at'     => $now,
-					),
+					$refresh,
 					array( 'id' => absint( $existing['id'] ), 'connection_id' => $connection_id ),
-					array( '%s', '%d', '%s', '%s', '%d', '%s' ),
+					$refresh_formats,
 					array( '%d', '%d' )
 				);
 				if ( false === $write_result ) {
 					$db_error = 'Could not refresh an existing image queue row.';
 					continue;
+				}
+				if ( $existing_url !== $url ) {
+					update_post_meta( $attachment_id, 'mobo_source_url', $url );
+					if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+						Mobo_Core_Runtime_Diagnostics::increment( 'image_redownload_avoided' );
+					}
+				}
+				if ( '' !== $token && $stored_token !== $token ) {
+					update_post_meta( $attachment_id, 'mobo_image_content_token', $token );
 				}
 				$count++;
 				continue;
@@ -354,7 +377,11 @@ class Mobo_Core_Image_Queue {
 
 			$superseded_attachment_id = 0;
 			if ( is_array( $existing ) ) {
-				$source_changed = $existing_url !== $url;
+				$source_changed = ! $same_source;
+				if ( 'processing' === $status && ! $source_changed && $existing_url !== $url ) {
+					/* Equivalent URL: keep the in-flight worker's CAS identity intact. */
+					unset( $data['source_url'] );
+				}
 
 				/*
 				 * Do not steal an active worker's lease. A changed desired source updates
@@ -2022,7 +2049,7 @@ class Mobo_Core_Image_Queue {
 	 * @param string $url Source URL.
 	 * @return bool
 	 */
-	private function attachment_matches_identity( $attachment_id, $image_guid, $url ) {
+	private function attachment_matches_identity( $attachment_id, $image_guid, $url, $token = '' ) {
 		$attachment_id = absint( $attachment_id );
 		$image_guid    = strtolower( trim( sanitize_text_field( (string) $image_guid ) ) );
 		if ( $attachment_id <= 0 || '' === $image_guid ) {
@@ -2051,7 +2078,7 @@ class Mobo_Core_Image_Queue {
 			return false;
 		}
 
-		return $this->attachment_matches_source( $attachment_id, $url );
+		return $this->attachment_matches_source( $attachment_id, $url, $token );
 	}
 
 	/**
@@ -2064,7 +2091,7 @@ class Mobo_Core_Image_Queue {
 	 * @param string $url Source URL.
 	 * @return bool
 	 */
-	private function attachment_matches_source( $attachment_id, $url ) {
+	private function attachment_matches_source( $attachment_id, $url, $token = '' ) {
 		$attachment_id = absint( $attachment_id );
 		$url           = esc_url_raw( (string) $url );
 
@@ -2074,7 +2101,10 @@ class Mobo_Core_Image_Queue {
 
 		$stored_source_url = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
 		if ( '' !== $stored_source_url && '' !== $url && $stored_source_url !== $url ) {
-			return false;
+			$stored_token = (string) get_post_meta( $attachment_id, 'mobo_image_content_token', true );
+			if ( ! class_exists( 'Mobo_Core_Image_Source_Identity' ) || ! Mobo_Core_Image_Source_Identity::same_source( $stored_source_url, $url, $stored_token, $token ) ) {
+				return false;
+			}
 		}
 
 		$file = get_attached_file( $attachment_id );

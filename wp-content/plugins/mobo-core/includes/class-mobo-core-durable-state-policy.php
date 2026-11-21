@@ -89,9 +89,41 @@ final class Mobo_Core_Durable_State_Policy {
 		if ( maybe_serialize( $current ) !== maybe_serialize( $expected ) ) {
 			update_post_meta( $post_id, $key, $expected );
 		}
-		wp_cache_delete( $post_id, 'post_meta' );
+		self::invalidate_post_meta_read_caches( $post_id, array( $key ) );
 		$stored = self::canonical_meta_value( get_post_meta( $post_id, $key, true ) );
 		return maybe_serialize( $stored ) === maybe_serialize( $expected );
+	}
+
+	/**
+	 * Make the verification read-back hit the database.
+	 *
+	 * Terminal Custom-Storage keys are served by Mobo's own request-local row cache,
+	 * not by WordPress' post_meta cache, so dropping that object snapshot is enough
+	 * for them and avoids reloading every WooCommerce meta row of the product. Any
+	 * other key keeps the original full post_meta cache invalidation.
+	 *
+	 * @param int   $post_id Post ID.
+	 * @param array $keys Keys about to be verified.
+	 * @return void
+	 */
+	private static function invalidate_post_meta_read_caches( $post_id, $keys ) {
+		$post_id = absint( $post_id );
+		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
+			Mobo_Core_Storage_Row_Cache::forget_object( $post_id );
+		}
+		$all_custom = class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement', false )
+			&& Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative();
+		if ( $all_custom ) {
+			foreach ( (array) $keys as $key ) {
+				if ( ! Mobo_Core_Storage_Entity_Meta_Retirement::key_applies_to_object( $post_id, (string) $key ) ) {
+					$all_custom = false;
+					break;
+				}
+			}
+		}
+		if ( ! $all_custom ) {
+			wp_cache_delete( $post_id, 'post_meta' );
+		}
 	}
 
 	/**
@@ -132,7 +164,7 @@ final class Mobo_Core_Durable_State_Policy {
 		}
 		/* WordPress update_post_meta() may have invalidated the cache while writing.
 		 * Make one final explicit refresh even when every field looked like a no-op. */
-		wp_cache_delete( $post_id, 'post_meta' );
+		self::invalidate_post_meta_read_caches( $post_id, array_keys( $expected ) );
 		foreach ( $expected as $key => $value ) {
 			$stored = self::canonical_meta_value( get_post_meta( $post_id, $key, true ) );
 			if ( maybe_serialize( $stored ) !== maybe_serialize( $value ) ) {

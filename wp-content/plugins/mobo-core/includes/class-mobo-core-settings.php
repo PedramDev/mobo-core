@@ -503,6 +503,41 @@ class Mobo_Core_Settings {
 	}
 
 	/**
+	 * Integer setting as configured by the merchant, ignoring request-local runtime
+	 * overrides (heartbeat/cron budgets). Used as the adaptive tuner's fingerprint so
+	 * a temporary override never discards learned limits.
+	 *
+	 * @param string $key Option key.
+	 * @param int    $default Default.
+	 * @param int    $min Minimum.
+	 * @param int    $max Maximum.
+	 * @return int
+	 */
+	public static function get_int_configured( $key, $default, $min, $max ) {
+		$key = (string) $key;
+		if ( ! array_key_exists( $key, self::$runtime_overrides ) ) {
+			return self::get_int( $key, $default, $min, $max );
+		}
+		$saved = self::$runtime_overrides[ $key ];
+		unset( self::$runtime_overrides[ $key ] );
+		try {
+			return self::get_int( $key, $default, $min, $max );
+		} finally {
+			self::$runtime_overrides[ $key ] = $saved;
+		}
+	}
+
+	/**
+	 * Whether a request-local override is active for one key.
+	 *
+	 * @param string $key Option key.
+	 * @return bool
+	 */
+	public static function has_runtime_override( $key ) {
+		return array_key_exists( (string) $key, self::$runtime_overrides );
+	}
+
+	/**
 	 * Set a request-local setting override.
 	 *
 	 * @param string $key Option key.

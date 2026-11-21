@@ -241,6 +241,14 @@ function mobo_core_terminal_all_meta_read( $check, $object_id, $meta_key, $singl
 }
 add_filter( 'get_post_metadata', 'mobo_core_terminal_all_meta_read', 3, 5 );
 
+/* 10.34.78: Mobo sideloads/attachments generate only the WooCommerce image sizes
+ * (option mobo_core_image_subsizes, filter mobo_core_image_subsizes; 'all' restores
+ * WordPress' default). The Backend already serves resized WebP. */
+function mobo_core_image_subsize_filter( $sizes, $image_meta = array(), $attachment_id = 0 ) {
+	return Mobo_Core_Image_Size_Policy::filter_sizes( $sizes, $image_meta, $attachment_id );
+}
+add_filter( 'intermediate_image_sizes_advanced', 'mobo_core_image_subsize_filter', 20, 3 );
+
 /* WC_Data_Store_WP reads custom Product metadata with SQL and updates existing
  * rows by meta ID, bypassing the ordinary metadata filters above. Bridge those
  * surfaces explicitly so WC_Product::get_meta()/save_meta_data() remain exact. */

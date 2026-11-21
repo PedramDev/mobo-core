@@ -86,6 +86,54 @@ final class Mobo_Core_Storage_Terminal_Meta_Compat {
 			return $check;
 		}
 
+		$legacy_map = self::legacy_all_meta_map( $object_id );
+		if ( null === $legacy_map ) {
+			/* A complete all-meta view cannot be proven. Returning an empty array is
+			 * safer than exposing retired/stale Mobo rows as authoritative. */
+			return array();
+		}
+
+		$out = array();
+		foreach ( $legacy_map as $key => $values ) {
+			$key = (string) $key;
+			if ( self::specialized_key_is_terminal_for_object( $object_id, $key )
+				|| self::generic_key_is_terminal_for_object( $object_id, $key ) ) {
+				continue;
+			}
+			foreach ( (array) $values as $value ) {
+				if ( ! isset( $out[ $key ] ) ) { $out[ $key ] = array(); }
+				$out[ $key ][] = null === $value ? '' : (string) $value;
+			}
+		}
+
+		self::append_specialized_all_meta( $out, $object_id );
+		self::append_generic_all_meta( $out, $object_id );
+		return $out;
+	}
+
+	/**
+	 * Raw wp_postmeta key => values map for one object.
+	 *
+	 * 10.34.78: served from WordPress' own post_meta cache (update_meta_cache() reads
+	 * the identical `post_id=%d ORDER BY meta_id ASC` row set and every metadata
+	 * write invalidates it). Previously every all-meta read, including storefront
+	 * get_post_custom() calls, issued its own uncached SELECT.
+	 *
+	 * @param int $object_id Object ID.
+	 * @return array|null Null when the rows cannot be read.
+	 */
+	private static function legacy_all_meta_map( $object_id ) {
+		$object_id = absint( $object_id );
+		if ( function_exists( 'wp_cache_get' ) && function_exists( 'update_meta_cache' ) ) {
+			$cached = wp_cache_get( $object_id, 'post_meta' );
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+			$primed = update_meta_cache( 'post', array( $object_id ) );
+			if ( is_array( $primed ) ) {
+				return isset( $primed[ $object_id ] ) && is_array( $primed[ $object_id ] ) ? $primed[ $object_id ] : array();
+			}
+		}
 		global $wpdb;
 		$wpdb->last_error = '';
 		$legacy_rows = $wpdb->get_results(
@@ -93,25 +141,13 @@ final class Mobo_Core_Storage_Terminal_Meta_Compat {
 			ARRAY_A
 		);
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $legacy_rows ) ) {
-			/* A complete all-meta view cannot be proven. Returning an empty array is
-			 * safer than exposing retired/stale Mobo rows as authoritative. */
-			return array();
+			return null;
 		}
-
-		$out = array();
+		$map = array();
 		foreach ( $legacy_rows as $row ) {
-			$key = (string) ( $row['meta_key'] ?? '' );
-			if ( self::specialized_key_is_terminal_for_object( $object_id, $key )
-				|| self::generic_key_is_terminal_for_object( $object_id, $key ) ) {
-				continue;
-			}
-			if ( ! isset( $out[ $key ] ) ) { $out[ $key ] = array(); }
-			$out[ $key ][] = null === ( $row['meta_value'] ?? null ) ? '' : (string) $row['meta_value'];
+			$map[ (string) ( $row['meta_key'] ?? '' ) ][] = $row['meta_value'] ?? '';
 		}
-
-		self::append_specialized_all_meta( $out, $object_id );
-		self::append_generic_all_meta( $out, $object_id );
-		return $out;
+		return $map;
 	}
 
 	/** @return bool */

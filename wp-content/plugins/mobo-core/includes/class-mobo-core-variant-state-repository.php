@@ -26,6 +26,36 @@ final class Mobo_Core_Variant_State_Repository {
 		return Mobo_Core_Storage_Schema::table_name( 'variants' );
 	}
 
+	/** Request-local row-cache bucket (see Mobo_Core_Storage_Row_Cache). */
+	const ROW_CACHE_BUCKET = 'variants';
+
+	/**
+	 * Read one row through the request-local cache; any write to the Variants table
+	 * invalidates the bucket. Errors are not cached.
+	 *
+	 * @param string $cache_key Cache key.
+	 * @param string $prepared Prepared SELECT.
+	 * @param int    $object_id Woo object hint for precise invalidation.
+	 * @return array|null
+	 */
+	private static function cached_row( $cache_key, $prepared, $object_id = 0 ) {
+		global $wpdb;
+		$hit    = false;
+		$cached = Mobo_Core_Storage_Row_Cache::get( self::ROW_CACHE_BUCKET, $cache_key, $hit );
+		if ( $hit ) {
+			return is_array( $cached ) ? $cached : null;
+		}
+		$wpdb->last_error = '';
+		$row = $wpdb->get_row( $prepared, ARRAY_A );
+		$row = is_array( $row ) ? $row : null;
+		if ( '' === trim( (string) $wpdb->last_error ) ) {
+			$object_id = is_array( $row ) ? absint( $row['woo_variation_id'] ?? 0 ) : absint( $object_id );
+			Mobo_Core_Storage_Row_Cache::register_table( self::ROW_CACHE_BUCKET, self::table_name() );
+			Mobo_Core_Storage_Row_Cache::set( self::ROW_CACHE_BUCKET, $cache_key, $row, $object_id );
+		}
+		return $row;
+	}
+
 	/**
 	 * Upsert local/remote variation identity only.
 	 *
@@ -340,8 +370,7 @@ final class Mobo_Core_Variant_State_Repository {
 			return null;
 		}
 		$table = self::table_name();
-		$row   = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND variant_guid = %s LIMIT 1", $connection_id, $variant_guid ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'g|' . $connection_id . '|' . $variant_guid, $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND variant_guid = %s LIMIT 1", $connection_id, $variant_guid ) );
 	}
 
 
@@ -352,8 +381,7 @@ final class Mobo_Core_Variant_State_Repository {
 		$woo_variation_id = absint( $woo_variation_id );
 		if ( $connection_id <= 0 || $woo_variation_id <= 0 || ! Mobo_Core_Storage_Schema::is_ready() ) { return null; }
 		$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND woo_variation_id=%d LIMIT 1", $connection_id, $woo_variation_id ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'w|' . $connection_id . '|' . $woo_variation_id, $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id=%d AND woo_variation_id=%d LIMIT 1", $connection_id, $woo_variation_id ), $woo_variation_id );
 	}
 
 	/**
@@ -393,8 +421,7 @@ final class Mobo_Core_Variant_State_Repository {
 		$woo_variation_id = absint( $woo_variation_id );
 		if ( $woo_variation_id <= 0 || ! Mobo_Core_Storage_Schema::is_ready() ) { return null; }
 		$table = self::table_name();
-		$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE woo_variation_id=%d LIMIT 1", $woo_variation_id ), ARRAY_A );
-		return is_array( $row ) ? $row : null;
+		return self::cached_row( 'o|' . $woo_variation_id, $wpdb->prepare( "SELECT * FROM {$table} WHERE woo_variation_id=%d LIMIT 1", $woo_variation_id ), $woo_variation_id );
 	}
 
 	/** @return string */

@@ -706,6 +706,11 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response|WP_Error
 	 */
 	public function receive_webhook( $request ) {
+		/* webhook-batch-v1: authenticated once by check_security() for the whole batch. */
+		if ( class_exists( 'Mobo_Core_Webhook_Batch' ) && Mobo_Core_Webhook_Batch::is_batch_header( $request->get_header( 'X-Mobo-Batch' ) ) ) {
+			return $this->receive_webhook_batch( $request );
+		}
+
 		$payload = $request->get_json_params();
 
 		if ( ! is_array( $payload ) ) {
@@ -714,6 +719,32 @@ class Mobo_Core_Rest_Controller {
 				'Invalid JSON payload.',
 				array( 'status' => 400 )
 			);
+		}
+
+		/* product-delta-v1: decide immediately whether the delta is safe; unknown or
+		 * quarantined/inconsistent local state answers needFullSnapshot. */
+		if ( class_exists( 'Mobo_Core_Product_Delta' ) && 'ProductUpdated' === Mobo_Core_Event_Type_Policy::detect( $payload ) && Mobo_Core_Product_Delta::is_delta( $payload ) ) {
+			$outcome = $this->apply_delta_inline( $payload );
+			if ( is_array( $outcome ) ) {
+				if ( empty( $outcome['ok'] ) ) {
+					return new WP_REST_Response(
+						array(
+							'success'          => false,
+							'status'           => 'rejected',
+							'needFullSnapshot' => false,
+							'error'            => (string) $outcome['error'],
+						),
+						400
+					);
+				}
+				return rest_ensure_response(
+					array(
+						'success'          => true,
+						'status'           => ! empty( $outcome['needFullSnapshot'] ) ? 'need-full-snapshot' : 'applied',
+						'needFullSnapshot' => ! empty( $outcome['needFullSnapshot'] ),
+					)
+				);
+			}
 		}
 
 		$queue = new Mobo_Core_Webhook_Queue();
@@ -748,6 +779,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'success'  => true,
 				'status'   => 'accepted',
+				'needFullSnapshot' => false,
 				'queue'    => array(
 					'processed' => isset( $process_result['processed'] ) ? absint( $process_result['processed'] ) : 0,
 					'failed'    => isset( $process_result['failed'] ) ? absint( $process_result['failed'] ) : 0,
@@ -899,6 +931,125 @@ class Mobo_Core_Rest_Controller {
 	}
 
 	/**
+	 * webhook-batch-v1 receiver. One result per received event, in order; each event
+	 * is applied inline (quick deltas only, within a bounded inline budget) or stored
+	 * whole in the durable webhook queue (ok:true), never partially applied.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	private function receive_webhook_batch( $request ) {
+		$declared = absint( $request->get_header( 'Content-Length' ) );
+		if ( $declared > Mobo_Core_Webhook_Batch::MAX_BYTES ) {
+			return new WP_REST_Response( array( 'success' => false, 'error' => 'batch_too_large' ), 413 );
+		}
+		$raw = (string) $request->get_body();
+		if ( strlen( $raw ) > Mobo_Core_Webhook_Batch::MAX_BYTES ) {
+			return new WP_REST_Response( array( 'success' => false, 'error' => 'batch_too_large' ), 413 );
+		}
+		$parsed = Mobo_Core_Webhook_Batch::parse( $raw, $request->get_json_params() );
+		if ( 200 !== absint( $parsed['status'] ) ) {
+			return new WP_REST_Response( array( 'success' => false, 'error' => (string) $parsed['error'] ), absint( $parsed['status'] ) );
+		}
+
+		$queue         = new Mobo_Core_Webhook_Queue();
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? Mobo_Core_Connection_Context::get_current_connection_id() : 0;
+		$enqueued      = 0;
+		$results       = Mobo_Core_Webhook_Batch::process(
+			$parsed['events'],
+			function ( $payload, $type ) {
+				if ( 'ProductUpdated' !== $type || ! class_exists( 'Mobo_Core_Product_Delta' ) || ! Mobo_Core_Product_Delta::is_delta( $payload ) ) {
+					return null;
+				}
+				return $this->apply_delta_inline( $payload );
+			},
+			function ( $payload ) use ( $queue, $connection_id, &$enqueued ) {
+				$stored = $queue->store( $payload, $connection_id );
+				if ( is_wp_error( $stored ) ) {
+					return $stored;
+				}
+				$enqueued++;
+				return true;
+			},
+			microtime( true ) + $this->inline_webhook_budget_seconds()
+		);
+
+		$self_kick = array( 'success' => true, 'status' => 'skipped' );
+		if ( $enqueued > 0 && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			$self_kick = Mobo_Core_Self_Runner::kick( 'webhook', false );
+		}
+
+		return rest_ensure_response(
+			array(
+				'success'  => true,
+				'results'  => $results,
+				'enqueued' => $enqueued,
+				'selfKick' => $self_kick,
+			)
+		);
+	}
+
+	/**
+	 * Inline (synchronous) budget for webhook deltas: a fraction of the PHP request
+	 * budget, at most 10 s, so the Backend's HTTP call always returns in time.
+	 *
+	 * @return float
+	 */
+	private function inline_webhook_budget_seconds() {
+		$limit = absint( ini_get( 'max_execution_time' ) );
+		$limit = $limit > 0 ? $limit : 30;
+		$spent = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? max( 0.0, microtime( true ) - (float) $_SERVER['REQUEST_TIME_FLOAT'] ) : 0.0; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- numeric server timestamp.
+		$budget = min( 10.0, $limit * 0.4 ) - $spent;
+		return (float) apply_filters( 'mobo_core_webhook_inline_budget_seconds', max( 0.0, $budget ) );
+	}
+
+	/**
+	 * Try one product-delta-v1 event synchronously.
+	 *
+	 * Returns null to decline (the caller stores the event in the durable queue):
+	 * notification-only deltas without inline data, inline apply disabled, or a busy
+	 * product lock. Otherwise returns ok/needFullSnapshot/error.
+	 *
+	 * @param array $payload Delta payload.
+	 * @return array|null
+	 */
+	private function apply_delta_inline( $payload ) {
+		if ( ! class_exists( 'Mobo_Core_Product_Delta' ) || ! class_exists( 'Mobo_Core_Product_Sync' ) ) {
+			return null;
+		}
+		$item = Mobo_Core_Product_Delta::product_item( $payload );
+		if ( ! is_array( $item ) || '' === Mobo_Core_Product_Delta::product_guid( $item ) ) {
+			/* Lightweight notification (payload must be pulled): queue it as today. */
+			return null;
+		}
+		$sync = new Mobo_Core_Product_Sync();
+		$pre  = Mobo_Core_Product_Delta::precheck( $payload, $sync );
+		if ( 'invalid' === $pre['status'] ) {
+			return array( 'ok' => false, 'needFullSnapshot' => false, 'error' => sanitize_key( (string) $pre['reason'] ) );
+		}
+		if ( 'ok' !== $pre['status'] ) {
+			return array( 'ok' => true, 'needFullSnapshot' => true, 'error' => '' );
+		}
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_delta_inline_apply_enabled', '1' ) ) {
+			return null;
+		}
+		$inline_payload                     = $payload;
+		$inline_payload['_moboDeltaInline'] = 1;
+		$result = $sync->apply_product_delta( $inline_payload );
+		$data   = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+		if ( ! empty( $data['waitingForProduct'] ) ) {
+			return null;
+		}
+		if ( ! empty( $data['needFullSnapshot'] ) ) {
+			return array( 'ok' => true, 'needFullSnapshot' => true, 'error' => '' );
+		}
+		if ( empty( $result['success'] ) ) {
+			return array( 'ok' => false, 'needFullSnapshot' => false, 'error' => sanitize_key( (string) ( isset( $data['error'] ) ? $data['error'] : 'delta_failed' ) ) );
+		}
+		return array( 'ok' => true, 'needFullSnapshot' => false, 'error' => '' );
+	}
+
+	/**
 	 * Return local site health for MoboCore probe.
 	 *
 	 * @param WP_REST_Request $request Request.
@@ -1029,6 +1180,7 @@ class Mobo_Core_Rest_Controller {
 			'heartbeatAt'   => gmdate( 'c' ),
 			'durationMs'    => $duration,
 			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+			'capabilities'  => class_exists( 'Mobo_Core_Webhook_Batch' ) ? Mobo_Core_Webhook_Batch::capabilities() : array(),
 			'worker'        => $this->compact_heartbeat_work( $work ),
 			'data'          => isset( $health['data'] ) && is_array( $health['data'] ) ? $health['data'] : array(),
 			'lastReport'    => isset( $health['lastReport'] ) && is_array( $health['lastReport'] ) ? $health['lastReport'] : array(),
