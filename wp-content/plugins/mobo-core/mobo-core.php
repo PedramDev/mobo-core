@@ -1040,17 +1040,50 @@ add_action(
 				if ( ! function_exists( 'is_user_logged_in' ) || ! is_user_logged_in() ) {
 					return;
 				}
-				$state = get_option( 'mobo_core_support_access_state', array() );
-				if ( ! is_array( $state ) || 'granted' !== (string) ( $state['status'] ?? '' ) || absint( $state['expiresAt'] ?? 0 ) > time() ) {
+				$state   = get_option( 'mobo_core_support_access_state', array() );
+				$state   = is_array( $state ) ? $state : array();
+				$expired = 'granted' === (string) ( $state['status'] ?? '' ) && absint( $state['expiresAt'] ?? 0 ) <= time();
+				$user    = wp_get_current_user();
+				$login   = is_object( $user ) && isset( $user->user_login ) ? (string) $user->user_login : '';
+				$is_candidate = get_current_user_id() === absint( $state['userId'] ?? 0 ) || in_array( $login, array( 'MoboCore', 'mobocore-support' ), true );
+				if ( ( ! $expired && ! $is_candidate ) || ! class_exists( 'Mobo_Core_Support_Access' ) ) {
 					return;
 				}
-				Mobo_Core_Support_Access::maybe_expire();
-				if ( get_current_user_id() === absint( $state['userId'] ?? 0 ) ) {
-					wp_clear_auth_cookie();
-					wp_set_current_user( 0 );
-				}
+				/* Per-request session validation: expire a passed grant and log
+				 * the support user out whenever its access is not live (revoked,
+				 * expired, never granted, or state pointing at another user). */
+				Mobo_Core_Support_Access::enforce_current_session();
 			},
 			1
+		);
+
+		/* Support user is powerless without a live grant on every path
+		 * (capabilities) and never gets Application Passwords. Ordinary users
+		 * exit before the support class is parsed. */
+		$mobo_support_candidate = static function ( $user ) {
+			if ( ! is_object( $user ) || empty( $user->ID ) ) {
+				return false;
+			}
+			$state = get_option( 'mobo_core_support_access_state', array() );
+			$sid   = is_array( $state ) ? absint( $state['userId'] ?? 0 ) : 0;
+			$login = isset( $user->user_login ) ? (string) $user->user_login : '';
+			return ( absint( $user->ID ) === $sid || in_array( $login, array( 'MoboCore', 'mobocore-support' ), true ) ) && class_exists( 'Mobo_Core_Support_Access' );
+		};
+		add_filter(
+			'user_has_cap',
+			static function ( $allcaps, $caps, $args, $user ) use ( $mobo_support_candidate ) {
+				return $mobo_support_candidate( $user ) ? Mobo_Core_Support_Access::filter_user_has_cap( $allcaps, $caps, $args, $user ) : $allcaps;
+			},
+			PHP_INT_MAX,
+			4
+		);
+		add_filter(
+			'wp_is_application_passwords_available_for_user',
+			static function ( $available, $user ) use ( $mobo_support_candidate ) {
+				return $mobo_support_candidate( $user ) ? Mobo_Core_Support_Access::filter_application_passwords_available( $available, $user ) : $available;
+			},
+			10,
+			2
 		);
 
 		/* REST controller is parsed only on actual REST requests. */

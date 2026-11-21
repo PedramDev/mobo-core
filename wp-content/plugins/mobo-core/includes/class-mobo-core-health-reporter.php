@@ -331,7 +331,22 @@ class Mobo_Core_Health_Reporter {
 		}
 		$requests = Mobo_Core_Settings::get( 'mobo_core_delta_full_snapshot_requests', array() );
 		if ( ! is_array( $requests ) ) {
-			return array();
+			$requests = array();
+		}
+		/* M6: deltas accepted for quarantined products were not applied; once the
+		 * product is released, ask the Backend for ONE full snapshot. */
+		if ( class_exists( 'Mobo_Core_Product_Delta' ) && class_exists( 'Mobo_Core_Migration_Quarantine' ) ) {
+			$split = Mobo_Core_Product_Delta::split_released_quarantine_skips(
+				Mobo_Core_Settings::get( Mobo_Core_Product_Delta::QUARANTINED_SKIPS_OPTION, array() ),
+				array( 'Mobo_Core_Migration_Quarantine', 'is_marked' )
+			);
+			if ( ! empty( $split['released'] ) ) {
+				foreach ( $split['released'] as $guid => $row ) {
+					$requests[ $guid ] = array( 'at' => time(), 'reason' => 'quarantine_released' );
+				}
+				Mobo_Core_Settings::update( 'mobo_core_delta_full_snapshot_requests', array_slice( $requests, -200, null, true ), false );
+				Mobo_Core_Settings::update( Mobo_Core_Product_Delta::QUARANTINED_SKIPS_OPTION, $split['remaining'], false );
+			}
 		}
 		$cutoff = time() - DAY_IN_SECONDS;
 		$out    = array();

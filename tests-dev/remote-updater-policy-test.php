@@ -112,6 +112,37 @@ $gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
 mobo_assert( 'running' === $gate['state'], 'undecodable lease fails closed (held)' );
 $wpdb->lease = null;
 
+echo "H2: stalled / blocked pending migration no longer blocks a hotfix\n";
+$GLOBALS['mobo_test_options']['mobo_core_db_version'] = '10.33.67';
+unset( $GLOBALS['mobo_test_options'][ Mobo_Core_Remote_Updater::MIGRATION_PROGRESS_OPTION ] );
+$t0 = time();
+$p = Mobo_Core_Remote_Updater::observe_migration_progress( $t0 );
+mobo_assert( $t0 === $p['lastProgressAt'] && 0 === $p['stalledForSeconds'], 'first observation records progress time' );
+$p = Mobo_Core_Remote_Updater::observe_migration_progress( $t0 + 600 );
+mobo_assert( $t0 === $p['lastProgressAt'] && 600 === $p['stalledForSeconds'], 'unchanged fingerprint accumulates stall time' );
+$gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
+mobo_assert( 'pending' === $gate['state'] && false === $gate['upgradeAllowed'], 'recent progress => still pending, refused' );
+mobo_assert_same( true, Mobo_Core_Remote_Updater::migration_gate_refuses( $gate, false ), 'progressing pending migration refuses apply' );
+$GLOBALS['mobo_test_options'][ Mobo_Core_Remote_Updater::MIGRATION_PROGRESS_OPTION ]['since'] = time() - 1801;
+$gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
+mobo_assert( 'stalled' === $gate['state'] && true === $gate['stalled'] && true === $gate['upgradeAllowed'], 'no progress for 30 min and lock free => stalled, upgrade allowed' );
+mobo_assert_same( false, Mobo_Core_Remote_Updater::migration_gate_refuses( $gate, false ), 'stalled migration does not refuse apply (no allowPendingMigration needed)' );
+$wpdb->mysql_holder = '77';
+$gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
+mobo_assert( 'running' === $gate['state'] && false === $gate['upgradeAllowed'] && false === $gate['stalled'], 'stalled but lock held (slice running) => running, refused' );
+mobo_assert_same( true, Mobo_Core_Remote_Updater::migration_gate_refuses( $gate, true ), 'held lock refuses even with allowPendingMigration' );
+$wpdb->mysql_holder = null;
+$GLOBALS['mobo_test_options']['mobo_core_db_version'] = '10.34.10';
+$gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
+mobo_assert( 'pending' === $gate['state'] && 0 === $gate['stalledForSeconds'], 'progress (db_version changed) resets the stall clock' );
+$GLOBALS['mobo_test_options']['mobo_core_schema_last_error'] = 'CREATE command denied';
+$gate = Mobo_Core_Remote_Updater::get_migration_gate_status();
+mobo_assert( 'blocked' === $gate['state'] && 'schema-error' === $gate['blockedReason'] && true === $gate['upgradeAllowed'], 'blocked (schema error) with free lock => upgrade allowed immediately' );
+unset( $GLOBALS['mobo_test_options']['mobo_core_schema_last_error'] );
+mobo_assert_same( false, Mobo_Core_Remote_Updater::migration_gate_refuses( array( 'lockHeld' => false, 'dbVersionMatches' => false ), true ), 'explicit allowPendingMigration still honoured' );
+mobo_assert_same( 1800, Mobo_Core_Remote_Updater::migration_stall_seconds(), 'default stall window is 30 minutes' );
+unset( $GLOBALS['mobo_test_options'][ Mobo_Core_Remote_Updater::MIGRATION_PROGRESS_OPTION ] );
+
 echo "/upgrade/apply refuses during migration (retryable 423)\n";
 class Mobo_Test_Request {
 	private $params;

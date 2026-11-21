@@ -292,4 +292,44 @@ function mobo_core_uninstall_runtime_state() {
 	 */
 }
 
+/**
+ * Revoke support access on uninstall: the plugin-managed support user keeps
+ * its account (authorship) but loses its role, password, sessions and
+ * Application Passwords, and every pending one-time login token is removed.
+ *
+ * @return void
+ */
+function mobo_core_uninstall_revoke_support_access() {
+	global $wpdb;
+	$user_ids = get_users( array( 'meta_key' => '_mobo_core_support_user', 'meta_value' => '1', 'fields' => 'ID', 'number' => 10 ) );
+	$state    = get_option( 'mobo_core_support_access_state', array() );
+	foreach ( (array) $user_ids as $user_id ) {
+		$user_id = absint( $user_id );
+		$user    = $user_id > 0 ? get_userdata( $user_id ) : false;
+		if ( ! $user ) {
+			continue;
+		}
+		wp_set_password( bin2hex( random_bytes( 24 ) ) . wp_generate_password( 16, true, true ), $user_id );
+		$user = get_userdata( $user_id );
+		if ( $user ) {
+			$user->set_role( '' );
+		}
+		if ( class_exists( 'WP_Session_Tokens' ) ) {
+			WP_Session_Tokens::get_instance( $user_id )->destroy_all();
+		}
+		if ( class_exists( 'WP_Application_Passwords' ) && method_exists( 'WP_Application_Passwords', 'delete_all_application_passwords' ) ) {
+			WP_Application_Passwords::delete_all_application_passwords( $user_id );
+		}
+	}
+	if ( is_array( $state ) && ! empty( $state ) ) {
+		$state['status']  = 'revoked';
+		$state['endedAt'] = time();
+		$state['endedBy'] = 'uninstall';
+		update_option( 'mobo_core_support_access_state', $state, true );
+	}
+	$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'mobo_core_support_lt_' ) . '%' ) );
+	delete_option( 'mobo_core_support_login_token_index' );
+}
+
+mobo_core_uninstall_revoke_support_access();
 mobo_core_uninstall_runtime_state();

@@ -61,6 +61,7 @@ class Mobo_Core_Settings {
 		return strlen( $value ) <= $max ? $value : '';
 	}
 	public static function get( $key, $default = '' ) { return get_option( $key, $default ); }
+	public static function enabled( $key, $default = '0' ) { return '1' === (string) get_option( $key, $default ); }
 }
 
 function mobo_assert( $condition, $label ) {

@@ -158,13 +158,17 @@ final class Mobo_Core_Webhook_Batch {
 	 * @param string $error Error code/message.
 	 * @return array
 	 */
-	public static function result( $event_id, $ok, $need_full = false, $error = '' ) {
-		return array(
+	public static function result( $event_id, $ok, $need_full = false, $error = '', $note = '' ) {
+		$row = array(
 			'eventId'          => (string) $event_id,
 			'ok'               => (bool) $ok,
 			'needFullSnapshot' => (bool) $need_full,
 			'error'            => (string) $error,
 		);
+		if ( '' !== (string) $note ) {
+			$row['note'] = (string) $note; // e.g. "quarantined": accepted, not applied, do not retry.
+		}
+		return $row;
 	}
 
 	/**
@@ -206,7 +210,8 @@ final class Mobo_Core_Webhook_Batch {
 						$event_id,
 						! empty( $outcome['ok'] ),
 						! empty( $outcome['needFullSnapshot'] ),
-						isset( $outcome['error'] ) && is_scalar( $outcome['error'] ) ? (string) $outcome['error'] : ''
+						isset( $outcome['error'] ) && is_scalar( $outcome['error'] ) ? (string) $outcome['error'] : '',
+						isset( $outcome['note'] ) && is_scalar( $outcome['note'] ) ? (string) $outcome['note'] : ''
 					);
 					continue;
 				}

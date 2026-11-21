@@ -155,7 +155,14 @@ check( '1250000' === $PR::canonical_decimal( 1250000 ), 'int 1250000' );
 check( '1250000' === $PR::canonical_decimal( 1250000.0 ), 'float 1250000.0' );
 check( '129.99' === $PR::canonical_decimal( 129.99 ), 'float 129.99' );
 check( '0' === $PR::canonical_decimal( '000' ), '"000" -> 0' );
-check( null === $PR::canonical_decimal( '1,250,000' ), 'grouped string rejected' );
+check( '1250000' === $PR::canonical_decimal( '1,250,000' ), 'H5: well-formed thousands grouping accepted' );
+check( '125000' === $PR::canonical_decimal( '۱۲۵٬۰۰۰' ), 'H5: Persian digits + Arabic thousands separator' );
+check( '125000' === $PR::canonical_decimal( '١٢٥٠٠٠' ), 'H5: Arabic-Indic digits' );
+check( '12.5' === $PR::canonical_decimal( '۱۲٫۵' ), 'H5: Arabic decimal separator' );
+check( '125000' === $PR::canonical_decimal( "\xE2\x80\x8F125\xC2\xA0000" ), 'H5: RLM / no-break space stripped' );
+check( null === $PR::canonical_decimal( '1,25,000' ), 'H5: malformed grouping rejected (never guessed)' );
+check( null === $PR::canonical_decimal( '125,000,' ), 'H5: trailing separator rejected' );
+check( true === $PR::decimal_lte( '99.5', '100' ) && false === $PR::decimal_lte( '100.01', '100' ) && true === $PR::decimal_lte( '100', '100.0' ), 'H5: string-exact numeric <=' );
 check( null === $PR::canonical_decimal( '-5' ), 'negative rejected' );
 check( null === $PR::canonical_decimal( true ), 'bool rejected' );
 check( null === $PR::canonical_decimal( '1e5' ), 'exponent rejected' );
@@ -179,6 +186,17 @@ $x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => arr
 check( null === $x['price'] && 'product.variant.price' === $x['field'], 'malformed price stays unknown (fail closed)' );
 $x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => array( 'id' => 77 ) ) ) );
 check( null === $x['price'] && '' === $x['field'], 'missing price -> unknown' );
+$x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => array( 'id' => 77, 'price' => 150000, 'sale_price' => 125000 ) ) ) );
+check( '125000' === $x['price'] && 'product.variant.sale_price' === $x['field'], 'H5: active sale price is what the Source charges' );
+$x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => array( 'id' => 77, 'price' => 150000, 'discount_price' => 0 ) ) ) );
+check( '150000' === $x['price'] && 'product.variant.price' === $x['field'], 'H5: zero discount price means no active discount' );
+$x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => array( 'id' => 77, 'price' => 150000, 'sale_price' => 170000 ) ) ) );
+check( '150000' === $x['price'], 'H5: sale price above list price ignored' );
+$x = $PR::extract_remote_unit_price( array( 'final_unit_price' => '۱۲۰٬۰۰۰', 'product' => array( 'variant' => array( 'id' => 77, 'price' => '۱۵۰٬۰۰۰' ) ) ) );
+check( '120000' === $x['price'] && 'final_unit_price' === $x['field'], 'H5: row final_unit_price with Persian digits' );
+$x = $PR::extract_remote_unit_price( array( 'product' => array( 'variant' => array( 'id' => 77, 'price' => '۱۲۵٬۰۰۰' ) ) ) );
+check( '125000' === $x['price'], 'H5: Persian formatted variant.price no longer becomes remote_unknown' );
+check( array() === $PR::compare_lines( array( '77' => array( 'name' => 'S', 'expected' => '125000.000000' ) ), array( '77' => array( $x['price'] ) ) ), 'H5: numeric (not textual) equality after normalization' );
 
 echo "Per-line comparison\n";
 $expected = array(
@@ -213,6 +231,23 @@ check( '1,250,000' === $PR::format_amount( '1250000' ) && '999' === $PR::format_
 $lines = $PR::describe_mismatches( array( array( 'variantId' => '77', 'name' => 'Shirt', 'expected' => '125000', 'remote' => '1250000' ), array( 'variantId' => '78', 'name' => 'Hat', 'expected' => null, 'remote' => '5' ) ), 'IRT' );
 check( 2 === count( $lines ) && false !== strpos( $lines[0], '125,000 تومان' ) && false !== strpos( $lines[0], '1,250,000 تومان' ) && false !== strpos( $lines[0], 'ریال/تومان' ), 'note line: name, expected, Source price, unit hint' );
 check( false !== strpos( $lines[1], 'نامشخص' ), 'unknown expected price is labelled' );
+
+echo "H5: per-Connection kill-switch\n";
+check( true === $PR::guard_enabled(), 'guard defaults ON' );
+final class Mobo_Core_Settings {
+	public static $values = array();
+	public static function enabled( $key, $default = '0' ) {
+		$value = array_key_exists( $key, self::$values ) ? self::$values[ $key ] : $default;
+		return in_array( strtolower( (string) $value ), array( '1', 'yes', 'true', 'on' ), true );
+	}
+}
+check( true === $PR::guard_enabled(), 'setting absent => default ON' );
+Mobo_Core_Settings::$values[ $PR::OPTION_GUARD_ENABLED ] = '0';
+check( false === $PR::guard_enabled(), 'support can disable the guard per Connection' );
+Mobo_Core_Settings::$values[ $PR::OPTION_GUARD_ENABLED ] = '1';
+check( true === $PR::guard_enabled(), 're-enabled' );
+$validator_src = file_get_contents( $plugin . 'class-mobo-core-checkout-validator.php' );
+check( false !== strpos( $validator_src, 'Mobo_Core_Order_Price_Review::guard_enabled()' ), 'validator consults the kill-switch before comparing' );
 
 echo "\n{$checks} checks, {$failures} failure(s) on PHP " . PHP_VERSION . "\n";
 exit( $failures > 0 ? 1 : 0 );

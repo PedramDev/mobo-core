@@ -15,6 +15,10 @@ class Mobo_Core_Remote_Updater {
 	const HISTORY_OPTION = 'mobo_core_remote_upgrade_history';
 	const MAX_PACKAGE_BYTES = 52428800; // 50 MiB.
 	const MAX_TREE_FILES    = 5000;
+	/** Last observed pending-migration progress {fingerprint, since}. */
+	const MIGRATION_PROGRESS_OPTION = 'mobo_core_upgrade_migration_progress_v1';
+	/** No-progress window after which a free-lock pending migration is stalled. */
+	const MIGRATION_STALL_SECONDS_DEFAULT = 1800;
 
 	/** @var array|null Request-local verified installed-build state. */
 	private static $build_integrity_cache = null;
@@ -70,7 +74,9 @@ class Mobo_Core_Remote_Updater {
 			'currentVersion' => $current_version,
 			/* Backend push gate: upgrade only when migration.upgradeAllowed. */
 			'dbVersion'      => $migration_gate['dbVersion'],
-			'migrationInProgress' => ! empty( $migration_gate['inProgress'] ),
+			/* The current Portal worker refuses to push while this is true; a
+			 * stalled/blocked migration (lock free) must not block a hotfix. */
+			'migrationInProgress' => ! empty( $migration_gate['inProgress'] ) && empty( $migration_gate['upgradeAllowed'] ),
 			'migration'      => $migration_gate,
 			'buildFingerprint' => ! empty( $build_integrity['ready'] ) ? (string) $build_integrity['fingerprint'] : '',
 			'buildIntegrity' => $build_integrity,
@@ -185,12 +191,13 @@ class Mobo_Core_Remote_Updater {
 		/* Never replace plugin files while the database migration for the
 		 * installed build is unfinished or its mutex is held. 423 + retryAfter is
 		 * what the Backend classifies as busy/retryable (409 is treated as a
-		 * permanent block by the current Portal worker). allowPendingMigration
-		 * lets the Backend push a fix-forward build for a stalled (not running)
-		 * migration; it never bypasses a held migration lock. */
+		 * permanent block by the current Portal worker). A migration that is NOT
+		 * running (lock free) but stalled/blocked does not hold back a fix-forward
+		 * build (the Backend never sends allowPendingMigration); a held migration
+		 * lock always refuses. */
 		$migration_gate = self::get_migration_gate_status();
 		$allow_pending  = ! empty( $params['allowPendingMigration'] ) && true === filter_var( $params['allowPendingMigration'], FILTER_VALIDATE_BOOLEAN );
-		if ( ! empty( $migration_gate['lockHeld'] ) || ( empty( $migration_gate['dbVersionMatches'] ) && ! $allow_pending ) ) {
+		if ( self::migration_gate_refuses( $migration_gate, $allow_pending ) ) {
 			return new WP_Error(
 				'mobo_core_upgrade_migration_in_progress',
 				'Database migration for the installed version is not finished; retry the upgrade later.',
@@ -1448,6 +1455,21 @@ class Mobo_Core_Remote_Updater {
 		$lock_held = '' !== $lock_kind;
 		$state = $lock_held ? 'running' : ( $matches ? 'complete' : 'pending' );
 
+		/* Stall/blocked detection for a pending migration (H2): the gate keeps the
+		 * last observed progress fingerprint; a pending migration whose lock is
+		 * free and that made no progress for the stall window (or reports a
+		 * blocked/needs-support state) no longer blocks a hotfix. */
+		$progress = $matches
+			? array( 'lastProgressAt' => 0, 'stalledForSeconds' => 0, 'blocked' => false, 'blockedReason' => '' )
+			: self::observe_migration_progress();
+		$stall_threshold = self::migration_stall_seconds();
+		$stalled = ! $matches && ! $lock_held && $progress['stalledForSeconds'] >= $stall_threshold;
+		$blocked = ! $matches && ! $lock_held && ! empty( $progress['blocked'] );
+		if ( 'pending' === $state && ( $stalled || $blocked ) ) {
+			$state = $blocked ? 'blocked' : 'stalled';
+		}
+		$allowed = in_array( $state, array( 'complete', 'stalled', 'blocked' ), true );
+
 		return array(
 			'dbVersion'        => sanitize_text_field( $db_version ),
 			'codeVersion'      => $code_version,
@@ -1456,8 +1478,122 @@ class Mobo_Core_Remote_Updater {
 			'lockKind'         => $lock_kind,
 			'inProgress'       => 'complete' !== $state,
 			'state'            => $state,
-			'upgradeAllowed'   => 'complete' === $state,
-			'retryAfter'       => 'complete' === $state ? 0 : 120,
+			'upgradeAllowed'   => $allowed,
+			'retryAfter'       => $allowed ? 0 : 120,
+			'stalled'          => $stalled,
+			'blocked'          => $blocked,
+			'blockedReason'    => $blocked ? (string) $progress['blockedReason'] : '',
+			'lastProgressAt'   => absint( $progress['lastProgressAt'] ),
+			'stalledForSeconds' => absint( $progress['stalledForSeconds'] ),
+			'stallThresholdSeconds' => $stall_threshold,
+		);
+	}
+
+	/**
+	 * Pure /upgrade/apply refusal decision (unit tested).
+	 *
+	 * Refuse while a migration slice actually runs (lock held), and while a
+	 * pending migration is still progressing. A stalled/blocked migration with a
+	 * free lock, or an explicit allowPendingMigration, lets a fix-forward build in.
+	 *
+	 * @param array $gate          get_migration_gate_status() result.
+	 * @param bool  $allow_pending Explicit Backend override.
+	 * @return bool True to refuse with 423.
+	 */
+	public static function migration_gate_refuses( $gate, $allow_pending = false ) {
+		$gate = is_array( $gate ) ? $gate : array();
+		if ( ! empty( $gate['lockHeld'] ) ) { return true; }
+		if ( ! empty( $gate['dbVersionMatches'] ) ) { return false; }
+		if ( $allow_pending || ! empty( $gate['stalled'] ) || ! empty( $gate['blocked'] ) ) { return false; }
+		return true;
+	}
+
+	/**
+	 * Seconds without migration progress after which a free-lock pending
+	 * migration counts as stalled. Constant MOBO_CORE_UPGRADE_MIGRATION_STALL_SECONDS
+	 * or filter `mobo_core_upgrade_migration_stall_seconds`; minimum 300.
+	 *
+	 * @return int
+	 */
+	public static function migration_stall_seconds() {
+		$seconds = defined( 'MOBO_CORE_UPGRADE_MIGRATION_STALL_SECONDS' ) ? (int) MOBO_CORE_UPGRADE_MIGRATION_STALL_SECONDS : self::MIGRATION_STALL_SECONDS_DEFAULT;
+		$seconds = (int) apply_filters( 'mobo_core_upgrade_migration_stall_seconds', $seconds );
+		return max( 300, $seconds );
+	}
+
+	/**
+	 * Read-only progress fingerprint of the pending migration plus blocked
+	 * detection. Uses only public status readers; never touches the mutex.
+	 *
+	 * @return array{fingerprint:string,blocked:bool,blockedReason:string}
+	 */
+	public static function migration_progress_snapshot() {
+		$parts   = array( trim( (string) get_option( 'mobo_core_db_version', '' ) ) );
+		$blocked = '';
+		$classes = array(
+			'operational' => 'Mobo_Core_Storage_Operational_Meta_Retirement',
+			'identity'    => 'Mobo_Core_Storage_Identity_Meta_Retirement',
+			'entity'      => 'Mobo_Core_Storage_Entity_Meta_Retirement',
+		);
+		foreach ( $classes as $key => $class ) {
+			if ( ! class_exists( $class ) || ! method_exists( $class, 'get_status' ) ) { continue; }
+			$worker = call_user_func( array( $class, 'get_status' ) );
+			$worker = is_array( $worker ) ? $worker : array();
+			$status = strtolower( sanitize_key( (string) ( $worker['status'] ?? '' ) ) );
+			$parts[] = $key . ':' . wp_json_encode( array(
+				$status,
+				$worker['stateRevision'] ?? 0,
+				$worker['proofCursor'] ?? 0,
+				$worker['copyCursor'] ?? 0,
+				$worker['cleanupCursor'] ?? 0,
+				$worker['reconcileCursor'] ?? 0,
+				$worker['backfillCursor'] ?? 0,
+				$worker['cleanedRows'] ?? 0,
+				! empty( $worker['complete'] ),
+			) );
+			if ( '' === $blocked && ( false !== strpos( $status, 'blocked' ) || false !== strpos( $status, 'support' ) ) ) {
+				$blocked = $key . ':' . $status;
+			}
+		}
+		if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && method_exists( 'Mobo_Core_Migration_Quarantine', 'count' ) ) {
+			$marked  = (int) Mobo_Core_Migration_Quarantine::count();
+			$parts[] = 'marked:' . $marked;
+			if ( '' === $blocked && defined( 'Mobo_Core_Migration_Quarantine::MAX_ITEMS' ) && $marked >= (int) Mobo_Core_Migration_Quarantine::MAX_ITEMS ) {
+				$blocked = 'quarantine-capacity';
+			}
+		}
+		$parts[] = 'seed:' . (string) get_option( 'mobo_core_product_map_last_seed_at', '' );
+		if ( '' === $blocked && '' !== trim( (string) get_option( 'mobo_core_schema_last_error', '' ) ) ) {
+			$blocked = 'schema-error';
+		}
+		return array(
+			'fingerprint'   => sha1( implode( '|', $parts ) ),
+			'blocked'       => '' !== $blocked,
+			'blockedReason' => sanitize_text_field( $blocked ),
+		);
+	}
+
+	/**
+	 * Record the progress fingerprint and report how long it has been unchanged.
+	 *
+	 * @param int|null $now Override for tests.
+	 * @return array{lastProgressAt:int,stalledForSeconds:int,blocked:bool,blockedReason:string}
+	 */
+	public static function observe_migration_progress( $now = null ) {
+		$now      = null === $now ? time() : (int) $now;
+		$snapshot = self::migration_progress_snapshot();
+		$stored   = get_option( self::MIGRATION_PROGRESS_OPTION, array() );
+		$stored   = is_array( $stored ) ? $stored : array();
+		$since    = absint( $stored['since'] ?? 0 );
+		if ( ! isset( $stored['fingerprint'] ) || ! hash_equals( (string) $stored['fingerprint'], $snapshot['fingerprint'] ) || $since <= 0 || $since > $now ) {
+			$since = $now;
+			update_option( self::MIGRATION_PROGRESS_OPTION, array( 'fingerprint' => $snapshot['fingerprint'], 'since' => $since ), false );
+		}
+		return array(
+			'lastProgressAt'    => $since,
+			'stalledForSeconds' => max( 0, $now - $since ),
+			'blocked'           => $snapshot['blocked'],
+			'blockedReason'     => $snapshot['blockedReason'],
 		);
 	}
 

@@ -161,8 +161,37 @@ final class Mobo_Core_Product_State_Repository {
 			return absint( isset( $by_woo['connection_id'] ) ? $by_woo['connection_id'] : 0 ) === $connection_id && sanitize_text_field( (string) $by_woo['product_guid'] ) === $product_guid;
 		}
 		$by_guid = $wpdb->get_row( $wpdb->prepare( "SELECT woo_product_id FROM {$table} WHERE connection_id=%d AND product_guid=%s LIMIT 1", $connection_id, $product_guid ), ARRAY_A );
-		if ( is_array( $by_guid ) && absint( isset( $by_guid['woo_product_id'] ) ? $by_guid['woo_product_id'] : 0 ) > 0 && absint( $by_guid['woo_product_id'] ) !== $woo_product_id ) { return false; }
+		$stale_owner = is_array( $by_guid ) ? absint( isset( $by_guid['woo_product_id'] ) ? $by_guid['woo_product_id'] : 0 ) : 0;
+		if ( $stale_owner > 0 && $stale_owner !== $woo_product_id ) {
+			/* M12: the row may point at a post that was hard-deleted without the
+			 * deleted_post cleanup (kill, bulk delete, backup restore). Re-point
+			 * exactly that leftover row (CAS on the old id) instead of refusing the
+			 * bind forever, which made every retry create another duplicate. A live
+			 * (even trashed) owner is never taken over. */
+			if ( ! $this->woo_post_missing( $stale_owner ) ) { return false; }
+			$repointed = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET woo_product_id=%d, updated_at=%s WHERE connection_id=%d AND product_guid=%s AND woo_product_id=%d", $woo_product_id, current_time( 'mysql', true ), $connection_id, $product_guid, $stale_owner ) );
+			if ( 1 !== (int) $repointed ) { return false; }
+			if ( class_exists( 'Mobo_Core_Storage_Row_Cache' ) && method_exists( 'Mobo_Core_Storage_Row_Cache', 'flush_all' ) ) { Mobo_Core_Storage_Row_Cache::flush_all(); }
+			if ( class_exists( 'Mobo_Core_Logger' ) ) {
+				Mobo_Core_Logger::warning( 'Repaired a product identity row that pointed at a deleted post.', array( 'productGuid' => $product_guid, 'deletedPostId' => $stale_owner, 'productId' => $woo_product_id ) );
+			}
+		}
 		return $this->upsert_identity( $product_guid, $woo_product_id, 0 );
+	}
+
+	/**
+	 * Whether a Woo post id no longer exists at all (hard-deleted).
+	 *
+	 * @param int $post_id Post id.
+	 * @return bool
+	 */
+	private function woo_post_missing( $post_id ) {
+		global $wpdb;
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 ) { return false; }
+		$wpdb->last_error = '';
+		$found = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE ID=%d LIMIT 1", $post_id ) );
+		return '' === (string) $wpdb->last_error && null === $found;
 	}
 
 	/** Set canonical Portal product ID for an already-bound Product. @return bool */

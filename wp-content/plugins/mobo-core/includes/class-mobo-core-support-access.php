@@ -4,9 +4,13 @@
  * diagnostics, sealed hosting-panel credentials and a readiness checklist.
  *
  * Contract (Backend "Portal"):
- * - POST /support/login-link     (X-SEC)  -> one-time login URL while access is granted.
- * - GET  /support/login?token=   (public) -> single-use, rate-limited login + redirect.
- * - POST /support/request-access (X-SEC)  -> pending request + admin notice + one email.
+ * - POST /support/login-link     (Default Connection X-SEC) -> one-time login URL while access is granted.
+ * - GET  /support/login?token=   (public) -> confirmation page only; never consumes the token.
+ * - POST /support/login          (public, token in body) -> single-use, rate-limited login + redirect.
+ * - POST /support/request-access (Default Connection X-SEC) -> pending request + admin notice + one email.
+ * - The support user is stripped of all capabilities unless access is granted
+ *   (user_has_cap), logged out on every request once access is not live, never
+ *   gets Application Passwords, and can never grant/extend its own access.
  * - POST {api_base_url}/api/support/hosting-access (plugin -> Backend, Token + X-SEC).
  *
  * Security notes:
@@ -92,6 +96,10 @@ final class Mobo_Core_Support_Access {
 
 	const SOURCE_CHECK_INTERVAL = 21600; // 6 hours.
 	const SOURCE_LOCK_RETRY     = 1800;  // Lock contention: try again after 30 minutes.
+	/** Cron Source check is skipped when less than this is left in the runner slice. */
+	const CRON_MIN_REMAINING_SECONDS = 15;
+	/** Safety margin kept between the last Source HTTP timeout and the deadline. */
+	const CRON_HTTP_MARGIN_SECONDS   = 2;
 
 	const INTEGRITY_CACHE_TTL = 21600;
 
@@ -212,6 +220,12 @@ final class Mobo_Core_Support_Access {
 		if ( ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || ! function_exists( 'current_user_can' ) || ! current_user_can( 'manage_options' ) ) {
 			return new WP_Error( 'mobo_core_support_forbidden', 'اجازه این عملیات را ندارید.' );
 		}
+		/* Only a non-support administrator may grant or extend support access;
+		 * the support user can never extend its own access. */
+		if ( function_exists( 'get_current_user_id' ) && self::is_support_user( get_current_user_id() ) ) {
+			self::log_event( 'grant_refused', array( 'requestedBy' => $granted_by, 'detail' => 'self_extend' ) );
+			return new WP_Error( 'mobo_core_support_self_extend_forbidden', 'کاربر پشتیبانی نمی‌تواند دسترسی خودش را فعال یا تمدید کند.' );
+		}
 
 		$days = self::clamp_days( $days );
 		$user = self::ensure_support_user();
@@ -259,6 +273,9 @@ final class Mobo_Core_Support_Access {
 				if ( class_exists( 'WP_Session_Tokens' ) ) {
 					WP_Session_Tokens::get_instance( $user_id )->destroy_all();
 				}
+				if ( class_exists( 'WP_Application_Passwords' ) && method_exists( 'WP_Application_Passwords', 'delete_all_application_passwords' ) ) {
+					WP_Application_Passwords::delete_all_application_passwords( $user_id );
+				}
 			}
 		}
 
@@ -283,6 +300,104 @@ final class Mobo_Core_Support_Access {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Whether a user id is the plugin-managed support user (marked user, or the
+	 * user recorded in the access state).
+	 *
+	 * @param int $user_id User id.
+	 * @return bool
+	 */
+	public static function is_support_user( $user_id ) {
+		$user_id = absint( $user_id );
+		if ( $user_id <= 0 ) {
+			return false;
+		}
+		$state = self::get_state();
+		if ( $user_id === absint( isset( $state['userId'] ) ? $state['userId'] : 0 ) ) {
+			return true;
+		}
+		return function_exists( 'get_user_meta' ) && '1' === (string) get_user_meta( $user_id, self::USER_META_MARK, true );
+	}
+
+	/**
+	 * Whether the given support user currently holds a live granted access.
+	 *
+	 * @param int      $user_id User id.
+	 * @param int|null $now     Unix time.
+	 * @return bool
+	 */
+	public static function support_user_session_valid( $user_id, $now = null ) {
+		$state = self::get_state();
+		$now   = null === $now ? time() : (int) $now;
+		return 'granted' === self::resolve_status( $state, $now )
+			&& absint( $user_id ) > 0
+			&& absint( $user_id ) === absint( isset( $state['userId'] ) ? $state['userId'] : 0 );
+	}
+
+	/**
+	 * user_has_cap filter (wired in mobo-core.php): strip every capability from the support user unless access is granted.
+	 * Covers FTP-removed plugin folders being restored, rollbacks and any path
+	 * where expiry/revoke did not run: a marked user is powerless without a
+	 * live grant.
+	 *
+	 * @param array $allcaps All caps.
+	 * @param array $caps    Required caps.
+	 * @param array $args    Args.
+	 * @param mixed $user    WP_User.
+	 * @return array
+	 */
+	public static function filter_user_has_cap( $allcaps, $caps = array(), $args = array(), $user = null ) {
+		$user_id = is_object( $user ) && isset( $user->ID ) ? absint( $user->ID ) : 0;
+		if ( $user_id <= 0 || ! is_array( $allcaps ) || empty( $allcaps ) ) {
+			return $allcaps;
+		}
+		$login = is_object( $user ) && isset( $user->user_login ) ? (string) $user->user_login : '';
+		$state = self::get_state();
+		if ( $user_id !== absint( isset( $state['userId'] ) ? $state['userId'] : 0 ) && ! in_array( $login, array( self::PRIMARY_LOGIN, self::FALLBACK_LOGIN ), true ) ) {
+			return $allcaps; // Cheap exit for every ordinary user.
+		}
+		if ( ! self::is_support_user( $user_id ) || self::support_user_session_valid( $user_id ) ) {
+			return $allcaps;
+		}
+		return array();
+	}
+
+	/**
+	 * The support user never gets Application Passwords (they would outlive revoke).
+	 *
+	 * @param bool  $available Available.
+	 * @param mixed $user      WP_User.
+	 * @return bool
+	 */
+	public static function filter_application_passwords_available( $available, $user = null ) {
+		$user_id = is_object( $user ) && isset( $user->ID ) ? absint( $user->ID ) : 0;
+		return ( $user_id > 0 && self::is_support_user( $user_id ) ) ? false : $available;
+	}
+
+	/**
+	 * Per-request session validation for a logged-in support user: expire a
+	 * passed grant and log the support user out whenever its access is not live.
+	 *
+	 * @return bool True when the current session was terminated.
+	 */
+	public static function enforce_current_session() {
+		self::maybe_expire();
+		$user_id = function_exists( 'get_current_user_id' ) ? absint( get_current_user_id() ) : 0;
+		if ( $user_id <= 0 || ! self::is_support_user( $user_id ) || self::support_user_session_valid( $user_id ) ) {
+			return false;
+		}
+		if ( class_exists( 'WP_Session_Tokens' ) ) {
+			WP_Session_Tokens::get_instance( $user_id )->destroy_all();
+		}
+		if ( function_exists( 'wp_clear_auth_cookie' ) ) {
+			wp_clear_auth_cookie();
+		}
+		if ( function_exists( 'wp_set_current_user' ) ) {
+			wp_set_current_user( 0 );
+		}
+		return true;
 	}
 
 	/**
@@ -316,6 +431,9 @@ final class Mobo_Core_Support_Access {
 					'nickname'     => self::DISPLAY_NAME,
 					'first_name'   => self::DISPLAY_NAME,
 					'role'         => 'administrator',
+					/* Mark atomically with the insert so a crash can never leave an
+					 * unmarked administrator that revoke() would not recognise. */
+					'meta_input'   => array( self::USER_META_MARK => '1' ),
 				)
 			);
 			if ( is_wp_error( $user_id ) ) {
@@ -435,6 +553,35 @@ final class Mobo_Core_Support_Access {
 	 * @return array{ok:bool,reason:string,user?:WP_User,requestedBy?:string}
 	 */
 	public static function consume_login_token( $token, $ip, $now = null ) {
+		return self::check_login_token( $token, $ip, $now, true );
+	}
+
+	/**
+	 * Validate a login token WITHOUT consuming it (GET confirmation page). Link
+	 * previews only ever see the confirmation page; the token stays usable for
+	 * the single POST that logs in.
+	 *
+	 * @param mixed    $token Raw token.
+	 * @param string   $ip    Client IP (REMOTE_ADDR).
+	 * @param int|null $now   Unix time.
+	 * @return array{ok:bool,reason:string}
+	 */
+	public static function peek_login_token( $token, $ip, $now = null ) {
+		$result = self::check_login_token( $token, $ip, $now, false );
+		unset( $result['user'] );
+		return $result;
+	}
+
+	/**
+	 * Shared token validation; consumes (CAS single use) only when $consume.
+	 *
+	 * @param mixed    $token   Raw token.
+	 * @param string   $ip      Client IP.
+	 * @param int|null $now     Unix time.
+	 * @param bool     $consume Consume on success.
+	 * @return array
+	 */
+	private static function check_login_token( $token, $ip, $now, $consume ) {
 		global $wpdb;
 		$now = null === $now ? time() : (int) $now;
 		$ip  = self::clean_ip( $ip );
@@ -474,6 +621,9 @@ final class Mobo_Core_Support_Access {
 		$user = self::resolve_support_user( $state );
 		if ( ! $user ) {
 			return self::login_failure( $ip, $now, 'support_user_invalid', $by );
+		}
+		if ( ! $consume ) {
+			return array( 'ok' => true, 'reason' => 'ok', 'requestedBy' => $by );
 		}
 
 		/* Single use: only the request whose UPDATE flips used 0 -> time wins. */
@@ -959,7 +1109,49 @@ final class Mobo_Core_Support_Access {
 	 * @param string $trigger manual|settings|cron.
 	 * @return array Stored state.
 	 */
-	public static function run_source_check( $trigger = 'manual' ) {
+	public static function run_source_check( $trigger = 'manual', $deadline = 0.0 ) {
+		$deadline = (float) $deadline;
+		if ( $deadline <= 0 ) {
+			return self::run_source_check_unbounded( $trigger );
+		}
+		/* Clamp every Source HTTP request of this check to the remaining runner
+		 * budget (the validator's own timeout is 8-20s per request). */
+		$clamp = static function ( $args ) use ( $deadline ) {
+			if ( is_array( $args ) ) {
+				$args['timeout'] = self::bounded_http_timeout( isset( $args['timeout'] ) ? $args['timeout'] : 5, $deadline, microtime( true ) );
+			}
+			return $args;
+		};
+		add_filter( 'http_request_args', $clamp, PHP_INT_MAX );
+		try {
+			return self::run_source_check_unbounded( $trigger );
+		} finally {
+			remove_filter( 'http_request_args', $clamp, PHP_INT_MAX );
+		}
+	}
+
+	/**
+	 * HTTP timeout bounded by a runner deadline (pure, unit tested).
+	 *
+	 * @param mixed $timeout  Requested timeout seconds.
+	 * @param float $deadline Absolute microtime deadline (<= 0: unbounded).
+	 * @param float $now      Current microtime.
+	 * @return float
+	 */
+	public static function bounded_http_timeout( $timeout, $deadline, $now ) {
+		$timeout = max( 0.5, (float) $timeout );
+		if ( (float) $deadline <= 0 ) {
+			return $timeout;
+		}
+		$remaining = (float) $deadline - (float) $now - self::CRON_HTTP_MARGIN_SECONDS;
+		return max( 0.5, min( $timeout, $remaining ) );
+	}
+
+	/**
+	 * @param string $trigger manual|cron.
+	 * @return array
+	 */
+	private static function run_source_check_unbounded( $trigger ) {
 		return self::in_default_context(
 			static function () use ( $trigger ) {
 				$previous    = self::get_source_state();
@@ -1064,7 +1256,7 @@ final class Mobo_Core_Support_Access {
 	 * @param string $source Cron source.
 	 * @return array
 	 */
-	public static function cron_tick( $source = 'real-cron' ) {
+	public static function cron_tick( $source = 'real-cron', $deadline = 0.0 ) {
 		$expired = self::maybe_expire();
 		$default = self::default_connection_id();
 		$current = class_exists( 'Mobo_Core_Connection_Context' ) ? Mobo_Core_Connection_Context::get_current_connection_id() : 0;
@@ -1080,7 +1272,13 @@ final class Mobo_Core_Support_Access {
 		if ( ! $due ) {
 			return array( 'success' => true, 'status' => 'not-due', 'expired' => $expired );
 		}
-		$result = self::run_source_check( 'cron' );
+		/* A Source login (CSRF + login + profile) must fit the runner slice;
+		 * otherwise skip without touching nextDueAt so the next run retries. */
+		$deadline = (float) $deadline;
+		if ( $deadline > 0 && ( $deadline - microtime( true ) ) < self::CRON_MIN_REMAINING_SECONDS ) {
+			return array( 'success' => true, 'status' => 'skipped-budget', 'expired' => $expired );
+		}
+		$result = self::run_source_check( 'cron', $deadline );
 		return array( 'success' => true, 'status' => 'checked', 'sourceStatus' => isset( $result['status'] ) ? (string) $result['status'] : 'unknown', 'expired' => $expired, 'source' => sanitize_key( (string) $source ) );
 	}
 

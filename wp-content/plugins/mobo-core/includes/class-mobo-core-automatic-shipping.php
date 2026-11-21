@@ -1805,6 +1805,25 @@ class Mobo_Core_Automatic_Shipping {
 	}
 
 	/**
+	 * Normalize a WooCommerce package destination to plain sanitized strings.
+	 *
+	 * Keeps the standard Woo destination keys (missing/non-scalar => '') so
+	 * matches_destination() and callers always receive the same shape.
+	 *
+	 * @param mixed $destination Package destination.
+	 * @return array<string,string>
+	 */
+	private static function normalize_destination( $destination ) {
+		$destination = is_array( $destination ) ? $destination : array();
+		$normalized  = array();
+		foreach ( array( 'country', 'state', 'postcode', 'city', 'address', 'address_1', 'address_2' ) as $key ) {
+			$normalized[ $key ] = isset( $destination[ $key ] ) && is_scalar( $destination[ $key ] ) ? sanitize_text_field( (string) $destination[ $key ] ) : '';
+		}
+		$normalized['country'] = strtoupper( $normalized['country'] );
+		return $normalized;
+	}
+
+	/**
 	 * Evaluate explicit Mobo location restrictions and safe Tehran title hints.
 	 *
 	 * @param array $method Method.

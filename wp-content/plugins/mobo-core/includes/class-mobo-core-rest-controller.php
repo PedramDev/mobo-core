@@ -313,7 +313,10 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'create_support_login_link' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				/* Admin login is installation-wide authority: only the Default
+				 * (installation controller) Connection may mint it, never a
+				 * secondary Provider's X-SEC. */
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -321,7 +324,9 @@ class Mobo_Core_Rest_Controller {
 			'mobo-core/v1',
 			'/support/login',
 			array(
-				'methods'             => 'GET',
+				/* GET only renders a confirmation page (link previews never log in);
+				 * the token is consumed by the POST that the page submits. */
+				'methods'             => array( 'GET', 'POST' ),
 				'callback'            => array( $this, 'support_login' ),
 				'permission_callback' => '__return_true', // Public: authenticated by the one-time token itself.
 				'args'                => array(
@@ -340,7 +345,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'support_request_access' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 	}
@@ -391,16 +396,37 @@ class Mobo_Core_Rest_Controller {
 	 * @return void
 	 */
 	public function support_login( $request ) {
-		$ip     = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : ''; // Proxy headers are spoofable; never trusted here.
-		$result = Mobo_Core_Support_Access::consume_login_token( (string) $request->get_param( 'token' ), $ip );
+		$ip      = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : ''; // Proxy headers are spoofable; never trusted here.
+		$token   = (string) $request->get_param( 'token' );
+		$is_post = 'POST' === strtoupper( (string) $request->get_method() );
+		$style   = '<style>body{font-family:Tahoma,Arial,sans-serif;background:#f6f7f7;color:#1d2327;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{background:#fff;border:1px solid #dcdcde;border-radius:8px;padding:32px;max-width:420px;text-align:center}h1{font-size:20px}button{font:inherit;background:#2271b1;color:#fff;border:0;border-radius:4px;padding:10px 24px;cursor:pointer}</style>';
 
 		nocache_headers();
-		if ( empty( $result['ok'] ) || ! ( $result['user'] instanceof WP_User ) ) {
+		header( 'Content-Type: text/html; charset=utf-8' );
+		header( 'X-Robots-Tag: noindex, nofollow' );
+		header( 'Referrer-Policy: no-referrer' );
+		header( 'X-Frame-Options: DENY' );
+
+		/* GET never consumes the token: link previews (Telegram, Slack, mail
+		 * scanners) only ever receive this confirmation page. */
+		$result = $is_post
+			? Mobo_Core_Support_Access::consume_login_token( $token, $ip )
+			: Mobo_Core_Support_Access::peek_login_token( $token, $ip );
+
+		if ( ! $is_post && ! empty( $result['ok'] ) ) {
+			status_header( 200 );
+			echo '<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer"><title>ورود پشتیبانی موبو</title>'
+				. $style . '</head><body><main><h1>ورود پشتیبانی موبو</h1><p>برای ورود به پیشخوان این فروشگاه با حساب پشتیبانی موبو، دکمه زیر را بزنید. این لینک فقط یک بار قابل استفاده است.</p>'
+				. '<form method="post" action="' . esc_url( rest_url( 'mobo-core/v1/support/login' ) ) . '">'
+				. '<input type="hidden" name="token" value="' . esc_attr( $token ) . '">'
+				. '<button type="submit">ورود</button></form></main></body></html>';
+			exit;
+		}
+
+		if ( empty( $result['ok'] ) || ! isset( $result['user'] ) || ! ( $result['user'] instanceof WP_User ) ) {
 			status_header( 403 );
-			header( 'Content-Type: text/html; charset=utf-8' );
-			header( 'X-Robots-Tag: noindex, nofollow' );
 			echo '<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>لینک ورود نامعتبر است</title>'
-				. '<style>body{font-family:Tahoma,Arial,sans-serif;background:#f6f7f7;color:#1d2327;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}main{background:#fff;border:1px solid #dcdcde;border-radius:8px;padding:32px;max-width:420px;text-align:center}h1{font-size:20px}</style></head>'
+				. $style . '</head>'
 				. '<body><main><h1>لینک ورود نامعتبر یا منقضی شده است</h1><p>این لینک فقط یک بار و برای مدت کوتاهی معتبر است. لطفاً از پشتیبانی موبو لینک جدید بخواهید.</p></main></body></html>';
 			exit;
 		}
@@ -860,13 +886,16 @@ class Mobo_Core_Rest_Controller {
 						400
 					);
 				}
-				return rest_ensure_response(
-					array(
-						'success'          => true,
-						'status'           => ! empty( $outcome['needFullSnapshot'] ) ? 'need-full-snapshot' : 'applied',
-						'needFullSnapshot' => ! empty( $outcome['needFullSnapshot'] ),
-					)
+				$quarantined = isset( $outcome['note'] ) && Mobo_Core_Product_Delta::NOTE_QUARANTINED === $outcome['note'];
+				$response    = array(
+					'success'          => true,
+					'status'           => ! empty( $outcome['needFullSnapshot'] ) ? 'need-full-snapshot' : ( $quarantined ? 'quarantined' : 'applied' ),
+					'needFullSnapshot' => ! empty( $outcome['needFullSnapshot'] ),
 				);
+				if ( $quarantined ) {
+					$response['note'] = Mobo_Core_Product_Delta::NOTE_QUARANTINED;
+				}
+				return rest_ensure_response( $response );
 			}
 		}
 
@@ -1172,6 +1201,11 @@ class Mobo_Core_Rest_Controller {
 		if ( 'invalid' === $pre['status'] ) {
 			return array( 'ok' => false, 'needFullSnapshot' => false, 'error' => sanitize_key( (string) $pre['reason'] ) );
 		}
+		if ( 'ok' !== $pre['status'] && Mobo_Core_Product_Delta::is_quarantine_reason( $pre['reason'] ) ) {
+			/* M6: accept and record, never apply, never loop on full snapshots. */
+			Mobo_Core_Product_Delta::record_quarantined_skip( $pre['productGuid'], absint( $pre['objectId'] ?? 0 ), absint( $pre['revision'] ), $pre['reason'] );
+			return array( 'ok' => true, 'needFullSnapshot' => false, 'error' => '', 'note' => Mobo_Core_Product_Delta::NOTE_QUARANTINED );
+		}
 		if ( 'ok' !== $pre['status'] ) {
 			return array( 'ok' => true, 'needFullSnapshot' => true, 'error' => '' );
 		}
@@ -1187,6 +1221,9 @@ class Mobo_Core_Rest_Controller {
 		}
 		if ( ! empty( $data['needFullSnapshot'] ) ) {
 			return array( 'ok' => true, 'needFullSnapshot' => true, 'error' => '' );
+		}
+		if ( ! empty( $data['note'] ) && Mobo_Core_Product_Delta::NOTE_QUARANTINED === $data['note'] ) {
+			return array( 'ok' => true, 'needFullSnapshot' => false, 'error' => '', 'note' => Mobo_Core_Product_Delta::NOTE_QUARANTINED );
 		}
 		if ( empty( $result['success'] ) ) {
 			return array( 'ok' => false, 'needFullSnapshot' => false, 'error' => sanitize_key( (string) ( isset( $data['error'] ) ? $data['error'] : 'delta_failed' ) ) );

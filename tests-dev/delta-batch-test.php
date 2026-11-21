@@ -174,5 +174,62 @@ $enqueued = array();
 $results = $B::process( array( $events[0] ), $inline, $enqueue, microtime( true ) - 1 );
 check( $results[0]['ok'] && array( 'e1' ) === $enqueued, 'after the inline deadline deltas are enqueued, not applied' );
 
+// --- M6: quarantined objects: accepted + recorded, never a full-snapshot loop.
+check( $D::is_quarantine_reason( 'product_quarantined' ) && $D::is_quarantine_reason( 'variant_quarantined' ) && ! $D::is_quarantine_reason( 'product_inconsistent' ), 'M6: quarantine reasons recognized (inconsistent still needs a snapshot)' );
+$p = $D::precheck( array( 'delta' => true, 'productId' => 'prod-0002', 'revision' => 5 ), $r );
+check( 11 === $p['objectId'], 'M6: precheck reports the quarantined product id' );
+$p = $D::precheck( array( 'delta' => true, 'productId' => 'prod-0001', 'revision' => 5, 'variants' => array( array( 'variantId' => 'var-00002', 'stock' => 1 ) ) ), $r );
+check( 22 === $p['objectId'], 'M6: precheck reports the quarantined VARIANT id (released per object)' );
+$row = $B::result( 'e9', true, false, '', $D::NOTE_QUARANTINED );
+check( true === $row['ok'] && false === $row['needFullSnapshot'] && 'quarantined' === $row['note'], 'M6: batch row ok:true, needFullSnapshot:false, note:"quarantined"' );
+check( ! array_key_exists( 'note', $B::result( 'e1', true ) ), 'batch rows without a note keep the original shape' );
+$results = $B::process(
+	array( array( 'eventId' => 'q1', 'event' => 'ProductUpdated', 'delta' => true, 'productId' => 'prod-0002' ) ),
+	function () { return array( 'ok' => true, 'needFullSnapshot' => false, 'error' => '', 'note' => 'quarantined' ); },
+	function () { return true; },
+	microtime( true ) + 30
+);
+check( 'quarantined' === ( $results[0]['note'] ?? '' ) && false === $results[0]['needFullSnapshot'], 'M6: inline quarantined outcome is passed through the batch' );
+$split = $D::split_released_quarantine_skips(
+	array( 'prod-0002' => array( 'productId' => 11 ), 'prod-0003' => array( 'productId' => 22 ), 'prod-0004' => array( 'productId' => 0 ) ),
+	function ( $id ) { return 22 === $id; }
+);
+check( array( 'prod-0002' ) === array_keys( $split['released'] ) && array( 'prod-0003', 'prod-0004' ) === array_keys( $split['remaining'] ), 'M6: only released objects get ONE full snapshot request' );
+
+// --- M5: in-flight delta crash marker.
+function get_post_meta( $id, $key, $single = false ) { return $GLOBALS['mobo_meta'][ $id ][ $key ] ?? ''; }
+function update_post_meta( $id, $key, $value ) { $GLOBALS['mobo_meta'][ $id ][ $key ] = $value; return true; }
+function delete_post_meta( $id, $key ) { unset( $GLOBALS['mobo_meta'][ $id ][ $key ] ); return true; }
+final class Inflight_WPDB {
+	public $postmeta = 'wp_postmeta';
+	public $posts = 'wp_posts';
+	public $rows = array();
+	public $last_sql = '';
+	public function prepare( $q, ...$a ) { $i = 0; return preg_replace_callback( '/%[sd]/', function ( $m ) use ( &$i, $a ) { $v = $a[ $i++ ] ?? ''; return '%d' === $m[0] ? (string) (int) $v : "'" . $v . "'"; }, $q ); }
+	public function get_results( $sql, $o = null ) { $this->last_sql = $sql; return $this->rows; }
+}
+$GLOBALS['wpdb'] = new Inflight_WPDB();
+define( 'ARRAY_A', 'ARRAY_A' );
+require $base . 'class-mobo-core-delta-inflight.php';
+$F = 'Mobo_Core_Delta_Inflight';
+check( 0 !== strpos( $F::META_KEY, '_mobo_' ) && 0 !== strpos( $F::META_KEY, 'mobo_' ), 'M5: marker key stays a plain postmeta row (outside managed prefixes)' );
+check( true === $F::mark( 10, 'prod-0001', 7 ), 'M5: marker written before phase-2 writes (verified)' );
+check( true === $F::is_marked( 10 ), 'M5: a killed delta leaves the marker behind' );
+$F::clear( 10 );
+check( false === $F::is_marked( 10 ), 'M5: marker removed after the last write' );
+$now = 2000000000;
+$GLOBALS['wpdb']->rows = array(
+	array( 'post_id' => 10, 'meta_value' => $F::value( 'prod-0001', 7, $now - 600 ) ),
+	array( 'post_id' => 11, 'meta_value' => $F::value( 'prod-0002', 8, $now - 30 ) ),
+	array( 'post_id' => 12, 'meta_value' => 'garbage' ),
+);
+$stale = $F::stale( $now );
+check( 2 === count( $stale ) && 10 === $stale[0]['productId'] && 'prod-0001' === $stale[0]['productGuid'], 'M5: restart sweep picks markers older than any live product lock' );
+check( 12 === $stale[1]['productId'] && '' === $stale[1]['productGuid'], 'M5: malformed marker is returned for cleanup only' );
+check( false !== strpos( $GLOBALS['wpdb']->last_sql, 'LIMIT 20' ), 'M5: sweep is bounded' );
+$sync_src = file_get_contents( $base . 'class-mobo-core-product-sync.php' );
+check( false !== strpos( $sync_src, 'Mobo_Core_Delta_Inflight::mark( $product_id, $guid, $revision )' ) && false !== strpos( $sync_src, "'delta_interrupted' )" ), 'M5: phase 2 marks first; sweep re-requests a full snapshot' );
+check( false !== strpos( $sync_src, 'Mobo_Core_Delta_Inflight::is_marked( $object_id )' ), 'M5: leftover marker makes the next delta ask for a full snapshot' );
+
 echo PHP_EOL . $checks . ' checks, ' . $failures . ' failure(s) on PHP ' . PHP_VERSION . PHP_EOL;
 exit( $failures > 0 ? 1 : 0 );

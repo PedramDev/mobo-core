@@ -2407,6 +2407,10 @@ class Mobo_Core_Product_Sync {
 		if ( class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::is_marked( $object_id ) ) {
 			return 'quarantined';
 		}
+		/* M5: a previous delta was killed halfway through its writes. */
+		if ( 'product' === $post_type && class_exists( 'Mobo_Core_Delta_Inflight' ) && Mobo_Core_Delta_Inflight::is_marked( $object_id ) ) {
+			return 'inconsistent';
+		}
 		if ( '1' === (string) get_post_meta( $object_id, 'mobo_sync_incomplete', true )
 			|| '1' === (string) get_post_meta( $object_id, '_mobo_desired_state_rebuild_pending', true ) ) {
 			return 'inconsistent';
@@ -2446,6 +2450,8 @@ class Mobo_Core_Product_Sync {
 					: $this->result( true, 'Delta deferred behind older events.', array( 'deleteFile' => false, 'waitingForProduct' => true, 'deferSeconds' => 20 ) );
 			}
 		}
+
+		$this->sweep_interrupted_deltas();
 
 		$lock = false;
 		if ( class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
@@ -2542,8 +2548,23 @@ class Mobo_Core_Product_Sync {
 		if ( 'invalid' === $pre['status'] ) {
 			return $this->result( false, 'Delta payload is malformed: ' . sanitize_key( $pre['reason'] ), array( 'deleteFile' => true, 'nonRetryable' => true, 'productGuid' => $guid, 'error' => sanitize_key( $pre['reason'] ) ) );
 		}
+		if ( 'ok' !== $pre['status'] && Mobo_Core_Product_Delta::is_quarantine_reason( $pre['reason'] ) ) {
+			/* M6: quarantined objects are never changed by a delta, but asking for a
+			 * full snapshot looped forever. Accept + record; a full snapshot is
+			 * requested once the object leaves quarantine (health report). */
+			Mobo_Core_Product_Delta::record_quarantined_skip( $guid, absint( $pre['objectId'] ?? 0 ), absint( $pre['revision'] ), $pre['reason'] );
+			return $this->result( true, 'Delta recorded for a quarantined product; not applied.', array( 'deleteFile' => true, 'needFullSnapshot' => false, 'note' => Mobo_Core_Product_Delta::NOTE_QUARANTINED, 'productGuid' => $guid, 'reason' => sanitize_key( $pre['reason'] ), 'healthSkipped' => true ) );
+		}
 		if ( 'ok' !== $pre['status'] ) {
 			$this->record_delta_full_snapshot_request( $guid, absint( $pre['product']['id'] ?? 0 ), $pre['reason'] );
+			$interrupted_id = absint( $pre['product']['id'] ?? 0 );
+			if ( $interrupted_id > 0 && class_exists( 'Mobo_Core_Delta_Inflight' ) && Mobo_Core_Delta_Inflight::is_marked( $interrupted_id ) ) {
+				/* M5: under the product lock a leftover in-flight marker is certainly
+				 * from a killed delta: hand over to the incomplete marker + snapshot. */
+				$this->persist_post_meta_verified( $interrupted_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $guid, $interrupted_id, true );
+				Mobo_Core_Delta_Inflight::clear( $interrupted_id );
+			}
 			return $this->result( true, 'Delta cannot be applied safely; a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid, 'reason' => sanitize_key( $pre['reason'] ), 'healthSkipped' => true ) );
 		}
 
@@ -2622,8 +2643,13 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, 'Delta rejected before any write: ' . sanitize_text_field( $e->getMessage() ), array( 'deleteFile' => true, 'nonRetryable' => true, 'productGuid' => $guid, 'productId' => $product_id, 'error' => 'delta_validation_failed' ) );
 		}
 
-		/* Phase 2: persist. */
+		/* Phase 2: persist. M5: an in-flight crash marker is written BEFORE the
+		 * first write and removed after the last; a request killed in between
+		 * leaves it behind, so the next delta/sweep asks for a full snapshot. */
 		try {
+			if ( class_exists( 'Mobo_Core_Delta_Inflight' ) && ! Mobo_Core_Delta_Inflight::mark( $product_id, $guid, $revision ) ) {
+				throw new RuntimeException( 'Delta in-flight crash marker could not be persisted.' );
+			}
 			if ( ! $this->persist_ordering_watermarks( $product_id, 'product', '', $revision, false ) ) {
 				throw new RuntimeException( 'Product delta revision watermark could not be persisted.' );
 			}
@@ -2652,9 +2678,15 @@ class Mobo_Core_Product_Sync {
 			$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
 			$this->upsert_product_map( $guid, $product_id, true );
 			$this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_write_failed' );
+			if ( class_exists( 'Mobo_Core_Delta_Inflight' ) ) {
+				Mobo_Core_Delta_Inflight::clear( $product_id ); // Superseded by the incomplete marker + snapshot request.
+			}
 			return $this->result( true, 'Delta write failed; product marked incomplete and a full snapshot is required.', array( 'deleteFile' => true, 'needFullSnapshot' => true, 'productGuid' => $guid, 'productId' => $product_id, 'error' => 'delta_write_failed' ) );
 		}
 
+		if ( class_exists( 'Mobo_Core_Delta_Inflight' ) ) {
+			Mobo_Core_Delta_Inflight::clear( $product_id );
+		}
 		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 			Mobo_Core_Runtime_Diagnostics::increment( 'product_delta_applied' );
 		}
@@ -2683,6 +2715,44 @@ class Mobo_Core_Product_Sync {
 	 * @param string $reason Reason code.
 	 * @return void
 	 */
+	/** @var bool Request-local: interrupted-delta sweep already ran. */
+	private static $delta_sweep_done = false;
+
+	/**
+	 * M5: on restart, products whose delta was killed halfway (in-flight marker
+	 * older than any live product lock) are marked incomplete and a full
+	 * snapshot is requested for them. Bounded; once per request.
+	 *
+	 * @return void
+	 */
+	private function sweep_interrupted_deltas() {
+		if ( self::$delta_sweep_done || ! class_exists( 'Mobo_Core_Delta_Inflight' ) ) {
+			return;
+		}
+		self::$delta_sweep_done = true;
+		foreach ( Mobo_Core_Delta_Inflight::stale( time() ) as $row ) {
+			$product_id = absint( $row['productId'] );
+			$guid       = (string) $row['productGuid'];
+			if ( $product_id <= 0 ) {
+				continue;
+			}
+			if ( '' === $guid ) {
+				Mobo_Core_Delta_Inflight::clear( $product_id );
+				continue;
+			}
+			try {
+				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
+				$this->upsert_product_map( $guid, $product_id, true );
+				$this->record_delta_full_snapshot_request( $guid, $product_id, 'delta_interrupted' );
+				Mobo_Core_Delta_Inflight::clear( $product_id );
+			} catch ( Throwable $error ) {
+				if ( class_exists( 'Mobo_Core_Logger' ) ) {
+					Mobo_Core_Logger::warning( 'Interrupted delta recovery deferred.', array( 'productId' => $product_id, 'error' => $error->getMessage() ) );
+				}
+			}
+		}
+	}
+
 	private function record_delta_full_snapshot_request( $guid, $product_id, $reason ) {
 		$guid = sanitize_text_field( (string) $guid );
 		if ( '' === $guid ) {
@@ -5372,6 +5442,7 @@ class Mobo_Core_Product_Sync {
 
 	private function upsert_parent_product_core( $data, $skip_images ) {
 		$this->last_parent_core_noop    = false;
+		$this->maybe_adopt_creation_orphans();
 
 		$product_guid = $this->extract_product_guid( $data );
 
@@ -5396,7 +5467,17 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 		$is_new_product  = $product_id <= 0;
-		if ( $is_new_product && ! self::product_creation_allowed() ) {
+		/* H6: a previous attempt may have crashed between wp_insert_post() and the
+		 * GUID bind. Adopt that marked product instead of creating a duplicate; it
+		 * is still filled with new-product semantics below. */
+		$adopted_creation_id = 0;
+		if ( $is_new_product && class_exists( 'Mobo_Core_Product_Creation_Intent' ) ) {
+			$adopted_creation_id = Mobo_Core_Product_Creation_Intent::find_adoptable( $this->connection_id(), $product_guid );
+			if ( $adopted_creation_id > 0 && class_exists( 'Mobo_Core_Logger' ) ) {
+				Mobo_Core_Logger::warning( 'Adopting a product left without identity by an interrupted creation instead of creating a duplicate.', array( 'productGuid' => $product_guid, 'productId' => $adopted_creation_id ) );
+			}
+		}
+		if ( $is_new_product && $adopted_creation_id <= 0 && ! self::product_creation_allowed() ) {
 			/* Upgrade window: the legacy Product Map seed is still running. Updates to
 			 * existing products proceed (lookups fall back to legacy identity); only
 			 * creating a product is deferred, so an unmapped existing one can never be
@@ -5428,6 +5509,11 @@ class Mobo_Core_Product_Sync {
 						$product_guid
 					)
 				);
+			}
+		} elseif ( $adopted_creation_id > 0 ) {
+			$product = wc_get_product( $adopted_creation_id );
+			if ( ! $product instanceof WC_Product ) {
+				throw new RuntimeException( sprintf( 'WooCommerce could not load interrupted-creation product %d (%s); creation deferred to avoid a duplicate.', $adopted_creation_id, $product_guid ) );
 			}
 		} else {
 			$product = new WC_Product_Simple();
@@ -5611,7 +5697,21 @@ class Mobo_Core_Product_Sync {
 				$this->update_product_meta_if_changed( $product, '_mobo_product_source_hash_updated_at', gmdate( 'c' ) );
 			}
 		}
-		$product_id = absint( $product->save() );
+		if ( $is_new_product && $adopted_creation_id <= 0 && class_exists( 'Mobo_Core_Product_Creation_Intent' ) ) {
+			/* H6: the provisional identity marker is written by wp_insert_post()
+			 * itself (meta_input), before any save hook can be interrupted. */
+			$product_id = absint(
+				Mobo_Core_Product_Creation_Intent::save_with_marker(
+					$this->connection_id(),
+					$product_guid,
+					static function () use ( $product ) {
+						return $product->save();
+					}
+				)
+			);
+		} else {
+			$product_id = absint( $product->save() );
+		}
 		if ( $is_new_product && $product_id > 0 && '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
 			$this->q2_new_parent_authorizations[ $product_guid ] = $product_id;
 		}
@@ -5634,6 +5734,10 @@ class Mobo_Core_Product_Sync {
 			}
 			if ( ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
 				throw new RuntimeException( 'Could not durably commit product identity mapping.' );
+			}
+			if ( $is_new_product && class_exists( 'Mobo_Core_Product_Creation_Intent' ) ) {
+				/* Identity and map are durable: the provisional marker is no longer needed. */
+				Mobo_Core_Product_Creation_Intent::clear( $product_id );
 			}
 		}
 
@@ -9976,7 +10080,81 @@ class Mobo_Core_Product_Sync {
 			$this->upsert_product_map( $guid, $product_id, $legacy_incomplete );
 		}
 
+		/* M11: a quarantined legacy product without Custom/map rows is invisible to
+		 * every lookup above once the identity fence hides its legacy product_guid
+		 * row. Adopt it (and give it a map row) instead of creating a duplicate. */
+		if ( $product_id <= 0 && class_exists( 'Mobo_Core_Product_Creation_Intent' ) && class_exists( 'Mobo_Core_Migration_Quarantine' ) && Mobo_Core_Migration_Quarantine::count() > 0 ) {
+			$marked_id = Mobo_Core_Product_Creation_Intent::find_quarantined_legacy_product( $guid, $this->connection_id() );
+			if ( $marked_id > 0 ) {
+				$this->upsert_product_map( $guid, $marked_id, true );
+				return $marked_id;
+			}
+		}
+
 		return $product_id;
+	}
+
+	/** @var array<int,bool> Request-local: orphan scan already ran for a Connection. */
+	private static $creation_orphan_scan_done = array();
+
+	/**
+	 * H6: bounded orphan-adoption scan. Products that carry a provisional
+	 * creation marker but never got an identity binding are bound to their GUID
+	 * (marked incomplete so the next sync fills them). A marked product whose GUID
+	 * already belongs to another product is parked and reported, never deleted.
+	 * Runs at most once per request and once per 10 minutes per Connection.
+	 *
+	 * @return void
+	 */
+	private function maybe_adopt_creation_orphans() {
+		$connection_id = $this->connection_id();
+		if ( $connection_id <= 0 || isset( self::$creation_orphan_scan_done[ $connection_id ] ) || ! class_exists( 'Mobo_Core_Product_Creation_Intent' ) ) {
+			return;
+		}
+		self::$creation_orphan_scan_done[ $connection_id ] = true;
+		$scan_at = get_option( 'mobo_core_creation_orphan_scan_at', array() );
+		$scan_at = is_array( $scan_at ) ? $scan_at : array();
+		if ( time() - absint( isset( $scan_at[ $connection_id ] ) ? $scan_at[ $connection_id ] : 0 ) < 600 ) {
+			return;
+		}
+		$scan_at[ $connection_id ] = time();
+		update_option( 'mobo_core_creation_orphan_scan_at', $scan_at, false );
+
+		foreach ( Mobo_Core_Product_Creation_Intent::list_marked( $connection_id, Mobo_Core_Product_Creation_Intent::SCAN_LIMIT ) as $row ) {
+			$post_id = absint( $row['postId'] );
+			$guid    = (string) $row['productGuid'];
+			$lock    = class_exists( 'Mobo_Core_Product_Concurrency' ) ? Mobo_Core_Product_Concurrency::acquire_product_lock( $guid, 0, 60 ) : true;
+			if ( false === $lock ) {
+				continue; // A writer owns this GUID right now; it will adopt the product itself.
+			}
+			try {
+				$bound  = $this->find_product_id_by_guid( $guid );
+				$action = Mobo_Core_Product_Creation_Intent::orphan_action( $post_id, $bound );
+				if ( 'clear' === $action ) {
+					Mobo_Core_Product_Creation_Intent::clear( $post_id );
+				} elseif ( 'duplicate' === $action ) {
+					Mobo_Core_Product_Creation_Intent::park_duplicate( $post_id, Mobo_Core_Product_Creation_Intent::marker_value( $connection_id, $guid ) );
+					if ( class_exists( 'Mobo_Core_Logger' ) ) {
+						Mobo_Core_Logger::warning( 'Product left by an interrupted creation duplicates an already bound product; it was kept untouched for the merchant to review.', array( 'productId' => $post_id, 'boundProductId' => $bound, 'productGuid' => $guid ) );
+					}
+				} elseif ( $this->persist_post_meta_verified( $post_id, 'mobo_sync_incomplete', '1' )
+					&& $this->persist_post_meta_verified( $post_id, 'product_guid', sanitize_text_field( $guid ) )
+					&& $this->upsert_product_map( $guid, $post_id, true ) ) {
+					Mobo_Core_Product_Creation_Intent::clear( $post_id );
+					if ( class_exists( 'Mobo_Core_Logger' ) ) {
+						Mobo_Core_Logger::warning( 'Adopted a product left without identity by an interrupted creation; the next sync completes it.', array( 'productId' => $post_id, 'productGuid' => $guid ) );
+					}
+				}
+			} catch ( Throwable $error ) {
+				if ( class_exists( 'Mobo_Core_Logger' ) ) {
+					Mobo_Core_Logger::warning( 'Interrupted-creation orphan adoption deferred.', array( 'productId' => $post_id, 'error' => $error->getMessage() ) );
+				}
+			} finally {
+				if ( true !== $lock && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+					Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+				}
+			}
+		}
 	}
 
 	/**

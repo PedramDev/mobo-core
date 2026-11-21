@@ -230,6 +230,8 @@ class Mobo_Core_Settings {
 			// Automatic Mobo order submission defaults.
 			'mobo_core_mobo_order_submission_enabled'       => '0',
 			'mobo_core_mobo_order_auto_complete_enabled'    => '1',
+			/* Per-Connection kill-switch for the Source price guard (default ON). */
+			'mobo_core_source_price_guard_enabled'          => '1',
 			'mobo_core_mobo_order_sender_name'              => '',
 			'mobo_core_mobo_order_sender_mobile'            => '',
 			'mobo_core_mobo_order_shipping_id'              => 148395514,

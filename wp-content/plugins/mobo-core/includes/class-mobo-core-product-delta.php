@@ -12,8 +12,12 @@
  * - Only the fields present are applied; everything else is left untouched.
  * - Stale revisions are skipped exactly like full payloads.
  * - If the product or any referenced variant is unknown locally, or its local
- *   state is quarantined/inconsistent, nothing is guessed or applied: the caller
- *   answers `needFullSnapshot: true` so the Backend sends a full snapshot.
+ *   state is inconsistent, nothing is guessed or applied: the caller answers
+ *   `needFullSnapshot: true` so the Backend sends a full snapshot.
+ * - A QUARANTINED product/variant (migration mark) is also never changed, but the
+ *   delta is accepted and recorded: `ok: true, needFullSnapshot: false,
+ *   note: "quarantined"`. Asking for a full snapshot there looped forever (M6);
+ *   a full snapshot is requested once the object is released from quarantine.
  *
  * PHP 7.4 compatible.
  */
@@ -22,6 +26,68 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 final class Mobo_Core_Product_Delta {
 
 	const CAPABILITY = 'product-delta-v1';
+
+	/** Response note for a delta accepted (not applied) on a quarantined object. */
+	const NOTE_QUARANTINED = 'quarantined';
+
+	/** Bounded record of deltas accepted for quarantined objects (guid => row). */
+	const QUARANTINED_SKIPS_OPTION = 'mobo_core_delta_quarantined_skips';
+
+	/**
+	 * Whether a precheck reason means "quarantined" (product or variant).
+	 *
+	 * @param string $reason Precheck reason.
+	 * @return bool
+	 */
+	public static function is_quarantine_reason( $reason ) {
+		return in_array( (string) $reason, array( 'product_quarantined', 'variant_quarantined' ), true );
+	}
+
+	/**
+	 * Record one accepted-but-not-applied delta of a quarantined object (bounded 200).
+	 *
+	 * @param string $guid       Product GUID.
+	 * @param int    $product_id Local quarantined object id (product or variation; 0 when unknown).
+	 * @param int    $revision   Delta revision.
+	 * @param string $reason     Precheck reason.
+	 * @return void
+	 */
+	public static function record_quarantined_skip( $guid, $product_id, $revision, $reason ) {
+		$guid = sanitize_text_field( (string) $guid );
+		if ( '' === $guid || ! class_exists( 'Mobo_Core_Settings' ) ) {
+			return;
+		}
+		$rows = Mobo_Core_Settings::get( self::QUARANTINED_SKIPS_OPTION, array() );
+		$rows = is_array( $rows ) ? $rows : array();
+		unset( $rows[ $guid ] );
+		$rows[ $guid ] = array( 'at' => time(), 'productId' => absint( $product_id ), 'revision' => absint( $revision ), 'reason' => sanitize_key( (string) $reason ) );
+		if ( count( $rows ) > 200 ) {
+			$rows = array_slice( $rows, -200, null, true );
+		}
+		Mobo_Core_Settings::update( self::QUARANTINED_SKIPS_OPTION, $rows, false );
+	}
+
+	/**
+	 * Skipped quarantined deltas whose product has since been released: these
+	 * need ONE full snapshot now (pure; $is_marked decides quarantine).
+	 *
+	 * @param array    $rows      QUARANTINED_SKIPS_OPTION value.
+	 * @param callable $is_marked fn(int $product_id): bool.
+	 * @return array{released:array<string,array>,remaining:array<string,array>}
+	 */
+	public static function split_released_quarantine_skips( $rows, $is_marked ) {
+		$released  = array();
+		$remaining = array();
+		foreach ( is_array( $rows ) ? $rows : array() as $guid => $row ) {
+			$product_id = is_array( $row ) ? absint( isset( $row['productId'] ) ? $row['productId'] : 0 ) : 0;
+			if ( $product_id > 0 && ! call_user_func( $is_marked, $product_id ) ) {
+				$released[ (string) $guid ] = $row;
+			} else {
+				$remaining[ (string) $guid ] = $row;
+			}
+		}
+		return array( 'released' => $released, 'remaining' => $remaining );
+	}
 
 	/** Field => accepted payload key aliases (camelCase first). */
 	const PRODUCT_FIELD_ALIASES = array(
@@ -242,6 +308,7 @@ final class Mobo_Core_Product_Delta {
 			'product'     => array(),
 			'targets'     => array(),
 			'revision'    => 0,
+			'objectId'    => 0, // Local object that made the precheck fail (when known).
 		);
 		$valid = self::validate( $payload );
 		if ( is_wp_error( $valid ) ) {
@@ -266,6 +333,10 @@ final class Mobo_Core_Product_Delta {
 		$state   = isset( $product['state'] ) ? (string) $product['state'] : 'missing';
 		if ( 'ok' !== $state || absint( $product['id'] ?? 0 ) <= 0 ) {
 			$result['reason'] = 'product_' . ( '' !== $state ? $state : 'missing' );
+			if ( absint( $product['id'] ?? 0 ) > 0 ) {
+				$result['product']  = $product; // Diagnostics/bookkeeping only (status stays need_full).
+				$result['objectId'] = absint( $product['id'] );
+			}
 			return $result;
 		}
 		$result['product'] = $product;
@@ -275,8 +346,9 @@ final class Mobo_Core_Product_Delta {
 			$target = is_array( $target ) ? $target : array();
 			$vstate = isset( $target['state'] ) ? (string) $target['state'] : 'missing';
 			if ( 'ok' !== $vstate || absint( $target['id'] ?? 0 ) <= 0 ) {
-				$result['reason']  = 'variant_' . ( '' !== $vstate ? $vstate : 'missing' );
-				$result['targets'] = array();
+				$result['reason']   = 'variant_' . ( '' !== $vstate ? $vstate : 'missing' );
+				$result['targets']  = array();
+				$result['objectId'] = absint( $target['id'] ?? 0 );
 				return $result;
 			}
 			$target['guid']    = $guid;

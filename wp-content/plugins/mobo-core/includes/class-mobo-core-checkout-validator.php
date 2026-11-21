@@ -29,6 +29,8 @@ class Mobo_Core_Checkout_Validator {
 	const ITEM_META_SKU               = '_mobo_identity_sku';
 	const ITEM_META_CAPTURED_AT       = '_mobo_identity_captured_at';
 	const ITEM_META_CONNECTION_ID     = '_mobo_identity_connection_id';
+	/** M4: item was a Mobo product held in migration quarantine when ordered. */
+	const ITEM_META_QUARANTINED       = '_mobo_identity_quarantined';
 
 	/**
 	 * Internal immutable line-item identity keys. These values are required for
@@ -450,6 +452,33 @@ class Mobo_Core_Checkout_Validator {
 		$item->update_meta_data( self::ITEM_META_PORTAL_VARIANT_ID, $is_mobo ? $portal_variant_id : 0 );
 		$item->update_meta_data( self::ITEM_META_SKU, $product instanceof WC_Product ? sanitize_text_field( (string) $product->get_sku() ) : '' );
 		$item->update_meta_data( self::ITEM_META_CONNECTION_ID, $is_mobo ? $connection_id : 0 );
+		if ( ! $is_mobo && $this->is_quarantined_mobo_line_item( $item ) ) {
+			$item->update_meta_data( self::ITEM_META_QUARANTINED, 'yes' );
+		}
+	}
+
+	/**
+	 * M4: a Mobo-owned product/variation held in migration quarantine has no
+	 * Custom ownership row, so it looks "non-Mobo". It must never be silently
+	 * skipped: such orders go to manual review instead.
+	 *
+	 * @param WC_Order_Item_Product $item Order item.
+	 * @return bool
+	 */
+	private function is_quarantined_mobo_line_item( $item ) {
+		if ( ! $item instanceof WC_Order_Item_Product ) {
+			return false;
+		}
+		if ( 'yes' === (string) $item->get_meta( self::ITEM_META_QUARANTINED, true ) ) {
+			return true;
+		}
+		if ( ! class_exists( 'Mobo_Core_Migration_Quarantine' ) || Mobo_Core_Migration_Quarantine::count() <= 0 ) {
+			return false;
+		}
+		$variation_id = absint( $item->get_variation_id() );
+		$product_id   = absint( $item->get_product_id() );
+		return ( $variation_id > 0 && Mobo_Core_Migration_Quarantine::is_marked( $variation_id ) )
+			|| ( $product_id > 0 && Mobo_Core_Migration_Quarantine::is_marked( $product_id ) );
 	}
 
 	/**
@@ -3627,6 +3656,13 @@ class Mobo_Core_Checkout_Validator {
 		 * Connection are intentionally fail-closed. Split-order behavior is not
 		 * implemented and no partial remote purchase is allowed. */
 		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			if ( 'quarantined' === sanitize_key( (string) ( $scope['status'] ?? '' ) ) && $order_object instanceof WC_Order ) {
+				/* M4: manual-review path (meta only; the order row is not re-saved here). */
+				$order_object->update_meta_data( '_mobo_order_scope_status', 'quarantined' );
+				$order_object->update_meta_data( '_mobo_order_submit_status', 'blocked_quarantined' );
+				$order_object->update_meta_data( '_mobo_order_requires_review', 'yes' );
+				$order_object->save_meta_data();
+			}
 			$this->add_unsubmittable_order_note( absint( $order_id ), $scope, 'status_processing' );
 			return;
 		}
@@ -4983,6 +5019,7 @@ class Mobo_Core_Checkout_Validator {
 			'connectionId'  => 0,
 			'connectionIds' => array(),
 			'nonMoboNames'  => array(),
+			'quarantined'   => 0,
 		);
 
 		if ( ! $order instanceof WC_Order ) { return $scope; }
@@ -5007,6 +5044,11 @@ class Mobo_Core_Checkout_Validator {
 				continue;
 			}
 
+			if ( $this->is_quarantined_mobo_line_item( $line_item ) ) {
+				$scope['quarantined']++;
+				$scope['nonMoboNames'][] = '' !== $name ? $name : 'محصول موبو در قرنطینه';
+				continue;
+			}
 			if ( ! $product instanceof WC_Product && empty( $identity['captured'] ) ) {
 				$scope['invalid']++;
 				$scope['nonMoboNames'][] = '' !== $name ? $name : 'محصول نامشخص';
@@ -5023,6 +5065,8 @@ class Mobo_Core_Checkout_Validator {
 			$scope['status'] = 'empty';
 		} elseif ( $scope['invalid'] > 0 ) {
 			$scope['status'] = 'invalid';
+		} elseif ( $scope['quarantined'] > 0 ) {
+			$scope['status'] = 'quarantined'; // Never submitted automatically; manual review (M4).
 		} elseif ( $scope['nonMobo'] > 0 && $scope['mobo'] > 0 ) {
 			$scope['status'] = 'mixed';
 		} elseif ( $scope['nonMobo'] > 0 && $scope['mobo'] <= 0 ) {
@@ -5062,7 +5106,9 @@ class Mobo_Core_Checkout_Validator {
 	 * @return bool
 	 */
 	private function order_scope_has_mobo_items( $scope ) {
-		return is_array( $scope ) && isset( $scope['mobo'] ) && absint( $scope['mobo'] ) > 0;
+		/* Quarantined items are Mobo-owned: route them to the unsubmittable/review
+		 * path instead of the silent "not a Mobo order" path (M4). */
+		return is_array( $scope ) && ( ( isset( $scope['mobo'] ) && absint( $scope['mobo'] ) > 0 ) || absint( $scope['quarantined'] ?? 0 ) > 0 );
 	}
 
 	/** Only an all-Mobo order owned by exactly one Connection may mutate a remote Source. */
@@ -5136,7 +5182,7 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_submit_status', 'blocked_' . $status );
 		$order->update_meta_data( '_mobo_order_last_error_code', 'order_scope_' . $status );
 		$order->update_meta_data( '_mobo_order_last_error', $message );
-		if ( in_array( $status, array( 'multi_connection', 'invalid' ), true ) ) {
+		if ( in_array( $status, array( 'multi_connection', 'invalid', 'quarantined' ), true ) ) {
 			$order->update_meta_data( '_mobo_order_requires_review', 'yes' );
 		}
 		$order->save();
@@ -5155,6 +5201,9 @@ class Mobo_Core_Checkout_Validator {
 		}
 		if ( 'invalid' === $status ) {
 			return 'ارسال سفارش به موبو متوقف شد چون مالکیت حداقل یک آیتم سفارش قابل اثبات نیست.';
+		}
+		if ( 'quarantined' === $status ) {
+			return 'این سفارش شامل محصول موبویی است که در قرنطینه مهاجرت قرار دارد؛ سفارش به‌صورت خودکار به موبو ارسال نشد و نیاز به بررسی و ثبت دستی دارد. محصول(ها): ' . implode( '، ', array_slice( is_array( $scope['nonMoboNames'] ?? null ) ? $scope['nonMoboNames'] : array(), 0, 5 ) );
 		}
 		return 'این سفارش طبق سیاست فعلی برای ارسال خودکار به موبو معتبر نیست.';
 	}
@@ -7058,6 +7107,11 @@ class Mobo_Core_Checkout_Validator {
 	private function enforce_source_price_match_before_checkout( $order, $snapshot, $context ) {
 		if ( ! class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
 			return $this->fail_mobo_order_submission( $order, 'price_guard_unavailable', 'کنترل قیمت Source در دسترس نیست؛ خرید خودکار برای جلوگیری از پرداخت با قیمت نامعلوم متوقف شد.' );
+		}
+		/* Per-Connection kill-switch (default ON) for Sources whose cart price format differs. */
+		if ( ! Mobo_Core_Order_Price_Review::guard_enabled() ) {
+			$this->append_order_log( $order, 'source_price_check_disabled', array( 'setting' => Mobo_Core_Order_Price_Review::OPTION_GUARD_ENABLED ) );
+			return true;
 		}
 		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
 		$contract      = class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::get_source_contract( $connection_id, true ) : array( 'unit' => '' );

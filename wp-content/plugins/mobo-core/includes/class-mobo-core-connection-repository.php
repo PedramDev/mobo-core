@@ -22,11 +22,12 @@ final class Mobo_Core_Connection_Repository {
 	 * Backend URL that 10.33.x defined as the MOBO_API_BASE_URL default.
 	 *
 	 * Effective Backend URL precedence (see resolve_api_base_url()):
-	 * 1. MOBO_API_BASE_URL constant (wp-config / environment override, never persisted).
+	 * 1. MOBO_API_BASE_URL constant (wp-config / environment override; always wins at runtime).
 	 * 2. The Connection row's api_base_url (server-provisioned, or adopted below).
 	 * 3./4. Only while adopting the legacy single connection as the Default
-	 *    Connection during a pre-10.34.12 upgrade: the legacy
-	 *    mobo_core_api_base_url option, else this legacy default. These are
+	 *    Connection during a pre-10.34.12 upgrade: the MOBO_API_BASE_URL
+	 *    wp-config value, else this legacy default (the legacy option is
+	 *    ignored: 10.33.x never used it at runtime). These are
 	 *    written once into the Default row so upgraded sites keep their Backend
 	 *    without waiting for provisioning. New/extra Connections never inherit them.
 	 */
@@ -1085,23 +1086,39 @@ final class Mobo_Core_Connection_Repository {
 
 	/**
 	 * Backend URL to persist on the legacy Default Connection while adopting a
-	 * 10.33.x install: legacy option when it is a valid Backend URL, else the old
-	 * built-in default. MOBO_API_BASE_URL is deliberately not persisted; it keeps
-	 * winning at runtime through resolve_api_base_url().
+	 * 10.33.x install.
 	 *
-	 * @param bool|null $legacy_context Override for tests; null detects.
+	 * Reproduces the 10.33.67 effective URL exactly: that release always defined
+	 * MOBO_API_BASE_URL (wp-config value, else http://mobo.codeya.ir/) and its
+	 * filter returned the constant first, so the legacy mobo_core_api_base_url
+	 * option never took effect at runtime. A stale dev/staging value saved in that
+	 * option must therefore NOT be adopted; it is ignored and logged.
+	 *
+	 * @param bool|null   $legacy_context Override for tests; null detects.
+	 * @param string|null $constant_url   Override for tests; null reads MOBO_API_BASE_URL.
 	 * @return string Normalized URL, or '' outside the legacy adoption context.
 	 */
-	public static function legacy_adoption_api_base_url( $legacy_context = null ) {
+	public static function legacy_adoption_api_base_url( $legacy_context = null, $constant_url = null ) {
 		$legacy_context = null === $legacy_context ? self::is_legacy_adoption_context() : (bool) $legacy_context;
 		if ( ! $legacy_context ) { return ''; }
-		$option = trim( (string) get_option( 'mobo_core_api_base_url', '' ) );
-		if ( '' !== $option ) {
-			/* No DNS during migration; literal/local-name checks still apply. */
-			$valid = self::validate_backend_base_url( $option, null, false );
-			if ( ! is_wp_error( $valid ) ) { return $valid; }
+		if ( null === $constant_url ) {
+			$constant_url = defined( 'MOBO_API_BASE_URL' ) ? (string) MOBO_API_BASE_URL : '';
 		}
-		return self::LEGACY_DEFAULT_API_BASE_URL;
+		$url      = self::LEGACY_DEFAULT_API_BASE_URL;
+		$constant = trim( (string) $constant_url );
+		if ( '' !== $constant ) {
+			/* No DNS during migration; literal/local-name checks still apply. */
+			$valid = self::validate_backend_base_url( $constant, null, false );
+			if ( ! is_wp_error( $valid ) ) { $url = $valid; }
+		}
+		$option = trim( (string) get_option( 'mobo_core_api_base_url', '' ) );
+		if ( '' !== $option && trailingslashit( $option ) !== $url && class_exists( 'Mobo_Core_Logger' ) ) {
+			Mobo_Core_Logger::warning(
+				'Legacy mobo_core_api_base_url option ignored during Default Connection adoption (10.33.x never used it at runtime).',
+				array( 'ignored' => $option, 'adopted' => $url )
+			);
+		}
+		return $url;
 	}
 
 	/**

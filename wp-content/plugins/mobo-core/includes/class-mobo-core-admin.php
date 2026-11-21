@@ -2969,6 +2969,7 @@ class Mobo_Core_Admin {
 
 						<div data-mobo-ui-group="auto-order">
 							<?php $this->bool_field( 'تکمیل خودکار سفارش‌های تماما موبو بعد از ثبت موفق', 'mobo_core_mobo_order_auto_complete_enabled' ); ?>
+							<?php $this->bool_field( 'بررسی اختلاف قیمت قبل از خرید خودکار', 'mobo_core_source_price_guard_enabled', false, '', 'پیش از پرداخت، قیمت هر عدد در سبد Source با قیمت همگام‌شده مقایسه می‌شود و در صورت اختلاف سفارش به بررسی دستی می‌رود. فقط اگر قالب قیمت Source ناسازگار است و پشتیبانی موبو تأیید کرده، خاموش کنید.', '1' ); ?>
 							<?php $this->text_field( 'نام فروشگاه یا فرستنده', 'mobo_core_mobo_order_sender_name', 'نامی که در اطلاعات سفارش موبو به عنوان فرستنده ثبت می‌شود.' ); ?>
 							<?php $this->text_field( 'شماره موبایل فروشگاه یا فرستنده', 'mobo_core_mobo_order_sender_mobile', 'شماره موبایلی که در اطلاعات سفارش موبو ثبت می‌شود.' ); ?>
 							<div class="mobo-field mobo-field-full"><div class="mobo-help">روش ارسال قابل مشاهده برای مشتری فقط با WooCommerce است. روش ارسال موبو در بخش پایین، بر اساس استان نگاشت‌شده و ساعت وردپرس برای ثبت سفارش اتوماتیک انتخاب می‌شود.</div></div>
@@ -7244,8 +7245,8 @@ https://source.example/products/test-product/
 	 * @param string $key Option key.
 	 * @return void
 	 */
-	private function bool_field( $label, $key, $disabled = false, $disabled_reason = '', $help = '' ) {
-		$value = self::effective_bool_value( $key );
+	private function bool_field( $label, $key, $disabled = false, $disabled_reason = '', $help = '', $default = null ) {
+		$value = ( null !== $default && ! array_key_exists( $key, Mobo_Core_Settings::defaults() ) ) ? ( in_array( strtolower( trim( (string) Mobo_Core_Settings::get( $key, $default ) ) ), array( '1', 'yes', 'true', 'on' ), true ) ? '1' : '0' ) : self::effective_bool_value( $key );
 		$on_id = $key . '_on';
 		$off_id = $key . '_off';
 		?>
@@ -9670,6 +9671,7 @@ https://source.example/products/test-product/
 						'mobo_core_shipping_diagnostics_enabled',
 						'mobo_core_mobo_order_submission_enabled',
 						'mobo_core_mobo_order_auto_complete_enabled',
+						'mobo_core_source_price_guard_enabled',
 						'mobo_core_checkout_external_validation_enabled',
 						'mobo_core_address_mapping_show_all_countries',
 					)

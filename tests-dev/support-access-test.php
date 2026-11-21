@@ -20,7 +20,11 @@ if ( ! defined( 'DAY_IN_SECONDS' ) ) {
 $GLOBALS['mobo_test_transients'] = array();
 $GLOBALS['mobo_test_users']      = array();
 $GLOBALS['mobo_test_user_meta']  = array();
+$GLOBALS['mobo_test_can']        = false;
+$GLOBALS['mobo_test_current']    = 0;
 
+function current_user_can( $cap ) { return ! empty( $GLOBALS['mobo_test_can'] ); }
+function get_current_user_id() { return (int) $GLOBALS['mobo_test_current']; }
 function delete_option( $name ) { unset( $GLOBALS['mobo_test_options'][ $name ] ); return true; }
 function get_transient( $key ) { return isset( $GLOBALS['mobo_test_transients'][ $key ] ) ? $GLOBALS['mobo_test_transients'][ $key ] : false; }
 function set_transient( $key, $value, $ttl = 0 ) { $GLOBALS['mobo_test_transients'][ $key ] = $value; return true; }
@@ -318,6 +322,75 @@ mobo_assert( false === $by_key['php_version']['ok'], '32-bit PHP is not ready' )
 mobo_assert( false === $by_key['plugin_integrity']['ok'], 'missing manifest is not ok' );
 mobo_assert( false === $by_key['migration']['ok'], 'unstamped migration is not ok' );
 mobo_assert( true === $by_key['db_charset']['ok'], 'unknown db charset (not yet checked) is not a failure' );
+
+echo "M9: GET confirmation never consumes; POST consumes once\n";
+$GLOBALS['mobo_test_transients'] = array();
+$GLOBALS['mobo_test_users'][42]->is_admin = true;
+update_option( $S::OPTION_STATE, array( 'status' => 'granted', 'userId' => 42, 'login' => 'MoboCore', 'expiresAt' => $now + 3600 ) );
+$preview = $S::create_login_link( 'admin@mobo.test', 300, $now );
+$peek1 = $S::peek_login_token( $preview['token'], '203.0.113.20', $now + 1 );
+$peek2 = $S::peek_login_token( $preview['token'], '203.0.113.21', $now + 2 );
+mobo_assert( ! empty( $peek1['ok'] ) && ! empty( $peek2['ok'] ) && ! isset( $peek1['user'] ), 'link preview (GET) sees a valid token but does not consume it or expose the user' );
+$post = $S::consume_login_token( $preview['token'], '203.0.113.22', $now + 3 );
+mobo_assert( ! empty( $post['ok'] ) && 42 === $post['user']->ID, 'POST consumes the token and logs in' );
+$peek3 = $S::peek_login_token( $preview['token'], '203.0.113.22', $now + 4 );
+mobo_assert( empty( $peek3['ok'] ) && 'already_used' === $peek3['reason'], 'after POST the GET page shows the token as used' );
+$expired_peek = $S::create_login_link( 'admin@mobo.test', 60, $now );
+mobo_assert_same( 'expired_token', $S::peek_login_token( $expired_peek['token'], '203.0.113.23', $now + 61 )['reason'], 'GET enforces token expiry' );
+
+echo "M9: capabilities / session / self-extension\n";
+$GLOBALS['mobo_test_users'][7] = (object) array( 'ID' => 7, 'user_login' => 'shopowner', 'is_admin' => true );
+$caps = array( 'manage_options' => true, 'edit_posts' => true );
+mobo_assert_same( $caps, $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][42] ), 'granted support user keeps its capabilities' );
+mobo_assert_same( $caps, $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][7] ), 'ordinary administrator untouched' );
+update_option( $S::OPTION_STATE, array( 'status' => 'granted', 'userId' => 42, 'login' => 'MoboCore', 'expiresAt' => time() - 5 ) );
+mobo_assert_same( array(), $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][42] ), 'expired (expiry job never ran) => support user has no capabilities' );
+update_option( $S::OPTION_STATE, array( 'status' => 'revoked', 'userId' => 42, 'login' => 'MoboCore', 'expiresAt' => time() + 3600 ) );
+mobo_assert_same( array(), $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][42] ), 'revoked => support user has no capabilities' );
+delete_option( $S::OPTION_STATE );
+mobo_assert_same( array(), $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][42] ), 'state lost (e.g. rollback/restore) => marked support user still powerless' );
+$GLOBALS['mobo_test_users'][43] = (object) array( 'ID' => 43, 'user_login' => 'MoboCore', 'is_admin' => true );
+mobo_assert_same( $caps, $S::filter_user_has_cap( $caps, array(), array(), $GLOBALS['mobo_test_users'][43] ), 'unmarked user that merely shares the login is never stripped' );
+mobo_assert_same( false, $S::filter_application_passwords_available( true, $GLOBALS['mobo_test_users'][42] ), 'support user never gets Application Passwords' );
+mobo_assert_same( true, $S::filter_application_passwords_available( true, $GLOBALS['mobo_test_users'][7] ), 'ordinary users keep Application Passwords' );
+
+update_option( $S::OPTION_STATE, array( 'status' => 'revoked', 'userId' => 42, 'login' => 'MoboCore', 'expiresAt' => time() + 3600 ) );
+$GLOBALS['mobo_test_current'] = 42;
+mobo_assert_same( true, $S::enforce_current_session(), 'logged-in support user session is terminated once access is not live' );
+update_option( $S::OPTION_STATE, array( 'status' => 'granted', 'userId' => 42, 'login' => 'MoboCore', 'expiresAt' => time() + 3600 ) );
+mobo_assert_same( false, $S::enforce_current_session(), 'live grant keeps the support session' );
+$GLOBALS['mobo_test_can'] = true;
+$self = $S::grant( 30, 'MoboCore' );
+mobo_assert( is_wp_error( $self ) && 'mobo_core_support_self_extend_forbidden' === $self->get_error_code(), 'support user cannot extend its own access' );
+$GLOBALS['mobo_test_current'] = 7;
+mobo_assert_same( false, $S::enforce_current_session(), 'ordinary admin session untouched' );
+$GLOBALS['mobo_test_can'] = false;
+$GLOBALS['mobo_test_current'] = 0;
+
+echo "M7: cron Source check bounded by the runner deadline\n";
+mobo_assert_same( 8.0, $S::bounded_http_timeout( 8, 0, 100.0 ), 'no deadline => validator timeout unchanged' );
+mobo_assert_same( 5.0, $S::bounded_http_timeout( 8, 107.0, 100.0 ), '7s left => timeout clamped to remaining minus 2s margin' );
+mobo_assert_same( 8.0, $S::bounded_http_timeout( 8, 200.0, 100.0 ), 'plenty left => validator timeout kept' );
+mobo_assert_same( 0.5, $S::bounded_http_timeout( 20, 101.0, 100.0 ), 'deadline nearly reached => minimal timeout, never negative' );
+if ( ! class_exists( 'Mobo_Core_Settings' ) ) {
+	final class Mobo_Core_Settings {
+		public static function get( $key, $default = '' ) { return 'mobo_core_checkout_mobo_username' === $key ? 'u' : ( 'mobo_core_checkout_mobo_password' === $key ? 'p' : $default ); }
+	}
+}
+delete_option( $S::OPTION_SOURCE );
+update_option( $S::OPTION_STATE, array( 'status' => 'revoked', 'userId' => 42 ) );
+$tick = $S::cron_tick( 'real-cron', microtime( true ) + 5 );
+mobo_assert_same( 'skipped-budget', $tick['status'], 'due check with <15s left in the slice is skipped (no Source login started)' );
+mobo_assert_same( false, get_option( $S::OPTION_SOURCE, false ), 'skip does not push nextDueAt (next run retries)' );
+
+echo "H3/M9: REST wiring (static)\n";
+$rest_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-rest-controller.php' );
+foreach ( array( 'create_support_login_link', 'support_request_access' ) as $cb ) {
+	$ok = (bool) preg_match( "/'callback'\s*=>\s*array\(\s*\\\$this,\s*'" . $cb . "'\s*\),(?:\s*\/\*.*?\*\/)?\s*'permission_callback'\s*=>\s*array\(\s*\\\$this,\s*'check_installation_security'\s*\)/s", $rest_src );
+	mobo_assert( $ok, 'H3: ' . $cb . ' requires the installation-controller (Default Connection) credential' );
+}
+mobo_assert( (bool) preg_match( "/'methods'\s*=>\s*array\(\s*'GET',\s*'POST'\s*\),\s*'callback'\s*=>\s*array\(\s*\\\$this,\s*'support_login'/s", $rest_src ), 'M9: /support/login accepts GET (confirm) and POST (consume)' );
+mobo_assert( false !== strpos( $rest_src, 'peek_login_token' ) && false !== strpos( $rest_src, 'Referrer-Policy: no-referrer' ), 'M9: GET path peeks only and sends no-referrer' );
 
 echo "Manifest integrity\n";
 $dir = sys_get_temp_dir() . '/mobo-support-manifest-' . bin2hex( random_bytes( 4 ) );

@@ -1544,8 +1544,9 @@ class Mobo_Core_Cron_Runner {
 
 				$round['supportAccess'] = $this->execute_stage(
 					'supportAccess',
-					function () use ( $source ) {
-						return Mobo_Core_Support_Access::cron_tick( $source );
+					function () use ( $source, $deadline ) {
+						/* Source login HTTP is bounded by the runner deadline (M7). */
+						return Mobo_Core_Support_Access::cron_tick( $source, $deadline );
 					},
 					array( 'success' => false, 'status' => 'exception' ),
 					$disabled_stages,

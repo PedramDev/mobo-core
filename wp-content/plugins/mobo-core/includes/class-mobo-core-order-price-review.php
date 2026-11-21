@@ -29,6 +29,8 @@ final class Mobo_Core_Order_Price_Review {
 	const BACKOFF_BASE_SECONDS  = 60;
 	const BACKOFF_MAX_SECONDS   = 3600;
 	const DISMISS_ACTION        = 'mobo_core_dismiss_price_review';
+	/** Per-Connection setting: "بررسی اختلاف قیمت قبل از خرید خودکار" (default '1'). */
+	const OPTION_GUARD_ENABLED  = 'mobo_core_source_price_guard_enabled';
 
 	/* ------------------------------------------------------------------
 	 * Pure helpers.
@@ -50,8 +52,44 @@ final class Mobo_Core_Order_Price_Review {
 	}
 
 	/**
+	 * Whether the Source price guard is enabled for the current Connection
+	 * (setting "بررسی اختلاف قیمت قبل از خرید خودکار", default ON).
+	 *
+	 * @return bool
+	 */
+	public static function guard_enabled() {
+		if ( ! class_exists( 'Mobo_Core_Settings' ) || ! method_exists( 'Mobo_Core_Settings', 'enabled' ) ) {
+			return true; // Fail closed: keep guarding.
+		}
+		return Mobo_Core_Settings::enabled( self::OPTION_GUARD_ENABLED, '1' );
+	}
+
+	/**
+	 * Normalize Persian/Arabic-Indic digits and separators to ASCII.
+	 * "۱۲۵٬۰۰۰" -> "125,000", "١٢٫٥" -> "12.5".
+	 *
+	 * @param string $value Raw.
+	 * @return string
+	 */
+	public static function normalize_digits( $value ) {
+		$value = (string) $value;
+		$map   = array(
+			'۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4', '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9',
+			'٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4', '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+			"\xD9\xAC" => ',', // U+066C ARABIC THOUSANDS SEPARATOR.
+			"\xD9\xAB" => '.', // U+066B ARABIC DECIMAL SEPARATOR.
+			"\xE2\x80\x8F" => '', "\xE2\x80\x8E" => '', "\xE2\x80\x8C" => '', // RLM, LRM, ZWNJ.
+			"\xE2\x80\xAF" => '', "\xE2\x80\x89" => '', "\xC2\xA0" => '', // Narrow/thin/no-break spaces.
+		);
+		return strtr( $value, $map );
+	}
+
+	/**
 	 * Canonical non-negative decimal string ("1250000.000000" -> "1250000").
-	 * Thousands separators, exponents, negatives and booleans are rejected.
+	 * Persian/Arabic digits and well-formed thousands grouping ("1,250,000",
+	 * "۱٬۲۵۰٬۰۰۰") are accepted; malformed grouping, exponents, negatives and
+	 * booleans are rejected. Two amounts are numerically equal iff their
+	 * canonical strings are equal.
 	 *
 	 * @param mixed $value Raw amount.
 	 * @return string|null
@@ -72,8 +110,14 @@ final class Mobo_Core_Order_Price_Review {
 		if ( ! is_string( $value ) ) {
 			return null;
 		}
-		$raw = str_replace( array( "\xC2\xA0", ' ' ), '', trim( $value ) );
+		$raw = str_replace( array( "\xC2\xA0", ' ' ), '', trim( self::normalize_digits( $value ) ) );
 		$raw = ltrim( $raw, '+' );
+		if ( false !== strpos( $raw, ',' ) ) {
+			if ( 1 !== preg_match( '/^[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?$/D', $raw ) ) {
+				return null; // Malformed grouping is never guessed.
+			}
+			$raw = str_replace( ',', '', $raw );
+		}
 		if ( 1 !== preg_match( '/^([0-9]+)(?:\.([0-9]+))?$/D', $raw, $m ) ) {
 			return null;
 		}
@@ -83,6 +127,30 @@ final class Mobo_Core_Order_Price_Review {
 			$whole = '0';
 		}
 		return '' === $fraction ? $whole : $whole . '.' . $fraction;
+	}
+
+	/**
+	 * Numeric a <= b on canonical decimals, strings only (no float rounding).
+	 *
+	 * @param string $a Canonical decimal.
+	 * @param string $b Canonical decimal.
+	 * @return bool
+	 */
+	public static function decimal_lte( $a, $b ) {
+		$a = self::canonical_decimal( $a );
+		$b = self::canonical_decimal( $b );
+		if ( null === $a || null === $b ) {
+			return false;
+		}
+		$pa = explode( '.', $a, 2 );
+		$pb = explode( '.', $b, 2 );
+		if ( strlen( $pa[0] ) !== strlen( $pb[0] ) ) {
+			return strlen( $pa[0] ) < strlen( $pb[0] );
+		}
+		$fa  = isset( $pa[1] ) ? $pa[1] : '';
+		$fb  = isset( $pb[1] ) ? $pb[1] : '';
+		$len = max( strlen( $fa ), strlen( $fb ) );
+		return strcmp( $pa[0] . str_pad( $fa, $len, '0' ), $pb[0] . str_pad( $fb, $len, '0' ) ) <= 0;
 	}
 
 	/** Shift a canonical decimal by a power of ten using strings only. @return string|null */
@@ -175,8 +243,19 @@ final class Mobo_Core_Order_Price_Review {
 	}
 
 	/**
-	 * Per-unit Source price of one cart row. The variant price is preferred
-	 * because it is the same field Product Sync stores as mobo_api_price.
+	 * Per-unit Source price of one cart row: the price the Source will
+	 * actually charge for one unit.
+	 *
+	 * Field precedence (the chosen field is returned in 'field' and logged):
+	 * 1. An ACTIVE per-unit sale/discount price on the variant or row
+	 *    (product.variant.final_price|sale_price|discount_price|discounted_price|
+	 *    special_price, camelCase variants, or row final_unit_price) - active
+	 *    means parseable, > 0 and not above product.variant.price.
+	 * 2. product.variant.price (the same field Product Sync stores as
+	 *    mobo_api_price; compare_price is the struck-through original and is
+	 *    never used).
+	 * 3. unit_price, unitPrice, price.
+	 * A malformed value in the chosen field stays null (fail closed).
 	 *
 	 * @param mixed $cart_item One raw cart.items[] row.
 	 * @return array{price:?string,field:string}
@@ -187,6 +266,30 @@ final class Mobo_Core_Order_Price_Review {
 			return $out;
 		}
 		$variant = isset( $cart_item['product']['variant'] ) && is_array( $cart_item['product']['variant'] ) ? $cart_item['product']['variant'] : array();
+		$base    = array_key_exists( 'price', $variant ) && null !== $variant['price'] && '' !== $variant['price'] ? self::canonical_decimal( $variant['price'] ) : null;
+		$sale_candidates = array();
+		foreach ( array( 'final_price', 'finalPrice', 'sale_price', 'salePrice', 'discount_price', 'discountPrice', 'discounted_price', 'discountedPrice', 'special_price', 'specialPrice' ) as $key ) {
+			if ( array_key_exists( $key, $variant ) ) {
+				$sale_candidates[ 'product.variant.' . $key ] = $variant[ $key ];
+			}
+		}
+		foreach ( array( 'final_unit_price', 'finalUnitPrice' ) as $key ) {
+			if ( array_key_exists( $key, $cart_item ) ) {
+				$sale_candidates[ $key ] = $cart_item[ $key ];
+			}
+		}
+		foreach ( $sale_candidates as $field => $value ) {
+			$sale = ( null === $value || '' === $value || is_bool( $value ) ) ? null : self::canonical_decimal( $value );
+			if ( null === $sale || '0' === $sale ) {
+				continue; // Absent/zero/unreadable sale price means "no active discount".
+			}
+			if ( null !== $base && ! self::decimal_lte( $sale, $base ) ) {
+				continue; // A "sale" above the list price is not a discount.
+			}
+			$out['field'] = $field;
+			$out['price'] = $sale;
+			return $out;
+		}
 		$candidates = array(
 			'product.variant.price' => array_key_exists( 'price', $variant ) ? $variant['price'] : null,
 			'unit_price'            => array_key_exists( 'unit_price', $cart_item ) ? $cart_item['unit_price'] : null,

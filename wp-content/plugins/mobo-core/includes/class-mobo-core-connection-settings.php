@@ -151,6 +151,7 @@ final class Mobo_Core_Connection_Settings {
 			// Purchase/order submission and Source shipping account policy.
 			'mobo_core_mobo_order_submission_enabled',
 			'mobo_core_mobo_order_auto_complete_enabled',
+			'mobo_core_source_price_guard_enabled',
 			'mobo_core_mobo_order_sender_name',
 			'mobo_core_mobo_order_sender_mobile',
 			'mobo_core_mobo_order_shipping_id',
