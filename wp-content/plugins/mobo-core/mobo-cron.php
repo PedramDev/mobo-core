@@ -156,12 +156,17 @@ function mobo_core_cron_run() {
 		? Mobo_Core_Self_Runner::claim_worker_request( '' )
 		: array( 'success' => true, 'token' => '' );
 	if ( empty( $dispatch_claim['success'] ) ) {
-		$http = isset( $dispatch_claim['httpStatus'] ) ? absint( $dispatch_claim['httpStatus'] ) : 423;
+		$http  = isset( $dispatch_claim['httpStatus'] ) ? absint( $dispatch_claim['httpStatus'] ) : 423;
+		$retry = isset( $dispatch_claim['retryAfter'] ) ? absint( $dispatch_claim['retryAfter'] ) : 0;
+		if ( 423 === $http && $retry > 0 && ! headers_sent() ) {
+			header( 'Retry-After: ' . $retry );
+		}
 		mobo_core_cron_emit_json(
 			array(
-				'success' => false,
-				'status'  => isset( $dispatch_claim['status'] ) ? sanitize_key( (string) $dispatch_claim['status'] ) : 'dispatcher-locked',
-				'message' => 'Another Mobo worker request is already active for this site.',
+				'success'    => false,
+				'status'     => isset( $dispatch_claim['status'] ) ? sanitize_key( (string) $dispatch_claim['status'] ) : 'dispatcher-locked',
+				'message'    => 'Another Mobo worker request is already active for this site.',
+				'retryAfter' => $retry,
 			),
 			0,
 			'',

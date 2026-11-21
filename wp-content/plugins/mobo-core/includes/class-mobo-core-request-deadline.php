@@ -1,0 +1,221 @@
+<?php
+/**
+ * One end-to-end wall-clock deadline for the current PHP request.
+ *
+ * Cheap shared hosts kill a request at max_execution_time (often 30 s, counted
+ * from the start of the request, not from when Mobo code starts). Every budgeted
+ * stage (migration slice, runner, health snapshot, dispatcher lease) therefore
+ * derives its limit from the same request deadline instead of measuring from its
+ * own start: deadline = REQUEST_TIME_FLOAT + min(25 s, 80% of the PHP limit).
+ * An unknown/unlimited limit is treated as 30 s.
+ *
+ * Pure helpers are public for the standalone tests in tests-dev/.
+ *
+ * PHP 7.4 compatible.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+final class Mobo_Core_Request_Deadline {
+
+	/** PHP limit assumed when max_execution_time is 0/unknown (CLI, unusual SAPIs). */
+	const ASSUMED_LIMIT_SECONDS = 30;
+
+	/** Absolute ceiling of the work budget of one request. */
+	const MAX_BUDGET_SECONDS = 25;
+
+	/** Share of the PHP limit that may be spent (the rest is bootstrap/shutdown headroom). */
+	const BUDGET_RATIO = 0.8;
+
+	/** Dispatcher lease = PHP limit + this margin, bounded below/above. */
+	const LEASE_MARGIN_SECONDS = 15;
+	const LEASE_MIN_SECONDS    = 45;
+	const LEASE_MAX_SECONDS    = 90;
+
+	/** A REQUEST_TIME_FLOAT older than this is not trusted (long-lived CLI loops). */
+	const MAX_REQUEST_AGE_SECONDS = 3600;
+
+	/** @var array|null Memoized compute() result for this request. */
+	private static $memo = null;
+
+	/** @var float|null Fallback start when REQUEST_TIME_FLOAT is unusable. */
+	private static $fallback_start = null;
+
+	/**
+	 * Effective PHP time limit in seconds (unknown/unlimited => 30).
+	 *
+	 * @param mixed $raw Raw ini value; null reads max_execution_time.
+	 * @return int
+	 */
+	public static function php_time_limit( $raw = null ) {
+		$raw   = null === $raw ? ini_get( 'max_execution_time' ) : $raw;
+		$limit = is_numeric( $raw ) ? (int) $raw : 0;
+		return $limit > 0 ? $limit : self::ASSUMED_LIMIT_SECONDS;
+	}
+
+	/**
+	 * Work budget for a request with the given PHP limit: min(25, 80% of limit).
+	 *
+	 * @param int $limit PHP limit in seconds (>0).
+	 * @return float
+	 */
+	public static function budget_seconds( $limit ) {
+		$limit = max( 1, absint( $limit ) );
+		return (float) max( 1.0, min( (float) self::MAX_BUDGET_SECONDS, floor( $limit * self::BUDGET_RATIO * 10 ) / 10 ) );
+	}
+
+	/**
+	 * Validate $_SERVER['REQUEST_TIME_FLOAT'].
+	 *
+	 * @param mixed $value Raw server value.
+	 * @param float $now   Current microtime.
+	 * @return float|null
+	 */
+	public static function resolve_request_start( $value, $now ) {
+		if ( ! is_numeric( $value ) ) {
+			return null;
+		}
+		$start = (float) $value;
+		$now   = (float) $now;
+		if ( $start <= 0 || $start > $now + 1.0 || $start < $now - self::MAX_REQUEST_AGE_SECONDS ) {
+			return null;
+		}
+		return $start;
+	}
+
+	/**
+	 * Pure deadline computation.
+	 *
+	 * @param float|null $request_start Validated request start (null => $now).
+	 * @param mixed      $raw_limit     Raw max_execution_time value.
+	 * @param float      $now           Current microtime.
+	 * @return array{start:float,limit:int,budget:float,deadline:float}
+	 */
+	public static function compute( $request_start, $raw_limit, $now ) {
+		$start  = null === $request_start ? (float) $now : (float) $request_start;
+		$limit  = self::php_time_limit( $raw_limit );
+		$budget = self::budget_seconds( $limit );
+		return array(
+			'start'    => $start,
+			'limit'    => $limit,
+			'budget'   => $budget,
+			'deadline' => $start + $budget,
+		);
+	}
+
+	/** @return array Memoized request deadline data. */
+	public static function current() {
+		if ( null === self::$memo ) {
+			$now = microtime( true );
+			if ( null === self::$fallback_start ) {
+				self::$fallback_start = $now;
+			}
+			$raw   = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? $_SERVER['REQUEST_TIME_FLOAT'] : null; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- numeric server timestamp, validated below.
+			$start = self::resolve_request_start( $raw, $now );
+			self::$memo = self::compute( null === $start ? self::$fallback_start : $start, ini_get( 'max_execution_time' ), $now );
+		}
+		return self::$memo;
+	}
+
+	/** @return float Absolute microtime deadline of this request. */
+	public static function deadline() {
+		$current = self::current();
+		return (float) $current['deadline'];
+	}
+
+	/**
+	 * Seconds left before the request deadline (may be negative).
+	 *
+	 * @param float|null $now Optional microtime.
+	 * @return float
+	 */
+	public static function remaining( $now = null ) {
+		$now = null === $now ? microtime( true ) : (float) $now;
+		return self::deadline() - $now;
+	}
+
+	/**
+	 * Whether at least $reserve seconds remain.
+	 *
+	 * @param float $reserve Seconds.
+	 * @return bool
+	 */
+	public static function has_time( $reserve = 0.0 ) {
+		return self::remaining() > (float) $reserve;
+	}
+
+	/**
+	 * Clamp a stage budget so it ends no later than the request deadline minus $reserve.
+	 *
+	 * @param float $seconds Desired budget.
+	 * @param float $reserve Seconds to keep for the caller after the stage.
+	 * @param float|null $now Optional microtime.
+	 * @return float Possibly 0 when no time is left.
+	 */
+	public static function clamp_seconds( $seconds, $reserve = 0.0, $now = null ) {
+		return (float) max( 0.0, min( (float) $seconds, self::remaining( $now ) - (float) $reserve ) );
+	}
+
+	/**
+	 * Dispatcher lease TTL derived from the PHP limit: limit + 15 s, within [45, 90].
+	 * A request killed by the host can therefore never lock the site out for more
+	 * than ~1.5 minutes even when the shutdown release could not run.
+	 *
+	 * @param mixed $raw_limit Raw max_execution_time; null reads ini.
+	 * @return int
+	 */
+	public static function lease_ttl( $raw_limit = null ) {
+		$limit = self::php_time_limit( $raw_limit );
+		return (int) max( self::LEASE_MIN_SECONDS, min( self::LEASE_MAX_SECONDS, $limit + self::LEASE_MARGIN_SECONDS ) );
+	}
+
+	/**
+	 * What an ordinary (non mobo-cron.php) request may do about an unstamped
+	 * database during plugins_loaded. Storefront/admin/REST page loads never run the
+	 * heavy pipeline: 'nudge' only wakes the background runner; the budgeted worker
+	 * routes do nothing here because their runner slice migrates within the request
+	 * deadline; WP-CLI (no time limit) keeps the full pass.
+	 *
+	 * @param bool $is_cli          WP-CLI request.
+	 * @param bool $is_worker_route /cron/run or /worker/run REST route.
+	 * @return string full-pass|none|nudge
+	 */
+	public static function migration_bootstrap_action( $is_cli, $is_worker_route ) {
+		if ( $is_cli ) {
+			return 'full-pass';
+		}
+		return $is_worker_route ? 'none' : 'nudge';
+	}
+
+	/**
+	 * Pure route check: /mobo-core/v1/cron/run or /mobo-core/v1/worker/run, either
+	 * as pretty-permalink path or as ?rest_route=.
+	 *
+	 * @param string $request_uri REQUEST_URI.
+	 * @param string $rest_route  ?rest_route= value.
+	 * @return bool
+	 */
+	public static function is_budgeted_worker_route( $request_uri, $rest_route = '' ) {
+		$path = (string) parse_url( (string) $request_uri, PHP_URL_PATH ); // phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- pure helper, no WP dependency.
+		foreach ( array( (string) $rest_route, $path ) as $candidate ) {
+			$candidate = '/' . trim( strtolower( $candidate ), '/' );
+			if ( preg_match( '#/mobo-core/v1/(cron|worker)/run$#', $candidate ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Test hook: forget the memoized deadline (optionally pin it).
+	 *
+	 * @param array|null $pinned Optional compute() result to use.
+	 * @return void
+	 */
+	public static function reset( $pinned = null ) {
+		self::$memo           = is_array( $pinned ) ? $pinned : null;
+		self::$fallback_start = null;
+	}
+}

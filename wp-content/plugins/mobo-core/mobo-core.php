@@ -510,6 +510,58 @@ function mobo_core_is_rest_request_early() {
 }
 
 /**
+ * Whether this request is one of the budgeted worker routes (/cron/run, /worker/run)
+ * that drive migration themselves inside the request deadline.
+ *
+ * @param string|null $request_uri Optional REQUEST_URI (tests).
+ * @param string|null $rest_route  Optional ?rest_route= value (tests).
+ * @return bool
+ */
+function mobo_core_is_budgeted_worker_route( $request_uri = null, $rest_route = null ) {
+	if ( null === $rest_route ) {
+		$rest_route = isset( $_GET['rest_route'] ) ? sanitize_text_field( wp_unslash( $_GET['rest_route'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only request-context detection.
+	}
+	if ( null === $request_uri ) {
+		$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+	}
+	return Mobo_Core_Request_Deadline::is_budgeted_worker_route( (string) $request_uri, (string) $rest_route );
+}
+
+/**
+ * Unstamped database on an ordinary request: do not migrate here, only make sure
+ * the background runner gets woken up. At most once per minute site-wide, never
+ * when a recurring real cron is already driving the site, and only at shutdown
+ * through the throttled, lease-protected, non-blocking self-runner kick.
+ *
+ * @return void
+ */
+function mobo_core_nudge_background_migration() {
+	$now  = time();
+	$last = absint( get_option( 'mobo_core_migration_last_nudge_at', 0 ) );
+	if ( $last > 0 && $last <= $now && ( $now - $last ) < 60 ) {
+		return;
+	}
+	update_option( 'mobo_core_migration_last_nudge_at', $now, false );
+	$last_cron_hit = absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
+	if ( $last_cron_hit > 0 && $last_cron_hit <= $now && ( $now - $last_cron_hit ) < 300 ) {
+		return;
+	}
+	add_action(
+		'shutdown',
+		static function () {
+			if ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
+				try {
+					Mobo_Core_Self_Runner::kick( 'migration-nudge', false );
+				} catch ( Throwable $e ) {
+					unset( $e ); // Best effort; the next nudge or real cron retries.
+				}
+			}
+		},
+		1
+	);
+}
+
+/**
  * Whether this request may mutate products/options and therefore needs the full
  * cache mutation listeners instead of the read-only frontend fast path.
  *
@@ -742,8 +794,23 @@ add_action(
 		if ( MOBO_CORE_VERSION !== $current_db_version && ! $is_budgeted_cron_bootstrap ) {
 			/* mobo-cron.php defines its context before wp-load.php. Let the dedicated
 			 * runner own the first migration pass so one Cron request cannot replay the
-			 * full historical pipeline once during bootstrap and again inside its slice. */
-			Mobo_Core_Migration::maybe_run();
+			 * full historical pipeline once during bootstrap and again inside its slice.
+			 *
+			 * Runtime hardening: the full pipeline never runs synchronously inside a
+			 * storefront/admin/REST page load any more (first page view took 13-26 s
+			 * and a product page hit the 30 s fatal). The cron/worker routes leave it
+			 * to the budgeted runner slice; every other request only nudges the
+			 * self-runner (throttled, non-blocking, at shutdown). WP-CLI has no time
+			 * limit and keeps the full pass. */
+			$bootstrap_action = Mobo_Core_Request_Deadline::migration_bootstrap_action(
+				defined( 'WP_CLI' ) && WP_CLI,
+				mobo_core_is_budgeted_worker_route()
+			);
+			if ( 'full-pass' === $bootstrap_action ) {
+				Mobo_Core_Migration::maybe_run();
+			} elseif ( 'nudge' === $bootstrap_action ) {
+				mobo_core_nudge_background_migration();
+			}
 		} elseif ( $connection_settings_contract_pending && ! $is_budgeted_cron_bootstrap ) {
 			/* WIP/replacement builds can expand the Source-owned settings contract
 			 * without changing MOBO_CORE_VERSION. Run the retry-safe terminal cutover once per contract revision: seed only

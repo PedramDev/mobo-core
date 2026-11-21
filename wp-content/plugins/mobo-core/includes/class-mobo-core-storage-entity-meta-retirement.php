@@ -36,6 +36,15 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	/** @var bool|null */
 	private static $transitioning = null;
 
+	/** @var array|null Request-local negative cache of the durable fence/transition flags. */
+	private static $state_flags = null;
+
+	/** @var float Microtime $state_flags was read. */
+	private static $state_flags_at = 0.0;
+
+	/** Seconds a negative fence/transition read is reused within one request. */
+	const NEGATIVE_STATE_TTL = 5;
+
 	/** @var bool Request-local cache: terminal zero-residue was already proven. */
 	private static $zero_residue_verified = false;
 
@@ -191,13 +200,58 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 			self::$fenced = true;
 			return true;
 		}
-		$state = self::load_state();
-		if ( ! empty( $state['fenceActive'] ) && self::FENCE_VERSION === absint( $state['fenceVersion'] ?? 0 ) ) {
+		$flags = self::state_flags();
+		if ( $flags['fence'] ) {
 			self::$fenced = true;
 			update_option( self::FENCE_OPTION, self::FENCE_VERSION, false );
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Fence/transition flags from the durable worker state.
+	 *
+	 * Before the fence every product meta read asked this (twice) and each time ran
+	 * `SELECT state_json FROM mobo_runtime`, because only a positive result was
+	 * cached. A negative result is now reused for NEGATIVE_STATE_TTL seconds: a flip
+	 * by another process is observed within that window (far inside the 120 s
+	 * transition grace that covers in-flight requests), a flip by this request sets
+	 * the positive statics directly, and persist_state()/reset_request_cache()
+	 * invalidate the memo. Read errors are never cached.
+	 *
+	 * @return array{fence:bool,transition:bool}
+	 */
+	private static function state_flags() {
+		$now = microtime( true );
+		if ( is_array( self::$state_flags ) && self::negative_state_cache_fresh( self::$state_flags_at, $now ) ) {
+			return self::$state_flags;
+		}
+		$state = self::load_state();
+		$flags = array(
+			'fence'      => ! empty( $state['fenceActive'] ) && self::FENCE_VERSION === absint( $state['fenceVersion'] ?? 0 ),
+			'transition' => ! empty( $state['transitionActive'] ) && self::FENCE_VERSION === absint( $state['transitionVersion'] ?? 0 ),
+		);
+		if ( empty( $state['__stateLoadError'] ) ) {
+			self::$state_flags    = $flags;
+			self::$state_flags_at = $now;
+		} else {
+			self::$state_flags = null;
+		}
+		return $flags;
+	}
+
+	/**
+	 * Pure TTL decision (unit tested).
+	 *
+	 * @param float $cached_at Microtime the flags were read (0 = never).
+	 * @param float $now       Current microtime.
+	 * @return bool
+	 */
+	public static function negative_state_cache_fresh( $cached_at, $now ) {
+		$cached_at = (float) $cached_at;
+		$age       = (float) $now - $cached_at;
+		return $cached_at > 0 && $age >= 0 && $age < self::NEGATIVE_STATE_TTL;
 	}
 
 	/** @return bool */
@@ -209,8 +263,8 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 			self::$transitioning = true;
 			return true;
 		}
-		$state = self::load_state();
-		if ( ! empty( $state['transitionActive'] ) && self::FENCE_VERSION === absint( $state['transitionVersion'] ?? 0 ) ) {
+		$flags = self::state_flags();
+		if ( $flags['transition'] ) {
 			self::$transitioning = true;
 			update_option( self::TRANSITION_OPTION, self::FENCE_VERSION, false );
 			return true;
@@ -245,6 +299,8 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 	public static function reset_request_cache() {
 		self::$fenced        = null;
 		self::$transitioning = null;
+		self::$state_flags   = null;
+		self::$state_flags_at = 0.0;
 		self::$zero_residue_verified = false;
 		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
 			Mobo_Core_Storage_Row_Cache::flush_bucket( self::ROW_CACHE_BUCKET );
@@ -1865,6 +1921,8 @@ final class Mobo_Core_Storage_Entity_Meta_Retirement {
 		global $wpdb;
 		if ( class_exists( 'Mobo_Core_Migration' ) && ! Mobo_Core_Migration::accelerated_slice_lock_is_valid() ) { return false; }
 		if ( ! empty( $state['__stateLoadError'] ) || ! self::storage_ready() ) { return false; }
+		/* Any state write may flip fence/transition: drop the negative flag memo. */
+		self::$state_flags = null;
 		$table = Mobo_Core_Storage_Schema::table_name( 'runtime' );
 		$now = current_time( 'mysql', true );
 		$expected_raw = $state['__persistedStateJson'] ?? null;

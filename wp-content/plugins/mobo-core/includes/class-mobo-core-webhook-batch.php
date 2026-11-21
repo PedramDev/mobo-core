@@ -29,7 +29,29 @@ final class Mobo_Core_Webhook_Batch {
 	 * @return array
 	 */
 	public static function capabilities() {
+		/* Not advertised while the runner is migration-only: the Backend would start
+		 * delta/batch delivery that this site cannot apply yet (full-snapshot flood). */
+		if ( ! self::normal_runtime_ready() ) {
+			return array();
+		}
 		return array( 'product-delta-v1', self::CAPABILITY );
+	}
+
+	/**
+	 * Whether ordinary runtime work (inline deltas included) may run now. A stamped
+	 * database is always ready and costs one option read; otherwise the migration's
+	 * structural readiness decides.
+	 *
+	 * @return bool
+	 */
+	public static function normal_runtime_ready() {
+		if ( defined( 'MOBO_CORE_VERSION' ) && MOBO_CORE_VERSION === trim( (string) get_option( 'mobo_core_db_version', '' ) ) ) {
+			return true;
+		}
+		if ( ! class_exists( 'Mobo_Core_Migration' ) || ! method_exists( 'Mobo_Core_Migration', 'normal_runtime_ready' ) ) {
+			return false;
+		}
+		return (bool) Mobo_Core_Migration::normal_runtime_ready();
 	}
 
 	/**

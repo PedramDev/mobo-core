@@ -1543,14 +1543,23 @@ class Mobo_Core_Product_Map {
 			return 0;
 		}
 
-		$count = 0;
-		$last  = $cursor;
+		$count  = 0;
+		$last   = $cursor;
+		$mapped = $this->mapped_guid_set( $rows, self::TYPE_PRODUCT );
 
 		foreach ( $rows as $row ) {
 			$post_id = absint( $row['ID'] );
 			$guid    = sanitize_text_field( (string) $row['remote_guid'] );
 
 			if ( $post_id <= 0 || '' === $guid ) {
+				$last = max( $last, $post_id );
+				continue;
+			}
+
+			/* Same outcome as seed_legacy_mapping_if_safe() for an existing row (keep it,
+			 * acknowledge the cursor) without its per-row locks and reads. */
+			if ( isset( $mapped[ $guid ] ) ) {
+				$count++;
 				$last = max( $last, $post_id );
 				continue;
 			}
@@ -1632,8 +1641,9 @@ class Mobo_Core_Product_Map {
 			return 0;
 		}
 
-		$count = 0;
-		$last  = $cursor;
+		$count  = 0;
+		$last   = $cursor;
+		$mapped = $this->mapped_guid_set( $rows, self::TYPE_VARIATION );
 
 		foreach ( $rows as $row ) {
 			$post_id     = absint( $row['ID'] );
@@ -1641,6 +1651,13 @@ class Mobo_Core_Product_Map {
 			$parent_guid = sanitize_text_field( (string) $row['parent_remote_guid'] );
 
 			if ( $post_id <= 0 || '' === $guid ) {
+				$last = max( $last, $post_id );
+				continue;
+			}
+
+			/* Already mapped: the per-row path would preserve the row and return true. */
+			if ( isset( $mapped[ $guid ] ) ) {
+				$count++;
 				$last = max( $last, $post_id );
 				continue;
 			}
@@ -1667,6 +1684,69 @@ class Mobo_Core_Product_Map {
 		update_option( 'mobo_core_product_map_variation_cursor', $last, false );
 
 		return $count;
+	}
+
+	/**
+	 * GUIDs of one seed batch that already have a map row for this Connection and
+	 * object type (exact, case-sensitive match), in one indexed query. An existing
+	 * row is never rewritten by the seed, so such rows need no per-row lock/proof;
+	 * a complete map is therefore re-validated at query speed. On a read error the
+	 * set is empty and every row takes the original safe per-row path.
+	 *
+	 * @param array  $rows        Seed rows with remote_guid.
+	 * @param string $object_type product|variation.
+	 * @return array<string,bool>
+	 */
+	private function mapped_guid_set( $rows, $object_type ) {
+		global $wpdb;
+		$connection_id = self::connection_id();
+		$guids = array();
+		foreach ( (array) $rows as $row ) {
+			$guid = sanitize_text_field( (string) ( $row['remote_guid'] ?? '' ) );
+			if ( '' !== $guid ) {
+				$guids[ $guid ] = true;
+			}
+		}
+		if ( $connection_id <= 0 || empty( $guids ) ) {
+			return array();
+		}
+		$list = array_keys( $guids );
+		$placeholders = implode( ',', array_fill( 0, count( $list ), '%s' ) );
+		$table = self::table_name();
+		$wpdb->last_error = '';
+		$found = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT remote_guid FROM {$table} WHERE connection_id=%d AND object_type=%s AND remote_guid IN ({$placeholders})",
+				array_merge( array( $connection_id, sanitize_key( (string) $object_type ) ), $list )
+			)
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $found ) ) {
+			return array();
+		}
+		return self::exact_guid_intersection( $list, $found );
+	}
+
+	/**
+	 * Pure helper (unit tested): exact, case-sensitive intersection; collation-level
+	 * matches that differ in case/trailing spaces are not treated as mapped.
+	 *
+	 * @param string[] $wanted Batch GUIDs.
+	 * @param string[] $found  GUIDs returned by SQL.
+	 * @return array<string,bool>
+	 */
+	public static function exact_guid_intersection( $wanted, $found ) {
+		$found_set = array();
+		foreach ( (array) $found as $guid ) {
+			$found_set[ (string) $guid ] = true;
+		}
+		$out = array();
+		foreach ( (array) $wanted as $guid ) {
+			$guid = (string) $guid;
+			if ( isset( $found_set[ $guid ] ) ) {
+				$out[ $guid ] = true;
+			}
+		}
+		return $out;
 	}
 
 }

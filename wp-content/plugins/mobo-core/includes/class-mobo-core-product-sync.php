@@ -89,6 +89,13 @@ final class Mobo_Core_Parent_Identity_Conflict extends RuntimeException {
 
 
 /**
+ * Thrown when creating a new product must wait (legacy Product Map seed still
+ * running). Retryable: queues defer the event without consuming an attempt.
+ */
+class Mobo_Core_Product_Creation_Deferred extends RuntimeException {
+}
+
+/**
  * Q2/P0 identity fence: evidence-only decision before selecting, creating or
  * rewriting a local WooCommerce product parent. Disabled by default until the
  * Disposable runtime contract and rollback have been proven. No remap is made.
@@ -5350,6 +5357,19 @@ class Mobo_Core_Product_Sync {
 		}
 	}
 
+	/**
+	 * Whether a brand-new local product may be created now: always after the DB
+	 * version is stamped, otherwise only once the legacy Product Map seed completed.
+	 *
+	 * @return bool
+	 */
+	public static function product_creation_allowed() {
+		if ( defined( 'MOBO_CORE_VERSION' ) && MOBO_CORE_VERSION === trim( (string) get_option( 'mobo_core_db_version', '' ) ) ) {
+			return true;
+		}
+		return absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) > 0;
+	}
+
 	private function upsert_parent_product_core( $data, $skip_images ) {
 		$this->last_parent_core_noop    = false;
 
@@ -5376,6 +5396,13 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 		$is_new_product  = $product_id <= 0;
+		if ( $is_new_product && ! self::product_creation_allowed() ) {
+			/* Upgrade window: the legacy Product Map seed is still running. Updates to
+			 * existing products proceed (lookups fall back to legacy identity); only
+			 * creating a product is deferred, so an unmapped existing one can never be
+			 * duplicated. Queues retry this without consuming an attempt. */
+			throw new Mobo_Core_Product_Creation_Deferred( 'Product creation is deferred until the Product Map seed completes: ' . $product_guid );
+		}
 		if ( $is_new_product && '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
 			Mobo_Core_Parent_Identity_Fence::assert_can_create( $product_guid );
 		}

@@ -552,17 +552,55 @@ global $wpdb;
 			}
 		}
 
-		$event_ownership = self::load_operational_event_ownership();
-		if ( ! empty( $event_ownership['readFailed'] ) ) {
+		$context = self::load_operational_context( $ignore_targeted_recovery_owner );
+		if ( null === $context ) {
 			$result['operationalStatus'] = 'unavailable';
 			$result['operationalReason'] = 'sync-event-ownership-query-failed';
 			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
 			return $result;
 		}
-		$active_events = isset( $event_ownership['active'] ) && is_array( $event_ownership['active'] ) ? $event_ownership['active'] : array();
-		$terminal_events = isset( $event_ownership['terminal'] ) && is_array( $event_ownership['terminal'] ) ? $event_ownership['terminal'] : array();
-		$targeted_recovery_guids = array();
-		$targeted_recovery_owns_unowned = false;
+		$limit = max( 0, absint( $detail_limit ) );
+		self::classify_operational_rows( $rows, $context, $deep_structure, $limit, $operational, $result );
+
+		$historical = self::count_historical_non_live( $connection_id, $health_table, static function ( $guids ) use ( $current_guids ) {
+			$live = array();
+			foreach ( $guids as $guid ) {
+				if ( ! empty( $current_guids[ $guid ] ) ) { $live[ $guid ] = true; }
+			}
+			return $live;
+		} );
+		if ( null === $historical ) {
+			$result['operationalStatus'] = 'unavailable';
+			$result['operationalReason'] = 'sync-health-history-query-failed';
+			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
+			return $result;
+		}
+		$operational['historicalNonLive'] += $historical;
+		$result = self::finalize_operational_result( $result, $operational, $deep_structure );
+
+		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) ) {
+			Mobo_Core_Health_Read_Cache::store_sync_health_operational_snapshot( $mobo_operational_limit, $result );
+		}
+		return $result;
+	}
+
+	/**
+	 * Event ownership + targeted-recovery context shared by the full and paged scans.
+	 *
+	 * @param bool $ignore_targeted_recovery_owner See get_operational_dashboard_status().
+	 * @return array|null Null when the event ownership read failed.
+	 */
+	private static function load_operational_context( $ignore_targeted_recovery_owner = false ) {
+		$event_ownership = self::load_operational_event_ownership();
+		if ( ! empty( $event_ownership['readFailed'] ) ) {
+			return null;
+		}
+		$context = array(
+			'active'               => isset( $event_ownership['active'] ) && is_array( $event_ownership['active'] ) ? $event_ownership['active'] : array(),
+			'terminal'             => isset( $event_ownership['terminal'] ) && is_array( $event_ownership['terminal'] ) ? $event_ownership['terminal'] : array(),
+			'targetedGuids'        => array(),
+			'targetedOwnsUnowned'  => false,
+		);
 		/* The worker's final reclassification must be able to observe its own
 		 * post-apply residuals and any newly-actionable rows that appeared while
 		 * the frozen target set was running. Ordinary dashboard callers keep the
@@ -573,15 +611,34 @@ global $wpdb;
 			$targeted_state = $targeted_sync->get_manual_sync_state();
 			$targeted_status = sanitize_key( (string) ( $targeted_state['status'] ?? '' ) );
 			if ( ! empty( $targeted_state['targetedConvergenceOnly'] ) && in_array( $targeted_status, array( 'running', 'waiting_for_portal' ), true ) ) {
-				$targeted_recovery_owns_unowned = ! empty( $targeted_state['targetedConvergenceOwnsUnowned'] );
+				$context['targetedOwnsUnowned'] = ! empty( $targeted_state['targetedConvergenceOwnsUnowned'] );
 				foreach ( (array) ( $targeted_state['targetedConvergenceTargets'] ?? array() ) as $target ) {
 					if ( ! is_array( $target ) ) { continue; }
 					$target_guid = sanitize_text_field( (string) ( $target['productGuid'] ?? '' ) );
-					if ( '' !== $target_guid ) { $targeted_recovery_guids[ $target_guid ] = true; }
+					if ( '' !== $target_guid ) { $context['targetedGuids'][ $target_guid ] = true; }
 				}
 			}
 		}
-		$limit = max( 0, absint( $detail_limit ) );
+		return $context;
+	}
+
+	/**
+	 * Classify current-product rows into the operational counters/detail lists.
+	 * Row-independent, so the paged background scan can feed it page by page.
+	 *
+	 * @param array $rows           Rows of the current-product query.
+	 * @param array $context        load_operational_context() result.
+	 * @param bool  $deep_structure Deep structure audit.
+	 * @param int   $limit          Detail rows per category.
+	 * @param array $operational    Counters (by reference).
+	 * @param array $result         Result with detail lists (by reference).
+	 * @return void
+	 */
+	private static function classify_operational_rows( $rows, $context, $deep_structure, $limit, &$operational, &$result ) {
+		$active_events = $context['active'];
+		$terminal_events = $context['terminal'];
+		$targeted_recovery_guids = $context['targetedGuids'];
+		$targeted_recovery_owns_unowned = ! empty( $context['targetedOwnsUnowned'] );
 
 		foreach ( $rows as $row ) {
 			$guid = sanitize_text_field( (string) ( isset( $row['remote_guid'] ) ? $row['remote_guid'] : '' ) );
@@ -745,30 +802,66 @@ global $wpdb;
 				$result['unownedRows'][] = $detail;
 			}
 		}
+	}
 
-		/* Health rows not belonging to a current live canonical Product Map row are
-		 * historical/non-live observations. They remain queryable but are excluded
-		 * from operational product-health counts. */
-		if ( '' !== $health_table ) {
-			$wpdb->last_error = '';
-			$incomplete_rows = $wpdb->get_results(
-				$wpdb->prepare( "SELECT product_guid FROM `{$health_table}` WHERE connection_id = %d AND sync_status IN ('behind','repairing','failed')", $connection_id ),
-				ARRAY_A
-			);
-			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $incomplete_rows ) ) {
-				$result['operationalStatus'] = 'unavailable';
-				$result['operationalReason'] = 'sync-health-history-query-failed';
-				$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
-				return $result;
-			}
-			foreach ( $incomplete_rows as $health_row ) {
-				$guid = sanitize_text_field( (string) ( isset( $health_row['product_guid'] ) ? $health_row['product_guid'] : '' ) );
-				if ( '' === $guid || empty( $current_guids[ $guid ] ) ) {
-					$operational['historicalNonLive']++;
-				}
+	/**
+	 * Health rows not belonging to a current live canonical Product Map row are
+	 * historical/non-live observations. They remain queryable but are excluded
+	 * from operational product-health counts.
+	 *
+	 * @param int      $connection_id Connection.
+	 * @param string   $health_table  Sanitized health table ('' when missing).
+	 * @param callable $live_lookup   function( string[] $guids ): array<string,bool> of live GUIDs.
+	 * @return int|null Null on a read failure.
+	 */
+	private static function count_historical_non_live( $connection_id, $health_table, $live_lookup ) {
+		global $wpdb;
+		if ( '' === $health_table ) {
+			return 0;
+		}
+		$wpdb->last_error = '';
+		$incomplete_rows = $wpdb->get_results(
+			$wpdb->prepare( "SELECT product_guid FROM `{$health_table}` WHERE connection_id = %d AND sync_status IN ('behind','repairing','failed')", $connection_id ),
+			ARRAY_A
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $incomplete_rows ) ) {
+			return null;
+		}
+		$guids = array();
+		$count = 0;
+		foreach ( $incomplete_rows as $health_row ) {
+			$guid = sanitize_text_field( (string) ( isset( $health_row['product_guid'] ) ? $health_row['product_guid'] : '' ) );
+			if ( '' === $guid ) {
+				$count++;
+			} else {
+				$guids[] = $guid;
 			}
 		}
+		$live = array();
+		foreach ( array_chunk( $guids, 200 ) as $chunk ) {
+			$found = call_user_func( $live_lookup, $chunk );
+			if ( null === $found ) {
+				return null;
+			}
+			$live += (array) $found;
+		}
+		foreach ( $guids as $guid ) {
+			if ( empty( $live[ $guid ] ) ) {
+				$count++;
+			}
+		}
+		return $count;
+	}
 
+	/**
+	 * Derived counters, accounting check and operational status.
+	 *
+	 * @param array $result         Partial result.
+	 * @param array $operational    Counters.
+	 * @param bool  $deep_structure Deep structure audit.
+	 * @return array
+	 */
+	private static function finalize_operational_result( $result, $operational, $deep_structure ) {
 		/* Only durable current-state evidence belongs in operational attention. A raw
 		 * Health-only discrepancy is audit evidence, not proof that the live product
 		 * needs mutation or Repair. Keep it in a separate verification denominator. */
@@ -796,11 +889,208 @@ global $wpdb;
 			: ( $operational['unownedConvergenceGap'] > 0 ? 'degraded-unowned' : ( $operational['unverifiedHealthGap'] > 0 ? 'needs-verification' : ( $operational['activeRetryOwner'] > 0 ? 'progressing' : ( $operational['terminalUpstreamInvalid'] > 0 ? 'blocked-upstream' : 'clear' ) ) ) );
 		$result['operationalReason'] = 'current-product-map';
 		$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
-
-		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) ) {
-			Mobo_Core_Health_Read_Cache::store_sync_health_operational_snapshot( $mobo_operational_limit, $result );
-		}
 		return $result;
+	}
+
+	/** Option holding the cursor/partial counters of the paged background scan (per Connection). */
+	const SCAN_STATE_OPTION_PREFIX = 'mobo_core_sync_health_scan_v1_c';
+
+	/** A partial scan older than this restarts from the beginning. */
+	const SCAN_STATE_MAX_AGE = 3600;
+
+	/**
+	 * Pure decision (unit tested): may a stored partial scan be resumed?
+	 *
+	 * @param mixed $state         Stored state.
+	 * @param int   $connection_id Current Connection.
+	 * @param int   $limit         Requested detail limit.
+	 * @param int   $now           Unix time.
+	 * @return bool
+	 */
+	public static function scan_state_resumable( $state, $connection_id, $limit, $now ) {
+		return is_array( $state )
+			&& absint( $state['connectionId'] ?? 0 ) === absint( $connection_id )
+			&& absint( $state['limit'] ?? -1 ) === absint( $limit )
+			&& isset( $state['operational'], $state['lists'] ) && is_array( $state['operational'] ) && is_array( $state['lists'] )
+			&& absint( $state['startedAt'] ?? 0 ) > 0
+			&& ( absint( $now ) - absint( $state['startedAt'] ) ) < self::SCAN_STATE_MAX_AGE;
+	}
+
+	/** @return bool Whether a paged background scan is in progress for the current Connection. */
+	public static function operational_scan_in_progress() {
+		$connection_id = self::connection_id();
+		return $connection_id > 0 && is_array( get_option( self::SCAN_STATE_OPTION_PREFIX . $connection_id, null ) );
+	}
+
+	/**
+	 * One deadline-bounded slice of the operational Sync Health scan for the
+	 * real-cron snapshot refresh. The full scan hydrated the whole catalog in one
+	 * request (126 s on a 21 s budget); this pages the current Product Map by id
+	 * with a durable cursor and partial counters, so successive cron requests finish
+	 * it. Classification is the same row-wise code as the synchronous scan.
+	 *
+	 * @param int   $detail_limit Detail rows per category.
+	 * @param float $deadline     Absolute microtime; work stops ~1 s before it.
+	 * @param int   $page_size    Rows per page.
+	 * @param int   $max_pages    Optional hard cap of pages in this call (0 = deadline only).
+	 * @return array{complete:bool,status:string,processed:int,cursor:int,result?:array}
+	 */
+	public static function run_operational_scan_page( $detail_limit = 20, $deadline = 0.0, $page_size = 200, $max_pages = 0 ) {
+		$max_pages = absint( $max_pages );
+		$pages     = 0;
+		global $wpdb;
+		$limit         = max( 1, absint( $detail_limit ) );
+		$page_size     = max( 20, min( 1000, absint( $page_size ) ) );
+		$deadline      = (float) $deadline > 0 ? (float) $deadline : microtime( true ) + 5.0;
+		$connection_id = self::connection_id();
+		$out           = array( 'complete' => false, 'status' => 'unavailable', 'processed' => 0, 'cursor' => 0 );
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
+			return $out;
+		}
+		$option = self::SCAN_STATE_OPTION_PREFIX . $connection_id;
+		$now    = time();
+		$state  = get_option( $option, null );
+		if ( ! self::scan_state_resumable( $state, $connection_id, $limit, $now ) ) {
+			$state = array(
+				'connectionId' => $connection_id,
+				'limit'        => $limit,
+				'startedAt'    => $now,
+				'cursor'       => 0,
+				'operational'  => array(
+					'currentProducts' => 0, 'monitoredProducts' => 0, 'excludedByPolicy' => 0, 'converged' => 0,
+					'activeRetryOwner' => 0, 'terminalUpstreamInvalid' => 0, 'unownedConvergenceGap' => 0,
+					'unverifiedHealthGap' => 0, 'needsAttention' => 0, 'needsVerification' => 0, 'notFullyConverged' => 0,
+					'historicalHealthResidue' => 0, 'historicalNonLive' => 0, 'historicalExcluded' => 0,
+				),
+				'lists'        => array( 'unownedRows' => array(), 'verificationRows' => array(), 'activeRetryRows' => array(), 'terminalRows' => array() ),
+			);
+		}
+
+		$context = self::load_operational_context( false );
+		if ( null === $context ) {
+			$out['status'] = 'event-ownership-query-failed';
+			return $out;
+		}
+
+		$map_table    = preg_replace( '/[^A-Za-z0-9_]/', '', Mobo_Core_Product_Map::table_name() );
+		$health_table = self::table_exists() ? preg_replace( '/[^A-Za-z0-9_]/', '', self::table_name() ) : '';
+		$health_select = '' !== $health_table
+			? ", h.id AS health_id, h.wp_product_id AS health_wp_product_id, h.portal_revision, h.portal_version, h.portal_hash, h.sync_status, h.last_error, h.updated_at AS health_updated_at"
+			: ", 0 AS health_id, 0 AS health_wp_product_id, 0 AS portal_revision, '' AS portal_version, '' AS portal_hash, '' AS sync_status, NULL AS last_error, NULL AS health_updated_at";
+		$health_join = '' !== $health_table
+			? " LEFT JOIN `{$health_table}` h ON h.connection_id = m.connection_id AND h.product_guid = m.remote_guid"
+			: '';
+
+		$operational = $state['operational'];
+		$lists       = $state['lists'];
+		$cursor      = absint( $state['cursor'] );
+		$finished    = false;
+		while ( microtime( true ) < $deadline - 1.0 ) {
+			$wpdb->last_error = '';
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT m.id AS map_id, m.remote_guid, m.wp_post_id, m.last_hash AS map_last_hash, m.sync_incomplete AS map_sync_incomplete, m.updated_at AS map_updated_at{$health_select}
+					 FROM `{$map_table}` m
+					 INNER JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
+					 {$health_join}
+					 WHERE m.connection_id = %d
+					   AND m.object_type = 'product'
+					   AND m.wp_post_id > 0
+					   AND m.id > %d
+					   AND p.post_type = 'product'
+					   AND p.post_status NOT IN ('trash','auto-draft')
+					 ORDER BY m.id ASC
+					 LIMIT %d",
+					$connection_id,
+					$cursor,
+					$page_size
+				),
+				ARRAY_A
+			);
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+				$out['status'] = 'current-product-map-query-failed';
+				return $out;
+			}
+			if ( empty( $rows ) ) {
+				$finished = true;
+				break;
+			}
+			$product_ids = array();
+			foreach ( $rows as $row ) {
+				$product_id = absint( $row['wp_post_id'] ?? 0 );
+				if ( $product_id > 0 ) { $product_ids[] = $product_id; }
+			}
+			if ( ! empty( $product_ids ) && function_exists( 'update_meta_cache' ) ) {
+				update_meta_cache( 'post', array_values( array_unique( $product_ids ) ) );
+			}
+			$operational['currentProducts'] += count( $rows );
+			self::classify_operational_rows( $rows, $context, false, $limit, $operational, $lists );
+			foreach ( $rows as $row ) {
+				$cursor = max( $cursor, absint( $row['map_id'] ?? 0 ) );
+			}
+			$out['processed'] += count( $rows );
+			if ( count( $rows ) < $page_size ) {
+				$finished = true;
+				break;
+			}
+			$pages++;
+			if ( $max_pages > 0 && $pages >= $max_pages ) {
+				break;
+			}
+		}
+
+		$out['cursor'] = $cursor;
+		if ( ! $finished ) {
+			$state['cursor']      = $cursor;
+			$state['operational'] = $operational;
+			$state['lists']       = $lists;
+			update_option( $option, $state, false );
+			$out['status'] = 'in-progress';
+			return $out;
+		}
+
+		$historical = self::count_historical_non_live( $connection_id, $health_table, static function ( $guids ) use ( $wpdb, $map_table, $connection_id ) {
+			$placeholders = implode( ',', array_fill( 0, count( $guids ), '%s' ) );
+			$wpdb->last_error = '';
+			$found = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT m.remote_guid FROM `{$map_table}` m INNER JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
+					 WHERE m.connection_id = %d AND m.object_type = 'product' AND m.wp_post_id > 0
+					   AND p.post_type = 'product' AND p.post_status NOT IN ('trash','auto-draft')
+					   AND m.remote_guid IN ({$placeholders})",
+					array_merge( array( $connection_id ), $guids )
+				)
+			);
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $found ) ) {
+				return null;
+			}
+			$live = array();
+			foreach ( $found as $guid ) {
+				$live[ sanitize_text_field( (string) $guid ) ] = true;
+			}
+			return $live;
+		} );
+		if ( null === $historical ) {
+			$out['status'] = 'sync-health-history-query-failed';
+			return $out;
+		}
+		$operational['historicalNonLive'] += $historical;
+
+		$raw = self::get_dashboard_status();
+		$result = $raw;
+		$result['rawCounts'] = isset( $raw['counts'] ) && is_array( $raw['counts'] ) ? $raw['counts'] : array( 'synced' => 0, 'behind' => 0, 'repairing' => 0, 'failed' => 0 );
+		foreach ( $lists as $key => $rows_list ) {
+			$result[ $key ] = $rows_list;
+		}
+		$result = self::finalize_operational_result( $result, $operational, false );
+		$result['scanMode'] = 'paged';
+		$result['scanStartedAt'] = absint( $state['startedAt'] );
+		delete_option( $option );
+
+		$out['complete'] = true;
+		$out['status']   = 'complete';
+		$out['result']   = $result;
+		return $out;
 	}
 
 	/**

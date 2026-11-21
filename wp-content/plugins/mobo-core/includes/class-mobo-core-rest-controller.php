@@ -915,6 +915,33 @@ class Mobo_Core_Rest_Controller {
 
 
 	/**
+	 * 423/409 answer for a refused dispatcher claim. A 423 carries Retry-After with
+	 * the remaining (short, request-derived) lease so callers back off instead of
+	 * accumulating busy retries.
+	 *
+	 * @param array  $claim   claim_worker_request() result.
+	 * @param string $message Message.
+	 * @return WP_REST_Response
+	 */
+	private function dispatcher_locked_response( $claim, $message ) {
+		$http  = isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423;
+		$body  = array(
+			'success' => false,
+			'status'  => isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked',
+			'message' => (string) $message,
+		);
+		$retry = isset( $claim['retryAfter'] ) ? absint( $claim['retryAfter'] ) : 0;
+		if ( 423 === $http && $retry > 0 ) {
+			$body['retryAfter'] = $retry;
+		}
+		$response = new WP_REST_Response( $body, $http );
+		if ( 423 === $http && $retry > 0 ) {
+			$response->header( 'Retry-After', (string) $retry );
+		}
+		return $response;
+	}
+
+	/**
 	 * Run one real-cron slice.
 	 *
 	 * @param WP_REST_Request $request Request.
@@ -930,14 +957,7 @@ class Mobo_Core_Rest_Controller {
 			: array( 'success' => true, 'token' => '' );
 
 		if ( empty( $claim['success'] ) ) {
-			return new WP_REST_Response(
-				array(
-					'success' => false,
-					'status'  => isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked',
-					'message' => 'Another Mobo worker request is already active for this site.',
-				),
-				isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423
-			);
+			return $this->dispatcher_locked_response( $claim, 'Another Mobo worker request is already active for this site.' );
 		}
 
 		$token  = isset( $claim['token'] ) ? (string) $claim['token'] : '';
@@ -1000,17 +1020,12 @@ class Mobo_Core_Rest_Controller {
 			: array( 'success' => true, 'token' => '' );
 
 		if ( empty( $claim['success'] ) ) {
-			$status = isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked';
-			$http   = isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423;
-			return new WP_REST_Response(
-				array(
-					'success' => false,
-					'status'  => $status,
-					'message' => 409 === $http
-						? 'The transferred worker lease is stale or no longer owned by this request.'
-						: 'Another Mobo worker request is already active for this site.',
-				),
-				$http
+			$http = isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423;
+			return $this->dispatcher_locked_response(
+				$claim,
+				409 === $http
+					? 'The transferred worker lease is stale or no longer owned by this request.'
+					: 'Another Mobo worker request is already active for this site.'
 			);
 		}
 
@@ -1143,6 +1158,13 @@ class Mobo_Core_Rest_Controller {
 		$item = Mobo_Core_Product_Delta::product_item( $payload );
 		if ( ! is_array( $item ) || '' === Mobo_Core_Product_Delta::product_guid( $item ) ) {
 			/* Lightweight notification (payload must be pulled): queue it as today. */
+			return null;
+		}
+		/* While the database migration still keeps the runner in migration-only mode,
+		 * never write a delta synchronously (it would bypass that mode and may hit
+		 * metadata in mid-fence transition): decline, so the event is stored durably
+		 * and applied once normal runtime is ready. */
+		if ( class_exists( 'Mobo_Core_Webhook_Batch' ) && method_exists( 'Mobo_Core_Webhook_Batch', 'normal_runtime_ready' ) && ! Mobo_Core_Webhook_Batch::normal_runtime_ready() ) {
 			return null;
 		}
 		$sync = new Mobo_Core_Product_Sync();

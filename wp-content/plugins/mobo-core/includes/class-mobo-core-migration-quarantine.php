@@ -45,8 +45,24 @@ final class Mobo_Core_Migration_Quarantine {
 	/** Unix time of the next allowed re-probe pass. */
 	const REPROBE_OPTION = 'mobo_core_migration_quarantine_next_probe_at';
 
-	/** Hard cap: beyond this the worker keeps its honest `blocked` state instead of growing an unbounded list. */
-	const MAX_ITEMS = 1000;
+	/** Hard cap: beyond this the worker keeps its honest `blocked` state instead of growing an unbounded list.
+	 * The list is stored in pages of PAGE_SIZE entries (OPTION, OPTION_p1, ...), so a
+	 * site with more than a thousand inconsistent objects can still finish retirement,
+	 * stamp its DB version and keep receiving hotfixes; entries of deleted posts are
+	 * pruned before the cap is ever enforced. */
+	const MAX_ITEMS = 20000;
+
+	/** Entries per stored option page. */
+	const PAGE_SIZE = 1000;
+
+	/** Upper bound of extra pages scanned when reading (MAX_ITEMS / PAGE_SIZE). */
+	const MAX_PAGES = 20;
+
+	/** Option recording attempts that exceeded MAX_ITEMS ("needs support"). */
+	const OVERFLOW_OPTION = 'mobo_core_migration_quarantine_overflow_v1';
+
+	/** A successful background run within this window means sync really continues. */
+	const RUNTIME_HEALTHY_WINDOW = 600;
 
 	/** Consecutive mirror/verify failures on one object before it is marked instead of retried. */
 	const FAILURE_THRESHOLD = 3;
@@ -81,12 +97,18 @@ final class Mobo_Core_Migration_Quarantine {
 	/** @return array<int,array> */
 	public static function all() {
 		if ( null === self::$items ) {
-			$raw = get_option( self::OPTION, array() );
 			self::$items = array();
-			if ( is_array( $raw ) ) {
-				foreach ( $raw as $post_id => $entry ) {
-					$post_id = absint( $post_id );
-					if ( $post_id > 0 && is_array( $entry ) ) { self::$items[ $post_id ] = $entry; }
+			$raw = get_option( self::OPTION, array() );
+			for ( $page = 0; $page <= self::MAX_PAGES; $page++ ) {
+				if ( $page > 0 ) {
+					$raw = get_option( self::page_option( $page ), null );
+					if ( ! is_array( $raw ) ) { break; }
+				}
+				if ( is_array( $raw ) ) {
+					foreach ( $raw as $post_id => $entry ) {
+						$post_id = absint( $post_id );
+						if ( $post_id > 0 && is_array( $entry ) ) { self::$items[ $post_id ] = $entry; }
+					}
 				}
 			}
 		}
@@ -119,7 +141,14 @@ final class Mobo_Core_Migration_Quarantine {
 		if ( $post_id <= 0 ) { return false; }
 		$items = self::all();
 		if ( isset( $items[ $post_id ] ) ) { return true; }
-		if ( count( $items ) >= self::MAX_ITEMS ) { return false; }
+		if ( count( $items ) >= self::MAX_ITEMS ) {
+			/* Entries of posts that no longer exist are dead weight: prune them first. */
+			$items = self::prune_missing_posts( $items );
+			if ( count( $items ) >= self::MAX_ITEMS ) {
+				self::record_overflow( $post_id, $reason );
+				return false;
+			}
+		}
 		$type = function_exists( 'get_post_type' ) ? (string) get_post_type( $post_id ) : '';
 		$items[ $post_id ] = array(
 			'w'      => sanitize_key( (string) $worker ),
@@ -150,13 +179,97 @@ final class Mobo_Core_Migration_Quarantine {
 	private static function persist_items( $items ) {
 		ksort( $items );
 		self::$items = $items;
-		if ( empty( $items ) ) {
+		$pages = array_chunk( $items, self::PAGE_SIZE, true );
+		$ok    = true;
+		if ( empty( $pages ) ) {
 			delete_option( self::OPTION );
-			return true;
+		} else {
+			update_option( self::OPTION, $pages[0], false );
+			$check = get_option( self::OPTION, array() );
+			$ok    = is_array( $check ) && count( $check ) === count( $pages[0] );
 		}
-		update_option( self::OPTION, $items, false );
-		$check = get_option( self::OPTION, array() );
-		return is_array( $check ) && count( $check ) === count( $items );
+		for ( $page = 1; $page <= self::MAX_PAGES; $page++ ) {
+			$name = self::page_option( $page );
+			if ( isset( $pages[ $page ] ) ) {
+				update_option( $name, $pages[ $page ], false );
+				$check = get_option( $name, array() );
+				$ok    = $ok && is_array( $check ) && count( $check ) === count( $pages[ $page ] );
+			} elseif ( false !== get_option( $name, false ) ) {
+				delete_option( $name );
+			} else {
+				break;
+			}
+		}
+		return $ok;
+	}
+
+	/** @return string Option name of one extra list page. */
+	private static function page_option( $page ) {
+		return self::OPTION . '_p' . absint( $page );
+	}
+
+	/**
+	 * Drop entries whose post no longer exists (one integer-only query per 500 ids).
+	 * On a read error nothing is pruned.
+	 *
+	 * @param array $items Marked list.
+	 * @return array
+	 */
+	private static function prune_missing_posts( $items ) {
+		global $wpdb;
+		$existing = array();
+		foreach ( array_chunk( array_map( 'absint', array_keys( $items ) ), 500 ) as $chunk ) {
+			$chunk = array_values( array_filter( $chunk ) );
+			if ( empty( $chunk ) ) { continue; }
+			$wpdb->last_error = '';
+			$found = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE ID IN (" . implode( ',', $chunk ) . ')' );
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $found ) ) {
+				return $items;
+			}
+			foreach ( $found as $id ) { $existing[ absint( $id ) ] = true; }
+		}
+		$kept = self::filter_existing( $items, $existing );
+		if ( count( $kept ) !== count( $items ) ) {
+			self::persist_items( $kept );
+		}
+		return $kept;
+	}
+
+	/**
+	 * Pure helper (unit tested): keep entries whose post id is in $existing.
+	 *
+	 * @param array $items    Marked list.
+	 * @param array $existing Existing post ids => true.
+	 * @return array
+	 */
+	public static function filter_existing( $items, $existing ) {
+		$kept = array();
+		foreach ( (array) $items as $post_id => $entry ) {
+			if ( isset( $existing[ absint( $post_id ) ] ) ) { $kept[ $post_id ] = $entry; }
+		}
+		return $kept;
+	}
+
+	/** Record a refused mark beyond MAX_ITEMS so admins/the Backend see "needs support". @return void */
+	private static function record_overflow( $post_id, $reason ) {
+		$raw = get_option( self::OVERFLOW_OPTION, array() );
+		$raw = is_array( $raw ) ? $raw : array();
+		update_option(
+			self::OVERFLOW_OPTION,
+			array(
+				'count'      => absint( $raw['count'] ?? 0 ) + 1,
+				'lastPostId' => absint( $post_id ),
+				'lastReason' => sanitize_key( (string) $reason ),
+				'lastAt'     => time(),
+			),
+			false
+		);
+	}
+
+	/** @return array Overflow diagnostics (empty when the list never overflowed). */
+	public static function overflow_status() {
+		$raw = get_option( self::OVERFLOW_OPTION, array() );
+		return is_array( $raw ) ? $raw : array();
 	}
 
 	/**
@@ -583,8 +696,39 @@ final class Mobo_Core_Migration_Quarantine {
 			'markedCapacity'     => self::MAX_ITEMS,
 			'marked'             => $list,
 			'markedListTruncated'=> count( $items ) > count( $list ),
+			'markedOverflow'     => self::overflow_status(),
 			'nextReprobeAt'      => absint( get_option( self::REPROBE_OPTION, 0 ) ),
 		);
+	}
+
+	/**
+	 * Pure classification (unit tested) of background activity for the notice.
+	 *
+	 * @param int   $last_success Latest successful runner/self-runner run (unix).
+	 * @param array $lease        Dispatcher lease status (Mobo_Core_Lock::get_status()).
+	 * @param int   $now          Unix time.
+	 * @return array{state:string,lockRemaining:int}
+	 */
+	public static function classify_runtime_activity( $last_success, $lease, $now ) {
+		$last_success = absint( $last_success );
+		$now          = absint( $now );
+		if ( $last_success > 0 && $last_success <= $now + 60 && ( $now - $last_success ) <= self::RUNTIME_HEALTHY_WINDOW ) {
+			return array( 'state' => 'healthy', 'lockRemaining' => 0 );
+		}
+		if ( is_array( $lease ) && ! empty( $lease['active'] ) ) {
+			return array( 'state' => 'locked', 'lockRemaining' => absint( $lease['remainingSeconds'] ?? 0 ) );
+		}
+		return array( 'state' => 'idle', 'lockRemaining' => 0 );
+	}
+
+	/** @return array{state:string,lockRemaining:int} Live background activity. */
+	public static function runtime_activity_state() {
+		$last_success = max(
+			absint( get_option( 'mobo_core_real_cron_last_success_at', 0 ) ),
+			absint( get_option( 'mobo_core_self_runner_last_run_success_at', 0 ) )
+		);
+		$lease = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'worker_dispatcher' ) : array();
+		return self::classify_runtime_activity( $last_success, $lease, time() );
 	}
 
 	/**
@@ -622,7 +766,18 @@ final class Mobo_Core_Migration_Quarantine {
 		if ( ! $stamped ) {
 			$runtime_ready = ! empty( $snapshot['runtimeReady'] );
 			if ( $runtime_ready ) {
-				$lines[] = 'موبوکور: انتقال داده‌ها به ساختار ذخیره‌سازی جدید در پس‌زمینه در حال انجام است. همگام‌سازی، وب‌هوک‌ها و سفارش‌ها به‌طور عادی ادامه دارند.';
+				/* Claim "continues normally" only when a background run really succeeded
+				 * recently; otherwise say what is actually going on (lease held / no run). */
+				$activity = self::runtime_activity_state();
+				if ( 'healthy' === $activity['state'] ) {
+					$lines[] = 'موبوکور: انتقال داده‌ها به ساختار ذخیره‌سازی جدید در پس‌زمینه در حال انجام است. همگام‌سازی، وب‌هوک‌ها و سفارش‌ها به‌طور عادی ادامه دارند.';
+				} elseif ( 'locked' === $activity['state'] ) {
+					$class = 'notice-warning';
+					$lines[] = sprintf( 'موبوکور: انتقال داده‌ها در پس‌زمینه در حال انجام است، اما در چند دقیقه اخیر هیچ اجرای موفق پس‌زمینه ثبت نشده و قفل اجرای کار (worker) هنوز فعال است (حداکثر %d ثانیه دیگر آزاد می‌شود). همگام‌سازی، وب‌هوک‌ها و سفارش‌ها پس از آزاد شدن قفل ادامه می‌یابند.', absint( $activity['lockRemaining'] ) );
+				} else {
+					$class = 'notice-warning';
+					$lines[] = 'موبوکور: انتقال داده‌ها به ساختار جدید در انتظار اجرای پس‌زمینه است؛ در چند دقیقه اخیر هیچ اجرای موفق Cron ثبت نشده است. همگام‌سازی، وب‌هوک‌ها و سفارش‌ها تا اجرای بعدی Cron منتظر می‌مانند. تنظیم Cron سایت را بررسی کنید.';
+				}
 			} else {
 				$class = 'notice-warning';
 				$reason = sanitize_key( (string) ( $snapshot['runtimeReason'] ?? '' ) );
@@ -645,6 +800,11 @@ final class Mobo_Core_Migration_Quarantine {
 		if ( $marked > 0 ) {
 			$class = 'notice-warning';
 			$lines[] = sprintf( '%d محصول/متغیر به دلیل داده‌های ناسازگار علامت‌گذاری شد و از انتقال خودکار کنار گذاشته شد. هیچ محصولی حذف نشده است؛ داده‌های قدیمی این موارد دست‌نخورده نگه داشته شده‌اند. فهرست در تب «سلامت همگام‌سازی» است و پس از رفع مشکل (مثلاً حذف محصول کپی‌شده یا اجرای Repair) خودکار دوباره بررسی می‌شوند.', $marked );
+		}
+		$overflow = self::overflow_status();
+		if ( absint( $overflow['count'] ?? 0 ) > 0 && ! $complete ) {
+			$class = 'notice-error';
+			$lines[] = sprintf( 'موبوکور: تعداد موارد ناسازگار از ظرفیت %d عبور کرد و انتقال خودکار متوقف ماند. لطفاً با پشتیبانی تماس بگیرید؛ هیچ داده‌ای حذف نشده است.', self::MAX_ITEMS );
 		}
 		if ( empty( $lines ) ) { return; }
 		$key = 'mobo_mig_notice_' . substr( md5( wp_json_encode( array( $db_version, $marked, $complete, $snapshot['runtimeReady'] ?? null ) ) ), 0, 12 );

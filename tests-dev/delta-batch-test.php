@@ -8,6 +8,9 @@
  */
 
 define( 'ABSPATH', __DIR__ . '/' );
+define( 'MOBO_CORE_VERSION', '10.34.77' );
+$GLOBALS['__delta_db_version'] = '10.33.67';
+function get_option( $name, $default = false ) { return 'mobo_core_db_version' === $name ? $GLOBALS['__delta_db_version'] : $default; }
 
 class WP_Error {
 	private $code;
@@ -119,7 +122,10 @@ check( 200 === $B::parse( json_encode( array( 'batch' => array_fill( 0, 200, arr
 check( 400 === $B::parse( '{not json' )['status'], 'invalid JSON => 400' );
 check( 400 === $B::parse( '{"events":[]}' )['status'], 'missing batch key => 400' );
 check( $B::is_batch_header( '1' ) && ! $B::is_batch_header( '' ) && ! $B::is_batch_header( null ), 'X-Mobo-Batch header detection' );
-check( array( 'product-delta-v1', 'webhook-batch-v1' ) === $B::capabilities(), 'capabilities list matches the contract' );
+/* M1: capabilities are advertised only while normal runtime is ready. */
+check( array() === $B::capabilities(), 'no capabilities while the migration keeps the runtime unready (no Migration class, unstamped)' );
+$GLOBALS['__delta_db_version'] = '10.34.77';
+check( array( 'product-delta-v1', 'webhook-batch-v1' ) === $B::capabilities(), 'capabilities list matches the contract once the DB is stamped' );
 check( 'ProductUpdated' === $B::event_type( array( 'eventType' => 'ProductUpdated' ) ) && 'UpdateVariant' === $B::event_type( array( 'type' => 1 ) ), 'event type from eventType / numeric type' );
 $single = $B::to_single_payload( array( 'eventType' => 'UpdateVariant', 'eventId' => 'x1', 'data' => array() ), 'UpdateVariant' );
 check( 'UpdateVariant' === $single['event'] && 'x1' === $single['eventId'], 'batch row normalized to single-event shape without dropping fields' );

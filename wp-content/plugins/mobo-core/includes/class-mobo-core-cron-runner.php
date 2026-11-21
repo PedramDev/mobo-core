@@ -86,7 +86,12 @@ class Mobo_Core_Cron_Runner {
 				: ( $runtime_ready ? 'shared' : 'migration-only' );
 			$upgrade_barrier_active = class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active();
 			if ( 'migration-only' === $migration_mode && ! $upgrade_barrier_active ) {
-				$migration = Mobo_Core_Migration::run_budgeted_slice( $source, 12, 200 );
+				/* Nothing else runs in this request: give migration whatever is left of
+				 * the request deadline (run_budgeted_slice() clamps to it as well). */
+				$migration_budget = class_exists( 'Mobo_Core_Request_Deadline' )
+					? (int) max( 2, min( 25, floor( Mobo_Core_Request_Deadline::remaining() - 1.0 ) ) )
+					: 12;
+				$migration = Mobo_Core_Migration::run_budgeted_slice( $source, $migration_budget, 500 );
 				$progressed = 'progressed' === (string) ( $migration['status'] ?? '' );
 				$result = array(
 					'success' => ! empty( $migration['success'] ),
@@ -570,6 +575,13 @@ class Mobo_Core_Cron_Runner {
 		if ( $php_limit > 0 ) {
 			$effective_budget = min( $configured_budget, max( 1, $php_limit - $safety_margin ) );
 		}
+		/* One end-to-end request deadline (REQUEST_TIME_FLOAT + min(25 s, 80% of the
+		 * PHP limit; 30 s assumed when unknown)): bootstrap, a migration share and the
+		 * runner all spend from the same clock instead of each measuring from its own
+		 * start. Never more than what is left of the request. */
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) ) {
+			$effective_budget = (int) max( 1, min( $effective_budget, floor( Mobo_Core_Request_Deadline::remaining() ) ) );
+		}
 
 		$api_timeout     = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
 		$payload_timeout = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
@@ -677,7 +689,7 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		$started_at = microtime( true );
-		$deadline = $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] );
+		$deadline = self::clamp_to_request_deadline( $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ) );
 		$results = array();
 		$overall_success = true;
 		$needs_continuation = false;
@@ -814,7 +826,7 @@ class Mobo_Core_Cron_Runner {
 	 */
 	private function run_locked( $source, $lock_token, $config ) {
 		$started_at      = microtime( true );
-		$deadline        = $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] );
+		$deadline        = self::clamp_to_request_deadline( $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ) );
 		$rounds          = 0;
 		$lock_renewals   = 0;
 		$lock_lost       = false;
@@ -2563,6 +2575,19 @@ class Mobo_Core_Cron_Runner {
 	 * @param int   $margin Safety margin.
 	 * @return bool
 	 */
+	/**
+	 * Never let a stage deadline outlive the request deadline.
+	 *
+	 * @param float $deadline Stage deadline (microtime).
+	 * @return float
+	 */
+	private static function clamp_to_request_deadline( $deadline ) {
+		if ( ! class_exists( 'Mobo_Core_Request_Deadline' ) ) {
+			return (float) $deadline;
+		}
+		return (float) min( (float) $deadline, Mobo_Core_Request_Deadline::deadline() );
+	}
+
 	private function has_time_remaining( $deadline, $margin = 0 ) {
 		return microtime( true ) < ( (float) $deadline - max( 0, (int) $margin ) );
 	}

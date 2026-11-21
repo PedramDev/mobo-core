@@ -38,6 +38,15 @@ class Mobo_Core_Migration {
 	/** @var array|null Lightweight per-slice benchmark telemetry; null outside accelerated migration. */
 	private static $slice_telemetry = null;
 
+	/** @var float Absolute microtime after which maybe_run() stops between steps (0 = no deadline). */
+	private static $pass_deadline = 0.0;
+
+	/* Prefix of the (real) schema-postcondition failure message. */
+	const POSTCONDITION_ERROR_PREFIX = 'Mobo Core database migration did not satisfy required schema postconditions';
+
+	/* Seed batch per object type while a pass deadline drives the Product Map seed. */
+	const SEED_DEADLINE_BATCH = 500;
+
 	/* Fallback lease only. Normal MySQL/MariaDB installs use a connection-scoped
 	 * advisory lock that disappears automatically when a killed PHP request loses
 	 * its DB connection. Keep the fallback lease bounded for unusual hosts where
@@ -237,10 +246,16 @@ class Mobo_Core_Migration {
 		self::cleanup_legacy_private_city_assets();
 		self::cleanup_deprecated_pw_option_enforcement_state();
 		$schema_ready = self::create_database_tables();
+		/* Deadline checkpoints (budgeted cron slice only): every step is idempotent
+		 * and resumable, so stopping between steps and resuming on the next request
+		 * is safe; finalize_database_version() simply does not run this time. */
+		if ( self::pass_deadline_reached() ) { return; }
 		$connection_foundation_ready = self::migrate_103412_connection_foundation();
 		$connection_settings_ready = self::migrate_103413_connection_settings_foundation();
 		$connection_ownership_ready = self::migrate_103414_connection_ownership();
+		if ( self::pass_deadline_reached() ) { return; }
 		$large_runtime_ready = self::migrate_103393_strict_large_runtime_cutover();
+		if ( self::pass_deadline_reached() ) { return; }
 		self::apply_10331614_table_housekeeping_fast_path( $current );
 		self::apply_103171_runtime_lock_recovery( $current );
 		self::apply_103164_image_family_migration( $current );
@@ -294,13 +309,19 @@ class Mobo_Core_Migration {
 		self::apply_103467_variant_checkpoint_order_residue_finalization_schedule( $current );
 		self::apply_103473_post_upgrade_convergence_recovery_schedule( $current );
 		self::maybe_mark_legacy_repair_required( $current );
+		if ( self::pass_deadline_reached() ) { return; }
 		self::seed_product_map_from_legacy_meta();
+		if ( self::pass_deadline_reached() ) { return; }
 		$operational_meta_ready = self::migrate_103394_operational_postmeta_retirement();
+		if ( self::pass_deadline_reached() ) { return; }
 		$identity_meta_ready = self::migrate_103395_identity_postmeta_retirement();
+		if ( self::pass_deadline_reached() ) { return; }
 		$entity_meta_ready = self::migrate_103396_entity_postmeta_retirement();
+		if ( self::pass_deadline_reached() ) { return; }
 		self::seed_category_map_from_legacy_meta();
 		self::discard_legacy_webhook_queue();
 		self::clear_legacy_cron_hooks();
+		if ( self::pass_deadline_reached() ) { return; }
 
 		/*
 		 * Cleanup old beta option if it exists.
@@ -333,6 +354,23 @@ class Mobo_Core_Migration {
 		$now = absint( $now );
 		if ( $last_pass <= 0 || $last_pass > $now + 60 ) { return true; }
 		return ( $now - $last_pass ) >= self::ORDINARY_PASS_INTERVAL;
+	}
+
+	/**
+	 * Pure checkpoint decision (unit tested).
+	 *
+	 * @param float $deadline Absolute microtime deadline; <= 0 means none.
+	 * @param float $now      Current microtime.
+	 * @return bool
+	 */
+	public static function deadline_reached( $deadline, $now ) {
+		$deadline = (float) $deadline;
+		return $deadline > 0 && (float) $now >= $deadline;
+	}
+
+	/** @return bool Whether the current budgeted pass must stop before its next step. */
+	private static function pass_deadline_reached() {
+		return self::deadline_reached( self::$pass_deadline, microtime( true ) );
 	}
 
 	/**
@@ -377,8 +415,13 @@ class Mobo_Core_Migration {
 	 *   filters. Proof pages verify every mirror against a fresh snapshot, so a
 	 *   concurrent Mobo write causes a retry, not divergence. What the runner truly
 	 *   depends on are the structural prerequisites checked below: Custom schema,
-	 *   Connection rows/settings/ownership, the large-runtime table cutover and the
-	 *   Product Map seed (without it sync could create duplicate products).
+	 *   Connection rows/settings/ownership and the large-runtime table cutover.
+	 * - The legacy Product Map seed is NOT a runtime prerequisite any more: product
+	 *   and variation lookups resolve unmapped objects through their legacy identity
+	 *   (and lazily write the map row), so stock/price updates, orders and webhooks
+	 *   for existing products are safe. Only *creating* a new product could duplicate
+	 *   an unmapped one, so Product Sync defers product creation alone until the seed
+	 *   completes (Mobo_Core_Product_Sync::product_creation_allowed()).
 	 *
 	 * Options-only checks plus the cached schema validation: no catalog scan.
 	 *
@@ -396,7 +439,6 @@ class Mobo_Core_Migration {
 		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::connection_ownership_ready() ) { $reason = 'connection-ownership-pending'; return false; }
 		if ( ( '' === $db_version || version_compare( $db_version, '10.33.93', '<' ) )
 			&& absint( get_option( 'mobo_core_103393_large_runtime_strict_cutover_at', 0 ) ) <= 0 ) { $reason = 'large-runtime-cutover-pending'; return false; }
-		if ( absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) <= 0 ) { $reason = 'product-map-seed-pending'; return false; }
 		return true;
 	}
 
@@ -499,11 +541,24 @@ class Mobo_Core_Migration {
 		$max_iterations      = max( 1, min( 500, absint( $max_iterations ) ) );
 		$started             = microtime( true );
 		$deadline            = $started + $time_budget_seconds;
+		/* The slice never outlives the request deadline (REQUEST_TIME_FLOAT based),
+		 * whatever share the caller asked for. */
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) ) {
+			$deadline = min( $deadline, Mobo_Core_Request_Deadline::deadline() );
+		}
 		/* Never start a new migration batch at the hard request boundary. Individual
 		 * SQL statements cannot be pre-empted safely by PHP, so reserve a small exit
 		 * margin for the final checkpoint/release path. */
-		$safety_margin       = min( 3.0, max( 1.0, $time_budget_seconds * 0.20 ) );
+		$safety_margin       = min( 3.0, max( 1.0, max( 0.0, $deadline - $started ) * 0.20 ) );
 		$work_deadline       = $deadline - $safety_margin;
+		if ( $work_deadline <= $started + 0.25 ) {
+			return array(
+				'success' => true, 'status' => 'deferred-budget', 'source' => $source,
+				'iterations' => 0, 'progressedIterations' => 0, 'elapsedMs' => 0,
+				'databaseVersion' => trim( (string) get_option( 'mobo_core_db_version', '' ) ),
+				'targetVersion' => MOBO_CORE_VERSION, 'needsContinuation' => true,
+			);
+		}
 		$iterations          = 0;
 		$progressed          = 0;
 		$pipeline_passes     = 0;
@@ -545,6 +600,9 @@ class Mobo_Core_Migration {
 		);
 		$previous = self::migration_progress_fingerprint();
 		self::$accelerated_context = true;
+		/* The full pipeline pass (first and final iteration) stops between steps at
+		 * the slice's work deadline instead of running unbounded (8 s share took 38 s). */
+		self::$pass_deadline = $work_deadline;
 		$reprobe = null;
 		try {
 			/* Post-stamp only: give marked objects their periodic chance to be released. */
@@ -600,6 +658,7 @@ class Mobo_Core_Migration {
 			}
 		} finally {
 			self::$accelerated_context = false;
+			self::$pass_deadline = 0.0;
 			self::$budgeted_slice_lock_token = '';
 			self::release_migration_request_lock( $lock_token );
 		}
@@ -757,6 +816,11 @@ class Mobo_Core_Migration {
 			'singletonCursor' => absint( get_option( 'mobo_core_103454_singleton_meta_dedupe_cursor', 0 ) ),
 			'marked' => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::count() : 0,
 		) );
+		/* Seed cursors are durable progress too: a slice whose first pass only advanced
+		 * the Product Map seed may continue with the next unit of work. */
+		$parts[] = 'seed:' . absint( get_option( 'mobo_core_product_map_product_cursor', 0 ) )
+			. ':' . absint( get_option( 'mobo_core_product_map_variation_cursor', 0 ) )
+			. ':' . ( absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) > 0 ? '1' : '0' );
 		return implode( '|', $parts );
 	}
 
@@ -1679,6 +1743,94 @@ class Mobo_Core_Migration {
 			return true;
 		}
 
+		/* dbDelta() cannot alter an existing index; for a same-name index whose text
+		 * differs it emits `ADD KEY <existing name>` and logs "Duplicate key name"
+		 * (52 errors per upgraded site). Drop index lines whose name already exists
+		 * from CREATE statements of existing tables; repair_database_index() below
+		 * remains the only path that replaces a mismatched index. */
+		add_filter( 'dbdelta_create_queries', array( __CLASS__, 'filter_dbdelta_existing_indexes' ), 10, 1 );
+		try {
+			self::create_runtime_tables_via_dbdelta();
+		} finally {
+			remove_filter( 'dbdelta_create_queries', array( __CLASS__, 'filter_dbdelta_existing_indexes' ), 10 );
+		}
+
+		/* Remove only indexes that are exact left-prefix duplicates of a verified
+		 * replacement. Failure to drop is non-fatal; correctness/readiness depends on
+		 * the covering index, while an extra old index only costs write amplification. */
+		self::drop_redundant_runtime_indexes();
+
+		return self::finish_create_database_tables();
+	}
+
+	/**
+	 * Strip index definitions that already exist (by name) from dbDelta CREATE
+	 * statements of existing tables. New tables are left untouched.
+	 *
+	 * @param array $cqueries dbDelta create queries keyed by table.
+	 * @return array
+	 */
+	public static function filter_dbdelta_existing_indexes( $cqueries ) {
+		global $wpdb;
+		if ( ! is_array( $cqueries ) ) {
+			return $cqueries;
+		}
+		foreach ( $cqueries as $table => $query ) {
+			if ( ! is_string( $query ) || ! preg_match( '/^\s*CREATE\s+TABLE/i', $query ) ) {
+				continue;
+			}
+			$table_name = trim( (string) $table, '` ' );
+			if ( '' === $table_name || ! preg_match( '/^[A-Za-z0-9_$]+$/', $table_name ) ) {
+				continue;
+			}
+			$wpdb->last_error = '';
+			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table_name ) ) );
+			if ( '' !== trim( (string) $wpdb->last_error ) || null === $exists || '' === (string) $exists ) {
+				continue;
+			}
+			$rows = $wpdb->get_results( 'SHOW INDEX FROM `' . $table_name . '`', ARRAY_A );
+			if ( ! is_array( $rows ) || empty( $rows ) ) {
+				continue;
+			}
+			$existing = array();
+			foreach ( $rows as $row ) {
+				$name = is_array( $row ) ? (string) ( $row['Key_name'] ?? ( $row['KEY_NAME'] ?? ( $row['key_name'] ?? '' ) ) ) : '';
+				if ( '' !== $name ) {
+					$existing[ strtolower( $name ) ] = true;
+				}
+			}
+			$cqueries[ $table ] = self::strip_existing_index_lines( $query, $existing );
+		}
+		return $cqueries;
+	}
+
+	/**
+	 * Pure helper (unit tested): remove index lines whose name is in $existing.
+	 *
+	 * @param string $query    CREATE TABLE statement.
+	 * @param array  $existing Lower-case index names => true (PRIMARY for the primary key).
+	 * @return string
+	 */
+	public static function strip_existing_index_lines( $query, $existing ) {
+		$lines = preg_split( '/\r\n|\r|\n/', (string) $query );
+		$out   = array();
+		foreach ( $lines as $line ) {
+			$name = '';
+			if ( preg_match( '/^\s*PRIMARY\s+KEY\b/i', $line ) ) {
+				$name = 'primary';
+			} elseif ( preg_match( '/^\s*(?:UNIQUE|FULLTEXT|SPATIAL)?\s*(?:KEY|INDEX)\s+`?([A-Za-z0-9_]+)`?\s*\(/i', $line, $m ) ) {
+				$name = strtolower( $m[1] );
+			}
+			if ( '' !== $name && isset( $existing[ $name ] ) ) {
+				continue;
+			}
+			$out[] = $line;
+		}
+		return implode( "\n", $out );
+	}
+
+	/** dbDelta() of every legacy runtime table plus the Custom Storage schema. @return void */
+	private static function create_runtime_tables_via_dbdelta() {
 		if ( class_exists( 'Mobo_Core_Product_Map' ) ) {
 			Mobo_Core_Product_Map::create_table();
 		}
@@ -1714,12 +1866,10 @@ class Mobo_Core_Migration {
 		if ( class_exists( 'Mobo_Core_Sync_Health' ) ) {
 			Mobo_Core_Sync_Health::create_table();
 		}
+	}
 
-		/* Remove only indexes that are exact left-prefix duplicates of a verified
-		 * replacement. Failure to drop is non-fatal; correctness/readiness depends on
-		 * the covering index, while an extra old index only costs write amplification. */
-		self::drop_redundant_runtime_indexes();
-
+	/** Custom Storage schema, backfill registration and readiness verdict. @return bool */
+	private static function finish_create_database_tables() {
 		/*
 		 * Phase-1 custom storage has its own readiness/version boundary.
 		 *
@@ -1732,7 +1882,12 @@ class Mobo_Core_Migration {
 		 * most once per ORDINARY_PASS_INTERVAL.
 		 */
 		if ( class_exists( 'Mobo_Core_Storage_Schema' ) ) {
-			Mobo_Core_Storage_Schema::ensure();
+			add_filter( 'dbdelta_create_queries', array( __CLASS__, 'filter_dbdelta_existing_indexes' ), 10, 1 );
+			try {
+				Mobo_Core_Storage_Schema::ensure();
+			} finally {
+				remove_filter( 'dbdelta_create_queries', array( __CLASS__, 'filter_dbdelta_existing_indexes' ), 10 );
+			}
 		}
 		/* 10.33.70: register the resumable Product/Variation state backfill.
 		 * Scheduling is metadata-only; catalog rows are processed later by the
@@ -2199,6 +2354,21 @@ class Mobo_Core_Migration {
 	 */
 	private static function finalize_database_version( $initial_ready ) {
 		$ready = (bool) $initial_ready && self::database_schema_ready();
+		/* create_database_tables() stamps mobo_core_schema_version only after it
+		 * proved the schema in this pass, so this costs no extra SHOW queries. */
+		$schema_ready = ! $initial_ready && MOBO_CORE_VERSION === (string) get_option( 'mobo_core_schema_version', '' );
+		if ( ! $ready && $schema_ready ) {
+			/* The schema postconditions ARE satisfied; only resumable data-migration
+			 * prerequisites (Connection foundation, retirement workers) are still in
+			 * progress. That is normal progress, not a schema error: do not report one
+			 * to admins/the Backend, and clear the false message older builds wrote.
+			 * Real failures of those steps keep their own dedicated error options. */
+			if ( 0 === strpos( (string) get_option( 'mobo_core_schema_last_error', '' ), self::POSTCONDITION_ERROR_PREFIX ) ) {
+				delete_option( 'mobo_core_schema_last_error' );
+				delete_option( 'mobo_core_schema_last_error_at' );
+			}
+			return;
+		}
 		if ( $ready ) {
 			update_option( 'mobo_core_db_version', MOBO_CORE_VERSION, false );
 			if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) ) {
@@ -2210,8 +2380,8 @@ class Mobo_Core_Migration {
 		}
 
 		$error = '' !== self::$schema_last_failure
-			? 'Mobo Core database migration did not satisfy required schema postconditions: ' . self::$schema_last_failure . ' It will retry on the next request.'
-			: 'Mobo Core database migration did not satisfy required schema postconditions; it will retry on the next request.';
+			? self::POSTCONDITION_ERROR_PREFIX . ': ' . self::$schema_last_failure . ' It will retry on the next request.'
+			: self::POSTCONDITION_ERROR_PREFIX . '; it will retry on the next request.';
 		update_option( 'mobo_core_schema_last_error', $error, false );
 		update_option( 'mobo_core_schema_last_error_at', time(), false );
 	}
@@ -3849,10 +4019,39 @@ class Mobo_Core_Migration {
 			return;
 		}
 
-		$map    = new Mobo_Core_Product_Map();
-		$result = $map->seed_from_legacy_meta( 100 );
+		$map = new Mobo_Core_Product_Map();
+		if ( absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) > 0 ) {
+			return;
+		}
 
-		update_option( 'mobo_core_product_map_last_seed_result', $result, false );
+		/* Outside a budgeted slice (activation/WP-CLI): one small bounded batch. */
+		if ( self::$pass_deadline <= 0 ) {
+			$result = $map->seed_from_legacy_meta( 100 );
+			update_option( 'mobo_core_product_map_last_seed_result', $result, false );
+			update_option( 'mobo_core_product_map_last_seed_at', time(), false );
+			return;
+		}
+
+		/* Budgeted slice: larger batches until the seed completes, stalls or the
+		 * pass deadline arrives. Rows whose GUID is already mapped are skipped by one
+		 * batched lookup (no per-row locks), so re-validating a complete map is fast. */
+		$total  = array( 'products' => 0, 'variations' => 0, 'stalled' => false, 'batches' => 0 );
+		$guard  = 0;
+		while ( $guard++ < 400 && ! self::pass_deadline_reached() ) {
+			$result = $map->seed_from_legacy_meta( self::SEED_DEADLINE_BATCH );
+			$total['batches']++;
+			$total['products']   += absint( $result['products'] ?? 0 );
+			$total['variations'] += absint( $result['variations'] ?? 0 );
+			$total['stalled']     = ! empty( $result['stalled'] );
+			if ( ! empty( $result['stalled'] ) || absint( get_option( 'mobo_core_product_map_seed_completed_at', 0 ) ) > 0 ) {
+				break;
+			}
+			if ( 0 === absint( $result['products'] ?? 0 ) && 0 === absint( $result['variations'] ?? 0 ) ) {
+				break;
+			}
+		}
+
+		update_option( 'mobo_core_product_map_last_seed_result', $total, false );
 		update_option( 'mobo_core_product_map_last_seed_at', time(), false );
 	}
 

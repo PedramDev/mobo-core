@@ -1238,6 +1238,23 @@ class Mobo_Core_Webhook_Queue {
 				/* An administrative disable/removal is not a delivery failure.
 				 * Retain the original owner and try count, release the claim and
 				 * defer until an operator restores the Source. */
+				/* Upgrade window: product creation waits for the Product Map seed.
+				 * Not a delivery failure: defer without consuming an attempt and keep
+				 * processing the following events (updates of existing products). */
+				if ( ! empty( $result['data']['creationDeferred'] ) ) {
+					$deferred = $store->mark_pending_progress(
+						$event_id,
+						isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array(),
+						array( 'deferSeconds' => 120, 'creationDeferred' => true ),
+						$claim_token
+					);
+					if ( ! $deferred ) {
+						$messages[] = 'Product creation deferral could not be committed; the claim will expire and the event retries.';
+						break;
+					}
+					$messages[] = 'Product creation deferred until the Product Map seed completes; no attempt consumed.';
+					continue;
+				}
 				if ( ! empty( $result['data']['ownerUnavailable'] ) ) {
 					$deferred = $store->mark_pending_progress(
 						$event_id,
@@ -1560,6 +1577,12 @@ class Mobo_Core_Webhook_Queue {
 	private function process_item_safely( $item, $payload_timeout = null ) {
 		try {
 			$result = $this->process_item( $item, $payload_timeout );
+		} catch ( Mobo_Core_Product_Creation_Deferred $deferred ) {
+			return array(
+				'success' => false,
+				'message' => 'Product creation deferred until the Product Map seed completes.',
+				'data'    => array( 'creationDeferred' => true ),
+			);
 		} catch ( Throwable $throwable ) {
 			/* Throwable messages can embed signed URLs, X-SEC or an absolute path;
 			 * neither the queue's last_error nor Logger may retain them. */

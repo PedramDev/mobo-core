@@ -80,7 +80,14 @@ class Fake_WPDB {
 		return 0;
 	}
 	public function get_var( $sql ) { $this->queries[] = $sql; return null; }
-	public function get_col( $sql ) { $this->queries[] = $sql; return array(); }
+	public function get_col( $sql ) {
+		$this->queries[] = $sql;
+		if ( preg_match( '/SELECT ID FROM wp_posts WHERE ID IN \(([0-9,]+)\)/', $sql, $m ) ) {
+			$existing = isset( $GLOBALS['__existing_posts'] ) ? $GLOBALS['__existing_posts'] : array();
+			return array_values( array_filter( explode( ',', $m[1] ), function ( $id ) use ( $existing ) { return isset( $existing[ (int) $id ] ); } ) );
+		}
+		return array();
+	}
 }
 $GLOBALS['wpdb'] = new Fake_WPDB();
 
@@ -166,8 +173,7 @@ Mobo_Core_Connection_Repository::$ownership_ready = false;
 Mobo_Core_Migration::normal_runtime_ready( $reason );
 check( 'ownership pending detected', 'connection-ownership-pending' === $reason );
 Mobo_Core_Connection_Repository::$ownership_ready = true;
-Mobo_Core_Migration::normal_runtime_ready( $reason );
-check( 'product map seed pending detected (sync could duplicate products)', 'product-map-seed-pending' === $reason );
+check( 'seed pending no longer blocks normal runtime (only product creation is gated)', true === Mobo_Core_Migration::normal_runtime_ready( $reason ) && '' === $reason );
 update_option( 'mobo_core_product_map_seed_completed_at', time() );
 check( 'all prerequisites -> ready even though unstamped and workers unfinished', true === Mobo_Core_Migration::normal_runtime_ready( $reason ) && '' === $reason );
 update_option( 'mobo_core_db_version', '10.34.77' );
@@ -204,7 +210,33 @@ reset_state();
 $full = array();
 for ( $i = 1; $i <= $Q::MAX_ITEMS; $i++ ) { $full[ $i ] = array( 'w' => 'identity', 'r' => 'x', 'at' => 1 ); }
 update_option( $Q::OPTION, $full );
-check( 'cap reached -> mark() returns false (worker stays honestly blocked)', false === $Q::mark( 999999, 'identity', 'x' ) );
+$GLOBALS['__existing_posts'] = array_fill_keys( array_keys( $full ), true );
+check( 'cap reached with live posts -> mark() returns false (worker stays honestly blocked)', false === $Q::mark( 999999, 'identity', 'x' ) );
+check( '  overflow is recorded for support', 1 === absint( $Q::overflow_status()['count'] ?? 0 ) );
+$Q::reset_request_cache();
+unset( $GLOBALS['__existing_posts'][5], $GLOBALS['__existing_posts'][6] );
+check( 'M8: entries of deleted posts are pruned at the cap, freeing capacity', true === $Q::mark( 999999, 'identity', 'x' ) );
+check( '  pruned entries gone, new entry present', ! $Q::is_marked( 5 ) && ! $Q::is_marked( 6 ) && $Q::is_marked( 999999 ) );
+unset( $GLOBALS['__existing_posts'] );
+
+echo "\n[5b] M8: paged quarantine storage (more than 1000 marked objects)\n";
+reset_state();
+check( 'capacity is no longer the old 1000 (paged)', $Q::MAX_ITEMS > 1000 && $Q::PAGE_SIZE <= 1000 );
+for ( $i = 1; $i <= 2500; $i++ ) { $Q::mark( $i, 'operational', 'mirror_failed' ); }
+check( '2500 objects marked', 2500 === $Q::count() );
+check( 'stored in pages of PAGE_SIZE', count( $GLOBALS['__options'][ $Q::OPTION ] ) === $Q::PAGE_SIZE && isset( $GLOBALS['__options'][ $Q::OPTION . '_p1' ], $GLOBALS['__options'][ $Q::OPTION . '_p2' ] ) );
+$Q::reset_request_cache();
+check( 'reload merges all pages', 2500 === $Q::count() && $Q::is_marked( 2500 ) && $Q::is_marked( 1 ) );
+for ( $i = 1001; $i <= 2500; $i++ ) { $Q::unmark( $i ); }
+check( 'shrinking deletes trailing pages', ! isset( $GLOBALS['__options'][ $Q::OPTION . '_p1' ] ) && ! isset( $GLOBALS['__options'][ $Q::OPTION . '_p2' ] ) && 1000 === $Q::count() );
+check( 'filter_existing keeps only live ids', array( 2 => 'b' ) === $Q::filter_existing( array( 1 => 'a', 2 => 'b' ), array( 2 => true ) ) );
+
+echo "\n[5c] admin notice reflects real background activity\n";
+$now = 1800000000;
+check( 'recent success -> healthy', 'healthy' === $Q::classify_runtime_activity( $now - 120, array(), $now )['state'] );
+$a = $Q::classify_runtime_activity( $now - 3600, array( 'active' => true, 'remainingSeconds' => 40 ), $now );
+check( 'stale success + active lease -> locked with remaining seconds', 'locked' === $a['state'] && 40 === $a['lockRemaining'] );
+check( 'stale success, no lease -> idle (no false "continues normally")', 'idle' === $Q::classify_runtime_activity( 0, array( 'active' => false ), $now )['state'] );
 
 echo "\n[6] multi-Connection topology\n";
 reset_state();
@@ -251,6 +283,34 @@ update_option( $Q::REPROBE_OPTION, time() + 600 );
 check( 're-probe respects its interval', false === $Q::reprobe_due() );
 $Q::request_reprobe();
 check( 'request_reprobe (Repair) makes it due again', true === $Q::reprobe_due() );
+
+echo "\n[9] runtime hardening: pass deadline, dbDelta index filter, honest schema error\n";
+$M = 'Mobo_Core_Migration';
+check( 'no deadline -> never reached', false === $M::deadline_reached( 0, 1e12 ) );
+check( 'before deadline -> continue', false === $M::deadline_reached( 100.0, 99.5 ) );
+check( 'at/after deadline -> stop between steps', true === $M::deadline_reached( 100.0, 100.0 ) && true === $M::deadline_reached( 100.0, 130.0 ) );
+$create = "CREATE TABLE wp_mobo_product_map (\n\t\t\tid bigint(20) unsigned NOT NULL AUTO_INCREMENT,\n\t\t\tremote_guid varchar(191) NOT NULL,\n\t\t\tPRIMARY KEY  (id),\n\t\t\tUNIQUE KEY remote_object (connection_id, remote_guid(140), object_type),\n\t\t\tKEY wp_post_id (connection_id, wp_post_id),\n\t\t\tKEY updated_id (connection_id, updated_at, id)\n\t\t) DEFAULT CHARSET=utf8mb4;";
+$stripped = $M::strip_existing_index_lines( $create, array( 'primary' => true, 'remote_object' => true, 'wp_post_id' => true ) );
+check( 'existing index names removed (no "Duplicate key name" ADD KEY)', false === strpos( $stripped, 'remote_object' ) && false === strpos( $stripped, 'KEY wp_post_id' ) && false === strpos( $stripped, 'PRIMARY KEY' ) );
+check( 'missing index kept so dbDelta still adds it', false !== strpos( $stripped, 'KEY updated_id' ) );
+check( 'columns untouched', false !== strpos( $stripped, 'remote_guid varchar(191) NOT NULL' ) && false !== strpos( $stripped, 'id bigint(20) unsigned NOT NULL AUTO_INCREMENT' ) );
+check( 'nothing existing -> statement unchanged', $create === $M::strip_existing_index_lines( $create, array() ) );
+reset_state();
+$finalize = new ReflectionMethod( $M, 'finalize_database_version' );
+$finalize->setAccessible( true );
+update_option( 'mobo_core_db_version', '10.33.67' );
+update_option( 'mobo_core_schema_version', MOBO_CORE_VERSION );
+update_option( 'mobo_core_schema_last_error', $M::POSTCONDITION_ERROR_PREFIX . '; it will retry on the next request.' );
+$finalize->invoke( null, false );
+check( 'schema fine, workers in progress -> no false "postconditions not satisfied" error', ! isset( $GLOBALS['__options']['mobo_core_schema_last_error'] ) );
+check( '  and the DB version is not stamped', '10.33.67' === get_option( 'mobo_core_db_version' ) );
+update_option( 'mobo_core_schema_last_error', 'Mobo Core database schema is incomplete: x' );
+$finalize->invoke( null, false );
+check( 'a real schema error written by create_database_tables() is preserved', 0 === strpos( (string) get_option( 'mobo_core_schema_last_error' ), 'Mobo Core database schema is incomplete' ) );
+delete_option( 'mobo_core_schema_version' );
+delete_option( 'mobo_core_schema_last_error' );
+$finalize->invoke( null, false );
+check( 'schema not proven -> postcondition error still reported', 0 === strpos( (string) get_option( 'mobo_core_schema_last_error' ), $M::POSTCONDITION_ERROR_PREFIX ) );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );

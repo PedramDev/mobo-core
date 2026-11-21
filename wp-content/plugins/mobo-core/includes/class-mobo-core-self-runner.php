@@ -23,7 +23,19 @@ class Mobo_Core_Self_Runner {
 	const OPTION_DISPATCHED_AT      = 'mobo_core_worker_dispatched_at';
 	const OPTION_WORKER_STARTED_AT  = 'mobo_core_worker_started_at';
 	const DISPATCH_LEASE_TTL        = 180; // Handoff/non-arrived request lease.
-	const ACTIVE_WORKER_LEASE_TTL    = 600; // Covers bounded worker + longest configured blocking call.
+	/* Upper bound of the active worker lease. The real TTL is derived from the PHP
+	 * limit (Mobo_Core_Request_Deadline::lease_ttl(): limit + 15 s within [45, 90]),
+	 * is renewed between runner stages and released by a shutdown handler, so a
+	 * killed request can no longer lock real cron out for 10 minutes. It must stay
+	 * well below DISPATCH_LEASE_TTL: the lease window distinguishes a claimed lease
+	 * from an unclaimed loopback handoff. */
+	const ACTIVE_WORKER_LEASE_TTL    = 90;
+
+	/* Real cron may take over an unclaimed loopback handoff older than this. */
+	const HANDOFF_TAKEOVER_AFTER     = 10;
+
+	/* Retry-After advertised with a 423 never exceeds this many seconds. */
+	const LEASE_RETRY_AFTER_CAP      = 90;
 
 	/**
 	 * Build local worker URL.
@@ -426,13 +438,14 @@ class Mobo_Core_Self_Runner {
 		}
 
 		/* Close the renew-before-metadata-update race. A pre-claim handoff has a
-		 * fixed 180-second lease window; claim_worker_request() renews it to the
-		 * 600-second active-worker window before touching OPTION_WORKER_STARTED_AT.
-		 * If that renewal already happened, treat it as live work and never delete. */
+		 * fixed 180-second lease window and was never renewed; claim_worker_request()
+		 * renews it to the (shorter, request-derived) active-worker window before
+		 * touching OPTION_WORKER_STARTED_AT. If that renewal already happened, treat
+		 * it as live work and never delete. */
 		$heartbeat_at = isset( $snapshot['lastHeartbeatAt'] ) ? absint( $snapshot['lastHeartbeatAt'] ) : 0;
 		$expires_at   = isset( $snapshot['expiresAt'] ) ? absint( $snapshot['expiresAt'] ) : 0;
 		$lease_window = $expires_at > $heartbeat_at ? ( $expires_at - $heartbeat_at ) : 0;
-		if ( $lease_window > ( self::DISPATCH_LEASE_TTL + 1 ) ) {
+		if ( ! self::is_unclaimed_handoff_snapshot( $snapshot ) ) {
 			return array(
 				'success'          => true,
 				'status'           => 'handoff-claimed-concurrently',
@@ -472,7 +485,7 @@ class Mobo_Core_Self_Runner {
 	 */
 	public static function claim_worker_request( $transferred_token = '' ) {
 		$transferred_token = sanitize_text_field( (string) $transferred_token );
-		$ttl = self::ACTIVE_WORKER_LEASE_TTL;
+		$ttl = self::active_worker_lease_ttl();
 
 		if ( '' !== $transferred_token ) {
 			if ( ! Mobo_Core_Lock::renew( self::DISPATCH_LOCK_NAME, $transferred_token, $ttl ) ) {
@@ -482,9 +495,29 @@ class Mobo_Core_Self_Runner {
 		} else {
 			$token = Mobo_Core_Lock::acquire( self::DISPATCH_LOCK_NAME, $ttl );
 			if ( false === $token ) {
-				return array( 'success' => false, 'status' => 'dispatcher-locked', 'httpStatus' => 423, 'token' => '' );
+				/* A loopback handoff that never reached /worker/run (blocked loopback,
+				 * slow host) must not make real cron answer 423 for 180 s. Take it over
+				 * with compare-and-delete: if the worker claims it concurrently the
+				 * snapshot no longer matches and we stay locked; a late worker gets 409.
+				 * This request then does the work the handoff was meant to start. */
+				$token = self::take_over_unclaimed_handoff( $ttl );
+			}
+			if ( false === $token ) {
+				return array(
+					'success'    => false,
+					'status'     => 'dispatcher-locked',
+					'httpStatus' => 423,
+					'token'      => '',
+					'retryAfter' => self::dispatcher_retry_after(),
+				);
 			}
 		}
+
+		/* `finally` does not run when PHP is killed by max_execution_time or a fatal
+		 * error; shutdown callbacks do. release() is owner-checked compare-and-delete,
+		 * so this is a no-op after the normal release or once another request owns
+		 * the lease. If the host SIGKILLs the process, the short TTL bounds the gap. */
+		register_shutdown_function( array( __CLASS__, 'release_worker_request' ), $token );
 
 		update_option( self::OPTION_WORKER_STARTED_AT, time(), false );
 		delete_option( self::OPTION_DISPATCH_PENDING );
@@ -502,7 +535,73 @@ class Mobo_Core_Self_Runner {
 			return false;
 		}
 
-		return Mobo_Core_Lock::renew( self::DISPATCH_LOCK_NAME, $token, self::ACTIVE_WORKER_LEASE_TTL );
+		return Mobo_Core_Lock::renew( self::DISPATCH_LOCK_NAME, $token, self::active_worker_lease_ttl() );
+	}
+
+	/** Active worker lease TTL derived from the PHP request limit. @return int */
+	public static function active_worker_lease_ttl() {
+		$ttl = class_exists( 'Mobo_Core_Request_Deadline' ) ? Mobo_Core_Request_Deadline::lease_ttl() : self::ACTIVE_WORKER_LEASE_TTL;
+		return (int) max( 30, min( self::ACTIVE_WORKER_LEASE_TTL, absint( $ttl ) ) );
+	}
+
+	/**
+	 * Seconds a caller that got 423 should wait: the remaining lease, capped. The
+	 * Backend treats 423 as "busy"; an honest Retry-After keeps it from piling up
+	 * retries against a lease that cannot expire sooner.
+	 *
+	 * @return int
+	 */
+	public static function dispatcher_retry_after() {
+		$status = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::DISPATCH_LOCK_NAME ) : array();
+		$remaining = ! empty( $status['active'] ) ? absint( $status['remainingSeconds'] ?? 0 ) : 0;
+		return (int) max( 1, min( self::LEASE_RETRY_AFTER_CAP, $remaining ) );
+	}
+
+	/**
+	 * Whether a dispatcher lease snapshot is a loopback handoff no worker claimed yet:
+	 * acquired by kick() with exactly DISPATCH_LEASE_TTL and never renewed.
+	 *
+	 * @param array $snapshot Mobo_Core_Lock::get_status() result.
+	 * @return bool
+	 */
+	public static function is_unclaimed_handoff_snapshot( $snapshot ) {
+		if ( ! is_array( $snapshot ) || empty( $snapshot['active'] ) ) {
+			return false;
+		}
+		$acquired  = absint( $snapshot['acquiredAt'] ?? 0 );
+		$heartbeat = absint( $snapshot['lastHeartbeatAt'] ?? 0 );
+		$expires   = absint( $snapshot['expiresAt'] ?? 0 );
+		return $acquired > 0 && $heartbeat === $acquired && ( $expires - $heartbeat ) === self::DISPATCH_LEASE_TTL;
+	}
+
+	/**
+	 * Pure decision: may a scheduler request take over this handoff now?
+	 *
+	 * @param array $snapshot      Lock snapshot.
+	 * @param int   $dispatched_at OPTION_DISPATCHED_AT value.
+	 * @param int   $now           Unix time.
+	 * @return bool
+	 */
+	public static function handoff_takeover_allowed( $snapshot, $dispatched_at, $now ) {
+		if ( ! self::is_unclaimed_handoff_snapshot( $snapshot ) || absint( $dispatched_at ) <= 0 ) {
+			return false;
+		}
+		return ( absint( $now ) - absint( $snapshot['acquiredAt'] ) ) >= self::HANDOFF_TAKEOVER_AFTER;
+	}
+
+	/** @return string|false New token when an unclaimed, overdue handoff was taken over. */
+	private static function take_over_unclaimed_handoff( $ttl ) {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) || ! method_exists( 'Mobo_Core_Lock', 'release_if_snapshot_matches' ) ) {
+			return false;
+		}
+		$snapshot = Mobo_Core_Lock::get_status( self::DISPATCH_LOCK_NAME );
+		if ( ! self::handoff_takeover_allowed( $snapshot, absint( get_option( self::OPTION_DISPATCHED_AT, 0 ) ), time() ) ) {
+			return false;
+		}
+		if ( ! Mobo_Core_Lock::release_if_snapshot_matches( self::DISPATCH_LOCK_NAME, $snapshot ) ) {
+			return false;
+		}
+		return Mobo_Core_Lock::acquire( self::DISPATCH_LOCK_NAME, $ttl );
 	}
 
 	/** Release the worker dispatcher only when the caller still owns it. */

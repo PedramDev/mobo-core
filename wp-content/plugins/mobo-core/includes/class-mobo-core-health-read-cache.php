@@ -622,6 +622,56 @@ final class Mobo_Core_Health_Read_Cache {
 
 
 	/**
+	 * Advance the paged operational Sync Health scan by one deadline-bounded slice
+	 * and publish the snapshot when it completes.
+	 *
+	 * @param int   $limit    Detail limit.
+	 * @param float $deadline Absolute microtime deadline (0 = short default).
+	 * @return string refreshed|in-progress|failed
+	 */
+	public static function refresh_sync_health_snapshot_paged( $limit, $deadline ) {
+		if ( self::$sync_refreshing ) {
+			return 'in-progress';
+		}
+		self::$sync_refreshing = true;
+		try {
+			$page = Mobo_Core_Sync_Health::run_operational_scan_page( max( 1, absint( $limit ) ), (float) $deadline );
+			if ( empty( $page['complete'] ) ) {
+				if ( 'in-progress' === (string) ( $page['status'] ?? '' ) ) {
+					return 'in-progress';
+				}
+				Mobo_Core_Settings::update( 'mobo_core_sync_health_snapshot_last_error', 'Operational Sync Health refresh unavailable: ' . sanitize_key( (string) ( $page['status'] ?? '' ) ), false );
+				return 'failed';
+			}
+			$result = isset( $page['result'] ) && is_array( $page['result'] ) ? $page['result'] : array();
+			if ( self::sync_health_result_is_usable( $result ) && self::store_sync_health_operational_snapshot( max( 1, absint( $limit ) ), $result ) ) {
+				/* The /health payload asks for 15 detail rows; a missing 15-row snapshot
+				 * would make it run the full synchronous scan. Same scan, first 15 rows. */
+				if ( absint( $limit ) > 15 ) {
+					$trimmed = $result;
+					foreach ( array( 'unownedRows', 'verificationRows', 'activeRetryRows', 'terminalRows' ) as $list_key ) {
+						if ( isset( $trimmed[ $list_key ] ) && is_array( $trimmed[ $list_key ] ) ) {
+							$trimmed[ $list_key ] = array_slice( $trimmed[ $list_key ], 0, 15 );
+						}
+					}
+					self::store_sync_health_operational_snapshot( 15, $trimmed );
+				}
+				Mobo_Core_Settings::update( self::SYNC_BACKGROUND_SUCCESS_OPTION, time(), false );
+				Mobo_Core_Settings::delete( self::SYNC_REFRESH_REQUESTED_AT_OPTION );
+				Mobo_Core_Settings::delete( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION );
+				return 'refreshed';
+			}
+			Mobo_Core_Settings::update( 'mobo_core_sync_health_snapshot_last_error', 'Operational Sync Health refresh did not return a usable result.', false );
+			return 'failed';
+		} catch ( Throwable $e ) {
+			Mobo_Core_Settings::update( 'mobo_core_sync_health_snapshot_last_error', 'Sync Health refresh failed with an internal exception.', false );
+			return 'failed';
+		} finally {
+			self::$sync_refreshing = false;
+		}
+	}
+
+	/**
 	 * Refresh stale/requested snapshots from the deterministic real-cron runner.
 	 *
 	 * Health refresh can include an 8-second cPanel request, so it only starts when
@@ -659,12 +709,22 @@ final class Mobo_Core_Health_Read_Cache {
 
 		$sync_requested = absint( Mobo_Core_Settings::get( self::SYNC_REFRESH_REQUESTED_AT_OPTION, 0 ) ) > 0;
 		$sync_last      = absint( Mobo_Core_Settings::get( self::SYNC_BACKGROUND_SUCCESS_OPTION, 0 ) );
-		$sync_due       = $sync_requested || $sync_last <= 0 || ( $now - $sync_last ) >= 300;
+		$sync_paged     = class_exists( 'Mobo_Core_Sync_Health' ) && method_exists( 'Mobo_Core_Sync_Health', 'run_operational_scan_page' );
+		$sync_resuming  = $sync_paged && Mobo_Core_Sync_Health::operational_scan_in_progress();
+		$sync_due       = $sync_resuming || $sync_requested || $sync_last <= 0 || ( $now - $sync_last ) >= 300;
 		$sync_limit     = max( 1, absint( Mobo_Core_Settings::get( self::SYNC_REFRESH_REQUESTED_LIMIT_OPTION, 20 ) ) );
 
 		if ( $sync_due ) {
-			if ( $deadline > 0 && microtime( true ) + 4.0 >= $deadline ) {
+			/* The paged scan only needs a little headroom: it stops ~1 s before the
+			 * deadline and resumes from its durable cursor on the next cron request. */
+			$floor = $sync_paged ? 2.5 : 4.0;
+			if ( $deadline > 0 && microtime( true ) + $floor >= $deadline ) {
 				$result['sync'] = 'deferred-budget';
+			} elseif ( $sync_paged ) {
+				$result['sync'] = self::refresh_sync_health_snapshot_paged( $sync_limit, $deadline );
+				if ( 'failed' === $result['sync'] ) {
+					$result['success'] = false;
+				}
 			} else {
 				$result['sync'] = self::refresh_sync_health_snapshot( $sync_limit ) ? 'refreshed' : 'failed';
 				if ( 'failed' === $result['sync'] ) {
