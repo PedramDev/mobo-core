@@ -762,7 +762,10 @@ global $wpdb;
 			$key = sanitize_title( (string) $attribute->get_name() );
 			if ( '' !== $key ) {
 				$options = array();
-				foreach ( (array) $attribute->get_options() as $option ) {
+				$raw_options = method_exists( $attribute, 'get_slugs' )
+					? (array) $attribute->get_slugs()
+					: (array) $attribute->get_options();
+				foreach ( $raw_options as $option ) {
 					$option = sanitize_text_field( (string) $option );
 					if ( '' !== $option ) {
 						$options[] = $option;
@@ -795,13 +798,25 @@ global $wpdb;
 				return false;
 			}
 			$actual = array();
-			foreach ( (array) $variation->get_attributes( 'edit' ) as $key => $value ) {
+			$variation_attributes = method_exists( $variation, 'get_variation_attributes' )
+				? (array) $variation->get_variation_attributes( false )
+				: (array) $variation->get_attributes( 'edit' );
+			foreach ( $variation_attributes as $key => $value ) {
 				$key = preg_replace( '/^attribute_/', '', sanitize_title( (string) $key ) );
 				$value = sanitize_text_field( (string) $value );
-				if ( '' === $key || '' === $value ) {
+				if ( '' === $key ) {
 					return false;
 				}
-				if ( isset( $expected[ $key ] ) && ! empty( $expected[ $key ] ) && ! in_array( $value, $expected[ $key ], true ) ) {
+				/*
+				 * WooCommerce stores an empty Variation attribute value as wildcard
+				 * "Any". It is valid for that attribute key and must not make Sync
+				 * Health report a malformed local structure.
+				 */
+				if ( '' !== $value
+					&& isset( $expected[ $key ] )
+					&& ! empty( $expected[ $key ] )
+					&& ! in_array( $value, $expected[ $key ], true )
+				) {
 					return false;
 				}
 				$actual[ $key ] = true;

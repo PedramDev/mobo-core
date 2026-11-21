@@ -94,6 +94,8 @@ class Mobo_Core_Migration {
 		self::apply_10334412_persistence_integrity_backfill( $previous_version );
 		self::apply_103353_health_snapshot_real_cron_ownership( $previous_version );
 		self::apply_103354_health_legacy_cron_cleanup( $previous_version );
+		self::apply_103357_failed_variant_checkpoint_recovery( $previous_version );
+		self::apply_103358_image_prune_queue_schedule( $previous_version );
 		self::apply_103353_convergence_residue_selfheal_schedule( $previous_version );
 		self::maybe_mark_legacy_repair_required( '' );
 		self::seed_product_map_from_legacy_meta();
@@ -167,6 +169,8 @@ class Mobo_Core_Migration {
 		self::apply_10334412_persistence_integrity_backfill( $current );
 		self::apply_103353_health_snapshot_real_cron_ownership( $current );
 		self::apply_103354_health_legacy_cron_cleanup( $current );
+		self::apply_103357_failed_variant_checkpoint_recovery( $current );
+		self::apply_103358_image_prune_queue_schedule( $current );
 		self::apply_103353_convergence_residue_selfheal_schedule( $current );
 		self::maybe_mark_legacy_repair_required( $current );
 		self::seed_product_map_from_legacy_meta();
@@ -391,6 +395,10 @@ class Mobo_Core_Migration {
 			Mobo_Core_Image_Refresh_Queue::create_table();
 		}
 
+		if ( class_exists( 'Mobo_Core_Image_Prune_Queue' ) ) {
+			Mobo_Core_Image_Prune_Queue::create_table();
+		}
+
 		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
 			Mobo_Core_Orphan_Image_Cleanup::create_table();
 		}
@@ -431,6 +439,7 @@ class Mobo_Core_Migration {
 			'Mobo_Core_Category_Map',
 			'Mobo_Core_Image_Queue',
 			'Mobo_Core_Image_Refresh_Queue',
+			'Mobo_Core_Image_Prune_Queue',
 			'Mobo_Core_Orphan_Image_Cleanup',
 			'Mobo_Core_Sync_Health',
 		);
@@ -466,6 +475,15 @@ class Mobo_Core_Migration {
 			return false;
 		}
 
+		$prune_table = Mobo_Core_Image_Prune_Queue::table_name();
+		foreach ( array( 'attachment_id', 'image_guid', 'phase', 'postmeta_cursor', 'option_cursor', 'post_cursor', 'proof_pass' ) as $column_name ) {
+			$found_column = $wpdb->get_var( $wpdb->prepare( "SHOW COLUMNS FROM {$prune_table} LIKE %s", $column_name ) );
+			if ( $column_name !== (string) $found_column ) {
+				self::$schema_last_failure = 'required column is missing or inaccessible: ' . $prune_table . '.' . $column_name . '.';
+				return false;
+			}
+		}
+
 		/*
 		 * Identity/ownership indexes are correctness constraints, not merely query
 		 * optimizations. A partial dbDelta that creates columns but misses one of these
@@ -482,6 +500,8 @@ class Mobo_Core_Migration {
 			array( Mobo_Core_Category_Map::table_name(), 'remote_guid', true, array( array( 'remote_guid', 0 ) ) ),
 			array( Mobo_Core_Image_Queue::table_name(), 'queue_key', true, array( array( 'queue_key', 0 ) ) ),
 			array( Mobo_Core_Image_Refresh_Queue::table_name(), 'queue_key', true, array( array( 'queue_key', 0 ) ) ),
+			array( Mobo_Core_Image_Prune_Queue::table_name(), 'attachment_id', true, array( array( 'attachment_id', 0 ) ) ),
+			array( Mobo_Core_Image_Prune_Queue::table_name(), 'status_retry_id', false, array( array( 'status', 0 ), array( 'next_retry_at', 0 ), array( 'id', 0 ) ) ),
 			array( Mobo_Core_Orphan_Image_Cleanup::table_name(), 'file_key', true, array( array( 'file_key', 0 ) ) ),
 			array( Mobo_Core_Sync_Health::table_name(), 'product_guid', true, array( array( 'product_guid', 0 ) ) ),
 		);
@@ -2425,6 +2445,103 @@ class Mobo_Core_Migration {
 
 			wp_clear_scheduled_hook( $hook );
 		}
+	}
+
+
+	/**
+	 * Recover a legacy Repair checkpoint that failed after fetching a variant
+	 * page but before that page was durably applied.
+	 *
+	 * Older builds advanced currentVariantCursor before the page commit. If the
+	 * page then failed during Simple -> Variable conversion, resuming that state
+	 * could skip the failed page. Preserve the Repair generation and its current
+	 * product, but rewind only that product's authoritative variant pass to page
+	 * one/cursor zero.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103357_failed_variant_checkpoint_recovery( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' !== $previous_version && version_compare( $previous_version, '10.33.57', '>=' ) ) {
+			return;
+		}
+
+		$state = get_option( 'mobo_core_sync_state', array() );
+		if ( ! is_array( $state ) || empty( $state ) ) {
+			return;
+		}
+
+		if ( 'running' !== sanitize_key( (string) ( $state['status'] ?? '' ) ) || empty( $state['repairMode'] ) ) {
+			return;
+		}
+
+		$legacy_error = trim( (string) ( $state['lastError'] ?? '' ) );
+		if ( 'WooCommerce variable product could not be durably saved after type conversion.' !== $legacy_error ) {
+			return;
+		}
+
+		if ( class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( 'manual_sync' ) ) {
+			return;
+		}
+
+		$now = time();
+		$state['legacyFailedVariantCheckpoint'] = array(
+			'error'                        => $legacy_error,
+			'variantPage'                  => absint( $state['variantPage'] ?? 1 ),
+			'currentVariantCursor'         => absint( $state['currentVariantCursor'] ?? 0 ),
+			'currentVariantProcessedPages' => absint( $state['currentVariantProcessedPages'] ?? 0 ),
+			'recoveredAt'                  => $now,
+			'recoveredByVersion'           => '10.33.57',
+		);
+
+		$state['variantPage']                  = 1;
+		$state['currentVariantCursor']         = 0;
+		$state['currentVariantTotalCount']     = 0;
+		$state['currentVariantTotalPages']     = 0;
+		$state['currentVariantProcessedPages'] = 0;
+		$state['lastError']                    = '';
+		$state['transientRetryCount']          = 0;
+		$state['lastTransientError']           = '';
+		$state['waitingForPortalSince']        = 0;
+		$state['nextRetryAt']                  = 0;
+		$state['staleRecoveryCount']           = absint( $state['staleRecoveryCount'] ?? 0 ) + 1;
+		$state['lastStaleRecoveryAt']          = $now;
+		$state['lastStaleRecoveryReason']      = 'upgrade-rewind-failed-variant-page';
+		$state['lastMessage']                  = 'Repair قدیمی پس از ارتقای افزونه از ابتدای تنوع‌های محصول جاری به‌صورت امن ادامه داده می‌شود.';
+		$state['updatedAt']                    = $now;
+
+		update_option( 'mobo_core_sync_state', $state, false );
+		wp_cache_delete( 'mobo_core_sync_state', 'options' );
+	}
+
+
+	/**
+	 * Schedule bounded migration of legacy image-prune debt.
+	 *
+	 * Do not scan wp_postmeta during plugin activation/upgrade. The new background
+	 * prune queue reads the two exact legacy meta keys with primary-key cursors on
+	 * later image-worker slices. Fresh installs have no legacy debt.
+	 *
+	 * @param string $previous_version Previously stored plugin DB version.
+	 * @return void
+	 */
+	private static function apply_103358_image_prune_queue_schedule( $previous_version ) {
+		$previous_version = trim( (string) $previous_version );
+		if ( '' === $previous_version || version_compare( $previous_version, '10.33.58', '>=' ) ) {
+			return;
+		}
+
+		update_option(
+			Mobo_Core_Image_Prune_Queue::LEGACY_SEED_STATE_OPTION,
+			array(
+				'phase'      => 'product',
+				'cursor'     => 0,
+				'complete'   => false,
+				'scheduledAt'=> time(),
+			),
+			false
+		);
 	}
 
 

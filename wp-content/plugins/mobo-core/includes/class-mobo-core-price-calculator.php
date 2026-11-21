@@ -92,8 +92,21 @@ class Mobo_Core_Price_Calculator {
 		$sale_base    = '';
 
 		if ( null !== $compare_price && '' !== $compare_price && '1' === $auto_compare ) {
-			$regular_base = intval( $normalized_compare_price );
-			$sale_base    = $base_price;
+			/*
+			 * WooCommerce requires a sale price to be strictly lower than the
+			 * regular price. A source comparePrice that is equal to or below the
+			 * source price is not a valid sale reference; treating it as regular
+			 * would produce sale >= regular and WooCommerce will normalize the sale
+			 * away during save, making our durable postcondition impossible.
+			 *
+			 * Fail-safe interpretation: only a strictly higher comparePrice creates
+			 * a sale pair. Otherwise the source price remains the ordinary regular/
+			 * active price and sale is empty.
+			 */
+			if ( $normalized_compare_price > $normalized_price ) {
+				$regular_base = intval( $normalized_compare_price );
+				$sale_base    = $base_price;
+			}
 		}
 
 		$product_override = class_exists( 'Mobo_Core_Product_Pricing_Policy' )
@@ -475,16 +488,30 @@ class Mobo_Core_Price_Calculator {
 			$context
 		);
 
-		if ( ! is_array( $filtered_pair ) ) {
-			return $pair;
+		$final_pair = ! is_array( $filtered_pair )
+			? $pair
+			: array(
+				'regular_price' => array_key_exists( 'regular_price', $filtered_pair ) ? $filtered_pair['regular_price'] : $pair['regular_price'],
+				'sale_price'    => array_key_exists( 'sale_price', $filtered_pair ) ? $filtered_pair['sale_price'] : $pair['sale_price'],
+				'error'         => isset( $filtered_pair['error'] ) ? sanitize_text_field( (string) $filtered_pair['error'] ) : '',
+				'policy_type'   => $pair['policy_type'],
+			);
+
+		/*
+		 * Compatibility filters are allowed to modify the pair, but the final pair
+		 * must still satisfy WooCommerce's durable sale invariant.
+		 */
+		if ( empty( $final_pair['error'] )
+			&& '' !== (string) $final_pair['sale_price']
+			&& null !== $final_pair['regular_price']
+			&& is_numeric( $final_pair['sale_price'] )
+			&& is_numeric( $final_pair['regular_price'] )
+			&& (float) $final_pair['sale_price'] >= (float) $final_pair['regular_price']
+		) {
+			$final_pair['error'] = 'Calculated WooCommerce sale price must be strictly lower than regular price.';
 		}
 
-		return array(
-			'regular_price' => array_key_exists( 'regular_price', $filtered_pair ) ? $filtered_pair['regular_price'] : $pair['regular_price'],
-			'sale_price'    => array_key_exists( 'sale_price', $filtered_pair ) ? $filtered_pair['sale_price'] : $pair['sale_price'],
-			'error'         => isset( $filtered_pair['error'] ) ? sanitize_text_field( (string) $filtered_pair['error'] ) : '',
-			'policy_type'   => $pair['policy_type'],
-		);
+		return $final_pair;
 	}
 
 	/**

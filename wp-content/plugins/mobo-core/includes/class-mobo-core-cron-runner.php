@@ -99,6 +99,26 @@ class Mobo_Core_Cron_Runner {
 		 */
 		register_shutdown_function( array( 'Mobo_Core_Lock', 'release' ), 'real_cron_runner', $lock );
 
+		/*
+		 * Interrupted requests can leave finite product/runtime lease rows behind.
+		 * They are already self-healing on the next acquire/status check for the
+		 * same name, but a real runner slice is the natural bounded housekeeping
+		 * point for reclaiming stale residue proactively. recover_stale_locks()
+		 * compare-deletes only the exact malformed/expired payload it inspected and
+		 * never shortens or force-releases a healthy live lease. Cleanup failure must
+		 * not block queue progress.
+		 */
+		$stale_lock_recovery = array();
+		try {
+			if ( method_exists( 'Mobo_Core_Lock', 'recover_stale_locks' ) ) {
+				$stale_lock_recovery = Mobo_Core_Lock::recover_stale_locks();
+			}
+		} catch ( Throwable $e ) {
+			$stale_lock_recovery = array(
+				'error' => $e->getMessage(),
+			);
+		}
+
 		try {
 			if ( class_exists( 'Mobo_Core_API_Client' ) && method_exists( 'Mobo_Core_API_Client', 'set_runtime_deadline' ) ) {
 				Mobo_Core_API_Client::set_runtime_deadline( microtime( true ) + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ), 1.0 );
@@ -123,6 +143,23 @@ class Mobo_Core_Cron_Runner {
 				Mobo_Core_API_Client::clear_runtime_deadline();
 			}
 			$result['lockReleased'] = Mobo_Core_Lock::release( 'real_cron_runner', $lock );
+		}
+
+		if ( ! empty( $stale_lock_recovery ) ) {
+			if ( isset( $stale_lock_recovery['error'] ) ) {
+				$result['staleLockRecovery'] = array(
+					'status' => 'error',
+					'error'  => sanitize_text_field( (string) $stale_lock_recovery['error'] ),
+				);
+			} else {
+				$result['staleLockRecovery'] = array(
+					'status'    => 'ok',
+					'scanned'   => absint( isset( $stale_lock_recovery['scanned'] ) ? $stale_lock_recovery['scanned'] : 0 ),
+					'recovered' => absint( isset( $stale_lock_recovery['recovered'] ) ? $stale_lock_recovery['recovered'] : 0 ),
+					'active'    => absint( isset( $stale_lock_recovery['active'] ) ? $stale_lock_recovery['active'] : 0 ),
+					'raced'     => absint( isset( $stale_lock_recovery['raced'] ) ? $stale_lock_recovery['raced'] : 0 ),
+				);
+			}
 		}
 
 		/* Runtime diagnostics is one bounded aggregate write per runner request. */
@@ -301,6 +338,9 @@ class Mobo_Core_Cron_Runner {
 					: array(),
 				'failedStages'                  => isset( $runner['failedStages'] ) && is_array( $runner['failedStages'] )
 					? array_values( array_map( 'sanitize_key', $runner['failedStages'] ) )
+					: array(),
+				'contendedStages'               => isset( $runner['contendedStages'] ) && is_array( $runner['contendedStages'] )
+					? array_values( array_map( 'sanitize_key', $runner['contendedStages'] ) )
 					: array(),
 				'priorityScheduler'             => array(
 					'webhookPressure'    => ! empty( $scheduler['webhookPressure'] ),
@@ -589,7 +629,8 @@ class Mobo_Core_Cron_Runner {
 			'configuredLockTtlSeconds'        => absint( $config['configuredLockTtlSeconds'] ),
 			'effectiveLockTtlSeconds'         => absint( $config['lockTtlSeconds'] ),
 			'longestBlockingTimeoutSeconds'   => absint( $config['longestBlockingTimeout'] ),
-			'failedStages'                    => array_values( array_keys( $disabled_stages ) ),
+			'failedStages'                    => array_values( array_keys( array_filter( $disabled_stages, static function ( $reason ) { return 'contended' !== $reason; } ) ) ),
+			'contendedStages'                 => isset( $aggregate['contendedStages'] ) ? array_values( array_unique( array_map( 'sanitize_key', $aggregate['contendedStages'] ) ) ) : array(),
 			'queuePasses'                     => $aggregate['queuePasses'],
 			'adaptiveTuning'                  => isset( $config['adaptiveTuning'] ) && is_array( $config['adaptiveTuning'] ) ? $config['adaptiveTuning'] : array(),
 			'adaptiveBudget'                  => isset( $config['adaptiveBudget'] ) && is_array( $config['adaptiveBudget'] ) ? $config['adaptiveBudget'] : array(),
@@ -830,27 +871,56 @@ class Mobo_Core_Cron_Runner {
 			$round['queuePasses']['recategorizeQueue']++;
 		}
 
-		/* Product image queue. */
+		/* Product image queue + bounded stale-media prune queue. */
 		$image_sync             = null;
 		$base_image_limit       = max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
 		$configured_image_limit = isset( $config['adaptiveTuning']['limits']['imageQueue'] )
 			? max( 1, min( 10, absint( $config['adaptiveTuning']['limits']['imageQueue'] ) ) )
 			: $base_image_limit;
 		$image_limit            = $configured_image_limit;
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ) && class_exists( 'Mobo_Core_Image_Sync' ) && ! isset( $disabled_stages['imageQueue'] ) && $allow_image_queue && ! $this->stage_circuit_open( $config, 'imageQueue' ) && empty( $round['parentFinalize']['remainingDue'] ) ) {
+		$image_import_enabled   = Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ) && class_exists( 'Mobo_Core_Image_Sync' );
+		$prune_due              = false;
+		if ( class_exists( 'Mobo_Core_Image_Prune_Queue' ) && Mobo_Core_Image_Prune_Queue::table_exists() ) {
+			try {
+				$prune_probe = new Mobo_Core_Image_Prune_Queue();
+				$prune_due   = $prune_probe->has_due_work();
+			} catch ( Throwable $e ) {
+				$prune_due = false;
+			}
+		}
+
+		$image_circuit_open = $this->stage_circuit_open( $config, 'imageQueue' );
+		if ( ( $prune_due || ( $image_import_enabled && ! $image_circuit_open ) ) && ! isset( $disabled_stages['imageQueue'] ) && $allow_image_queue && empty( $round['parentFinalize']['remainingDue'] ) ) {
 			if ( ! $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
 				return $round;
 			}
 
 			$image_remaining = max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) );
 			$image_budget    = min( $image_remaining, $this->stage_budget_seconds( $config, 'imageQueue', 6, 1, 12 ) );
-			$image_limit = $webhook_due_pressure ? 1 : ( $image_budget < 3 ? 1 : ( $image_budget < 6 ? min( 2, $configured_image_limit ) : $configured_image_limit ) );
-			$image_limit = $this->stage_capacity_limit( $config, 'imageQueue', $image_limit );
-			$image_sync = new Mobo_Core_Image_Sync();
+			$image_limit     = $webhook_due_pressure ? 1 : ( $image_budget < 3 ? 1 : ( $image_budget < 6 ? min( 2, $configured_image_limit ) : $configured_image_limit ) );
+			$image_limit     = $this->stage_capacity_limit( $config, 'imageQueue', $image_limit );
+			$image_sync      = $image_import_enabled ? new Mobo_Core_Image_Sync() : null;
+
 			$round['imageQueue'] = $this->execute_stage(
 				'imageQueue',
-				function () use ( $image_sync, $image_limit ) {
-					return $image_sync->process_queue( $image_limit );
+				function () use ( $image_sync, $image_import_enabled, $image_circuit_open, $image_limit, $image_budget ) {
+					$result = array( 'processed' => 0, 'failed' => 0, 'status' => 'empty', 'remaining' => false );
+					if ( $image_import_enabled && ! $image_circuit_open && $image_sync instanceof Mobo_Core_Image_Sync ) {
+						$result = $image_sync->process_queue( $image_limit );
+						$result = is_array( $result ) ? $result : array( 'processed' => 0, 'failed' => 1, 'status' => 'invalid-result', 'remaining' => true );
+					}
+					if ( class_exists( 'Mobo_Core_Image_Prune_Queue' ) && Mobo_Core_Image_Prune_Queue::table_exists() ) {
+						$prune = new Mobo_Core_Image_Prune_Queue();
+						$prune_result = $prune->process_due( max( 1, min( 3, $image_limit ) ), max( 1, min( 4, $image_budget ) ) );
+						$result['prune']     = $prune_result;
+						$result['processed'] = absint( isset( $result['processed'] ) ? $result['processed'] : 0 ) + absint( isset( $prune_result['processed'] ) ? $prune_result['processed'] : 0 );
+						$result['failed']    = absint( isset( $result['failed'] ) ? $result['failed'] : 0 ) + absint( isset( $prune_result['failed'] ) ? $prune_result['failed'] : 0 );
+						$result['remaining'] = ! empty( $result['remaining'] ) || ! empty( $prune_result['remaining'] );
+						if ( 'empty' === sanitize_key( (string) ( isset( $result['status'] ) ? $result['status'] : '' ) ) && 'empty' !== sanitize_key( (string) ( isset( $prune_result['status'] ) ? $prune_result['status'] : '' ) ) ) {
+							$result['status'] = sanitize_key( (string) $prune_result['status'] );
+						}
+					}
+					return $result;
 				},
 				array( 'processed' => 0, 'failed' => 1, 'status' => 'exception', 'remaining' => true ),
 				$disabled_stages,
@@ -924,8 +994,25 @@ class Mobo_Core_Cron_Runner {
 					$step_started_at = microtime( true );
 					try {
 						$round['lastStep'] = $product_sync->run_manual_sync_step();
-						$steps++;
 						$status = $product_sync->get_manual_sync_status();
+
+						/* Lock contention is not a processed product step and must never hot-loop.
+						 * Defer Product Sync for the rest of this runner invocation; the next real
+						 * cron tick can retry after the canonical manual_sync lease changes. */
+						if ( ! empty( $round['lastStep']['data']['locked'] ) ) {
+							$disabled_stages['productSync'] = 'contended';
+							$round['contendedStages'][]      = 'productSync';
+							if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+								Mobo_Core_Runtime_Diagnostics::record_stage(
+									'productSync',
+									max( 0, (int) round( ( microtime( true ) - $step_started_at ) * 1000 ) ),
+									array( 'processed' => 0, 'failed' => 0, 'status' => 'contended' )
+								);
+							}
+							break;
+						}
+
+						$steps++;
 						if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 							Mobo_Core_Runtime_Diagnostics::record_stage(
 								'productSync',
@@ -1144,6 +1231,7 @@ class Mobo_Core_Cron_Runner {
 			'productStatus'          => array(),
 			'lastStep'               => null,
 			'runnerErrors'           => array(),
+			'contendedStages'        => array(),
 			'queuePasses'            => array(
 				'webhookQueue'      => 0,
 				'parentFinalize'    => 0,
@@ -1249,6 +1337,23 @@ class Mobo_Core_Cron_Runner {
 				$image_due     = 0;
 			}
 		}
+		/* Physical stale-media cleanup is independent from remote image downloading.
+		 * A disabled image import queue must not strand durable prune debt forever. */
+		if ( class_exists( 'Mobo_Core_Image_Prune_Queue' ) && Mobo_Core_Image_Prune_Queue::table_exists() ) {
+			try {
+				$prune_store   = new Mobo_Core_Image_Prune_Queue();
+				$prune_summary = $prune_store->get_summary();
+				$prune_pending = absint( isset( $prune_summary['pending'] ) ? $prune_summary['pending'] : 0 );
+				$prune_due     = absint( isset( $prune_summary['due'] ) ? $prune_summary['due'] : 0 );
+				if ( $prune_store->has_due_work() && 0 === $prune_due ) {
+					$prune_due = 1; /* Legacy seed debt. */
+				}
+				$image_pending += $prune_pending;
+				$image_due     += $prune_due;
+			} catch ( Throwable $e ) {
+				/* Fail open for the scheduler; schema migration will retry separately. */
+			}
+		}
 		$snapshot['imageQueue'] = array( 'active' => $image_due > 0 || $image_pending > 0, 'backlog' => max( $image_due, $image_pending ) );
 
 		$sync_state = get_option( 'mobo_core_sync_state', array() );
@@ -1321,10 +1426,21 @@ class Mobo_Core_Cron_Runner {
 			$active['parentFinalize'] = true;
 			$active['imageQueue']     = true;
 		}
-		if ( ! empty( $snapshot['productSync']['active'] ) && Mobo_Core_Settings::enabled( 'mobo_core_image_queue_enabled', '1' ) ) {
-			/* Product sync may enqueue images later in this same round. Reserve a fair
-			 * slot so the late image pass can consume them without a fresh COUNT query. */
+		if ( ! empty( $snapshot['productSync']['active'] ) ) {
+			/* Product sync can enqueue either remote image work or local prune debt later
+			 * in this invocation. Reserve the image-family slot independent of whether
+			 * remote image downloading itself is enabled. */
 			$active['imageQueue'] = true;
+		}
+		if ( class_exists( 'Mobo_Core_Image_Prune_Queue' ) && Mobo_Core_Image_Prune_Queue::table_exists() ) {
+			try {
+				$prune_probe = new Mobo_Core_Image_Prune_Queue();
+				if ( $prune_probe->has_due_work() ) {
+					$active['imageQueue'] = true;
+				}
+			} catch ( Throwable $e ) {
+				/* Keep scheduler state from failing because optional cleanup diagnostics failed. */
+			}
 		}
 		if ( $this->option_queue_has_items( 'mobo_core_parent_finalize_queue' ) ) {
 			$active['parentFinalize'] = true;
@@ -1617,6 +1733,10 @@ class Mobo_Core_Cron_Runner {
 
 		if ( ! empty( $round['stageErrors'] ) && is_array( $round['stageErrors'] ) ) {
 			$aggregate['runnerErrors'] = array_slice( array_merge( $aggregate['runnerErrors'], $round['stageErrors'] ), -20 );
+		}
+
+		if ( ! empty( $round['contendedStages'] ) && is_array( $round['contendedStages'] ) ) {
+			$aggregate['contendedStages'] = array_values( array_unique( array_merge( $aggregate['contendedStages'], array_map( 'sanitize_key', $round['contendedStages'] ) ) ) );
 		}
 
 		foreach ( $aggregate['queuePasses'] as $key => $count ) {

@@ -40,6 +40,23 @@ final class Mobo_Core_Fair_Scheduler {
 			}
 			$stat = isset( $scheduler_stats[ $stage ] ) && is_array( $scheduler_stats[ $stage ] ) ? $scheduler_stats[ $stage ] : array();
 			$last = absint( isset( $stat['lastSelectedAt'] ) ? $stat['lastSelectedAt'] : 0 );
+
+			/*
+			 * A newly-started explicit admin queue may have no scheduler history yet.
+			 * Treating lastSelectedAt=0 as age=0 forever made the documented hard
+			 * starvation escape unreachable while sustained webhook pressure kept the
+			 * stage deferred. Anchor never-selected Reprice/Recategorize jobs to their
+			 * durable generation start time instead. Once selected, lastSelectedAt
+			 * becomes the normal fairness anchor again.
+			 */
+			if ( $last <= 0 && in_array( $stage, array( 'repriceQueue', 'recategorizeQueue' ), true ) ) {
+				$state_option = 'repriceQueue' === $stage ? 'mobo_core_reprice_state' : 'mobo_core_recategorize_state';
+				$admin_state  = get_option( $state_option, array() );
+				if ( is_array( $admin_state ) && 'running' === sanitize_key( (string) ( isset( $admin_state['status'] ) ? $admin_state['status'] : '' ) ) ) {
+					$last = absint( isset( $admin_state['startedAt'] ) ? $admin_state['startedAt'] : 0 );
+				}
+			}
+
 			$age  = $last > 0 ? max( 0, $now - $last ) : 0;
 			$score = absint( isset( $weights[ $stage ] ) ? $weights[ $stage ] : 20 );
 			$score += (int) floor( absint( isset( $pressure[ $stage ] ) ? $pressure[ $stage ] : 0 ) / 4 );

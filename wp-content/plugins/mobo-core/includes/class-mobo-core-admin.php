@@ -24,6 +24,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
 		add_action( 'admin_head-edit.php', array( $this, 'render_product_list_badge_styles' ) );
 		add_action( 'admin_footer-edit.php', array( $this, 'render_product_pricing_override_modal' ) );
+		add_action( 'restrict_manage_posts', array( $this, 'render_mobo_product_source_filter' ), 30, 2 );
+		add_filter( 'posts_where', array( $this, 'filter_product_list_where' ), 20, 2 );
 		add_filter( 'display_post_states', array( $this, 'add_mobo_product_post_state' ), 10, 2 );
 		add_filter( 'post_row_actions', array( $this, 'add_mobo_product_pricing_row_action' ), 20, 2 );
 		add_action( 'wp_ajax_mobo_core_save_product_pricing_override', array( $this, 'handle_ajax_save_product_pricing_override' ) );
@@ -186,6 +188,102 @@ class Mobo_Core_Admin {
 	}
 
 
+
+	/**
+	 * Render the Mobo ownership filter on the WooCommerce Products list.
+	 *
+	 * Default/empty means all products. The classification is backed by the
+	 * shared durable identity policy rather than by one legacy meta key.
+	 *
+	 * @param string $post_type Current post type.
+	 * @param string $which     Tablenav position.
+	 * @return void
+	 */
+	public function render_mobo_product_source_filter( $post_type, $which = 'top' ) {
+		if ( 'product' !== $post_type || 'top' !== $which ) {
+			return;
+		}
+
+		$selected = $this->get_product_source_filter_value();
+		?>
+		<label class="screen-reader-text" for="mobo-core-product-source-filter">فیلتر محصولات بر اساس منبع موبو</label>
+		<select name="mobo_core_product_source" id="mobo-core-product-source-filter">
+			<option value="" <?php selected( '', $selected ); ?>>همه محصولات</option>
+			<option value="mobo" <?php selected( 'mobo', $selected ); ?>>محصولات موبویی</option>
+			<option value="non_mobo" <?php selected( 'non_mobo', $selected ); ?>>محصولات غیر موبویی</option>
+		</select>
+		<?php
+	}
+
+	/**
+	 * Restrict the main WooCommerce product-list query by durable Mobo identity.
+	 *
+	 * A correlated EXISTS keeps the normal WooCommerce query shape intact and
+	 * avoids JOIN duplication when an object has more than one identity meta row.
+	 *
+	 * @param string   $where Existing WHERE SQL.
+	 * @param WP_Query $query Query object.
+	 * @return string
+	 */
+	public function filter_product_list_where( $where, $query ) {
+		if ( ! is_admin() || ! $query instanceof WP_Query || ! $query->is_main_query() ) {
+			return $where;
+		}
+
+		$post_type = $query->get( 'post_type' );
+		if ( 'product' !== $post_type ) {
+			return $where;
+		}
+
+		$filter = $this->get_product_source_filter_value();
+		if ( ! in_array( $filter, array( 'mobo', 'non_mobo' ), true ) || ! class_exists( 'Mobo_Core_Product_Identity_Policy' ) ) {
+			return $where;
+		}
+
+		global $wpdb;
+
+		$numeric_keys = Mobo_Core_Product_Identity_Policy::numeric_identity_meta_keys();
+		$string_keys  = array_values(
+			array_diff(
+				Mobo_Core_Product_Identity_Policy::identity_meta_keys(),
+				$numeric_keys
+			)
+		);
+
+		$identity_parts = array();
+		$prepare_values = array();
+
+		if ( ! empty( $string_keys ) ) {
+			$identity_parts[] = '(mobo_identity_pm.meta_key IN (' . implode( ', ', array_fill( 0, count( $string_keys ), '%s' ) ) . ") AND TRIM(COALESCE(mobo_identity_pm.meta_value, '')) <> '')";
+			$prepare_values  = array_merge( $prepare_values, $string_keys );
+		}
+
+		if ( ! empty( $numeric_keys ) ) {
+			$identity_parts[] = '(mobo_identity_pm.meta_key IN (' . implode( ', ', array_fill( 0, count( $numeric_keys ), '%s' ) ) . ') AND CAST(mobo_identity_pm.meta_value AS UNSIGNED) > 0)';
+			$prepare_values  = array_merge( $prepare_values, $numeric_keys );
+		}
+
+		if ( empty( $identity_parts ) ) {
+			return $where;
+		}
+
+		$identity_predicate = $wpdb->prepare( implode( ' OR ', $identity_parts ), $prepare_values );
+		$exists_sql         = "EXISTS (SELECT 1 FROM {$wpdb->postmeta} AS mobo_identity_pm WHERE mobo_identity_pm.post_id = {$wpdb->posts}.ID AND ({$identity_predicate}))";
+
+		$where .= ' AND ' . ( 'mobo' === $filter ? $exists_sql : 'NOT ' . $exists_sql );
+		return $where;
+	}
+
+	/**
+	 * Read and normalize the current Products-list Mobo filter.
+	 *
+	 * @return string
+	 */
+	private function get_product_source_filter_value() {
+		$value = isset( $_GET['mobo_core_product_source'] ) ? sanitize_key( wp_unslash( $_GET['mobo_core_product_source'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only admin list filtering.
+		return in_array( $value, array( 'mobo', 'non_mobo' ), true ) ? $value : '';
+	}
+
 	/**
 	 * Add a clear Mobo marker beside product names in WooCommerce product list.
 	 *
@@ -198,8 +296,7 @@ class Mobo_Core_Admin {
 			return $post_states;
 		}
 
-		$product_guid = trim( (string) get_post_meta( $post->ID, 'product_guid', true ) );
-		if ( '' === $product_guid ) {
+		if ( ! class_exists( 'Mobo_Core_Product_Identity_Policy' ) || ! Mobo_Core_Product_Identity_Policy::is_mobo_object_id( $post->ID ) ) {
 			return $post_states;
 		}
 
@@ -6473,12 +6570,25 @@ type:{mobo_order_type_label}</textarea>
 			? Mobo_Core_Self_Runner::claim_worker_request( '' )
 			: array( 'success' => true, 'token' => '' );
 		if ( empty( $claim['success'] ) ) {
-			return array(
+			$result = array(
 				'success'    => false,
 				'status'     => isset( $claim['status'] ) ? sanitize_key( (string) $claim['status'] ) : 'dispatcher-locked',
 				'httpStatus' => isset( $claim['httpStatus'] ) ? absint( $claim['httpStatus'] ) : 423,
 				'message'    => 'یک Worker دیگر موبو در این سایت در حال اجرا است.',
+				'source'     => sanitize_key( (string) $source ),
+				'executedAt' => time(),
+				'runner'     => array(
+					'pluginVersion'  => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
+					'stopReason'     => 'dispatcher-locked',
+					'madeProgress'   => false,
+					'contendedStages'=> array( 'workerDispatcher' ),
+				),
 			);
+			/* A rejected manual attempt is still the latest cron attempt. Persist it so
+			 * diagnostics never keep showing a successful result from an older plugin. */
+			update_option( 'mobo_core_real_cron_last_hit_at', time(), false );
+			update_option( 'mobo_core_real_cron_last_result', $result, false );
+			return $result;
 		}
 
 		$token  = isset( $claim['token'] ) ? (string) $claim['token'] : '';
@@ -6779,10 +6889,22 @@ type:{mobo_order_type_label}</textarea>
 			if ( $is_stale ) {
 				$admin_fallback['attempted'] = true;
 				$admin_fallback['stopReason'] = 'step-limit';
-				$max_steps = ! empty( $status['repairMode'] ) ? 4 : 3;
-				$deadline  = microtime( true ) + ( ! empty( $status['repairMode'] ) ? 2.25 : 1.50 );
 
-				while ( $admin_fallback['steps'] < $max_steps && microtime( true ) < $deadline ) {
+				/* The browser fallback is a real worker too. Claim the same site-wide
+				 * dispatcher used by REST, heartbeat, Self Runner and Real Cron before
+				 * entering manual_sync. This prevents the admin poll from racing cron. */
+				$dispatcher_claim = class_exists( 'Mobo_Core_Self_Runner' )
+					? Mobo_Core_Self_Runner::claim_worker_request( '' )
+					: array( 'success' => true, 'token' => '' );
+				if ( empty( $dispatcher_claim['success'] ) ) {
+					$admin_fallback['stopReason'] = 'dispatcher-locked';
+				} else {
+					$dispatcher_token = isset( $dispatcher_claim['token'] ) ? (string) $dispatcher_claim['token'] : '';
+					$max_steps = ! empty( $status['repairMode'] ) ? 4 : 3;
+					$deadline  = microtime( true ) + ( ! empty( $status['repairMode'] ) ? 2.25 : 1.50 );
+
+					try {
+					while ( $admin_fallback['steps'] < $max_steps && microtime( true ) < $deadline ) {
 					/* Foreground Webhook freshness always wins over Repair catch-up. */
 					if ( class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
 						$priority_queue = new Mobo_Core_Webhook_Queue();
@@ -6822,6 +6944,12 @@ type:{mobo_order_type_label}</textarea>
 					if ( microtime( true ) >= $deadline ) {
 						$admin_fallback['stopReason'] = 'time-budget';
 						break;
+					}
+					}
+					} finally {
+						if ( '' !== $dispatcher_token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+							Mobo_Core_Self_Runner::release_worker_request( $dispatcher_token );
+						}
 					}
 				}
 			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
@@ -6931,6 +7059,27 @@ type:{mobo_order_type_label}</textarea>
 
 		$queue  = new Mobo_Core_Reprice_Queue();
 		$status = $queue->get_status();
+
+		/*
+		 * A non-blocking loopback can report dispatched even when the hosting stack
+		 * never executes the request. Reprice is an explicit finite admin job, so a
+		 * stale authenticated status poll may advance one tiny bounded batch itself.
+		 * process_batch() still owns the global Reprice worker lease and product-level
+		 * concurrency locks, so this cannot race a live Cron/Self Runner worker.
+		 */
+		if ( ! empty( $status['shouldContinue'] ) && empty( $status['lastError'] ) ) {
+			$updated_at = isset( $status['updatedAt'] ) ? absint( $status['updatedAt'] ) : 0;
+			$is_stale   = $updated_at > 0 && ( time() - $updated_at ) >= 8;
+
+			if ( $is_stale ) {
+				$rescue_result = $queue->process_batch( 1, 2 );
+				$status        = $queue->get_status();
+				$status['adminRescue'] = array(
+					'status'    => isset( $rescue_result['status'] ) ? sanitize_key( (string) $rescue_result['status'] ) : '',
+					'processed' => isset( $rescue_result['processed'] ) ? absint( $rescue_result['processed'] ) : 0,
+				);
+			}
+		}
 
 		if ( ! empty( $status['shouldContinue'] ) && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::kick( 'admin-reprice-status', false );

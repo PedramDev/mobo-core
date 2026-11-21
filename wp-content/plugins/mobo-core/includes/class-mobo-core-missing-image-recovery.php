@@ -337,7 +337,7 @@ class Mobo_Core_Missing_Image_Recovery {
 		if ( is_wp_error( $image_integrity ) ) {
 			return $image_integrity;
 		}
-		$images = $image_field['value'];
+		$images = Mobo_Core_Image_Desired_State_Policy::ordered_collection( $image_field['value'] );
 
 		if ( empty( $images ) ) {
 			return array(

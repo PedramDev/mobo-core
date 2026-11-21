@@ -7,7 +7,7 @@ Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.54
+Stable tag: 10.33.67
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -144,6 +144,84 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.33.67 =
+* Added a WooCommerce Products-list filter with three states: all products (default), Mobo products, and non-Mobo products.
+* Mobo/non-Mobo filtering uses the shared durable product identity policy, including legacy/Portal identity aliases, instead of relying only on `product_guid`.
+* The existing Products-list Mobo badge now uses the same identity policy so the visual marker and the filter cannot disagree.
+* No schema migration, Repair, reset, or manual SQL is required.
+
+= 10.33.66 =
+* Fixed ProductUpdated handoff for a currently-Simple product whose source ProductUpdated payload is variation-capable and whose authoritative Variant lookup spans additional pages.
+* Additional Variant pages now prove “not safely Simple”; ProductUpdated returns its normal terminal checkpoint while preserving `mobo_sync_incomplete=1`, allowing UpdateVariant to perform the authoritative Simple-to-Variable transition.
+* Transport/schema failures in the Variant probe still defer/fail closed. Only the explicit pagination-ambiguity condition is treated as evidence that the product must continue through UpdateVariant.
+* Retains the 10.33.65 WooCommerce wildcard/slug Sync Health fix and the one/no-selection Variant Simple completion fix.
+
+= 10.33.65 =
+* Fixed Sync Health variable-structure validation to use WooCommerce attribute slugs when available and to accept empty Variation attribute values as WooCommerce wildcard/“Any” semantics.
+* Fixed ProductUpdated completion for a WC_Product_Simple that carries product attributes: Mobo now probes the authoritative Variant endpoint and completes the Simple product when the source proves one no-selection purchasable Variant (or authoritative zero-Variant state), instead of leaving `mobo_sync_incomplete=1` solely because product attributes exist.
+* Variable candidates remain fail-closed/incomplete until UpdateVariant convergence when the Variant snapshot is ambiguous or contains selection attributes.
+* Added postcondition-safe compatibility fallbacks for older WooCommerce API generations; no exact WooCommerce version pin is required by these fixes.
+
+= 10.33.64 =
+* Compare-price safety: auto-compare only creates a WooCommerce sale pair when source comparePrice is strictly greater than source price. Equal/lower comparePrice is treated as no-sale, preventing impossible sale >= regular states.
+* Final compatibility-filter output is validated against WooCommerce's sale invariant and fails closed if a filter produces sale >= regular.
+* Reprice now requests variable-parent price sync for every successfully processed variation, even when that child required no price mutation, so stale parent child-derived `_price` sets converge during a full Reprice pass.
+* Variable-parent singleton-collapse protection from 10.33.63 remains unchanged.
+* No schema migration, Full Repair, reset, or manual SQL is required.
+
+= 10.33.63 =
+* Woo variable-parent price safety: Repair and the shared singleton price-meta helper no longer classify variable-parent `_price` rows as duplicate singleton corruption.
+* Variable-parent prices remain owned by WooCommerce's child-derived sync semantics (`WC_Product_Variable::sync()`), which intentionally stores one `_price` row per distinct visible variation price.
+* Reprice behavior for purchasable simple products and variations is unchanged.
+* No schema migration, Full Repair, reset, or manual SQL is required.
+
+= 10.33.62 =
+* Price metadata integrity: Reprice collapses duplicate `_price`, `_regular_price`, and `_sale_price` rows to the current pricing-policy result while holding the existing product lock.
+* Repair price-meta cleanup no longer trusts a WooCommerce object whose current price may already be poisoned by duplicate meta; it derives the canonical value from stored Mobo API price + the current Mobo pricing policy for purchasable Mobo objects.
+* Added a shared verified singleton helper for duplicate WooCommerce price metadata.
+* No schema migration, Full Repair, reset, or manual SQL is required.
+
+= 10.33.61 =
+* Image prune safety: the durable stale-image cleanup queue now refuses final attachment deletion when a non-empty attached-file path is outside WordPress uploads or resolves outside uploads through traversal/symlink boundaries.
+* Missing-file cleanup remains supported: stale attachment database rows can still be removed when their registered path is safely rooted under uploads but the physical file is already gone.
+* No Reprice, pricing formula, webhook priority, queue schema, product identity, or Repair cursor behavior changed.
+
+= 10.33.60 =
+* Runtime-lock hygiene: each real Cron Runner slice safely scans Mobo runtime leases and compare-deletes only leases that are provably malformed or expired; live leases are preserved.
+* Diagnostics: the runner result exposes bounded stale-lock recovery counts (`scanned`, `recovered`, `active`, `raced`) without lock tokens or payload secrets.
+* Reprice liveness behavior from 10.33.59 is unchanged; this release only hardens cleanup of stale product/runtime lock residue after interrupted requests.
+
+= 10.33.59 =
+* Reprice liveness: a never-selected administrator Reprice/Recategorize generation now uses its durable `startedAt` as the starvation-age anchor, so sustained webhook pressure cannot keep `lastSelectedAt=0` queues deferred forever.
+* Reprice admin rescue: the authenticated Pricing status poll advances one bounded Reprice item after eight seconds without a checkpoint, while retaining the existing queue worker lease and product-level concurrency locks.
+* No pricing formula, product identity, webhook priority, batch checkpoint, or database schema behavior changed.
+
+= 10.33.58 =
+* Repair image cleanup: stale Mobo attachments are detached and durably queued; physical deletion and reference proof no longer run inside the Product/Repair manual_sync lock.
+* GUID-first deletion policy: image_guid/img_guid are the destructive ownership identity, conflicting/invalid/missing identities fail closed, and mobo_source_url alone never authorizes deletion.
+* Bounded cleanup: legacy and current prune debt is processed in two resumable primary-key proof passes by the Image worker instead of unbounded wildcard scans across wp_postmeta/wp_options/wp_posts.
+* Concurrency: admin Repair fallback now claims the site-wide worker dispatcher; Product Sync lock contention is deferred for the invocation instead of busy-spinning and is reported separately from failures. Prune debt can still drain when remote Image Queue processing is disabled or circuit-open.
+* Diagnostics: rejected Manual Cron dispatcher claims are persisted as the latest attempt instead of leaving stale results from an older plugin version.
+* Progress: non-terminal Repair accounts for the current product and local product queue, so it cannot report 100% / 0 remaining before completion.
+
+= 10.33.57 =
+* Repair upgrade recovery: a legacy Repair checkpoint stopped by the known Simple→Variable durable-save failure is preserved but rewound to variant page/cursor zero for the current product, then allowed to continue under the new product-type policy.
+* Cursor durability: `currentVariantCursor` advances only after the fetched authoritative Variant page is successfully applied, preventing a failed page from being skipped after retry or upgrade.
+* Scope safety: unrelated Variant validation failures remain fail-closed and are not auto-retried by this migration.
+
+
+= 10.33.56 =
+* Image desired-state ordering is explicit and durable: positioned Portal payloads are validated and sorted by position before queueing, hashing, featured-image selection, and gallery reconciliation.
+* Backward compatible with older Portal payloads that provide only array order.
+
+
+= 10.33.55 =
+* Fix: route Simple↔Variable product-type changes through WooCommerce CRUD instead of pre-writing the product_type taxonomy.
+* Durability: verify raw taxonomy, WooCommerce factory type, and fresh product class before acknowledging a type transition.
+* Safety: make the existing Variable→Simple variation-preservation filter run around the real WooCommerce type-change hook; Mobo-owned retirement remains quarantine/Trash based and manual Variations remain preserved.
+* Policy: align the internal Desired-State topology document with current delta-vs-authoritative Variant semantics and Repair/lifecycle boundaries.
+* Package: remove historical PHP backup source files from the distributable artifact.
 
 = 10.33.54 =
 * Fix: remove retired Health and Sync Health WP-Cron events even when legacy schedules carry non-empty arguments.

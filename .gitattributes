@@ -1,0 +1,2 @@
+# Keep MoboCore plugin files byte-exact: the plugin verifies its own files against mobo-core-manifest.json (sha256).
+wp-content/plugins/mobo-core/** -text

@@ -511,8 +511,20 @@ class Mobo_Core_Product_Sync {
 			$remaining = 0;
 			$progress  = 100;
 		} else {
-			$remaining = $total > 0 ? max( 0, $total - $processed ) : 0;
-			$progress  = $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
+			/* A fetched parent is counted before its image/variant sub-steps finish, and
+			 * productQueue can still hold authoritative snapshots after Portal says
+			 * hasMore=false. Never expose terminal-looking 100%/0 while either exists. */
+			$queued_products = is_array( $state['productQueue'] ) ? count( $state['productQueue'] ) : 0;
+			$current_product = '' !== trim( (string) $state['currentProductGuid'] ) ? 1 : 0;
+			$local_remaining = $queued_products + $current_product;
+			$remote_remaining = $total > $processed ? $total - $processed : 0;
+			$remaining = max( $local_remaining, $remote_remaining );
+			$effective_total = max( $total, $processed + $remaining );
+			$total = $effective_total;
+			$progress = $effective_total > 0 ? round( ( $processed / $effective_total ) * 100, 2 ) : 0;
+			if ( $progress >= 100 ) {
+				$progress = 99.99;
+			}
 		}
 
 		$next_retry_at   = absint( $state['nextRetryAt'] ?? 0 );
@@ -1414,9 +1426,8 @@ class Mobo_Core_Product_Sync {
 			$error = new WP_Error( 'mobo_core_variants_cursor_stalled', 'Variant cursor did not advance while hasMore=true.' );
 			return $this->handle_transient_request_error( $state, $error, 'صفحه‌بندی تنوع‌های MoboCore متوقف شد.' );
 		}
-		if ( '' !== $variant_cursor_mode && null !== $variant_next_cursor && '' !== $variant_next_cursor ) {
-			$state['currentVariantCursor'] = absint( $variant_next_cursor );
-		}
+		/* Do not checkpoint nextCursor until this fetched page is durably applied.
+		 * Otherwise a failed page can be skipped after retry/upgrade. */
 
 		$variant_source_version  = $this->extract_source_version( $response, $response );
 		$variant_source_revision = $this->extract_source_revision( $response, $response );
@@ -1447,6 +1458,10 @@ class Mobo_Core_Product_Sync {
 			}
 
 			return $this->result( false, $state['lastError'], $this->get_manual_sync_status() );
+		}
+
+		if ( '' !== $variant_cursor_mode && null !== $variant_next_cursor && '' !== $variant_next_cursor ) {
+			$state['currentVariantCursor'] = absint( $variant_next_cursor );
 		}
 
 		$state['currentVariantProcessedPages'] = absint( $state['currentVariantProcessedPages'] ) + 1;
@@ -2016,26 +2031,110 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		/* ProductUpdated must leave a simple product immediately purchasable. */
-		if ( ! $this->product_payload_can_have_variants( $product_data, $product_id ) ) {
-			$api            = new Mobo_Core_API_Client();
-			$simple_variant = $this->sync_simple_product_variant_from_api( $api, $product_guid, $product_id, 'product-updated-' . gmdate( 'YmdHis' ) );
+		/*
+		 * Product attributes alone are not proof that the storefront topology is
+		 * variable. A WC_Product_Simple can legitimately carry descriptive/product
+		 * attributes while its source topology contains exactly one purchasable
+		 * Variant with no selection attributes.
+		 *
+		 * When the current Woo object is Simple, probe the authoritative Variant
+		 * endpoint even if ProductUpdated carries attributes. A mapped no-selection
+		 * Variant (or authoritative zero-Variant state) proves Simple topology and
+		 * can complete immediately. Ambiguous/selection-attribute snapshots remain
+		 * incomplete and are left for UpdateVariant to converge.
+		 */
+		$payload_can_have_variants = $this->product_payload_can_have_variants( $product_data, $product_id );
+		$current_product_for_topology = wc_get_product( $product_id );
+		$should_probe_simple_topology = ! $payload_can_have_variants || $current_product_for_topology instanceof WC_Product_Simple;
 
-			if ( is_wp_error( $simple_variant ) ) {
+		if ( $should_probe_simple_topology ) {
+			$api             = new Mobo_Core_API_Client();
+			$simple_snapshot = $this->fetch_simple_product_variant_snapshot_from_api(
+				$api,
+				$product_guid,
+				$product_id,
+				'product-updated-' . gmdate( 'YmdHis' )
+			);
+
+			if ( is_wp_error( $simple_snapshot ) ) {
+				$probe_error_code = sanitize_key( (string) $simple_snapshot->get_error_code() );
+
+				if ( $payload_can_have_variants && 'mobo_core_simple_variant_pagination_ambiguous' === $probe_error_code ) {
+					/*
+					 * Additional authoritative Variant pages are not a transient
+					 * Simple lookup failure. They prove that selecting one Variant
+					 * for the Simple parent would be unsafe. Preserve the incomplete
+					 * marker and let the normal UpdateVariant snapshot perform the
+					 * Simple-to-Variable convergence.
+					 */
+					$simple_snapshot = array(
+						'mode'    => 'variable_handoff',
+						'message' => $simple_snapshot->get_error_message(),
+					);
+				} else {
+					return $this->result(
+						true,
+						'ProductUpdated منتظر دریافت topology قابل اتکای Variant است.',
+						array(
+							'deleteFile'   => false,
+							'deferSeconds' => 60,
+							'productId'    => $product_id,
+							'error'        => $simple_snapshot->get_error_message(),
+						)
+					);
+				}
+			}
+
+			$snapshot_mode = sanitize_key( (string) ( isset( $simple_snapshot['mode'] ) ? $simple_snapshot['mode'] : '' ) );
+			$snapshot_variant = isset( $simple_snapshot['variant'] ) && is_array( $simple_snapshot['variant'] )
+				? $simple_snapshot['variant']
+				: array();
+			$simple_topology_proven = 'authoritative_missing' === $snapshot_mode
+				|| ( 'mapped' === $snapshot_mode && ! $this->variant_has_selection_attributes( $snapshot_variant ) );
+
+			if ( $simple_topology_proven ) {
+				$simple_variant = $this->apply_simple_product_variant_snapshot(
+					$product_id,
+					$product_guid,
+					$simple_snapshot
+				);
+
+				if ( is_wp_error( $simple_variant ) ) {
+					return $this->result(
+						true,
+						'ProductUpdated منتظر commit امن topology محصول ساده است.',
+						array(
+							'deleteFile'   => false,
+							'deferSeconds' => 60,
+							'productId'    => $product_id,
+							'error'        => $simple_variant->get_error_message(),
+						)
+					);
+				}
+
+				$payload_can_have_variants = false;
+			} elseif ( ! $payload_can_have_variants ) {
+				/*
+				 * A payload that itself proves no variation attributes but receives
+				 * an ambiguous Variant snapshot cannot be acknowledged complete.
+				 * Preserve the previous fail-closed retry behavior.
+				 */
+				$message = isset( $simple_snapshot['message'] )
+					? sanitize_text_field( (string) $simple_snapshot['message'] )
+					: 'Simple product Variant snapshot is ambiguous.';
 				return $this->result(
 					true,
-					'ProductUpdated منتظر دریافت شناسه قابل خرید محصول ساده است.',
+					'ProductUpdated منتظر رفع ابهام topology محصول ساده است.',
 					array(
 						'deleteFile'   => false,
 						'deferSeconds' => 60,
 						'productId'    => $product_id,
-						'error'        => $simple_variant->get_error_message(),
+						'error'        => $message,
 					)
 				);
 			}
 		}
 
-		$payload_can_have_variants = $this->product_payload_can_have_variants( $product_data, $product_id );
 		$preserve_variable_completion = $payload_can_have_variants
 			&& $this->variable_completion_already_covers_product_update( $product_id, $source_version, $source_revision, $attribute_structure_changed );
 
@@ -5993,47 +6092,17 @@ class Mobo_Core_Product_Sync {
 			return true;
 		}
 
-		$type_write = wp_set_object_terms( $product_id, 'simple', 'product_type', false );
-		if ( is_wp_error( $type_write ) ) {
+		/* Product type mutation belongs to WooCommerce CRUD. Do not pre-write the
+		 * product_type term: doing so hides the old type from WC_Data_Store and
+		 * suppresses woocommerce_product_type_changed. The shared policy performs
+		 * the typed save, scopes variation preservation to this transition, refreshes
+		 * the read boundary and verifies raw taxonomy + factory + object class. */
+		$simple_conversion = class_exists( 'Mobo_Core_Product_Type_Policy' )
+			? Mobo_Core_Product_Type_Policy::to_simple_preserving_variations( $product_id )
+			: new WP_Error( 'mobo_core_product_type_policy_missing', 'Product type transition policy is unavailable.' );
+		if ( is_wp_error( $simple_conversion ) ) {
 			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-			return new WP_Error( 'mobo_core_simple_product_type_write_failed', 'WooCommerce product_type could not be changed to simple: ' . $type_write->get_error_message() );
-		}
-
-		/*
-		 * WooCommerce's woocommerce_product_type_changed handler normally calls
-		 * delete_variations( $product_id, true ) when Variable becomes non-Variable.
-		 * That force-deletes BOTH quarantined Mobo children and merchant/manual
-		 * variations. Use WooCommerce's own deletion-control filter, scoped to this
-		 * exact parent and exact Variable->Simple transition, then remove it in a
-		 * finally block so no unrelated save in this request is affected.
-		 */
-		$preserve_variations = static function( $delete_variations, $candidate, $from, $to ) use ( $product_id ) {
-			if ( $candidate instanceof WC_Product
-				&& absint( $candidate->get_id() ) === $product_id
-				&& 'variable' === (string) $from
-				&& 'simple' === (string) $to
-			) {
-				return false;
-			}
-			return $delete_variations;
-		};
-
-		add_filter( 'woocommerce_delete_variations_on_product_type_change', $preserve_variations, PHP_INT_MAX, 4 );
-		$saved_id = 0;
-		try {
-			$simple   = new WC_Product_Simple( $product_id );
-			$saved_id = absint( $simple->save() );
-		} catch ( Throwable $e ) {
-			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-			return new WP_Error( 'mobo_core_simple_product_save_exception', 'WooCommerce simple product conversion threw an exception: ' . $e->getMessage() );
-		} finally {
-			remove_filter( 'woocommerce_delete_variations_on_product_type_change', $preserve_variations, PHP_INT_MAX );
-		}
-
-		$fresh = $saved_id === $product_id ? wc_get_product( $product_id ) : false;
-		if ( $saved_id !== $product_id || ! $fresh instanceof WC_Product_Simple || $fresh instanceof WC_Product_Variable ) {
-			update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-			return new WP_Error( 'mobo_core_simple_product_save_failed', 'WooCommerce simple product conversion did not persist successfully.' );
+			return $simple_conversion;
 		}
 
 		$preserved = $this->verify_simple_variation_preservation( $product_id, $owned_children, $manual_children );
@@ -6128,23 +6197,17 @@ class Mobo_Core_Product_Sync {
 			}
 
 			$had_simple_variant_mapping = '1' === (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true );
-			$type_write = wp_set_object_terms( $product_id, 'variable', 'product_type', false );
-			if ( is_wp_error( $type_write ) ) {
+			$variable = class_exists( 'Mobo_Core_Product_Type_Policy' )
+				? Mobo_Core_Product_Type_Policy::to_variable( $product_id )
+				: new WP_Error( 'mobo_core_product_type_policy_missing', 'Product type transition policy is unavailable.' );
+			if ( is_wp_error( $variable ) ) {
 				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-				return new WP_Error( 'mobo_core_variable_product_type_write_failed', 'WooCommerce product_type could not be changed to variable: ' . $type_write->get_error_message() );
-			}
-
-			$variable    = new WC_Product_Variable( $product_id );
-			$variable_id = absint( $variable->save() );
-			$fresh       = $variable_id === $product_id ? wc_get_product( $product_id ) : false;
-			if ( $variable_id !== $product_id || ! $fresh instanceof WC_Product_Variable ) {
-				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
-				return new WP_Error( 'mobo_core_variable_product_save_failed', 'WooCommerce variable product could not be durably saved after type conversion.' );
+				return $variable;
 			}
 
 			/* The parent-level simple-variant identity is recovery evidence until the
-			 * product_type mutation itself is durable. Removing it before the taxonomy
-			 * write succeeds can orphan a simple product after a transient DB failure. */
+			 * WooCommerce product-type transition itself is durable. Removing it before
+			 * verified read-back can orphan a simple product after a transient failure. */
 			if ( $had_simple_variant_mapping ) {
 				$cleanup = $this->clear_simple_variant_mapping_from_parent( $product_id );
 				if ( is_wp_error( $cleanup ) ) {
@@ -6770,7 +6833,14 @@ class Mobo_Core_Product_Sync {
 			array()
 		);
 
-		return is_array( $images ) ? $images : array();
+		if ( ! is_array( $images ) ) {
+			return array();
+		}
+
+		/* Portal >= v79 emits explicit image positions. Prefer that durable contract
+		 * over incidental JSON/DB enumeration order, while preserving array order for
+		 * older Portal versions that do not send position yet. */
+		return Mobo_Core_Image_Desired_State_Policy::ordered_collection( $images );
 	}
 
 	private function product_title_field_present( $data ) {

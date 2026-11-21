@@ -808,6 +808,29 @@ class Mobo_Core_Reprice_Queue {
 				}
 			}
 
+			/*
+			 * Existing duplicate WooCommerce price rows can make get_post_meta(..., true)
+			 * and WC_Product disagree even after a successful save. While this worker
+			 * holds the shared product lock, collapse only duplicate rows to the
+			 * authoritative calculator result before evaluating the durable postcondition.
+			 */
+			if ( class_exists( 'Mobo_Core_Price_Meta_Integrity' ) ) {
+				$price_meta_desired = array(
+					'_price'      => null !== $desired_active ? $desired_active : '',
+					'_sale_price' => $desired_sale,
+				);
+				if ( null !== $desired_regular ) {
+					$price_meta_desired['_regular_price'] = $desired_regular;
+				}
+				$collapsed = Mobo_Core_Price_Meta_Integrity::collapse_duplicates_verified( $post_id, $price_meta_desired );
+				if ( is_wp_error( $collapsed ) ) {
+					throw new RuntimeException( $collapsed->get_error_message() );
+				}
+				if ( ! empty( $collapsed['changed'] ) ) {
+					clean_post_cache( $post_id );
+				}
+			}
+
 			$fresh_product = wc_get_product( $post_id );
 			$durable_active = get_post_meta( $post_id, '_price', true );
 			$durable_active = '' !== $durable_active && null !== $durable_active ? wc_format_decimal( $durable_active ) : '';
@@ -847,7 +870,13 @@ class Mobo_Core_Reprice_Queue {
 		return array(
 			'updated'  => $frontend_changed || $meta_changed,
 			'changed'  => $frontend_changed,
-			'parentId' => $frontend_changed && $product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : 0,
+			/*
+			 * Parent `_price` is a child-derived multi-row set in WooCommerce.
+			 * Request a bounded parent sync for every successfully processed
+			 * variation, not only changed variations, so stale historical parent
+			 * state converges even when the child itself is already correct.
+			 */
+			'parentId' => $product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : 0,
 		);
 	}
 

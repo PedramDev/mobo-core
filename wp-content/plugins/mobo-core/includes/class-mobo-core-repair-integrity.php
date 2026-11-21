@@ -32,8 +32,14 @@ class Mobo_Core_Repair_Integrity {
 	/** @var Mobo_Core_Product_Map|null */
 	private $product_map;
 
+	/** @var Mobo_Core_Price_Calculator|null */
+	private $price_calculator;
+
 	public function __construct() {
 		$this->product_map = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
+		$this->price_calculator = class_exists( 'Mobo_Core_Price_Calculator' ) && class_exists( 'Mobo_Core_Legacy_Rules' )
+			? new Mobo_Core_Price_Calculator( new Mobo_Core_Legacy_Rules() )
+			: null;
 	}
 
 	/**
@@ -2054,25 +2060,73 @@ class Mobo_Core_Repair_Integrity {
 			if ( ! $product instanceof WC_Product ) {
 				return false;
 			}
+
+			/*
+			 * WooCommerce variable parents intentionally persist one _price row per
+			 * distinct visible-child price for sorting/filtering. Those rows are a
+			 * derived set, not duplicate singleton corruption. Parent convergence is
+			 * owned by WC_Product_Variable::sync() / the Mobo parent-finalize path.
+			 */
+			if ( $product->is_type( 'variable' ) ) {
+				$stats['priceMetaVariableParentDerivedSkipped'] = absint( $stats['priceMetaVariableParentDerivedSkipped'] ?? 0 ) + 1;
+				return false;
+			}
+
 			$desired = array(
 				'_price'         => (string) $product->get_price( 'edit' ),
 				'_regular_price' => (string) $product->get_regular_price( 'edit' ),
 				'_sale_price'    => (string) $product->get_sale_price( 'edit' ),
 			);
-			$changed = false;
+
+			/*
+			 * A duplicate _price row can itself poison WC_Product::get_price('edit').
+			 * For purchasable Mobo objects, derive the canonical values from the
+			 * durable Mobo source price and current pricing policy instead.
+			 */
+			if ( ! $product->is_type( 'variable' ) && $this->price_calculator instanceof Mobo_Core_Price_Calculator ) {
+				$raw_price = get_post_meta( $post_id, 'mobo_api_price', true );
+				if ( '' !== $raw_price && null !== $raw_price ) {
+					$raw_compare = get_post_meta( $post_id, 'mobo_api_compare_price', true );
+					$context = $product->is_type( 'variation' ) ? 'variation' : 'product';
+					$pair = $this->price_calculator->calculate_price_pair(
+						$post_id,
+						$raw_price,
+						$raw_compare,
+						$context,
+						$product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : 0
+					);
+					if ( ! empty( $pair['error'] ) ) {
+						return new WP_Error( 'mobo_core_repair_price_meta_source_invalid', 'Stored Mobo source price is invalid for object ' . $post_id . ': ' . sanitize_text_field( (string) $pair['error'] ) );
+					}
+					$desired_regular = null !== $pair['regular_price'] && '' !== $pair['regular_price'] ? wc_format_decimal( $pair['regular_price'] ) : '';
+					$desired_sale = isset( $pair['sale_price'] ) ? wc_format_decimal( $pair['sale_price'] ) : '';
+					$desired['_regular_price'] = $desired_regular;
+					$desired['_sale_price'] = $desired_sale;
+					$desired['_price'] = '' !== $desired_sale ? $desired_sale : $desired_regular;
+				}
+			}
+
+			$duplicate_rows = 0;
 			foreach ( $desired as $key => $value ) {
 				$values = get_post_meta( $post_id, $key, false );
-				if ( ! is_array( $values ) || count( $values ) <= 1 ) {
-					continue;
+				if ( is_array( $values ) && count( $values ) > 1 ) {
+					$duplicate_rows += count( $values ) - 1;
 				}
-				$before = count( $values );
-				if ( ! $this->replace_meta_single( $post_id, $key, $value ) ) {
-					$stats['errors'] = absint( $stats['errors'] ?? 0 ) + 1;
-					continue;
-				}
-				$stats['priceMetaRowsRemoved'] = absint( $stats['priceMetaRowsRemoved'] ?? 0 ) + max( 0, $before - 1 );
-				$changed = true;
 			}
+			if ( $duplicate_rows <= 0 ) {
+				return false;
+			}
+
+			if ( ! class_exists( 'Mobo_Core_Price_Meta_Integrity' ) ) {
+				return new WP_Error( 'mobo_core_repair_price_meta_integrity_unavailable', 'Price metadata integrity helper is unavailable.' );
+			}
+			$collapsed = Mobo_Core_Price_Meta_Integrity::collapse_duplicates_verified( $post_id, $desired );
+			if ( is_wp_error( $collapsed ) ) {
+				$stats['errors'] = absint( $stats['errors'] ?? 0 ) + 1;
+				return $collapsed;
+			}
+			$changed = ! empty( $collapsed['changed'] );
+			$stats['priceMetaRowsRemoved'] = absint( $stats['priceMetaRowsRemoved'] ?? 0 ) + absint( $collapsed['removed'] ?? 0 );
 			if ( $changed ) {
 				$stats['priceMetaObjectsRepaired'] = absint( $stats['priceMetaObjectsRepaired'] ?? 0 ) + 1;
 				$this->refresh_product_caches( $parent_id );

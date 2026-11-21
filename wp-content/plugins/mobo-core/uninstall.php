@@ -116,6 +116,7 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_started_at' );
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_finished_at' );
 	delete_option( 'mobo_core_image_refresh_automation_last_tick_source' );
+	delete_option( 'mobo_core_image_prune_legacy_seed_state' );
 	delete_option( 'mobo_core_103171_lock_cleanup_result' );
 	delete_option( 'mobo_core_103171_lock_cleanup_at' );
 	delete_option( 'mobo_core_category_placeholder_repair_pending' );
