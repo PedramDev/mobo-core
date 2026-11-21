@@ -36,16 +36,20 @@ test.describe('Connection tab', () => {
     }
   });
 
-  test('invalid webhook security code is rejected and nothing is saved', async ({ page }) => {
+  test('invalid webhook security code is blocked and nothing is saved', async ({ page }) => {
     await gotoTab(page, 'connection');
     const before = getOption('mobo_core_security_code');
     const form = settingsForm(page, 'connection');
-    await form.locator('[name="mobo_core_security_code"]').fill('کد نامعتبر با فاصله');
-    const n = await submitForm(page, form);
-    expect(n.type).toBe('error');
-    expect(n.message).toContain('کد امنیتی وب‌هوک ذخیره نشد');
-    expect(n.message).toContain('مقدار قبلی بدون تغییر باقی ماند');
+    const input = form.locator('[name="mobo_core_security_code"]');
+    await input.fill('کد نامعتبر با فاصله');
+    const urlBefore = page.url();
+    // The input carries pattern="[!-~]{1,255}": the browser must refuse to submit.
+    await form.locator('button[type="submit"]').last().click();
+    await page.waitForTimeout(1500);
+    expect(page.url(), 'no admin-post navigation happened').toBe(urlBefore);
+    expect(await input.evaluate((el: HTMLInputElement) => el.validity.patternMismatch)).toBe(true);
     expect(getOption('mobo_core_security_code')).toBe(before);
+    // Server-side guard (A:9602) is the second line of defense; it is not reachable through the UI.
   });
 
   test('"ایجاد اتصال" creates a pending Connection and "لغو اتصال در انتظار" deletes it', async ({ page }) => {

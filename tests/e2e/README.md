@@ -98,7 +98,7 @@ Code refs are `includes/class-mobo-core-admin.php` (A) and
 | ajax get_sync_status | A:9819 | dashboard › ajax mobo_core_get_sync_status… | JSON success/isRunning; bad nonce → 403 |
 | create_connection | A:9479 | connection › "ایجاد اتصال"… | notice + pending row (enabled 0); duplicate token refused |
 | cancel_pending_connection | A:9504 | connection › … "لغو اتصال در انتظار"… | notice + row and scoped settings deleted |
-| save_settings: connection | A:9543 / A:2229 | connection › "ذخیره اطلاعات اتصال"…; invalid security code rejected | `mobo_core_money_target_preference`; error + unchanged code |
+| save_settings: connection | A:9543 / A:2229 | connection › "ذخیره اطلاعات اتصال"…; invalid security code is blocked | `mobo_core_money_target_preference`; HTML `pattern` blocks submit, code unchanged (the server-side guard at A:9602 can't be reached through the UI) |
 | save_settings: product | A:9045 / A:2627 | product › toggle {8 keys}…; cache warmup policy | Connection-scoped setting + re-rendered radio |
 | save_settings: categories | A:5102 / A:5125 | categories › "ذخیره رفتار دسته‌بندی"; mapping off clears required; "ذخیره نگاشت‌های این صفحه" | settings + `wp_mobo_category_map.manual_term_id` |
 | save_settings: pricing | A:5160 | pricing › "ذخیره سیاست قیمت"… | `mobo_price_type`, `global_additional_percentage` |
@@ -157,3 +157,10 @@ Code refs are `includes/class-mobo-core-admin.php` (A) and
   `C:\MOBO-WORK\staging\STAGING.md`). Tests for 10.34.77-only features (for example
   Multi-Connection create/cancel, the Unicode migration, and the product-list
   filter/pricing modal) need 10.34.77 deployed on the target site.
+- Last run (2026-11-21, 8081 clean on **10.33.67**, Backend/mock down): 24 passed,
+  19 skipped (state-dependent or `@backend`), 50 failed. Every failure traced to
+  10.33.67 differing from 10.34.77: no `mobo-admin--{tab}` wrapper class, older labels
+  and notice texts, different bool-field markup, and no money-target select,
+  product-list filter or Connection tables. Re-run after 10.34.77 is deployed. The DB
+  helpers fall back to legacy storage (`mobo_core_sync_state` option, tables without
+  `connection_id`), so the sync and health tests also run on 10.33.67.
