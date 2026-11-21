@@ -9,7 +9,14 @@
  * Mobo Sync/Repair/Webhook/queue mutation is in progress.
  *
  * Supported native safeguards:
- * - WP Rocket: marks Mobo mutations as imports via rocket_is_importing.
+ * - WP Rocket: detaches its per-save rocket_clean_post() listener from
+ *   clean_post_cache for the mutation scope. WooCommerce calls
+ *   clean_post_cache() on every product save; WP Rocket then purges the
+ *   product, every related category/tag archive, the home page and home feeds
+ *   and (with preload enabled) dispatches a partial preload of all of them at
+ *   shutdown. During a Source mass price change this multiplied into a
+ *   loopback/preload storm that exhausted PHP workers on shared hosting.
+ *   rocket_is_importing is still set for WP Rocket releases that honour it.
  * - LiteSpeed Cache: removes broad/related public purge tags while archive
  *   purging is disabled, retaining direct post/URL purges.
  * - W3 Total Cache: vetoes native post/posts/all flushes while archive purging
@@ -41,6 +48,11 @@ final class Mobo_Core_Cache_Mutation_Guard {
 	private static $reasons               = array();
 	private static $archive_purge_interval_minutes = 0;
 	private static $protections           = array();
+	private static $used_in_request       = false;
+
+	/** Reason used by Mobo_Core_Cache_Purger for its shutdown object-cache purge. */
+	const INTERNAL_PURGER_REASON = 'cache-purger-object-cache';
+	private static $detached_callbacks    = array();
 
 	/**
 	 * Enter a Mobo-owned mutation scope.
@@ -54,6 +66,11 @@ final class Mobo_Core_Cache_Mutation_Guard {
 			self::$reasons[ $reason ] = true;
 		}
 
+		if ( self::INTERNAL_PURGER_REASON !== $reason ) {
+			// The purger's own shutdown object-cache scope is not a Mobo mutation.
+			self::$used_in_request = true;
+		}
+
 		self::$depth++;
 		if ( 1 !== self::$depth ) {
 			return;
@@ -61,10 +78,18 @@ final class Mobo_Core_Cache_Mutation_Guard {
 
 		self::$archive_purge_interval_minutes = self::archive_purge_interval_minutes();
 		self::$protections           = array();
+		self::$detached_callbacks    = array();
 
-		// WP Rocket documents rocket_is_importing for bulk/import mutations.
+		// Some WP Rocket releases honour rocket_is_importing for bulk mutations.
 		add_filter( 'rocket_is_importing', array( __CLASS__, 'filter_rocket_is_importing' ), PHP_INT_MAX );
 		self::$protections['wpRocketImport'] = true;
+
+		// WP Rocket (all releases up to at least 3.17) hooks rocket_clean_post()
+		// directly to clean_post_cache, which ignores rocket_is_importing. Detach
+		// it for the scope; Mobo's shutdown purger invalidates the exact product
+		// URLs (bounded) and defers archives. WP Rocket itself removes the same
+		// listener on managed hosts (kinsta/flywheel/presslabs integrations).
+		self::detach_wp_rocket_post_purge();
 
 		// LiteSpeed Cache: keep direct post/URL invalidation but strip related/global tags
 		// during every Mobo mutation. If archive purging is enabled, Mobo's final
@@ -98,7 +123,12 @@ final class Mobo_Core_Cache_Mutation_Guard {
 		 *
 		 * @param array $state Guard state.
 		 */
-		do_action( 'mobo_core_cache_mutation_guard_begin', self::get_state() );
+		try {
+			do_action( 'mobo_core_cache_mutation_guard_begin', self::get_state() );
+		} catch ( Throwable $e ) {
+			// A failing third-party guard must never abort or stall a Mobo mutation.
+			self::log_warning( 'A custom cache mutation guard (begin) failed: ' . $e->getMessage() );
+		}
 	}
 
 	/**
@@ -120,6 +150,7 @@ final class Mobo_Core_Cache_Mutation_Guard {
 		$state = self::get_state();
 
 		remove_filter( 'rocket_is_importing', array( __CLASS__, 'filter_rocket_is_importing' ), PHP_INT_MAX );
+		self::restore_wp_rocket_post_purge();
 
 		if ( isset( self::$protections['liteSpeedRelatedTags'] ) ) {
 			remove_filter( 'litespeed_purge_tags', array( __CLASS__, 'filter_litespeed_purge_tags' ), PHP_INT_MAX );
@@ -141,9 +172,87 @@ final class Mobo_Core_Cache_Mutation_Guard {
 		 *
 		 * @param array $state State captured immediately before cleanup.
 		 */
-		do_action( 'mobo_core_cache_mutation_guard_end', $state );
+		try {
+			do_action( 'mobo_core_cache_mutation_guard_end', $state );
+		} catch ( Throwable $e ) {
+			self::log_warning( 'A custom cache mutation guard (end) failed: ' . $e->getMessage() );
+		}
 
 		self::reset_state();
+	}
+
+	/**
+	 * Whether any Mobo-owned mutation scope ran during this PHP request.
+	 * Storefront requests (checkout stock changes, visitor actions) never open a
+	 * scope, so background-only side effects such as cache warmup can be limited
+	 * to Mobo work.
+	 *
+	 * @return bool
+	 */
+	public static function was_used_in_request() {
+		return self::$used_in_request;
+	}
+
+	/**
+	 * Detach WP Rocket's per-save full related purge for the guarded scope.
+	 *
+	 * @return void
+	 */
+	private static function detach_wp_rocket_post_purge() {
+		try {
+			if ( ! function_exists( 'has_action' ) || ! function_exists( 'remove_action' ) ) {
+				return;
+			}
+			$enabled = function_exists( 'apply_filters' ) ? (bool) apply_filters( 'mobo_core_cache_guard_detach_wp_rocket_post_purge', true ) : true;
+			if ( ! $enabled ) {
+				return;
+			}
+			foreach ( array( 'clean_post_cache' ) as $hook ) {
+				$priority = has_action( $hook, 'rocket_clean_post' );
+				if ( false === $priority ) {
+					continue;
+				}
+				if ( remove_action( $hook, 'rocket_clean_post', (int) $priority ) ) {
+					self::$detached_callbacks[] = array( 'hook' => $hook, 'callback' => 'rocket_clean_post', 'priority' => (int) $priority, 'args' => 2 );
+					self::$protections['wpRocketPostPurgeDetached'] = true;
+				}
+			}
+		} catch ( Throwable $e ) {
+			self::log_warning( 'WP Rocket per-save purge listener could not be detached: ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * Re-attach callbacks detached by this guard, exactly once.
+	 *
+	 * @return void
+	 */
+	private static function restore_wp_rocket_post_purge() {
+		$detached = self::$detached_callbacks;
+		self::$detached_callbacks = array();
+		foreach ( $detached as $entry ) {
+			try {
+				if ( false === has_action( $entry['hook'], $entry['callback'] ) ) {
+					add_action( $entry['hook'], $entry['callback'], $entry['priority'], $entry['args'] );
+				}
+			} catch ( Throwable $e ) {
+				self::log_warning( 'WP Rocket per-save purge listener could not be restored: ' . $e->getMessage() );
+			}
+		}
+	}
+
+	/**
+	 * @param string $message Message.
+	 * @return void
+	 */
+	private static function log_warning( $message ) {
+		try {
+			if ( class_exists( 'Mobo_Core_Logger' ) ) {
+				Mobo_Core_Logger::warning( substr( (string) $message, 0, 500 ), array( 'component' => 'cache-mutation-guard' ) );
+			}
+		} catch ( Throwable $e ) {
+			unset( $e );
+		}
 	}
 
 	/**
@@ -396,5 +505,6 @@ final class Mobo_Core_Cache_Mutation_Guard {
 		self::$reasons               = array();
 		self::$archive_purge_interval_minutes = 0;
 		self::$protections           = array();
+		self::$detached_callbacks    = array();
 	}
 }

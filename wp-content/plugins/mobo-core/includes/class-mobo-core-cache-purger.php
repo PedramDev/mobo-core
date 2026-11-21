@@ -6,6 +6,17 @@
  * related archive URLs and old/new taxonomy URLs are collected during the
  * request and invalidated once at shutdown.
  *
+ * Integration modes (mobo_core_cache_integration_mode, installation-wide):
+ * - off:        no page-cache plugin calls and no warmup; WordPress/WooCommerce
+ *               object-cache invalidation still runs (data consistency).
+ * - safe:       default. At most SAFE_MAX_IMMEDIATE_URLS product URLs are purged
+ *               per request; a burst (mass Source price change) switches to one
+ *               coalesced, capped deferred purge; never a home/domain purge.
+ * - aggressive: larger caps, home-page purge in the deferred archive pass and
+ *               WP Super Cache overflow fallback. Still never a domain purge.
+ * Mobo never calls WP Rocket preload/RUCSS APIs; WP Rocket schedules its own
+ * preload after a targeted purge.
+ *
  * PHP 7.4 compatible.
  *
  * @package MoboCore
@@ -38,8 +49,23 @@ final class Mobo_Core_Cache_Purger {
 	const ARCHIVE_QUEUE_SCHEMA_VERSION = 1;
 	const ARCHIVE_QUEUE_MAX_URLS = 5000;
 	const ARCHIVE_QUEUE_MAX_PRODUCTS = 5000;
-	const HEALTH_SCHEMA_VERSION = 3;
+	const HEALTH_SCHEMA_VERSION = 4;
 	const ERROR_MAX_LENGTH = 1000;
+
+	const OPTION_INTEGRATION_MODE = 'mobo_core_cache_integration_mode';
+	const MODE_OFF        = 'off';
+	const MODE_SAFE       = 'safe';
+	const MODE_AGGRESSIVE = 'aggressive';
+	const OPTION_BURST    = 'mobo_core_cache_purge_burst_window';
+	const BURST_WINDOW_SECONDS = 600;
+	const SAFE_BURST_THRESHOLD_PRODUCTS       = 60;
+	const AGGRESSIVE_BURST_THRESHOLD_PRODUCTS = 600;
+	const SAFE_MAX_IMMEDIATE_URLS       = 25;
+	const AGGRESSIVE_MAX_IMMEDIATE_URLS = 200;
+	const SAFE_MAX_DEFERRED_URLS_PER_PASS       = 200;
+	const AGGRESSIVE_MAX_DEFERRED_URLS_PER_PASS = 1000;
+	const DEFERRED_CONTINUATION_SECONDS = 60;
+	const CLAIM_SECONDS = 180;
 
 	/**
 	 * Register WooCommerce/WordPress listeners and deferred flush handlers.
@@ -352,6 +378,12 @@ final class Mobo_Core_Cache_Purger {
 		$warmup_queue     = array( 'queued' => false, 'queuedCount' => 0, 'pendingCount' => 0, 'status' => 'not-run' );
 		$overall_status   = 'failed';
 		$last_error       = '';
+		$mode             = self::integration_mode();
+		$burst            = array( 'active' => false, 'count' => 0 );
+		$deferred_count   = 0;
+		$stale_count      = 0;
+		/* Captured before flush opens its own guard scope for object-cache work. */
+		$mobo_request     = ! class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) || Mobo_Core_Cache_Mutation_Guard::was_used_in_request();
 
 		try {
 			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', array_keys( self::$product_ids ) ) ) ) );
@@ -406,8 +438,49 @@ final class Mobo_Core_Cache_Purger {
 				)
 			);
 
-			if ( $archive_interval > 0 && ! empty( $archive_urls ) ) {
-				$archive_queue = self::enqueue_deferred_archive_purge( $archive_urls, $product_ids, $reasons, $archive_interval );
+			/*
+			 * Bound the immediate page-cache work of one request. A Source mass
+			 * price change touches thousands of products across many slices; each
+			 * slice must not purge an unbounded URL list. During a burst every
+			 * product URL is coalesced into the single deferred queue instead.
+			 */
+			$immediate_urls        = $urls;
+			$immediate_product_ids = $product_ids;
+			$deferred_urls         = array();
+			$deferred_product_ids  = array();
+			if ( self::MODE_OFF !== $mode ) {
+				$burst = self::register_burst( count( $product_ids ) );
+				$cap   = self::max_immediate_urls( $mode );
+				if ( ! empty( $burst['active'] ) && $archive_interval > 0 ) {
+					$deferred_urls         = $urls;
+					$deferred_product_ids  = $product_ids;
+					$immediate_urls        = array();
+					$immediate_product_ids = array();
+				} elseif ( count( $urls ) > $cap || count( $product_ids ) > $cap ) {
+					$immediate_urls        = array_slice( $urls, 0, $cap );
+					$immediate_product_ids = array_slice( $product_ids, 0, $cap );
+					$deferred_urls         = array_slice( $urls, $cap );
+					$deferred_product_ids  = array_slice( $product_ids, $cap );
+				}
+				if ( $archive_interval <= 0 && ( ! empty( $deferred_urls ) || ! empty( $deferred_product_ids ) ) ) {
+					/* No deferred queue configured: leave these pages to the cache
+					 * plugin's own lifespan instead of purging without bound. */
+					$stale_count          = max( count( $deferred_urls ), count( $deferred_product_ids ) );
+					$deferred_urls        = array();
+					$deferred_product_ids = array();
+				}
+				$custom_urls    = array_values( array_intersect( $custom_urls, $immediate_urls ) );
+				$deferred_count = count( $deferred_urls );
+			} else {
+				$immediate_urls        = array();
+				$immediate_product_ids = array();
+				$custom_urls           = array();
+			}
+
+			$queue_urls = array_values( array_unique( array_merge( $deferred_urls, $archive_urls ) ) );
+			if ( self::MODE_OFF !== $mode && $archive_interval > 0 && ! empty( $queue_urls ) ) {
+				$queue_products = ! empty( $deferred_product_ids ) ? array_values( array_unique( array_merge( $deferred_product_ids, $product_ids ) ) ) : $product_ids;
+				$archive_queue  = self::enqueue_deferred_archive_purge( $queue_urls, $queue_products, $reasons, $archive_interval );
 			}
 
 			/* Clear the request queue before integrations run, preventing recursive duplicate work. */
@@ -419,73 +492,124 @@ final class Mobo_Core_Cache_Purger {
 				'wordpressWooCommerce',
 				$inventory['wordpressWooCommerce'],
 				static function () use ( $object_ids, $product_ids ) {
+					/* clean_post_cache() fires WP Rocket's rocket_clean_post() listener,
+					 * which purges home + every related archive and dispatches a
+					 * preload. Run object-cache invalidation inside the guard. */
+					if ( class_exists( 'Mobo_Core_Cache_Mutation_Guard' ) ) {
+						Mobo_Core_Cache_Mutation_Guard::run(
+							static function () use ( $object_ids, $product_ids ) {
+								self::purge_wordpress_and_woocommerce( $object_ids, $product_ids );
+							},
+							'cache-purger-object-cache'
+						);
+						return;
+					}
 					self::purge_wordpress_and_woocommerce( $object_ids, $product_ids );
 				}
 			);
 
-			/* Page-cache product URLs are always immediate. Related archives are deferred. */
-			$integration_data['wpRocket'] = self::run_integration(
-				'wpRocket',
-				$inventory['wpRocket'],
-				static function () use ( $product_ids, $urls, $custom_urls ) {
-					if ( ! self::purge_wp_rocket( $product_ids, $urls, $custom_urls, false ) ) {
-						throw new RuntimeException( 'WP Rocket targeted purge API is unavailable.' );
+			if ( self::MODE_OFF === $mode ) {
+				foreach ( array( 'wpRocket', 'liteSpeedCache', 'w3TotalCache', 'wpSuperCache', 'customHooks' ) as $skipped_key ) {
+					$integration_data[ $skipped_key ] = self::skipped_integration( $skipped_key, $inventory[ $skipped_key ], 'disabled-by-mode' );
+				}
+				$warmup_queue['status'] = 'disabled-by-mode';
+			}
+
+			$urls                  = $immediate_urls;
+			$product_ids_for_pages = $immediate_product_ids;
+
+			/* Product URLs are purged immediately up to the per-request cap; archives and overflow are deferred. */
+			if ( self::MODE_OFF !== $mode ) {
+				$integration_data['wpRocket'] = self::run_integration(
+					'wpRocket',
+					$inventory['wpRocket'],
+					static function () use ( $product_ids_for_pages, $urls, $custom_urls ) {
+						if ( empty( $urls ) && empty( $custom_urls ) ) {
+							return; // Everything was coalesced into the deferred queue.
+						}
+						if ( ! self::purge_wp_rocket( $product_ids_for_pages, $urls, $custom_urls, false ) ) {
+							throw new RuntimeException( 'WP Rocket targeted purge API is unavailable.' );
+						}
+					}
+				);
+
+				$integration_data['liteSpeedCache'] = self::run_integration(
+					'liteSpeedCache',
+					$inventory['liteSpeedCache'],
+					static function () use ( $product_ids_for_pages, $urls ) {
+						if ( empty( $urls ) ) {
+							return;
+						}
+						if ( ! self::purge_litespeed( $product_ids_for_pages, $urls, false ) ) {
+							throw new RuntimeException( 'LiteSpeed targeted purge hooks are unavailable.' );
+						}
+					}
+				);
+
+				$integration_data['w3TotalCache'] = self::run_integration(
+					'w3TotalCache',
+					$inventory['w3TotalCache'],
+					static function () use ( $product_ids_for_pages, $urls ) {
+						if ( empty( $urls ) ) {
+							return;
+						}
+						if ( ! self::purge_w3_total_cache( $product_ids_for_pages, $urls, false ) ) {
+							throw new RuntimeException( 'W3 Total Cache targeted purge API is unavailable.' );
+						}
+					}
+				);
+
+				$integration_data['wpSuperCache'] = self::run_integration(
+					'wpSuperCache',
+					$inventory['wpSuperCache'],
+					static function () use ( $product_ids_for_pages ) {
+						if ( empty( $product_ids_for_pages ) ) {
+							return;
+						}
+						if ( ! self::purge_wp_super_cache( $product_ids_for_pages, false ) ) {
+							throw new RuntimeException( 'WP Super Cache targeted purge API is unavailable.' );
+						}
+					}
+				);
+
+				$context = array(
+					'product_ids'                  => $product_ids,
+					'object_ids'                   => $object_ids,
+					'urls'                         => $urls,
+					'custom_urls'                  => $custom_urls,
+					'reasons'                      => $reasons,
+					'archivePurgeEnabled'          => $archive_interval > 0,
+					'archivePurgeDeferred'         => true,
+					'archivePurgeIntervalMinutes'  => $archive_interval,
+					'archiveUrlsQueued'            => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
+					'archivePurgeDueAt'            => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
+					'integrationResults'           => $integration_data,
+					'integrationMode'              => $mode,
+					'burstActive'                  => ! empty( $burst['active'] ),
+					'deferredProductUrls'          => $deferred_count,
+				);
+
+				$integration_data['customHooks'] = self::run_custom_hooks_integration( $inventory['customHooks'], $context, $custom_hook_error );
+
+				/*
+				 * Warm only the current product permalink after at least one detected
+				 * page-cache integration was purged successfully. The warmup itself is
+				 * deferred to the real cron so sync/shutdown never waits for page render.
+				 */
+				if ( ! empty( $burst['active'] ) ) {
+					$warmup_queue['status'] = 'skipped-burst';
+				} elseif ( ! $mobo_request ) {
+					/* Storefront requests (e.g. checkout stock changes) never warm. */
+					$warmup_queue['status'] = 'skipped-non-mobo-request';
+				} else {
+					try {
+						$warmup_queue = self::queue_product_warmups( $product_ids_for_pages, $inventory, $integration_data, $reasons );
+					} catch ( Throwable $e ) {
+						$warmup_queue['status'] = 'enqueue-failed';
+						self::log_warning( 'Product cache warmup admission failed; synchronization continues: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'cache-warmup' ) );
 					}
 				}
-			);
-
-			$integration_data['liteSpeedCache'] = self::run_integration(
-				'liteSpeedCache',
-				$inventory['liteSpeedCache'],
-				static function () use ( $product_ids, $urls ) {
-					if ( ! self::purge_litespeed( $product_ids, $urls, false ) ) {
-						throw new RuntimeException( 'LiteSpeed targeted purge hooks are unavailable.' );
-					}
-				}
-			);
-
-			$integration_data['w3TotalCache'] = self::run_integration(
-				'w3TotalCache',
-				$inventory['w3TotalCache'],
-				static function () use ( $product_ids, $urls ) {
-					if ( ! self::purge_w3_total_cache( $product_ids, $urls, false ) ) {
-						throw new RuntimeException( 'W3 Total Cache targeted purge API is unavailable.' );
-					}
-				}
-			);
-
-			$integration_data['wpSuperCache'] = self::run_integration(
-				'wpSuperCache',
-				$inventory['wpSuperCache'],
-				static function () use ( $product_ids ) {
-					if ( ! self::purge_wp_super_cache( $product_ids, false ) ) {
-						throw new RuntimeException( 'WP Super Cache targeted purge API is unavailable.' );
-					}
-				}
-			);
-
-			$context = array(
-				'product_ids'                  => $product_ids,
-				'object_ids'                   => $object_ids,
-				'urls'                         => $urls,
-				'custom_urls'                  => $custom_urls,
-				'reasons'                      => $reasons,
-				'archivePurgeEnabled'          => $archive_interval > 0,
-				'archivePurgeDeferred'         => true,
-				'archivePurgeIntervalMinutes'  => $archive_interval,
-				'archiveUrlsQueued'            => isset( $archive_queue['urlCount'] ) ? absint( $archive_queue['urlCount'] ) : 0,
-				'archivePurgeDueAt'            => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
-				'integrationResults'           => $integration_data,
-			);
-
-			$integration_data['customHooks'] = self::run_custom_hooks_integration( $inventory['customHooks'], $context, $custom_hook_error );
-
-			/*
-			 * Warm only the current product permalink after at least one detected
-			 * page-cache integration was purged successfully. The warmup itself is
-			 * deferred to the real cron so sync/shutdown never waits for page render.
-			 */
-			$warmup_queue = self::queue_product_warmups( $product_ids, $inventory, $integration_data, $reasons );
+			} // End page-cache integrations (mode is not off).
 
 			$overall_status = self::resolve_overall_status( $integration_data );
 			$last_error     = self::resolve_last_integration_error( $integration_data );
@@ -523,6 +647,11 @@ final class Mobo_Core_Cache_Purger {
 				'durationMs'                   => self::elapsed_ms( $started_at ),
 				'reasons'                      => array_slice( $reasons, 0, 20 ),
 				'archivePurgeEnabled'           => $archive_interval > 0,
+				'integrationMode'              => $mode,
+				'burstActive'                  => ! empty( $burst['active'] ),
+				'burstProductCount'            => isset( $burst['count'] ) ? absint( $burst['count'] ) : 0,
+				'deferredUrlCount'             => $deferred_count,
+				'staleUrlCount'                => $stale_count,
 				'lastError'                    => $last_error,
 				'integrations'                 => $integration_data,
 			);
@@ -546,9 +675,112 @@ final class Mobo_Core_Cache_Purger {
 			'archivePurgeDueAt' => isset( $archive_queue['dueAt'] ) ? absint( $archive_queue['dueAt'] ) : 0,
 			'warmupQueued'      => isset( $warmup_queue['queuedCount'] ) ? absint( $warmup_queue['queuedCount'] ) : 0,
 			'warmupPending'     => isset( $warmup_queue['pendingCount'] ) ? absint( $warmup_queue['pendingCount'] ) : 0,
+			'warmupStatus'      => isset( $warmup_queue['status'] ) ? (string) $warmup_queue['status'] : '',
 			'integrations'      => $successful_integrations,
 			'status'            => $overall_status,
 			'lastError'         => $last_error,
+			'mode'              => $mode,
+			'burstActive'       => ! empty( $burst['active'] ),
+			'deferredUrls'      => $deferred_count,
+			'staleUrls'         => $stale_count,
+		);
+	}
+
+	/**
+	 * Current cache-plugin integration mode (installation-wide).
+	 *
+	 * @return string off|safe|aggressive
+	 */
+	public static function integration_mode() {
+		try {
+			$value = get_option( self::OPTION_INTEGRATION_MODE, self::MODE_SAFE );
+		} catch ( Throwable $e ) {
+			return self::MODE_SAFE;
+		}
+		return self::sanitize_integration_mode( $value );
+	}
+
+	/**
+	 * @param mixed $value Raw mode.
+	 * @return string
+	 */
+	public static function sanitize_integration_mode( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+		return in_array( $value, array( self::MODE_OFF, self::MODE_SAFE, self::MODE_AGGRESSIVE ), true ) ? $value : self::MODE_SAFE;
+	}
+
+	/**
+	 * Whether a product-change burst (e.g. a Source mass price change) is active.
+	 * While active, product URLs are coalesced into one deferred purge and
+	 * warmup is paused.
+	 *
+	 * @return bool
+	 */
+	public static function is_burst_active() {
+		try {
+			$state = get_option( self::OPTION_BURST, array() );
+		} catch ( Throwable $e ) {
+			return false;
+		}
+		return is_array( $state ) && isset( $state['burstUntil'] ) && absint( $state['burstUntil'] ) > time();
+	}
+
+	/**
+	 * Record purged products in the rolling window and return burst state.
+	 *
+	 * @param int $product_count Products in this flush.
+	 * @return array
+	 */
+	private static function register_burst( $product_count ) {
+		$product_count = absint( $product_count );
+		try {
+			$now   = time();
+			$state = get_option( self::OPTION_BURST, array() );
+			$state = is_array( $state ) ? $state : array();
+			$start = isset( $state['windowStart'] ) ? absint( $state['windowStart'] ) : 0;
+			$count = isset( $state['count'] ) ? absint( $state['count'] ) : 0;
+			$until = isset( $state['burstUntil'] ) ? absint( $state['burstUntil'] ) : 0;
+			if ( $start <= 0 || $now - $start >= self::BURST_WINDOW_SECONDS ) {
+				$start = $now;
+				$count = 0;
+			}
+			$count += $product_count;
+			$threshold = (int) apply_filters(
+				'mobo_core_cache_burst_threshold_products',
+				self::MODE_AGGRESSIVE === self::integration_mode() ? self::AGGRESSIVE_BURST_THRESHOLD_PRODUCTS : self::SAFE_BURST_THRESHOLD_PRODUCTS
+			);
+			$threshold = max( 1, $threshold );
+			if ( $count > $threshold ) {
+				$until = $now + self::BURST_WINDOW_SECONDS;
+			}
+			if ( $product_count > 0 ) {
+				update_option( self::OPTION_BURST, array( 'windowStart' => $start, 'count' => $count, 'burstUntil' => $until ), false );
+			}
+			return array( 'active' => $until > $now, 'count' => $count );
+		} catch ( Throwable $e ) {
+			return array( 'active' => false, 'count' => 0 );
+		}
+	}
+
+	private static function max_immediate_urls( $mode ) {
+		$cap = self::MODE_AGGRESSIVE === $mode ? self::AGGRESSIVE_MAX_IMMEDIATE_URLS : self::SAFE_MAX_IMMEDIATE_URLS;
+		return max( 1, min( 1000, (int) apply_filters( 'mobo_core_cache_max_immediate_urls', $cap, $mode ) ) );
+	}
+
+	private static function max_deferred_urls_per_pass( $mode ) {
+		$cap = self::MODE_AGGRESSIVE === $mode ? self::AGGRESSIVE_MAX_DEFERRED_URLS_PER_PASS : self::SAFE_MAX_DEFERRED_URLS_PER_PASS;
+		return max( 1, min( 5000, (int) apply_filters( 'mobo_core_cache_max_deferred_urls_per_pass', $cap, $mode ) ) );
+	}
+
+	private static function skipped_integration( $key, $inventory, $reason ) {
+		return array(
+			'label'      => isset( $inventory['label'] ) ? (string) $inventory['label'] : (string) $key,
+			'detected'   => ! empty( $inventory['detected'] ),
+			'version'    => isset( $inventory['version'] ) ? (string) $inventory['version'] : '',
+			'status'     => 'skipped',
+			'durationMs' => 0,
+			'error'      => '',
+			'reason'     => sanitize_key( (string) $reason ),
 		);
 	}
 
@@ -587,7 +819,7 @@ final class Mobo_Core_Cache_Purger {
 			$queue['dueAt'] = $current_due > 0 ? min( $current_due, $new_due ) : $new_due;
 			$queue['intervalMinutes'] = $minutes;
 			$queue['updatedAt']       = $now;
-			unset( $queue['processingToken'], $queue['processingUntil'] );
+			$queue = self::strip_claim( $queue );
 			self::write_archive_queue( $queue );
 		} finally {
 			self::release_archive_queue_lock( $lock );
@@ -604,6 +836,11 @@ final class Mobo_Core_Cache_Purger {
 	public static function process_due_archive_purge( $source = 'real-cron' ) {
 		$source   = sanitize_key( (string) $source );
 		$interval = self::archive_purge_interval_minutes();
+		$mode     = self::integration_mode();
+		if ( self::MODE_OFF === $mode ) {
+			/* Merchant disabled cache-plugin integration: never call purge APIs. */
+			return array( 'success' => true, 'status' => 'disabled-by-mode', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
+		}
 		$queue    = self::read_archive_queue();
 		$now      = time();
 
@@ -694,10 +931,22 @@ final class Mobo_Core_Cache_Purger {
 				);
 			}
 
-			$urls        = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $queue['urls'] ) ) ) );
-			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', $queue['productIds'] ) ) ) );
+			$all_urls        = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $queue['urls'] ) ) ) );
+			$all_product_ids = array_values( array_unique( array_filter( array_map( 'absint', $queue['productIds'] ) ) ) );
 			$product_overflow = ! empty( $queue['productOverflow'] );
 			$reasons     = array_values( array_unique( array_filter( array_map( 'sanitize_key', $queue['reasons'] ) ) ) );
+			/* One bounded slice per runner pass; the remainder stays queued and is
+			 * continued shortly after, so a 5000-URL mass change never becomes one
+			 * long purge (and one huge preload wave) in a single request. */
+			$per_pass    = self::max_deferred_urls_per_pass( $mode );
+			$urls        = array_slice( $all_urls, 0, $per_pass );
+			$product_ids = array_slice( $all_product_ids, 0, $per_pass );
+			$has_more    = count( $all_urls ) > count( $urls ) || count( $all_product_ids ) > count( $product_ids );
+			if ( $product_overflow && self::MODE_AGGRESSIVE !== $mode ) {
+				/* Safe mode never escalates to a sitewide flush; pages beyond the
+				 * bounded map expire through the cache plugin's own lifespan. */
+				$product_overflow = false;
+			}
 			if ( empty( $urls ) ) {
 				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
 				self::delete_legacy_archive_queue();
@@ -707,9 +956,13 @@ final class Mobo_Core_Cache_Purger {
 			}
 
 			$claim_token = wp_generate_uuid4();
-			$queue['processingToken'] = $claim_token;
-			$queue['processingUntil'] = time() + 180;
-			$queue['updatedAt']       = time();
+			$queue['processingToken']      = $claim_token;
+			$queue['processingUntil']      = time() + self::CLAIM_SECONDS;
+			$queue['processingUrls']       = $urls;
+			$queue['processingProductIds'] = $product_ids;
+			$queue['requeueUrls']          = array();
+			$queue['requeueProductIds']    = array();
+			$queue['updatedAt']            = time();
 			self::write_archive_queue( $queue );
 
 			/* Third-party purge APIs/hooks may be slow. Never hold the queue mutex here. */
@@ -720,8 +973,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['wpRocket'] = self::run_integration(
 				'wpRocket',
 				$inventory['wpRocket'],
-				static function () use ( $product_ids, $urls ) {
-					if ( ! self::purge_wp_rocket_archive_targets( $product_ids, $urls ) ) {
+				static function () use ( $product_ids, $urls, $mode ) {
+					if ( ! self::purge_wp_rocket_archive_targets( $product_ids, $urls, self::MODE_AGGRESSIVE === $mode ) ) {
 						throw new RuntimeException( 'WP Rocket archive purge API is unavailable.' );
 					}
 				}
@@ -808,14 +1061,24 @@ final class Mobo_Core_Cache_Purger {
 				/* A newer enqueue/settings mutation owns the durable snapshot now. */
 				$overall_status = 'superseded';
 			} elseif ( 'failed' !== $overall_status && 'partial' !== $overall_status ) {
-				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
-				self::delete_legacy_archive_queue();
+				$remaining = self::remove_processed_batch( $current );
+				if ( empty( $remaining['urls'] ) && empty( $remaining['productIds'] ) ) {
+					if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
+					self::delete_legacy_archive_queue();
+				} else {
+					/* Continue the coalesced queue soon, one bounded slice at a time. */
+					$remaining['dueAt']           = time() + self::DEFERRED_CONTINUATION_SECONDS;
+					$remaining['updatedAt']       = time();
+					$remaining['attempts']        = 0;
+					$remaining['intervalMinutes'] = $interval;
+					self::write_archive_queue( $remaining );
+				}
 			} else {
 				$current['dueAt']           = time() + ( $interval * MINUTE_IN_SECONDS );
 				$current['updatedAt']       = time();
 				$current['attempts']        = isset( $current['attempts'] ) ? absint( $current['attempts'] ) + 1 : 1;
 				$current['intervalMinutes'] = $interval;
-				unset( $current['processingToken'], $current['processingUntil'] );
+				$current = self::strip_claim( $current );
 				self::write_archive_queue( $current );
 			}
 
@@ -829,6 +1092,8 @@ final class Mobo_Core_Cache_Purger {
 				'intervalMinutes' => $interval,
 				'urlCount'        => count( $urls ),
 				'productCount'    => count( $product_ids ),
+				'hasMore'         => ! empty( $has_more ),
+				'integrationMode' => $mode,
 				'durationMs'      => self::elapsed_ms( $started ),
 				'lastError'       => $last_error,
 				'integrations'    => $integration_data,
@@ -844,9 +1109,47 @@ final class Mobo_Core_Cache_Purger {
 			'processed'    => true,
 			'urlCount'     => count( $urls ),
 			'productCount' => count( $product_ids ),
+			'hasMore'      => ! empty( $has_more ),
 			'durationMs'   => self::elapsed_ms( $started ),
 			'lastError'    => $last_error,
 		);
+	}
+
+	/**
+	 * Remove claim bookkeeping from a queue snapshot.
+	 *
+	 * @param array $queue Queue.
+	 * @return array
+	 */
+	private static function strip_claim( $queue ) {
+		$queue = is_array( $queue ) ? $queue : array();
+		unset( $queue['processingToken'], $queue['processingUntil'], $queue['processingUrls'], $queue['processingProductIds'], $queue['requeueUrls'], $queue['requeueProductIds'] );
+		return $queue;
+	}
+
+	/**
+	 * Drop the successfully purged batch from the current queue snapshot while
+	 * keeping targets that were re-enqueued during the claim (they changed again
+	 * after or while being purged and must be purged once more).
+	 *
+	 * @param array $queue Current queue (owned claim).
+	 * @return array
+	 */
+	private static function remove_processed_batch( $queue ) {
+		$queue      = is_array( $queue ) ? $queue : array();
+		$done_urls  = isset( $queue['processingUrls'] ) && is_array( $queue['processingUrls'] ) ? $queue['processingUrls'] : array();
+		$done_ids   = isset( $queue['processingProductIds'] ) && is_array( $queue['processingProductIds'] ) ? array_map( 'absint', $queue['processingProductIds'] ) : array();
+		$again_urls = isset( $queue['requeueUrls'] ) && is_array( $queue['requeueUrls'] ) ? $queue['requeueUrls'] : array();
+		$again_ids  = isset( $queue['requeueProductIds'] ) && is_array( $queue['requeueProductIds'] ) ? array_map( 'absint', $queue['requeueProductIds'] ) : array();
+		$urls       = isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? $queue['urls'] : array();
+		$ids        = isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? array_map( 'absint', $queue['productIds'] ) : array();
+
+		$queue['urls']       = array_values( array_unique( array_merge( array_diff( $urls, array_diff( $done_urls, $again_urls ) ) ) ) );
+		$queue['productIds'] = array_values( array_unique( array_merge( array_diff( $ids, array_diff( $done_ids, $again_ids ) ) ) ) );
+		if ( empty( $queue['productIds'] ) ) {
+			$queue['productOverflow'] = false;
+		}
+		return self::strip_claim( $queue );
 	}
 
 	/**
@@ -861,7 +1164,11 @@ final class Mobo_Core_Cache_Purger {
 			'intervalMinutes' => self::archive_purge_interval_minutes(),
 			'pendingUrlCount' => isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? count( $queue['urls'] ) : 0,
 			'pendingProductCount' => isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? count( $queue['productIds'] ) : 0,
-			'requiresSitewideFallback' => ! empty( $queue['productOverflow'] ),
+			'requiresSitewideFallback' => ! empty( $queue['productOverflow'] ) && self::MODE_AGGRESSIVE === self::integration_mode(),
+			'productOverflow' => ! empty( $queue['productOverflow'] ),
+			'urlOverflow'     => ! empty( $queue['urlOverflow'] ),
+			'droppedUrlCount' => isset( $queue['droppedUrlCount'] ) ? absint( $queue['droppedUrlCount'] ) : 0,
+			'lastHasMore'     => ! empty( $last['hasMore'] ),
 			'queuedAt'        => self::format_timestamp( isset( $queue['queuedAt'] ) ? absint( $queue['queuedAt'] ) : 0 ),
 			'dueAt'           => self::format_timestamp( isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0 ),
 			'lastAttemptAt'   => self::format_timestamp( isset( $last['attemptedAt'] ) ? absint( $last['attemptedAt'] ) : 0 ),
@@ -896,9 +1203,35 @@ final class Mobo_Core_Cache_Purger {
 			$merged_reasons = array_values( array_unique( array_filter( array_map( 'sanitize_key', array_merge( $existing_reasons, (array) $reasons ) ) ) ) );
 			$product_overflow = ! empty( $queue['productOverflow'] ) || count( $merged_products ) > self::ARCHIVE_QUEUE_MAX_PRODUCTS;
 
+			$url_overflow     = ! empty( $queue['urlOverflow'] ) || count( $merged_urls ) > self::ARCHIVE_QUEUE_MAX_URLS;
+			$dropped_urls     = ( isset( $queue['droppedUrlCount'] ) ? absint( $queue['droppedUrlCount'] ) : 0 ) + max( 0, count( $merged_urls ) - self::ARCHIVE_QUEUE_MAX_URLS );
+
 			$merged_urls     = array_slice( $merged_urls, 0, self::ARCHIVE_QUEUE_MAX_URLS );
 			$merged_products = array_slice( $merged_products, 0, self::ARCHIVE_QUEUE_MAX_PRODUCTS );
 			$merged_reasons  = array_slice( $merged_reasons, 0, 50 );
+
+			/*
+			 * Keep a live processing claim. Previously every enqueue rewrote the
+			 * snapshot without the token, so the in-flight pass was "superseded"
+			 * and the whole queue was purged again; with bounded passes that would
+			 * starve the remainder during a sync burst.
+			 */
+			$claim = array();
+			$token = isset( $queue['processingToken'] ) ? trim( (string) $queue['processingToken'] ) : '';
+			if ( '' !== $token && absint( isset( $queue['processingUntil'] ) ? $queue['processingUntil'] : 0 ) > $now ) {
+				$processing_urls = isset( $queue['processingUrls'] ) && is_array( $queue['processingUrls'] ) ? $queue['processingUrls'] : array();
+				$processing_ids  = isset( $queue['processingProductIds'] ) && is_array( $queue['processingProductIds'] ) ? array_map( 'absint', $queue['processingProductIds'] ) : array();
+				$requeue_urls    = isset( $queue['requeueUrls'] ) && is_array( $queue['requeueUrls'] ) ? $queue['requeueUrls'] : array();
+				$requeue_ids     = isset( $queue['requeueProductIds'] ) && is_array( $queue['requeueProductIds'] ) ? array_map( 'absint', $queue['requeueProductIds'] ) : array();
+				$claim = array(
+					'processingToken'      => $token,
+					'processingUntil'      => absint( $queue['processingUntil'] ),
+					'processingUrls'       => $processing_urls,
+					'processingProductIds' => $processing_ids,
+					'requeueUrls'          => array_values( array_unique( array_merge( $requeue_urls, array_intersect( $urls, $processing_urls ) ) ) ),
+					'requeueProductIds'    => array_values( array_unique( array_merge( $requeue_ids, array_intersect( array_map( 'absint', (array) $product_ids ), $processing_ids ) ) ) ),
+				);
+			}
 
 			$current_due = isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0;
 			$new_due     = $now + ( $interval * MINUTE_IN_SECONDS );
@@ -915,8 +1248,13 @@ final class Mobo_Core_Cache_Purger {
 				'urls'            => $merged_urls,
 				'productIds'      => $merged_products,
 				'productOverflow' => $product_overflow,
+				'urlOverflow'     => $url_overflow,
+				'droppedUrlCount' => $dropped_urls,
 				'reasons'         => $merged_reasons,
 			);
+			if ( ! empty( $claim ) ) {
+				$queue = array_merge( $queue, $claim );
+			}
 			self::write_archive_queue( $queue );
 			return array( 'queued' => true, 'urlCount' => count( $merged_urls ), 'productCount' => count( $merged_products ), 'dueAt' => $due_at );
 		} finally {
@@ -924,11 +1262,12 @@ final class Mobo_Core_Cache_Purger {
 		}
 	}
 
-	private static function purge_wp_rocket_archive_targets( $product_ids, $urls ) {
-		unset( $product_ids ); // Archive roots are purged directly; product pages were already invalidated immediately.
+	private static function purge_wp_rocket_archive_targets( $product_ids, $urls, $allow_home = false ) {
+		unset( $product_ids ); // Archive roots and deferred product URLs are purged directly.
 		if ( ! function_exists( 'rocket_clean_files' ) && ! function_exists( 'rocket_clean_home' ) ) {
 			return false;
 		}
+		$allow_home = $allow_home && (bool) apply_filters( 'mobo_core_cache_allow_home_purge', true );
 		$home = trailingslashit( home_url( '/' ) );
 		$files = array();
 		$purge_home = false;
@@ -942,7 +1281,8 @@ final class Mobo_Core_Cache_Purger {
 		if ( ! empty( $files ) && function_exists( 'rocket_clean_files' ) ) {
 			rocket_clean_files( array_values( array_unique( $files ) ) );
 		}
-		if ( $purge_home && function_exists( 'rocket_clean_home' ) ) {
+		if ( $purge_home && $allow_home && function_exists( 'rocket_clean_home' ) ) {
+			// Home page + its pagination only (never rocket_clean_domain); aggressive mode only.
 			rocket_clean_home();
 		}
 		return true;
@@ -1207,7 +1547,7 @@ final class Mobo_Core_Cache_Purger {
 			'status'       => 'not-needed',
 		);
 
-		if ( empty( $product_ids ) || ! class_exists( 'Mobo_Core_Cache_Warmer' ) || ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) ) {
+		if ( empty( $product_ids ) || ! class_exists( 'Mobo_Core_Cache_Warmer' ) || ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '0' ) ) {
 			return $result;
 		}
 
@@ -1241,7 +1581,11 @@ final class Mobo_Core_Cache_Purger {
 		$pending = 0;
 		$admission = array( 'queued' => 0, 'skippedCold' => 0, 'capacityRejected' => 0, 'writeFailures' => 0 );
 		foreach ( array_values( array_unique( array_filter( array_map( 'absint', (array) $product_ids ) ) ) ) as $product_id ) {
-			$enqueue = Mobo_Core_Cache_Warmer::enqueue_product( $product_id, '', 'targeted-product-purge' );
+			try {
+				$enqueue = Mobo_Core_Cache_Warmer::enqueue_product( $product_id, '', 'targeted-product-purge' );
+			} catch ( Throwable $e ) {
+				$enqueue = array( 'success' => false, 'status' => 'exception', 'queued' => false );
+			}
 			if ( ! empty( $enqueue['queued'] ) ) {
 				$queued++;
 				$admission['queued']++;
@@ -1279,6 +1623,10 @@ final class Mobo_Core_Cache_Purger {
 				 * queue, but create only one post-recovery serial warmup intent. */
 				Mobo_Core_Recovery_Coordinator::mark_post_recovery_warmup_pending();
 				$result['status'] = 'queued-after-recovery';
+			} elseif ( self::MODE_AGGRESSIVE !== self::integration_mode() ) {
+				/* Safe mode: no extra loopback just for warmup; the next real cron
+				 * or an already scheduled runner drains the bounded queue. */
+				$result['status'] = 'queued-for-next-runner';
 			} elseif ( class_exists( 'Mobo_Core_Self_Runner' ) ) {
 				try {
 					Mobo_Core_Self_Runner::kick( 'cache-warmup-queued', false );
@@ -1358,6 +1706,10 @@ final class Mobo_Core_Cache_Purger {
 			'consecutiveFailures' => isset( $stored['consecutiveFailures'] ) ? absint( $stored['consecutiveFailures'] ) : 0,
 			'reasons'             => isset( $stored['reasons'] ) && is_array( $stored['reasons'] ) ? array_values( array_slice( $stored['reasons'], 0, 20 ) ) : array(),
 			'lastError'           => isset( $stored['lastError'] ) ? self::sanitize_error( $stored['lastError'] ) : '',
+			'integrationMode'     => self::integration_mode(),
+			'burstActive'         => self::is_burst_active(),
+			'deferredUrlCount'    => isset( $stored['deferredUrlCount'] ) ? absint( $stored['deferredUrlCount'] ) : 0,
+			'staleUrlCount'       => isset( $stored['staleUrlCount'] ) ? absint( $stored['staleUrlCount'] ) : 0,
 			'archiveQueue'        => $archive_queue_status,
 			'warmupQueue'         => $warmup_queue_status,
 			'integrations'        => $integrations,

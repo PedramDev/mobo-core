@@ -69,8 +69,10 @@ class Mobo_Core_Settings {
 			// Per-Connection; OFF by default (portal-ir/mobomobo.ir must not sync descriptions).
 			'global_product_auto_description'     => '0',
 			'mobo_core_cache_archive_purge_interval_minutes' => '15',
-			// Exact product-page cache warmup after successful targeted purge.
-			'mobo_core_cache_warmup_enabled'             => '1',
+			// Cache-plugin integration mode: off | safe (default) | aggressive.
+			'mobo_core_cache_integration_mode'           => 'safe',
+			// Exact product-page cache warmup after successful targeted purge (opt-in).
+			'mobo_core_cache_warmup_enabled'             => '0',
 			'mobo_core_cache_warmup_policy'              => 'selective',
 			'mobo_core_cache_warmup_batch_size'          => 2,
 			'mobo_core_cache_warmup_debounce_seconds'    => 15,
@@ -982,6 +984,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_description' => 'دریافت توضیحات محصول از منبع',
 			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی صفحات مرتبط',
 			'mobo_core_cache_warmup_enabled' => 'پیش‌بارگذاری صفحه محصول بعد از بروزرسانی',
+			'mobo_core_cache_integration_mode' => 'حالت هماهنگی با افزونه کش',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
 			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
 			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',
@@ -1195,6 +1198,26 @@ class Mobo_Core_Settings {
 	}
 
 
+
+	/**
+	 * Allowed cache-plugin integration modes.
+	 *
+	 * @return array
+	 */
+	public static function cache_integration_modes() {
+		return array( 'off', 'safe', 'aggressive' );
+	}
+
+	/**
+	 * Normalize the cache-plugin integration mode; unknown values become safe.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return string
+	 */
+	public static function sanitize_cache_integration_mode( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+		return in_array( $value, self::cache_integration_modes(), true ) ? $value : 'safe';
+	}
 
 	/**
 	 * Allowed deferred archive purge intervals in minutes.

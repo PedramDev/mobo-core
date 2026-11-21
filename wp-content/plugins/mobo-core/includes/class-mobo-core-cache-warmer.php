@@ -9,6 +9,11 @@
  *
  * No home/category/tag/shop URLs are warmed by this class.
  *
+ * Warmup is opt-in (default off since 10.34.77). It never runs on storefront
+ * requests (only the Mobo runner calls process_batch()), pauses while a
+ * product-change burst is coalescing purges, is limited to 2 URLs per slice
+ * in the safe cache-integration mode and is disabled in the off mode.
+ *
  * PHP 7.4 compatible.
  *
  * @package MoboCore
@@ -256,8 +261,21 @@ final class Mobo_Core_Cache_Warmer {
 		$deadline = $started + $time_budget_seconds;
 		$result = array( 'success' => true, 'status' => 'empty', 'processed' => 0, 'warmed' => 0, 'hotProcessed' => 0, 'warmProcessed' => 0, 'verifiedHit' => 0, 'unverified' => 0, 'cacheBypass' => 0,
 			'failed' => 0, 'dropped' => 0, 'deferred' => 0, 'remaining' => false, 'remainingDue' => false, 'pendingCount' => 0, 'lastError' => '', 'source' => $source );
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) ) {
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '0' ) ) {
 			$result['status'] = 'disabled'; self::persist_last_result( $result, $started ); return $result;
+		}
+		$integration_mode = class_exists( 'Mobo_Core_Cache_Purger' ) ? Mobo_Core_Cache_Purger::integration_mode() : 'safe';
+		if ( 'off' === $integration_mode ) {
+			$result['status'] = 'disabled-by-mode'; self::persist_last_result( $result, $started ); return $result;
+		}
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && Mobo_Core_Cache_Purger::is_burst_active() ) {
+			/* A mass change is in progress: page-cache purges are coalesced and the
+			 * host is busy. Keep the queue; warm after the burst window ends. */
+			$result['status'] = 'deferred-cache-burst'; $result['remaining'] = true;
+			self::persist_last_result( $result, $started ); return $result;
+		}
+		if ( 'aggressive' !== $integration_mode ) {
+			$limit = min( $limit, 2 );
 		}
 		if ( ! self::row_store_ready() ) {
 			$result['success'] = false; $result['status'] = 'storage-unavailable'; $result['lastError'] = 'Warmup row storage is unavailable.';
@@ -389,7 +407,8 @@ final class Mobo_Core_Cache_Warmer {
 	 * @return bool
 	 */
 	public static function has_due_work() {
-		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) || ! self::row_store_ready() ) { return false; }
+		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '0' ) || ! self::row_store_ready() ) { return false; }
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && ( 'off' === Mobo_Core_Cache_Purger::integration_mode() || Mobo_Core_Cache_Purger::is_burst_active() ) ) { return false; }
 		return Mobo_Core_Work_Queue_Store::has_due_one( self::QUEUE_TYPE_HOT ) || Mobo_Core_Work_Queue_Store::has_due_one( self::QUEUE_TYPE );
 	}
 
@@ -402,7 +421,7 @@ final class Mobo_Core_Cache_Warmer {
 		$oldest = '' !== $stats['oldestAt'] ? strtotime( $stats['oldestAt'] . ' UTC' ) : 0;
 		$next = '' !== $stats['nextAt'] ? strtotime( $stats['nextAt'] . ' UTC' ) : 0;
 		return array(
-			'enabled' => Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ),
+			'enabled' => Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '0' ),
 			'policy' => sanitize_key( (string) Mobo_Core_Settings::get( 'mobo_core_cache_warmup_policy', 'selective' ) ),
 			'queueCapacity' => self::QUEUE_MAX_ITEMS, 'warmCapacity' => self::WARM_MAX_ITEMS, 'hotReservedCapacity' => self::QUEUE_MAX_ITEMS - self::WARM_MAX_ITEMS,
 			'pendingCount' => $stats['pending'], 'dueCount' => $stats['due'],

@@ -1568,8 +1568,9 @@ class Mobo_Core_Cron_Runner {
 		 */
 		$cache_side_effect_pressure = $webhook_due_pressure
 			|| ! empty( $round['parentFinalize']['remainingDue'] )
-			|| ! empty( $round['imageQueue']['remaining'] );
-		if ( Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) && $this->option_queue_has_items( 'mobo_core_cache_warmup_queue', 'items' ) && class_exists( 'Mobo_Core_Cache_Warmer' ) && ! isset( $disabled_stages['cacheWarmup'] ) && $allow_cache_warmup && ! $this->stage_circuit_open( $config, 'cacheWarmup' ) && ! $cache_side_effect_pressure ) {
+			|| ! empty( $round['imageQueue']['remaining'] )
+			|| $this->cache_warmup_host_pressure( $config, $deadline );
+		if ( Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '0' ) && $this->option_queue_has_items( 'mobo_core_cache_warmup_queue', 'items' ) && class_exists( 'Mobo_Core_Cache_Warmer' ) && ! isset( $disabled_stages['cacheWarmup'] ) && $allow_cache_warmup && ! $this->stage_circuit_open( $config, 'cacheWarmup' ) && ! $cache_side_effect_pressure ) {
 			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
 				/* UX60: claim the durable fairness turn only at the actual execution
 				 * boundary. No work/GET is allowed when the cursor cannot be saved. */
@@ -2158,6 +2159,33 @@ class Mobo_Core_Cron_Runner {
 		return is_array( $state ) && 'running' === sanitize_key( (string) ( isset( $state['status'] ) ? $state['status'] : '' ) );
 	}
 
+
+	/**
+	 * Whether cache warmup should yield to host pressure in this round.
+	 *
+	 * Warmup GETs render full storefront pages; on shared hosting they compete
+	 * with shoppers for PHP workers. Skip them while the adaptive tuner reports a
+	 * memory/time-pressure profile, while a product-change burst is coalescing
+	 * page-cache purges, or when little of this invocation's budget remains.
+	 *
+	 * @param array $config Runner config.
+	 * @param float $deadline Absolute deadline.
+	 * @return bool
+	 */
+	private function cache_warmup_host_pressure( $config, $deadline ) {
+		try {
+			$tuning_mode = isset( $config['adaptiveTuning']['mode'] ) ? (string) $config['adaptiveTuning']['mode'] : '';
+			if ( in_array( $tuning_mode, array( 'conservative', 'cautious' ), true ) ) {
+				return true;
+			}
+			if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'is_burst_active' ) && Mobo_Core_Cache_Purger::is_burst_active() ) {
+				return true;
+			}
+			return ( (float) $deadline - microtime( true ) ) < 4.0;
+		} catch ( Throwable $e ) {
+			return true;
+		}
+	}
 
 	/**
 	 * Cheap option-backed queue preflight used to avoid autoloading queue classes

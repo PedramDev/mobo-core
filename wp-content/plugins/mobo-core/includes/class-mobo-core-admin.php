@@ -2678,7 +2678,8 @@ class Mobo_Core_Admin {
 					</div>
 					<div class="mobo-fields-grid">
 						<?php $this->bool_field( 'بروزرسانی تصاویر محصول', 'global_update_images', false, '', 'اگر روشن باشد، تصاویر جدید یا تغییرکرده در صف مستقل تصویر دریافت و بروزرسانی می‌شوند.' ); ?>
-						<?php $this->bool_field( 'پیش‌بارگذاری صفحه محصول بعد از بروزرسانی', 'mobo_core_cache_warmup_enabled', false, '', 'بعد از تغییر محصول، صفحه همان محصول یک‌بار در پس‌زمینه باز می‌شود تا کش آن برای بازدید بعدی آماده باشد.' ); ?>
+						<?php $this->cache_integration_mode_field(); ?>
+						<?php $this->bool_field( 'پیش‌بارگذاری صفحه محصول بعد از بروزرسانی', 'mobo_core_cache_warmup_enabled', false, '', 'اختیاری و به‌طور پیش‌فرض خاموش. بعد از تغییر محصول، صفحه همان محصول یک‌بار در پس‌زمینه باز می‌شود تا کش آن برای بازدید بعدی آماده باشد. این کار فقط در اجرای پس‌زمینه موبو، با فاصله و تعداد محدود انجام می‌شود و هنگام فشار روی هاست یا تغییرات انبوه قیمت متوقف می‌شود. اگر Preload افزونه کش (مثل WP Rocket) روشن است، معمولاً به این گزینه نیازی ندارید.' ); ?>
 						<div class="mobo-field">
 							<label for="mobo_core_cache_warmup_policy">سیاست انتخاب محصولات برای Warmup</label>
 							<select id="mobo_core_cache_warmup_policy" name="mobo_core_cache_warmup_policy">
@@ -2695,7 +2696,7 @@ class Mobo_Core_Admin {
 			<details class="mobo-admin-details mobo-product-technical-notes">
 				<summary>جزئیات فنی همگام‌سازی و کش</summary>
 				<div class="mobo-admin-details__body mobo-product-notes">
-					<div class="mobo-note">تغییرات محصول طوری پردازش می‌شوند که همگام‌سازی اصلی منتظر دانلود تصویر یا آماده‌شدن کش نماند. کش صفحه خود محصول بلافاصله تازه می‌شود و صفحات فروشگاه، دسته‌ها، برچسب‌ها و صفحه اصلی طبق فاصله انتخاب‌شده به‌صورت تجمیعی پاک‌سازی می‌شوند.</div>
+					<div class="mobo-note">تغییرات محصول طوری پردازش می‌شوند که همگام‌سازی اصلی منتظر دانلود تصویر یا آماده‌شدن کش نماند. در حالت امن، کش صفحه خود محصول (حداکثر ۲۵ صفحه در هر درخواست) تازه می‌شود؛ در تغییرات انبوه (مثلاً تغییر قیمت هزاران محصول از منبع) همه صفحات در یک صف تجمیعی قرار می‌گیرند و به‌صورت محدود و مرحله‌ای پاک‌سازی می‌شوند. صفحات فروشگاه، دسته‌ها و برچسب‌ها طبق فاصله انتخاب‌شده پاک‌سازی می‌شوند. موبو هرگز کل کش سایت را پاک نمی‌کند و Preload یا RUCSS افزونه WP Rocket را مستقیماً اجرا نمی‌کند.</div>
 					<div class="mobo-note">در این نسخه محتوای توضیحی/caption از منبع همگام‌سازی نمی‌شود. محصول یا تنوعی که داخل سطل زباله باشد نیز به‌طور خودکار بازیابی یا منتشر نمی‌شود.</div>
 				</div>
 			</details>
@@ -6926,6 +6927,53 @@ https://source.example/products/test-product/
 
 
 	/**
+	 * Cache-plugin integration mode (installation-wide).
+	 *
+	 * @return void
+	 */
+	private function cache_integration_mode_field() {
+		$key   = 'mobo_core_cache_integration_mode';
+		$value = Mobo_Core_Settings::sanitize_cache_integration_mode( get_option( $key, 'safe' ) );
+		$options = array(
+			'safe'       => 'امن — پیشنهادی',
+			'aggressive' => 'تهاجمی',
+			'off'        => 'خاموش',
+		);
+		?>
+		<div class="mobo-field">
+			<label for="<?php echo esc_attr( $key ); ?>">حالت هماهنگی با افزونه کش</label>
+			<select id="<?php echo esc_attr( $key ); ?>" name="<?php echo esc_attr( $key ); ?>">
+				<?php foreach ( $options as $option_value => $label ) : ?>
+					<option value="<?php echo esc_attr( $option_value ); ?>" <?php selected( $value, $option_value ); ?>><?php echo esc_html( $label ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<div class="mobo-help">
+				این تنظیم مشخص می‌کند موبو بعد از همگام‌سازی محصولات چطور با افزونه‌های کش (WP Rocket، LiteSpeed Cache، W3 Total Cache، WP Super Cache) هماهنگ شود.
+				<br><strong>امن (پیشنهادی):</strong> فقط کش صفحه محصولات تغییرکرده و با سقف محدود در هر درخواست پاک می‌شود. اگر تعداد زیادی محصول در مدت کوتاه تغییر کند (مثل تغییر قیمت انبوه از منبع)، پاک‌سازی‌ها تجمیع و مرحله‌ای انجام می‌شوند. صفحه اصلی و کل کش سایت هرگز از طرف همگام‌سازی پاک نمی‌شود. مناسب هاست‌های اشتراکی.
+				<br><strong>تهاجمی:</strong> سقف‌ها بزرگ‌تر است و صفحه اصلی هم در پاک‌سازی تجمیعی دوره‌ای تازه می‌شود. فقط برای سرورهای قوی.
+				<br><strong>خاموش:</strong> موبو هیچ پاک‌سازی کش یا پیش‌بارگذاری انجام نمی‌دهد و صفحات کش‌شده تا پایان عمر کش (مثلاً ۱۰ ساعت در WP Rocket) ممکن است قیمت قدیمی نشان دهند. در هر سه حالت، موبو جلوی پاک‌سازی پشت‌سرهم کل صفحات مرتبط و صفحه اصلی توسط WP Rocket را هنگام ذخیره هر محصول در همگام‌سازی می‌گیرد.
+			</div>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Save the installation-wide cache-plugin integration mode.
+	 *
+	 * @return void
+	 */
+	private function save_cache_integration_mode_from_post() {
+		$key = 'mobo_core_cache_integration_mode';
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- handle_save_settings() verifies mobo_core_nonce before dispatching to this private helper.
+		if ( ! isset( $_POST[ $key ] ) ) {
+			return;
+		}
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- nonce is verified by the caller; value is whitelisted.
+		$value = Mobo_Core_Settings::sanitize_cache_integration_mode( wp_unslash( $_POST[ $key ] ) );
+		update_option( $key, $value, false );
+	}
+
+	/**
 	 * Deferred archive page-cache purge interval.
 	 *
 	 * @return void
@@ -9077,6 +9125,7 @@ https://source.example/products/test-product/
 					)
 				);
 				$this->save_cache_archive_purge_interval_from_post();
+				$this->save_cache_integration_mode_from_post();
 				$policy = isset( $_POST['mobo_core_cache_warmup_policy'] ) ? sanitize_key( wp_unslash( $_POST['mobo_core_cache_warmup_policy'] ) ) : 'selective';
 				Mobo_Core_Settings::update( 'mobo_core_cache_warmup_policy', in_array( $policy, array( 'selective', 'all' ), true ) ? $policy : 'selective', false );
 				break;

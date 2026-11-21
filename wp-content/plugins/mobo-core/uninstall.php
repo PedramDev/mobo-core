@@ -143,6 +143,8 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_cache_archive_purge_interval_minutes' );
 	delete_option( 'mobo_core_cache_archive_purge_queue' );
 	delete_option( 'mobo_core_cache_archive_purge_last_result' );
+	delete_option( 'mobo_core_cache_integration_mode' );
+	delete_option( 'mobo_core_cache_purge_burst_window' );
 	delete_option( 'mobo_core_auto_reconciliation_enabled' );
 	delete_option( 'mobo_core_reconciliation_fast_interval' );
 	delete_option( 'mobo_core_reconciliation_products_per_run' );
