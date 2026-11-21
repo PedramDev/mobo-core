@@ -565,6 +565,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$this->invalidate_post_queue_verification_state();
 
 		$processed = 0;
+		$write_failed = false;
 		$failed    = 0;
 		$skipped   = 0;
 		$superseded = 0;
@@ -622,6 +623,10 @@ class Mobo_Core_Image_Refresh_Service {
 				if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
 					$queue->mark_failure( $id, 'Image refresh exceeded its persisted attempt limit after an interrupted worker.', $total_try_limit, true );
 				}
+				if ( ! $committed && method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+					$write_failed = true;
+					break;
+				}
 				if ( $committed ) {
 					$failed++;
 				} else {
@@ -631,6 +636,12 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 			if ( method_exists( $queue, 'begin_attempt_if_current' )
 				&& ! $queue->begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token ) ) {
+				if ( method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+					/* The attempt checkpoint was not persisted (disk full / DB error):
+					 * do not run the editor without it; the lease expires and retries. */
+					$write_failed = true;
+					break;
+				}
 				if ( method_exists( $queue, 'release_if_superseded' ) ) {
 					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
 				}
@@ -653,6 +664,10 @@ class Mobo_Core_Image_Refresh_Service {
 				$committed  = method_exists( $queue, 'mark_done_if_current' )
 					? $queue->mark_done_if_current( $id, $new_id, $note, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 					: true;
+				if ( ! $committed && method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+					$write_failed = true;
+					break;
+				}
 				if ( ! $committed ) {
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
 						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
@@ -672,6 +687,10 @@ class Mobo_Core_Image_Refresh_Service {
 				$committed = method_exists( $queue, 'mark_skipped_if_current' )
 					? $queue->mark_skipped_if_current( $id, $message, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 					: true;
+				if ( ! $committed && method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+					$write_failed = true;
+					break;
+				}
 				if ( ! $committed ) {
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
 						$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
@@ -691,6 +710,10 @@ class Mobo_Core_Image_Refresh_Service {
 			$committed = method_exists( $queue, 'mark_failure_if_current' )
 				? $queue->mark_failure_if_current( $id, $message, $try_count, ! empty( $result['permanent'] ), $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token )
 				: true;
+			if ( ! $committed && method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+				$write_failed = true;
+				break;
+			}
 			if ( ! $committed ) {
 				if ( method_exists( $queue, 'release_if_superseded' ) ) {
 					$queue->release_if_superseded( $id, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token );
@@ -707,7 +730,8 @@ class Mobo_Core_Image_Refresh_Service {
 		return $this->save_last_result(
 			array(
 				'success'   => true,
-				'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $stopped_by_admin ? 'stopped-by-admin' : 'processed' ),
+				'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $stopped_by_admin ? 'stopped-by-admin' : ( $write_failed ? 'db-write-failed' : 'processed' ) ),
+				'writeFailed' => $write_failed,
 				'processed' => $processed,
 				'failed'    => $failed,
 				'skipped'   => $skipped,
@@ -835,7 +859,16 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		if ( $new_attachment_id <= 0 || 'attachment' !== get_post_type( $new_attachment_id ) ) {
-			return array( 'success' => false, 'message' => 'دریافت یا ثبت تصویر WebP ناموفق بود.' );
+			/* Surface the download guard's reason (truncated body, image too large
+			 * for memory_limit); a too-large source is terminal instead of being
+			 * downloaded again on every retry. */
+			$import_error = method_exists( $image_sync, 'last_import_error' ) ? (string) $image_sync->last_import_error() : '';
+			$too_large    = class_exists( 'Mobo_Core_Image_Integrity' ) && 0 === strpos( $import_error, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX );
+			return array(
+				'success'   => false,
+				'permanent' => $too_large,
+				'message'   => '' !== $import_error ? 'دریافت یا ثبت تصویر WebP ناموفق بود: ' . $import_error : 'دریافت یا ثبت تصویر WebP ناموفق بود.',
+			);
 		}
 
 		if ( ! $this->is_valid_new_attachment( $new_attachment_id ) ) {
@@ -853,8 +886,9 @@ class Mobo_Core_Image_Refresh_Service {
 
 		if ( empty( $subsize_result['success'] ) ) {
 			return array(
-				'success' => false,
-				'message' => 'تصویر WebP دریافت شد، اما کنترل نهایی برش های وردپرس ناموفق بود: ' . sanitize_text_field( isset( $subsize_result['message'] ) ? (string) $subsize_result['message'] : 'خطای نامشخص' ),
+				'success'   => false,
+				'permanent' => ! empty( $subsize_result['permanent'] ),
+				'message'   => 'تصویر WebP دریافت شد، اما کنترل نهایی برش های وردپرس ناموفق بود: ' . sanitize_text_field( isset( $subsize_result['message'] ) ? (string) $subsize_result['message'] : 'خطای نامشخص' ),
 			);
 		}
 
@@ -2390,7 +2424,47 @@ class Mobo_Core_Image_Refresh_Service {
 			);
 		}
 
+		/* Regeneration decodes the full bitmap. Refuse a truncated original or one
+		 * that cannot be decoded within memory_limit before GD/Imagick runs out of
+		 * memory and kills the worker request (refresh queue and normal sync). */
+		$integrity = $this->subsize_integrity_problem( $attachment_id );
+		if ( ! empty( $integrity ) ) {
+			return $integrity;
+		}
+
 		return $this->ensure_attachment_subsizes( $attachment_id );
+	}
+
+	/**
+	 * Integrity / decode-budget gate before subsize regeneration.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array Empty when regeneration may run, otherwise a failed result
+	 *               (code truncated|too_large|memory_headroom, permanent flag).
+	 */
+	private function subsize_integrity_problem( $attachment_id ) {
+		if ( ! class_exists( 'Mobo_Core_Image_Integrity' ) ) {
+			return array();
+		}
+		$file = get_attached_file( absint( $attachment_id ) );
+		$file = is_string( $file ) ? $this->normalize_file_path( $file ) : '';
+		if ( '' === $file || ! is_file( $file ) ) {
+			return array(); /* Missing original is reported by the regular flow. */
+		}
+		$problem = Mobo_Core_Image_Integrity::inspect_file( $file, '' );
+		if ( '' === $problem ) {
+			return array();
+		}
+		$code = 0 === strpos( $problem, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX ) ? 'too_large'
+			: ( 0 === strpos( $problem, Mobo_Core_Image_Integrity::HEADROOM_PREFIX ) ? 'memory_headroom' : 'truncated' );
+		return array(
+			'success'    => false,
+			'code'       => $code,
+			'permanent'  => 'too_large' === $code,
+			'generated'  => 0,
+			'registered' => 0,
+			'message'    => $problem,
+		);
 	}
 
 	/**

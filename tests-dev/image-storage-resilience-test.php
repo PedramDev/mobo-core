@@ -321,6 +321,45 @@ t_same( 1, (int) $res['processed'], '  slice stopped after the first failed writ
 t_same( 'posts', $wpdb->row( 'wp_mobo_image_prune_queue', $r107 )['phase'], '  no progress recorded for the failed row' );
 t_same( 'pending', $wpdb->row( 'wp_mobo_image_prune_queue', $r108 )['status'], '  the next row was not touched' );
 
+echo "\n[8] admin image refresh: integrity gate and failed queue writes\n";
+require $inc . 'class-mobo-core-image-refresh-queue.php';
+require $inc . 'class-mobo-core-image-refresh-service.php';
+$wpdb->pdo->exec( "CREATE TABLE wp_mobo_image_refresh_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, connection_id INTEGER DEFAULT 0, product_id INTEGER DEFAULT 0, image_guid TEXT DEFAULT '', old_attachment_id INTEGER DEFAULT 0, new_attachment_id INTEGER DEFAULT 0, new_source_url TEXT DEFAULT '', status TEXT DEFAULT 'pending', try_count INTEGER DEFAULT 0, next_retry_at TEXT NULL, locked_until TEXT NULL, last_error TEXT NULL, created_at TEXT, updated_at TEXT)" );
+$wpdb->insert( 'wp_mobo_image_refresh_queue', array( 'connection_id' => 1, 'product_id' => 9, 'image_guid' => 'g-r', 'old_attachment_id' => 77, 'new_source_url' => 'https://cdn.test/r.webp', 'status' => 'processing', 'locked_until' => 'tok-r', 'created_at' => $ts, 'updated_at' => $ts ) );
+$rid = $wpdb->insert_id;
+$rq  = new Mobo_Core_Image_Refresh_Queue();
+$wpdb->fail_pattern = '/^UPDATE wp_mobo_image_refresh_queue/';
+t_same( false, $rq->mark_done_if_current( $rid, 501, '', 9, 'g-r', 77, 'https://cdn.test/r.webp', 'tok-r' ), 'refresh done transition fails when the write fails' );
+t_same( true, $rq->last_write_failed(), '  reported as a write failure (worker stops the batch), not as superseded' );
+t_same( false, $rq->begin_attempt_if_current( $rid, 1, 9, 'g-r', 77, 'https://cdn.test/r.webp', 'tok-r' ), 'attempt checkpoint write failure => false' );
+t_same( true, $rq->last_write_failed(), '  reported as a write failure (editor not run without its checkpoint)' );
+$wpdb->fail_pattern = '';
+t_same( false, $rq->mark_done_if_current( $rid, 501, '', 9, 'g-r', 77, 'https://cdn.test/OTHER.webp', 'tok-r' ), 'superseded identity => false' );
+t_same( false, $rq->last_write_failed(), '  but not a write failure (superseded path unchanged)' );
+t_same( true, $rq->mark_done_if_current( $rid, 501, '', 9, 'g-r', 77, 'https://cdn.test/r.webp', 'tok-r' ), 'healthy write commits' );
+$svc_src = (string) file_get_contents( $inc . 'class-mobo-core-image-refresh-service.php' );
+t_check( substr_count( $svc_src, "\$queue->last_write_failed()" ) >= 5 && false !== strpos( $svc_src, "'db-write-failed'" ), 'refresh worker stops (db-write-failed, remaining) on every failed transition write' );
+
+$svc_ref = new ReflectionClass( 'Mobo_Core_Image_Refresh_Service' );
+$svc     = $svc_ref->newInstanceWithoutConstructor();
+$gate    = $svc_ref->getMethod( 'subsize_integrity_problem' );
+$gate->setAccessible( true );
+foreach ( array( 201 => 'huge.png', 202 => 'cut.png', 203 => 'ok.png' ) as $aid => $name ) {
+	copy( $tmp . '/' . $name, $GLOBALS['t_basedir'] . '/2026/11/r-' . $name );
+	$wpdb->insert( 'wp_postmeta', array( 'post_id' => $aid, 'meta_key' => '_wp_attached_file', 'meta_value' => '2026/11/r-' . $name ) );
+}
+if ( function_exists( 'ini_set' ) ) { @ini_set( 'memory_limit', '256M' ); } // 8000x8000 is too large both under 256M and under the unmeasured 50 MP cap.
+$big = $gate->invoke( $svc, 201 );
+t_check( isset( $big['code'] ) && 'too_large' === $big['code'] && true === $big['permanent'], 'subsize regeneration of an 8000x8000 original refused before decode (permanent)' );
+$cutr = $gate->invoke( $svc, 202 );
+t_check( isset( $cutr['code'] ) && 'truncated' === $cutr['code'] && empty( $cutr['permanent'] ), 'truncated original refused (retryable)' );
+t_same( array(), $gate->invoke( $svc, 203 ), 'complete original may be regenerated' );
+$err = $sync_ref->getProperty( 'last_image_error' );
+$err->setAccessible( true );
+$err->setValue( $sync, $I::TOO_LARGE_PREFIX . ' 8000x8000' );
+t_same( $I::TOO_LARGE_PREFIX . ' 8000x8000', $sync->last_import_error(), 'refresh service can read the download guard reason (too large => permanent refresh failure)' );
+t_check( false !== strpos( $svc_src, "'permanent' => \$too_large" ) && false !== strpos( $svc_src, "'permanent' => ! empty( \$subsize_result['permanent'] )" ), 'refresh failures carry the permanent flag for too-large images' );
+
 /* cleanup */
 foreach ( array_reverse( (array) glob( $tmp . '/{,uploads/2026/11/}*', GLOB_BRACE ) ) as $path ) { if ( is_file( $path ) ) { @unlink( $path ); } }
 @rmdir( $tmp . '/uploads/2026/11' ); @rmdir( $tmp . '/uploads/2026' ); @rmdir( $tmp . '/uploads' ); @rmdir( $tmp );

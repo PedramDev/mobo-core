@@ -1539,6 +1539,16 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * @return string
 	 */
+	/**
+	 * Reason of the last failed import (download guard, storage, sideload) for
+	 * callers such as the image refresh service.
+	 *
+	 * @return string
+	 */
+	public function last_import_error() {
+		return $this->get_last_image_error();
+	}
+
 	private function get_last_image_error() {
 		return sanitize_text_field( (string) $this->last_image_error );
 	}
@@ -2406,6 +2416,12 @@ class Mobo_Core_Image_Sync {
 			 * ledger, never triggers a fresh reimport and never becomes terminal.
 			 * A generic editor failure is re-probed: if storage is not ready right
 			 * after the failure, the write most likely failed for lack of space. */
+			if ( is_array( $result ) && isset( $result['code'] ) && 'too_large' === (string) $result['code'] && class_exists( 'Mobo_Core_Image_Integrity' ) ) {
+				/* Terminal like a too-large download (bounded 7-day re-check). */
+				$message = 0 === strpos( $readiness_message, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX ) ? $readiness_message : Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX . ' ' . $readiness_message;
+				$this->set_last_image_error( $message . ( class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ? ' [' . Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER . ']' : '' ) );
+				return false;
+			}
 			if ( $this->is_storage_transient_readiness_failure( $result, $readiness_message ) ) {
 				$this->set_last_image_error( Mobo_Core_Image_Reimport_Ledger::STORAGE_NOT_READY_PREFIX . ' ' . $readiness_message );
 				return false;
