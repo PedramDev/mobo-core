@@ -430,10 +430,20 @@ class Mobo_Core_Revenue_Ledger {
 		$cursor = absint( get_option( 'mobo_core_103477_revenue_ledger_backfill_cursor', 0 ) );
 		$blocked_ids = get_option( 'mobo_core_103477_revenue_ledger_backfill_blocked_ids', array() );
 		$blocked_ids = is_array($blocked_ids)?array_values(array_unique(array_filter(array_map('absint',$blocked_ids)))):array();
-		$ids = $wpdb->get_col( $wpdb->prepare(
-			"SELECT DISTINCT v.post_id FROM {$wpdb->postmeta} v INNER JOIN {$wpdb->postmeta} r ON r.post_id=v.post_id AND r.meta_key=%s WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d ORDER BY v.post_id ASC LIMIT %d",
-			self::META_LEDGER_RECORD, self::META_LEDGER_VERSION, (string)self::LEDGER_VERSION, $cursor, $limit
-		) );
+		/* HPOS authoritative with compatibility sync off: ledgers written after the
+		 * switch exist only in the HPOS meta table. A second phase walks that table
+		 * (order_id cursor) after wp_postmeta is exhausted. */
+		$hpos_meta_table = self::hpos_meta_table();
+		$phase = sanitize_key( (string) get_option( 'mobo_core_103477_revenue_ledger_backfill_phase', 'postmeta' ) );
+		if ( 'hpos' !== $phase || '' === $hpos_meta_table ) {
+			$phase = 'postmeta';
+		}
+		$scan = self::backfill_candidate_sql( $phase, $hpos_meta_table );
+		$wpdb->last_error = '';
+		$ids = $wpdb->get_col( $wpdb->prepare( $scan['select'], self::META_LEDGER_RECORD, self::META_LEDGER_VERSION, (string)self::LEDGER_VERSION, $cursor, $limit ) );
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			$result['status'] = 'read-failed'; $result['remaining'] = 1; return $result;
+		}
 		$ids=is_array($ids)?array_values(array_filter(array_map('absint',$ids))):array();
 		$last_cursor=$cursor;
 
@@ -469,13 +479,60 @@ class Mobo_Core_Revenue_Ledger {
 			$blocked_ids=array_values(array_diff($blocked_ids,array($order_id))); if(!$already_embedded||!$already_owner)$result['updated']++;
 		}
 		update_option('mobo_core_103477_revenue_ledger_backfill_cursor',$last_cursor,false);
-		$more=absint($wpdb->get_var($wpdb->prepare("SELECT MIN(v.post_id) FROM {$wpdb->postmeta} v WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d",self::META_LEDGER_VERSION,(string)self::LEDGER_VERSION,$last_cursor)));
+		$more=absint($wpdb->get_var($wpdb->prepare($scan['more'],self::META_LEDGER_VERSION,(string)self::LEDGER_VERSION,$last_cursor)));
 		$blocked_ids=array_values(array_unique(array_filter(array_map('absint',$blocked_ids)))); update_option('mobo_core_103477_revenue_ledger_backfill_blocked_ids',$blocked_ids,false);
-		if($more>0){$result['remaining']=1;}else{delete_option('mobo_core_103477_revenue_ledger_backfill_cursor');$result['remaining']=count($blocked_ids);}
+		if($more>0){$result['remaining']=1;}
+		elseif('postmeta'===$phase&&''!==$hpos_meta_table){
+			/* wp_postmeta exhausted; continue with the HPOS-only ledgers. */
+			update_option('mobo_core_103477_revenue_ledger_backfill_phase','hpos',false);
+			delete_option('mobo_core_103477_revenue_ledger_backfill_cursor');
+			$result['remaining']=1;
+		}
+		else{delete_option('mobo_core_103477_revenue_ledger_backfill_cursor');delete_option('mobo_core_103477_revenue_ledger_backfill_phase');$result['remaining']=count($blocked_ids);}
 		$result['blocked']=count($blocked_ids);$result['blockedIds']=array_slice($blocked_ids,0,25);if($result['remaining']>0&&$result['updated']===0)$result['status']='blocked';
 		if($result['updated']>0)$this->invalidate_summary_cache(); return $result;
 	}
 
+
+	/**
+	 * HPOS order meta table when HPOS is the authoritative order store ('' otherwise).
+	 *
+	 * @return string
+	 */
+	public static function hpos_meta_table() {
+		global $wpdb;
+		$util = '\\Automattic\\WooCommerce\\Utilities\\OrderUtil';
+		if ( ! class_exists( $util ) || ! method_exists( $util, 'custom_orders_table_usage_is_enabled' ) || ! call_user_func( array( $util, 'custom_orders_table_usage_is_enabled' ) ) ) {
+			return '';
+		}
+		$store = '\\Automattic\\WooCommerce\\Internal\\DataStores\\Orders\\OrdersTableDataStore';
+		if ( class_exists( $store ) && method_exists( $store, 'get_meta_table_name' ) ) {
+			return (string) call_user_func( array( $store, 'get_meta_table_name' ) );
+		}
+		return $wpdb->prefix . 'wc_orders_meta';
+	}
+
+	/**
+	 * Pure: candidate discovery SQL for one backfill phase.
+	 *
+	 * @param string $phase postmeta|hpos.
+	 * @param string $hpos_meta_table HPOS meta table.
+	 * @return array{select:string,more:string}
+	 */
+	public static function backfill_candidate_sql( $phase, $hpos_meta_table ) {
+		global $wpdb;
+		if ( 'hpos' === $phase && '' !== (string) $hpos_meta_table ) {
+			$t = preg_replace( '/[^A-Za-z0-9_]/', '', (string) $hpos_meta_table );
+			return array(
+				'select' => "SELECT DISTINCT v.order_id FROM {$t} v INNER JOIN {$t} r ON r.order_id=v.order_id AND r.meta_key=%s WHERE v.meta_key=%s AND v.meta_value=%s AND v.order_id>%d ORDER BY v.order_id ASC LIMIT %d",
+				'more'   => "SELECT MIN(v.order_id) FROM {$t} v WHERE v.meta_key=%s AND v.meta_value=%s AND v.order_id>%d",
+			);
+		}
+		return array(
+			'select' => "SELECT DISTINCT v.post_id FROM {$wpdb->postmeta} v INNER JOIN {$wpdb->postmeta} r ON r.post_id=v.post_id AND r.meta_key=%s WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d ORDER BY v.post_id ASC LIMIT %d",
+			'more'   => "SELECT MIN(v.post_id) FROM {$wpdb->postmeta} v WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d",
+		);
+	}
 
 	/**
 	 * Build a revenue summary. A positive Connection id scopes every record to the

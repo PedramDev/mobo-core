@@ -150,6 +150,17 @@ function mobo_core_cron_run() {
 		mobo_core_cron_emit_json( array( 'success' => false, 'status' => 'plugin-not-loaded', 'message' => 'Mobo Core is inactive or unavailable.' ), 1, '', $base_ob_level, 503 );
 	}
 
+	/* The autoloader is registered even when the plugin bootstrap stopped because
+	 * WooCommerce (or another requirement) is missing. Running the worker then
+	 * fatals on the first wc_* call; answer a clean 503 instead. The function
+	 * checks also catch a WooCommerce that is listed as active but failed to load. */
+	$requirements_met = class_exists( 'Mobo_Core_Dependencies' ) && method_exists( 'Mobo_Core_Dependencies', 'requirements_met' )
+		? Mobo_Core_Dependencies::requirements_met()
+		: true;
+	if ( ! $requirements_met || ! function_exists( 'WC' ) || ! function_exists( 'wc_get_product' ) ) {
+		mobo_core_cron_emit_json( array( 'success' => false, 'status' => 'dependency-missing', 'message' => 'WooCommerce (or another Mobo Core requirement) is not active; the worker did not run.' ), 1, '', $base_ob_level, 503 );
+	}
+
 	Mobo_Core_Cron_Runner::record_real_cron_hit();
 
 	$dispatch_claim = class_exists( 'Mobo_Core_Self_Runner' )

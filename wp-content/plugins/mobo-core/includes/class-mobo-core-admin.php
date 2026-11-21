@@ -1924,7 +1924,7 @@ class Mobo_Core_Admin {
 			if ( is_numeric( $last_sync_raw ) ) {
 				$last_sync_label = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $last_sync_raw ) );
 			} else {
-				$last_sync_timestamp = strtotime( $last_sync_raw );
+				$last_sync_timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $last_sync_raw ) : strtotime( $last_sync_raw ) );
 				$last_sync_label = false !== $last_sync_timestamp
 					? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $last_sync_timestamp )
 					: $last_sync_raw;
@@ -5070,7 +5070,7 @@ type:{mobo_order_type_label}</textarea>
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'Cron واقعی MoboCore', ! empty( $status['isActive'] ) ? ( ! empty( $status['isOverdue'] ) ? 'Hit قبلی ثبت شده؛ اکنون عقب افتاده' : 'Hit اخیر ثبت شده' ) : 'تشخیص داده نشده' ); ?>
+						<?php $this->status_box( 'Cron واقعی MoboCore', ! empty( $status['isActive'] ) ? ( ! empty( $status['isOverdue'] ) ? 'Hit قبلی ثبت شده؛ اکنون عقب افتاده' : 'Hit اخیر ثبت شده' ) : ( ! empty( $status['driverActive'] ) ? 'Cron سرور تشخیص داده نشد؛ کارها با Heartbeat بک‌اند اجرا می‌شوند' : 'تشخیص داده نشده' ) ); ?>
 						<?php $this->status_box( 'آخرین اجرای کران واقعی', ! empty( $status['lastHitAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastHitAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'آخرین اجرای کاملاً سالم Runner', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'اجرای بعدی Cron، تقریبی', ! empty( $status['lastHitAt'] ) && ! empty( $status['nextEstimatedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextEstimatedAt'] ) ) : '—' ); ?>

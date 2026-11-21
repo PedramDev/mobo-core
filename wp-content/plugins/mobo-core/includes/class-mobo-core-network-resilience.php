@@ -70,7 +70,7 @@ final class Mobo_Core_Network_Resilience {
 		if ( preg_match( '/^[0-9]+$/D', $value ) ) {
 			return min( self::MAX_BACKOFF_SECONDS, max( 0, absint( $value ) ) );
 		}
-		$timestamp = strtotime( $value );
+		$timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $value ) : strtotime( $value ) );
 		if ( false === $timestamp ) {
 			return 0;
 		}

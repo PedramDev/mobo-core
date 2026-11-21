@@ -63,6 +63,7 @@ class Mobo_Core_Cron_Runner {
 		if ( self::is_real_scheduler_source( $source ) && ! $scheduler_hit_recorded ) {
 			self::record_real_cron_hit();
 		}
+		self::record_driver_run( $source );
 
 
 		/* Database migration is driven by the customer's existing real cron and is no
@@ -376,6 +377,47 @@ class Mobo_Core_Cron_Runner {
 	}
 
 	/**
+	 * Record that some driver (real cron, Backend heartbeat, worker/run,
+	 * self-runner) started the runner. Health uses it so a heartbeat-only site is
+	 * not reported as "cron not detected".
+	 *
+	 * @param string $source Runner source.
+	 * @return void
+	 */
+	public static function record_driver_run( $source ) {
+		$source = sanitize_key( (string) $source );
+		$last   = get_option( 'mobo_core_runner_last_driver_run', array() );
+		if ( is_array( $last ) && $source === ( $last['source'] ?? '' ) && ( time() - absint( $last['at'] ?? 0 ) ) < 30 ) {
+			return; /* Throttled: one write per driver per 30 s is enough for health. */
+		}
+		update_option( 'mobo_core_runner_last_driver_run', array( 'at' => time(), 'source' => $source ), false );
+	}
+
+	/**
+	 * Pure: scheduler activity label for health.
+	 *
+	 * @param int    $last_self_run Self-runner last run.
+	 * @param int    $last_cron_hit Real cron last hit.
+	 * @param int    $last_driver_run Any driver last run.
+	 * @param string $driver_source Source of that run.
+	 * @param int    $now Unix time.
+	 * @return string self_runner|real_cron|portal_heartbeat|other_driver|not_detected
+	 */
+	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now ) {
+		if ( absint( $last_self_run ) > 0 ) {
+			return 'self_runner';
+		}
+		if ( absint( $last_cron_hit ) > 0 ) {
+			return 'real_cron';
+		}
+		$last_driver_run = absint( $last_driver_run );
+		if ( $last_driver_run > 0 && ( absint( $now ) - $last_driver_run ) < HOUR_IN_SECONDS ) {
+			return 'portal-heartbeat' === sanitize_key( (string) $driver_source ) ? 'portal_heartbeat' : 'other_driver';
+		}
+		return 'not_detected';
+	}
+
+	/**
 	 * Build a secure cron URL for the current site.
 	 *
 	 * @return string
@@ -448,8 +490,14 @@ class Mobo_Core_Cron_Runner {
 		$next_estimated_at = $last_hit > 0 ? $last_hit + $expected_interval : 0;
 		$is_overdue        = $next_estimated_at > 0 && time() > ( $next_estimated_at + $tolerance );
 		$lock_status       = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'real_cron_runner' ) : array();
+		$driver_run        = get_option( 'mobo_core_runner_last_driver_run', array() );
+		$driver_run        = is_array( $driver_run ) ? $driver_run : array();
+		$driver_run_at     = absint( isset( $driver_run['at'] ) ? $driver_run['at'] : 0 );
 
 		return array(
+			'lastDriverRunAt'         => $driver_run_at,
+			'lastDriverSource'        => isset( $driver_run['source'] ) ? sanitize_key( (string) $driver_run['source'] ) : '',
+			'driverActive'            => $driver_run_at > 0 && ( time() - $driver_run_at ) < HOUR_IN_SECONDS,
 			'cronEndpoint'            => self::build_cron_endpoint(),
 			'cronUrl'                 => self::build_cron_url(),
 			'lastHitAt'               => $last_hit,
@@ -502,6 +550,8 @@ class Mobo_Core_Cron_Runner {
 		return array(
 			'pluginVersion'           => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'lastHitAt'               => isset( $status['lastHitAt'] ) ? absint( $status['lastHitAt'] ) : 0,
+			'lastDriverRunAt'         => isset( $status['lastDriverRunAt'] ) ? absint( $status['lastDriverRunAt'] ) : 0,
+			'lastDriverSource'        => isset( $status['lastDriverSource'] ) ? sanitize_key( (string) $status['lastDriverSource'] ) : '',
 			'lastSuccessAt'           => isset( $status['lastSuccessAt'] ) ? absint( $status['lastSuccessAt'] ) : 0,
 			'expectedIntervalSeconds' => isset( $status['expectedIntervalSeconds'] ) ? absint( $status['expectedIntervalSeconds'] ) : 0,
 			'scheduleToleranceSeconds'=> isset( $status['scheduleToleranceSeconds'] ) ? absint( $status['scheduleToleranceSeconds'] ) : 0,
