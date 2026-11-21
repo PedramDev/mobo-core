@@ -3,11 +3,16 @@
  * Safe automation coordinator for the full-source image refresh workflow.
  *
  * It advances one bounded workflow batch per cron/self-runner slice. Read-only
- * scans, queue creation, replacement, WebP subsize verification/repair and
- * post-replacement cleanup are fully autonomous. The administrator starts one
- * workflow and the coordinator performs storage cleanup, retry/backoff, safe
- * deletion and quarantine decisions without manual approval or pause gates. A
- * Product Repair is only a prerequisite and is never started by this workflow.
+ * scans, queue creation, replacement, WebP subsize verification/repair, retry/
+ * backoff and quarantine decisions are autonomous. Two administrator controls
+ * are authoritative:
+ * - Stop/Pause (OPTION_PAUSED) halts the workflow; workers re-check it before
+ *   every queue row, deleted attachment and deleted file family.
+ * - Permanent deletion (preflight collision/orphan cleanup, inline old-image
+ *   deletion, Stage 7 and Stage 9) runs only after an explicit approval that is
+ *   bound to the current generation (OPTION_DELETE_APPROVED); otherwise those
+ *   stages wait and keep every old attachment/file.
+ * A Product Repair is only a prerequisite and is never started by this workflow.
  *
  * PHP 7.4 compatible.
  */
@@ -36,6 +41,73 @@ class Mobo_Core_Image_Refresh_Automation {
 		const OPTION_GENERATION_ID           = 'mobo_core_image_refresh_generation_id';
 		const OPTION_GENERATION_STARTED_AT   = 'mobo_core_image_refresh_generation_started_at';
 		const OPTION_GENERATION_STATS        = 'mobo_core_image_refresh_generation_stats';
+	/** Administrator Stop/Pause flag. While '1' no tick, queue row or delete runs. */
+	const OPTION_PAUSED                  = 'mobo_core_image_refresh_automation_paused';
+	const OPTION_PAUSED_AT               = 'mobo_core_image_refresh_automation_paused_at';
+	/**
+	 * Explicit administrator approval for permanent media deletion. The value is
+	 * the generation id it was granted for, so an approval never carries over to
+	 * a later cycle and a stale form cannot approve a different generation.
+	 */
+	const OPTION_DELETE_APPROVED         = 'mobo_core_image_refresh_automation_delete_approved';
+
+	/**
+	 * Read one Source-scoped automation flag from durable storage, bypassing the
+	 * request-local settings cache, so a Stop pressed in another request is seen
+	 * between two units of work of a long-running worker request.
+	 *
+	 * @param string $key Option key.
+	 * @param mixed  $fallback Fallback.
+	 * @return mixed
+	 */
+	private static function fresh_setting( $key, $fallback = '' ) {
+		if ( class_exists( 'Mobo_Core_Connection_Settings' ) && method_exists( 'Mobo_Core_Connection_Settings', 'forget' ) ) {
+			Mobo_Core_Connection_Settings::forget( $key );
+		}
+		if ( function_exists( 'wp_cache_delete' ) ) {
+			wp_cache_delete( $key, 'options' );
+		}
+		return Mobo_Core_Settings::get( $key, $fallback );
+	}
+
+	/**
+	 * Whether the administrator stopped/paused the workflow.
+	 *
+	 * @param bool $fresh Bypass request-local caches.
+	 * @return bool
+	 */
+	public static function is_paused( $fresh = false ) {
+		$value = $fresh ? self::fresh_setting( self::OPTION_PAUSED, '0' ) : Mobo_Core_Settings::get( self::OPTION_PAUSED, '0' );
+		return '1' === (string) $value;
+	}
+
+	/**
+	 * Cooperative stop check used by the workflow and its workers between every
+	 * unit of work (queue row, deleted attachment, deleted file family).
+	 *
+	 * @return bool
+	 */
+	public static function stop_requested() {
+		return self::is_paused( true );
+	}
+
+	/**
+	 * Whether permanent deletion is allowed for the current generation: the
+	 * administrator approved it explicitly for this generation and has not
+	 * paused the workflow since. Every destructive path of the workflow checks
+	 * this immediately before it deletes anything.
+	 *
+	 * @param bool $fresh Bypass request-local caches.
+	 * @return bool
+	 */
+	public static function destructive_cleanup_allowed( $fresh = true ) {
+		if ( self::is_paused( $fresh ) ) {
+			return false;
+		}
+		$generation = sanitize_text_field( (string) ( $fresh ? self::fresh_setting( self::OPTION_GENERATION_ID, '' ) : Mobo_Core_Settings::get( self::OPTION_GENERATION_ID, '' ) ) );
+		$approved   = sanitize_text_field( (string) ( $fresh ? self::fresh_setting( self::OPTION_DELETE_APPROVED, '' ) : Mobo_Core_Settings::get( self::OPTION_DELETE_APPROVED, '' ) ) );
+		return '' !== $generation && '' !== $approved && hash_equals( $generation, $approved );
+	}
 
 	/** @var string Concrete environment preflight failure for the current request. */
 	private $last_environment_error = '';
@@ -59,6 +131,9 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		return array(
 			'enabled'              => Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ),
+			'paused'               => self::is_paused(),
+			'pausedAt'             => absint( Mobo_Core_Settings::get( self::OPTION_PAUSED_AT, 0 ) ),
+			'deleteApproved'       => self::destructive_cleanup_allowed( false ),
 			'deleteOldApproved'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ),
 			'deleteOrphanApproved' => Mobo_Core_Settings::enabled( self::OPTION_DELETE_ORPHAN_APPROVED, '0' ),
 			'startedAt'            => absint( Mobo_Core_Settings::get( self::OPTION_STARTED_AT, 0 ) ),
@@ -85,7 +160,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	 *
 	 * @return array
 	 */
-	public function start() {
+	public function start( $approve_delete = false ) {
 		$previous = self::get_status();
 
 		/*
@@ -145,6 +220,17 @@ class Mobo_Core_Image_Refresh_Automation {
 		}
 		Mobo_Core_Settings::update( 'mobo_core_image_refresh_force_source_reimport', '1', false );
 
+		/* Start/Resume clears an administrator Stop. Permanent deletion is allowed
+		 * only when the administrator explicitly approved it in this request; an
+		 * earlier approval (possibly for another generation) is never inherited. */
+		Mobo_Core_Settings::update( self::OPTION_PAUSED, '0', false );
+		Mobo_Core_Settings::update( self::OPTION_PAUSED_AT, 0, false );
+		if ( $approve_delete ) {
+			Mobo_Core_Settings::update( self::OPTION_DELETE_APPROVED, $generation_id, false );
+		} else {
+			Mobo_Core_Settings::delete( self::OPTION_DELETE_APPROVED );
+		}
+
 		Mobo_Core_Settings::delete( self::OPTION_PREFLIGHT_COMPLETED_AT );
 		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
 			$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
@@ -180,63 +266,91 @@ class Mobo_Core_Image_Refresh_Automation {
 				'needsContinuation'     => true,
 				'progressed'            => true,
 				'retriedLegacyFailures' => absint( $retried_legacy_failures ),
-				'message'               => $retried_legacy_failures > 0
+				'deleteApproved'        => (bool) $approve_delete,
+				'message'               => ( $retried_legacy_failures > 0
 					? sprintf( 'نوسازی کامل از منبع شروع شد و %d مورد قرنطینه‌شده از چرخه قبل برای تلاش تازه آزاد شد.', absint( $retried_legacy_failures ) )
-					: 'نوسازی کامل با پاک‌سازی اولیه شروع شد؛ تصاویر Mobo با cache-bust از منبع دوباره دریافت می‌شوند. Repair/Reconciliation خودکار نیست.',
+					: 'نوسازی کامل شروع شد؛ تصاویر Mobo با cache-bust از منبع دوباره دریافت می‌شوند. Repair/Reconciliation خودکار نیست.' )
+					. ( $approve_delete
+						? ' حذف دائمی پیوست‌ها/فایل‌های قدیمیِ اثبات‌شده برای همین چرخه توسط مدیر تأیید شد.'
+						: ' هیچ پیوست یا فایلی حذف نمی‌شود؛ مرحله‌های حذف تا تأیید صریح مدیر منتظر می‌مانند.' ),
 			)
 		);
 	}
 
 	/**
-	 * Legacy compatibility endpoint. An active one-click workflow is intentionally
-	 * not pausable from wp-admin; stale forms/direct requests cannot strand it.
+	 * Stop/Pause the workflow for real.
 	 *
-	 * @param string $reason Legacy reason.
-	 * @param string $status Legacy status.
+	 * The durable Stop flag is written first, then the workflow is disabled and
+	 * every destructive switch is returned to fail-closed. run_tick() refuses to
+	 * start while the flag is set, and the replacement queue, Stage 7 deletion
+	 * and orphan deletion re-check it before every single unit of work, so an
+	 * in-flight batch stops after at most the unit it is executing right now.
+	 * Delete approval is revoked: a resumed workflow must be approved again.
+	 * Progress (cursors, queue rows, generation) is kept so Resume continues.
+	 *
+	 * @param string $reason Optional reason (sanitized, stored in the result).
+	 * @param string $status Retained for backward compatibility.
 	 * @return array
 	 */
-	public function pause( $reason = '', $status = 'running' ) {
-		$current = self::get_status();
-		if ( empty( $current['enabled'] ) ) {
-			return $this->save_result(
-				array(
-					'success'           => true,
-					'status'            => isset( $current['status'] ) ? sanitize_key( (string) $current['status'] ) : 'idle',
-					'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
-					'needsContinuation' => false,
-					'progressed'        => false,
-					'message'           => 'چرخه فعالی برای توقف وجود ندارد.',
-				)
-			);
-		}
+	public function pause( $reason = '', $status = 'paused' ) {
+		$current     = self::get_status();
+		$was_running = ! empty( $current['enabled'] );
 
+		Mobo_Core_Settings::update( self::OPTION_PAUSED, '1', false );
+		Mobo_Core_Settings::update( self::OPTION_PAUSED_AT, time(), false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '0', false );
+		Mobo_Core_Settings::delete( self::OPTION_DELETE_APPROVED );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+
+		$reason = sanitize_text_field( (string) $reason );
 		return $this->save_result(
 			array(
 				'success'           => true,
-				'status'            => 'running',
-				'step'              => $this->detect_step(),
-				'needsContinuation' => true,
+				'status'            => 'paused',
+				'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
+				'needsContinuation' => false,
 				'progressed'        => false,
-				'message'           => 'نوسازی تصاویر پس از شروع به صورت خودکار تا رسیدن به حالت پایدار ادامه پیدا می کند و نیاز به توقف یا تصمیم مدیر ندارد.',
+				'pausedAt'          => time(),
+				'reason'            => $reason,
+				'message'           => $was_running
+					? 'نوسازی تصاویر متوقف شد. واحد کاری در حال اجرا (حداکثر یک تصویر) تمام می‌شود و پس از آن هیچ دانلود، جایگزینی یا حذفی انجام نمی‌شود. برای ادامه، «ادامه نوسازی» را بزنید؛ تأیید حذف باید دوباره داده شود.'
+					: 'چرخه فعالی در حال اجرا نبود؛ پرچم توقف ثبت شد و هیچ اجرای خودکاری شروع نمی‌شود.',
 			)
 		);
 	}
 
 	/**
-	 * Legacy compatibility action: persistently enable replaced-old deletion.
+	 * Explicit administrator approval for permanent deletion of proven old
+	 * attachments/files in the CURRENT generation only.
 	 *
 	 * @return array
 	 */
 	public function approve_delete_old() {
-		$current = self::get_status();
+		$current    = self::get_status();
+		$generation = sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_GENERATION_ID, '' ) );
+		if ( empty( $current['enabled'] ) || self::is_paused( true ) || '' === $generation ) {
+			return array(
+				'success'           => false,
+				'status'            => self::is_paused() ? 'paused' : 'idle',
+				'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'چرخه فعالی برای تأیید حذف وجود ندارد (یا متوقف شده است). ابتدا نوسازی را شروع/ادامه دهید.',
+			);
+		}
 
-		return array(
-			'success'           => true,
-			'status'            => ! empty( $current['enabled'] ) ? 'managed-automatically' : 'idle',
-			'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
-			'needsContinuation' => ! empty( $current['enabled'] ),
-			'progressed'        => false,
-			'message'           => 'تصمیم حذف پیوست قدیمی فقط در Stage ایمن و توسط خود نوسازی خودکار انجام می شود.',
+		Mobo_Core_Settings::update( self::OPTION_DELETE_APPROVED, $generation, false );
+		return $this->save_result(
+			array(
+				'success'           => true,
+				'status'            => 'delete-approved',
+				'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
+				'needsContinuation' => true,
+				'progressed'        => false,
+				'message'           => 'حذف دائمی پیوست‌ها و فایل‌های قدیمیِ اثبات‌شده برای همین چرخه تأیید شد. هر حذف پیش از اجرا دوباره Safety Audit می‌شود و با «توقف» بلافاصله لغو می‌شود.',
+			)
 		);
 	}
 
@@ -252,6 +366,18 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	public function arm_delete_old_autodrain() {
+		if ( self::is_paused( true ) ) {
+			return array(
+				'success'           => true,
+				'status'            => 'paused',
+				'step'              => $this->detect_step(),
+				'armed'             => false,
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'نوسازی تصاویر توسط مدیر متوقف شده است؛ Stage 7 فعال نشد.',
+			);
+		}
+
 		if ( ! Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ) ) {
 			return array(
 				'success'           => true,
@@ -317,16 +443,8 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	public function approve_delete_orphans() {
-		$current = self::get_status();
-
-		return array(
-			'success'           => true,
-			'status'            => ! empty( $current['enabled'] ) ? 'managed-automatically' : 'idle',
-			'step'              => absint( isset( $current['currentStep'] ) ? $current['currentStep'] : 0 ),
-			'needsContinuation' => ! empty( $current['enabled'] ),
-			'progressed'        => false,
-			'message'           => 'تصمیم پاکسازی فایل یتیم فقط پس از Safety Audit و توسط خود نوسازی خودکار انجام می شود.',
-		);
+		/* One explicit, generation-bound approval covers every destructive stage. */
+		return $this->approve_delete_old();
 	}
 
 	/**
@@ -338,6 +456,17 @@ class Mobo_Core_Image_Refresh_Automation {
 	public function run_tick( $source = 'real-cron' ) {
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 			return array_merge( Mobo_Core_Upgrade_Coordinator::paused_result( 'image-refresh-automation' ), array( 'progressed' => false, 'needsContinuation' => false ) );
+		}
+
+		if ( self::is_paused( true ) ) {
+			return array(
+				'success'           => true,
+				'status'            => 'paused',
+				'step'              => 0,
+				'needsContinuation' => false,
+				'progressed'        => false,
+				'message'           => 'نوسازی تصاویر توسط مدیر متوقف شده است.',
+			);
 		}
 
 		if ( ! Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ) ) {
@@ -429,7 +558,18 @@ class Mobo_Core_Image_Refresh_Automation {
 		}
 
 		try {
-			$result = $this->run_locked( sanitize_key( (string) $source ) );
+			/* Re-check the Stop flag under the lock: Stop may have been pressed while
+			 * this request was waiting for the pipeline lease. */
+			$result = self::stop_requested()
+				? array(
+					'success'           => true,
+					'status'            => 'paused',
+					'step'              => 0,
+					'needsContinuation' => false,
+					'progressed'        => false,
+					'message'           => 'نوسازی تصاویر توسط مدیر متوقف شده است.',
+				)
+				: $this->run_locked( sanitize_key( (string) $source ) );
 		} catch ( Throwable $e ) {
 			$result = $this->pause_for_error( 'یک اجرای نوسازی با خطای غیرمنتظره پایان یافت؛ چرخه فعال می ماند و خودکار دوباره تلاش می کند.', 0, 'automation-exception' );
 			$result['exceptionClass'] = get_class( $e );
@@ -641,6 +781,10 @@ class Mobo_Core_Image_Refresh_Automation {
 		$migration_candidates  = absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 );
 		$replaced_actionable   = $replaced_ready + $migration_candidates;
 		if ( $replaced_actionable > 0 && ( ! $delete_newer || $delete_needs_followup ) ) {
+			if ( ! self::destructive_cleanup_allowed() ) {
+				Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
+				return $this->waiting_delete_approval( 7, 'delete-old', $replaced_actionable );
+			}
 			Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '1', false );
 			$operation = $service->audit_replaced_legacy_attachments( $scan_limit, true );
 			$result    = $this->operation_result( 7, 'delete-replaced-old', $operation, 'انتقال مراجع و حذف خودکار و امن پیوست های قدیمی', true );
@@ -686,6 +830,11 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$orphan_candidates = absint( isset( $orphan_status['actionable'] ) ? $orphan_status['actionable'] : ( isset( $orphan_status['candidate'] ) ? $orphan_status['candidate'] : 0 ) );
 		if ( $orphan_candidates > 0 ) {
+			if ( ! self::destructive_cleanup_allowed() ) {
+				Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+				update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+				return $this->waiting_delete_approval( 9, 'delete-orphans', $orphan_candidates );
+			}
 			Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
 			update_option( 'mobo_core_orphan_image_cleanup_enabled', '1', false );
 			$operation = $cleanup->delete_candidates( Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 200 ) );
@@ -723,9 +872,13 @@ class Mobo_Core_Image_Refresh_Automation {
 		}
 
 		$cleanup   = new Mobo_Core_Orphan_Image_Cleanup();
+		/* Preflight deletes collision attachments and orphan files. Without the
+		 * explicit, generation-bound approval only the read-only orphan scan runs;
+		 * the deletions are deferred to Stage 9, which waits for approval. */
+		$may_delete = self::destructive_cleanup_allowed();
 		$collision = get_option( Mobo_Core_Orphan_Image_Cleanup::INCOMPLETE_COLLISION_RESULT_OPTION, array() );
 		$collision = is_array( $collision ) ? $collision : array();
-		if ( empty( $collision['cycleComplete'] ) ) {
+		if ( $may_delete && empty( $collision['cycleComplete'] ) ) {
 			$limit     = min( 5, Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 100 ) );
 			$operation = $cleanup->cleanup_incomplete_collision_attachments( $limit );
 			$busy      = in_array( isset( $operation['status'] ) ? (string) $operation['status'] : '', array( 'image-queue-busy', 'image-refresh-queue-busy' ), true );
@@ -750,7 +903,7 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$status     = $cleanup->get_status();
 		$actionable = absint( isset( $status['actionable'] ) ? $status['actionable'] : 0 );
-		if ( $actionable > 0 ) {
+		if ( $may_delete && $actionable > 0 ) {
 			Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
 			update_option( 'mobo_core_orphan_image_cleanup_enabled', '1', false );
 			$operation = $cleanup->delete_candidates( Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 100 ) );
@@ -966,8 +1119,11 @@ class Mobo_Core_Image_Refresh_Automation {
 	 */
 	private function pause_for_error( $message, $step, $status ) {
 		/* Fail closed for the current mutation, but never strand the global workflow.
-		 * Real Cron/Self Runner will retry the stage later. */
-		Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
+		 * Real Cron/Self Runner will retry the stage later. An administrator Stop
+		 * always wins: an error inside an in-flight tick must not re-enable it. */
+		if ( ! self::stop_requested() ) {
+			Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
+		}
 		Mobo_Core_Settings::update( 'mobo_core_image_refresh_enabled', '0', false );
 
 		return array(
@@ -992,6 +1148,15 @@ class Mobo_Core_Image_Refresh_Automation {
 		Mobo_Core_Settings::update( 'mobo_core_image_refresh_enabled', '0', false );
 		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
+		/* B25: a completed generation must not keep force_source_reimport_enabled()
+		 * true. Otherwise every later scan/enqueue re-queues healthy WebP images for
+		 * another download (historical endless-download class). The generation id,
+		 * its start time and the delete approval end with the cycle; the size stats
+		 * stay for the admin report and are reset by the next start(). */
+		Mobo_Core_Settings::delete( self::OPTION_GENERATION_ID );
+		Mobo_Core_Settings::delete( self::OPTION_GENERATION_STARTED_AT );
+		Mobo_Core_Settings::delete( self::OPTION_DELETE_APPROVED );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_force_source_reimport', '0', false );
 
 		$stage7  = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_replaced_delete', array() );
 		$stage7  = is_array( $stage7 ) ? $stage7 : array();
@@ -1058,6 +1223,7 @@ class Mobo_Core_Image_Refresh_Automation {
 		Mobo_Core_Settings::delete( self::OPTION_GENERATION_ID );
 		Mobo_Core_Settings::delete( self::OPTION_GENERATION_STARTED_AT );
 		Mobo_Core_Settings::delete( self::OPTION_GENERATION_STATS );
+		Mobo_Core_Settings::delete( self::OPTION_DELETE_APPROVED );
 		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
 		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 	}
@@ -1136,6 +1302,33 @@ class Mobo_Core_Image_Refresh_Automation {
 			? Mobo_Core_Settings::get( $name, array() )
 			: array();
 		return is_array( $value ) ? $value : array();
+	}
+
+	/**
+	 * Hold a destructive stage until the administrator approves deletion for the
+	 * current generation. The workflow stays enabled (cheap no-op ticks) and does
+	 * not advance past the stage, so nothing is skipped or marked complete.
+	 *
+	 * @param int    $step Workflow step.
+	 * @param string $what delete-old|delete-orphans.
+	 * @param int    $count Actionable items waiting.
+	 * @return array
+	 */
+	private function waiting_delete_approval( $step, $what, $count ) {
+		return array(
+			'success'           => true,
+			'status'            => 'waiting-delete-approval',
+			'step'              => absint( $step ),
+			'waitingApproval'   => sanitize_key( (string) $what ),
+			'waitingItems'      => absint( $count ),
+			'needsContinuation' => false,
+			'progressed'        => false,
+			'message'           => sprintf(
+				'%d مورد %s آماده است، اما حذف دائمی بدون تأیید صریح مدیر انجام نمی‌شود. پس از تهیه Backup، «تأیید حذف» را بزنید یا چرخه را متوقف کنید.',
+				absint( $count ),
+				'delete-orphans' === $what ? 'خانواده فایل یتیم' : 'پیوست قدیمی جایگزین‌شده'
+			),
+		);
 	}
 
 	/**

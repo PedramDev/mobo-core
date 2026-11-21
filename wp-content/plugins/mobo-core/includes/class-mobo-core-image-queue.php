@@ -93,6 +93,46 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Pure re-enqueue decision for an existing, non-processing queue row (H7).
+	 *
+	 * - reset : fresh retry budget (status pending, try_count 0, backoff cleared)
+	 * - detach: forget an incompatible attachment but keep status/try_count/backoff
+	 * - keep  : leave retry state untouched
+	 *
+	 * Re-enqueueing the SAME source must never reset the retry budget of a
+	 * pending row or revive a terminal readiness failure; otherwise every Product
+	 * Sync/Repair restarts the attempt cycle (and the fresh-reimport step) forever.
+	 *
+	 * @param string $status Current row status.
+	 * @param bool   $source_changed Whether the desired source file changed.
+	 * @param bool   $attachment_compatible Whether the stored attachment matches.
+	 * @param int    $attachment_id Stored attachment ID.
+	 * @param bool   $terminal_readiness Row failed terminally on readiness.
+	 * @return string reset|detach|keep
+	 */
+	public static function requeue_decision( $status, $source_changed, $attachment_compatible, $attachment_id, $terminal_readiness = false ) {
+		$status   = (string) $status;
+		$detached = ! $attachment_compatible && absint( $attachment_id ) > 0;
+		if ( $source_changed ) {
+			return 'reset';
+		}
+		if ( 'done' === $status ) {
+			return $attachment_compatible ? 'keep' : 'reset';
+		}
+		if ( 'failed' === $status ) {
+			if ( ! $terminal_readiness ) {
+				return 'reset';
+			}
+			return $detached ? 'detach' : 'keep';
+		}
+		if ( 'pending' === $status ) {
+			return $detached ? 'detach' : 'keep';
+		}
+		/* attaching/unknown states keep the historical behaviour. */
+		return $attachment_compatible ? 'keep' : 'reset';
+	}
+
+	/**
 	 * Check whether queue table exists.
 	 *
 	 * @return bool
@@ -241,7 +281,7 @@ class Mobo_Core_Image_Queue {
 		/* One lookup for the full product image set instead of one SELECT per image. */
 		$keys         = array_values( array_unique( array_filter( array_map( 'strval', wp_list_pluck( $normalized, 'key' ) ) ) ) );
 		$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
-		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE connection_id = %d AND queue_key IN ({$placeholders})";
+		$query        = "SELECT id, queue_key, status, attachment_id, source_url, last_error FROM {$table} WHERE connection_id = %d AND queue_key IN ({$placeholders})";
 		$wpdb->last_error = '';
 		$rows         = $wpdb->get_results( $wpdb->prepare( $query, array_merge( array( $connection_id ), $keys ) ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all values are bound by wpdb::prepare().
 		if ( ! is_array( $rows ) && '' !== (string) $wpdb->last_error ) {
@@ -274,7 +314,7 @@ class Mobo_Core_Image_Queue {
 			$wpdb->last_error = '';
 			$legacy_rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT id, queue_key, status, attachment_id, source_url, image_guid FROM {$table} WHERE connection_id = %d AND product_id = %d",
+					"SELECT id, queue_key, status, attachment_id, source_url, image_guid, last_error FROM {$table} WHERE connection_id = %d AND product_id = %d",
 					$connection_id,
 					$product_id
 				),
@@ -319,6 +359,8 @@ class Mobo_Core_Image_Queue {
 			$status                = is_array( $existing ) ? sanitize_key( (string) $existing['status'] ) : 'pending';
 			$token                 = isset( $item['token'] ) ? (string) $item['token'] : '';
 			$attachment_compatible = $attachment_id > 0 && $this->attachment_matches_identity( $attachment_id, $image_guid, $url, $token );
+			$terminal_readiness    = 'failed' === $status && is_array( $existing ) && class_exists( 'Mobo_Core_Image_Reimport_Ledger' )
+				&& false !== strpos( (string) ( isset( $existing['last_error'] ) ? $existing['last_error'] : '' ), Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER );
 			/* 10.34.78: a host/query-only URL change (same path + file name) or an equal
 			 * content token is the same image; refresh bookkeeping instead of
 			 * re-downloading and regenerating every thumbnail. */
@@ -389,6 +431,7 @@ class Mobo_Core_Image_Queue {
 				 * the replacement becomes claimable when the short lease expires. This
 				 * avoids running two workers for one queue row at the same time.
 				 */
+				$requeue = 'processing' === $status ? 'keep' : self::requeue_decision( $status, $source_changed, $attachment_compatible, $attachment_id, $terminal_readiness );
 				if ( 'processing' === $status ) {
 					if ( $source_changed ) {
 						$data['try_count']     = 0;
@@ -397,13 +440,24 @@ class Mobo_Core_Image_Queue {
 						$data['attachment_id'] = 0;
 						$superseded_attachment_id = $attachment_id;
 					}
-				} elseif ( $source_changed || ! $attachment_compatible ) {
+				} elseif ( 'reset' === $requeue ) {
+					/* A new source file, a completed row whose attachment vanished, or a
+					 * failed row whose cause may have gone (e.g. product recreated):
+					 * genuinely new work with a fresh retry budget. A terminal readiness
+					 * failure (H7) is only revived by a changed source. */
 					$data['status']        = 'pending';
 					$data['try_count']     = 0;
 					$data['next_retry_at'] = null;
 					$data['locked_until']  = null;
 					$data['last_error']    = null;
 					$data['attachment_id'] = 0;
+					$superseded_attachment_id = $attachment_id;
+				} elseif ( 'detach' === $requeue ) {
+					/* H7: same source, row still pending/failed. Detach the incompatible
+					 * attachment but KEEP status, try_count, next_retry_at and last_error.
+					 * Re-enqueue by every Product Sync/Repair must not reset the retry
+					 * budget/backoff (historical endless re-download/duplicate loop). */
+					$data['attachment_id']    = 0;
 					$superseded_attachment_id = $attachment_id;
 				}
 

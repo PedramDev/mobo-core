@@ -25,6 +25,8 @@ class Mobo_Core_Image_Sync {
 	 * attachment and accumulate orphan files on each retry.
 	 */
 	const FRESH_REIMPORT_ATTEMPT = 3;
+	/** Distinctive prefix of a readiness (WebP/subsize) failure message. */
+	const READINESS_FAILURE_PREFIX = 'Image file exists but final WebP/subsize validation failed:';
 
 	/**
 	 * Last image resolution error for queue diagnostics.
@@ -1327,6 +1329,20 @@ class Mobo_Core_Image_Sync {
 					$message = 'Image source is not ready or the download/import failed.';
 				}
 
+				/* H7: a readiness failure (file exists, WebP/subsizes never converge) is
+				 * counted in a durable per-image ledger that survives queue resets. After
+				 * the one bounded fresh reimport (or too many failures) it becomes a
+				 * terminal failure instead of an endless retry/duplicate loop. */
+				$terminal_readiness = false;
+				if ( 0 === strpos( $message, self::READINESS_FAILURE_PREFIX ) && class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+					$ledger_key   = Mobo_Core_Image_Reimport_Ledger::key( $this->ledger_connection_id(), $image_guid, $url );
+					$ledger_entry = Mobo_Core_Image_Reimport_Ledger::record_readiness_failure( $ledger_key );
+					$terminal_readiness = Mobo_Core_Image_Reimport_Ledger::is_terminal( $ledger_entry, $try_count, self::FRESH_REIMPORT_ATTEMPT );
+					if ( $terminal_readiness ) {
+						$message = 'Permanent: ' . Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER . ' after the bounded fresh reimport; no further attachments are created for this image. ' . $message;
+					}
+				}
+
 				/*
 				 * Network errors, timeouts, HTTP 404/5xx responses and a not-yet-ready
 				 * shared-media manifest are recoverable. They remain pending forever
@@ -1338,7 +1354,7 @@ class Mobo_Core_Image_Sync {
 				 * do not isolate the image stage while it is correctly waiting.
 				 */
 				$failure_committed = method_exists( $queue, 'mark_failure_if_current' )
-					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, false, $claim_token )
+					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, $terminal_readiness, $claim_token )
 					: true;
 				if ( ! $failure_committed ) {
 					/* The row was superseded while this worker was active. */
@@ -1349,7 +1365,7 @@ class Mobo_Core_Image_Sync {
 					continue;
 				}
 				if ( ! method_exists( $queue, 'mark_failure_if_current' ) ) {
-					$queue->mark_failure( $id, $message, $try_count, false );
+					$queue->mark_failure( $id, $message, $try_count, $terminal_readiness );
 				}
 
 				/*
@@ -1364,7 +1380,7 @@ class Mobo_Core_Image_Sync {
 				 * a fresh attachment. The exact-attempt gate guarantees that a temporary
 				 * disk-full condition cannot create an unbounded reimport loop.
 				 */
-				if ( ! $fresh_reimport_prepared ) {
+				if ( ! $fresh_reimport_prepared && ! $terminal_readiness ) {
 					$this->maybe_quarantine_incomplete_attachment_for_fresh_reimport(
 						$attachment_id,
 						$image_guid,
@@ -2781,6 +2797,15 @@ class Mobo_Core_Image_Sync {
 	}
 
 	/**
+	 * Connection owning the reimport ledger entry.
+	 *
+	 * @return int
+	 */
+	private function ledger_connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
+	/**
 	 * Retire one repeatedly-unready local attachment from Mobo identity lookup.
 	 *
 	 * Values are moved to private quarantine meta instead of deleted so the old
@@ -2819,6 +2844,16 @@ class Mobo_Core_Image_Sync {
 			return false;
 		}
 
+		/* H7: at most MAX_FRESH_REIMPORTS new attachments per image identity, no
+		 * matter how often the queue row is re-enqueued and its try_count reset. */
+		$ledger_key = '';
+		if ( class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+			$ledger_key = Mobo_Core_Image_Reimport_Ledger::key( $this->ledger_connection_id(), $image_guid, $url );
+			if ( ! Mobo_Core_Image_Reimport_Ledger::may_fresh_reimport( Mobo_Core_Image_Reimport_Ledger::get( $ledger_key ) ) ) {
+				return false;
+			}
+		}
+
 		$stored_image_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'image_guid', true ) );
 		$stored_legacy_guid = sanitize_text_field( (string) get_post_meta( $attachment_id, 'img_guid', true ) );
 		$stored_source_url  = esc_url_raw( (string) get_post_meta( $attachment_id, 'mobo_source_url', true ) );
@@ -2853,6 +2888,9 @@ class Mobo_Core_Image_Sync {
 
 		update_post_meta( $attachment_id, '_mobo_quarantine_reason', 'fresh-reimport-after-readiness-failure' );
 		update_post_meta( $attachment_id, '_mobo_quarantined_at', time() );
+		if ( '' !== $ledger_key ) {
+			Mobo_Core_Image_Reimport_Ledger::record_fresh_reimport( $ledger_key );
+		}
 		$this->forget_attachment_lookup_caches( $image_guid, $url );
 		clean_post_cache( $attachment_id );
 

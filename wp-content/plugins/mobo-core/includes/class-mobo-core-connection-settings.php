@@ -318,6 +318,22 @@ final class Mobo_Core_Connection_Settings {
 		return self::$cache[ $cache_key ];
 	}
 
+	/**
+	 * Drop one request-local cached value so the next read hits durable storage.
+	 * Used for cooperative Stop flags that another request may change while a
+	 * long-running worker request is in progress.
+	 *
+	 * @param string $key Setting key.
+	 * @param int    $connection_id Connection (0 = effective).
+	 * @return void
+	 */
+	public static function forget( $key, $connection_id = 0 ) {
+		$id = self::effective_connection_id( $connection_id );
+		if ( $id <= 0 ) { return; }
+		$cache_key = $id . '|' . (string) $key;
+		unset( self::$cache[ $cache_key ], self::$missing_cache[ $cache_key ] );
+	}
+
 	/** Whether a durable scoped row exists for one Connection. @return bool */
 	public static function has( $connection_id, $key ) {
 		global $wpdb;

@@ -82,6 +82,11 @@ class Mobo_Core_Admin {
 		add_action( 'admin_post_mobo_core_reset_recategorize', array( $this, 'handle_reset_recategorize' ) );
 		add_action( 'admin_post_mobo_core_retry_failed_webhooks', array( $this, 'handle_retry_failed_webhooks' ) );
 		add_action( 'admin_post_mobo_core_start_image_refresh_automation', array( $this, 'handle_start_image_refresh_automation' ) );
+		add_action( 'admin_post_mobo_core_pause_image_refresh_automation', array( $this, 'handle_pause_image_refresh_automation' ) );
+		add_action( 'admin_post_mobo_core_approve_image_refresh_delete_old', array( $this, 'handle_approve_image_refresh_delete_old' ) );
+		add_action( 'admin_post_mobo_core_legacy_image_audit_run', array( $this, 'handle_legacy_image_audit_run' ) );
+		add_action( 'admin_post_mobo_core_legacy_image_audit_stop', array( $this, 'handle_legacy_image_audit_stop' ) );
+		add_action( 'admin_post_mobo_core_legacy_image_audit_reset', array( $this, 'handle_legacy_image_audit_reset' ) );
 		add_action( 'wp_ajax_mobo_core_get_sync_status', array( $this, 'handle_ajax_sync_status' ) );
 		add_action( 'wp_ajax_mobo_core_get_reprice_status', array( $this, 'handle_ajax_reprice_status' ) );
 		add_action( 'wp_ajax_mobo_core_get_recategorize_status', array( $this, 'handle_ajax_recategorize_status' ) );
@@ -5994,6 +5999,107 @@ https://source.example/products/test-product/
 		}
 	}
 
+	/**
+	 * Read-only legacy image scan: summary, sample list, Run/Continue/Stop/Reset.
+	 * No deletion or replacement is reachable from this card.
+	 *
+	 * @return void
+	 */
+	private function render_legacy_image_audit_card() {
+		if ( ! class_exists( 'Mobo_Core_Legacy_Image_Audit' ) || ! class_exists( 'Mobo_Core_Legacy_Image_Policy' ) ) {
+			return;
+		}
+		$state   = Mobo_Core_Legacy_Image_Audit::get_state();
+		$summary = Mobo_Core_Legacy_Image_Audit::health_summary();
+		$status  = sanitize_key( (string) $state['status'] );
+		$running = 'running' === $status;
+		$labels  = array(
+			Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE       => 'بدون استفاده (قابل حذف پس از اثبات نهایی)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE    => 'در استفاده محصول Mobo؛ WebP موجود (اول جایگزینی)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_IN_USE_NO_REPLACEMENT  => 'در استفاده؛ WebP جایگزین شناخته نشده (نگه داشته می‌شود)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_FOREIGN_USE  => 'استفاده خارج از محصولات Mobo (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_LIVE         => 'تصویر فعلی صف تصاویر/نوسازی فعال (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_FILE  => 'فایل مشترک با پیوست دیگر (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_MEDIA => 'Shared Media (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN    => 'نامطمئن (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_NOT_MOBO     => 'آپلود فروشگاه / غیر Mobo (هرگز لمس نمی‌شود)',
+		);
+		$total      = absint( $state['estimatedTotal'] );
+		$scanned    = absint( $state['scanned'] );
+		$percent    = 'content' === $state['phase'] ? 0 : ( $total > 0 ? min( 100, round( ( $scanned / $total ) * 100, 1 ) ) : 0 );
+		$last_label = absint( $state['lastRunAt'] ) > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $state['lastRunAt'] ) ) : 'هنوز اجرا نشده';
+		?>
+		<div class="mobo-card mobo-card-wide mobo-legacy-image-audit-card" id="mobo-legacy-image-audit">
+			<div class="mobo-admin-card-heading">
+				<div>
+					<h2 class="mobo-admin-section-title">پاک‌سازی تصاویر قدیمی — بررسی (فقط خواندنی)</h2>
+					<p>پیوست‌های JPG/PNG که نسخه‌های قدیمی افزونه از فروشگاه منبع دانلود کرده‌اند شناسایی، دسته‌بندی و حجمشان برآورد می‌شود. این بخش هیچ فایل، پیوست یا محصولی را تغییر نمی‌دهد. آپلودهای خود فروشگاه (بدون نشانگر img_guid/image_guid) هرگز کاندید نمی‌شوند.</p>
+				</div>
+				<span class="mobo-admin-badge mobo-admin-badge--<?php echo esc_attr( 'complete' === $status ? 'success' : ( $running ? 'info' : 'warning' ) ); ?>"><?php echo esc_html( array( 'idle' => 'اجرا نشده', 'running' => 'در حال بررسی', 'stopped' => 'متوقف‌شده', 'complete' => 'کامل' )[ $status ] ?? $status ); ?></span>
+			</div>
+			<div class="mobo-status-grid">
+				<?php $this->status_box( 'کاندید پاک‌سازی (a+b)', number_format_i18n( absint( $summary['candidates'] ) ) ); ?>
+				<?php $this->status_box( 'حجم قابل آزادسازی (فایل‌های موجود)', size_format( absint( $summary['bytes'] ), 1 ) ); ?>
+				<?php $this->status_box( 'حجم طبق متادیتای وردپرس', size_format( absint( $summary['metadataBytes'] ), 1 ) ); ?>
+				<?php $this->status_box( 'پیوست JPG/PNG بررسی‌شده', number_format_i18n( $scanned ) . ' / ' . number_format_i18n( $total ) ); ?>
+				<?php $this->status_box( 'آخرین اجرا', $last_label ); ?>
+			</div>
+			<?php if ( $running || 'stopped' === $status ) : ?>
+				<div class="mobo-progress-wrap"><div class="mobo-progress-meta"><span><?php echo esc_html( 'content' === $state['phase'] ? 'مرحله ۱: جمع‌آوری مراجع محتوای نوشته‌ها' : 'مرحله ۲: دسته‌بندی پیوست‌ها' ); ?></span><strong><?php echo esc_html( number_format_i18n( $percent, 1 ) . '٪' ); ?></strong></div><div class="mobo-progress"><div style="width: <?php echo esc_attr( $percent ); ?>%;"></div></div></div>
+			<?php endif; ?>
+			<?php if ( '' !== (string) $state['lastError'] ) : ?><div class="mobo-alert mobo-alert-warning"><?php echo esc_html( (string) $state['lastError'] ); ?></div><?php endif; ?>
+			<table class="widefat striped" style="margin:12px 0;">
+				<thead><tr><th>دسته</th><th>تعداد</th><th>حجم موجود</th><th>حجم متادیتا</th><th>فایل‌ها (مفقود)</th></tr></thead>
+				<tbody>
+				<?php foreach ( $labels as $class => $label ) : $row = isset( $state['classes'][ $class ] ) ? $state['classes'][ $class ] : array(); ?>
+					<tr><td><?php echo esc_html( $label ); ?></td><td><?php echo esc_html( number_format_i18n( absint( $row['count'] ?? 0 ) ) ); ?></td><td><?php echo esc_html( size_format( absint( $row['bytes'] ?? 0 ), 1 ) ); ?></td><td><?php echo esc_html( size_format( absint( $row['metaBytes'] ?? 0 ), 1 ) ); ?></td><td><?php echo esc_html( number_format_i18n( absint( $row['files'] ?? 0 ) ) . ' (' . number_format_i18n( absint( $row['missingFiles'] ?? 0 ) ) . ')' ); ?></td></tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php if ( ! empty( $state['samples'] ) ) : ?>
+				<details><summary>نمونه موارد (حداکثر <?php echo esc_html( number_format_i18n( Mobo_Core_Legacy_Image_Audit::SAMPLE_LIMIT ) ); ?>)</summary>
+					<table class="widefat striped"><thead><tr><th>شناسه پیوست</th><th>فایل</th><th>دسته / دلیل</th><th>حجم</th></tr></thead><tbody>
+					<?php foreach ( $state['samples'] as $sample ) : ?>
+						<tr><td><?php echo esc_html( (string) absint( $sample['id'] ) ); ?></td><td dir="ltr"><code><?php echo esc_html( (string) $sample['file'] ); ?></code></td><td><?php echo esc_html( (string) $sample['class'] . ' / ' . (string) $sample['reason'] ); ?></td><td><?php echo esc_html( size_format( max( absint( $sample['bytes'] ), absint( $sample['metaBytes'] ) ), 1 ) ); ?></td></tr>
+					<?php endforeach; ?>
+					</tbody></table>
+				</details>
+			<?php endif; ?>
+			<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+				<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-legacy-audit-continue="<?php echo $running ? '1' : '0'; ?>">
+					<input type="hidden" name="action" value="mobo_core_legacy_image_audit_run">
+					<?php wp_nonce_field( 'mobo_core_legacy_image_audit_run', 'mobo_core_nonce' ); ?>
+					<button type="submit" class="button button-primary"><?php echo esc_html( in_array( $status, array( 'running', 'stopped' ), true ) ? 'ادامه بررسی' : ( 'complete' === $status ? 'بررسی دوباره' : 'شروع بررسی فقط‌خواندنی' ) ); ?></button>
+				</form>
+				<?php if ( $running ) : ?>
+					<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>">
+						<input type="hidden" name="action" value="mobo_core_legacy_image_audit_stop">
+						<?php wp_nonce_field( 'mobo_core_legacy_image_audit_stop', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="button">توقف بررسی</button>
+					</form>
+				<?php endif; ?>
+				<?php if ( 'idle' !== $status ) : ?>
+					<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" onsubmit="return confirm('نتایج بررسی پاک شود؟ هیچ تصویری تغییر نمی‌کند.');">
+						<input type="hidden" name="action" value="mobo_core_legacy_image_audit_reset">
+						<?php wp_nonce_field( 'mobo_core_legacy_image_audit_reset', 'mobo_core_nonce' ); ?>
+						<button type="submit" class="button-link">پاک کردن نتایج</button>
+					</form>
+				<?php endif; ?>
+			</div>
+			<div class="mobo-note">حذف در این نسخه فعال نیست. «بدون استفاده» یعنی در تصویر شاخص/گالری محصولات و متغیرها، متادیتای دسته‌ها، تنظیمات سایت و محتوای نوشته‌ها مرجعی پیدا نشد؛ پیش از هر حذف آینده یک اثبات کامل دیگر روی همه جداول لازم است.</div>
+			<?php if ( $running ) : ?>
+				<script>
+				(function () {
+					var form = document.querySelector('[data-mobo-legacy-audit-continue="1"]');
+					if (!form) { return; }
+					window.setTimeout(function () { if (document.visibilityState !== 'hidden') { form.submit(); } }, 1500);
+				})();
+				</script>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
 	private function render_image_refresh_tab() {
 		$automation_status = class_exists( 'Mobo_Core_Image_Refresh_Automation' ) ? Mobo_Core_Image_Refresh_Automation::get_status() : array();
 		$automation_status = is_array( $automation_status ) ? $automation_status : array();
@@ -6068,7 +6174,10 @@ https://source.example/products/test-product/
 		$last_run_label  = $last_run_at > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $last_run_at ) : 'هنوز اجرا ثبت نشده';
 
 		$blocking_statuses = array( 'image-environment-not-ready', 'missing-components', 'missing-orphan-cleanup', 'missing-preflight-cleanup', 'automation-exception' );
-		$waiting_statuses  = array( 'waiting-retry', 'waiting-active-processor', 'waiting-subsize-retry', 'waiting-preflight-worker', 'deferred-recovery', 'pipeline-locked', 'locked' );
+		$waiting_statuses  = array( 'waiting-retry', 'waiting-active-processor', 'waiting-subsize-retry', 'waiting-preflight-worker', 'deferred-recovery', 'pipeline-locked', 'locked', 'waiting-delete-approval' );
+		$automation_paused = ! empty( $automation_status['paused'] );
+		$delete_approved   = ! empty( $automation_status['deleteApproved'] );
+		$waiting_approval  = $automation_active && 'waiting-delete-approval' === $automation_state;
 
 		$state_class = 'info';
 		$state_label = 'آماده شروع';
@@ -6081,6 +6190,12 @@ https://source.example/products/test-product/
 		} elseif ( $batch_stuck ) {
 			$state_class = 'danger';
 			$state_label = 'Worker نیازمند بررسی';
+		} elseif ( $automation_paused ) {
+			$state_class = 'warning';
+			$state_label = 'متوقف‌شده توسط مدیر';
+		} elseif ( $waiting_approval ) {
+			$state_class = 'warning';
+			$state_label = 'منتظر تأیید حذف توسط مدیر';
 		} elseif ( 'completed' === $automation_state ) {
 			$state_class = $has_retained_items ? 'warning' : 'success';
 			$state_label = $has_retained_items ? 'تکمیل با موارد حفظ‌شده' : 'کامل و پایدار';
@@ -6155,7 +6270,7 @@ https://source.example/products/test-product/
 		$live_refresh_nonce    = wp_create_nonce( 'mobo_core_image_refresh_live_status' );
 		$live_refresh_interval = $automation_active ? 4000 : 8000;
 		$start_allowed = ! $automation_active && $repair_completed && $connection_ready && $components_ready;
-		$start_label = 'completed' === $automation_state ? 'شروع چرخه جدید نوسازی تصاویر' : 'نوسازی کامل تصاویر از منبع';
+		$start_label = 'completed' === $automation_state ? 'شروع چرخه جدید نوسازی تصاویر' : ( $automation_paused ? 'ادامه نوسازی تصاویر' : 'نوسازی کامل تصاویر از منبع' );
 		?>
 		<div id="mobo-image-refresh-live-root" data-mobo-image-refresh-live-root data-ajax-url="<?php echo esc_url( $this->admin_ajax_url() ); ?>" data-nonce="<?php echo esc_attr( $live_refresh_nonce ); ?>" data-refresh-interval="<?php echo esc_attr( $live_refresh_interval ); ?>" data-live-polling="<?php echo $live_polling ? '1' : '0'; ?>" data-automation-active="<?php echo $automation_active ? '1' : '0'; ?>">
 			<div class="mobo-card mobo-card-wide mobo-image-refresh-command-card">
@@ -6210,19 +6325,47 @@ https://source.example/products/test-product/
 					<div class="mobo-alert mobo-alert-info"><?php echo esc_html( '' !== $message ? $message : 'چرخه فعال است و با batchهای محدود توسط Cron/Self Runner ادامه پیدا می‌کند.' ); ?></div>
 				<?php endif; ?>
 
+				<?php if ( $automation_paused ) : ?>
+					<div class="mobo-alert mobo-alert-warning">نوسازی تصاویر توسط مدیر متوقف شده است. هیچ دانلود، جایگزینی یا حذفی انجام نمی‌شود. پیشرفت حفظ شده و با «ادامه نوسازی تصاویر» از همان مرحله ادامه می‌یابد؛ تأیید حذف باید دوباره داده شود.</div>
+				<?php endif; ?>
+
 				<?php if ( $start_allowed ) : ?>
-					<div class="mobo-message mobo-message-warning mobo-image-refresh-backup-warning"><strong>قبل از شروع:</strong> از دیتابیس و <code>wp-content/uploads</code> پشتیبان قابل بازیابی داشته باشید. این چرخه پس از Safety Audit می‌تواند پیوست‌های قدیمی جایگزین‌شده و خانواده‌های orphan اثبات‌شده را به‌صورت خودکار حذف کند؛ موارد مبهم یا ناامن حذف نمی‌شوند.</div>
-					<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('چرخه کامل نوسازی تصاویر شروع شود؟ پس از Safety Audit، رسانه‌های قدیمی یا orphan اثبات‌شده می‌توانند به‌صورت خودکار حذف شوند. داشتن Backup کامل توصیه می‌شود.');">
+					<div class="mobo-message mobo-message-warning mobo-image-refresh-backup-warning"><strong>قبل از شروع:</strong> از دیتابیس و <code>wp-content/uploads</code> پشتیبان قابل بازیابی داشته باشید. بدون تأیید صریح زیر، این چرخه هیچ پیوست یا فایلی را حذف نمی‌کند و مرحله‌های حذف منتظر تأیید می‌مانند.</div>
+					<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('چرخه نوسازی تصاویر شروع/ادامه شود؟ حذف دائمی فقط وقتی انجام می‌شود که هر دو گزینه تأیید را علامت زده باشید.');">
 						<input type="hidden" name="action" value="mobo_core_start_image_refresh_automation">
 						<?php wp_nonce_field( 'mobo_core_start_image_refresh_automation', 'mobo_core_nonce' ); ?>
+						<p><label><input type="checkbox" name="mobo_backup_confirmed" value="1"> از دیتابیس و پوشه uploads پشتیبان قابل بازیابی دارم.</label></p>
+						<p><label><input type="checkbox" name="mobo_approve_delete" value="1"> حذف دائمی پیوست‌های قدیمیِ جایگزین‌شده و فایل‌های یتیمِ اثبات‌شده در همین چرخه را تأیید می‌کنم (اختیاری).</label></p>
 						<button type="submit" class="button button-primary"><?php echo esc_html( $start_label ); ?></button>
 					</form>
-				<?php elseif ( ! $repair_completed && ! $repair_active ) : ?>
+				<?php endif; ?>
+
+				<?php if ( $automation_active ) : ?>
+					<div class="mobo-image-refresh-controls" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start;margin-top:8px;">
+						<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('نوسازی تصاویر متوقف شود؟ واحد کاری در حال اجرا تمام می‌شود و پس از آن هیچ دانلود، جایگزینی یا حذفی انجام نمی‌شود.');">
+							<input type="hidden" name="action" value="mobo_core_pause_image_refresh_automation">
+							<?php wp_nonce_field( 'mobo_core_pause_image_refresh_automation', 'mobo_core_nonce' ); ?>
+							<button type="submit" class="button">توقف نوسازی تصاویر</button>
+						</form>
+						<?php if ( ! $delete_approved ) : ?>
+							<form method="post" action="<?php echo esc_url( $this->admin_post_url() ); ?>" data-mobo-busy-submit="1" onsubmit="return confirm('حذف دائمی پیوست‌ها و فایل‌های قدیمیِ اثبات‌شده برای همین چرخه تأیید شود؟ این کار برگشت‌پذیر نیست مگر از Backup.');">
+								<input type="hidden" name="action" value="mobo_core_approve_image_refresh_delete_old">
+								<?php wp_nonce_field( 'mobo_core_approve_image_refresh_delete_old', 'mobo_core_nonce' ); ?>
+								<label style="display:block;margin-bottom:4px;"><input type="checkbox" name="mobo_backup_confirmed" value="1"> Backup قابل بازیابی دارم.</label>
+								<button type="submit" class="button<?php echo $waiting_approval ? ' button-primary' : ''; ?>">تأیید حذف دائمی برای این چرخه</button>
+							</form>
+						<?php else : ?>
+							<span class="mobo-admin-badge mobo-admin-badge--warning">حذف دائمی برای این چرخه تأیید شده است</span>
+						<?php endif; ?>
+					</div>
+				<?php elseif ( ! $start_allowed && ! $repair_completed && ! $repair_active ) : ?>
 					<a class="mobo-btn mobo-btn-primary" href="<?php echo esc_url( $this->admin_page_url() ); ?>">رفتن به نمای کلی برای اجرای Repair</a>
 				<?php endif; ?>
 
 				<div class="mobo-note">تصاویر Mobo در هر چرخه برای refresh منبع بررسی می‌شوند؛ URL یکسان مانع refresh نسل جدید نیست. Shared Media همچنان توسط مسیر مرکزی خودش مدیریت می‌شود. خطای یک فایل کل چرخه را متوقف نمی‌کند و Retry/backoff مستقل است.</div>
 			</div>
+
+			<?php $this->render_legacy_image_audit_card(); ?>
 
 			<details class="mobo-ux-secondary-details">
 				<summary>جزئیات فنی و نتیجه چرخه</summary>
@@ -11273,8 +11416,13 @@ https://source.example/products/test-product/
 			return;
 		}
 
+		/* Permanent deletion needs an explicit, separate opt-in in the same form. */
+		$approve_delete = isset( $_POST['mobo_approve_delete'], $_POST['mobo_backup_confirmed'] ) // phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified in verify_image_refresh_automation_action().
+			&& '1' === sanitize_key( wp_unslash( $_POST['mobo_approve_delete'] ) ) // phpcs:ignore WordPress.Security.NonceVerification.Missing
+			&& '1' === sanitize_key( wp_unslash( $_POST['mobo_backup_confirmed'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+
 		$automation = new Mobo_Core_Image_Refresh_Automation();
-		$result     = $automation->start();
+		$result     = $automation->start( $approve_delete );
 		$success    = ! empty( $result['success'] );
 
 		if ( $success && class_exists( 'Mobo_Core_Self_Runner' ) ) {
@@ -11294,11 +11442,12 @@ https://source.example/products/test-product/
 	 * @return void
 	 */
 	public function handle_pause_image_refresh_automation() {
-		$this->verify_image_refresh_automation_action( 'mobo_core_pause_image_refresh_automation' );
+		/* Stop must always work, even when Repair state changed meanwhile. */
+		$this->verify_image_refresh_automation_action( 'mobo_core_pause_image_refresh_automation', false );
 
 		$automation = new Mobo_Core_Image_Refresh_Automation();
-		$result     = $automation->pause();
-		$this->redirect_with_message( isset( $result['message'] ) ? (string) $result['message'] : 'اجرای خودکار متوقف شد.', 'success', 'image-refresh' );
+		$result     = $automation->pause( 'admin' );
+		$this->redirect_with_message( isset( $result['message'] ) ? (string) $result['message'] : 'نوسازی تصاویر متوقف شد.', 'success', 'image-refresh' );
 	}
 
 	/**
@@ -11330,6 +11479,12 @@ https://source.example/products/test-product/
 	public function handle_approve_image_refresh_delete_old() {
 		$this->verify_image_refresh_automation_action( 'mobo_core_approve_image_refresh_delete_old' );
 
+		$backup_confirmed = isset( $_POST['mobo_backup_confirmed'] ) && '1' === sanitize_key( wp_unslash( $_POST['mobo_backup_confirmed'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+		if ( ! $backup_confirmed ) {
+			$this->redirect_with_message( 'برای تأیید حذف دائمی، ابتدا تهیه Backup از دیتابیس و uploads را تأیید کنید.', 'warning', 'image-refresh' );
+			return;
+		}
+
 		$automation = new Mobo_Core_Image_Refresh_Automation();
 		$result     = $automation->approve_delete_old();
 		$success    = ! empty( $result['success'] );
@@ -11356,6 +11511,63 @@ https://source.example/products/test-product/
 		}
 
 		$this->redirect_with_message( isset( $result['message'] ) ? (string) $result['message'] : 'تایید مرحله ثبت نشد.', $success ? 'success' : 'warning', 'image-refresh' );
+	}
+
+	/**
+	 * Run (or continue) the read-only legacy image scan for one bounded slice.
+	 *
+	 * @return void
+	 */
+	public function handle_legacy_image_audit_run() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+		check_admin_referer( 'mobo_core_legacy_image_audit_run', 'mobo_core_nonce' );
+		if ( ! class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ) {
+			$this->redirect_with_message( 'ماژول بررسی تصاویر قدیمی در دسترس نیست.', 'error', 'image-refresh' );
+			return;
+		}
+		$audit = new Mobo_Core_Legacy_Image_Audit();
+		$state = $audit->run( 8.0, Mobo_Core_Legacy_Image_Audit::BATCH_DEFAULT );
+		$done  = 'complete' === $state['status'];
+		$msg   = '' !== (string) $state['lastError']
+			? 'بررسی تصاویر قدیمی متوقف ماند: ' . (string) $state['lastError']
+			: ( $done
+				? sprintf( 'بررسی فقط‌خواندنی تصاویر قدیمی کامل شد: %s پیوست JPG/PNG بررسی شد. هیچ فایلی تغییر نکرد.', number_format_i18n( absint( $state['scanned'] ) ) )
+				: sprintf( 'بخشی از بررسی انجام شد (%s پیوست). ادامه خودکار تا پایان یا تا زدن «توقف بررسی».', number_format_i18n( absint( $state['scanned'] ) ) ) );
+		$this->redirect_with_message( $msg, '' !== (string) $state['lastError'] ? 'warning' : 'success', 'image-refresh' );
+	}
+
+	/**
+	 * Stop the read-only legacy image scan.
+	 *
+	 * @return void
+	 */
+	public function handle_legacy_image_audit_stop() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+		check_admin_referer( 'mobo_core_legacy_image_audit_stop', 'mobo_core_nonce' );
+		if ( class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ) {
+			( new Mobo_Core_Legacy_Image_Audit() )->request_stop();
+		}
+		$this->redirect_with_message( 'بررسی تصاویر قدیمی متوقف شد. نتایج تا همین نقطه حفظ شده و با «ادامه بررسی» از همان‌جا ادامه می‌یابد.', 'success', 'image-refresh' );
+	}
+
+	/**
+	 * Forget legacy scan results (no media changes).
+	 *
+	 * @return void
+	 */
+	public function handle_legacy_image_audit_reset() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
+		}
+		check_admin_referer( 'mobo_core_legacy_image_audit_reset', 'mobo_core_nonce' );
+		if ( class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ) {
+			( new Mobo_Core_Legacy_Image_Audit() )->reset();
+		}
+		$this->redirect_with_message( 'نتایج بررسی تصاویر قدیمی پاک شد. هیچ تصویری تغییر نکرد.', 'success', 'image-refresh' );
 	}
 
 	/**

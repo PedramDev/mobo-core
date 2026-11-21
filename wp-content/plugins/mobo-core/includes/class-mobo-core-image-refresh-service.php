@@ -570,9 +570,15 @@ class Mobo_Core_Image_Refresh_Service {
 		$superseded = 0;
 		$paused_for_upgrade = false;
 
+		$stopped_by_admin = false;
 		foreach ( $rows as $row ) {
 			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 				$paused_for_upgrade = true;
+				break;
+			}
+			/* Administrator Stop is checked before every queue row (download/replace). */
+			if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Image_Refresh_Automation::stop_requested() ) {
+				$stopped_by_admin = true;
 				break;
 			}
 
@@ -701,7 +707,7 @@ class Mobo_Core_Image_Refresh_Service {
 		return $this->save_last_result(
 			array(
 				'success'   => true,
-				'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : 'processed',
+				'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : ( $stopped_by_admin ? 'stopped-by-admin' : 'processed' ),
 				'processed' => $processed,
 				'failed'    => $failed,
 				'skipped'   => $skipped,
@@ -1126,6 +1132,14 @@ class Mobo_Core_Image_Refresh_Service {
 			return array( 'deleted' => false, 'outcome' => 'blocked', 'message' => 'تصویر قدیمی به عنوان تصویر موبو ثبت نشده است.', 'referenceMigration' => $migration_result );
 		}
 
+		/* Permanent deletion (and the reference rewrite that precedes it) requires
+		 * the administrator's explicit approval for the current generation and is
+		 * refused while the workflow is stopped. The old attachment keeps its
+		 * replaced-by marker, so Stage 6/7 can finish it after approval. */
+		if ( ! class_exists( 'Mobo_Core_Image_Refresh_Automation' ) || ! Mobo_Core_Image_Refresh_Automation::destructive_cleanup_allowed() ) {
+			return array( 'deleted' => false, 'outcome' => 'awaiting-approval', 'message' => 'تصویر قدیمی نگه داشته شد؛ حذف دائمی تا تأیید صریح مدیر (یا پس از توقف) انجام نمی‌شود.', 'referenceMigration' => $migration_result );
+		}
+
 		/* Shared Media files are worker-owned/read-only from the WordPress site's
 		 * perspective. wp_delete_attachment(..., true) would otherwise ask WordPress
 		 * to unlink the centrally shared physical family. Never do that from a site
@@ -1187,6 +1201,9 @@ class Mobo_Core_Image_Refresh_Service {
 		$family_snapshot   = $this->get_legacy_attachment_family_paths( $attachment_id );
 		$new_file          = get_attached_file( $new_attachment_id );
 		$new_file          = is_string( $new_file ) ? $this->normalize_file_path( $new_file ) : '';
+		if ( ! Mobo_Core_Image_Refresh_Automation::destructive_cleanup_allowed() ) {
+			return array( 'deleted' => false, 'outcome' => 'awaiting-approval', 'message' => 'توقف/لغو تأیید پیش از حذف دریافت شد؛ تصویر قدیمی نگه داشته شد.', 'referenceMigration' => $migration_result );
+		}
 		$deleted           = wp_delete_attachment( $attachment_id, true );
 
 		if ( ! $deleted ) {
@@ -2215,6 +2232,12 @@ class Mobo_Core_Image_Refresh_Service {
 		$time_budget        = $delete ? 8.0 : 12.0;
 
 		foreach ( $attachment_ids as $old_attachment_id ) {
+			/* Administrator Stop is checked before every attachment; the durable
+			 * cursor only advances after a processed attachment, so nothing is lost. */
+			if ( $delete && class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Image_Refresh_Automation::stop_requested() ) {
+				$result['stoppedByAdmin'] = true;
+				break;
+			}
 			$old_attachment_id = absint( $old_attachment_id );
 			$result['scanned']++;
 			$processed_in_batch++;

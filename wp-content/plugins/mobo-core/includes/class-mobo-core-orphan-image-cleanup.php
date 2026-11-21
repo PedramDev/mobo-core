@@ -305,6 +305,12 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			$result['cycleComplete'] = ! empty( $batch['cycleComplete'] );
 
 			foreach ( isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array() as $attachment_id ) {
+				/* Administrator Stop is honoured before every destructive unit. */
+				if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Image_Refresh_Automation::stop_requested() ) {
+					$result['status']        = 'stopped';
+					$result['cycleComplete'] = false;
+					break;
+				}
 				$attachment_id = absint( $attachment_id );
 				$result['processed']++;
 				$outcome = $this->delete_incomplete_collision_attachment( $attachment_id );
@@ -522,6 +528,11 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		);
 
 		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			/* Administrator Stop is honoured before every family; unprocessed rows stay candidates. */
+			if ( class_exists( 'Mobo_Core_Image_Refresh_Automation' ) && Mobo_Core_Image_Refresh_Automation::stop_requested() ) {
+				$result['status'] = 'stopped';
+				break;
+			}
 			$result['checked']++;
 			$result['checkedFamilies']++;
 

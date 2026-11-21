@@ -232,6 +232,8 @@ class Mobo_Core_Health_Reporter {
 			'disableWpCronDefined'   => defined( 'DISABLE_WP_CRON' ),
 			'wpCronDisabled'         => defined( 'DISABLE_WP_CRON' ) && true === DISABLE_WP_CRON,
 			'imageProcessing'        => $this->get_image_processing_stats( ! $non_blocking ),
+			/* Read-only legacy JPG/PNG cleanup estimate (option read only, no scan). */
+			'legacyImages'           => class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ? Mobo_Core_Legacy_Image_Audit::health_summary() : null,
 			'phpInfoSummary'         => $this->get_php_info_summary(),
 
 			'lastError'             => $last_error,
@@ -484,6 +486,8 @@ class Mobo_Core_Health_Reporter {
 			'writeProbeStatus'  => isset( $probe['status'] ) ? sanitize_key( (string) $probe['status'] ) : 'unavailable',
 			'writeProbeError'   => isset( $probe['error'] ) ? sanitize_text_field( (string) $probe['error'] ) : '',
 			'refreshAutomationEnabled'         => ! empty( $automation['enabled'] ),
+			'refreshAutomationPaused'          => ! empty( $automation['paused'] ),
+			'refreshAutomationDeleteApproved'  => ! empty( $automation['deleteApproved'] ),
 			'refreshAutomationStep'            => absint( isset( $automation['currentStep'] ) ? $automation['currentStep'] : 0 ),
 			'refreshAutomationStatus'          => isset( $automation['status'] ) ? sanitize_key( (string) $automation['status'] ) : 'idle',
 			'refreshAutomationWaitingApproval' => isset( $automation['waitingApproval'] ) ? sanitize_key( (string) $automation['waitingApproval'] ) : '',

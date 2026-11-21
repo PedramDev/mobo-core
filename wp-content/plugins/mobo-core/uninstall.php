@@ -195,6 +195,12 @@ function mobo_core_uninstall_runtime_state() {
 	 * Remove old v2 beta option if it exists.
 	 */
 	delete_option( 'mobo_core_enable_wp_cron' );
+	/* Legacy image scan state and the per-image reimport ledger. */
+	delete_option( 'mobo_core_legacy_image_audit_state' );
+	delete_option( 'mobo_core_legacy_image_audit_stop' );
+	delete_option( 'mobo_core_legacy_image_audit_content_refs' );
+	delete_option( 'mobo_core_legacy_image_cleanup_deleted_total' );
+	delete_option( 'mobo_core_image_reimport_ledger' );
 
 	/*
 	 * Remove temporary seen-variant options.
