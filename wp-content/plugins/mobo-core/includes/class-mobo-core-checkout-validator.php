@@ -323,6 +323,9 @@ class Mobo_Core_Checkout_Validator {
 			add_action( 'manage_shop_order_posts_custom_column', array( $this, 'render_legacy_order_column' ), 30, 2 );
 			add_filter( 'woocommerce_shop_order_list_table_columns', array( $this, 'add_hpos_order_column' ), 30 );
 			add_action( 'woocommerce_shop_order_list_table_custom_column', array( $this, 'render_hpos_order_column' ), 30, 2 );
+			if ( class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
+				Mobo_Core_Order_Price_Review::register_admin_hooks();
+			}
 		}
 		/*
 		 * Single shared Mobo cart mode: do not mirror live WooCommerce cart
@@ -3627,7 +3630,9 @@ class Mobo_Core_Checkout_Validator {
 				if ( ! $this->is_order_submission_enabled() ) { return; }
 				$context = is_array( $context ) ? $context : array();
 				$context['connectionId'] = $connection_id;
-				$this->queue_mobo_order_id_for_later( $order_id, $context );
+				$next_attempt_at = isset( $context['nextAttemptAt'] ) ? absint( $context['nextAttemptAt'] ) : 0;
+				unset( $context['nextAttemptAt'] );
+				$this->queue_mobo_order_id_for_later( $order_id, $context, $next_attempt_at > time() ? $next_attempt_at : 0 );
 			}
 		);
 	}
@@ -3646,23 +3651,29 @@ class Mobo_Core_Checkout_Validator {
 	 *
 	 * @param int   $order_id Order ID.
 	 * @param array $context Context.
+	 * @param int   $next_attempt_at Optional epoch before which the row is not claimable (deferral backoff).
 	 * @return bool
 	 */
-	private function queue_mobo_order_id_for_later( $order_id, $context = array() ) {
+	private function queue_mobo_order_id_for_later( $order_id, $context = array(), $next_attempt_at = 0 ) {
 		$order_id = absint( $order_id );
 		if ( $order_id <= 0 ) {
 			return false;
 		}
+		$next_attempt_at = absint( $next_attempt_at );
 
 		$token = str_replace( '-', '', wp_generate_uuid4() );
 		$locked = $this->with_order_queue_state_lock(
-			function () use ( $order_id, $context, $token ) {
+			function () use ( $order_id, $context, $token, $next_attempt_at ) {
 				$item = array(
 					'orderId'    => $order_id,
 					'queueToken' => $token,
 					'queuedAt'   => time(),
 					'context'    => $this->sanitize_order_log_value( is_array( $context ) ? $context : array() ),
 				);
+				if ( $next_attempt_at > 0 ) {
+					/* Mirrored into the indexed available_at column by the row store. */
+					$item['nextAttemptAt'] = $next_attempt_at;
+				}
 				if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
 					return $this->primary_order_row_store_ready()
 						&& Mobo_Core_Work_Queue_Store::put( self::ORDER_QUEUE_TYPE, (string) $order_id, $item );
@@ -3680,9 +3691,11 @@ class Mobo_Core_Checkout_Validator {
 			 * be discovered by that runner without touching the WC_Order during the
 			 * status-transition hook and without a shared read-modify-write race.
 			 */
-			$persisted = $this->persist_order_queue_recovery_marker( $order_id, $context, $token );
+			$persisted = $this->persist_order_queue_recovery_marker( $order_id, $context, $token, $next_attempt_at );
 			if ( function_exists( 'wp_schedule_single_event' ) ) {
-				wp_schedule_single_event( time() + 10, 'mobo_core_queue_mobo_order_submission', array( $order_id, is_array( $context ) ? $context : array() ) );
+				$scheduled_context = is_array( $context ) ? $context : array();
+				if ( $next_attempt_at > 0 ) { $scheduled_context['nextAttemptAt'] = $next_attempt_at; }
+				wp_schedule_single_event( time() + 10, 'mobo_core_queue_mobo_order_submission', array( $order_id, $scheduled_context ) );
 			}
 			if ( $persisted && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 				Mobo_Core_Self_Runner::kick( 'order-submission-recovery', false );
@@ -3724,7 +3737,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @param string $token Queue token.
 	 * @return bool
 	 */
-	private function persist_order_queue_recovery_marker( $order_id, $context, $token ) {
+	private function persist_order_queue_recovery_marker( $order_id, $context, $token, $next_attempt_at = 0 ) {
 		$order_id = absint( $order_id );
 		$token    = preg_replace( '/[^a-zA-Z0-9]/', '', (string) $token );
 		if ( $order_id <= 0 || '' === $token ) {
@@ -3738,6 +3751,9 @@ class Mobo_Core_Checkout_Validator {
 			'queuedAt'   => time(),
 			'context'    => $this->sanitize_order_log_value( is_array( $context ) ? $context : array() ),
 		);
+		if ( absint( $next_attempt_at ) > 0 ) {
+			$value['nextAttemptAt'] = absint( $next_attempt_at );
+		}
 
 		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
 			return Mobo_Core_Work_Queue_Store::put( self::ORDER_RECOVERY_QUEUE_TYPE, $key, $value );
@@ -3768,6 +3784,7 @@ class Mobo_Core_Checkout_Validator {
 				$item = get_option( $name, array() );
 				$order_id = is_array( $item ) && isset( $item['orderId'] ) ? absint( $item['orderId'] ) : 0;
 				if ( $order_id <= 0 ) { delete_option( $name ); continue; }
+				if ( isset( $item['nextAttemptAt'] ) && absint( $item['nextAttemptAt'] ) > time() ) { continue; } // Deferral backoff.
 				$out[] = array(
 					'queueKey' => null, 'queueToken' => '',
 					'recoveryKey' => substr( (string) $name, strlen( self::ORDER_RECOVERY_OPTION_PREFIX ) ),
@@ -3791,10 +3808,10 @@ class Mobo_Core_Checkout_Validator {
 				}
 			}
 		}
-		/* PERF04: ORDER BY id keeps the legacy load_map()/array_slice() FIFO,
-		 * but only the requested page is loaded/decoded. Do not process a partial
-		 * page when any row on it has failed the digest/payload check. */
-		$page = Mobo_Core_Work_Queue_Store::first_rows_checked( self::ORDER_RECOVERY_QUEUE_TYPE, $limit );
+		/* PERF04: only the requested page is loaded/decoded. Do not process a partial
+		 * page when any row on it has failed the digest/payload check. Only due rows
+		 * (available_at reached) are read so a backed-off marker cannot block later ones. */
+		$page = Mobo_Core_Work_Queue_Store::first_due_rows_checked( self::ORDER_RECOVERY_QUEUE_TYPE, $limit );
 		$this->order_recovery_read_failed = 'ok' !== $page['status'];
 		if ( $this->order_recovery_read_failed ) {
 			return array();
@@ -4059,11 +4076,14 @@ class Mobo_Core_Checkout_Validator {
 				$result['remaining'] = true;
 				return $result;
 			}
-			/* PERF06: inspect a bounded FIFO page. A full page may conceal an
+			/* PERF06: inspect a bounded page. A full page may conceal an
 			 * additional primary row: never promote a recovery marker or legacy
-			 * Woo lookup ahead of an unseen owner-scoped primary queue record. */
+			 * Woo lookup ahead of an unseen owner-scoped primary queue record.
+			 * Only DUE rows are read (available_at NULL/reached, ordered by
+			 * available_at, id): a deferred order with backoff can no longer keep
+			 * its old id at the head and block every later paid order. */
 			$page_size = max( 16, $limit + 1 );
-			$page = Mobo_Core_Work_Queue_Store::first_rows_checked( self::ORDER_QUEUE_TYPE, $page_size );
+			$page = Mobo_Core_Work_Queue_Store::first_due_rows_checked( self::ORDER_QUEUE_TYPE, $page_size );
 			if ( 'ok' !== $page['status'] ) {
 				$result['status'] = 'queue-read-failed';
 				$result['remaining'] = true;
@@ -4085,6 +4105,9 @@ class Mobo_Core_Checkout_Validator {
 				$removed = $this->remove_order_queue_item_if_token_matches( $key, $this->order_queue_item_token( $item, $key ), isset( $primary_hashes[ $key ] ) ? $primary_hashes[ $key ] : '' );
 				if ( ! $removed ) { $result['remaining'] = true; }
 				continue;
+			}
+			if ( ! $row_mode && is_array( $item ) && isset( $item['nextAttemptAt'] ) && absint( $item['nextAttemptAt'] ) > time() ) {
+				continue; // Option-backed fallback: honor the same deferral backoff as available_at.
 			}
 			$queue_items[] = array(
 				'queueKey'       => $key,
@@ -4119,6 +4142,20 @@ class Mobo_Core_Checkout_Validator {
 				$this->cleanup_order_queue_item( $recovery_item );
 				continue;
 			}
+			if ( $row_mode && $recovery_order_id > 0 ) {
+				/* The primary page now holds only due rows, so a backed-off primary row
+				 * is not in $seen_order_ids. It is still authoritative (it carries the
+				 * deferral backoff); the emergency marker must not bypass it. */
+				$primary_read = Mobo_Core_Work_Queue_Store::read_one_checked( self::ORDER_QUEUE_TYPE, (string) $recovery_order_id );
+				if ( 'ok' === $primary_read['status'] ) {
+					$this->cleanup_order_queue_item( $recovery_item );
+					continue;
+				}
+				if ( 'missing' !== $primary_read['status'] ) {
+					$result['remaining'] = true;
+					continue;
+				}
+			}
 			if ( $recovery_order_id > 0 ) {
 				$seen_order_ids[ $recovery_order_id ] = true;
 			}
@@ -4149,6 +4186,18 @@ class Mobo_Core_Checkout_Validator {
 					$legacy_orders = array_slice( $legacy_orders, 0, $limit );
 				}
 				foreach ( $legacy_orders as $legacy_order_id ) {
+					/* A deferred order keeps meta status "queued". Never let this legacy
+					 * meta lookup bypass its backoff or its authoritative primary row. */
+					$legacy_order = wc_get_order( absint( $legacy_order_id ) );
+					if ( $legacy_order instanceof WC_Order && absint( $legacy_order->get_meta( '_mobo_order_submit_next_attempt_at', true ) ) > time() ) {
+						continue;
+					}
+					if ( $row_mode ) {
+						$legacy_primary = Mobo_Core_Work_Queue_Store::read_one_checked( self::ORDER_QUEUE_TYPE, (string) absint( $legacy_order_id ) );
+						if ( 'missing' !== $legacy_primary['status'] ) {
+							continue;
+						}
+					}
 					$queue_items[] = array(
 						'queueKey'       => null,
 						'queueToken'     => '',
@@ -4241,9 +4290,10 @@ class Mobo_Core_Checkout_Validator {
 
 			/* A historical failed/aborted purchase must never be revived just
 			 * because an old recovery row survived a crash or a queue rewrite.
-			 * Only a separately authorized administrator action may retry it. */
+			 * Only a separately authorized administrator action may retry it.
+			 * A price-review order is terminal for automation in the same way. */
 			$durable_submit_status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
-			if ( in_array( $durable_submit_status, array( 'failed', 'aborted' ), true ) ) {
+			if ( in_array( $durable_submit_status, array( 'failed', 'aborted', 'price_review' ), true ) ) {
 				$result['skipped']++;
 				$this->cleanup_order_queue_item( $queue_item );
 				continue;
@@ -4330,7 +4380,8 @@ class Mobo_Core_Checkout_Validator {
 
 			$this->cleanup_order_queue_item( $queue_item );
 
-			if ( is_wp_error( $submit ) && in_array( $submit->get_error_code(), array( 'mobo_core_order_submission_superseded', 'mobo_core_order_submission_uncertain', 'mobo_core_order_submission_aborted', 'mobo_core_order_not_processing' ), true ) ) {
+			/* Price review: queue row retired above, so later paid orders proceed. */
+			if ( is_wp_error( $submit ) && in_array( $submit->get_error_code(), array( 'mobo_core_order_submission_superseded', 'mobo_core_order_submission_uncertain', 'mobo_core_order_submission_aborted', 'mobo_core_order_not_processing', 'mobo_core_order_submission_price_review' ), true ) ) {
 				$result['skipped']++;
 				continue;
 			}
@@ -4373,7 +4424,19 @@ class Mobo_Core_Checkout_Validator {
 
 		/* PERF06: end-of-batch continuation must not re-materialize the full
 		 * primary queue. A count failure is an error, not an empty queue. */
-		$primary_count = $row_mode ? Mobo_Core_Work_Queue_Store::count_strict( self::ORDER_QUEUE_TYPE ) : count( $this->get_option_backed_order_queue() );
+		/* Only DUE rows ask for an immediate continuation; backed-off rows are
+		 * picked up by a later runner pass once available_at is reached. */
+		if ( $row_mode ) {
+			$primary_counts = Mobo_Core_Work_Queue_Store::pending_due_counts_strict( self::ORDER_QUEUE_TYPE );
+			$primary_count  = is_array( $primary_counts ) ? absint( $primary_counts['due'] ) : -1;
+		} else {
+			$primary_count = 0;
+			foreach ( $this->get_option_backed_order_queue() as $option_item ) {
+				if ( ! is_array( $option_item ) || ! isset( $option_item['nextAttemptAt'] ) || absint( $option_item['nextAttemptAt'] ) <= time() ) {
+					$primary_count++;
+				}
+			}
+		}
 		if ( $primary_count < 0 ) {
 			$result['status'] = 'queue-read-failed';
 			$result['remaining'] = true;
@@ -5386,6 +5449,7 @@ class Mobo_Core_Checkout_Validator {
 				$fresh->delete_meta_data( '_mobo_order_last_error' );
 				$fresh->delete_meta_data( '_mobo_order_failed_at' );
 				$fresh->delete_meta_data( '_mobo_order_uncertain_at' );
+				$this->clear_order_defer_backoff_meta( $fresh );
 				$fresh->save();
 			}
 
@@ -5596,6 +5660,13 @@ class Mobo_Core_Checkout_Validator {
 			}
 			/* The final authoritative snapshot seals this Clear -> Add All rebuild. */
 			$this->shared_mobo_cart_rebuild_ready = false;
+
+			/* Per-line, per-unit Source price guard. Stops BEFORE Checkout creates a
+			 * remote order and long before Wallet; shipping is never compared. */
+			$price_guard = $this->enforce_source_price_match_before_checkout( $order, $snapshot, $context );
+			if ( true !== $price_guard ) {
+				return $price_guard;
+			}
 
 			$checkout_payload = $this->build_mobo_checkout_payload( $order, $snapshot, $contact_preflight );
 			if ( is_wp_error( $checkout_payload ) ) {
@@ -6710,6 +6781,7 @@ class Mobo_Core_Checkout_Validator {
 		$order->delete_meta_data( '_mobo_order_last_error' );
 		$order->delete_meta_data( '_mobo_order_failed_at' );
 		$order->delete_meta_data( '_mobo_order_uncertain_at' );
+		$this->clear_order_defer_backoff_meta( $order );
 		foreach ( array( '_mobo_order_pending_stage', '_mobo_order_pending_attempt_key', '_mobo_order_pending_updated_at', '_mobo_order_pending_token', '_mobo_order_pending_token_sha256', '_mobo_order_pending_remote_id', '_mobo_order_pending_shipping_id', '_mobo_order_pending_business_fingerprint' ) as $pending_key ) {
 			$order->delete_meta_data( $pending_key );
 		}
@@ -6744,6 +6816,14 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_order_submission_deferred', $message );
 		}
 
+		/* Bounded exponential backoff per consecutive deferral reason (1m..1h).
+		 * The row keeps its id but becomes unclaimable until available_at, so it
+		 * can no longer block later paid orders of the same Connection. */
+		$previous_reason = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_defer_reason', true ) );
+		$defer_count     = $previous_reason === $code ? absint( $order->get_meta( '_mobo_order_submit_defer_count', true ) ) + 1 : 1;
+		$delay           = class_exists( 'Mobo_Core_Order_Price_Review' ) ? Mobo_Core_Order_Price_Review::defer_backoff_seconds( $defer_count ) : 60;
+		$next_attempt_at = time() + $delay;
+
 		$order->delete_meta_data( '_mobo_order_submit_attempted' );
 		$order->delete_meta_data( '_mobo_order_submit_attempted_at' );
 		$order->update_meta_data( '_mobo_order_submit_queued', 'yes' );
@@ -6752,12 +6832,216 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_submit_context', array( 'trigger' => 'automatic_defer', 'reason' => $code ) );
 		$order->update_meta_data( '_mobo_order_last_error_code', $code );
 		$order->update_meta_data( '_mobo_order_last_error', $message );
+		$order->update_meta_data( '_mobo_order_submit_defer_reason', $code );
+		$order->update_meta_data( '_mobo_order_submit_defer_count', $defer_count );
+		$order->update_meta_data( '_mobo_order_submit_next_attempt_at', $next_attempt_at );
 		$order->delete_meta_data( '_mobo_order_failed_at' );
 		$order->save();
 
-		$this->append_order_log( $order, 'order_submission_deferred', array_merge( array( 'code' => $code, 'message' => $message ), is_array( $context ) ? $context : array() ) );
-		$this->queue_mobo_order_id_for_later( absint( $order->get_id() ), array( 'trigger' => 'automatic_defer', 'reason' => $code ) );
-		return new WP_Error( 'mobo_core_order_submission_deferred', $message, array( 'reason' => $code ) );
+		if ( 1 === $defer_count ) {
+			/* One note per (new) reason keeps the reason visible without hourly note spam. */
+			$order->add_order_note( sprintf(
+				'ثبت خودکار سفارش در موبو موقتاً به تعویق افتاد (%s): %s تلاش بعدی به‌صورت خودکار حدود %s انجام می‌شود و در صورت تکرار، فاصله تلاش‌ها تا حداکثر یک ساعت افزایش می‌یابد. سفارش‌های بعدی منتظر این سفارش نمی‌مانند.',
+				$code,
+				$message,
+				function_exists( 'wp_date' ) ? wp_date( 'Y-m-d H:i', $next_attempt_at ) : gmdate( 'Y-m-d H:i', $next_attempt_at ) . ' UTC'
+			) );
+		}
+		$this->append_order_log( $order, 'order_submission_deferred', array_merge( array( 'code' => $code, 'message' => $message, 'deferCount' => $defer_count, 'delaySeconds' => $delay, 'nextAttemptAt' => $next_attempt_at ), is_array( $context ) ? $context : array() ) );
+		$this->queue_mobo_order_id_for_later( absint( $order->get_id() ), array( 'trigger' => 'automatic_defer', 'reason' => $code ), $next_attempt_at );
+		return new WP_Error( 'mobo_core_order_submission_deferred', $message, array( 'reason' => $code, 'nextAttemptAt' => $next_attempt_at ) );
+	}
+
+	/** Forget deferral backoff state once an attempt reaches a non-deferred outcome (caller saves). */
+	private function clear_order_defer_backoff_meta( $order ) {
+		if ( ! $order instanceof WC_Order ) {
+			return;
+		}
+		$order->delete_meta_data( '_mobo_order_submit_defer_reason' );
+		$order->delete_meta_data( '_mobo_order_submit_defer_count' );
+		$order->delete_meta_data( '_mobo_order_submit_next_attempt_at' );
+	}
+
+	/**
+	 * Expected Source per-unit price of every Mobo order line, keyed by portal
+	 * variant id, in the Connection's Source money unit.
+	 *
+	 * Priority: the immutable checkout snapshot of the synced Source price
+	 * (_mobo_revenue_source_unit_cost, captured from mobo_api_price when the
+	 * customer ordered), then the currently synced mobo_api_price of the
+	 * variation (or the simple product). Both are raw Source amounts, so they
+	 * share the Source unit with the Source cart. Lines of one variant that
+	 * disagree, or have no synced price, yield null (= mismatch, fail closed).
+	 *
+	 * @return array variantKey => array{name:string, expected:?string, origin:string}
+	 */
+	private function build_expected_source_unit_prices( $order ) {
+		$out = array();
+		if ( ! $order instanceof WC_Order || ! class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
+			return $out;
+		}
+		$snapshot_key = class_exists( 'Mobo_Core_Revenue_Ledger' ) && defined( 'Mobo_Core_Revenue_Ledger::ITEM_META_SOURCE_UNIT_COST' )
+			? Mobo_Core_Revenue_Ledger::ITEM_META_SOURCE_UNIT_COST
+			: '_mobo_revenue_source_unit_cost';
+		foreach ( $order->get_items( 'line_item' ) as $line_item ) {
+			if ( ! $line_item instanceof WC_Order_Item_Product ) {
+				continue;
+			}
+			$product    = $line_item->get_product();
+			$identity   = $this->get_order_line_item_identity( $line_item, $product );
+			$variant_id = absint( isset( $identity['portalVariantId'] ) ? $identity['portalVariantId'] : 0 );
+			if ( $variant_id <= 0 ) {
+				continue;
+			}
+			$origin   = 'checkout_snapshot';
+			$expected = Mobo_Core_Order_Price_Review::canonical_decimal( (string) $line_item->get_meta( $snapshot_key, true ) );
+			if ( null === $expected && class_exists( 'Mobo_Core_Money_Policy' ) ) {
+				$origin = 'synced_mobo_api_price';
+				$live   = Mobo_Core_Money_Policy::get_mobo_api_price( absint( $line_item->get_variation_id() ), absint( $line_item->get_product_id() ) );
+				$expected = null === $live ? null : Mobo_Core_Order_Price_Review::canonical_decimal( (float) $live );
+			}
+			if ( null === $expected ) {
+				$origin = 'unknown';
+			}
+			$key = (string) $variant_id;
+			if ( ! isset( $out[ $key ] ) ) {
+				$out[ $key ] = array( 'name' => wp_strip_all_tags( $line_item->get_name() ), 'expected' => $expected, 'origin' => $origin );
+			} elseif ( $out[ $key ]['expected'] !== $expected ) {
+				$out[ $key ]['expected'] = null;
+				$out[ $key ]['origin']   = 'ambiguous';
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Per-unit Source prices of the rebuilt Source cart, converted to $target_unit.
+	 *
+	 * @return array variantKey => list<?string>
+	 */
+	private function build_remote_source_unit_prices( $snapshot, $target_unit, &$fields ) {
+		$fields = array();
+		$out    = array();
+		if ( ! class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
+			return $out;
+		}
+		$declared = Mobo_Core_Order_Price_Review::extract_snapshot_unit( $snapshot );
+		$unit     = '' !== $declared ? $declared : $target_unit;
+		$rows     = isset( $snapshot['cart']['items'] ) && is_array( $snapshot['cart']['items'] ) ? $snapshot['cart']['items'] : array();
+		foreach ( $rows as $cart_item ) {
+			$variant_id = is_array( $cart_item ) && isset( $cart_item['product']['variant'] ) && is_array( $cart_item['product']['variant'] ) && array_key_exists( 'id', $cart_item['product']['variant'] )
+				? $this->parse_positive_integer_id( $cart_item['product']['variant']['id'] )
+				: 0;
+			if ( $variant_id <= 0 ) {
+				continue; // Unknown rows already fail the existing cart comparison.
+			}
+			$price = Mobo_Core_Order_Price_Review::extract_remote_unit_price( $cart_item );
+			$fields[ (string) $variant_id ] = $price['field'];
+			$out[ (string) $variant_id ][]  = null === $price['price'] ? null : Mobo_Core_Order_Price_Review::convert_unit( $price['price'], $unit, $target_unit );
+		}
+		return $out;
+	}
+
+	/**
+	 * Owner decision: the wallet must never pay a Source price that differs from
+	 * the price the plugin expects. Runs after the cart rebuild was verified and
+	 * BEFORE Checkout, so no remote order exists and no Wallet call happened.
+	 * The filled Source cart is intentionally left as is (no destructive call).
+	 *
+	 * @return true|WP_Error
+	 */
+	private function enforce_source_price_match_before_checkout( $order, $snapshot, $context ) {
+		if ( ! class_exists( 'Mobo_Core_Order_Price_Review' ) ) {
+			return $this->fail_mobo_order_submission( $order, 'price_guard_unavailable', 'کنترل قیمت Source در دسترس نیست؛ خرید خودکار برای جلوگیری از پرداخت با قیمت نامعلوم متوقف شد.' );
+		}
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$contract      = class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::get_source_contract( $connection_id, true ) : array( 'unit' => '' );
+		$unit          = Mobo_Core_Order_Price_Review::normalize_unit( isset( $contract['unit'] ) ? $contract['unit'] : '' );
+
+		$fields     = array();
+		$expected   = $this->build_expected_source_unit_prices( $order );
+		$remote     = $this->build_remote_source_unit_prices( $snapshot, $unit, $fields );
+		$mismatches = '' === $unit ? array() : Mobo_Core_Order_Price_Review::compare_lines( $expected, $remote );
+		if ( '' === $unit ) {
+			foreach ( $expected as $key => $line ) {
+				$mismatches[] = array( 'variantId' => (string) $key, 'name' => $line['name'], 'expected' => $line['expected'], 'remote' => null, 'reason' => 'source_unit_unknown' );
+			}
+		}
+		$origins = array();
+		foreach ( $expected as $key => $line ) {
+			$origins[ $key ] = $line['origin'];
+		}
+
+		if ( empty( $mismatches ) ) {
+			$this->append_order_log( $order, 'source_price_check_passed', array( 'unit' => $unit, 'lines' => count( $expected ), 'expectedOrigin' => $origins, 'remoteField' => $fields ) );
+			return true;
+		}
+
+		$fingerprint  = Mobo_Core_Order_Price_Review::mismatch_fingerprint( $mismatches );
+		$acknowledged = is_array( $context )
+			&& 'admin_manual_retry' === sanitize_key( (string) ( isset( $context['trigger'] ) ? $context['trigger'] : '' ) )
+			&& ! empty( $context['priceReviewAcknowledged'] )
+			&& hash_equals( (string) $context['priceReviewAcknowledged'], $fingerprint );
+		if ( $acknowledged ) {
+			/* The administrator explicitly reviewed exactly these Source prices. */
+			$this->append_order_log( $order, 'source_price_difference_accepted_by_admin', array( 'unit' => $unit, 'mismatches' => $mismatches, 'userId' => absint( isset( $context['userId'] ) ? $context['userId'] : 0 ) ) );
+			$order->add_order_note( 'مدیر اختلاف قیمت Source را بررسی و تأیید کرد؛ خرید با قیمت فعلی Source ادامه یافت.' );
+			return true;
+		}
+
+		return $this->mark_order_price_review( $order, $mismatches, $unit, $fingerprint, $origins, $fields );
+	}
+
+	/**
+	 * Terminal-for-automation state "needs manual review: price difference".
+	 * It is not "queued"/"running"/"uncertain", so the queue row is retired and
+	 * the admin Retry button (with its existing safety checks) stays available.
+	 *
+	 * @return WP_Error
+	 */
+	private function mark_order_price_review( $order, $mismatches, $unit, $fingerprint, $origins = array(), $fields = array() ) {
+		$message = 'نیازمند بررسی دستی: قیمت Source با قیمت همگام‌شده تفاوت دارد؛ پرداخت از کیف پول انجام نشد.';
+		if ( ! $order instanceof WC_Order ) {
+			return new WP_Error( 'mobo_core_order_submission_price_review', $message );
+		}
+		$lines  = Mobo_Core_Order_Price_Review::describe_mismatches( $mismatches, $unit );
+		$stored = array();
+		foreach ( is_array( $mismatches ) ? $mismatches : array() as $row ) {
+			$stored[] = array(
+				'variantId' => sanitize_text_field( (string) ( isset( $row['variantId'] ) ? $row['variantId'] : '' ) ),
+				'name'      => sanitize_text_field( (string) ( isset( $row['name'] ) ? $row['name'] : '' ) ),
+				'expected'  => isset( $row['expected'] ) && null !== $row['expected'] ? sanitize_text_field( (string) $row['expected'] ) : null,
+				'remote'    => isset( $row['remote'] ) && null !== $row['remote'] ? sanitize_text_field( (string) $row['remote'] ) : null,
+				'reason'    => sanitize_key( (string) ( isset( $row['reason'] ) ? $row['reason'] : '' ) ),
+			);
+		}
+
+		$order->delete_meta_data( '_mobo_order_submit_attempted' );
+		$order->delete_meta_data( '_mobo_order_submit_attempted_at' );
+		$order->delete_meta_data( '_mobo_order_submit_queued' );
+		$order->delete_meta_data( '_mobo_order_submit_context' );
+		$this->clear_order_defer_backoff_meta( $order );
+		$order->update_meta_data( '_mobo_order_submit_status', Mobo_Core_Order_Price_Review::STATUS );
+		$order->update_meta_data( '_mobo_order_last_error_code', 'source_price_mismatch' );
+		$order->update_meta_data( '_mobo_order_last_error', $message );
+		$order->update_meta_data( '_mobo_order_price_review_at', time() );
+		$order->update_meta_data( '_mobo_order_price_review_unit', $unit );
+		$order->update_meta_data( '_mobo_order_price_review_items', $stored );
+		$order->update_meta_data( '_mobo_order_price_review_fingerprint', $fingerprint );
+		$order->save();
+
+		$order->add_order_note(
+			"خرید خودکار موبو متوقف شد: قیمت Source برای اقلام زیر با قیمت مورد انتظار افزونه تفاوت دارد. پرداخت از کیف پول انجام نشد و سفارشی در موبو ثبت نشد (سبد Source دست‌نخورده باقی ماند).\n"
+			. implode( "\n", $lines )
+			. "\nپس از بررسی، از کادر «ثبت سفارش در موبو» گزینه ارسال مجدد را بزنید تا خرید با همین قیمت‌های Source انجام شود."
+		);
+		$this->append_order_log( $order, 'order_submission_price_review', array( 'unit' => $unit, 'mismatches' => $mismatches, 'expectedOrigin' => $origins, 'remoteField' => $fields ) );
+
+		Mobo_Core_Order_Price_Review::register_order( absint( $order->get_id() ) );
+		$mailed = Mobo_Core_Order_Price_Review::send_admin_email_once( $order, $mismatches, $unit );
+		$this->append_order_log( $order, 'order_price_review_admin_email', array( 'sent' => $mailed ) );
+
+		return new WP_Error( 'mobo_core_order_submission_price_review', $message, array( 'reason' => 'source_price_mismatch' ) );
 	}
 
 	/**
@@ -6780,6 +7064,7 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_submit_status', 'aborted' );
 		$order->update_meta_data( '_mobo_order_last_error_code', $code );
 		$order->update_meta_data( '_mobo_order_last_error', $message );
+		$this->clear_order_defer_backoff_meta( $order );
 		$order->save();
 		$order->add_order_note( 'پرداخت سفارش در موبو قبل از مرحله Wallet متوقف شد: ' . $message );
 		$this->append_order_log( $order, 'order_submission_aborted_before_payment', array( 'code' => $code, 'message' => $message ) );
@@ -6794,6 +7079,7 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_last_error_code', sanitize_key( (string) $code ) );
 		$order->update_meta_data( '_mobo_order_last_error', $message );
 		$order->update_meta_data( '_mobo_order_failed_at', time() );
+		$this->clear_order_defer_backoff_meta( $order );
 		$order->save();
 		$order->add_order_note( 'ثبت سفارش در موبو ناموفق بود: ' . $message );
 		$this->append_order_log( $order, 'order_submission_failed', array( 'code' => $code, 'message' => $message ) );
@@ -6917,7 +7203,10 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$order_id = isset( $_POST['order_id'] ) ? absint( wp_unslash( $_POST['order_id'] ) ) : 0;
-		if ( $order_id <= 0 || ! current_user_can( 'edit_shop_order', $order_id ) ) {
+		/* A manual Retry can spend the merchant's Source wallet: require the store
+		 * management capability (shop managers have it) in addition to the per-order
+		 * edit capability, and keep the per-order nonce. */
+		if ( $order_id <= 0 || ! current_user_can( 'manage_woocommerce' ) || ! current_user_can( 'edit_shop_order', $order_id ) ) {
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
 
@@ -6999,6 +7288,14 @@ class Mobo_Core_Checkout_Validator {
 			}
 		}
 
+		/* Retrying a price-review order is the administrator's explicit acceptance of
+		 * exactly the Source prices that were reviewed. If the Source price changed
+		 * again since then, the guard stops once more with a fresh review. */
+		$retry_context = array( 'trigger' => 'admin_manual_retry', 'userId' => get_current_user_id(), 'verifiedAbsentInMobo' => $verified_absent );
+		if ( 'price_review' === $submit_status ) {
+			$retry_context['priceReviewAcknowledged'] = sanitize_text_field( (string) $order->get_meta( '_mobo_order_price_review_fingerprint', true ) );
+		}
+
 		$this->append_order_log(
 			$order,
 			'admin_manual_retry_requested',
@@ -7006,9 +7303,10 @@ class Mobo_Core_Checkout_Validator {
 				'userId'                 => get_current_user_id(),
 				'previousAttemptState'   => $attempt_state,
 				'verifiedAbsentInMobo'   => $verified_absent,
+				'priceReviewAcknowledged' => 'price_review' === $submit_status,
 			)
 		);
-		$result = $this->submit_order_to_mobo( $order, array( 'trigger' => 'admin_manual_retry', 'userId' => get_current_user_id(), 'verifiedAbsentInMobo' => $verified_absent ) );
+		$result = $this->submit_order_to_mobo( $order, $retry_context );
 
 		if ( true === $result ) {
 			$order = wc_get_order( $order_id );
@@ -7201,6 +7499,17 @@ class Mobo_Core_Checkout_Validator {
 			$state['label']   = 'در صف ارسال';
 			$state['tone']    = 'info';
 			$state['message'] = 'سفارش در صف پردازش موبو قرار دارد. تا تعیین نتیجه صف، Retry در دسترس نیست.';
+			$next_attempt_at  = absint( $order->get_meta( '_mobo_order_submit_next_attempt_at', true ) );
+			if ( $next_attempt_at > time() ) {
+				$state['label']    = 'در صف؛ تلاش مجدد خودکار';
+				$state['message'] .= sprintf(
+					' ارسال موقتاً به تعویق افتاده است (%s، تلاش %s): %s تلاش بعدی حدود %s؛ سفارش‌های دیگر منتظر این سفارش نمی‌مانند.',
+					sanitize_key( (string) $order->get_meta( '_mobo_order_submit_defer_reason', true ) ),
+					absint( $order->get_meta( '_mobo_order_submit_defer_count', true ) ),
+					$last_error,
+					function_exists( 'wp_date' ) ? wp_date( 'Y-m-d H:i', $next_attempt_at ) : gmdate( 'Y-m-d H:i', $next_attempt_at ) . ' UTC'
+				);
+			}
 			return $state;
 		}
 		if ( in_array( $attempt_state, array( 'running_stale', 'uncertain' ), true ) ) {
@@ -7219,6 +7528,19 @@ class Mobo_Core_Checkout_Validator {
 			$state['message']    = '' !== $last_error ? 'آخرین تلاش ناموفق بود: ' . $last_error : 'آخرین تلاش ارسال ناموفق بود. جزئیات فنی را بررسی کنید و در صورت رفع علت Retry کنید.';
 			$state['canRetry']   = true;
 			$state['retryLabel'] = 'ارسال مجدد به موبو';
+			return $state;
+		}
+		if ( 'price_review' === $submit_status ) {
+			$review_items = $order->get_meta( '_mobo_order_price_review_items', true );
+			$review_lines = class_exists( 'Mobo_Core_Order_Price_Review' )
+				? Mobo_Core_Order_Price_Review::describe_mismatches( is_array( $review_items ) ? $review_items : array(), (string) $order->get_meta( '_mobo_order_price_review_unit', true ) )
+				: array();
+			$state['label']       = 'نیازمند بررسی: اختلاف قیمت';
+			$state['tone']        = 'warning';
+			$state['message']     = 'قیمت Source با قیمت مورد انتظار افزونه تفاوت داشت؛ خرید خودکار و پرداخت از کیف پول انجام نشد. ' . implode( ' ', $review_lines );
+			$state['canRetry']    = true;
+			$state['retryLabel']  = 'بررسی کردم؛ خرید با قیمت فعلی Source';
+			$state['confirmText'] = 'قیمت‌های فعلی Source را بررسی کرده‌اید و خرید از کیف پول موبو با همین قیمت‌ها انجام شود؟ اگر قیمت Source دوباره تغییر کرده باشد، خرید مجدداً برای بررسی متوقف می‌شود.';
 			return $state;
 		}
 		if ( 'aborted' === $submit_status ) {
@@ -7240,13 +7562,13 @@ class Mobo_Core_Checkout_Validator {
 	/** Render a POST-only submission action after the same fail-closed state classification used by the list. */
 	private function render_admin_order_action_form( $order_id, $state ) {
 		$order_id = absint( $order_id );
-		if ( $order_id <= 0 || ! is_array( $state ) || empty( $state['canRetry'] ) ) {
+		if ( $order_id <= 0 || ! is_array( $state ) || empty( $state['canRetry'] ) || ! current_user_can( 'manage_woocommerce' ) ) {
 			return;
 		}
 		$verified_absent = ! empty( $state['requiresVerifiedAbsent'] );
 		$confirm = $verified_absent
 			? 'تأیید می‌کنم در موبو بررسی کرده‌ام و این سفارش/پرداخت ایجاد نشده است. ارسال مجدد انجام شود؟'
-			: 'ارسال این سفارش به موبو انجام شود؟';
+			: ( ! empty( $state['confirmText'] ) ? (string) $state['confirmText'] : 'ارسال این سفارش به موبو انجام شود؟' );
 		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="margin-top:10px;">';
 		echo '<input type="hidden" name="action" value="mobo_core_retry_mobo_order_submission">';
 		echo '<input type="hidden" name="order_id" value="' . esc_attr( (string) $order_id ) . '">';

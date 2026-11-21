@@ -246,6 +246,22 @@ final class Mobo_Core_Work_Queue_Store {
 	 * @return array{status:string,rows:array} status ok|error; rows keyed by the full dedupe key.
 	 */
 	public static function first_rows_checked( $queue_type, $limit ) {
+		return self::first_rows_page_checked( $queue_type, $limit, false );
+	}
+
+	/**
+	 * Head-of-line safe variant of first_rows_checked(): only rows whose
+	 * available_at is NULL or already reached, without a live claim, ordered by
+	 * available_at, id. A deferred row (available_at in the future) therefore can
+	 * never hide later due rows of the same owner/queue. Same strict validation.
+	 *
+	 * @return array{status:string,rows:array} status ok|error
+	 */
+	public static function first_due_rows_checked( $queue_type, $limit ) {
+		return self::first_rows_page_checked( $queue_type, $limit, true );
+	}
+
+	private static function first_rows_page_checked( $queue_type, $limit, $due_only ) {
 		global $wpdb;
 		$queue_type    = self::queue_type( $queue_type );
 		$connection_id = self::connection_id();
@@ -254,10 +270,16 @@ final class Mobo_Core_Work_Queue_Store {
 		if ( '' === $queue_type || $connection_id <= 0 || ! self::is_available() ) {
 			return $error;
 		}
-		$rows = $wpdb->get_results( $wpdb->prepare(
-			'SELECT dedupe_key,dedupe_hash,payload,payload_hash FROM ' . self::table_name() . ' WHERE connection_id=%d AND queue_type=%s ORDER BY id ASC LIMIT %d',
-			$connection_id, $queue_type, $limit
-		), ARRAY_A );
+		$sql = $due_only
+			? $wpdb->prepare(
+				'SELECT dedupe_key,dedupe_hash,payload,payload_hash FROM ' . self::table_name() . ' WHERE connection_id=%d AND queue_type=%s AND (available_at IS NULL OR available_at<=UTC_TIMESTAMP()) AND (claim_token=%s OR claim_expires_at IS NULL OR claim_expires_at<=UTC_TIMESTAMP()) ORDER BY available_at ASC,id ASC LIMIT %d',
+				$connection_id, $queue_type, '', $limit
+			)
+			: $wpdb->prepare(
+				'SELECT dedupe_key,dedupe_hash,payload,payload_hash FROM ' . self::table_name() . ' WHERE connection_id=%d AND queue_type=%s ORDER BY id ASC LIMIT %d',
+				$connection_id, $queue_type, $limit
+			);
+		$rows = $wpdb->get_results( $sql, ARRAY_A );
 		if ( ! is_array( $rows ) || '' !== trim( (string) $wpdb->last_error ) ) {
 			return $error;
 		}
