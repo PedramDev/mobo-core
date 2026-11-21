@@ -104,6 +104,7 @@ class Mobo_Core_Repair_Integrity {
 			'trashedProductsExcluded' => 0,
 			'trashedProductsRemoteMissing' => 0,
 			'trashedProductsAmbiguous' => 0,
+			'trashedProductsPreserved' => 0,
 			'variationSignatureDuplicateGroups' => 0,
 			'variationSignatureDuplicateRows' => 0,
 			'priceMetaObjectsScanned' => 0,
@@ -677,6 +678,21 @@ class Mobo_Core_Repair_Integrity {
 		}
 
 		$state['repairIntegrityStats']['trashedProductsScanned']++;
+
+		/*
+		 * Merchant intent: Repair cannot tell whether the merchant or an old plugin trashed
+		 * this product, so it never un-trashes automatically. It only reports/logs. An
+		 * operator can opt in explicitly with the 'mobo_core_repair_untrash_enabled' filter.
+		 */
+		if ( ! (bool) apply_filters( 'mobo_core_repair_untrash_enabled', false, $post_id, 'product' ) ) {
+			$state['repairIntegrityCursor'] = $post_id;
+			$state['repairIntegrityStats']['trashedProductsPreserved'] = absint( $state['repairIntegrityStats']['trashedProductsPreserved'] ?? 0 ) + 1;
+			$this->append_sample( $state['repairIntegrityStats']['ambiguousSamples'], array( 'productId' => $post_id, 'productGuid' => $product_guid, 'reason' => 'trashed product kept in Trash (merchant intent preserved; not restored automatically)' ) );
+			if ( class_exists( 'Mobo_Core_Logger' ) ) {
+				Mobo_Core_Logger::warning( 'Repair kept a trashed Mobo product in Trash (merchant intent preserved).', array( 'productId' => $post_id, 'productGuid' => $product_guid ) );
+			}
+			return array( 'success' => true, 'done' => false, 'message' => 'محصول در سطل زباله است و برای حفظ تصمیم مدیر فروشگاه به‌صورت خودکار بازیابی نشد.' );
+		}
 
 		/* If the GUID already has another active local parent, this Trash row is a
 		 * local duplicate/history record and must never be auto-restored. */

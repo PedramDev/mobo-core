@@ -64,6 +64,7 @@ final class Mobo_Core_Connection_Settings {
 			'global_product_auto_slug',
 			'global_update_categories',
 			'global_update_images',
+			'global_product_auto_description',
 			'mobo_core_category_mapping_enabled',
 			'mobo_core_category_mapping_required',
 			'mobo_default_category_id',

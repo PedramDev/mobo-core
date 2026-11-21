@@ -733,6 +733,11 @@ add_action(
 			add_action( 'init', array( 'Mobo_Core_Migration', 'run_deferred_repairs' ), 20 );
 		}
 
+		/* Source status guard: products hidden/deactivated on the Source stay published (SEO)
+		 * but are out of stock and not purchasable on every request path (storefront, cart,
+		 * checkout, REST). Filters only read already-loaded product meta. */
+		Mobo_Core_Source_Visibility::init();
+
 		/* Private shared media is loaded only on servers that explicitly enable it. */
 		if ( mobo_core_shared_media_configured() ) {
 			Mobo_Core_Shared_Media::init();

@@ -66,6 +66,8 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug'            => '1',
 			'global_update_categories'            => '1',
 			'global_update_images'                => '1',
+			// Per-Connection; OFF by default (portal-ir/mobomobo.ir must not sync descriptions).
+			'global_product_auto_description'     => '0',
 			'mobo_core_cache_archive_purge_interval_minutes' => '15',
 			// Exact product-page cache warmup after successful targeted purge.
 			'mobo_core_cache_warmup_enabled'             => '1',
@@ -671,6 +673,7 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'global_product_auto_slug' );
 		self::save_bool( $post, 'global_update_categories' );
 		self::save_bool( $post, 'global_update_images' );
+		self::save_bool_if_present( $post, 'global_product_auto_description' );
 		self::save_bool( $post, 'mobo_core_category_mapping_enabled' );
 		self::save_bool( $post, 'mobo_core_category_mapping_required' );
 
@@ -941,6 +944,7 @@ class Mobo_Core_Settings {
 			'global_product_auto_slug' => 'بروزرسانی نامک و آدرس محصول',
 			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
 			'global_update_images' => 'بروزرسانی تصاویر محصول',
+			'global_product_auto_description' => 'دریافت توضیحات محصول از منبع',
 			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی صفحات مرتبط',
 			'mobo_core_cache_warmup_enabled' => 'پیش‌بارگذاری صفحه محصول بعد از بروزرسانی',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',

@@ -2660,6 +2660,7 @@ class Mobo_Core_Admin {
 					<div class="mobo-fields-grid">
 						<?php $this->bool_field( 'بروزرسانی عنوان محصول', 'global_product_auto_title', false, '', 'اگر روشن باشد، تغییر عنوان در منبع می‌تواند عنوانی را که داخل WooCommerce ویرایش کرده‌اید بازنویسی کند. برای سایت فعال معمولاً بهتر است خاموش باشد.' ); ?>
 						<?php $this->bool_field( 'بروزرسانی نامک و آدرس محصول', 'global_product_auto_slug', false, '', 'اگر روشن باشد، تغییر نامک در منبع می‌تواند URL محصول را عوض کند. برای سایت فعال معمولاً بهتر است خاموش باشد.' ); ?>
+						<?php $this->bool_field( 'دریافت توضیحات محصول از منبع', 'global_product_auto_description', false, '', 'فقط برای همین اتصال. پیش‌فرض خاموش است. اگر روشن باشد و منبع توضیحات محصول را ارسال کند، توضیحات WooCommerce بازنویسی می‌شود. منبع mobomobo.ir توضیحات ارسال نمی‌کند.' ); ?>
 					</div>
 				</section>
 
@@ -9064,6 +9065,7 @@ https://source.example/products/test-product/
 						'mobo_core_only_in_stock',
 						'global_product_auto_compare_price',
 						'global_update_images',
+						'global_product_auto_description',
 						'mobo_core_cache_warmup_enabled',
 					)
 				);

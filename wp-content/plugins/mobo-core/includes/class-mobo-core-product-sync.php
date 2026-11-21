@@ -2588,6 +2588,29 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$existing_product_id       = '' !== $product_guid ? $this->find_product_id_by_guid( $product_guid ) : 0;
+
+		/* Never create a product that is not published on the Source. Acknowledge the
+		 * event (no retry storm); a later publish arrives as a new revision and creates it. */
+		if ( $existing_product_id <= 0 && ! Mobo_Core_Source_Visibility::payload_allows_creation( $product_data ) ) {
+			$product_index++;
+			$payload['_moboProductIndex'] = $product_index;
+			$payload['_moboImageOffset']  = 0;
+			$terminal = $product_index >= count( $items );
+			if ( $terminal ) {
+				unset( $payload['_moboProductIndex'], $payload['_moboImageOffset'] );
+			}
+			return $this->result(
+				true,
+				'ProductUpdated skipped a product that is not published on the Source; it was not created.',
+				array(
+					'deleteFile'     => $terminal,
+					'productGuid'    => $product_guid,
+					'healthSkipped'  => true,
+					'skippedBecause' => 'source_not_published',
+				)
+			);
+		}
+
 		$source_version            = $this->extract_source_version( $product_data, $payload );
 		$source_revision           = $this->extract_source_revision( $product_data, $payload );
 		if ( $existing_product_id > 0 && '' !== $source_version ) {
@@ -3039,6 +3062,21 @@ class Mobo_Core_Product_Sync {
 					'productGuid'    => $product_guid,
 					'healthSkipped'  => true,
 					'skippedBecause' => 'excluded_url',
+				)
+			);
+		}
+
+		if ( $product_id <= 0 && Mobo_Core_Source_Visibility::HIDDEN === Mobo_Core_Source_Visibility::variant_page_parent_visibility( $payload ) ) {
+			/* The parent is intentionally never created while it is not published on the
+			 * Source; waiting for it would retry forever. */
+			return $this->result(
+				true,
+				'محصول مادر در منبع منتشر نشده است؛ تنوع‌ها بدون ساخت محصول رد شدند.',
+				array(
+					'deleteFile'     => true,
+					'productGuid'    => $product_guid,
+					'healthSkipped'  => true,
+					'skippedBecause' => 'source_not_published',
 				)
 			);
 		}
@@ -4697,7 +4735,68 @@ class Mobo_Core_Product_Sync {
 		return $this->save_manual_sync_state( $state );
 	}
 
+	/**
+	 * Source-status aware parent upsert.
+	 *
+	 * - A payload explicitly marked not published never creates a new local product
+	 *   (returns 0, which every caller already treats as "skip").
+	 * - Existing products get the Source visibility overlay (never trashed/drafted).
+	 * - Payloads without status fields (10.33.67-era Backend) keep the legacy behavior.
+	 *
+	 * @param array $data Product payload.
+	 * @param bool  $skip_images Skip images.
+	 * @return int
+	 */
 	private function upsert_parent_product( $data, $skip_images ) {
+		$visibility = class_exists( 'Mobo_Core_Source_Visibility' ) ? Mobo_Core_Source_Visibility::payload_visibility( $data ) : '';
+		if ( Mobo_Core_Source_Visibility::HIDDEN === $visibility ) {
+			$guard_guid = $this->extract_product_guid( $data );
+			if ( '' !== $guard_guid && $this->find_product_id_by_guid( $guard_guid ) <= 0 ) {
+				$this->last_parent_core_noop = false;
+				Mobo_Core_Source_Visibility::log( 'warning', 'Product is not published on the Source; it was not created on this site.', array( 'productGuid' => $guard_guid ) );
+				return 0;
+			}
+		}
+
+		$product_id = $this->upsert_parent_product_core( $data, $skip_images );
+
+		if ( $product_id > 0 ) {
+			$source_status = Mobo_Core_Source_Visibility::normalize_status( $this->get_value( $data, 'sourceStatus', '' ) );
+			Mobo_Core_Source_Visibility::apply_to_product( $product_id, $visibility, $source_status );
+			$this->apply_optional_description( $product_id, $data );
+		}
+
+		return $product_id;
+	}
+
+	/**
+	 * Apply the Source description only when this Connection enabled it and the payload
+	 * explicitly carries a non-null description (portal-ir never sends one).
+	 *
+	 * @param int   $product_id Product ID.
+	 * @param array $data Product payload.
+	 * @return void
+	 */
+	private function apply_optional_description( $product_id, $data ) {
+		if ( ! method_exists( $this->rules, 'should_update_description' ) || ! $this->rules->should_update_description() ) {
+			return;
+		}
+		$inspection = Mobo_Core_Payload_Field_Policy::inspect( $data, array( 'description', 'Description' ) );
+		if ( empty( $inspection['present'] ) || ! is_string( $inspection['value'] ) ) {
+			return;
+		}
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+		$description = wp_kses_post( (string) $inspection['value'] );
+		if ( (string) $product->get_description( 'edit' ) !== $description ) {
+			$product->set_description( $description );
+			$product->save();
+		}
+	}
+
+	private function upsert_parent_product_core( $data, $skip_images ) {
 		$this->last_parent_core_noop    = false;
 
 		$product_guid = $this->extract_product_guid( $data );
@@ -4714,6 +4813,10 @@ class Mobo_Core_Product_Sync {
 		}
 		if ( $product_id <= 0 && $this->is_repair_mode() ) {
 			$product_id = $this->restore_trashed_mobo_object_by_identity( 'product', 'product_guid', $product_guid, 0 );
+			if ( $product_id < 0 ) {
+				/* Merchant-trashed product: never resurrect and never create a duplicate. */
+				return 0;
+			}
 			if ( $product_id > 0 ) {
 				$this->upsert_product_map( $product_guid, $product_id, false );
 			}
@@ -5025,7 +5128,24 @@ class Mobo_Core_Product_Sync {
 		return $product_id;
 	}
 
+	/**
+	 * Variation upsert plus the Source inactive-variant overlay (out of stock / not
+	 * purchasable, never deleted). Unknown purchasability (legacy payload) changes nothing.
+	 *
+	 * @param WC_Product $parent Parent.
+	 * @param array      $data Variant payload.
+	 * @param string     $authoritative_product_guid Parent GUID.
+	 * @return array
+	 */
 	private function upsert_variation( $parent, $data, $authoritative_product_guid = '' ) {
+		$result = $this->upsert_variation_core( $parent, $data, $authoritative_product_guid );
+		if ( is_array( $result ) && ! empty( $result['id'] ) ) {
+			Mobo_Core_Source_Visibility::apply_inactive_flag( absint( $result['id'] ), Mobo_Core_Source_Visibility::payload_variant_purchasable( $data ) );
+		}
+		return $result;
+	}
+
+	private function upsert_variation_core( $parent, $data, $authoritative_product_guid = '' ) {
 		if ( ! $parent instanceof WC_Product ) {
 			return array(
 				'id'      => 0,
@@ -5092,6 +5212,14 @@ class Mobo_Core_Product_Sync {
 		$variation_id            = $this->find_variation_id_by_guid( $variant_guid );
 		if ( $variation_id <= 0 && $this->is_repair_mode() ) {
 			$variation_id = $this->restore_trashed_mobo_object_by_identity( 'product_variation', 'variant_guid', $variant_guid, $parent_id );
+			if ( $variation_id < 0 ) {
+				/* Merchant-trashed variation: keep it in Trash, same contract as normal sync. */
+				return array(
+					'id'            => 0,
+					'changed'       => false,
+					'skipped_trash' => true,
+				);
+			}
 		}
 		$matched_by_portal_id    = false;
 		$matched_by_signature    = false;
@@ -7236,7 +7364,23 @@ class Mobo_Core_Product_Sync {
 	 * @param string $product_guid Product GUID.
 	 * @return array|WP_Error
 	 */
+	/**
+	 * Simple-product single-variant apply plus the Source inactive-variant overlay.
+	 *
+	 * @param int    $product_id Product ID.
+	 * @param array  $variant_data Variant payload.
+	 * @param string $product_guid Product GUID.
+	 * @return array|WP_Error
+	 */
 	private function apply_simple_variant_to_product( $product_id, $variant_data, $product_guid = '' ) {
+		$result = $this->apply_simple_variant_to_product_core( $product_id, $variant_data, $product_guid );
+		if ( ! is_wp_error( $result ) && is_array( $variant_data ) ) {
+			Mobo_Core_Source_Visibility::apply_inactive_flag( absint( $product_id ), Mobo_Core_Source_Visibility::payload_variant_purchasable( $variant_data ) );
+		}
+		return $result;
+	}
+
+	private function apply_simple_variant_to_product_core( $product_id, $variant_data, $product_guid = '' ) {
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
 
@@ -9157,6 +9301,25 @@ class Mobo_Core_Product_Sync {
 		$post_id = absint( $ids[0] );
 		if ( 'product_variation' === $post_type && $expected_parent > 0 && absint( wp_get_post_parent_id( $post_id ) ) !== $expected_parent ) {
 			return 0;
+		}
+
+		/*
+		 * Merchant intent wins: a product/variation in Trash may have been trashed by the
+		 * merchant, and Repair cannot tell who trashed it. Never un-trash automatically;
+		 * log instead and return -1 so the caller skips the identity (no duplicate is
+		 * created either). Operators can opt in explicitly via the filter below.
+		 */
+		if ( ! (bool) apply_filters( 'mobo_core_repair_untrash_enabled', false, $post_id, $post_type ) ) {
+			if ( class_exists( 'Mobo_Core_Logger' ) ) {
+				Mobo_Core_Logger::warning(
+					'Repair found a trashed Mobo object and kept it in Trash (merchant intent preserved).',
+					array( 'postId' => $post_id, 'postType' => $post_type, 'identity' => $meta_value )
+				);
+			}
+			if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+				Mobo_Core_Runtime_Diagnostics::increment( 'repair_trash_preserved' );
+			}
+			return -1;
 		}
 
 		$restored = wp_untrash_post( $post_id );

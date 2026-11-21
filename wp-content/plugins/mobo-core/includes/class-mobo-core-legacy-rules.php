@@ -54,6 +54,7 @@ class Mobo_Core_Legacy_Rules {
 			'global_product_auto_slug',
 			'global_update_categories',
 			'global_update_images',
+			'global_product_auto_description',
 
 			'mobo_core_only_in_stock',
 			'mobo_price_type',
@@ -126,6 +127,16 @@ class Mobo_Core_Legacy_Rules {
 	 */
 	public function should_update_slug() {
 		return $this->enabled( 'global_product_auto_slug', '1' );
+	}
+
+	/**
+	 * Should apply the Source product description? Per-Connection, default OFF
+	 * (mobomobo.ir asked that descriptions are not synced; portal-ir never sends one).
+	 *
+	 * @return bool
+	 */
+	public function should_update_description() {
+		return $this->enabled( 'global_product_auto_description', '0' );
 	}
 
 	/**
@@ -234,6 +245,7 @@ class Mobo_Core_Legacy_Rules {
 			'global_product_auto_slug'          => '1',
 			'global_update_categories'          => '1',
 			'global_update_images'              => '1',
+			'global_product_auto_description'   => '0',
 
 			'mobo_core_only_in_stock'           => '0',
 			'mobo_price_type'                   => 'static-price',
