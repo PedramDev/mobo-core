@@ -23,4 +23,4 @@ Release date: 2026-07-31
 - No WordPress database migration is required.
 - Existing Site Health JSON fields are retained.
 - Shared Media, image recovery, Webhook Queue, Sync, Repair, Remote Upgrade, and Upgrade Barrier behavior are unchanged.
-- The configured public Portal address remains `http://mobo.codeya.ir`.
+- The configured public Portal address remains `the provisioned Backend`.

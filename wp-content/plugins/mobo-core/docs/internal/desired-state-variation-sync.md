@@ -1,6 +1,6 @@
 # Desired-State Product / Variation Topology Policy
 
-Current contract: Mobo Core 10.33.67.
+Current contract: Mobo Core 10.33.94.
 
 Portal is the authoritative source for Mobo-owned product topology only when the payload carries enough valid desired-state evidence to make the requested mutation safe. Runtime consumers must fail closed when topology evidence is absent, malformed, contradictory, stale, or only partially delivered.
 

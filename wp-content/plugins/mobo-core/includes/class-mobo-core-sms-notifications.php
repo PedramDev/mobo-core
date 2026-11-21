@@ -15,7 +15,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_SMS_Notifications {
 
-	const META_SENT_PREFIX = '_mobo_core_sms_notification_sent_';
+	const META_SENT_PREFIX  = '_mobo_core_sms_notification_sent_';
+	const META_FENCE_PREFIX = '_mobo_core_sms_notification_fence_';
 
 	/**
 	 * Bootstrap hooks.
@@ -94,14 +95,21 @@ class Mobo_Core_SMS_Notifications {
 				return false;
 			}
 
-			$sent_meta_key = self::META_SENT_PREFIX . $scenario;
+			$sent_meta_key  = self::META_SENT_PREFIX . $scenario;
+			$fence_meta_key = self::META_FENCE_PREFIX . $scenario;
 			if ( $order->get_meta( $sent_meta_key ) ) {
+				return false;
+			}
+			if ( $order->get_meta( $fence_meta_key ) ) {
+				/* A previous attempt crossed (or was about to cross) the remote side-effect
+				 * boundary. Never auto-replay an order SMS whose durable outcome is not
+				 * provably clean. */
 				return false;
 			}
 
 			$client = $this->get_pwsms_client();
 			if ( is_wp_error( $client ) ) {
-				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $client->get_error_message() );
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد؛ پیکربندی درگاه در دسترس نیست [' . substr( sanitize_key( (string) $client->get_error_code() ), 0, 64 ) . '].' );
 				return $client;
 			}
 
@@ -120,7 +128,7 @@ class Mobo_Core_SMS_Notifications {
 
 			$message = $this->render_template( $template, $order, $scenario, $client );
 			if ( is_wp_error( $message ) ) {
-				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد: ' . $message->get_error_message() );
+				$this->add_order_note( $order, 'ارسال پیامک موبو انجام نشد؛ آماده‌سازی متن ناموفق بود [' . substr( sanitize_key( (string) $message->get_error_code() ), 0, 64 ) . '].' );
 				return $message;
 			}
 			if ( '' === trim( $message ) ) {
@@ -128,15 +136,35 @@ class Mobo_Core_SMS_Notifications {
 				return new WP_Error( 'mobo_core_sms_empty_message', 'Rendered SMS message is empty.' );
 			}
 
+			/* Persist a replay fence before the gateway call. A local persistence failure
+			 * means no remote SMS side effect is allowed. */
+			try {
+				$order->update_meta_data( $fence_meta_key, current_time( 'mysql' ) );
+				$order->save();
+				$fence_check = function_exists( 'wc_get_order' ) ? wc_get_order( $order_id ) : false;
+				if ( ! $fence_check instanceof WC_Order || ! $fence_check->get_meta( $fence_meta_key ) ) {
+					return new WP_Error( 'mobo_core_sms_fence_write_failed', 'SMS was not sent because the durable order replay fence could not be verified.' );
+				}
+				$order = $fence_check;
+			} catch ( Throwable $e ) {
+				return new WP_Error( 'mobo_core_sms_fence_write_exception', 'SMS was not sent because the durable order replay fence could not be stored.' );
+			}
+
 			$send = $this->dispatch_sms( $client, $recipients, $message, $order->get_id(), 'mobo_core_sms_send_failed' );
 			if ( is_wp_error( $send ) ) {
-				$this->add_order_note( $order, 'ارسال پیامک موبو ناموفق بود: ' . $send->get_error_message() );
+				$this->add_order_note( $order, 'ارسال پیامک موبو ناموفق/نامطمئن بود؛ تکرار خودکار متوقف شد [' . substr( sanitize_key( (string) $send->get_error_code() ), 0, 64 ) . '].' );
 				return $send;
 			}
 
-			$order->update_meta_data( $sent_meta_key, current_time( 'mysql' ) );
-			$order->save();
-			$this->add_order_note( $order, 'پیامک موبو برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» به این شماره ها ارسال شد: ' . implode( ', ', $recipients ) );
+			try {
+				$order->update_meta_data( $sent_meta_key, current_time( 'mysql' ) );
+				$order->delete_meta_data( $fence_meta_key );
+				$order->save();
+			} catch ( Throwable $e ) {
+				/* The already-persisted fence intentionally remains in storage. */
+				return new WP_Error( 'mobo_core_sms_success_commit_uncertain', 'SMS gateway accepted the request, but the final sent marker could not be committed. Automatic replay remains blocked.' );
+			}
+			$this->add_order_note( $order, 'پیامک موبو برای نوع سفارش «' . $this->get_scenario_label( $scenario ) . '» به این شماره ها توسط درگاه پذیرفته شد: ' . implode( ', ', $recipients ) );
 			return true;
 		} finally {
 			if ( class_exists( 'Mobo_Core_Lock' ) && 'no-lock' !== $lock ) {
@@ -273,7 +301,7 @@ class Mobo_Core_SMS_Notifications {
 				$status  = method_exists( $order, 'get_status' ) ? $order->get_status() : 'created';
 				$message = $client->replace_short_codes( $message, $status, $order );
 			} catch ( Throwable $e ) {
-				return new WP_Error( 'mobo_core_wallet_sms_template_exception', 'Persian WooCommerce SMS shortcode rendering failed: ' . $e->getMessage() );
+				return new WP_Error( 'mobo_core_wallet_sms_template_exception', 'Persian WooCommerce SMS shortcode rendering failed.' );
 			}
 		}
 
@@ -310,7 +338,7 @@ class Mobo_Core_SMS_Notifications {
 			try {
 				$message = $client->replace_short_codes( $message, $status, $order );
 			} catch ( Throwable $e ) {
-				return new WP_Error( 'mobo_core_sms_template_exception', 'Persian WooCommerce SMS shortcode rendering failed: ' . $e->getMessage() );
+				return new WP_Error( 'mobo_core_sms_template_exception', 'Persian WooCommerce SMS shortcode rendering failed.' );
 			}
 		}
 
@@ -413,7 +441,7 @@ class Mobo_Core_SMS_Notifications {
 		try {
 			$client = PWSMS();
 		} catch ( Throwable $e ) {
-			return new WP_Error( 'mobo_core_sms_pwsms_bootstrap_exception', 'Persian WooCommerce SMS bootstrap failed: ' . $e->getMessage() );
+			return new WP_Error( 'mobo_core_sms_pwsms_bootstrap_exception', 'Persian WooCommerce SMS bootstrap failed.' );
 		}
 
 		if ( ! is_object( $client ) || ! method_exists( $client, 'send_sms' ) ) {
@@ -444,18 +472,18 @@ class Mobo_Core_SMS_Notifications {
 				)
 			);
 		} catch ( Throwable $e ) {
-			return new WP_Error( $error_code . '_exception', 'SMS gateway threw an exception: ' . $e->getMessage() );
+			return new WP_Error( $error_code . '_exception', 'SMS gateway threw an exception; delivery outcome is unverified.' );
 		}
 
 		if ( is_wp_error( $result ) ) {
-			return $result;
+			return new WP_Error( $error_code, 'SMS gateway returned an error; delivery outcome is unverified.' );
 		}
 
 		if ( $this->is_successful_send_result( $result ) ) {
 			return true;
 		}
 
-		return new WP_Error( $error_code, $this->describe_send_result( $result ) );
+		return new WP_Error( $error_code, 'SMS gateway did not acknowledge successful delivery; outcome is unverified.' );
 	}
 
 	/**

@@ -53,7 +53,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table           = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
@@ -122,7 +122,137 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	 * @return bool
 	 */
 	private function is_unlocked() {
-		return class_exists( 'Mobo_Core_Product_Sync' ) && Mobo_Core_Product_Sync::is_repair_completed();
+		if ( ! class_exists( 'Mobo_Core_Product_Sync' ) ) {
+			return false;
+		}
+
+		/* Physical cleanup is installation-global. In Multi-Connection mode it may
+		 * only unlock after every enabled Source has completed Repair and the
+		 * Connection ownership migration has published its proof. */
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			if ( ! Mobo_Core_Connection_Repository::multi_connection_runtime_ready() ) {
+				return false;
+			}
+			$connections = Mobo_Core_Connection_Repository::list_enabled();
+			if ( ! empty( $connections ) ) {
+				foreach ( $connections as $connection ) {
+					$connection_id = is_array( $connection ) ? absint( isset( $connection['id'] ) ? $connection['id'] : 0 ) : 0;
+					if ( $connection_id <= 0 ) {
+						return false;
+					}
+					if ( class_exists( 'Mobo_Core_Connection_Settings' ) ) {
+						if ( absint( Mobo_Core_Connection_Settings::get_option( Mobo_Core_Product_Sync::REPAIR_COMPLETED_OPTION, 0, $connection_id ) ) <= 0 ) {
+							return false;
+						}
+					} elseif ( class_exists( 'Mobo_Core_Connection_Context' ) ) {
+						$complete = Mobo_Core_Connection_Context::run(
+							$connection_id,
+							function () {
+								return Mobo_Core_Product_Sync::is_repair_completed();
+							}
+						);
+						if ( ! $complete ) {
+							return false;
+						}
+					} else {
+						return false;
+					}
+				}
+				return true;
+			}
+		}
+
+		return Mobo_Core_Product_Sync::is_repair_completed();
+	}
+
+	/**
+	 * Freeze every enabled Connection's image/import workers before a destructive
+	 * installation-global media operation. Locks are acquired in deterministic
+	 * Connection/id order and released in reverse order.
+	 *
+	 * @param int $ttl Lock TTL.
+	 * @return array|false
+	 */
+	private function acquire_all_image_worker_locks( $ttl = 300 ) {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return array();
+		}
+
+		$connection_ids = array();
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			foreach ( Mobo_Core_Connection_Repository::list_enabled() as $connection ) {
+				$id = is_array( $connection ) ? absint( isset( $connection['id'] ) ? $connection['id'] : 0 ) : 0;
+				if ( $id > 0 ) {
+					$connection_ids[] = $id;
+				}
+			}
+		}
+		$connection_ids = array_values( array_unique( $connection_ids ) );
+		sort( $connection_ids, SORT_NUMERIC );
+
+		/* Pre-Connection/single-site fallback retains the historical lock behavior. */
+		if ( empty( $connection_ids ) ) {
+			$queue_token = Mobo_Core_Lock::acquire( 'image_queue_worker', $ttl );
+			if ( false === $queue_token ) {
+				return false;
+			}
+			$refresh_token = Mobo_Core_Lock::acquire( 'image_refresh_queue_worker', $ttl );
+			if ( false === $refresh_token ) {
+				Mobo_Core_Lock::release( 'image_queue_worker', $queue_token );
+				return false;
+			}
+			return array(
+				array( 'connection_id' => 0, 'name' => 'image_queue_worker', 'token' => $queue_token ),
+				array( 'connection_id' => 0, 'name' => 'image_refresh_queue_worker', 'token' => $refresh_token ),
+			);
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			return false;
+		}
+
+		$locks = array();
+		foreach ( $connection_ids as $connection_id ) {
+			foreach ( array( 'image_queue_worker', 'image_refresh_queue_worker' ) as $name ) {
+				$token = Mobo_Core_Connection_Context::run(
+					$connection_id,
+					function () use ( $name, $ttl ) {
+						return Mobo_Core_Lock::acquire( $name, $ttl );
+					}
+				);
+				if ( false === $token ) {
+					$this->release_all_image_worker_locks( $locks );
+					return false;
+				}
+				$locks[] = array( 'connection_id' => $connection_id, 'name' => $name, 'token' => $token );
+			}
+		}
+		return $locks;
+	}
+
+	/** @param array $locks Locks returned by acquire_all_image_worker_locks(). */
+	private function release_all_image_worker_locks( $locks ) {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) || ! is_array( $locks ) ) {
+			return;
+		}
+		foreach ( array_reverse( $locks ) as $lock ) {
+			$name = isset( $lock['name'] ) ? (string) $lock['name'] : '';
+			$token = isset( $lock['token'] ) ? (string) $lock['token'] : '';
+			$connection_id = isset( $lock['connection_id'] ) ? absint( $lock['connection_id'] ) : 0;
+			if ( '' === $name || '' === $token ) {
+				continue;
+			}
+			if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+				Mobo_Core_Connection_Context::run(
+					$connection_id,
+					function () use ( $name, $token ) {
+						Mobo_Core_Lock::release( $name, $token );
+					}
+				);
+			} else {
+				Mobo_Core_Lock::release( $name, $token );
+			}
+		}
 	}
 
 	/**
@@ -161,19 +291,9 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return $result;
 		}
 
-		$queue_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'image_queue_worker', 120 ) : '__mobo_no_lock__';
-		if ( false === $queue_lock ) {
-			$result['status'] = 'image-queue-busy';
-			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
-			return $result;
-		}
-
-		$refresh_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'image_refresh_queue_worker', 120 ) : '__mobo_no_lock__';
-		if ( false === $refresh_lock ) {
-			if ( class_exists( 'Mobo_Core_Lock' ) ) {
-				Mobo_Core_Lock::release( 'image_queue_worker', $queue_lock );
-			}
-			$result['status'] = 'image-refresh-queue-busy';
+		$worker_locks = $this->acquire_all_image_worker_locks( 300 );
+		if ( false === $worker_locks ) {
+			$result['status'] = 'image-workers-busy';
 			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
 			return $result;
 		}
@@ -217,10 +337,7 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			update_option( self::INCOMPLETE_COLLISION_RESULT_OPTION, $result, false );
 			return $result;
 		} finally {
-			if ( class_exists( 'Mobo_Core_Lock' ) ) {
-				Mobo_Core_Lock::release( 'image_refresh_queue_worker', $refresh_lock );
-				Mobo_Core_Lock::release( 'image_queue_worker', $queue_lock );
-			}
+			$this->release_all_image_worker_locks( $worker_locks );
 		}
 	}
 
@@ -387,6 +504,14 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return $result;
 		}
 
+		$worker_locks = $this->acquire_all_image_worker_locks( 300 );
+		if ( false === $worker_locks ) {
+			$result['status'] = 'image-workers-busy';
+			update_option( 'mobo_core_orphan_image_cleanup_last_delete', $result, false );
+			return $result;
+		}
+
+		try {
 		$table = self::table_name();
 		$rows  = $wpdb->get_results(
 			$wpdb->prepare(
@@ -482,6 +607,9 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		update_option( 'mobo_core_orphan_image_cleanup_last_delete', $result, false );
 
 		return $result;
+		} finally {
+			$this->release_all_image_worker_locks( $worker_locks );
+		}
 	}
 
 	/**
@@ -696,13 +824,32 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			return array( 'status' => 'referenced', 'file' => $relative, 'message' => 'Attachment یا یکی از فایل‌هایش هنوز مرجع زنده دارد.' );
 		}
 
-		$bytes   = $this->sum_file_sizes( $family_paths );
-		$deleted = wp_delete_attachment( $attachment_id, true );
-		if ( ! $deleted || 'attachment' === get_post_type( $attachment_id ) ) {
-			return array( 'status' => 'failed', 'file' => $relative, 'bytes' => 0, 'message' => 'وردپرس نتوانست Attachment ناقص را حذف کند.' );
+		$physical_lock_name = 'image_physical_delete_' . $attachment_id;
+		$physical_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( $physical_lock_name, 120 ) : '__mobo_no_lock__';
+		if ( false === $physical_lock ) {
+			return array( 'status' => 'active', 'file' => $relative, 'message' => 'یک حذف فیزیکی دیگر هم‌زمان این Attachment را در اختیار دارد.' );
 		}
 
-		return array( 'status' => 'deleted', 'file' => $relative, 'bytes' => $bytes, 'message' => 'Attachment collision ناقص و خانواده ثبت‌شده آن حذف شد.' );
+		try {
+			/* The outer cleanup pass already freezes every Connection's image workers.
+			 * Re-run the live-reference proof after obtaining the installation-global
+			 * per-attachment delete lease so prune/collision cleanup cannot race. */
+			if ( $this->attachment_has_active_image_worker( $attachment_id ) || $this->attachment_has_live_reference( $attachment_id, $family_paths ) ) {
+				return array( 'status' => 'referenced', 'file' => $relative, 'message' => 'Attachment در مرز حذف دوباره دارای مرجع زنده یا Worker شد.' );
+			}
+
+			$bytes   = $this->sum_file_sizes( $family_paths );
+			$deleted = wp_delete_attachment( $attachment_id, true );
+			if ( ! $deleted || 'attachment' === get_post_type( $attachment_id ) ) {
+				return array( 'status' => 'failed', 'file' => $relative, 'bytes' => 0, 'message' => 'وردپرس نتوانست Attachment ناقص را حذف کند.' );
+			}
+
+			return array( 'status' => 'deleted', 'file' => $relative, 'bytes' => $bytes, 'message' => 'Attachment collision ناقص و خانواده ثبت‌شده آن حذف شد.' );
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && '__mobo_no_lock__' !== $physical_lock ) {
+				Mobo_Core_Lock::release( $physical_lock_name, $physical_lock );
+			}
+		}
 	}
 
 	/**
@@ -731,7 +878,9 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	}
 
 	/**
-	 * Protect an attachment currently owned by an unexpired image worker lease.
+	 * Protect an attachment still owned by non-terminal image work in any
+	 * Connection. This deliberately ignores Connection identity because the
+	 * attachment itself is a shared installation-global WordPress object.
 	 *
 	 * @param int $attachment_id Attachment ID.
 	 * @return bool
@@ -739,7 +888,6 @@ class Mobo_Core_Orphan_Image_Cleanup {
 	private function attachment_has_active_image_worker( $attachment_id ) {
 		global $wpdb;
 		$attachment_id = absint( $attachment_id );
-		$now           = current_time( 'mysql', true );
 		if ( $attachment_id <= 0 ) {
 			return true;
 		}
@@ -748,9 +896,8 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			$table = Mobo_Core_Image_Queue::table_name();
 			$active = $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT id FROM {$table} WHERE attachment_id = %d AND status = 'processing' AND locked_until IS NOT NULL AND locked_until >= %s LIMIT 1",
-					$attachment_id,
-					$now
+					"SELECT id FROM {$table} WHERE attachment_id = %d AND status IN ('pending','processing','attaching') LIMIT 1",
+					$attachment_id
 				)
 			);
 			if ( absint( $active ) > 0 ) {
@@ -762,9 +909,9 @@ class Mobo_Core_Orphan_Image_Cleanup {
 			$table = Mobo_Core_Image_Refresh_Queue::table_name();
 			$active = $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT id FROM {$table} WHERE new_attachment_id = %d AND status = 'processing' AND locked_until IS NOT NULL AND locked_until >= %s LIMIT 1",
+					"SELECT id FROM {$table} WHERE (old_attachment_id = %d OR new_attachment_id = %d) AND status IN ('pending','processing') LIMIT 1",
 					$attachment_id,
-					$now
+					$attachment_id
 				)
 			);
 			if ( absint( $active ) > 0 ) {

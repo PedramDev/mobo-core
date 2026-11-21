@@ -1,10 +1,10 @@
 <?php
 /**
- * Mobo address mapping cache and WooCommerce checkout select fields.
+ * Legacy address cache and native WooCommerce order-address capture.
  *
- * MoboCore is the central source. Customer WordPress sites pull the cached
- * country/state/city mapping from MoboCore on a weekly cadence and then use local
- * cached IDs during checkout/order submission.
+ * Automatic order submission resolves native WooCommerce country/state/city
+ * via the central Backend/Provider Location Resolver. Historic numeric city-code
+ * decoding remains only for compatibility with orders already recorded.
  *
  * PHP 7.4 compatible.
  */
@@ -36,16 +36,16 @@ class Mobo_Core_Address_Mapping {
 	 */
 	public function init() {
 		/*
-		 * Automatic Mobo order submission needs Mobo location IDs, but checkout
-		 * country/state/city fields should remain owned by WooCommerce or Persian
-		 * WooCommerce. The plugin stores a manual, admin-approved mapping from
-		 * local checkout values to Mobo IDs and uses it when the order is created.
+		 * Checkout country/state/city fields remain owned by WooCommerce.
+		 * Automatic remote ordering resolves location identity centrally; no
+		 * city assets or local mapping refresh run during checkout bootstrap.
 		 */
-		if ( ! $this->is_enabled() ) {
+		if ( ! class_exists( 'Mobo_Core_Order_Submission_Policy' ) || ! Mobo_Core_Order_Submission_Policy::is_enabled_for_any_connection() ) {
 			return;
 		}
 
-		$this->ensure_mapping_for_auto_order();
+		/* Register checkout hooks when any Connection needs them. Source-owned
+		 * mapping work itself still runs only in the owning Connection context. */
 
 		add_action( 'woocommerce_checkout_create_order', array( $this, 'save_order_location_meta' ), 20, 2 );
 		add_action( 'woocommerce_store_api_checkout_update_order_from_request', array( $this, 'save_store_api_order_location_meta' ), 20, 2 );
@@ -53,8 +53,8 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	/**
-	 * Automatic order submission requires local Mobo country/state/city IDs.
-	 * Try to populate the cache automatically when checkout ownership is enabled.
+	 * Legacy local mapping refresh helper; not invoked by checkout bootstrap.
+	 * Central auto-order submission no longer requires the local city cache.
 	 *
 	 * @return void
 	 */
@@ -66,7 +66,7 @@ class Mobo_Core_Address_Mapping {
 			return;
 		}
 
-		$last_attempt = absint( get_option( 'mobo_core_address_mapping_last_attempt_at', 0 ) );
+		$last_attempt = absint( Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_attempt_at', 0 ) );
 		if ( $last_attempt > 0 && ( time() - $last_attempt ) < HOUR_IN_SECONDS ) {
 			return;
 		}
@@ -87,7 +87,7 @@ class Mobo_Core_Address_Mapping {
 		}
 
 		$interval_days = Mobo_Core_Settings::get_int( 'mobo_core_address_mapping_sync_interval_days', 7, 1, 30 );
-		$last_sync     = absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) );
+		$last_sync     = absint( Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_success_at', 0 ) );
 
 		if ( ! $force && $last_sync > 0 && ( time() - $last_sync ) < ( $interval_days * DAY_IN_SECONDS ) ) {
 			return array(
@@ -109,9 +109,16 @@ class Mobo_Core_Address_Mapping {
 	 * @return array
 	 */
 	public function sync_now( $source = 'manual', $force = true ) {
-		update_option( 'mobo_core_address_mapping_last_attempt_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_attempt_at', time(), false );
 
-		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'address_mapping_sync', 180 ) : 'legacy-unlocked';
+		$owner_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $owner_id <= 0 ) {
+			return array( 'success' => false, 'status' => 'owner-unavailable', 'message' => 'Address mapping requires a valid Connection owner.' );
+		}
+		/* Each Connection has independent mapping state and generated city assets. */
+		/* The lock helper auto-scopes this logical name to the active Connection. */
+		$lock_name = 'address_mapping_sync';
+		$lock_token = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( $lock_name, 180 ) : false;
 		if ( false === $lock_token ) {
 			$cached = $this->get_mapping();
 			if ( $this->mapping_is_complete( $cached ) ) {
@@ -135,17 +142,19 @@ class Mobo_Core_Address_Mapping {
 			$result = $api->get_address_mapping();
 
 			if ( is_wp_error( $result ) ) {
-				update_option( 'mobo_core_address_mapping_last_error', $result->get_error_message(), false );
+				$code = substr( sanitize_key( (string) $result->get_error_code() ), 0, 64 );
+				$message = 'Address mapping API request failed [' . $code . '].';
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $message, false );
 				return array(
 					'success' => false,
 					'status'  => 'failed',
-					'message' => $result->get_error_message(),
+					'message' => $message,
 				);
 			}
 
 			$shape = $this->validate_mapping_payload_shape( $result );
 			if ( is_wp_error( $shape ) ) {
-				update_option( 'mobo_core_address_mapping_last_error', $shape->get_error_message(), false );
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $shape->get_error_message(), false );
 				return array(
 					'success' => false,
 					'status'  => 'invalid',
@@ -156,7 +165,7 @@ class Mobo_Core_Address_Mapping {
 			$normalized = $this->normalize_mapping_payload( $result );
 			if ( ! $this->mapping_is_complete( $normalized ) || ! $this->mapping_references_are_valid( $normalized ) ) {
 				$message = 'MoboCore address mapping payload is empty, incomplete, or contains invalid parent references.';
-				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $message, false );
 				return array(
 					'success' => false,
 					'status'  => 'invalid',
@@ -168,11 +177,21 @@ class Mobo_Core_Address_Mapping {
 			$normalized['syncedAt'] = time();
 			$normalized['source']   = sanitize_key( (string) $source );
 
-			update_option( 'mobo_core_address_mapping_data', $normalized, false );
-			$stored_mapping = get_option( 'mobo_core_address_mapping_data', array() );
+			$state_available = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available();
+			$legacy_allowed = ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed();
+			$persisted = $state_available
+				? Mobo_Core_State_Store::set( 'address_mapping_data', $normalized )
+				: ( $legacy_allowed ? Mobo_Core_Durable_State_Policy::update_option_verified( 'mobo_core_address_mapping_data', $normalized, false ) : false );
+			if ( ! $persisted ) {
+				$message = 'Could not persist the Mobo address mapping snapshot.';
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $message, false );
+				return array( 'success' => false, 'status' => 'storage-failed', 'message' => $message, 'counts' => $this->get_counts_from_mapping( $normalized ) );
+			}
+			if ( $state_available && $legacy_allowed ) { Mobo_Core_Settings::delete( 'mobo_core_address_mapping_data' ); }
+			$stored_mapping = $state_available ? Mobo_Core_State_Store::get( 'address_mapping_data', array() ) : ( $legacy_allowed ? Mobo_Core_Settings::get( 'mobo_core_address_mapping_data', array() ) : array() );
 			if ( ! is_array( $stored_mapping ) || $stored_mapping !== $normalized ) {
 				$message = 'Could not persist the Mobo address mapping snapshot.';
-				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $message, false );
 				return array(
 					'success' => false,
 					'status'  => 'storage-failed',
@@ -181,43 +200,25 @@ class Mobo_Core_Address_Mapping {
 				);
 			}
 
-			$city_assets = null;
-			if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
-				$generator   = new Mobo_Core_City_Assets();
-				$city_assets = $generator->generate( $normalized, $this->get_manual_mapping(), $source );
-			}
-
-			if ( is_wp_error( $city_assets ) ) {
-				$message = 'Address mapping synced, but Mobo city assets could not be generated: ' . $city_assets->get_error_message();
-				update_option( 'mobo_core_address_mapping_last_error', $message, false );
-				return array(
-					'success'    => false,
-					'status'     => 'mapping-ok-city-assets-failed',
-					'counts'     => $this->get_counts_from_mapping( $normalized ),
-					'cityAssets' => array( 'success' => false, 'message' => $city_assets->get_error_message() ),
-					'message'    => $message,
-				);
-			}
-
 			$success_at = time();
-			update_option( 'mobo_core_address_mapping_last_success_at', $success_at, false );
-			if ( absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ) !== $success_at ) {
+			Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_success_at', $success_at, false );
+			if ( absint( Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_success_at', 0 ) ) !== $success_at ) {
 				$message = 'Address mapping was stored but its success checkpoint could not be persisted.';
-				update_option( 'mobo_core_address_mapping_last_error', $message, false );
+				Mobo_Core_Settings::update( 'mobo_core_address_mapping_last_error', $message, false );
 				return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => $message, 'counts' => $this->get_counts_from_mapping( $normalized ) );
 			}
-			delete_option( 'mobo_core_address_mapping_last_error' );
+			Mobo_Core_Settings::delete( 'mobo_core_address_mapping_last_error' );
 
 			return array(
 				'success'    => true,
 				'status'     => 'ok',
 				'counts'     => $this->get_counts_from_mapping( $normalized ),
-				'cityAssets' => $city_assets,
-				'message'    => 'Address mapping and Mobo city assets synced from MoboCore.',
+				'cityAssets' => array( 'status' => 'retired' ),
+				'message'    => 'Legacy address mapping snapshot synced; checkout city assets are retired.', 
 			);
 		} finally {
-			if ( 'legacy-unlocked' !== $lock_token && class_exists( 'Mobo_Core_Lock' ) ) {
-				Mobo_Core_Lock::release( 'address_mapping_sync', $lock_token );
+			if ( false !== $lock_token && class_exists( 'Mobo_Core_Lock' ) ) {
+				Mobo_Core_Lock::release( $lock_name, $lock_token );
 			}
 		}
 	}
@@ -554,22 +555,76 @@ class Mobo_Core_Address_Mapping {
 	 * @return void
 	 */
 	public function save_order_location_meta( $order, $data ) {
+		$connection_id = $this->resolve_checkout_connection_id( $order );
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) && $current_connection_id !== $connection_id ) {
+			Mobo_Core_Connection_Context::run( $connection_id, function () use ( $order, $data ) { $this->save_order_location_meta_in_connection( $order, $data ); } );
+			return;
+		}
+		$this->save_order_location_meta_in_connection( $order, $data );
+	}
+
+	/** Persist checkout location metadata inside the order/cart owning Connection. */
+	private function save_order_location_meta_in_connection( $order, $data ) {
 		if ( ! $this->is_enabled() || ! is_object( $order ) || ! method_exists( $order, 'update_meta_data' ) ) {
 			return;
 		}
 
 		foreach ( array( 'billing', 'shipping' ) as $group ) {
 			$values = $this->get_checkout_group_values( $order, is_array( $data ) ? $data : array(), $group );
-			$resolved = $this->resolve_values_to_mobo_location( $values['country'], $values['state'], $values['city'] );
-
-			if ( is_wp_error( $resolved ) ) {
-				$order->update_meta_data( '_mobo_' . $group . '_location_mapping_error', $resolved->get_error_message() );
-				continue;
+			/* Keep WooCommerce values native. Provider identity is resolved centrally by
+			 * .NET during order submission; checkout does not rewrite city/state fields. */
+			foreach ( array( 'country', 'state', 'city' ) as $part ) {
+				$order->update_meta_data( '_mobo_' . $group . '_source_' . $part, sanitize_text_field( (string) $values[ $part ] ) );
 			}
-
-			$this->write_resolved_location_meta( $order, $group, $resolved );
 			$order->delete_meta_data( '_mobo_' . $group . '_location_mapping_error' );
 		}
+	}
+
+
+	/**
+	 * Resolve the single Mobo Connection represented by the order/cart without
+	 * trusting Default Connection context. Ambiguous A+B carts intentionally
+	 * return 0 because no single Source owns their address mapping.
+	 *
+	 * @param WC_Order|null $order Order when already available.
+	 * @return int
+	 */
+	private function resolve_checkout_connection_id( $order = null ) {
+		$explicit_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_current_connection_id() ) : 0;
+		if ( $explicit_id > 0 ) { return $explicit_id; }
+
+		$ids = array();
+		if ( $order instanceof WC_Order ) {
+			foreach ( $order->get_items( 'line_item' ) as $item ) {
+				if ( ! $item instanceof WC_Order_Item_Product ) { continue; }
+				$id = absint( $item->get_meta( '_mobo_identity_connection_id', true ) );
+				if ( $id > 0 ) { $ids[ $id ] = true; }
+			}
+		}
+
+		if ( empty( $ids ) && function_exists( 'WC' ) && WC()->cart ) {
+			$cart = WC()->cart->get_cart();
+			foreach ( is_array( $cart ) ? $cart : array() as $cart_item ) {
+				$product_id = absint( isset( $cart_item['product_id'] ) ? $cart_item['product_id'] : 0 );
+				$variation_id = absint( isset( $cart_item['variation_id'] ) ? $cart_item['variation_id'] : 0 );
+				$product_owner = 0;
+				$variation_owner = 0;
+				if ( $variation_id > 0 && class_exists( 'Mobo_Core_Variant_State_Repository' ) ) {
+					$row = ( new Mobo_Core_Variant_State_Repository() )->get_owner_by_woo_variation_id( $variation_id );
+					$variation_owner = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+				}
+				if ( $product_id > 0 && class_exists( 'Mobo_Core_Product_State_Repository' ) ) {
+					$row = ( new Mobo_Core_Product_State_Repository() )->get_owner_by_woo_product_id( $product_id );
+					$product_owner = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+				}
+				if ( $product_owner > 0 && $variation_owner > 0 && $product_owner !== $variation_owner ) { return 0; }
+				$id = $variation_owner > 0 ? $variation_owner : $product_owner;
+				if ( $id > 0 ) { $ids[ $id ] = true; }
+			}
+		}
+
+		return 1 === count( $ids ) ? absint( array_key_first( $ids ) ) : 0;
 	}
 
 
@@ -635,14 +690,14 @@ class Mobo_Core_Address_Mapping {
 		return array(
 			'enabled'                => $this->is_enabled(),
 			'checkoutActive'         => $this->is_checkout_mapping_active(),
-			'checkoutMode'           => $this->is_enabled() ? 'mobo-city-assets' : 'disabled',
+			'checkoutMode'           => $this->is_enabled() ? 'woocommerce-native' : 'disabled',
 			'orderSubmissionEnabled' => Mobo_Core_Order_Submission_Policy::is_enabled(),
-			'lastAttemptAt'          => absint( get_option( 'mobo_core_address_mapping_last_attempt_at', 0 ) ),
-			'lastSuccessAt'          => absint( get_option( 'mobo_core_address_mapping_last_success_at', 0 ) ),
-			'lastError'              => (string) get_option( 'mobo_core_address_mapping_last_error', '' ),
+			'lastAttemptAt'          => absint( Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_attempt_at', 0 ) ),
+			'lastSuccessAt'          => absint( Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_success_at', 0 ) ),
+			'lastError'              => (string) Mobo_Core_Settings::get( 'mobo_core_address_mapping_last_error', '' ),
 			'counts'                 => $this->get_counts_from_mapping( $mapping ),
 			'manualMapping'          => $this->get_manual_mapping_status(),
-			'cityAssets'             => class_exists( 'Mobo_Core_City_Assets' ) ? ( new Mobo_Core_City_Assets() )->get_status() : array(),
+			'cityAssets'             => array( 'status' => 'retired' ),
 		);
 	}
 
@@ -656,13 +711,81 @@ class Mobo_Core_Address_Mapping {
 		return $this->get_mapping();
 	}
 
+
+	/**
+	 * Resolve an order address through the backend provider-level resolver.
+	 * No Connection ID is sent: each backend deployment already owns one Provider.
+	 *
+	 * @param WC_Order $order Order.
+	 * @param string   $group billing|shipping.
+	 * @return array|WP_Error
+	 */
+	public function resolve_order_group_via_backend( $order, $group ) {
+		if ( ! $order instanceof WC_Order ) {
+			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
+		}
+		$group = 'shipping' === $group ? 'shipping' : 'billing';
+		$values = $this->get_order_group_values( $order, $group );
+		$country_code = $this->resolve_local_country_code( $values['country'] );
+		$state_code   = $this->resolve_local_state_code( $country_code, $values['state'] );
+		$city_name    = $this->resolve_local_city_name( $country_code, $state_code, $values['city'] );
+
+		$countries = $this->get_woocommerce_countries();
+		$states    = $this->get_woocommerce_states( $country_code );
+		$country_name = isset( $countries[ $country_code ] ) ? sanitize_text_field( (string) $countries[ $country_code ] ) : sanitize_text_field( (string) $values['country'] );
+		$state_name   = isset( $states[ $state_code ] ) ? sanitize_text_field( (string) $states[ $state_code ] ) : sanitize_text_field( (string) $values['state'] );
+
+		$api = new Mobo_Core_API_Client();
+		$result = $api->resolve_location( array(
+			'countryCode' => sanitize_text_field( (string) $country_code ),
+			'countryName' => $country_name,
+			'stateCode'   => sanitize_text_field( (string) $state_code ),
+			'stateName'   => $state_name,
+			'cityCode'    => sanitize_text_field( (string) $values['city'] ),
+			'cityName'    => sanitize_text_field( (string) $city_name ),
+		) );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		$status = isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
+		$location = isset( $result['location'] ) && is_array( $result['location'] ) ? $result['location'] : array();
+		if ( empty( $result['success'] ) || 'resolved' !== $status || empty( $location ) ) {
+			return new WP_Error(
+				'mobo_core_location_resolution_pending',
+				'آدرس سفارش هنوز در Resolver مرکزی به Location Provider متصل نشده است؛ سفارش بدون پرداخت در صف می‌ماند تا مورد استثنا یک‌بار در پنل مرکزی تعیین تکلیف شود.',
+				array( 'action' => 'defer', 'resolutionKey' => sanitize_text_field( (string) ( $result['resolutionKey'] ?? '' ) ) )
+			);
+		}
+
+		$resolved = array(
+			'providerKey'       => sanitize_key( (string) ( $result['providerKey'] ?? '' ) ),
+			'matchType'         => sanitize_key( (string) ( $result['matchType'] ?? '' ) ),
+			'countryExternalId' => sanitize_text_field( (string) ( $location['countryExternalId'] ?? '' ) ),
+			'stateExternalId'   => sanitize_text_field( (string) ( $location['stateExternalId'] ?? '' ) ),
+			'cityExternalId'    => sanitize_text_field( (string) ( $location['cityExternalId'] ?? '' ) ),
+			'countryId'         => absint( $location['countryId'] ?? 0 ),
+			'stateId'           => absint( $location['stateId'] ?? 0 ),
+			'cityId'            => absint( $location['cityId'] ?? 0 ),
+			'countryName'       => sanitize_text_field( (string) ( $location['countryName'] ?? $country_name ) ),
+			'stateName'         => sanitize_text_field( (string) ( $location['stateName'] ?? $state_name ) ),
+			'cityName'          => sanitize_text_field( (string) ( $location['cityName'] ?? $city_name ) ),
+			'latitude'          => null,
+			'longitude'         => null,
+		);
+		if ( '' === $resolved['countryExternalId'] || '' === $resolved['stateExternalId'] || '' === $resolved['cityExternalId'] ) {
+			return new WP_Error( 'mobo_core_location_resolution_invalid', 'Central location resolver returned an incomplete provider identity.', array( 'action' => 'defer' ) );
+		}
+		return $resolved;
+	}
+
 	/**
 	 * Get admin-approved manual mapping from local WooCommerce values to Mobo IDs.
 	 *
 	 * @return array
 	 */
 	public function get_manual_mapping() {
-		$mapping = get_option( 'mobo_core_address_manual_mapping', array() );
+		$mapping = Mobo_Core_Settings::get( 'mobo_core_address_manual_mapping', array() );
 		if ( ! is_array( $mapping ) ) {
 			$mapping = array();
 		}
@@ -751,12 +874,7 @@ class Mobo_Core_Address_Mapping {
 			}
 		}
 
-		update_option( 'mobo_core_address_manual_mapping', $out, false );
-
-		if ( class_exists( 'Mobo_Core_City_Assets' ) ) {
-			$generator = new Mobo_Core_City_Assets();
-			$generator->generate( $this->get_mapping(), $out, 'manual-state-map-save' );
-		}
+		Mobo_Core_Settings::update( 'mobo_core_address_manual_mapping', $out, false );
 
 		return $out;
 	}
@@ -806,7 +924,7 @@ class Mobo_Core_Address_Mapping {
 		$manual = $this->get_manual_mapping();
 		$local  = $this->get_local_location_candidates();
 
-		$city_status = class_exists( 'Mobo_Core_City_Assets' ) ? ( new Mobo_Core_City_Assets() )->get_status() : array();
+		$city_status = array();
 		$cached = $this->get_mapping();
 
 		return array(
@@ -953,10 +1071,10 @@ class Mobo_Core_Address_Mapping {
 		}
 
 		if ( ! empty( $missing ) ) {
-			$city_assets_ready = class_exists( 'Mobo_Core_City_Assets' ) && ( new Mobo_Core_City_Assets() )->is_ready();
+			$city_assets_ready = false;
 			return new WP_Error(
 				'mobo_core_location_resolution_failed',
-				'آدرس سفارش به شناسه‌های موبو تبدیل نشد. موارد نامعتبر: ' . implode( '، ', $missing ) . '. ' . ( $city_assets_ready ? 'نگاشت کشور و استان را بررسی کنید؛ شهر باید مستقیما با شناسه موبو از Checkout ارسال شود.' : 'فایل شهرهای موبو آماده نیست؛ داده آدرس را از MoboCore بروزرسانی و فایل شهرها را دوباره تولید کنید.' ),
+				'آدرس سفارش در Resolver محلی قدیمی قابل تبدیل نیست: ' . implode( '، ', $missing ) . '. برای ثبت سفارش خودکار از Resolver مرکزی Backend استفاده کنید.', 
 				array(
 					'country'    => sanitize_text_field( (string) $country ),
 					'state'      => sanitize_text_field( (string) $state ),
@@ -964,7 +1082,7 @@ class Mobo_Core_Address_Mapping {
 					'countryKey' => $country_code,
 					'stateKey'   => $state_code,
 					'cityKey'    => $city_name,
-					'cityAssetsReady' => $city_assets_ready,
+					'cityAssetsReady' => false,
 				)
 			);
 		}
@@ -1143,11 +1261,15 @@ class Mobo_Core_Address_Mapping {
 
 	private function write_resolved_location_meta( $order, $group, $resolved ) {
 		$prefix = '_mobo_' . $group . '_';
-		$order->update_meta_data( $prefix . 'country_id', absint( $resolved['countryId'] ) );
+		$order->update_meta_data( $prefix . 'country_external_id', sanitize_text_field( (string) ( $resolved['countryExternalId'] ?? '' ) ) );
+		$order->update_meta_data( $prefix . 'state_external_id', sanitize_text_field( (string) ( $resolved['stateExternalId'] ?? '' ) ) );
+		$order->update_meta_data( $prefix . 'city_external_id', sanitize_text_field( (string) ( $resolved['cityExternalId'] ?? '' ) ) );
+		/* Numeric fields remain additive compatibility snapshots for Portal.ir/old tooling. */
+		$order->update_meta_data( $prefix . 'country_id', absint( $resolved['countryId'] ?? 0 ) );
 		$order->update_meta_data( $prefix . 'country_name', sanitize_text_field( (string) $resolved['countryName'] ) );
-		$order->update_meta_data( $prefix . 'state_id', absint( $resolved['stateId'] ) );
+		$order->update_meta_data( $prefix . 'state_id', absint( $resolved['stateId'] ?? 0 ) );
 		$order->update_meta_data( $prefix . 'state_name', sanitize_text_field( (string) $resolved['stateName'] ) );
-		$order->update_meta_data( $prefix . 'city_id', absint( $resolved['cityId'] ) );
+		$order->update_meta_data( $prefix . 'city_id', absint( $resolved['cityId'] ?? 0 ) );
 		$order->update_meta_data( $prefix . 'city_name', sanitize_text_field( (string) $resolved['cityName'] ) );
 
 		if ( null !== $resolved['latitude'] ) {
@@ -1246,10 +1368,8 @@ class Mobo_Core_Address_Mapping {
 		}
 
 		/*
-		 * Legacy compatibility source only. Current checkout city options are
-		 * generated from authoritative Mobo city IDs by Mobo_Core_City_Assets.
-		 * This bundled dataset is retained to resolve old Persian WooCommerce
-		 * numeric city codes already stored on historical orders.
+		 * Legacy compatibility source only. WooCommerce owns the current city
+		 * field. Retain this dataset solely for numeric values saved on old orders.
 		 */
 		$this->append_bundled_iran_city_candidates( $states, $cities );
 
@@ -1842,7 +1962,14 @@ class Mobo_Core_Address_Mapping {
 	}
 
 	private function get_mapping() {
-		$mapping = get_option( 'mobo_core_address_mapping_data', array() );
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_State_Store::migrate_option( 'mobo_core_address_mapping_data', 'address_mapping_data' ); }
+			$mapping = Mobo_Core_State_Store::get( 'address_mapping_data', array() );
+		} elseif ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) {
+			$mapping = Mobo_Core_Settings::get( 'mobo_core_address_mapping_data', array() );
+		} else {
+			$mapping = array();
+		}
 		return is_array( $mapping ) ? $mapping : array();
 	}
 

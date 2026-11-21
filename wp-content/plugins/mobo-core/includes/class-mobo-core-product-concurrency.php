@@ -22,6 +22,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Product_Concurrency {
 
+	/** Active Source owner for Source-scoped locks and duplicate checks. */
+	private static function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
 	/**
 	 * Acquire a product GUID lock.
 	 *
@@ -188,7 +193,11 @@ class Mobo_Core_Product_Concurrency {
 			return false;
 		}
 
-		$state = get_option( 'mobo_core_sync_state', array() );
+		$state = ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() )
+			? Mobo_Core_State_Store::get( 'sync_state', array() )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? get_option( 'mobo_core_sync_state', array() )
+				: array() );
 
 		if ( ! is_array( $state ) ) {
 			return false;
@@ -252,19 +261,37 @@ class Mobo_Core_Product_Concurrency {
 			return array();
 		}
 
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-				WHERE p.post_type = 'product'
-				AND p.post_status IN ('publish','draft','private','pending')
-				AND pm.meta_key = 'product_guid'
-				AND pm.meta_value = %s
-				ORDER BY p.ID ASC",
-				$product_guid
-			)
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$table} c ON c.woo_product_id = p.ID
+					WHERE p.post_type = 'product'
+					AND p.post_status IN ('publish','draft','private','pending')
+					AND c.connection_id = %d
+					AND c.product_guid = %s
+					ORDER BY p.ID ASC",
+					self::connection_id(),
+					$product_guid
+				)
+			);
+		} else {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					WHERE p.post_type = 'product'
+					AND p.post_status IN ('publish','draft','private','pending')
+					AND pm.meta_key = 'product_guid'
+					AND pm.meta_value = %s
+					ORDER BY p.ID ASC",
+					$product_guid
+				)
+			);
+		}
 
 		return is_array( $ids ) ? array_values( array_filter( array_map( 'absint', $ids ) ) ) : array();
 	}
@@ -327,12 +354,41 @@ class Mobo_Core_Product_Concurrency {
 	}
 
 	/**
-	 * Count product_guid groups with more than one active product.
+	 * Count unresolved product_guid groups with more than one local product.
+	 *
+	 * Products that an administrator already quarantined as duplicate are kept in
+	 * WordPress for reversibility, but they are no longer an active dashboard
+	 * incident. Excluding the explicit quarantine marker keeps the warning tied to
+	 * current work instead of historical/resolved duplicates.
 	 *
 	 * @return int
 	 */
 	public static function count_duplicate_product_groups() {
 		global $wpdb;
+
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			return absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(*) FROM (
+							SELECT c.product_guid
+							FROM {$wpdb->posts} p
+							INNER JOIN {$table} c ON c.woo_product_id = p.ID
+							LEFT JOIN {$wpdb->postmeta} q ON q.post_id = p.ID AND q.meta_key = '_mobo_duplicate_quarantined' AND q.meta_value = '1' AND p.post_status = 'draft'
+							WHERE c.connection_id = %d
+							AND p.post_type = 'product'
+							AND p.post_status IN ('publish','draft','private','pending')
+							AND c.product_guid <> ''
+							AND q.post_id IS NULL
+							GROUP BY c.product_guid
+							HAVING COUNT(DISTINCT p.ID) > 1
+						) x",
+						self::connection_id()
+					)
+				)
+			);
+		}
 
 		return absint(
 			$wpdb->get_var(
@@ -340,10 +396,12 @@ class Mobo_Core_Product_Concurrency {
 					SELECT pm.meta_value
 					FROM {$wpdb->posts} p
 					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					LEFT JOIN {$wpdb->postmeta} q ON q.post_id = p.ID AND q.meta_key = '_mobo_duplicate_quarantined' AND q.meta_value = '1' AND p.post_status = 'draft'
 					WHERE p.post_type = 'product'
 					AND p.post_status IN ('publish','draft','private','pending')
 					AND pm.meta_key = 'product_guid'
 					AND pm.meta_value <> ''
+					AND q.post_id IS NULL
 					GROUP BY pm.meta_value
 					HAVING COUNT(DISTINCT p.ID) > 1
 				) x"
@@ -352,7 +410,11 @@ class Mobo_Core_Product_Concurrency {
 	}
 
 	/**
-	 * Return a few duplicate groups for admin diagnostics.
+	 * Return unresolved duplicate groups for admin diagnostics/remediation.
+	 *
+	 * Explicitly quarantined products are excluded. They still exist in WordPress
+	 * and remain reversible, but should not keep an already-resolved dashboard
+	 * warning alive.
 	 *
 	 * @param int $limit Limit.
 	 * @return array
@@ -362,23 +424,49 @@ class Mobo_Core_Product_Concurrency {
 
 		$limit = max( 1, min( 50, absint( $limit ) ) );
 
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT pm.meta_value AS product_guid, COUNT(DISTINCT p.ID) AS product_count, GROUP_CONCAT(DISTINCT p.ID ORDER BY p.ID ASC) AS ids
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-				WHERE p.post_type = 'product'
-				AND p.post_status IN ('publish','draft','private','pending')
-				AND pm.meta_key = 'product_guid'
-				AND pm.meta_value <> ''
-				GROUP BY pm.meta_value
-				HAVING COUNT(DISTINCT p.ID) > 1
-				ORDER BY MAX(p.ID) DESC
-				LIMIT %d",
-				$limit
-			),
-			ARRAY_A
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT c.product_guid AS product_guid, COUNT(DISTINCT p.ID) AS product_count, GROUP_CONCAT(DISTINCT p.ID ORDER BY p.ID ASC) AS ids
+					FROM {$wpdb->posts} p
+					INNER JOIN {$table} c ON c.woo_product_id = p.ID
+					LEFT JOIN {$wpdb->postmeta} q ON q.post_id = p.ID AND q.meta_key = '_mobo_duplicate_quarantined' AND q.meta_value = '1' AND p.post_status = 'draft'
+					WHERE c.connection_id = %d
+					AND p.post_type = 'product'
+					AND p.post_status IN ('publish','draft','private','pending')
+					AND c.product_guid <> ''
+					AND q.post_id IS NULL
+					GROUP BY c.product_guid
+					HAVING COUNT(DISTINCT p.ID) > 1
+					ORDER BY MAX(p.ID) DESC
+					LIMIT %d",
+					self::connection_id(),
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT pm.meta_value AS product_guid, COUNT(DISTINCT p.ID) AS product_count, GROUP_CONCAT(DISTINCT p.ID ORDER BY p.ID ASC) AS ids
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					LEFT JOIN {$wpdb->postmeta} q ON q.post_id = p.ID AND q.meta_key = '_mobo_duplicate_quarantined' AND q.meta_value = '1' AND p.post_status = 'draft'
+					WHERE p.post_type = 'product'
+					AND p.post_status IN ('publish','draft','private','pending')
+					AND pm.meta_key = 'product_guid'
+					AND pm.meta_value <> ''
+					AND q.post_id IS NULL
+					GROUP BY pm.meta_value
+					HAVING COUNT(DISTINCT p.ID) > 1
+					ORDER BY MAX(p.ID) DESC
+					LIMIT %d",
+					$limit
+				),
+				ARRAY_A
+			);
+		}
 
 		return is_array( $rows ) ? $rows : array();
 	}
@@ -416,10 +504,12 @@ class Mobo_Core_Product_Concurrency {
 			}
 
 			$preferred_id = $map instanceof Mobo_Core_Product_Map ? absint( $map->get_product_id( $product_guid ) ) : 0;
-			$canonical_id = self::get_canonical_product_id( $product_guid, $preferred_id );
-			$ids          = self::get_product_ids_by_guid( $product_guid );
+			$ids = array_values( array_filter( array_map( 'absint', explode( ',', (string) ( $group['ids'] ?? '' ) ) ) ) );
+			$canonical_id = $preferred_id > 0 && in_array( $preferred_id, $ids, true )
+				? $preferred_id
+				: ( ! empty( $ids ) ? absint( $ids[0] ) : 0 );
 
-			if ( $canonical_id <= 0 || empty( $ids ) ) {
+			if ( $canonical_id <= 0 || count( $ids ) < 2 ) {
 				$result['skipped']++;
 				continue;
 			}
@@ -480,7 +570,7 @@ class Mobo_Core_Product_Concurrency {
 
 		$prefix = isset( $wpdb->prefix ) ? sanitize_key( (string) $wpdb->prefix ) : 'wp_';
 
-		return substr( 'mobo:' . $prefix . ':product:' . md5( sanitize_text_field( (string) $product_guid ) ), 0, 64 );
+		return substr( 'mobo:' . $prefix . ':c' . self::connection_id() . ':product:' . md5( sanitize_text_field( (string) $product_guid ) ), 0, 64 );
 	}
 
 	/**
@@ -490,6 +580,6 @@ class Mobo_Core_Product_Concurrency {
 	 * @return string
 	 */
 	private static function fallback_lock_name( $product_guid ) {
-		return 'product_' . md5( sanitize_text_field( (string) $product_guid ) );
+		return 'product_c' . self::connection_id() . '_' . md5( sanitize_text_field( (string) $product_guid ) );
 	}
 }

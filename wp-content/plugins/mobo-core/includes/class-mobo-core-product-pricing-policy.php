@@ -80,15 +80,18 @@ final class Mobo_Core_Product_Pricing_Policy {
 	}
 
 	public static function effective_policy_type( $object_id, $parent_id = 0, $context = 'product' ) {
+		$object_id = absint( $object_id );
 		$override = self::resolve_for_object( $object_id, $parent_id, $context );
 		if ( ! empty( $override['error'] ) ) { return 'product-override-invalid'; }
-		if ( ! empty( $override['enabled'] ) ) {
-			return 'product-percentage-override';
-		}
-		$object_id = absint( $object_id );
+
 		if ( $object_id > 0 && absint( get_post_meta( $object_id, 'mobo_additional_price', true ) ) > 0 ) {
 			return 'object-additional-price';
 		}
+
+		if ( ! empty( $override['enabled'] ) ) {
+			return 'product-percentage-override';
+		}
+
 		return (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
 	}
 
@@ -125,6 +128,18 @@ final class Mobo_Core_Product_Pricing_Policy {
 		if ( ! in_array( $mode, array( 'global', 'custom' ), true ) ) {
 			return new WP_Error( 'mobo_core_pricing_override_mode_invalid', 'Pricing override mode is invalid.' );
 		}
+
+		$connection_id = self::resolve_owner_connection_id( $product_id );
+		if ( $connection_id <= 0 ) {
+			return new WP_Error( 'mobo_core_pricing_override_owner_unavailable', 'Product Connection ownership is unavailable; pricing override was not queued.' );
+		}
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$explicit_connection_id = absint( Mobo_Core_Connection_Context::get_current_connection_id() );
+			if ( $explicit_connection_id > 0 && $explicit_connection_id !== $connection_id ) {
+				return new WP_Error( 'mobo_core_pricing_override_owner_mismatch', 'The selected Connection does not own this product; pricing override was blocked.' );
+			}
+		}
+
 		$normalized = '';
 		if ( 'custom' === $mode ) {
 			$normalized = self::normalize_percentage( $value );
@@ -138,6 +153,7 @@ final class Mobo_Core_Product_Pricing_Policy {
 			'token' => $token,
 			'mode' => $mode,
 			'value' => $normalized,
+			'connectionId' => $connection_id,
 			'requestedAt' => gmdate( 'c' ),
 		) );
 		if ( ! is_string( $payload ) || '' === $payload ) {
@@ -152,9 +168,25 @@ final class Mobo_Core_Product_Pricing_Policy {
 		return self::apply_pending_request( $product_id, $token );
 	}
 
-	/** Apply the currently pending generation under the shared product lock. */
+	/** Apply the currently pending generation under the durable owning Connection. */
 	public static function apply_pending_request( $product_id, $expected_token = '' ) {
 		$product_id = absint( $product_id );
+		$owner_connection_id = self::resolve_owner_connection_id( $product_id );
+		if ( $product_id <= 0 || $owner_connection_id <= 0 ) {
+			$message = 'Product Connection ownership is unavailable; pending pricing override cannot run.';
+			if ( $product_id > 0 ) { self::set_pending_error( $product_id, $message ); }
+			return array( 'success' => false, 'status' => 'owner-unavailable', 'queued' => false, 'message' => $message );
+		}
+
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && absint( Mobo_Core_Connection_Context::get_current_connection_id() ) !== $owner_connection_id ) {
+			return Mobo_Core_Connection_Context::run(
+				$owner_connection_id,
+				static function () use ( $product_id, $expected_token ) {
+					return Mobo_Core_Product_Pricing_Policy::apply_pending_request( $product_id, $expected_token );
+				}
+			);
+		}
+
 		$pending = self::read_pending_request( $product_id );
 		if ( null === $pending ) {
 			return array( 'success' => true, 'status' => 'nothing-pending' );
@@ -243,22 +275,35 @@ final class Mobo_Core_Product_Pricing_Policy {
 		}
 	}
 
-	public static function handle_retry_action( $product_id ) {
-		self::apply_pending_request( absint( $product_id ) );
+	public static function handle_retry_action( $product_id, $scheduled_connection_id = 0 ) {
+		$product_id = absint( $product_id );
+		$scheduled_connection_id = absint( $scheduled_connection_id );
+		$owner_connection_id = self::resolve_owner_connection_id( $product_id );
+		if ( $owner_connection_id <= 0 || ( $scheduled_connection_id > 0 && $scheduled_connection_id !== $owner_connection_id ) ) {
+			if ( $product_id > 0 ) { self::set_pending_error( $product_id, 'Scheduled pricing override Connection ownership does not match the durable product owner.' ); }
+			return;
+		}
+		self::apply_pending_request( $product_id );
 	}
 
-	public static function schedule_retry( $product_id ) {
+	public static function schedule_retry( $product_id, $connection_id = 0 ) {
 		$product_id = absint( $product_id );
-		if ( $product_id <= 0 ) { return false; }
+		$connection_id = absint( $connection_id );
+		if ( $connection_id <= 0 ) { $connection_id = self::resolve_owner_connection_id( $product_id ); }
+		if ( $product_id <= 0 || $connection_id <= 0 ) { return false; }
 		$timestamp = time() + 60;
+		$legacy_args = array( $product_id );
+		$owned_args = array( $product_id, $connection_id );
 		if ( function_exists( 'as_has_scheduled_action' ) && function_exists( 'as_schedule_single_action' ) ) {
-			if ( ! as_has_scheduled_action( self::ACTION_RETRY, array( $product_id ), 'mobo-core' ) ) {
-				as_schedule_single_action( $timestamp, self::ACTION_RETRY, array( $product_id ), 'mobo-core', true );
+			$legacy_scheduled = as_has_scheduled_action( self::ACTION_RETRY, $legacy_args, 'mobo-core' );
+			$owned_scheduled = as_has_scheduled_action( self::ACTION_RETRY, $owned_args, 'mobo-core' );
+			if ( ! $legacy_scheduled && ! $owned_scheduled ) {
+				as_schedule_single_action( $timestamp, self::ACTION_RETRY, $owned_args, 'mobo-core', true );
 			}
 			return true;
 		}
-		if ( ! wp_next_scheduled( self::ACTION_RETRY, array( $product_id ) ) ) {
-			return false !== wp_schedule_single_event( $timestamp, self::ACTION_RETRY, array( $product_id ), true );
+		if ( ! wp_next_scheduled( self::ACTION_RETRY, $legacy_args ) && ! wp_next_scheduled( self::ACTION_RETRY, $owned_args ) ) {
+			return false !== wp_schedule_single_event( $timestamp, self::ACTION_RETRY, $owned_args, true );
 		}
 		return true;
 	}
@@ -274,6 +319,8 @@ final class Mobo_Core_Product_Pricing_Policy {
 		$token = isset( $decoded['token'] ) && is_scalar( $decoded['token'] ) ? sanitize_text_field( (string) $decoded['token'] ) : '';
 		$mode = isset( $decoded['mode'] ) && is_scalar( $decoded['mode'] ) ? sanitize_key( (string) $decoded['mode'] ) : '';
 		$value = isset( $decoded['value'] ) && is_scalar( $decoded['value'] ) ? (string) $decoded['value'] : '';
+		$durable_owner_connection_id = self::resolve_owner_connection_id( $product_id );
+		$connection_id = isset( $decoded['connectionId'] ) ? absint( $decoded['connectionId'] ) : $durable_owner_connection_id;
 		if ( '' === $token || ! in_array( $mode, array( 'global', 'custom' ), true ) ) {
 			return new WP_Error( 'mobo_core_pricing_override_pending_malformed', 'Pending product pricing request identity or mode is malformed.' );
 		}
@@ -285,7 +332,33 @@ final class Mobo_Core_Product_Pricing_Policy {
 		} else {
 			$value = '';
 		}
-		return array( 'token' => $token, 'mode' => $mode, 'value' => $value );
+		if ( $durable_owner_connection_id <= 0 || $connection_id <= 0 || $connection_id !== $durable_owner_connection_id ) {
+			return new WP_Error( 'mobo_core_pricing_override_pending_owner_mismatch', 'Pending product pricing request does not match durable Connection ownership.' );
+		}
+		return array( 'token' => $token, 'mode' => $mode, 'value' => $value, 'connectionId' => $connection_id );
+	}
+
+	/** Resolve the installation-global Woo Product owner without Default fallback in ready Multi-Connection runtime. */
+	private static function resolve_owner_connection_id( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) { return 0; }
+
+		if ( class_exists( 'Mobo_Core_Product_State_Repository' ) && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			$row = ( new Mobo_Core_Product_State_Repository() )->get_owner_by_woo_product_id( $product_id );
+			$owner_connection_id = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+			if ( $owner_connection_id > 0 ) { return $owner_connection_id; }
+
+			if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::connection_ownership_ready() ) {
+				return 0;
+			}
+		}
+
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$explicit_connection_id = absint( Mobo_Core_Connection_Context::get_current_connection_id() );
+			if ( $explicit_connection_id > 0 ) { return $explicit_connection_id; }
+			return absint( Mobo_Core_Connection_Context::get_effective_connection_id() );
+		}
+		return 0;
 	}
 
 	private static function write_active_state( $product_id, $mode, $value ) {

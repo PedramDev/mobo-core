@@ -17,9 +17,214 @@ if ( ! defined( 'ABSPATH' ) ) {
  * identifiers are generated internally and all external values are prepared.
  */
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+/**
+ * Narrowly typed, non-transient conflict. A cross-parent identity is never
+ * reparented automatically; Repair may quarantine this exact product and keep
+ * the other products progressing without losing the historical Woo IDs.
+ */
+final class Mobo_Core_Variation_Parent_Conflict extends RuntimeException {
+	public $variant_guid;
+	public $variation_id;
+	public $existing_parent_id;
+	public $requested_parent_id;
+	public $product_guid;
+	public $connection_id;
+
+	public function __construct( $variant_guid, $variation_id, $existing_parent_id, $requested_parent_id, $product_guid, $connection_id ) {
+		$this->variant_guid = sanitize_text_field( (string) $variant_guid );
+		$this->variation_id = absint( $variation_id );
+		$this->existing_parent_id = absint( $existing_parent_id );
+		$this->requested_parent_id = absint( $requested_parent_id );
+		$this->product_guid = sanitize_text_field( (string) $product_guid );
+		$this->connection_id = absint( $connection_id );
+		parent::__construct( sprintf(
+			'Existing variation identity belongs to another parent product; refusing cross-parent reassignment. connection=%d product_guid=%s variant_guid=%s variation=%d existing_parent=%d requested_parent=%d',
+			$this->connection_id, $this->product_guid, $this->variant_guid,
+			$this->variation_id, $this->existing_parent_id, $this->requested_parent_id
+		) );
+	}
+}
+
+
+/**
+ * Q2 P4B5: definitive, source-scoped parent identity disagreement.
+ * Incomplete evidence (including database errors) MUST remain an ordinary
+ * hard failure: it is not evidence of a durable identity conflict.
+ */
+final class Mobo_Core_Parent_Identity_Conflict extends RuntimeException {
+	public $product_guid;
+	public $connection_id;
+	public $reason;
+	public $canonical_parent_id;
+	public $legacy_parent_id;
+	public $custom_parent_id;
+	public $candidate_parent_id;
+	public $variation_parent_ids;
+
+	public static function is_definitive_reason( $reason ) {
+		return in_array( (string) $reason, array(
+			'split_parent_maps',
+			'variation_parent_disagrees_with_map',
+			'mixed_variation_parents',
+			'foreign_parent_owner',
+			'candidate_disagrees_with_map',
+		), true );
+	}
+
+	public function __construct( $guid, $connection_id, $decision ) {
+		$this->product_guid = sanitize_text_field( (string) $guid );
+		$this->connection_id = absint( $connection_id );
+		$this->reason = sanitize_key( (string) ( $decision['reason'] ?? '' ) );
+		$this->canonical_parent_id = absint( $decision['canonical'] ?? 0 );
+		$this->legacy_parent_id = absint( $decision['legacy'] ?? 0 );
+		$this->custom_parent_id = absint( $decision['custom'] ?? 0 );
+		$this->candidate_parent_id = absint( $decision['candidate'] ?? 0 );
+		$this->variation_parent_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) ( $decision['variationParents'] ?? array() ) ) ) ) );
+		parent::__construct( sprintf(
+			'Q2 parent identity fence blocked unsafe product mutation: %s connection=%d guid=%s',
+			$this->reason, $this->connection_id, $this->product_guid
+		) );
+	}
+}
+
+
+/**
+ * Q2/P0 identity fence: evidence-only decision before selecting, creating or
+ * rewriting a local WooCommerce product parent. Disabled by default until the
+ * Disposable runtime contract and rollback have been proven. No remap is made.
+ */
+final class Mobo_Core_Parent_Identity_Fence {
+	/** Pure classifier; its inputs are source-scoped and must be read under a product lock. */
+	public static function classify( $candidate_id, $legacy_id, $custom_id, $variation_parents, $foreign_owner = false, $evidence_complete = true ) {
+		$candidate_id = absint( $candidate_id );
+		$legacy_id = absint( $legacy_id );
+		$custom_id = absint( $custom_id );
+		$parents = array_values( array_unique( array_filter( array_map( 'absint', (array) $variation_parents ) ) ) );
+		sort( $parents, SORT_NUMERIC );
+		$canonical = $custom_id > 0 ? $custom_id : $legacy_id;
+		$reason = '';
+		if ( ! $evidence_complete ) {
+			$reason = 'evidence_unavailable';
+		} elseif ( $foreign_owner ) {
+			$reason = 'foreign_parent_owner';
+		} elseif ( $legacy_id > 0 && $custom_id > 0 && $legacy_id !== $custom_id ) {
+			$reason = 'split_parent_maps';
+		} elseif ( $candidate_id > 0 && $canonical > 0 && $candidate_id !== $canonical ) {
+			$reason = 'candidate_disagrees_with_map';
+		} elseif ( count( $parents ) > 1 ) {
+			$reason = 'mixed_variation_parents';
+		} elseif ( ! empty( $parents ) && ( 0 === $canonical || $parents[0] !== $canonical ) ) {
+			$reason = 'variation_parent_disagrees_with_map';
+		} elseif ( 0 === $canonical && $candidate_id > 0 ) {
+			// Explicit candidate on an unowned GUID is not proof of ownership.
+			$reason = 'unmapped_candidate_requires_authority';
+		}
+		return array(
+			'allow' => '' === $reason,
+			'reason' => '' === $reason ? ( $canonical > 0 ? 'existing_consistent' : 'new_without_local_identity' ) : $reason,
+			'canonical' => $canonical,
+			'legacy' => $legacy_id,
+			'custom' => $custom_id,
+			'candidate' => $candidate_id,
+			'variationParents' => $parents,
+		);
+	}
+
+	/** A hidden/future/trashed map owner must never silently become a duplicate. */
+	public static function assert_can_create( $guid ) {
+		$decision = self::assert_safe( $guid );
+		if ( 0 !== $decision['canonical'] || 'new_without_local_identity' !== $decision['reason'] ) {
+			throw new RuntimeException( 'Q2 parent identity fence: existing GUID authority must be resolved before creating another Woo product.' );
+		}
+		return true;
+	}
+
+	/** Never consult a different connection and never infer identity from a title. */
+	public static function assert_safe( $guid, $candidate_id = 0, $trusted_new = false ) {
+		global $wpdb;
+		$guid = sanitize_text_field( (string) $guid );
+		$candidate_id = absint( $candidate_id );
+		$cid = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( ! $wpdb instanceof wpdb || '' === $guid || $cid <= 0
+			|| ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists()
+			|| ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			throw new RuntimeException( 'Q2 parent identity fence: scoped storage evidence unavailable; no parent mutation allowed.' );
+		}
+
+		$legacy_table = Mobo_Core_Product_Map::table_name();
+		$custom_table = Mobo_Core_Storage_Schema::table_name( 'products' );
+		$variant_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+		$legacy_rows = $wpdb->get_col( $wpdb->prepare(
+			"SELECT wp_post_id FROM {$legacy_table} WHERE connection_id=%d AND BINARY remote_guid=BINARY %s AND object_type='product' LIMIT 2", $cid, $guid
+		) );
+		$legacy_error = (string) $wpdb->last_error;
+		$custom_rows = $wpdb->get_col( $wpdb->prepare(
+			"SELECT woo_product_id FROM {$custom_table} WHERE connection_id=%d AND BINARY product_guid=BINARY %s LIMIT 2", $cid, $guid
+		) );
+		$custom_error = (string) $wpdb->last_error;
+		$parents_rows = $wpdb->get_results( $wpdb->prepare(
+			"SELECT p.post_parent AS parent_id, MIN(v.woo_variation_id) AS example_variation_id, COUNT(*) AS child_count
+			 FROM {$variant_table} v INNER JOIN {$wpdb->posts} p ON p.ID=v.woo_variation_id
+			 WHERE v.connection_id=%d AND BINARY v.product_guid=BINARY %s
+			 AND p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','pending','future','trash')
+			 GROUP BY p.post_parent ORDER BY p.post_parent ASC LIMIT 4", $cid, $guid
+		), ARRAY_A );
+		$parents_error = (string) $wpdb->last_error;
+		$complete = '' === $legacy_error && '' === $custom_error && '' === $parents_error
+			&& is_array( $legacy_rows ) && is_array( $custom_rows ) && is_array( $parents_rows )
+			&& count( $legacy_rows ) <= 1 && count( $custom_rows ) <= 1 && count( $parents_rows ) < 4;
+		if ( ( is_array( $legacy_rows ) && count( $legacy_rows ) > 0 && absint( $legacy_rows[0] ) <= 0 )
+			|| ( is_array( $custom_rows ) && count( $custom_rows ) > 0 && absint( $custom_rows[0] ) <= 0 ) ) {
+			$complete = false;
+		}
+		$legacy_id = ! empty( $legacy_rows[0] ) ? absint( $legacy_rows[0] ) : 0;
+		$custom_id = ! empty( $custom_rows[0] ) ? absint( $custom_rows[0] ) : 0;
+		$parents = array();
+		foreach ( (array) $parents_rows as $row ) {
+			$parents[] = absint( $row['parent_id'] ?? 0 );
+			if ( absint( $row['parent_id'] ?? 0 ) <= 0 && absint( $row['child_count'] ?? 0 ) > 0 ) {
+				$complete = false;
+			}
+		}
+		// Cross-source/connection reuse of a concrete local Woo ID is a hard failure.
+		$foreign_owner = false;
+		$ids = array_values( array_unique( array_filter( array( $candidate_id, $legacy_id, $custom_id ) ) ) );
+		foreach ( $ids as $id ) {
+			$foreign_custom = $wpdb->get_var( $wpdb->prepare(
+				"SELECT id FROM {$custom_table} WHERE woo_product_id=%d AND (connection_id<>%d OR BINARY product_guid<>BINARY %s) LIMIT 1", $id, $cid, $guid
+			) );
+			if ( '' !== (string) $wpdb->last_error ) { $complete = false; }
+			$foreign_legacy = $wpdb->get_var( $wpdb->prepare(
+				"SELECT id FROM {$legacy_table} WHERE wp_post_id=%d AND object_type='product' AND (connection_id<>%d OR BINARY remote_guid<>BINARY %s) LIMIT 1", $id, $cid, $guid
+			) );
+			if ( '' !== (string) $wpdb->last_error ) { $complete = false; }
+			if ( $foreign_custom || $foreign_legacy ) { $foreign_owner = true; }
+		}
+		$decision = self::classify( $trusted_new ? 0 : $candidate_id, $legacy_id, $custom_id, $parents, $foreign_owner, $complete );
+		if ( $trusted_new && ( ! $decision['allow'] || ( $decision['canonical'] > 0 && $decision['canonical'] !== $candidate_id ) ) ) {
+			$decision['allow'] = false;
+			$decision['reason'] = 'concurrent_identity_appeared_during_creation';
+		}
+		if ( ! $decision['allow'] ) {
+			static $logged = array();
+			$log_key = $cid . ':' . $guid . ':' . $decision['reason'];
+			if ( ! isset( $logged[ $log_key ] ) ) {
+				$logged[ $log_key ] = true;
+				error_log( '[MOBO Q2 PARENT IDENTITY FENCE] connection=' . $cid . ' guid=' . $guid . ' reason=' . $decision['reason'] . ' legacy=' . $legacy_id . ' custom=' . $custom_id . ' candidate=' . $candidate_id . ' variantParents=' . implode( ',', $decision['variationParents'] ) );
+			}
+			if ( Mobo_Core_Parent_Identity_Conflict::is_definitive_reason( $decision['reason'] ) ) {
+				throw new Mobo_Core_Parent_Identity_Conflict( $guid, $cid, $decision );
+			}
+			throw new RuntimeException( 'Q2 parent identity fence blocked unsafe product mutation: ' . $decision['reason'] . ' connection=' . $cid . ' guid=' . $guid );
+		}
+		return $decision;
+	}
+}
+
 class Mobo_Core_Product_Sync {
 
-	const STATE_OPTION = 'mobo_core_sync_state';
+	const STATE_OPTION = 'mobo_core_sync_state'; // legacy migration source only
+	const STATE_KEY    = 'sync_state';
 	const REPAIR_COMPLETED_OPTION = 'mobo_core_repair_completed_at';
 	const REPAIR_LAST_SYNC_ID_OPTION = 'mobo_core_repair_last_sync_id';
 	const REPAIR_SYNC_ID_META = '_mobo_last_repair_sync_id';
@@ -27,6 +232,9 @@ class Mobo_Core_Product_Sync {
 	const REPAIR_APPLIED_REVISION_META = '_mobo_last_repair_applied_revision';
 	const REPAIR_WEBHOOK_US_META = '_mobo_last_repair_webhook_us';
 	const STALE_RUNNING_RECOVERY_SECONDS = 15;
+	const TARGETED_CONVERGENCE_WINDOW = 1000;
+	const TARGETED_CONVERGENCE_RECLASSIFY_LIMIT = 2000;
+	const TARGETED_CONVERGENCE_UNRESOLVED_LIMIT = 1000;
 
 	/** Request-local checkpoint coalescing used only by the real cron runner. */
 	private $checkpoint_coalescing = false;
@@ -44,11 +252,17 @@ class Mobo_Core_Product_Sync {
 	private $repair_mode = false;
 	private $last_parent_core_noop    = false;
 
-	/** @var array Request-local blocked-status decisions by object type/GUID. */
+	/** Q2: request-local authorization for exactly one newly saved parent ID. */
+	private $q2_new_parent_authorizations = array();
+
+	/** @var array Request-local blocked-status decisions by Connection/object type/GUID. */
 	private $blocked_status_cache = array();
 
 	/** @var array Request-local variation attribute-signature index by parent product ID. */
 	private $variation_signature_index = array();
+
+	/** PERF02: winner-only reverse index (parent => variation ID => signature). */
+	private $variation_signature_reverse = array();
 
 	/** @var array Request-local parent portal_product_id cache. */
 	private $parent_portal_product_id_cache = array();
@@ -59,6 +273,11 @@ class Mobo_Core_Product_Sync {
 		$this->image_sync       = new Mobo_Core_Image_Sync();
 		$this->category_sync    = new Mobo_Core_Category_Sync();
 		$this->product_map      = class_exists( 'Mobo_Core_Product_Map' ) ? new Mobo_Core_Product_Map() : null;
+	}
+
+	/** Active Source owner for every durable product/variant query in this instance. */
+	private function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
 	}
 
 	/**
@@ -131,7 +350,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $repair_mode ) {
-			delete_option( self::REPAIR_COMPLETED_OPTION );
+			Mobo_Core_Settings::delete( self::REPAIR_COMPLETED_OPTION );
 		}
 
 		if ( '' === $sync_id ) {
@@ -146,6 +365,11 @@ class Mobo_Core_Product_Sync {
 			'hashCheckBypassed'            => $repair_mode,
 
 			'categorySynced'               => false,
+			'categorySnapshotRetryCount'    => 0,
+			'categorySyncDegraded'          => false,
+			'categorySyncSkippedRows'       => 0,
+			'categorySyncUnresolved'        => array(),
+			'categoryRetiredRows'           => 0,
 
 			'productPage'                  => 1,
 			'productCursor'                => 0,
@@ -159,6 +383,7 @@ class Mobo_Core_Product_Sync {
 			'currentProductSourceRevision' => 0,
 			'currentProductSourceVersion'  => '',
 			'currentProductSourceHash'     => '',
+			'currentProductSnapshotUs'    => 0,
 			'currentProductImages'         => array(),
 			'currentProductImagesPresent'  => false,
 			'currentProductAttributes'     => array(),
@@ -178,6 +403,7 @@ class Mobo_Core_Product_Sync {
 			'currentVariantTotalPages'     => 0,
 			'currentVariantProcessedPages' => 0,
 			'currentVariantCursor'          => 0,
+			'currentVariantCursorDisabled'  => false,
 
 			'startedAt'                    => time(),
 			'completedAt'                  => 0,
@@ -187,11 +413,19 @@ class Mobo_Core_Product_Sync {
 			'transientRetryCount'           => 0,
 			'lastTransientError'            => '',
 			'waitingForPortalSince'         => 0,
+			'waitingForPortalReason'        => '',
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
 			'staleRecoveryCount'           => 0,
 			'lastStaleRecoveryAt'          => 0,
 			'lastStaleRecoveryReason'      => '',
+			'repairLivenessLockKey'        => '',
+			'repairLivenessLockCount'      => 0,
+			'repairProductLockQuarantined' => 0,
+			'repairProductLockSamples'     => array(),
+			'repairParentConflictCount'    => 0,
+			'repairParentConflictSamples'  => array(),
+			'repairParentConflictGuids'    => array(),
 
 			'repairIntegrityPhase'           => $repair_mode ? 'portal-variant-duplicates' : 'done',
 			'repairIntegrityCursor'          => 0,
@@ -203,6 +437,18 @@ class Mobo_Core_Product_Sync {
 			'postSyncIntegrityCursor'          => 0,
 			'postSyncIntegrityComplete'        => ! $repair_mode,
 			'postSyncIntegrityStats'           => array(),
+
+			'convergenceRecoveryComplete'     => ! $repair_mode,
+			'convergenceRecoveryAttempted'    => array(),
+			'convergenceRecoveryScanned'      => 0,
+			'convergenceRecoveryQueued'       => 0,
+			'convergenceRecoverySkipped'      => 0,
+			'convergenceRecoveryUnresolved'   => 0,
+			'convergenceRecoveryCursor'       => 0,
+			'targetedConvergenceOnly'       => false,
+			'targetedConvergenceOwnsUnowned'=> false,
+			'targetedConvergenceTargets'    => array(),
+
 			'missingImageRecoveryCursor'      => 0,
 			'missingImageRecoveryScanned'     => 0,
 			'missingImageRecoveryQueued'      => 0,
@@ -222,6 +468,114 @@ class Mobo_Core_Product_Sync {
 		);
 	}
 
+
+
+	/**
+	 * Start a post-upgrade exact convergence generation without running a full
+	 * catalogue Repair. The target set is frozen from the current authoritative
+	 * unowned classifier so a temporary Backend outage still has durable recovery
+	 * ownership and the normal real-cron runner can resume later.
+	 *
+	 * @param string $source Source label.
+	 * @return array
+	 */
+	public function start_targeted_convergence_recovery( $source = 'post-upgrade-convergence' ) {
+		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			return $this->result( false, 'Targeted convergence recovery is deferred until the upgrade barrier is released.', array_merge( $this->get_manual_sync_status(), array( 'pausedForUpgrade' => true ) ) );
+		}
+
+		$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( 'manual_sync_start', 30 ) : 'no-lock';
+		if ( false === $lock ) {
+			return $this->result( false, 'Targeted convergence recovery start is contended.', array_merge( $this->get_manual_sync_status(), array( 'locked' => true ) ) );
+		}
+
+		try {
+			$current_state = $this->get_manual_sync_state();
+			$current_status = sanitize_key( (string) ( $current_state['status'] ?? '' ) );
+			if ( in_array( $current_status, array( 'running', 'waiting_for_portal' ), true ) ) {
+				if ( ! empty( $current_state['targetedConvergenceOnly'] ) ) {
+					return $this->result( true, 'Targeted convergence recovery is already owned by the current generation.', array_merge( $this->get_manual_sync_status(), array( 'alreadyAccepted' => true ) ) );
+				}
+				return $this->result( false, 'Another Sync/Repair generation already owns Product Sync.', $this->get_manual_sync_status() );
+			}
+
+			if ( ! class_exists( 'Mobo_Core_Sync_Health' ) || ! method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ) {
+				return $this->result( false, 'Operational Sync Health is unavailable for targeted recovery selection.', $this->get_manual_sync_status() );
+			}
+			if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_sync_health_snapshot' ) ) {
+				Mobo_Core_Health_Read_Cache::refresh_sync_health_snapshot( self::TARGETED_CONVERGENCE_WINDOW );
+			}
+			$dashboard = Mobo_Core_Sync_Health::get_operational_dashboard_status( self::TARGETED_CONVERGENCE_WINDOW, false );
+			if ( ! is_array( $dashboard ) || 'unavailable' === sanitize_key( (string) ( $dashboard['operationalStatus'] ?? '' ) ) ) {
+				return $this->result( false, 'Operational Sync Health could not classify post-upgrade recovery targets.', $this->get_manual_sync_status() );
+			}
+
+			$targets = array();
+			foreach ( (array) ( $dashboard['unownedRows'] ?? array() ) as $row ) {
+				if ( ! is_array( $row ) ) { continue; }
+				$guid = sanitize_text_field( (string) ( $row['productGuid'] ?? '' ) );
+				$wp_id = absint( $row['wpProductId'] ?? ( $row['wpId'] ?? 0 ) );
+				if ( '' === $guid || $wp_id <= 0 ) { continue; }
+				$targets[] = array(
+					'productGuid'       => $guid,
+					'wpProductId'       => $wp_id,
+					'postIncomplete'    => ! empty( $row['postIncomplete'] ),
+					'mapIncomplete'     => ! empty( $row['mapIncomplete'] ),
+					'localStructureSane'=> array_key_exists( 'localStructureSane', $row ) ? (bool) $row['localStructureSane'] : true,
+				);
+			}
+
+			$total_unowned = absint( $dashboard['operational']['unownedConvergenceGap'] ?? count( $targets ) );
+
+			if ( empty( $targets ) ) {
+				return $this->result( true, 'No post-upgrade convergence gaps require exact recovery.', array_merge( $this->get_manual_sync_status(), array( 'noTargets' => true, 'targetCount' => 0 ) ) );
+			}
+
+			$now = time();
+			$state = array(
+				'syncId'                       => wp_generate_uuid4(),
+				'status'                       => 'running',
+				'source'                       => sanitize_key( (string) $source ),
+				'repairMode'                   => true,
+				'hashCheckBypassed'            => true,
+				'categorySynced'               => true,
+				'productQueue'                 => array(),
+				'currentProductGuid'           => '',
+				'currentProductId'             => 0,
+				'productTotalCount'            => 0,
+				'processedProducts'            => 0,
+				'startedAt'                    => $now,
+				'completedAt'                  => 0,
+				'updatedAt'                    => $now,
+				'lastMessage'                  => sprintf( 'Post-upgrade targeted convergence recovery owns %d actionable local product(s); current worker window: %d.', $total_unowned, count( $targets ) ),
+				'lastError'                    => '',
+				'repairIntegrityPhase'          => 'done',
+				'repairIntegrityComplete'       => true,
+				'repairProductsComplete'        => true,
+				'postSyncIntegrityPhase'        => 'done',
+				'postSyncIntegrityComplete'     => true,
+				'convergenceRecoveryComplete'   => false,
+				'convergenceRecoveryAttempted'  => array(),
+				'convergenceRecoveryScanned'    => 0,
+				'convergenceRecoveryQueued'     => 0,
+				'convergenceRecoverySkipped'    => 0,
+				'convergenceRecoveryUnresolved' => 0,
+				'convergenceRecoveryCursor'     => 0,
+				'missingImageRecoveryComplete' => true,
+				'targetedConvergenceOnly'       => true,
+				'targetedConvergenceOwnsUnowned'=> true,
+				'targetedConvergenceTargets'    => array_slice( $targets, 0, self::TARGETED_CONVERGENCE_WINDOW ),
+			);
+			if ( ! $this->persist_manual_sync_state_verified( $state ) ) {
+				return $this->result( false, 'Targeted convergence recovery checkpoint could not be persisted.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], array_merge( $this->get_manual_sync_status(), array( 'targetCount' => count( $targets ), 'ownedCount' => $total_unowned ) ) );
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && 'no-lock' !== $lock ) {
+				Mobo_Core_Lock::release( 'manual_sync_start', $lock );
+			}
+		}
+	}
 
 
 	/**
@@ -310,7 +664,6 @@ class Mobo_Core_Product_Sync {
 		}
 
 		try {
-			wp_cache_delete( self::STATE_OPTION, 'options' );
 			$state = $this->get_manual_sync_state();
 			$status = sanitize_key( (string) ( $state['status'] ?? '' ) );
 			$sync_id = sanitize_text_field( (string) ( $state['syncId'] ?? '' ) );
@@ -379,10 +732,20 @@ class Mobo_Core_Product_Sync {
 		}
 
 		try {
-			delete_option( self::STATE_OPTION );
-			wp_cache_delete( self::STATE_OPTION, 'options' );
-			if ( null !== get_option( self::STATE_OPTION, null ) ) {
-				return false;
+			$legacy_owner_allowed = ! class_exists( 'Mobo_Core_Connection_Context' ) || ! method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) || Mobo_Core_Connection_Context::legacy_default_owner_allowed();
+			if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+				Mobo_Core_State_Store::delete( self::STATE_KEY );
+				if ( $legacy_owner_allowed && ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) {
+					delete_option( self::STATE_OPTION );
+					wp_cache_delete( self::STATE_OPTION, 'options' );
+				}
+				if ( null !== Mobo_Core_State_Store::get( self::STATE_KEY, null ) ) { return false; }
+			} else {
+				if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+				if ( ! $legacy_owner_allowed ) { return false; }
+				delete_option( self::STATE_OPTION );
+				wp_cache_delete( self::STATE_OPTION, 'options' );
+				if ( false !== get_option( self::STATE_OPTION, false ) ) { return false; }
 			}
 			$this->checkpoint_state         = null;
 			$this->checkpoint_pending_steps = 0;
@@ -394,6 +757,24 @@ class Mobo_Core_Product_Sync {
 		}
 	}
 
+	/**
+	 * Read the large sync checkpoint from the dedicated state table.
+	 * The first read after upgrading migrates and deletes the legacy option.
+	 *
+	 * @return array
+	 */
+	private function load_durable_sync_state() {
+		if ( ! class_exists( 'Mobo_Core_State_Store' ) || ! Mobo_Core_State_Store::is_available() ) {
+			if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return array(); }
+			if ( class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) { return array(); }
+			$legacy = get_option( self::STATE_OPTION, array() );
+			return is_array( $legacy ) ? $legacy : array();
+		}
+		if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_State_Store::migrate_option( self::STATE_OPTION, self::STATE_KEY ); }
+		$state = Mobo_Core_State_Store::get( self::STATE_KEY, array() );
+		return is_array( $state ) ? $state : array();
+	}
+
 	public function get_manual_sync_state() {
 		$default = array(
 			'syncId'                       => '',
@@ -403,6 +784,11 @@ class Mobo_Core_Product_Sync {
 			'hashCheckBypassed'            => false,
 
 			'categorySynced'               => false,
+			'categorySnapshotRetryCount'    => 0,
+			'categorySyncDegraded'          => false,
+			'categorySyncSkippedRows'       => 0,
+			'categorySyncUnresolved'        => array(),
+			'categoryRetiredRows'           => 0,
 
 			'productPage'                  => 1,
 			'productCursor'                => 0,
@@ -416,6 +802,7 @@ class Mobo_Core_Product_Sync {
 			'currentProductSourceRevision' => 0,
 			'currentProductSourceVersion'  => '',
 			'currentProductSourceHash'     => '',
+			'currentProductSnapshotUs'    => 0,
 			'currentProductImages'         => array(),
 			'currentProductImagesPresent'  => false,
 			'currentProductAttributes'     => array(),
@@ -435,6 +822,7 @@ class Mobo_Core_Product_Sync {
 			'currentVariantTotalPages'     => 0,
 			'currentVariantProcessedPages' => 0,
 			'currentVariantCursor'          => 0,
+			'currentVariantCursorDisabled'  => false,
 
 			'startedAt'                    => 0,
 			'completedAt'                  => 0,
@@ -444,11 +832,19 @@ class Mobo_Core_Product_Sync {
 			'transientRetryCount'           => 0,
 			'lastTransientError'            => '',
 			'waitingForPortalSince'         => 0,
+			'waitingForPortalReason'        => '',
 			'nextRetryAt'                  => 0,
 			'cancelRequestedAt'            => 0,
 			'staleRecoveryCount'           => 0,
 			'lastStaleRecoveryAt'          => 0,
 			'lastStaleRecoveryReason'      => '',
+			'repairLivenessLockKey'        => '',
+			'repairLivenessLockCount'      => 0,
+			'repairProductLockQuarantined' => 0,
+			'repairProductLockSamples'     => array(),
+			'repairParentConflictCount'    => 0,
+			'repairParentConflictSamples'  => array(),
+			'repairParentConflictGuids'    => array(),
 
 			'repairIntegrityPhase'           => 'done',
 			'repairIntegrityCursor'          => 0,
@@ -460,6 +856,18 @@ class Mobo_Core_Product_Sync {
 			'postSyncIntegrityCursor'          => 0,
 			'postSyncIntegrityComplete'        => true,
 			'postSyncIntegrityStats'           => array(),
+
+			'convergenceRecoveryComplete'     => true,
+			'convergenceRecoveryAttempted'    => array(),
+			'convergenceRecoveryScanned'      => 0,
+			'convergenceRecoveryQueued'       => 0,
+			'convergenceRecoverySkipped'      => 0,
+			'convergenceRecoveryUnresolved'   => 0,
+			'convergenceRecoveryCursor'       => 0,
+			'targetedConvergenceOnly'       => false,
+			'targetedConvergenceOwnsUnowned'=> false,
+			'targetedConvergenceTargets'    => array(),
+
 			'missingImageRecoveryCursor'      => 0,
 			'missingImageRecoveryScanned'     => 0,
 			'missingImageRecoveryQueued'      => 0,
@@ -470,13 +878,14 @@ class Mobo_Core_Product_Sync {
 
 		$state = $this->checkpoint_coalescing && is_array( $this->checkpoint_state )
 			? $this->checkpoint_state
-			: get_option( self::STATE_OPTION, array() );
+			: $this->load_durable_sync_state();
 
 		if ( ! is_array( $state ) ) {
 			$state = array();
 		}
 
 		$had_post_sync_state = array_key_exists( 'postSyncIntegrityComplete', $state );
+		$had_convergence_recovery_state = array_key_exists( 'convergenceRecoveryComplete', $state );
 		$state = wp_parse_args( $state, $default );
 		/* An in-flight Repair created by an older build did not have the post-sync
 		 * phase. Do not silently treat that missing field as completed after upgrade. */
@@ -485,6 +894,18 @@ class Mobo_Core_Product_Sync {
 			$state['postSyncIntegrityCursor']   = 0;
 			$state['postSyncIntegrityComplete'] = false;
 			$state['postSyncIntegrityStats']    = array();
+		}
+		/* 10.34.68 added exact convergence recovery after the catalogue pass. An
+		 * in-flight Repair from an older build must execute that phase instead of
+		 * inheriting the default completed value. */
+		if ( ! empty( $state['repairMode'] ) && ! $had_convergence_recovery_state ) {
+			$state['convergenceRecoveryComplete']   = false;
+			$state['convergenceRecoveryAttempted']  = array();
+			$state['convergenceRecoveryScanned']    = 0;
+			$state['convergenceRecoveryQueued']     = 0;
+			$state['convergenceRecoverySkipped']    = 0;
+			$state['convergenceRecoveryUnresolved'] = 0;
+			$state['convergenceRecoveryCursor']     = 0;
 		}
 
 		return $state;
@@ -545,7 +966,7 @@ class Mobo_Core_Product_Sync {
 			'repairMode'                   => ! empty( $state['repairMode'] ),
 			'hashCheckBypassed'            => ! empty( $state['hashCheckBypassed'] ),
 			'repairCompletedAt'            => self::get_repair_completed_at(),
-			'isRepairCompleted'            => self::is_repair_completed(),
+			'isRepairCompleted'            => self::is_repair_completed() && absint( $state['repairParentConflictCount'] ?? 0 ) === 0 && 'needs_attention' !== $current_status,
 
 			'isRunning'                    => 'running' === $current_status,
 			'isWaitingForPortal'            => $is_waiting,
@@ -555,6 +976,17 @@ class Mobo_Core_Product_Sync {
 			'isCancelled'                  => 'cancelled' === $current_status,
 
 			'categorySynced'               => (bool) $state['categorySynced'],
+			'categorySyncDegraded'          => ! empty( $state['categorySyncDegraded'] ),
+			'categorySyncSkippedRows'       => absint( $state['categorySyncSkippedRows'] ?? 0 ),
+			'categoryRetiredRows'           => absint( $state['categoryRetiredRows'] ?? 0 ),
+			'categorySyncUnresolved'        => isset( $state['categorySyncUnresolved'] ) && is_array( $state['categorySyncUnresolved'] ) ? array_slice( $state['categorySyncUnresolved'], 0, 25 ) : array(),
+			'repairLivenessLockKey'         => sanitize_text_field( (string) ( $state['repairLivenessLockKey'] ?? '' ) ),
+			'repairLivenessLockCount'       => absint( $state['repairLivenessLockCount'] ?? 0 ),
+			'repairProductLockQuarantined'  => absint( $state['repairProductLockQuarantined'] ?? 0 ),
+			'repairProductLockSamples'      => isset( $state['repairProductLockSamples'] ) && is_array( $state['repairProductLockSamples'] ) ? array_slice( $state['repairProductLockSamples'], 0, 25 ) : array(),
+			'repairParentConflictCount'     => absint( $state['repairParentConflictCount'] ?? 0 ),
+			'repairParentConflictSamples'   => isset( $state['repairParentConflictSamples'] ) && is_array( $state['repairParentConflictSamples'] ) ? array_slice( $state['repairParentConflictSamples'], 0, 25 ) : array(),
+			'isNeedsAttention'              => 'needs_attention' === $current_status,
 			'repairIntegrityPhase'           => sanitize_key( (string) $state['repairIntegrityPhase'] ),
 			'repairIntegrityCursor'          => absint( $state['repairIntegrityCursor'] ),
 			'repairIntegrityComplete'        => ! empty( $state['repairIntegrityComplete'] ),
@@ -564,6 +996,12 @@ class Mobo_Core_Product_Sync {
 			'postSyncIntegrityCursor'          => absint( $state['postSyncIntegrityCursor'] ),
 			'postSyncIntegrityComplete'        => ! empty( $state['postSyncIntegrityComplete'] ),
 			'postSyncIntegrityStats'           => is_array( $state['postSyncIntegrityStats'] ) ? $state['postSyncIntegrityStats'] : array(),
+			'convergenceRecoveryComplete'      => ! empty( $state['convergenceRecoveryComplete'] ),
+			'convergenceRecoveryScanned'       => absint( $state['convergenceRecoveryScanned'] ?? 0 ),
+			'convergenceRecoveryQueued'        => absint( $state['convergenceRecoveryQueued'] ?? 0 ),
+			'convergenceRecoverySkipped'       => absint( $state['convergenceRecoverySkipped'] ?? 0 ),
+			'convergenceRecoveryUnresolved'    => absint( $state['convergenceRecoveryUnresolved'] ?? 0 ),
+			'convergenceRecoveryCursor'        => absint( $state['convergenceRecoveryCursor'] ?? 0 ),
 			'missingImageRecoveryCursor'      => absint( $state['missingImageRecoveryCursor'] ),
 			'missingImageRecoveryScanned'     => absint( $state['missingImageRecoveryScanned'] ),
 			'missingImageRecoveryQueued'      => absint( $state['missingImageRecoveryQueued'] ),
@@ -602,6 +1040,7 @@ class Mobo_Core_Product_Sync {
 			'completedAt'                  => absint( $state['completedAt'] ),
 			'updatedAt'                    => absint( $state['updatedAt'] ),
 			'waitingForPortalSince'         => absint( $state['waitingForPortalSince'] ?? 0 ),
+			'waitingForPortalReason'        => sanitize_key( (string) ( $state['waitingForPortalReason'] ?? '' ) ),
 			'nextRetryAt'                  => $next_retry_at,
 			'cancelRequestedAt'            => absint( $state['cancelRequestedAt'] ?? 0 ),
 			'workerLock'                    => $worker_lock,
@@ -613,6 +1052,9 @@ class Mobo_Core_Product_Sync {
 			'lastMessage'                  => sanitize_text_field( (string) $state['lastMessage'] ),
 			'lastError'                    => $last_error,
 			'transientRetryCount'           => absint( $state['transientRetryCount'] ?? 0 ),
+			'repairLivenessLockKey'         => sanitize_text_field( (string) ( $state['repairLivenessLockKey'] ?? '' ) ),
+			'repairLivenessLockCount'       => absint( $state['repairLivenessLockCount'] ?? 0 ),
+			'repairProductLockQuarantined'  => absint( $state['repairProductLockQuarantined'] ?? 0 ),
 			'lastTransientError'            => sanitize_text_field( (string) ( $state['lastTransientError'] ?? '' ) ),
 
 			'shouldContinue'               => $should_continue,
@@ -639,8 +1081,7 @@ class Mobo_Core_Product_Sync {
 			 * after acquiring ownership, before any product mutation.
 			 */
 			if ( $this->checkpoint_coalescing && is_array( $this->checkpoint_state ) ) {
-				wp_cache_delete( self::STATE_OPTION, 'options' );
-				$durable       = get_option( self::STATE_OPTION, array() );
+				$durable       = $this->load_durable_sync_state();
 				$buffered_id   = sanitize_text_field( (string) ( $this->checkpoint_state['syncId'] ?? '' ) );
 				$durable_id    = is_array( $durable ) ? sanitize_text_field( (string) ( $durable['syncId'] ?? '' ) ) : '';
 				$durable_state = is_array( $durable ) ? sanitize_key( (string) ( $durable['status'] ?? '' ) ) : '';
@@ -705,6 +1146,9 @@ class Mobo_Core_Product_Sync {
 		if ( 'done' === $state['status'] ) {
 			return $this->result( true, 'همگام‌سازی قبلاً کامل شده است.', $this->get_manual_sync_status() );
 		}
+		if ( 'needs_attention' === $state['status'] ) {
+			return $this->result( false, 'Repair با تعارض هویت والد Variant متوقف شده است؛ برای این نسل تأیید تکمیل ممنوع است.', $this->get_manual_sync_status() );
+		}
 
 		if ( 'waiting_for_portal' === $state['status'] ) {
 			$next_retry_at = absint( $state['nextRetryAt'] ?? 0 );
@@ -718,11 +1162,17 @@ class Mobo_Core_Product_Sync {
 				return $this->result( true, 'MoboCore هنوز آماده تلاش مجدد نیست. وضعیت sync حفظ شده است.', $this->get_manual_sync_status() );
 			}
 
-			$state['status']              = 'running';
-			$state['transientRetryCount'] = 0;
-			$state['lastError']           = '';
-			$state['lastMessage']         = 'اتصال به MoboCore دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
-			$state['updatedAt']           = time();
+			$waiting_reason = sanitize_key( (string) ( $state['waitingForPortalReason'] ?? '' ) );
+			$state['status'] = 'running';
+			/* A dependency circuit deferral did not send a new HTTP request, so it must
+			 * not erase the count of actual transport attempts accumulated so far. */
+			if ( 'network_backoff' !== $waiting_reason ) {
+				$state['transientRetryCount'] = 0;
+			}
+			$state['waitingForPortalReason'] = '';
+			$state['lastError']              = '';
+			$state['lastMessage']            = 'اتصال به MoboCore دوباره بررسی می‌شود؛ ادامه از آخرین نقطه ذخیره‌شده.';
+			$state['updatedAt']              = time();
 			if ( ! $this->save_manual_sync_state( $state ) ) {
 				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
 			}
@@ -746,6 +1196,9 @@ class Mobo_Core_Product_Sync {
 			$integrity = new Mobo_Core_Repair_Integrity();
 			$integrity_result = $integrity->run_slice( $state );
 			if ( is_wp_error( $integrity_result ) ) {
+				if ( $this->is_retryable_repair_integrity_error( $integrity_result ) ) {
+					return $this->handle_transient_request_error( $state, $integrity_result, 'خواندن داده‌های مرحله Repair موقتاً ناموفق بود.' );
+				}
 				$state['lastError']   = sanitize_text_field( $integrity_result->get_error_message() );
 				$state['lastMessage'] = 'ترمیم داده‌های قدیمی با خطا متوقف شد: ' . $state['lastError'];
 				if ( ! $this->save_manual_sync_state( $state ) ) {
@@ -754,6 +1207,7 @@ class Mobo_Core_Product_Sync {
 				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
 
+			$this->clear_transient_request_error( $state );
 			$state['lastError']   = '';
 			$state['lastMessage'] = sanitize_text_field( (string) ( isset( $integrity_result['message'] ) ? $integrity_result['message'] : 'مرحله ترمیم داده‌های قدیمی اجرا شد.' ) );
 			$state['updatedAt']   = time();
@@ -764,23 +1218,49 @@ class Mobo_Core_Product_Sync {
 		}
 
 		/*
-		 * Once the authoritative product pass is complete, run a second bounded
-		 * integrity pass over only the parents that were durably completed by this
-		 * exact Repair generation. This avoids treating OnlyInStock omissions as
-		 * authoritative topology evidence.
+		 * A catalogue filtered by OnlyInStock may intentionally omit an existing local
+		 * product after its upstream stock reaches zero. Omission from the list is not
+		 * authoritative deletion evidence, but an already-local product with a durable
+		 * unowned convergence gap must not remain stale forever. After the catalogue
+		 * pass, Repair therefore exact-fetches only current local unowned products by
+		 * GUID and feeds them through the same Parent/Variant pipeline. New products are
+		 * never discovered by this phase and terminal/active-owned rows are excluded by
+		 * Operational Health classification.
 		 */
-		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && empty( $state['postSyncIntegrityComplete'] ) ) {
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && empty( $state['convergenceRecoveryComplete'] ) ) {
+			if ( '' === trim( (string) ( $state['currentProductGuid'] ?? '' ) ) && empty( $state['productQueue'] ) ) {
+				$recovery_result = $this->run_convergence_gap_recovery_step( $state, $api );
+				if ( is_array( $recovery_result ) ) {
+					return $recovery_result;
+				}
+			}
+			/* When an exact snapshot has been queued, fall through to the ordinary product
+			 * stages below. Their existing lock, webhook-watermark, hash and Variant
+			 * boundaries remain the mutation authority. */
+		}
+
+		/*
+		 * Once the authoritative product pass and exact local-gap recovery are complete,
+		 * run a second bounded integrity pass over only the parents that were durably
+		 * completed by this exact Repair generation. This avoids treating remaining
+		 * OnlyInStock omissions as authoritative topology evidence.
+		 */
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && ! empty( $state['convergenceRecoveryComplete'] ) && empty( $state['postSyncIntegrityComplete'] ) ) {
 			if ( ! class_exists( 'Mobo_Core_Repair_Integrity' ) ) {
 				return $this->result( false, 'مرحله نهایی Repair در دسترس نیست.', $this->get_manual_sync_status() );
 			}
 			$integrity = new Mobo_Core_Repair_Integrity();
 			$post_result = $integrity->run_post_sync_slice( $state );
 			if ( is_wp_error( $post_result ) ) {
+				if ( $this->is_retryable_repair_integrity_error( $post_result ) ) {
+					return $this->handle_transient_request_error( $state, $post_result, 'خواندن داده‌های مرحله نهایی Repair موقتاً ناموفق بود.' );
+				}
 				$state['lastError']   = sanitize_text_field( $post_result->get_error_message() );
 				$state['lastMessage'] = 'مرحله نهایی Repair با خطا متوقف شد: ' . $state['lastError'];
 				$this->save_manual_sync_state( $state );
 				return $this->result( false, $state['lastMessage'], $this->get_manual_sync_status() );
 			}
+			$this->clear_transient_request_error( $state );
 			$state['lastError']   = '';
 			$state['lastMessage'] = sanitize_text_field( (string) ( $post_result['message'] ?? 'مرحله نهایی Repair اجرا شد.' ) );
 			if ( ! $this->save_manual_sync_state( $state ) ) {
@@ -795,7 +1275,7 @@ class Mobo_Core_Product_Sync {
 		 * have no usable image are fetched individually by GUID and only their
 		 * image payload is applied. Stock, fields and variants are untouched.
 		 */
-		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && ! empty( $state['postSyncIntegrityComplete'] ) && empty( $state['missingImageRecoveryComplete'] ) ) {
+		if ( ! empty( $state['repairMode'] ) && ! empty( $state['repairProductsComplete'] ) && ! empty( $state['convergenceRecoveryComplete'] ) && ! empty( $state['postSyncIntegrityComplete'] ) && empty( $state['missingImageRecoveryComplete'] ) ) {
 			return $this->run_missing_image_repair_step( $state );
 		}
 
@@ -804,6 +1284,7 @@ class Mobo_Core_Product_Sync {
 		 */
 		if ( empty( $state['categorySynced'] ) ) {
 			if ( $this->rules->should_update_categories() ) {
+				$category_snapshot_started_us = (int) floor( microtime( true ) * 1000000 );
 				$response = $api->get_categories( $state['syncId'] );
 
 				if ( is_wp_error( $response ) ) {
@@ -814,18 +1295,37 @@ class Mobo_Core_Product_Sync {
 				if ( is_wp_error( $categories ) ) {
 					return $this->handle_transient_request_error( $state, $categories, 'پاسخ دسته‌بندی MoboCore نامعتبر بود.' );
 				}
-				$this->clear_transient_request_error( $state );
-
-				$category_result = $this->category_sync->sync_categories_payload( $categories );
+				$category_result = $this->category_sync->sync_categories_payload( $categories, $category_snapshot_started_us );
 				if ( empty( $category_result['complete'] ) || absint( $category_result['skipped'] ) > 0 ) {
-					$error = new WP_Error(
-						'mobo_core_category_snapshot_incomplete',
-						sprintf( 'Category snapshot was only partially applied; %d row(s) were invalid or unresolved.', absint( $category_result['skipped'] ) )
-					);
-					return $this->handle_transient_request_error( $state, $error, 'همگام‌سازی دسته‌بندی ناقص بود و در اجرای بعد دوباره تلاش می‌شود.' );
+					$category_try = absint( $state['categorySnapshotRetryCount'] ?? 0 ) + 1;
+					$category_max = 3;
+					$state['categorySnapshotRetryCount'] = $category_try;
+					$state['categorySyncSkippedRows'] = absint( $category_result['skipped'] ?? 0 );
+					$state['categorySyncUnresolved'] = isset( $category_result['unresolved'] ) && is_array( $category_result['unresolved'] ) ? array_slice( $category_result['unresolved'], 0, 25 ) : array();
+					$state['lastError'] = '';
+					if ( $category_try < $category_max ) {
+						$state['lastMessage'] = sprintf( 'همگام‌سازی دسته‌بندی ناقص بود؛ %d ردیف invalid/unresolved است. تلاش semantic %d از %d.', absint( $category_result['skipped'] ), $category_try, $category_max );
+						if ( ! $this->save_manual_sync_state( $state ) ) { return $this->result( false, 'Checkpoint دسته‌بندی ذخیره نشد.', $this->get_manual_sync_status() ); }
+						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+					}
+					/* Permanent/semantic source defects must not hold the entire Repair forever.
+					 * Preserve a degraded marker, skip authoritative retirement because the
+					 * snapshot was incomplete, and continue products from the last safe map. */
+					$state['categorySynced'] = true;
+					$state['categorySyncDegraded'] = true;
+					$state['categorySnapshotRetryCount'] = 0;
+					$state['lastMessage'] = sprintf( 'دسته‌بندی با وضعیت degraded ادامه یافت: %d ردیف منبع بعد از %d تلاش همچنان invalid/unresolved بود؛ Repair محصولات ادامه می‌یابد.', absint( $category_result['skipped'] ), $category_max );
+					if ( ! $this->save_manual_sync_state( $state ) ) { return $this->result( false, 'Checkpoint دسته‌بندی degraded ذخیره نشد.', $this->get_manual_sync_status() ); }
+					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 				}
+				$this->clear_transient_request_error( $state );
+				$state['categorySnapshotRetryCount'] = 0;
+				$state['categorySyncDegraded'] = false;
+				$state['categorySyncSkippedRows'] = 0;
+				$state['categorySyncUnresolved'] = array();
+				$state['categoryRetiredRows'] = absint( $category_result['retired'] ?? 0 );
 
-				update_option( 'mobo_core_categories_last_sync_at', time(), false );
+				Mobo_Core_Settings::update( 'mobo_core_categories_last_sync_at', time(), false );
 
 				$state['categorySynced'] = true;
 				$state['lastError']      = '';
@@ -859,6 +1359,9 @@ class Mobo_Core_Product_Sync {
 		if ( empty( $state['productQueue'] ) && '' === $state['currentProductGuid'] ) {
 			$use_product_cursor = Mobo_Core_Settings::enabled( 'mobo_core_product_cursor_sync_enabled', '1' ) && 'page-fallback' !== (string) $state['productCursorMode'];
 
+			/* Capture before the network request: an applied webhook during the HTTP
+			 * response must be treated as newer than this potentially stale page. */
+			$manual_snapshot_us = $this->current_wall_clock_us();
 			$response = $api->get_products_page(
 				absint( $state['productPage'] ),
 				$products_limit,
@@ -901,10 +1404,13 @@ class Mobo_Core_Product_Sync {
 
 				$next_cursor = $this->get_value( $response, 'nextCursor', null );
 				if ( $has_more && ( null === $next_cursor || '' === $next_cursor || absint( $next_cursor ) <= absint( $state['productCursor'] ) ) ) {
-					$error = new WP_Error( 'mobo_core_products_cursor_stalled', 'Product cursor did not advance while hasMore=true.' );
-					return $this->handle_transient_request_error( $state, $error, 'صفحه‌بندی محصولات MoboCore متوقف شد.' );
-				}
-				if ( null !== $next_cursor && '' !== $next_cursor ) {
+					/* Cursor semantics are optional optimization. A non-advancing cursor is
+					 * not allowed to deadlock Repair: fall back durably to page-number mode. */
+					$state['productCursorMode'] = 'page-fallback';
+					$state['productCursorSupported'] = false;
+					$state['productCursor'] = 0;
+					$state['lastMessage'] = 'Cursor محصولات جلو نرفت؛ ادامه همگام‌سازی به حالت page fallback منتقل شد.';
+				} elseif ( null !== $next_cursor && '' !== $next_cursor ) {
 					$state['productCursor'] = absint( $next_cursor );
 				}
 			} elseif ( $use_product_cursor ) {
@@ -921,8 +1427,6 @@ class Mobo_Core_Product_Sync {
 			 * after this fetch can never be overwritten when the item is processed
 			 * later. This protection is required for normal Full Sync as well as
 			 * Repair. */
-			$manual_snapshot_us = $this->current_wall_clock_us();
-
 			foreach ( $items as $product_data ) {
 				if ( is_array( $product_data ) ) {
 					$product_data['_moboManualSnapshotUs'] = $manual_snapshot_us;
@@ -1022,10 +1526,14 @@ class Mobo_Core_Product_Sync {
 			 * latency stays low; a second watermark check after lock acquisition closes
 			 * the race.
 			 */
-			if ( '' !== $product_guid && $manual_snapshot_us > 0 ) {
+			if ( '' !== $product_guid ) {
 				$last_webhook_us = $this->get_last_webhook_applied_us( $product_guid );
 
-				if ( $last_webhook_us > $manual_snapshot_us ) {
+				/* A legacy checkpoint without a snapshot time cannot safely be
+				 * blessed with the current clock. Always fetch an exact fresh parent
+				 * before applying it, even if no webhook watermark is currently stored. */
+				if ( $manual_snapshot_us <= 0 || $last_webhook_us > $manual_snapshot_us ) {
+					$manual_snapshot_us = $this->current_wall_clock_us();
 					$fresh_response = $api->get_product_by_guid( $product_guid, $state['syncId'] );
 
 					if ( is_wp_error( $fresh_response ) ) {
@@ -1077,7 +1585,6 @@ class Mobo_Core_Product_Sync {
 						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 					}
 
-					$manual_snapshot_us                    = $this->current_wall_clock_us();
 					$product_data['_moboManualSnapshotUs'] = $manual_snapshot_us;
 					if ( $this->is_repair_mode() ) {
 						$product_data['_moboRepairSnapshotUs'] = $manual_snapshot_us;
@@ -1110,6 +1617,21 @@ class Mobo_Core_Product_Sync {
 				$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 5, 180 );
 
 				if ( false === $product_lock ) {
+					if ( ! empty( $state['repairMode'] ) ) {
+						$lock_try = $this->repair_product_lock_miss( $state, 'parent-upsert', $product_guid );
+						if ( $lock_try >= 5 ) {
+							return $this->quarantine_repair_product_for_liveness( $state, 'parent-upsert', $product_guid, $this->find_product_id_by_guid( $product_guid ), false );
+						}
+						array_unshift( $state['productQueue'], $product_data );
+						$state['lastError'] = '';
+						$state['lastMessage'] = sprintf( 'Repair منتظر lock محصول است (%d/5): %s.', $lock_try, $product_guid );
+						$state['updatedAt'] = time();
+						if ( ! $this->save_manual_sync_state( $state ) ) {
+							return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+						}
+						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+					}
+
 					array_unshift( $state['productQueue'], $product_data );
 					$state['lastError']   = '';
 					$state['lastMessage'] = 'این محصول در مسیر دیگری در حال پردازش است؛ sync در مرحله بعدی دوباره تلاش می‌کند: ' . $product_guid;
@@ -1120,6 +1642,7 @@ class Mobo_Core_Product_Sync {
 
 					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 				}
+				$this->clear_repair_product_lock_miss( $state, 'parent-upsert', $product_guid );
 			}
 
 			try {
@@ -1173,6 +1696,13 @@ class Mobo_Core_Product_Sync {
 						Mobo_Core_Sync_Health::mark_behind( $product_guid, $product_id );
 					}
 				}
+			} catch ( Mobo_Core_Parent_Identity_Conflict $conflict ) {
+				/* Only definitive conflicts can be journalled. The product lock is
+				 * released by finally even when Repair checkpoints this conflict. */
+				if ( ! empty( $state['repairMode'] ) ) {
+					return $this->quarantine_repair_parent_conflict( $state, $conflict, $product_guid, 0 );
+				}
+				throw $conflict;
 			} finally {
 				if ( false !== $product_lock && class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
 					Mobo_Core_Product_Concurrency::release_product_lock( $product_lock );
@@ -1203,6 +1733,7 @@ class Mobo_Core_Product_Sync {
 			$state['currentProductSourceRevision']  = isset( $product_source_revision ) ? absint( $product_source_revision ) : 0;
 			$state['currentProductSourceVersion']   = isset( $product_source_version ) ? sanitize_text_field( (string) $product_source_version ) : '';
 			$state['currentProductSourceHash']      = isset( $product_source_hash ) ? sanitize_text_field( (string) $product_source_hash ) : '';
+			$state['currentProductSnapshotUs']     = absint( $manual_snapshot_us );
 			$state['currentProductImages']          = $this->get_product_images_from_payload( $product_data );
 			$state['currentProductImagesPresent']   = $this->product_images_field_present( $product_data );
 			$state['currentProductAttributes']      = is_array( $desired_attributes ) ? $desired_attributes : array();
@@ -1216,6 +1747,7 @@ class Mobo_Core_Product_Sync {
 			$state['currentVariantTotalPages']      = 0;
 			$state['currentVariantProcessedPages']  = 0;
 			$state['currentVariantCursor']          = 0;
+			$state['currentVariantCursorDisabled']  = false;
 			$state['lastError']                     = '';
 			$state['lastMessage']                   = $this->last_parent_core_noop
 				? 'محصول اصلی بدون تغییر بود و ذخیره مجدد نشد: ' . $product_guid
@@ -1234,6 +1766,13 @@ class Mobo_Core_Product_Sync {
 			}
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		/* UX55: Do not continue images/variant topology from a parent snapshot that
+		 * lost to an applied foreground webhook after Step 3's parent lock. */
+		$rebase = $this->rebase_current_product_if_webhook_advanced( $state, $api );
+		if ( null !== $rebase ) {
+			return $rebase;
 		}
 
 		/*
@@ -1337,12 +1876,29 @@ class Mobo_Core_Product_Sync {
 					$simple_snapshot,
 					isset( $state['currentProductAttributes'] ) && is_array( $state['currentProductAttributes'] )
 						? $state['currentProductAttributes']
-						: array()
+						: array(),
+					absint( $state['currentProductSnapshotUs'] ?? 0 )
 				);
 
 				if ( is_wp_error( $simple_variant ) ) {
+					if ( 'mobo_core_manual_snapshot_superseded' === $simple_variant->get_error_code() ) {
+						return $this->rebase_current_product_if_webhook_advanced( $state, $api, true );
+					}
+					if ( ! empty( $state['repairMode'] ) && 'mobo_core_manual_simple_product_lock_busy' === $simple_variant->get_error_code() ) {
+						$lock_try = $this->repair_product_lock_miss( $state, 'simple-commit', $product_guid );
+						if ( $lock_try >= 5 ) {
+							return $this->quarantine_repair_product_for_liveness( $state, 'simple-commit', $product_guid, $product_id, true );
+						}
+						$state['lastError'] = '';
+						$state['lastMessage'] = sprintf( 'Repair منتظر lock محصول ساده است (%d/5): %s.', $lock_try, $product_guid );
+						if ( ! $this->save_manual_sync_state( $state ) ) {
+							return $this->result( false, 'Checkpoint انتظار lock محصول ساده ذخیره نشد.', $this->get_manual_sync_status() );
+						}
+						return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+					}
 					return $this->handle_transient_request_error( $state, $simple_variant, 'محصول ساده برای commit امن منتظر lock/revalidation والد است.' );
 				}
+				$this->clear_repair_product_lock_miss( $state, 'simple-commit', $product_guid );
 
 				$message = ! empty( $simple_variant['success'] )
 					? 'محصول ساده و شناسه قابل خرید آن با موفقیت همگام شد.'
@@ -1356,6 +1912,7 @@ class Mobo_Core_Product_Sync {
 			if ( ! $this->finish_current_product_state( $state, $message ) ) {
 				return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_product_map_finalize_failed', 'Product Map final checkpoint was not durably stored.' ), 'ثبت نهایی Product Map محصول ناموفق بود.' );
 			}
+			$this->clear_transient_request_error( $state );
 
 			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 		}
@@ -1365,7 +1922,7 @@ class Mobo_Core_Product_Sync {
 		 */
 		$product_guid = sanitize_text_field( (string) $state['currentProductGuid'] );
 
-		$use_variant_cursor = Mobo_Core_Settings::enabled( 'mobo_core_variant_cursor_sync_enabled', '1' );
+		$use_variant_cursor = Mobo_Core_Settings::enabled( 'mobo_core_variant_cursor_sync_enabled', '1' ) && empty( $state['currentVariantCursorDisabled'] );
 		$variant_cursor     = max( 0, absint( $state['currentVariantCursor'] ?? 0 ) );
 
 		$response = $api->get_variants_page(
@@ -1390,7 +1947,6 @@ class Mobo_Core_Product_Sync {
 			return $this->handle_transient_request_error( $state, $variant_has_more_result, 'صفحه‌بندی تنوع‌های MoboCore نامعتبر بود.' );
 		}
 		$variant_has_more = (bool) $variant_has_more_result;
-		$this->clear_transient_request_error( $state );
 
 		$variant_items_count = count( $variant_items );
 		$variant_total_count = absint( $this->get_value( $response, 'totalCount', 0 ) );
@@ -1423,8 +1979,10 @@ class Mobo_Core_Product_Sync {
 		$variant_cursor_mode = sanitize_key( (string) $this->get_value( $response, 'cursorMode', '' ) );
 		$variant_next_cursor = $this->get_value( $response, 'nextCursor', null );
 		if ( '' !== $variant_cursor_mode && $variant_has_more && ( null === $variant_next_cursor || '' === $variant_next_cursor || absint( $variant_next_cursor ) <= $variant_cursor ) ) {
-			$error = new WP_Error( 'mobo_core_variants_cursor_stalled', 'Variant cursor did not advance while hasMore=true.' );
-			return $this->handle_transient_request_error( $state, $error, 'صفحه‌بندی تنوع‌های MoboCore متوقف شد.' );
+			$state['currentVariantCursorDisabled'] = true;
+			$state['currentVariantCursor'] = 0;
+			$state['lastMessage'] = 'Cursor تنوع‌ها جلو نرفت؛ ادامه این محصول به page fallback منتقل شد.';
+			$variant_next_cursor = null;
 		}
 		/* Do not checkpoint nextCursor until this fetched page is durably applied.
 		 * Otherwise a failed page can be skipped after retry/upgrade. */
@@ -1445,10 +2003,51 @@ class Mobo_Core_Product_Sync {
 			'isLastPage'    => ! $variant_has_more,
 			'attributes'    => is_array( $state['currentProductAttributes'] ) ? $state['currentProductAttributes'] : array(),
 			'attributeOrderSignificant' => false,
+			'_moboManualParentSnapshotUs' => absint( $state['currentProductSnapshotUs'] ?? 0 ),
 			'data'          => $variant_items,
 		);
 
-		$result = $this->process_update_variant_payload( $payload, true );
+		try {
+			$result = $this->process_update_variant_payload( $payload, true );
+		} catch ( Mobo_Core_Variation_Parent_Conflict $conflict ) {
+			/* Existing typed variation-parent conflict remains fail-closed. */
+			if ( ! empty( $state['repairMode'] ) ) {
+				return $this->quarantine_repair_parent_conflict( $state, $conflict, $product_guid, $product_id );
+			}
+			throw $conflict;
+		} catch ( Mobo_Core_Parent_Identity_Conflict $conflict ) {
+			/* The parent fence also protects variant-page entrypoints. */
+			if ( ! empty( $state['repairMode'] ) ) {
+				return $this->quarantine_repair_parent_conflict( $state, $conflict, $product_guid, $product_id );
+			}
+			throw $conflict;
+		}
+
+		$variant_wait = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+		if ( ! empty( $variant_wait['manualSnapshotStale'] ) ) {
+			return $this->rebase_current_product_if_webhook_advanced( $state, $api, true );
+		}
+		if ( ! empty( $variant_wait['waitingForProduct'] ) ) {
+			$waiting_reason = sanitize_key( (string) ( $variant_wait['waitingReason'] ?? '' ) );
+			if ( ! empty( $state['repairMode'] ) && 'product_lock_busy' === $waiting_reason ) {
+				$lock_try = $this->repair_product_lock_miss( $state, 'variant-page', $product_guid );
+				if ( $lock_try >= 5 ) {
+					return $this->quarantine_repair_product_for_liveness( $state, 'variant-page', $product_guid, $product_id, true );
+				}
+				$state['lastError'] = '';
+				$state['lastMessage'] = sprintf( 'Repair منتظر lock صفحه Variant است (%d/5): %s.', $lock_try, $product_guid );
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint انتظار lock Variant ذخیره نشد.', $this->get_manual_sync_status() );
+				}
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+			}
+			return $this->handle_transient_request_error(
+				$state,
+				new WP_Error( 'mobo_core_manual_variant_waiting_for_product', isset( $result['message'] ) ? (string) $result['message'] : 'Variant page is waiting for the shared product lock.' ),
+				'صفحه Variant برای lock محصول منتظر می‌ماند.'
+			);
+		}
+		$this->clear_repair_product_lock_miss( $state, 'variant-page', $product_guid );
 
 		if ( empty( $result['success'] ) ) {
 			$state['lastError']   = isset( $result['message'] ) ? $result['message'] : 'خطا در پردازش تنوع محصول.';
@@ -1484,6 +2083,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( $variant_has_more ) {
+			$this->clear_transient_request_error( $state );
 			$state['variantPage'] = absint( $state['variantPage'] ) + 1;
 			$state['lastError']   = '';
 			$state['lastMessage'] = $result['message'];
@@ -1498,6 +2098,7 @@ class Mobo_Core_Product_Sync {
 		if ( ! $this->finish_current_product_state( $state, $result['message'] ) ) {
 			return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_product_map_finalize_failed', 'Product Map final checkpoint was not durably stored.' ), 'ثبت نهایی Product Map محصول ناموفق بود.' );
 		}
+		$this->clear_transient_request_error( $state );
 
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
@@ -1576,6 +2177,90 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * Rebase an in-flight Manual/Repair product when a foreground webhook wins.
+	 * Never finalize an old product state or reuse its old variation seen-set.
+	 * An exact product GET starts from a conservative pre-request time fence.
+	 * Returns null if the accepted parent snapshot is still safe to continue.
+	 */
+	private function rebase_current_product_if_webhook_advanced( &$state, $api, $force = false ) {
+		$product_guid = sanitize_text_field( (string) ( $state['currentProductGuid'] ?? '' ) );
+		if ( '' === $product_guid ) {
+			return null;
+		}
+		$parent_snapshot_us = absint( $state['currentProductSnapshotUs'] ?? 0 );
+		$latest_webhook_us = $this->get_last_webhook_applied_us( $product_guid );
+		if ( ! $force && ( 0 === $latest_webhook_us || $latest_webhook_us <= $parent_snapshot_us ) ) {
+			return null;
+		}
+
+		/* Do not advance the catalogue cursor or mark a stale parent complete if
+		 * Portal is temporarily unavailable. Preserve the current checkpoint. */
+		$fresh_snapshot_us = $this->current_wall_clock_us();
+		$fresh_response = $api->get_product_by_guid( $product_guid, $state['syncId'] );
+		if ( is_wp_error( $fresh_response ) ) {
+			return $this->handle_transient_request_error( $state, $fresh_response, 'Snapshot والد پس از Webhook تازه باید دوباره دریافت شود.' );
+		}
+		$fresh_items = $this->extract_explicit_list_data( $fresh_response, 'manual current product rebase' );
+		if ( is_wp_error( $fresh_items ) ) {
+			return $this->handle_transient_request_error( $state, $fresh_items, 'Snapshot تازه والد معتبر نبود؛ مراحل قبلی ادامه نیافت.' );
+		}
+		$fresh_product = null;
+		foreach ( $fresh_items as $candidate ) {
+			if ( is_array( $candidate ) && $product_guid === $this->extract_product_guid( $candidate ) ) {
+				$fresh_product = $candidate;
+				break;
+			}
+		}
+		if ( ! is_array( $fresh_product ) ) {
+			return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_manual_rebase_product_missing', 'The exact replacement parent is not available.' ), 'تا دریافت Snapshot معتبر والد، مراحل تصاویر و Variant اجرا نمی‌شوند.' );
+		}
+		$fresh_product['_moboManualSnapshotUs'] = $fresh_snapshot_us;
+		if ( ! empty( $state['repairMode'] ) ) {
+			$fresh_product['_moboRepairSnapshotUs'] = $fresh_snapshot_us;
+		}
+
+		/* Product is still incomplete until the refreshed Parent+Variant stages
+		 * reach their normal durable completion boundary. */
+		$product_id = absint( $state['currentProductId'] ?? 0 );
+		if ( $product_id > 0 && ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' )
+			|| ! $this->upsert_product_map( $product_guid, $product_id, true ) ) ) {
+			return $this->result( false, 'Could not checkpoint the superseded parent before rebase.', $this->get_manual_sync_status() );
+		}
+		array_unshift( $state['productQueue'], $fresh_product );
+		$state['currentProductGuid'] = '';
+		$state['currentProductId'] = 0;
+		$state['currentProductPortalId'] = 0;
+		$state['currentProductSourceRevision'] = 0;
+		$state['currentProductSourceVersion'] = '';
+		$state['currentProductSourceHash'] = '';
+		$state['currentProductSnapshotUs'] = 0;
+		$state['currentProductImages'] = array();
+		$state['currentProductImagesPresent'] = false;
+		$state['currentProductAttributes'] = array();
+		$state['currentProductImageOffset'] = 0;
+		$state['currentProductWasExisting'] = false;
+		$state['currentProductImagesDone'] = false;
+		$state['currentProductCanHaveVariants'] = false;
+		$state['variantPage'] = 1;
+		$state['currentVariantTotalCount'] = 0;
+		$state['currentVariantTotalPages'] = 0;
+		$state['currentVariantProcessedPages'] = 0;
+		$state['currentVariantCursor'] = 0;
+		$state['currentVariantCursorDisabled'] = false;
+		$state['lastError'] = '';
+		$state['lastMessage'] = 'Webhook newer than the parent snapshot: restarted this product from an exact fresh snapshot.';
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Could not persist the superseded-parent rebase checkpoint.', $this->get_manual_sync_status() );
+		}
+		/* A rebase is a correctness boundary; force any request-local checkpoint
+		 * coalescer to flush now so the old current product cannot replay on crash. */
+		if ( $this->checkpoint_coalescing && ! $this->flush_manual_sync_checkpoint() ) {
+			return $this->result( false, 'Could not flush the superseded-parent rebase checkpoint.', $this->get_manual_sync_status() );
+		}
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+	}
+
+	/**
 	 * Current wall-clock timestamp in microseconds for local ordering guards.
 	 *
 	 * @return int
@@ -1635,7 +2320,7 @@ class Mobo_Core_Product_Sync {
 	 * @return int
 	 */
 	public static function get_repair_completed_at() {
-		return absint( get_option( self::REPAIR_COMPLETED_OPTION, 0 ) );
+		return absint( Mobo_Core_Settings::get( self::REPAIR_COMPLETED_OPTION, 0 ) );
 	}
 
 	/**
@@ -1908,6 +2593,17 @@ class Mobo_Core_Product_Sync {
 		if ( $existing_product_id > 0 && '' !== $source_version ) {
 			$seen_version = sanitize_text_field( (string) get_post_meta( $existing_product_id, '_mobo_product_seen_event_version', true ) );
 			$version_cmp  = $this->compare_source_versions( $source_version, $seen_version );
+			if ( '' !== $seen_version && null === $version_cmp && $source_version !== $seen_version ) {
+				return $this->result( false, 'ProductUpdated ordering watermark is not comparable with the durable product watermark; mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $existing_product_id, 'sourceVersion' => $source_version, 'orderingConflict' => true, 'nonRetryable' => true ) );
+			}
+			if ( 0 === $version_cmp ) {
+				$incoming_source_hash = $this->build_product_source_hash( $product_data, $product_guid );
+				$stored_source_hash   = sanitize_text_field( (string) get_post_meta( $existing_product_id, '_mobo_product_source_hash', true ) );
+				$applied_version      = sanitize_text_field( (string) get_post_meta( $existing_product_id, '_mobo_product_applied_event_version', true ) );
+				if ( '' !== $incoming_source_hash && '' !== $stored_source_hash && $applied_version === $source_version && ! hash_equals( $stored_source_hash, $incoming_source_hash ) ) {
+					return $this->result( false, 'Equal-version ProductUpdated payload conflicts with the durable applied source hash; mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $existing_product_id, 'sourceVersion' => $source_version, 'orderingConflict' => true, 'nonRetryable' => true ) );
+				}
+			}
 			if ( -1 === $version_cmp ) {
 				$product_index++;
 				$payload['_moboProductIndex'] = $product_index;
@@ -2048,13 +2744,38 @@ class Mobo_Core_Product_Sync {
 		$should_probe_simple_topology = ! $payload_can_have_variants || $current_product_for_topology instanceof WC_Product_Simple;
 
 		if ( $should_probe_simple_topology ) {
-			$api             = new Mobo_Core_API_Client();
-			$simple_snapshot = $this->fetch_simple_product_variant_snapshot_from_api(
-				$api,
-				$product_guid,
-				$product_id,
-				'product-updated-' . gmdate( 'YmdHis' )
-			);
+			$api = new Mobo_Core_API_Client();
+
+			/* PERF09: Portal already exposes a lightweight count endpoint. When the
+			 * ProductUpdated payload itself contains variation-capable attributes and
+			 * the local parent is still Simple, a count > 1 is sufficient to prove that
+			 * selecting one purchasable Variant for the Simple parent would be unsafe.
+			 * This is deliberately one-way/non-destructive: count 0/1, malformed data or
+			 * any endpoint failure falls back to the full authoritative Variant snapshot. */
+			$simple_snapshot = null;
+			if ( $payload_can_have_variants
+				&& $current_product_for_topology instanceof WC_Product_Simple
+				&& method_exists( $api, 'get_variants_count' )
+			) {
+				$variant_count = $api->get_variants_count( $product_guid );
+				if ( ! is_wp_error( $variant_count ) && absint( $variant_count ) > 1 ) {
+					$simple_snapshot = array(
+						'mode'         => 'variable_handoff',
+						'totalCount'   => absint( $variant_count ),
+						'countFastPath'=> true,
+						'message'      => 'Variant count proves multi-Variant topology; full Simple lookup was skipped.',
+					);
+				}
+			}
+
+			if ( ! is_array( $simple_snapshot ) ) {
+				$simple_snapshot = $this->fetch_simple_product_variant_snapshot_from_api(
+					$api,
+					$product_guid,
+					$product_id,
+					'product-updated-' . gmdate( 'YmdHis' )
+				);
+			}
 
 			if ( is_wp_error( $simple_snapshot ) ) {
 				$probe_error_code = sanitize_key( (string) $simple_snapshot->get_error_code() );
@@ -2341,6 +3062,13 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, 'Invalid parent product.' );
 		}
 
+		/* Under the shared product lock, reject a Manual/Repair variant page if
+		 * the foreground webhook already committed a newer parent generation. */
+		if ( array_key_exists( '_moboManualParentSnapshotUs', $payload )
+			&& absint( get_post_meta( $product_id, '_mobo_last_webhook_applied_us', true ) ) > absint( $payload['_moboManualParentSnapshotUs'] ) ) {
+			return $this->result( false, 'Manual variant page was superseded by a foreground webhook.', array( 'manualSnapshotStale' => true, 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+		}
+
 		$variant_list_authoritative = $this->is_authoritative_variant_list_payload( $payload, $variants );
 		$source_version             = $this->extract_source_version( $payload, $payload );
 		$source_revision            = $this->extract_source_revision( $payload, $payload );
@@ -2368,6 +3096,9 @@ class Mobo_Core_Product_Sync {
 			$seen_event_version = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_seen_event_version', true ) );
 			$seen_revision      = absint( get_post_meta( $product_id, '_mobo_variant_seen_revision', true ) );
 			$version_cmp        = '' !== $source_version ? $this->compare_source_versions( $source_version, $seen_event_version ) : null;
+			if ( '' !== $source_version && '' !== $seen_event_version && null === $version_cmp && $source_version !== $seen_event_version ) {
+				return $this->result( false, 'Authoritative UpdateVariant ordering watermark is not comparable with the durable variant watermark; topology mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceVersion' => $source_version, 'orderingConflict' => true, 'nonRetryable' => true ) );
+			}
 			if ( '' !== $source_version && -1 === $version_cmp ) {
 				return $this->result( true, 'Stale authoritative UpdateVariant event version skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'sourceVersion' => $source_version, 'staleSkipped' => true ) );
 			}
@@ -2439,6 +3170,9 @@ class Mobo_Core_Product_Sync {
 				$simple_seen_version  = sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_variant_seen_event_version', true ) );
 				$simple_seen_revision = absint( get_post_meta( $product_id, '_mobo_variant_seen_revision', true ) );
 				$simple_version_cmp   = '' !== $source_version ? $this->compare_source_versions( $source_version, $simple_seen_version ) : null;
+				if ( '' !== $source_version && '' !== $simple_seen_version && null === $simple_version_cmp && $source_version !== $simple_seen_version ) {
+					return $this->result( false, 'Simple UpdateVariant ordering watermark is not comparable with the durable variant watermark; mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceVersion' => $source_version, 'orderingConflict' => true, 'nonRetryable' => true ) );
+				}
 				if ( '' !== $source_version && -1 === $simple_version_cmp ) {
 					return $this->result( true, 'Stale simple UpdateVariant event version skipped.', array( 'deleteFile' => true, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceRevision' => $source_revision, 'sourceVersion' => $source_version, 'staleSkipped' => true ) );
 				}
@@ -2615,6 +3349,9 @@ class Mobo_Core_Product_Sync {
 					$variation_seen_version  = sanitize_text_field( (string) get_post_meta( $existing_variation_id, '_mobo_variant_seen_event_version', true ) );
 					$variation_seen_revision = absint( get_post_meta( $existing_variation_id, '_mobo_variant_seen_revision', true ) );
 					$variation_version_cmp   = '' !== $source_version ? $this->compare_source_versions( $source_version, $variation_seen_version ) : null;
+					if ( '' !== $source_version && '' !== $variation_seen_version && null === $variation_version_cmp && $source_version !== $variation_seen_version ) {
+						return $this->result( false, 'Variation ordering watermark is not comparable with the durable variation watermark; mutation was blocked.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'productId' => $product_id, 'sourceVersion' => $source_version, 'orderingConflict' => true, 'nonRetryable' => true ) );
+					}
 					if ( ( '' !== $source_version && -1 === $variation_version_cmp ) || ( $source_revision > 0 && $variation_seen_revision > $source_revision ) ) {
 						$stale_skipped++;
 						$unchanged++;
@@ -2630,11 +3367,16 @@ class Mobo_Core_Product_Sync {
 			}
 
 
-			$variation_result = $this->upsert_variation( $product, $variant_data );
+			$variation_result = $this->upsert_variation( $product, $variant_data, $product_guid );
 			$variation_id     = is_array( $variation_result ) && isset( $variation_result['id'] ) ? absint( $variation_result['id'] ) : absint( $variation_result );
 
 			if ( $variation_id > 0 ) {
 				$variant_guid = $this->extract_variant_guid( $variant_data );
+				$authoritative_attrs = $this->normalize_variation_attributes( $this->get_value( $variant_data, 'attributes', array() ) );
+				if ( ! empty( $authoritative_attrs ) && ! $this->persist_variation_attributes_exact( $variation_id, $authoritative_attrs ) ) {
+					$this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '1' );
+					return $this->result( false, 'Exact variation storefront attributes could not be durably converged after mutation.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
+				}
 
 				/* Every successful child mutation, including authoritative snapshots, must
 				 * persist the child watermark. Otherwise a late pre-snapshot delta can pass
@@ -2869,6 +3611,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$api      = new Mobo_Core_API_Client();
+		$category_snapshot_started_us = (int) floor( microtime( true ) * 1000000 );
 		$response = $api->get_categories( $sync_id );
 
 		if ( is_wp_error( $response ) ) {
@@ -2887,7 +3630,7 @@ class Mobo_Core_Product_Sync {
 			return $this->result( false, $categories->get_error_message(), array( 'skipped' => false, 'synced' => false ) );
 		}
 
-		$category_result = $this->category_sync->load_categories_for_mapping_payload( $categories );
+		$category_result = $this->category_sync->load_categories_for_mapping_payload( $categories, $category_snapshot_started_us );
 
 		if ( empty( $category_result['complete'] ) || absint( $category_result['skipped'] ) > 0 ) {
 			return $this->result(
@@ -2899,12 +3642,13 @@ class Mobo_Core_Product_Sync {
 					'mappingOnly'  => true,
 					'created'      => absint( $category_result['created'] ),
 					'updated'      => absint( $category_result['updated'] ),
+					'active'       => absint( $category_result['active'] ?? 0 ),
 					'skippedItems' => absint( $category_result['skipped'] ),
 				)
 			);
 		}
 
-		update_option( 'mobo_core_categories_mapping_loaded_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_categories_mapping_loaded_at', time(), false );
 
 		return $this->result(
 			true,
@@ -2915,6 +3659,7 @@ class Mobo_Core_Product_Sync {
 				'mappingOnly'  => true,
 				'created'      => absint( $category_result['created'] ),
 				'updated'      => absint( $category_result['updated'] ),
+				'active'       => absint( $category_result['active'] ?? 0 ),
 				'skippedItems' => absint( $category_result['skipped'] ),
 			)
 		);
@@ -2950,9 +3695,9 @@ class Mobo_Core_Product_Sync {
 			$sync_id = 'category-refresh-' . gmdate( 'YmdHis' );
 		}
 
-		$last_sync_at = absint( get_option( 'mobo_core_categories_last_sync_at', 0 ) );
+		$last_sync_at = absint( Mobo_Core_Settings::get( 'mobo_core_categories_last_sync_at', 0 ) );
 
-		$interval_hours = absint( get_option( 'mobo_core_categories_refresh_interval_hours', 12 ) );
+		$interval_hours = absint( Mobo_Core_Settings::get( 'mobo_core_categories_refresh_interval_hours', 12 ) );
 
 		if ( $interval_hours <= 0 ) {
 			$interval_hours = 12;
@@ -2978,6 +3723,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$api      = new Mobo_Core_API_Client();
+		$category_snapshot_started_us = (int) floor( microtime( true ) * 1000000 );
 		$response = $api->get_categories( $sync_id );
 
 		if ( is_wp_error( $response ) ) {
@@ -2996,7 +3742,7 @@ class Mobo_Core_Product_Sync {
 		if ( is_wp_error( $categories ) ) {
 			return $this->result( false, $categories->get_error_message(), array( 'skipped' => false, 'synced' => false, 'forced' => (bool) $force ) );
 		}
-		$category_result = $this->category_sync->sync_categories_payload( $categories );
+		$category_result = $this->category_sync->sync_categories_payload( $categories, $category_snapshot_started_us );
 
 		if ( empty( $category_result['complete'] ) || absint( $category_result['skipped'] ) > 0 ) {
 			return $this->result(
@@ -3015,7 +3761,7 @@ class Mobo_Core_Product_Sync {
 			);
 		}
 
-		update_option( 'mobo_core_categories_last_sync_at', $now, false );
+		Mobo_Core_Settings::update( 'mobo_core_categories_last_sync_at', $now, false );
 
 		return $this->result(
 			true,
@@ -3149,6 +3895,357 @@ class Mobo_Core_Product_Sync {
 		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
 
+	/**
+	 * Build the next bounded targeted-convergence window from a fresh owner-ignored
+	 * Health view. Successful GUIDs disappear from the unowned view and are dropped
+	 * from the attempted ledger; unresolved GUIDs stay carried but are never retried
+	 * inside the same generation. The unresolved count is capped so a permanently
+	 * missing upstream set cannot grow durable state or loop forever.
+	 *
+	 * @param array $post_rows Fresh unowned rows.
+	 * @param array $attempted Previously attempted GUIDs.
+	 * @param int   $unresolved_attempts Durable skipped/unresolved count.
+	 * @return array
+	 */
+	private function build_targeted_convergence_window( $post_rows, $attempted, $unresolved_attempts ) {
+		$post_rows = is_array( $post_rows ) ? $post_rows : array();
+		$attempted = is_array( $attempted ) ? array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $attempted ) ) ) ) : array();
+		$attempted_index = array_fill_keys( $attempted, true );
+		$post_unowned_guids = array();
+		$new_targets = array();
+
+		foreach ( $post_rows as $post_row ) {
+			if ( ! is_array( $post_row ) ) { continue; }
+			$post_guid = sanitize_text_field( (string) ( $post_row['productGuid'] ?? '' ) );
+			$post_wp_id = absint( $post_row['wpProductId'] ?? ( $post_row['wpId'] ?? 0 ) );
+			if ( '' === $post_guid || $post_wp_id <= 0 ) { continue; }
+			$post_unowned_guids[ $post_guid ] = true;
+			if ( isset( $attempted_index[ $post_guid ] ) ) { continue; }
+			$new_targets[] = array(
+				'productGuid'        => $post_guid,
+				'wpProductId'        => $post_wp_id,
+				'postIncomplete'     => ! empty( $post_row['postIncomplete'] ),
+				'mapIncomplete'      => ! empty( $post_row['mapIncomplete'] ),
+				'localStructureSane' => array_key_exists( 'localStructureSane', $post_row ) ? (bool) $post_row['localStructureSane'] : true,
+			);
+		}
+
+		$carry_attempted = array();
+		foreach ( $attempted as $attempted_guid ) {
+			if ( isset( $post_unowned_guids[ $attempted_guid ] ) ) {
+				$carry_attempted[] = $attempted_guid;
+			}
+		}
+		$carry_attempted = array_slice(
+			array_values( array_unique( $carry_attempted ) ),
+			-self::TARGETED_CONVERGENCE_UNRESOLVED_LIMIT
+		);
+
+		$next_window = array();
+		if ( absint( $unresolved_attempts ) < self::TARGETED_CONVERGENCE_UNRESOLVED_LIMIT && ! empty( $new_targets ) ) {
+			$next_window = array_slice( $new_targets, 0, self::TARGETED_CONVERGENCE_WINDOW );
+		}
+
+		return array(
+			'nextWindow'      => $next_window,
+			'carryAttempted'  => $carry_attempted,
+			'availableFresh'  => count( $new_targets ),
+			'unresolvedBound' => absint( $unresolved_attempts ) >= self::TARGETED_CONVERGENCE_UNRESOLVED_LIMIT,
+		);
+	}
+
+	/**
+	 * Exact-fetch one existing local product that Operational Health classifies as
+	 * an unowned convergence gap. This is a Repair-only bridge for catalogue-policy
+	 * omissions such as OnlyInStock. It never discovers/imports a new product.
+	 *
+	 * Returning null means an exact snapshot was queued and the caller should fall
+	 * through to the normal product mutation stages in the same step.
+	 *
+	 * @param array                $state Durable Repair state (by reference).
+	 * @param Mobo_Core_API_Client $api API client.
+	 * @return array|null
+	 */
+	private function run_convergence_gap_recovery_step( &$state, $api ) {
+		if ( ! class_exists( 'Mobo_Core_Sync_Health' ) || ! method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ) {
+			$state['convergenceRecoveryComplete']   = true;
+			$state['convergenceRecoveryUnresolved'] = 0;
+			$state['lastMessage'] = 'Exact convergence recovery skipped because Operational Health is unavailable.';
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint exact convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		$targeted_only = ! empty( $state['targetedConvergenceOnly'] );
+		$operational = array();
+		if ( $targeted_only ) {
+			/* The target set was frozen before this generation became the recovery owner.
+			 * Do not re-read the operational dashboard here: Health correctly classifies
+			 * these GUIDs as active-owned while this state is running, so using that view
+			 * as the worker input would make the worker hide its own work. */
+			$rows = isset( $state['targetedConvergenceTargets'] ) && is_array( $state['targetedConvergenceTargets'] )
+				? $state['targetedConvergenceTargets']
+				: array();
+		} else {
+			/* Force a fresh targeted classification at this mutation boundary. The admin
+			 * dashboard cache is intentionally long-lived and must not cause a just-healed
+			 * GUID to be selected again or keep the unresolved count stale. */
+			if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_sync_health_snapshot' ) ) {
+				Mobo_Core_Health_Read_Cache::refresh_sync_health_snapshot( 500 );
+			}
+			$dashboard = Mobo_Core_Sync_Health::get_operational_dashboard_status( 500, false );
+			if ( ! is_array( $dashboard ) || 'unavailable' === sanitize_key( (string) ( $dashboard['operationalStatus'] ?? '' ) ) ) {
+				return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_convergence_recovery_health_unavailable', 'Operational Health could not classify exact convergence recovery candidates.' ), 'Exact convergence recovery منتظر وضعیت پایدار Health است.' );
+			}
+			$operational = isset( $dashboard['operational'] ) && is_array( $dashboard['operational'] ) ? $dashboard['operational'] : array();
+			$rows = isset( $dashboard['unownedRows'] ) && is_array( $dashboard['unownedRows'] ) ? $dashboard['unownedRows'] : array();
+		}
+		$attempted = isset( $state['convergenceRecoveryAttempted'] ) && is_array( $state['convergenceRecoveryAttempted'] )
+			? array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $state['convergenceRecoveryAttempted'] ) ) ) )
+			: array();
+		$attempted_index = array_fill_keys( $attempted, true );
+		$candidate = null;
+		$cursor = $targeted_only ? min( count( $rows ), absint( $state['convergenceRecoveryCursor'] ?? 0 ) ) : 0;
+		$row_count = count( $rows );
+		for ( $row_index = $cursor; $row_index < $row_count; $row_index++ ) {
+			$row = $rows[ $row_index ];
+			if ( ! is_array( $row ) ) {
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = $row_index + 1; }
+				continue;
+			}
+			$guid = sanitize_text_field( (string) ( $row['productGuid'] ?? '' ) );
+			$wp_id = absint( $row['wpProductId'] ?? 0 );
+			if ( '' === $guid || $wp_id <= 0 ) {
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = $row_index + 1; }
+				continue;
+			}
+			if ( in_array( $guid, (array) ( $state['repairParentConflictGuids'] ?? array() ), true ) ) {
+				/* A hard parent identity conflict is not a retryable convergence gap
+				 * during the same Repair generation. Never loop over the same GUID. */
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = $row_index + 1; }
+				continue;
+			}
+			if ( isset( $attempted_index[ $guid ] ) ) {
+				/* Older states may predate the durable targeted cursor. Fast-forward over
+				 * already-finalized GUIDs without counting or reprocessing them. */
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = $row_index + 1; }
+				continue;
+			}
+			/* Never create a new product in this phase. The canonical live map row and the
+			 * local Woo object must still resolve to the identity classified by Health. */
+			$product = function_exists( 'wc_get_product' ) ? wc_get_product( $wp_id ) : false;
+			if ( ! $product instanceof WC_Product || 'trash' === get_post_status( $wp_id ) ) {
+				$state['convergenceRecoveryAttempted'][] = $guid;
+				$attempted_index[ $guid ] = true;
+				$state['convergenceRecoverySkipped'] = absint( $state['convergenceRecoverySkipped'] ?? 0 ) + 1;
+				$state['convergenceRecoveryScanned'] = absint( $state['convergenceRecoveryScanned'] ?? 0 ) + 1;
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = $row_index + 1; }
+				continue;
+			}
+			$candidate = array(
+				'guid'  => $guid,
+				'wpId'  => $wp_id,
+				'row'   => $row,
+				'index' => $row_index,
+			);
+			break;
+		}
+		if ( ! is_array( $candidate ) ) {
+			/* A targeted post-upgrade generation freezes its initial target set so an
+			 * outage cannot lose ownership. That set is not necessarily the final set:
+			 * reconnects/newer source boundaries can invalidate old terminal evidence
+			 * while this generation is running. Before releasing the owner, classify
+			 * current state again while explicitly ignoring this generation's own
+			 * ownership. Adopt newly-unowned GUIDs into the same durable generation. */
+			if ( $targeted_only ) {
+				if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_sync_health_snapshot' ) ) {
+					Mobo_Core_Health_Read_Cache::refresh_sync_health_snapshot( self::TARGETED_CONVERGENCE_RECLASSIFY_LIMIT );
+				}
+				$post_dashboard = Mobo_Core_Sync_Health::get_operational_dashboard_status( self::TARGETED_CONVERGENCE_RECLASSIFY_LIMIT, false, true );
+				if ( ! is_array( $post_dashboard ) || 'unavailable' === sanitize_key( (string) ( $post_dashboard['operationalStatus'] ?? '' ) ) ) {
+					return $this->handle_transient_request_error( $state, new WP_Error( 'mobo_core_targeted_convergence_final_health_unavailable', 'Operational Health could not reclassify the targeted generation at completion.' ), 'Exact convergence recovery منتظر reclassification نهایی Health است.' );
+				}
+
+				$post_rows = isset( $post_dashboard['unownedRows'] ) && is_array( $post_dashboard['unownedRows'] )
+					? $post_dashboard['unownedRows']
+					: array();
+				$window_plan = $this->build_targeted_convergence_window(
+					$post_rows,
+					$attempted,
+					absint( $state['convergenceRecoverySkipped'] ?? 0 )
+				);
+				$state['convergenceRecoveryAttempted'] = $window_plan['carryAttempted'];
+
+				if ( ! empty( $window_plan['nextWindow'] ) ) {
+					$next_window = $window_plan['nextWindow'];
+					$state['targetedConvergenceTargets'] = $next_window;
+					$state['convergenceRecoveryCursor'] = 0;
+					$state['convergenceRecoveryComplete'] = false;
+					$state['convergenceRecoveryUnresolved'] = 0;
+					$state['lastError'] = '';
+					$state['lastMessage'] = sprintf(
+						'Exact convergence recovery advanced to the next bounded window: %d target(s), %d actionable gap(s) currently owned.',
+						count( $next_window ),
+						absint( $post_dashboard['operational']['unownedConvergenceGap'] ?? count( $post_rows ) )
+					);
+					if ( ! $this->save_manual_sync_state( $state ) ) {
+						return $this->result( false, 'Checkpoint expanded targeted convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+					}
+					return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+				}
+
+				$remaining = absint( $post_dashboard['operational']['unownedConvergenceGap'] ?? count( $post_rows ) );
+			} else {
+				$remaining = absint( $operational['unownedConvergenceGap'] ?? 0 );
+			}
+
+			$state['convergenceRecoveryComplete']   = true;
+			$state['convergenceRecoveryUnresolved'] = $remaining;
+			$state['lastError'] = '';
+			$state['lastMessage'] = $remaining > 0
+				? sprintf( 'Exact convergence recovery reached its safe boundary; %d product(s) remain unresolved.', $remaining )
+				: 'Exact convergence recovery completed with no unresolved target.';
+			if ( $targeted_only ) {
+				$state['status']                         = 'done';
+				$state['completedAt']                    = time();
+				$state['targetedConvergenceOwnsUnowned'] = false;
+			}
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint exact convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+			}
+			if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_sync_health_snapshot' ) ) {
+				Mobo_Core_Health_Read_Cache::refresh_sync_health_snapshot( 500 );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		$guid = (string) $candidate['guid'];
+		$snapshot_us = $this->current_wall_clock_us();
+		$response = $api->get_product_by_guid( $guid, $state['syncId'] );
+		if ( is_wp_error( $response ) ) {
+			return $this->handle_transient_request_error( $state, $response, 'Exact convergence recovery نتوانست Snapshot محصول محلی را دریافت کند.' );
+		}
+		$items = $this->extract_explicit_list_data( $response, 'repair exact convergence recovery' );
+		if ( is_wp_error( $items ) ) {
+			return $this->handle_transient_request_error( $state, $items, 'Exact convergence recovery پاسخ محصول را معتبر دریافت نکرد.' );
+		}
+		/* A valid exact response proves the dependency recovered. Clear the accumulated
+		 * real-attempt retry budget here as every other successful API phase does;
+		 * otherwise an old outage can poison later isolated failures after recovery. */
+		$this->clear_transient_request_error( $state );
+		$exact = null;
+		foreach ( $items as $item ) {
+			if ( is_array( $item ) && hash_equals( $guid, $this->extract_product_guid( $item ) ) ) {
+				$exact = $item;
+				break;
+			}
+		}
+		if ( ! is_array( $exact ) ) {
+			$state['convergenceRecoveryAttempted'][] = $guid;
+			$state['convergenceRecoveryAttempted'] = array_slice( array_values( array_unique( $state['convergenceRecoveryAttempted'] ) ), -1000 );
+			$state['convergenceRecoveryScanned'] = absint( $state['convergenceRecoveryScanned'] ?? 0 ) + 1;
+			if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = absint( $candidate['index'] ?? 0 ) + 1; }
+			/* Absence from the exact endpoint is not deletion evidence. Record the bounded
+			 * unresolved attempt and continue; downstream Health remains degraded. */
+			$state['convergenceRecoverySkipped'] = absint( $state['convergenceRecoverySkipped'] ?? 0 ) + 1;
+			$state['lastMessage'] = 'Exact convergence recovery could not confirm the local product upstream: ' . $guid;
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint exact convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
+		/* A product can be fully mapped/completed yet remain operationally unowned
+		 * solely because its local Variable child selections drifted from the exact
+		 * upstream option bytes (for example legacy case-only attribute values). In
+		 * that narrow state, replaying the parent through the generic catalogue queue
+		 * is unnecessary and can lose the exact child snapshot boundary. If the exact
+		 * product response embeds concrete Variants, repair those existing children as
+		 * a non-destructive UpdateVariant delta. This never treats an omitted embedded
+		 * Variant as deletion evidence; authoritative missing-Variant finalization stays
+		 * exclusively on the normal paged snapshot path. */
+		$candidate_row = isset( $candidate['row'] ) && is_array( $candidate['row'] ) ? $candidate['row'] : array();
+		$structure_only = array_key_exists( 'localStructureSane', $candidate_row )
+			&& empty( $candidate_row['localStructureSane'] )
+			&& empty( $candidate_row['postIncomplete'] )
+			&& empty( $candidate_row['mapIncomplete'] );
+		$embedded_variants = $this->get_value( $exact, 'variants', null );
+		if ( $structure_only && is_array( $embedded_variants ) && $this->is_list_array( $embedded_variants ) && ! empty( $embedded_variants ) ) {
+			$repair_variants = array();
+			foreach ( $embedded_variants as $variant ) {
+				if ( ! is_array( $variant ) || ! $this->looks_like_variant_payload( $variant ) ) {
+					continue;
+				}
+				$variant_parent = $this->extract_product_guid( $variant );
+				if ( '' !== $variant_parent && ! hash_equals( $guid, $variant_parent ) ) {
+					continue;
+				}
+				if ( '' === $variant_parent ) {
+					$variant['productId'] = $guid;
+				}
+				$repair_variants[] = $variant;
+			}
+
+			if ( ! empty( $repair_variants ) ) {
+				$variant_payload = array(
+					'event'                       => 'UpdateVariant',
+					'variantListAuthoritative'    => false,
+					'syncId'                      => sanitize_text_field( (string) $state['syncId'] ),
+					'productId'                   => $guid,
+					'pageNumber'                  => 1,
+					'recordPerPage'               => count( $repair_variants ),
+					'totalCount'                  => count( $repair_variants ),
+					'hasMore'                     => false,
+					'isLastPage'                  => true,
+					'_moboManualParentSnapshotUs' => $snapshot_us,
+					'data'                        => $repair_variants,
+				);
+				$variant_result = $this->process_update_variant_payload( $variant_payload, true );
+				if ( ! is_array( $variant_result ) || empty( $variant_result['success'] ) ) {
+					$message = is_array( $variant_result ) && isset( $variant_result['message'] )
+						? sanitize_text_field( (string) $variant_result['message'] )
+						: 'Embedded exact Variant repair failed.';
+					return $this->handle_transient_request_error(
+						$state,
+						new WP_Error( 'mobo_core_exact_structure_variant_repair_failed', $message ),
+						'Exact convergence recovery نتوانست ساختار Variantهای محلی را از Snapshot دقیق ترمیم کند.'
+					);
+				}
+
+				$state['convergenceRecoveryAttempted'][] = $guid;
+				$state['convergenceRecoveryAttempted'] = array_slice( array_values( array_unique( $state['convergenceRecoveryAttempted'] ) ), -1000 );
+				$state['convergenceRecoveryScanned'] = absint( $state['convergenceRecoveryScanned'] ?? 0 ) + 1;
+				if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = absint( $candidate['index'] ?? 0 ) + 1; }
+				$state['convergenceRecoveryQueued'] = absint( $state['convergenceRecoveryQueued'] ?? 0 ) + 1;
+				$state['lastError'] = '';
+				$state['lastMessage'] = sprintf( 'Exact convergence recovery replayed %d embedded Variant(s) for local structure drift: %s', count( $repair_variants ), $guid );
+				if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_sync_health_snapshot' ) ) {
+					Mobo_Core_Health_Read_Cache::refresh_sync_health_snapshot( 500 );
+				}
+				if ( ! $this->save_manual_sync_state( $state ) ) {
+					return $this->result( false, 'Checkpoint exact structure convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+				}
+				return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+			}
+		}
+
+		$state['convergenceRecoveryAttempted'][] = $guid;
+		$state['convergenceRecoveryAttempted'] = array_slice( array_values( array_unique( $state['convergenceRecoveryAttempted'] ) ), -1000 );
+		$state['convergenceRecoveryScanned'] = absint( $state['convergenceRecoveryScanned'] ?? 0 ) + 1;
+		if ( $targeted_only ) { $state['convergenceRecoveryCursor'] = absint( $candidate['index'] ?? 0 ) + 1; }
+		$exact['_moboManualSnapshotUs'] = $snapshot_us;
+		$exact['_moboRepairSnapshotUs'] = $snapshot_us;
+		$state['productQueue'][] = $exact;
+		$state['convergenceRecoveryQueued'] = absint( $state['convergenceRecoveryQueued'] ?? 0 ) + 1;
+		$state['lastError'] = '';
+		$state['lastMessage'] = 'Exact convergence recovery queued existing local product: ' . $guid;
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint exact convergence recovery could not be persisted.', $this->get_manual_sync_status() );
+		}
+		return null;
+	}
+
 	private function save_manual_sync_state( $state ) {
 		if ( ! is_array( $state ) ) {
 			return false;
@@ -3156,7 +4253,7 @@ class Mobo_Core_Product_Sync {
 
 		$incoming_status  = sanitize_key( (string) ( $state['status'] ?? '' ) );
 		$incoming_sync_id = sanitize_text_field( (string) ( $state['syncId'] ?? '' ) );
-		$current          = $this->checkpoint_coalescing ? array() : get_option( self::STATE_OPTION, array() );
+		$current          = $this->checkpoint_coalescing ? array() : $this->load_durable_sync_state();
 
 		/*
 		 * A running worker may have loaded the state before the admin clicked
@@ -3193,6 +4290,16 @@ class Mobo_Core_Product_Sync {
 			$incoming_status                 = 'running';
 		}
 
+		/* A completed product traversal is not a successful Repair if even one
+		 * cross-parent identity was quarantined. Persist a terminal diagnostic,
+		 * not the Repair completed option or a misleading 100% success state. */
+		if ( ! empty( $state['repairMode'] ) && 'done' === sanitize_key( (string) ( $state['status'] ?? '' ) ) && absint( $state['repairParentConflictCount'] ?? 0 ) > 0 ) {
+			$state['status'] = 'needs_attention';
+			$state['completedAt'] = 0;
+			$state['lastError'] = sprintf( 'Repair parent identity conflicts: %d unresolved product(s).', absint( $state['repairParentConflictCount'] ) );
+			$state['lastMessage'] = sprintf( 'Repair سایر مراحل را پیمود، اما %d محصول دارای تعارض والد Variant است؛ تکمیل Repair تأیید نشد.', absint( $state['repairParentConflictCount'] ) );
+		}
+
 		$state['updatedAt'] = time();
 
 		if ( $this->checkpoint_coalescing ) {
@@ -3227,7 +4334,13 @@ class Mobo_Core_Product_Sync {
 	 * @return bool
 	 */
 	private function persist_manual_sync_state_verified( $state ) {
-		return is_array( $state ) && Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
+		if ( ! is_array( $state ) ) { return false; }
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			return Mobo_Core_Durable_State_Policy::update_state_verified( self::STATE_KEY, $state );
+		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) { return false; }
+		return Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
 	}
 
 	/**
@@ -3260,9 +4373,8 @@ class Mobo_Core_Product_Sync {
 			return true;
 		}
 
-		/* Avoid a stale request-local options-cache entry hiding a concurrent cancel. */
-		wp_cache_delete( self::STATE_OPTION, 'options' );
-		$current = get_option( self::STATE_OPTION, array() );
+		/* Read the durable row directly so a concurrent cancel/new generation is visible. */
+		$current = $this->load_durable_sync_state();
 		$pending = $this->checkpoint_state;
 
 		if ( is_array( $current ) ) {
@@ -3304,16 +4416,208 @@ class Mobo_Core_Product_Sync {
 
 	/** Persist repair-completion flags only when the durable state checkpoint is accepted. */
 	private function persist_repair_completion_if_needed( $state ) {
-		if ( ! is_array( $state ) || empty( $state['repairMode'] ) || 'done' !== sanitize_key( (string) ( $state['status'] ?? '' ) ) ) {
+		if ( ! is_array( $state ) || empty( $state['repairMode'] ) || ! empty( $state['targetedConvergenceOnly'] ) || absint( $state['repairParentConflictCount'] ?? 0 ) > 0 || 'done' !== sanitize_key( (string) ( $state['status'] ?? '' ) ) ) {
 			return;
 		}
 
 		$completed_at = ! empty( $state['completedAt'] ) ? absint( $state['completedAt'] ) : time();
-		update_option( self::REPAIR_COMPLETED_OPTION, $completed_at, false );
-		update_option( self::REPAIR_LAST_SYNC_ID_OPTION, sanitize_text_field( (string) ( $state['syncId'] ?? '' ) ), false );
+		Mobo_Core_Settings::update( self::REPAIR_COMPLETED_OPTION, $completed_at, false );
+		Mobo_Core_Settings::update( self::REPAIR_LAST_SYNC_ID_OPTION, sanitize_text_field( (string) ( $state['syncId'] ?? '' ) ), false );
 		update_option( 'mobo_core_legacy_repair_required', '0', false );
 		delete_option( 'mobo_core_desired_state_repair_required' );
 		delete_option( 'mobo_core_desired_state_repair_queue_pending' );
+	}
+
+	/** Track one repeated Repair product-lock miss without using the transport retry budget. */
+	private function repair_product_lock_miss( &$state, $scope, $product_guid ) {
+		$scope = sanitize_key( (string) $scope );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$key = 'product-sync|' . $scope . '|' . $product_guid;
+		$previous = sanitize_text_field( (string) ( $state['repairLivenessLockKey'] ?? '' ) );
+		$count = $previous === $key ? absint( $state['repairLivenessLockCount'] ?? 0 ) + 1 : 1;
+		$state['repairLivenessLockKey'] = $key;
+		$state['repairLivenessLockCount'] = $count;
+		return $count;
+	}
+
+	/** Clear the request-local/durable Repair lock budget after real progress. */
+	private function clear_repair_product_lock_miss( &$state, $scope, $product_guid ) {
+		$key = 'product-sync|' . sanitize_key( (string) $scope ) . '|' . sanitize_text_field( (string) $product_guid );
+		if ( $key === sanitize_text_field( (string) ( $state['repairLivenessLockKey'] ?? '' ) ) ) {
+			$state['repairLivenessLockKey'] = '';
+			$state['repairLivenessLockCount'] = 0;
+		}
+	}
+
+	/** Record a bounded Repair product quarantine and preserve an explicit incomplete marker. */
+	private function quarantine_repair_product_for_liveness( &$state, $scope, $product_guid, $product_id, $reset_current ) {
+		$scope = sanitize_key( (string) $scope );
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 && '' !== $product_guid ) {
+			$product_id = $this->find_product_id_by_guid( $product_guid );
+		}
+		if ( $product_id > 0 ) {
+			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) ) {
+				return $this->result( false, 'Repair نتوانست incomplete marker محصول lock‌شده را به‌صورت پایدار ثبت کند.', $this->get_manual_sync_status() );
+			}
+			if ( '' !== $product_guid && ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				return $this->result( false, 'Repair نتوانست Product Map محصول lock‌شده را به‌صورت ناقص ثبت کند.', $this->get_manual_sync_status() );
+			}
+			if ( '' !== $product_guid && class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_behind( $product_guid, $product_id );
+			}
+		}
+
+		$state['repairProductLockQuarantined'] = absint( $state['repairProductLockQuarantined'] ?? 0 ) + 1;
+		if ( ! isset( $state['repairProductLockSamples'] ) || ! is_array( $state['repairProductLockSamples'] ) ) {
+			$state['repairProductLockSamples'] = array();
+		}
+		if ( count( $state['repairProductLockSamples'] ) < 25 ) {
+			$state['repairProductLockSamples'][] = array(
+				'scope' => $scope,
+				'productGuid' => $product_guid,
+				'productId' => $product_id,
+				'reason' => 'persistent product lock contention quarantined after five Repair attempts',
+			);
+		}
+		$state['repairLivenessLockKey'] = '';
+		$state['repairLivenessLockCount'] = 0;
+		$state['processedProducts'] = absint( $state['processedProducts'] ?? 0 ) + 1;
+
+		if ( $reset_current ) {
+			$state['currentProductGuid'] = '';
+			$state['currentProductId'] = 0;
+			$state['currentProductPortalId'] = 0;
+			$state['currentProductSourceRevision'] = 0;
+			$state['currentProductSourceVersion'] = '';
+			$state['currentProductSourceHash'] = '';
+			$state['currentProductSnapshotUs'] = 0;
+			$state['currentProductImages'] = array();
+			$state['currentProductImagesPresent'] = false;
+			$state['currentProductAttributes'] = array();
+			$state['currentProductImageOffset'] = 0;
+			$state['currentProductWasExisting'] = false;
+			$state['currentProductImagesDone'] = false;
+			$state['currentProductCanHaveVariants'] = false;
+			$state['variantPage'] = 1;
+			$state['currentVariantTotalCount'] = 0;
+			$state['currentVariantTotalPages'] = 0;
+			$state['currentVariantProcessedPages'] = 0;
+			$state['currentVariantCursor'] = 0;
+			$state['currentVariantCursorDisabled'] = false;
+		}
+
+		$state['lastError'] = '';
+		$state['lastMessage'] = sprintf( 'Repair محصول %s را پس از ۵ بار lock contention به‌صورت ناقص quarantine کرد و ادامه می‌دهد.', '' !== $product_guid ? $product_guid : ('#' . $product_id) );
+		if ( absint( $state['productTotalCount'] ?? 0 ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+			$state['status'] = 'done';
+			$state['completedAt'] = time();
+		}
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Checkpoint quarantine محصول lock‌شده ذخیره نشد.', $this->get_manual_sync_status() );
+		}
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+	}
+
+	/**
+	 * Quarantine one definitive cross-parent identity mismatch without changing
+	 * Woo post_parent, variation IDs, order items or Product Map parent IDs.
+	 * Unlike a transient fetch failure, this conflict must not be retried on
+	 * every cron tick. Other products may still progress in the same generation.
+	 * Completion remains blocked until a new, fully validated Repair generation.
+	 */
+	private function quarantine_repair_parent_conflict( &$state, $conflict, $product_guid, $product_id ) {
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		$product_id = absint( $product_id );
+		$q2_enabled = '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' );
+		$is_parent_fence_conflict = $conflict instanceof Mobo_Core_Parent_Identity_Conflict;
+		if ( '' === $product_guid
+			|| ! ( $conflict instanceof Mobo_Core_Variation_Parent_Conflict || $is_parent_fence_conflict )
+			|| ! hash_equals( $product_guid, $conflict->product_guid )
+			|| $this->connection_id() !== $conflict->connection_id
+			|| ( $is_parent_fence_conflict && ( ! $q2_enabled || ! Mobo_Core_Parent_Identity_Conflict::is_definitive_reason( $conflict->reason ) ) ) ) {
+			return $this->result( false, 'Repair rejected an unowned or non-definitive parent-identity conflict.', $this->get_manual_sync_status() );
+		}
+
+		/* Q2: no postmeta, map, Woo-parent or Health writes to a conflicting
+		 * identity. The durable Repair journal is the sole quarantine marker.
+		 * Before Q2 activation the existing variation path is unchanged. */
+		if ( ! $q2_enabled ) {
+			if ( $product_id <= 0
+				|| ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' )
+				|| ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
+				return $this->result( false, 'Parent conflict checkpoint could not durably preserve the mapped product as incomplete.', $this->get_manual_sync_status() );
+			}
+			if ( class_exists( 'Mobo_Core_Sync_Health' ) ) {
+				Mobo_Core_Sync_Health::mark_behind( $product_guid, $product_id );
+			}
+		}
+
+		$guids = isset( $state['repairParentConflictGuids'] ) && is_array( $state['repairParentConflictGuids'] ) ? $state['repairParentConflictGuids'] : array();
+		$already_quarantined = in_array( $product_guid, $guids, true );
+		if ( ! $already_quarantined ) {
+			if ( count( $guids ) >= 1000 ) {
+				return $this->result( false, 'Parent conflict journal reached the hard limit; skipping is forbidden.', $this->get_manual_sync_status() );
+			}
+			$guids[] = $product_guid;
+			$state['repairParentConflictGuids'] = $guids;
+			$state['repairParentConflictCount'] = absint( $state['repairParentConflictCount'] ?? 0 ) + 1;
+			if ( ! isset( $state['repairParentConflictSamples'] ) || ! is_array( $state['repairParentConflictSamples'] ) ) {
+				$state['repairParentConflictSamples'] = array();
+			}
+			if ( count( $state['repairParentConflictSamples'] ) < 25 ) {
+				$state['repairParentConflictSamples'][] = array(
+					'connectionId'    => $conflict->connection_id,
+					'productGuid'     => $product_guid,
+					'mappedParent'    => $product_id,
+					'existingParent'  => $is_parent_fence_conflict ? 0 : $conflict->existing_parent_id,
+					'variationId'     => $is_parent_fence_conflict ? 0 : $conflict->variation_id,
+					'variantGuid'     => $is_parent_fence_conflict ? '' : $conflict->variant_guid,
+					'reason'          => $is_parent_fence_conflict ? $conflict->reason : 'cross-parent variation identity; no reassignment',
+					'legacyParent'    => $is_parent_fence_conflict ? $conflict->legacy_parent_id : 0,
+					'customParent'    => $is_parent_fence_conflict ? $conflict->custom_parent_id : 0,
+					'variationParents' => $is_parent_fence_conflict ? $conflict->variation_parent_ids : array( $conflict->existing_parent_id ),
+				);
+			}
+		}
+
+		/* One remote GUID is counted only once per Repair generation, even if a
+		 * duplicate catalogue snapshot reaches this method again. */
+		if ( ! $already_quarantined ) {
+			$state['processedProducts'] = absint( $state['processedProducts'] ?? 0 ) + 1;
+		}
+		$state['currentProductGuid'] = '';
+		$state['currentProductId'] = 0;
+		$state['currentProductPortalId'] = 0;
+		$state['currentProductSourceRevision'] = 0;
+		$state['currentProductSourceVersion'] = '';
+		$state['currentProductSourceHash'] = '';
+		$state['currentProductSnapshotUs'] = 0;
+		$state['currentProductImages'] = array();
+		$state['currentProductImagesPresent'] = false;
+		$state['currentProductAttributes'] = array();
+		$state['currentProductImageOffset'] = 0;
+		$state['currentProductWasExisting'] = false;
+		$state['currentProductImagesDone'] = false;
+		$state['currentProductCanHaveVariants'] = false;
+		$state['variantPage'] = 1;
+		$state['currentVariantTotalCount'] = 0;
+		$state['currentVariantTotalPages'] = 0;
+		$state['currentVariantProcessedPages'] = 0;
+		$state['currentVariantCursor'] = 0;
+		$state['currentVariantCursorDisabled'] = false;
+		$state['lastError'] = '';
+		$state['lastMessage'] = $is_parent_fence_conflict
+			? sprintf( 'Repair تعارض هویت Parent را فقط در Checkpoint ثبت کرد: %s، علت %s. هیچ نگاشت یا Variant تغییر نکرد.', $product_guid, $conflict->reason )
+			: sprintf( 'Repair تعارض والد Variant را بدون جابه‌جایی یا حذف قرنطینه کرد: %s، والد ثبت‌شده %d، والد دارای Variant %d.', $product_guid, $product_id, $conflict->existing_parent_id );
+		if ( absint( $state['productTotalCount'] ?? 0 ) > 0 && absint( $state['processedProducts'] ) >= absint( $state['productTotalCount'] ) ) {
+			$state['status'] = 'done';
+		}
+		if ( ! $this->save_manual_sync_state( $state ) ) {
+			return $this->result( false, 'Parent conflict quarantine checkpoint could not be persisted.', $this->get_manual_sync_status() );
+		}
+		return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
 	}
 
 	private function finish_current_product_state( &$state, $message ) {
@@ -3367,6 +4671,7 @@ class Mobo_Core_Product_Sync {
 		$state['currentProductSourceRevision']   = 0;
 		$state['currentProductSourceVersion']    = '';
 		$state['currentProductSourceHash']       = '';
+		$state['currentProductSnapshotUs']      = 0;
 		$state['currentProductImages']           = array();
 		$state['currentProductImagesPresent']    = false;
 		$state['currentProductAttributes']       = array();
@@ -3379,6 +4684,7 @@ class Mobo_Core_Product_Sync {
 		$state['currentVariantTotalPages']       = 0;
 		$state['currentVariantProcessedPages']   = 0;
 		$state['currentVariantCursor']            = 0;
+		$state['currentVariantCursorDisabled']    = false;
 		$state['lastError']                      = '';
 		$state['lastMessage']                    = sanitize_text_field( (string) $message );
 
@@ -3413,6 +4719,9 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 		$is_new_product  = $product_id <= 0;
+		if ( $is_new_product && '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
+			Mobo_Core_Parent_Identity_Fence::assert_can_create( $product_guid );
+		}
 		$incoming_hash   = $this->build_product_source_hash( $data, $product_guid );
 
 		if ( $product_id > 0 ) {
@@ -3500,7 +4809,7 @@ class Mobo_Core_Product_Sync {
 				/* A missing simple-product storefront identity must still be repairable. */
 				if ( ! $this->product_payload_can_have_variants( $data, $product_id ) ) {
 					$embedded_variant = $this->extract_embedded_simple_variant_data( $data );
-					if ( ! empty( $embedded_variant ) && $this->get_stored_portal_variant_id( $product_id ) <= 0 ) {
+					if ( ! empty( $embedded_variant ) && ! $this->has_stored_simple_variant_identity( $product_id ) ) {
 						if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' ) || ! $this->upsert_product_map( $product_guid, $product_id, true ) ) {
 							throw new RuntimeException( 'Could not durably persist the simple-product repair crash marker.' );
 						}
@@ -3538,6 +4847,7 @@ class Mobo_Core_Product_Sync {
 			$product->set_status( 'publish' );
 			$this->update_product_meta_if_changed( $product, 'product_guid', $product_guid );
 			$this->store_portal_product_id_on_product_object( $product, $data );
+			$this->store_external_product_id_on_product_object( $product, $data );
 			$product->update_meta_data( 'mobo_sync_incomplete', '1' );
 		} else {
 			/*
@@ -3616,6 +4926,9 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 		$product_id = absint( $product->save() );
+		if ( $is_new_product && $product_id > 0 && '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
+			$this->q2_new_parent_authorizations[ $product_guid ] = $product_id;
+		}
 		if ( $product_id > 0 && class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 			Mobo_Core_Runtime_Diagnostics::increment( 'product_save' );
 			if ( $is_new_product ) {
@@ -3712,7 +5025,7 @@ class Mobo_Core_Product_Sync {
 		return $product_id;
 	}
 
-	private function upsert_variation( $parent, $data ) {
+	private function upsert_variation( $parent, $data, $authoritative_product_guid = '' ) {
 		if ( ! $parent instanceof WC_Product ) {
 			return array(
 				'id'      => 0,
@@ -3800,7 +5113,7 @@ class Mobo_Core_Product_Sync {
 		if ( $variation_id > 0 ) {
 			$existing_parent_id = absint( wp_get_post_parent_id( $variation_id ) );
 			if ( $existing_parent_id > 0 && $existing_parent_id !== $parent_id ) {
-				throw new RuntimeException( 'Existing variation identity belongs to another parent product; refusing cross-parent reassignment.' );
+				throw new Mobo_Core_Variation_Parent_Conflict( $variant_guid, $variation_id, $existing_parent_id, $parent_id, '' !== $product_guid ? $product_guid : $authoritative_product_guid, $this->connection_id() );
 			}
 		}
 
@@ -3915,7 +5228,7 @@ class Mobo_Core_Product_Sync {
 			}
 		}
 
-		if ( $this->variation_attribute_signature( $variation->get_attributes( 'edit' ) ) !== $this->variation_attribute_signature( $attrs ) ) {
+		if ( ! $this->variation_attributes_match_exact_payload( $this->get_persisted_variation_attributes_exact( $variation ), $attrs ) ) {
 			$variation->set_attributes( $attrs );
 		}
 
@@ -3937,6 +5250,15 @@ class Mobo_Core_Product_Sync {
 		$variation_id = absint( $variation->save() );
 		if ( $variation_id <= 0 ) {
 			throw new RuntimeException( 'WooCommerce variation save returned no durable post ID.' );
+		}
+		/* WooCommerce may hydrate a custom-attribute option through the parent and
+		 * expose the canonical case in the product object even while the persisted
+		 * attribute_* postmeta still contains legacy case. A normal CRUD save then
+		 * sees no dirty property and leaves the raw storefront value stale. Verify
+		 * and repair the durable variation attribute values explicitly. */
+		if ( ! $this->persist_variation_attributes_exact( $variation_id, $attrs ) ) {
+			$this->persist_post_meta_verified( $variation_id, 'mobo_sync_incomplete', '1' );
+			throw new RuntimeException( 'Could not durably converge exact variation attribute values.' );
 		}
 		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 			Mobo_Core_Runtime_Diagnostics::increment( 'variation_save' );
@@ -3978,19 +5300,37 @@ class Mobo_Core_Product_Sync {
 			return;
 		}
 
-		$portal_product_id = $this->extract_portal_product_id( $data );
+		$portal_product_id   = $this->extract_portal_product_id( $data );
+		$external_product_id = $this->extract_external_product_id( $data );
 
-		if ( $portal_product_id <= 0 && $fallback_product_id > 0 ) {
+		/* An explicit generic provider identity means a missing numeric Portal ID is
+		 * intentional. Do not resurrect an old Portal.ir ID from local fallback. */
+		if ( $portal_product_id <= 0 && '' === $external_product_id && $fallback_product_id > 0 ) {
 			$portal_product_id = $this->get_cached_parent_portal_product_id( $fallback_product_id );
 		}
 
 		if ( $portal_product_id <= 0 ) {
+			if ( '' !== $external_product_id ) {
+				foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $legacy_key ) {
+					$product->delete_meta_data( $legacy_key );
+				}
+			}
 			return;
 		}
 
 		$this->update_product_meta_if_changed( $product, 'portal_product_id', $portal_product_id );
 		$this->update_product_meta_if_changed( $product, 'mobo_portal_product_id', $portal_product_id );
 		$this->update_product_meta_if_changed( $product, '_mobo_portal_product_id', $portal_product_id );
+	}
+
+	private function store_external_product_id_on_product_object( $product, $data ) {
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+		$external_product_id = $this->extract_external_product_id( $data );
+		if ( '' !== $external_product_id ) {
+			$this->update_product_meta_if_changed( $product, '_mobo_external_product_id', $external_product_id );
+		}
 	}
 
 	private function store_portal_variant_id_on_product_object( $product, $data ) {
@@ -4016,6 +5356,11 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
+		$external_variant_id = $this->extract_external_variant_id( $data );
+		if ( '' !== $external_variant_id && ! $this->persist_post_meta_verified( $variation_id, '_mobo_external_variant_id', $external_variant_id ) ) {
+			return false;
+		}
+
 		$portal_variant_id = $this->extract_portal_variant_id( $data );
 
 		if ( $portal_variant_id > 0 ) {
@@ -4024,17 +5369,34 @@ class Mobo_Core_Product_Sync {
 					return false;
 				}
 			}
+		} elseif ( '' !== $external_variant_id ) {
+			foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $key ) {
+				if ( ! $this->delete_post_meta_verified( $variation_id, $key ) ) {
+					return false;
+				}
+			}
+		}
+
+		$external_product_id = $this->extract_external_product_id( $data );
+		if ( '' !== $external_product_id && ! $this->persist_post_meta_verified( $variation_id, '_mobo_external_product_id', $external_product_id ) ) {
+			return false;
 		}
 
 		$portal_product_id = $this->extract_portal_product_id( $data );
 
-		if ( $portal_product_id <= 0 && $parent_id > 0 ) {
+		if ( $portal_product_id <= 0 && '' === $external_product_id && $parent_id > 0 ) {
 			$portal_product_id = $this->get_cached_parent_portal_product_id( $parent_id );
 		}
 
 		if ( $portal_product_id > 0 ) {
 			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
 				if ( ! $this->persist_post_meta_verified( $variation_id, $key, $portal_product_id ) ) {
+					return false;
+				}
+			}
+		} elseif ( '' !== $external_product_id ) {
+			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
+				if ( ! $this->delete_post_meta_verified( $variation_id, $key ) ) {
 					return false;
 				}
 			}
@@ -4180,7 +5542,7 @@ class Mobo_Core_Product_Sync {
 		}
 		$parent_id = absint( wp_get_post_parent_id( $variation_id ) );
 		if ( $parent_id > 0 ) {
-			unset( $this->variation_signature_index[ $parent_id ] );
+			unset( $this->variation_signature_index[ $parent_id ], $this->variation_signature_reverse[ $parent_id ] );
 		}
 		return Mobo_Core_Variation_Lifecycle_Policy::quarantine( $variation_id, $reason, $context, $this->product_map );
 	}
@@ -4245,16 +5607,26 @@ class Mobo_Core_Product_Sync {
 		if ( $parent_id <= 0 || $variation_id <= 0 || ! array_key_exists( $parent_id, $this->variation_signature_index ) ) {
 			return;
 		}
-		/* A changed Variation must not remain reachable through its old signature. */
-		foreach ( $this->variation_signature_index[ $parent_id ] as $known_signature => $known_id ) {
-			if ( absint( $known_id ) === $variation_id ) {
-				unset( $this->variation_signature_index[ $parent_id ][ $known_signature ] );
-			}
+		/* The reverse map tracks only actual signature winners. A losing duplicate
+		 * must never erase the winning variation's lookup on a later update. */
+		$old_signature = isset( $this->variation_signature_reverse[ $parent_id ][ $variation_id ] )
+			? (string) $this->variation_signature_reverse[ $parent_id ][ $variation_id ] : '';
+		if ( '' !== $old_signature && isset( $this->variation_signature_index[ $parent_id ][ $old_signature ] )
+			&& absint( $this->variation_signature_index[ $parent_id ][ $old_signature ] ) === $variation_id ) {
+			unset( $this->variation_signature_index[ $parent_id ][ $old_signature ] );
 		}
+		unset( $this->variation_signature_reverse[ $parent_id ][ $variation_id ] );
 		$signature = $this->variation_attribute_signature( $attrs );
 		if ( '' !== $signature ) {
+			$previous_winner = isset( $this->variation_signature_index[ $parent_id ][ $signature ] )
+				? absint( $this->variation_signature_index[ $parent_id ][ $signature ] ) : 0;
+			if ( $previous_winner > 0 && $previous_winner !== $variation_id ) {
+				unset( $this->variation_signature_reverse[ $parent_id ][ $previous_winner ] );
+			}
 			$this->variation_signature_index[ $parent_id ][ $signature ] = $variation_id;
+			$this->variation_signature_reverse[ $parent_id ][ $variation_id ] = $signature;
 		}
+
 	}
 
 	private function find_variation_id_by_attribute_signature( $parent_id, $data ) {
@@ -4307,6 +5679,10 @@ class Mobo_Core_Product_Sync {
 			}
 
 			$this->variation_signature_index[ $parent_id ] = $index;
+			$this->variation_signature_reverse[ $parent_id ] = array();
+			foreach ( $index as $known_signature => $winner_id ) {
+				$this->variation_signature_reverse[ $parent_id ][ absint( $winner_id ) ] = (string) $known_signature;
+			}
 		}
 
 		return isset( $this->variation_signature_index[ $parent_id ][ $incoming ] )
@@ -4317,6 +5693,217 @@ class Mobo_Core_Product_Sync {
 	private function variation_attribute_signature( $attributes ) {
 	return Mobo_Core_Variation_Identity_Policy::attribute_signature( $attributes );
 }
+
+	/**
+	 * Compare the persisted storefront variation selection with the desired payload
+	 * without collapsing value case through sanitize_title(). Identity matching may
+	 * intentionally use a slug signature, but WooCommerce custom-attribute option
+	 * membership is value-sensitive. A legacy `Airpods 3` child under a parent whose
+	 * authoritative option is `airpods 3` must therefore be rewritten, not treated as
+	 * a no-op merely because both values produce the same identity slug.
+	 *
+	 * @param mixed $current Persisted WooCommerce variation attributes.
+	 * @param mixed $desired Normalized desired variation attributes.
+	 * @return bool
+	 */
+	/**
+	 * Read the durable variation attribute_* values instead of trusting the
+	 * hydrated WC_Product_Variation attribute property. WooCommerce may resolve a
+	 * custom option against the parent and hide case-only drift in raw postmeta.
+	 *
+	 * @param WC_Product_Variation|int $variation Variation object or ID.
+	 * @return array
+	 */
+	private function get_persisted_variation_attributes_exact( $variation ) {
+		global $wpdb;
+
+		$variation_id = is_numeric( $variation )
+			? absint( $variation )
+			: ( $variation instanceof WC_Product_Variation ? absint( $variation->get_id() ) : 0 );
+		if ( $variation_id <= 0 ) {
+			return array();
+		}
+
+		/* Read the durable rows directly. WC_Product_Variation hydration is allowed to
+		 * normalize option values and therefore cannot be used as exact persistence
+		 * evidence for case-only storefront convergence. */
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_key,meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key LIKE %s ORDER BY meta_id ASC",
+				$variation_id,
+				$wpdb->esc_like( 'attribute_' ) . '%'
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+
+		$result = array();
+		foreach ( $rows as $row ) {
+			$raw_key = isset( $row['meta_key'] ) ? (string) $row['meta_key'] : '';
+			if ( 0 !== strpos( $raw_key, 'attribute_' ) ) {
+				continue;
+			}
+			$key = sanitize_title( substr( $raw_key, strlen( 'attribute_' ) ) );
+			if ( '' === $key ) {
+				continue;
+			}
+			/* Duplicate normalized keys are not exact convergence. Preserve an extra
+			 * sentinel key so equality checks fail closed until canonicalized. */
+			if ( array_key_exists( $key, $result ) ) {
+				$result[ '__mobo_duplicate__' . $key ] = sanitize_text_field( (string) ( $row['meta_value'] ?? '' ) );
+				continue;
+			}
+			$result[ $key ] = sanitize_text_field( (string) ( $row['meta_value'] ?? '' ) );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Persist exact custom-attribute option values when WooCommerce's hydrated
+	 * object has already canonicalized them and therefore does not mark a case-only
+	 * change dirty. Identity matching remains slug-normalized; this helper only
+	 * converges the durable storefront value after the ordinary variation save.
+	 *
+	 * @param int   $variation_id Variation ID.
+	 * @param array $desired Normalized desired attributes.
+	 * @return bool
+	 */
+	private function persist_variation_attributes_exact( $variation_id, $desired ) {
+		global $wpdb;
+
+		$variation_id = absint( $variation_id );
+		if ( $variation_id <= 0 || ! is_array( $desired ) ) {
+			return false;
+		}
+
+		$normalized_desired = array();
+		foreach ( $desired as $key => $value ) {
+			$key = preg_replace( '/^attribute_/', '', sanitize_title( (string) $key ) );
+			$value = sanitize_text_field( (string) $value );
+			if ( '' === $key || '' === $value ) {
+				return false;
+			}
+			$normalized_desired[ $key ] = $value;
+		}
+		if ( empty( $normalized_desired ) ) {
+			return false;
+		}
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT meta_id,meta_key,meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key LIKE %s ORDER BY meta_id ASC",
+				$variation_id,
+				$wpdb->esc_like( 'attribute_' ) . '%'
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) ) {
+			return false;
+		}
+
+		$groups = array();
+		foreach ( $rows as $row ) {
+			$meta_id = absint( $row['meta_id'] ?? 0 );
+			$raw_key = isset( $row['meta_key'] ) ? (string) $row['meta_key'] : '';
+			if ( $meta_id <= 0 || 0 !== strpos( $raw_key, 'attribute_' ) ) {
+				continue;
+			}
+			$key = sanitize_title( substr( $raw_key, strlen( 'attribute_' ) ) );
+			if ( '' === $key ) {
+				continue;
+			}
+			$groups[ $key ][] = $row;
+		}
+
+		foreach ( $normalized_desired as $key => $value ) {
+			$canonical_meta_key = 'attribute_' . $key;
+			$matches = isset( $groups[ $key ] ) && is_array( $groups[ $key ] ) ? $groups[ $key ] : array();
+			$keep = null;
+			foreach ( $matches as $row ) {
+				if ( isset( $row['meta_key'] ) && $canonical_meta_key === (string) $row['meta_key'] ) {
+					$keep = $row;
+					break;
+				}
+			}
+			if ( null === $keep && ! empty( $matches ) ) {
+				$keep = reset( $matches );
+			}
+
+			if ( is_array( $keep ) && absint( $keep['meta_id'] ?? 0 ) > 0 ) {
+				$meta_id = absint( $keep['meta_id'] );
+				$updated = update_metadata_by_mid( 'post', $meta_id, $value, $canonical_meta_key );
+				if ( false === $updated ) {
+					/* update_metadata_by_mid() returns false both for failure and for a
+					 * byte-identical no-op. Verify the durable row before failing. */
+					$verified = $wpdb->get_row( $wpdb->prepare( "SELECT meta_key,meta_value FROM {$wpdb->postmeta} WHERE meta_id=%d", $meta_id ), ARRAY_A );
+					if ( ! is_array( $verified ) || $canonical_meta_key !== (string) ( $verified['meta_key'] ?? '' ) || $value !== (string) ( $verified['meta_value'] ?? '' ) ) {
+						return false;
+					}
+				}
+				foreach ( $matches as $row ) {
+					$duplicate_id = absint( $row['meta_id'] ?? 0 );
+					if ( $duplicate_id > 0 && $duplicate_id !== $meta_id && ! delete_metadata_by_mid( 'post', $duplicate_id ) ) {
+						return false;
+					}
+				}
+			} else {
+				$added = add_post_meta( $variation_id, $canonical_meta_key, $value, true );
+				if ( false === $added ) {
+					return false;
+				}
+			}
+		}
+
+		/* An authoritative concrete Variant payload must not retain stale extra
+		 * attribute_* selections from an older topology. Remove only normalized keys
+		 * that are absent from the validated desired set. */
+		foreach ( $groups as $key => $group_rows ) {
+			if ( isset( $normalized_desired[ $key ] ) ) {
+				continue;
+			}
+			foreach ( $group_rows as $row ) {
+				$meta_id = absint( $row['meta_id'] ?? 0 );
+				if ( $meta_id > 0 && ! delete_metadata_by_mid( 'post', $meta_id ) ) {
+					return false;
+				}
+			}
+		}
+
+		clean_post_cache( $variation_id );
+		$reloaded = wc_get_product( $variation_id );
+		if ( ! $reloaded instanceof WC_Product_Variation ) {
+			return false;
+		}
+		$parent_id = absint( $reloaded->get_parent_id() );
+		if ( $parent_id > 0 ) {
+			wc_delete_product_transients( $parent_id );
+		}
+
+		return $this->variation_attributes_match_exact_payload( $this->get_persisted_variation_attributes_exact( $variation_id ), $normalized_desired );
+	}
+
+	private function variation_attributes_match_exact_payload( $current, $desired ) {
+		$normalize = static function( $attributes ) {
+			$result = array();
+			if ( ! is_array( $attributes ) ) {
+				return $result;
+			}
+			foreach ( $attributes as $key => $value ) {
+				$key   = preg_replace( '/^attribute_/', '', sanitize_title( (string) $key ) );
+				$value = sanitize_text_field( (string) $value );
+				if ( '' !== $key && '' !== $value ) {
+					$result[ $key ] = $value;
+				}
+			}
+			ksort( $result, SORT_STRING );
+			return $result;
+		};
+
+		return $normalize( $current ) === $normalize( $desired );
+	}
 
 	/**
 	 * Whether a ProductUpdated payload contains every field that contributes to the
@@ -4637,10 +6224,20 @@ class Mobo_Core_Product_Sync {
 		if ( ! $this->persist_post_meta_verified( $product_id, 'product_guid', sanitize_text_field( (string) $product_guid ) ) ) {
 			return false;
 		}
+		$external_product_id = $this->extract_external_product_id( $data );
+		if ( '' !== $external_product_id && ! $this->persist_post_meta_verified( $product_id, '_mobo_external_product_id', $external_product_id ) ) {
+			return false;
+		}
 		$portal_product_id = $this->extract_portal_product_id( $data );
 		if ( $portal_product_id > 0 ) {
 			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
 				if ( ! $this->persist_post_meta_verified( $product_id, $key, $portal_product_id ) ) {
+					return false;
+				}
+			}
+		} elseif ( '' !== $external_product_id ) {
+			foreach ( array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' ) as $key ) {
+				if ( ! $this->delete_post_meta_verified( $product_id, $key ) ) {
 					return false;
 				}
 			}
@@ -4678,27 +6275,27 @@ class Mobo_Core_Product_Sync {
 		$raw_price   = $price_present ? $this->get_value( $data, 'price', null ) : get_post_meta( $post_id, 'mobo_api_price', true );
 		$raw_compare = $compare_present ? $this->get_compare_price_field_value( $data, null ) : get_post_meta( $post_id, 'mobo_api_compare_price', true );
 		$changed     = false;
+		/* PERF03: only contiguous price-source bookkeeping is batched. Crash
+		 * markers and source ordering watermarks retain individual readback. */
+		$price_source_updates = array();
 
 		if ( $price_present ) {
 			$desired = null === $raw_price || '' === $raw_price ? '' : wc_format_decimal( $raw_price );
 			$changed = maybe_serialize( get_post_meta( $post_id, 'mobo_api_price', true ) ) !== maybe_serialize( $desired ) || $changed;
-			if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_api_price', $desired ) ) {
-				return false;
-			}
+			$price_source_updates['mobo_api_price'] = $desired;
 		}
 		if ( $compare_present ) {
 			$desired = null === $raw_compare || '' === $raw_compare ? '' : wc_format_decimal( $raw_compare );
 			$changed = maybe_serialize( get_post_meta( $post_id, 'mobo_api_compare_price', true ) ) !== maybe_serialize( $desired ) || $changed;
-			if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_api_compare_price', $desired ) ) {
-				return false;
-			}
+			$price_source_updates['mobo_api_compare_price'] = $desired;
 		}
 
 		$fast_context = 'product_variation' === get_post_type( $post_id ) ? 'variation' : 'product';
 		$fast_parent_id = 'variation' === $fast_context ? absint( wp_get_post_parent_id( $post_id ) ) : 0;
 		$policy_type = class_exists( 'Mobo_Core_Product_Pricing_Policy' ) ? Mobo_Core_Product_Pricing_Policy::effective_policy_type( $post_id, $fast_parent_id, $fast_context ) : (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' );
 		$changed     = (string) get_post_meta( $post_id, 'mobo_price_policy_type', true ) !== $policy_type || $changed;
-		if ( ! $this->persist_post_meta_verified( $post_id, 'mobo_price_policy_type', $policy_type ) ) {
+		$price_source_updates['mobo_price_policy_type'] = $policy_type;
+		if ( ! Mobo_Core_Durable_State_Policy::update_post_meta_verified_batch( $post_id, $price_source_updates ) ) {
 			return false;
 		}
 
@@ -4790,6 +6387,28 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
+		$product_id = absint( $product->get_id() );
+		$typed_terminal_key = $product_id > 0 && (
+			( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' )
+				&& Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced()
+				&& Mobo_Core_Storage_Identity_Meta_Retirement::key_applies_to_object( $product_id, $key ) )
+			|| ( class_exists( 'Mobo_Core_Storage_Operational_Meta_Retirement' )
+				&& Mobo_Core_Storage_Operational_Meta_Retirement::is_fenced()
+				&& Mobo_Core_Storage_Operational_Meta_Retirement::key_applies_to_object( $product_id, $key ) )
+		);
+
+		/* WC_Data_Store_WP does not read the typed 10.33.94/10.33.95 stores.
+		 * Once those terminal fences are active, use the WordPress metadata API for
+		 * existing objects so its terminal filters become the sole authority. New
+		 * products still need WC's in-memory metadata queue until their first ID exists. */
+		if ( $typed_terminal_key ) {
+			$current = get_post_meta( $product_id, $key, true );
+			if ( $current == $value ) { // Intentional loose compare for numeric metadata stored as strings.
+				return false;
+			}
+			return false !== update_post_meta( $product_id, $key, $value );
+		}
+
 		$current = $product->get_meta( $key, true, 'edit' );
 		if ( $current == $value ) { // Intentional loose compare for numeric metadata stored as strings.
 			return false;
@@ -4811,6 +6430,19 @@ class Mobo_Core_Product_Sync {
 
 		if ( ! $exists ) {
 			return false;
+		}
+
+		$typed_terminal_key = $product_id > 0 && (
+			( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' )
+				&& Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced()
+				&& Mobo_Core_Storage_Identity_Meta_Retirement::key_applies_to_object( $product_id, $key ) )
+			|| ( class_exists( 'Mobo_Core_Storage_Operational_Meta_Retirement' )
+				&& Mobo_Core_Storage_Operational_Meta_Retirement::is_fenced()
+				&& Mobo_Core_Storage_Operational_Meta_Retirement::key_applies_to_object( $product_id, $key ) )
+		);
+
+		if ( $typed_terminal_key ) {
+			return (bool) delete_post_meta( $product_id, $key );
 		}
 
 		$product->delete_meta_data( $key );
@@ -5170,7 +6802,7 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$incoming_attributes = $this->normalize_variation_attributes( $this->get_value( $data, 'attributes', array() ) );
-		if ( $this->variation_attribute_signature( $variation->get_attributes() ) !== $this->variation_attribute_signature( $incoming_attributes ) ) {
+		if ( ! $this->variation_attributes_match_exact_payload( $this->get_persisted_variation_attributes_exact( $variation ), $incoming_attributes ) ) {
 			return false;
 		}
 
@@ -5229,6 +6861,24 @@ class Mobo_Core_Product_Sync {
 			'global_product_auto_compare_price' => (string) Mobo_Core_Settings::get( 'global_product_auto_compare_price', '0' ),
 			'mobo_dynamic_price'                => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
 		);
+
+		/* Currency affects the actual price written by the shared calculator.
+		 * An explicitly saved preference must therefore invalidate the Sync
+		 * fast-skip policy hash whenever the destination currency or its
+		 * WooCommerce decimal precision changes. Preserve the exact historical
+		 * hash for customers who have NOT opted into conversion: upgrading the
+		 * plugin must not force unrelated V1 storefront rewrites. */
+		$currency_preference = class_exists( 'Mobo_Core_Money_Target_Settings' )
+			? get_option( Mobo_Core_Money_Target_Settings::OPTION, null )
+			: null;
+		if ( null !== $currency_preference ) {
+			$policy['currencyPreferenceSaved'] = true;
+			$policy['currencyPreference']      = is_string( $currency_preference ) ? $currency_preference : '';
+			$policy['wooCurrency']             = function_exists( 'get_woocommerce_currency' )
+				? (string) get_woocommerce_currency() : '';
+			$policy['wooPriceDecimals']        = function_exists( 'wc_get_price_decimals' )
+				? (int) wc_get_price_decimals() : -1;
+		}
 
 		$json = wp_json_encode( $this->sort_array_for_hash( $policy ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 
@@ -5522,7 +7172,7 @@ class Mobo_Core_Product_Sync {
 	 * @param array  $expected_attributes Parent attributes from the accepted product snapshot.
 	 * @return array|WP_Error
 	 */
-	private function commit_manual_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot, $expected_attributes ) {
+	private function commit_manual_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot, $expected_attributes, $parent_snapshot_us = 0 ) {
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
 
@@ -5540,6 +7190,11 @@ class Mobo_Core_Product_Sync {
 		}
 
 		try {
+			/* A webhook may have passed its manual-sync preflight before the parent
+			 * checkpoint became visible and completed while Simple waited for lock. */
+			if ( absint( get_post_meta( $product_id, '_mobo_last_webhook_applied_us', true ) ) > absint( $parent_snapshot_us ) ) {
+				return new WP_Error( 'mobo_core_manual_snapshot_superseded', 'A foreground webhook superseded this Manual Simple parent snapshot.' );
+			}
 			$revalidated = $this->revalidate_manual_simple_product_target( $product_id, $product_guid, $expected_attributes );
 			if ( is_wp_error( $revalidated ) ) {
 				return $revalidated;
@@ -5594,12 +7249,18 @@ class Mobo_Core_Product_Sync {
 			return $money_integrity;
 		}
 
-		$portal_variant_id = $this->extract_portal_variant_id( $variant_data );
-		$variant_guid      = $this->extract_simple_variant_guid( $variant_data );
+		$portal_variant_id   = $this->extract_portal_variant_id( $variant_data );
+		$external_variant_id = $this->extract_external_variant_id( $variant_data );
+		$variant_guid        = $this->extract_simple_variant_guid( $variant_data );
 
-		if ( $portal_variant_id <= 0 ) {
-			$this->mark_simple_product_variant_unresolved( $product_id, 'portal_variant_id_missing', 'شناسه قابل خرید موبو برای محصول ساده در پاسخ API موجود نیست.' );
-			return new WP_Error( 'mobo_core_simple_portal_variant_id_missing', 'Simple Mobo product portal_variant_id is missing.' );
+		/* Provider-neutral synchronization must not require Portal.ir's numeric
+		 * purchase identity. Future providers may expose only an opaque string
+		 * ExternalVariantId while MoboCore still supplies its stable VariantId GUID.
+		 * At least one durable source identity is required; PortalVariantId remains
+		 * optional compatibility/purchase metadata. */
+		if ( $portal_variant_id <= 0 && '' === $external_variant_id && '' === $variant_guid ) {
+			$this->mark_simple_product_variant_unresolved( $product_id, 'variant_identity_missing', 'شناسه Variant در پاسخ منبع موجود نیست.' );
+			return new WP_Error( 'mobo_core_simple_variant_identity_missing', 'Simple Mobo product variant identity is missing.' );
 		}
 
 		$incoming_hash = $this->build_variation_source_hash( $variant_data, $product_guid );
@@ -5611,10 +7272,11 @@ class Mobo_Core_Product_Sync {
 		if ( ! $this->is_repair_mode() && $old_mapped && '1' !== $old_incomplete && '' !== $incoming_hash && $old_hash === $incoming_hash && $current instanceof WC_Product_Simple && $this->simple_product_matches_variant_payload( $current, $variant_data ) ) {
 			$this->store_simple_variant_identity_meta_fast( $product_id, $variant_data, $product_guid );
 			return array(
-				'productId'       => $product_id,
-				'portalVariantId' => $portal_variant_id,
-				'variantGuid'     => $variant_guid,
-				'changed'         => false,
+				'productId'         => $product_id,
+				'portalVariantId'   => $portal_variant_id,
+				'externalVariantId' => $external_variant_id,
+				'variantGuid'       => $variant_guid,
+				'changed'           => false,
 			);
 		}
 
@@ -5653,9 +7315,20 @@ class Mobo_Core_Product_Sync {
 		$product = new WC_Product_Simple( $product_id );
 
 		$was_mapped = '1' === sanitize_text_field( (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true ) );
-		$this->update_product_meta_if_changed( $product, 'portal_variant_id', $portal_variant_id );
-		$this->update_product_meta_if_changed( $product, 'mobo_portal_variant_id', $portal_variant_id );
-		$this->update_product_meta_if_changed( $product, '_mobo_portal_variant_id', $portal_variant_id );
+		if ( $portal_variant_id > 0 ) {
+			$this->update_product_meta_if_changed( $product, 'portal_variant_id', $portal_variant_id );
+			$this->update_product_meta_if_changed( $product, 'mobo_portal_variant_id', $portal_variant_id );
+			$this->update_product_meta_if_changed( $product, '_mobo_portal_variant_id', $portal_variant_id );
+		} elseif ( '' !== $external_variant_id ) {
+			/* An explicit provider-neutral Variant identity with no Portal numeric ID
+			 * must not inherit a stale Portal.ir purchase identity. */
+			foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $legacy_key ) {
+				$product->delete_meta_data( $legacy_key );
+			}
+		}
+		if ( '' !== $external_variant_id ) {
+			$this->update_product_meta_if_changed( $product, '_mobo_external_variant_id', $external_variant_id );
+		}
 
 		if ( '' !== $variant_guid ) {
 			$this->update_product_meta_if_changed( $product, 'variant_guid', $variant_guid );
@@ -5664,10 +7337,11 @@ class Mobo_Core_Product_Sync {
 		}
 
 		if ( '' !== $product_guid ) {
-			$product->update_meta_data( 'product_guid', $product_guid );
+			$this->update_product_meta_if_changed( $product, 'product_guid', $product_guid );
 		}
 
 		$this->store_portal_product_id_on_product_object( $product, $variant_data, $product_id );
+		$this->store_external_product_id_on_product_object( $product, $variant_data );
 		$this->apply_price_to_product( $product, $variant_data, 'product', ! $was_mapped );
 
 		if ( ! $was_mapped || $this->rules->should_update_stock() ) {
@@ -5694,9 +7368,12 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$fresh = wc_get_product( $product_id );
+		$portal_identity_ok = $portal_variant_id <= 0 || absint( get_post_meta( $product_id, '_mobo_portal_variant_id', true ) ) === $portal_variant_id;
+		$external_identity_ok = '' === $external_variant_id || hash_equals( $external_variant_id, (string) get_post_meta( $product_id, '_mobo_external_variant_id', true ) );
 		if ( ! $fresh instanceof WC_Product_Simple
 			|| '1' !== (string) $fresh->get_meta( '_mobo_simple_variant_mapped', true )
-			|| absint( $fresh->get_meta( '_mobo_portal_variant_id', true ) ) !== $portal_variant_id
+			|| ! $portal_identity_ok
+			|| ! $external_identity_ok
 			|| ! $this->simple_product_matches_variant_payload( $fresh, $variant_data )
 		) {
 			return new WP_Error( 'mobo_core_simple_variant_postcondition_failed', 'Simple Mobo variant save failed its post-write verification.' );
@@ -5706,8 +7383,9 @@ class Mobo_Core_Product_Sync {
 
 		return array(
 			'productId'       => $product_id,
-			'portalVariantId' => $portal_variant_id,
-			'variantGuid'     => $variant_guid,
+			'portalVariantId'   => $portal_variant_id,
+			'externalVariantId' => $external_variant_id,
+			'variantGuid'       => $variant_guid,
 		);
 	}
 
@@ -5743,11 +7421,11 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( '_mobo_simple_variant_resolution_message', 'Authoritative Source topology contains no purchasable Variant.' );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_at', gmdate( 'c' ) );
 		if ( '' !== $product_guid ) {
-			$product->update_meta_data( 'product_guid', $product_guid );
+			$this->update_product_meta_if_changed( $product, 'product_guid', $product_guid );
 		}
 		$saved = absint( $product->save() );
 		$fresh = $saved === $product_id ? wc_get_product( $product_id ) : false;
-		if ( $saved !== $product_id || ! $fresh instanceof WC_Product_Simple || 'outofstock' !== (string) $fresh->get_stock_status() || absint( $fresh->get_meta( '_mobo_portal_variant_id', true ) ) > 0 || '' !== trim( (string) $fresh->get_meta( 'variant_guid', true ) ) ) {
+		if ( $saved !== $product_id || ! $fresh instanceof WC_Product_Simple || 'outofstock' !== (string) $fresh->get_stock_status() || absint( get_post_meta( $product_id, '_mobo_portal_variant_id', true ) ) > 0 || '' !== trim( (string) get_post_meta( $product_id, 'variant_guid', true ) ) ) {
 			return new WP_Error( 'mobo_core_authoritative_simple_empty_postcondition', 'Authoritative Simple zero-Variant state failed post-write verification.' );
 		}
 		wc_delete_product_transients( $product_id );
@@ -5775,7 +7453,7 @@ class Mobo_Core_Product_Sync {
 				$current->update_meta_data( '_mobo_simple_variant_resolution_status', 'conversion_failed' );
 				$current->update_meta_data( '_mobo_simple_variant_resolution_message', sanitize_text_field( (string) $message ) );
 				$current->update_meta_data( '_mobo_simple_variant_resolution_at', gmdate( 'c' ) );
-				$current->update_meta_data( 'mobo_sync_incomplete', '1' );
+				update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
 				$current->save();
 			}
 			return;
@@ -5783,7 +7461,7 @@ class Mobo_Core_Product_Sync {
 		$product = new WC_Product_Simple( $product_id );
 
 		foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid' ) as $meta_key ) {
-			$product->delete_meta_data( $meta_key );
+			$this->delete_product_meta_if_present( $product, $meta_key );
 		}
 
 		$product->set_manage_stock( true );
@@ -5793,7 +7471,7 @@ class Mobo_Core_Product_Sync {
 		$product->update_meta_data( '_mobo_simple_variant_resolution_status', sanitize_key( (string) $reason ) );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_message', sanitize_text_field( (string) $message ) );
 		$product->update_meta_data( '_mobo_simple_variant_resolution_at', gmdate( 'c' ) );
-		$product->update_meta_data( 'mobo_sync_incomplete', '1' );
+		update_post_meta( $product_id, 'mobo_sync_incomplete', '1' );
 		$product->save();
 
 		/* Stale parent-level Variant mappings are not purchase authority, but leaving
@@ -5850,12 +7528,20 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function store_simple_variant_identity_meta_fast( $product_id, $variant_data, $product_guid = '' ) {
-		$portal_variant_id = $this->extract_portal_variant_id( $variant_data );
-		$variant_guid      = $this->extract_simple_variant_guid( $variant_data );
+		$portal_variant_id   = $this->extract_portal_variant_id( $variant_data );
+		$external_variant_id = $this->extract_external_variant_id( $variant_data );
+		$variant_guid        = $this->extract_simple_variant_guid( $variant_data );
 		if ( $portal_variant_id > 0 ) {
 			foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $key ) {
 				$this->update_post_meta_if_changed( $product_id, $key, $portal_variant_id );
 			}
+		} elseif ( '' !== $external_variant_id ) {
+			foreach ( array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' ) as $key ) {
+				$this->delete_post_meta_verified( $product_id, $key );
+			}
+		}
+		if ( '' !== $external_variant_id ) {
+			$this->update_post_meta_if_changed( $product_id, '_mobo_external_variant_id', $external_variant_id );
 		}
 		if ( '' !== $variant_guid ) {
 			foreach ( array( 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid' ) as $key ) {
@@ -5894,7 +7580,7 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		foreach ( array( 'portal_variant_id', 'portalVariantId', 'PortalVariantId', 'variant_guid', 'variantGuid', 'variantId', 'variant_id' ) as $key ) {
+		foreach ( array( 'external_variant_id', 'externalVariantId', 'ExternalVariantId', 'portal_variant_id', 'portalVariantId', 'PortalVariantId', 'variant_guid', 'variantGuid', 'variantId', 'variant_id' ) as $key ) {
 			if ( null !== $this->get_value( $data, $key, null ) ) {
 				return true;
 			}
@@ -6132,6 +7818,7 @@ class Mobo_Core_Product_Sync {
 			'portal_variant_id',
 			'mobo_portal_variant_id',
 			'_mobo_portal_variant_id',
+			'_mobo_external_variant_id',
 			'variant_guid',
 			'mobo_variant_guid',
 			'_mobo_variant_guid',
@@ -6186,6 +7873,7 @@ class Mobo_Core_Product_Sync {
 				 * when any such identity remains so retries are self-healing. */
 				$has_parent_variant_identity = '1' === (string) get_post_meta( $product_id, '_mobo_simple_variant_mapped', true )
 					|| '' !== trim( (string) get_post_meta( $product_id, 'variant_guid', true ) )
+					|| '' !== (string) get_post_meta( $product_id, '_mobo_external_variant_id', true )
 					|| absint( get_post_meta( $product_id, 'portal_variant_id', true ) ) > 0;
 				if ( $has_parent_variant_identity ) {
 					$cleanup = $this->clear_simple_variant_mapping_from_parent( $product_id );
@@ -6646,23 +8334,62 @@ class Mobo_Core_Product_Sync {
 	 * @param string   $message Human message.
 	 * @return array
 	 */
+	/** Identify database-read Repair failures that are safe to retry without advancing phase/cursor. */
+	private function is_retryable_repair_integrity_error( $error ) {
+		if ( ! is_wp_error( $error ) ) {
+			return false;
+		}
+		$code = sanitize_key( (string) $error->get_error_code() );
+		return 0 === strpos( $code, 'mobo_core_repair_' )
+			&& ( false !== strpos( $code, '_read_failed' ) || false !== strpos( $code, '_count_failed' ) );
+	}
+
 	private function handle_transient_request_error( &$state, $error, $message ) {
+		$error_code = is_wp_error( $error ) ? sanitize_key( (string) $error->get_error_code() ) : '';
+		$error_data = is_wp_error( $error ) ? $error->get_error_data() : array();
+		$error_data = is_array( $error_data ) ? $error_data : array();
+		$error_msg  = is_wp_error( $error ) ? $error->get_error_message() : (string) $error;
+		$retry_after = absint( $error_data['retry_after_seconds'] ?? 0 );
+		$is_network_deferral = in_array( $error_code, array( 'mobo_core_dependency_backoff', 'mobo_core_api_request_circuit_open' ), true );
+
+		/* A circuit/backoff result means no new HTTP request was attempted. Counting it
+		 * against transientRetryCount turns one real outage into many fake retries and
+		 * can spin a targeted recovery over the same target set. Park the generation
+		 * until the dependency's durable retry boundary instead. */
+		if ( $is_network_deferral ) {
+			$delay_seconds = max( 1, $retry_after > 0 ? $retry_after : 5 );
+			$state['status']                 = 'waiting_for_portal';
+			$state['waitingForPortalSince']  = empty( $state['waitingForPortalSince'] ) ? time() : absint( $state['waitingForPortalSince'] );
+			$state['waitingForPortalReason'] = 'network_backoff';
+			$state['nextRetryAt']            = max( absint( $state['nextRetryAt'] ?? 0 ), time() + $delay_seconds );
+			$state['lastTransientError']     = sanitize_text_field( $error_msg );
+			$state['lastError']              = '';
+			$state['lastMessage']            = sprintf( '%s درخواست جدیدی ارسال نشد؛ backoff شبکه فعال است و تلاش بعدی حدود %d ثانیه بعد انجام می‌شود.', $message, $delay_seconds );
+			$state['updatedAt']              = time();
+			if ( ! $this->save_manual_sync_state( $state ) ) {
+				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
+			}
+			return $this->result( true, $state['lastMessage'], $this->get_manual_sync_status() );
+		}
+
 		$try_count = absint( $state['transientRetryCount'] ?? 0 ) + 1;
 		$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_transient_retry_max_try', 10, 1, 50 );
-		$error_msg = is_wp_error( $error ) ? $error->get_error_message() : (string) $error;
 
 		$state['transientRetryCount'] = $try_count;
 		$state['lastTransientError']  = sanitize_text_field( $error_msg );
+		$state['waitingForPortalReason'] = '';
 		$state['updatedAt']           = time();
 
 		if ( $try_count >= $max_try ) {
 			$delay_seconds = Mobo_Core_Settings::get_int( 'mobo_core_waiting_for_portal_retry_delay_seconds', 60, 10, 3600 );
+			$delay_seconds = max( $delay_seconds, $retry_after );
 
-			$state['status']                = 'waiting_for_portal';
-			$state['waitingForPortalSince'] = empty( $state['waitingForPortalSince'] ) ? time() : absint( $state['waitingForPortalSince'] );
-			$state['nextRetryAt']           = time() + $delay_seconds;
-			$state['lastError']             = '';
-			$state['lastMessage']           = sprintf( '%s اتصال به MoboCore پس از %d تلاش برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
+			$state['status']                 = 'waiting_for_portal';
+			$state['waitingForPortalSince']  = empty( $state['waitingForPortalSince'] ) ? time() : absint( $state['waitingForPortalSince'] );
+			$state['waitingForPortalReason'] = 'retry_budget';
+			$state['nextRetryAt']            = time() + $delay_seconds;
+			$state['lastError']              = '';
+			$state['lastMessage']            = sprintf( '%s اتصال به MoboCore پس از %d تلاش واقعی برقرار نشد. sync متوقف نشده؛ از همین نقطه در تلاش بعدی ادامه می‌دهد.', $message, $max_try );
 			if ( ! $this->save_manual_sync_state( $state ) ) {
 				return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
 			}
@@ -6674,7 +8401,7 @@ class Mobo_Core_Product_Sync {
 		$state['status']      = 'running';
 		$state['nextRetryAt'] = 0;
 		$state['lastError']   = '';
-		$state['lastMessage'] = sprintf( '%s خطای موقت؛ تلاش مجدد %d از %d. %s', $message, $try_count, $max_try, $error_msg );
+		$state['lastMessage'] = sprintf( '%s خطای موقت؛ تلاش واقعی %d از %d. %s', $message, $try_count, $max_try, $error_msg );
 		if ( ! $this->save_manual_sync_state( $state ) ) {
 			return $this->result( false, 'Checkpoint همگام‌سازی به‌صورت پایدار ذخیره نشد؛ عملیات در اجرای بعد از آخرین state تأییدشده ادامه می‌یابد.', $this->get_manual_sync_status() );
 		}
@@ -6693,6 +8420,7 @@ class Mobo_Core_Product_Sync {
 		$state['lastTransientError']    = '';
 		$state['lastError']             = '';
 		$state['waitingForPortalSince'] = 0;
+		$state['waitingForPortalReason'] = '';
 		$state['nextRetryAt']           = 0;
 		if ( 'waiting_for_portal' === sanitize_key( (string) ( $state['status'] ?? '' ) ) ) {
 			$state['status'] = 'running';
@@ -6712,18 +8440,32 @@ class Mobo_Core_Product_Sync {
 		if ( ! is_array( $data ) ) {
 			return new WP_Error( 'mobo_core_money_payload_invalid', 'Mobo money payload is invalid.' );
 		}
+		$has_price = $this->product_price_field_present( $data );
+		$has_compare = $this->product_compare_price_field_present( $data );
+		if ( ! $has_price && ! $has_compare ) {
+			return true;
+		}
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			return new WP_Error( 'mobo_core_money_policy_unavailable', 'Mobo monetary policy is unavailable.' );
+		}
+		$compat = Mobo_Core_Money_Policy::assert_pricing_compatible();
+		if ( is_wp_error( $compat ) ) {
+			return $compat;
+		}
 
-		if ( $this->product_price_field_present( $data ) ) {
+		if ( $has_price ) {
 			$price = Mobo_Core_Payload_Field_Policy::value( $data, Mobo_Core_Payload_Field_Policy::price_aliases(), null );
-			if ( ! Mobo_Core_Money_Policy::is_valid_source_amount( $price ) ) {
-				return new WP_Error( 'mobo_core_price_payload_invalid', 'Mobo ' . sanitize_key( (string) $context ) . ' price is present but malformed.' );
+			$valid = Mobo_Core_Money_Policy::validate_source_amount( $price, 0, true );
+			if ( is_wp_error( $valid ) ) {
+				return new WP_Error( $valid->get_error_code(), 'Mobo ' . sanitize_key( (string) $context ) . ' price: ' . $valid->get_error_message(), $valid->get_error_data() );
 			}
 		}
 
-		if ( $this->product_compare_price_field_present( $data ) ) {
+		if ( $has_compare ) {
 			$compare = Mobo_Core_Payload_Field_Policy::value( $data, Mobo_Core_Payload_Field_Policy::compare_price_aliases(), null );
-			if ( ! Mobo_Core_Money_Policy::is_valid_source_amount( $compare ) ) {
-				return new WP_Error( 'mobo_core_compare_price_payload_invalid', 'Mobo ' . sanitize_key( (string) $context ) . ' comparePrice is present but malformed.' );
+			$valid = Mobo_Core_Money_Policy::validate_source_amount( $compare, 0, true );
+			if ( is_wp_error( $valid ) ) {
+				return new WP_Error( $valid->get_error_code(), 'Mobo ' . sanitize_key( (string) $context ) . ' comparePrice: ' . $valid->get_error_message(), $valid->get_error_data() );
 			}
 		}
 
@@ -7131,9 +8873,14 @@ class Mobo_Core_Product_Sync {
 			return new WP_Error( 'mobo_core_missing_variants_parent_excluded', 'Excluded/invalid parent cannot be mutated during variation finalization.' );
 		}
 
-		$seen_option = $this->seen_option_name( $product_guid, $sync_id );
-		wp_cache_delete( $seen_option, 'options' );
-		$seen = get_option( $seen_option, null );
+		$seen = null;
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			$seen = Mobo_Core_Seen_Variants_Store::load_set( $product_guid, $sync_id );
+		} elseif ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) {
+			$seen_option = $this->seen_option_name( $product_guid, $sync_id );
+			wp_cache_delete( $seen_option, 'options' );
+			$seen = get_option( $seen_option, null );
+		}
 		if ( ! is_array( $seen ) ) {
 			return new WP_Error( 'mobo_core_seen_variants_checkpoint_missing', 'Authoritative variation seen-set is missing or unreadable; destructive finalization was blocked.' );
 		}
@@ -7210,7 +8957,7 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
-		$cache_key = sanitize_key( (string) $object_type ) . '|' . $guid;
+		$cache_key = $this->connection_id() . '|' . sanitize_key( (string) $object_type ) . '|' . $guid;
 		if ( array_key_exists( $cache_key, $this->blocked_status_cache ) ) {
 			return (bool) $this->blocked_status_cache[ $cache_key ];
 		}
@@ -7243,6 +8990,21 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			global $wpdb;
+			$post_type = sanitize_key( (string) $post_type );
+			$meta_key = sanitize_key( (string) $meta_key );
+			if ( 'product' === $post_type && 'product_guid' === $meta_key ) {
+				$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+				return absint( $wpdb->get_var( $wpdb->prepare( "SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND p.post_status IN ('trash','auto-draft') AND c.product_guid=%s ORDER BY p.ID ASC LIMIT 1", $this->connection_id(), $meta_value ) ) );
+			}
+			if ( 'product_variation' === $post_type && 'variant_guid' === $meta_key ) {
+				$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+				return absint( $wpdb->get_var( $wpdb->prepare( "SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_variation_id=p.ID WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status IN ('trash','auto-draft') AND c.variant_guid=%s ORDER BY p.ID ASC LIMIT 1", $this->connection_id(), $meta_value ) ) );
+			}
+			return 0;
+		}
+
 		$query = new WP_Query(
 			array(
 				'post_type'              => sanitize_key( $post_type ),
@@ -7272,6 +9034,12 @@ class Mobo_Core_Product_Sync {
 
 		if ( '' === $guid ) {
 			return 0;
+		}
+
+		// Q2 P0 opt-in strict preflight: inspect both identity layers and real
+		// variant parenthood *before* canonical fallback can rewrite a map.
+		if ( '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
+			Mobo_Core_Parent_Identity_Fence::assert_safe( $guid );
 		}
 
 		$mapped_product_id = 0;
@@ -7333,27 +9101,53 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$query = new WP_Query(
-			array(
-				'post_type'              => $post_type,
-				'post_status'            => array( 'trash' ),
-				'fields'                 => 'ids',
-				'posts_per_page'         => 2,
-				'orderby'                => 'ID',
-				'order'                  => 'ASC',
-				'no_found_rows'          => true,
-				'update_post_meta_cache' => false,
-				'update_post_term_cache' => false,
-				// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded authoritative Repair identity lookup.
-				'meta_query'             => array(
-					array(
-						'key'   => $meta_key,
-						'value' => $meta_value,
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			global $wpdb;
+			if ( 'product' === $post_type && 'product_guid' === $meta_key ) {
+				$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+				$ids = $wpdb->get_col(
+					$wpdb->prepare(
+						"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND p.post_status='trash' AND c.product_guid=%s ORDER BY p.ID ASC LIMIT 2",
+						$this->connection_id(),
+						$meta_value
+					)
+				);
+			} elseif ( 'product_variation' === $post_type && 'variant_guid' === $meta_key ) {
+				$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+				$ids = $wpdb->get_col(
+					$wpdb->prepare(
+						"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_variation_id=p.ID WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status='trash' AND c.variant_guid=%s ORDER BY p.ID ASC LIMIT 2",
+						$this->connection_id(),
+						$meta_value
+					)
+				);
+			} else {
+				$ids = array();
+			}
+			$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		} else {
+			$query = new WP_Query(
+				array(
+					'post_type'              => $post_type,
+					'post_status'            => array( 'trash' ),
+					'fields'                 => 'ids',
+					'posts_per_page'         => 2,
+					'orderby'                => 'ID',
+					'order'                  => 'ASC',
+					'no_found_rows'          => true,
+					'update_post_meta_cache' => false,
+					'update_post_term_cache' => false,
+					// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Pre-terminal bounded Repair identity lookup.
+					'meta_query'             => array(
+						array(
+							'key'   => $meta_key,
+							'value' => $meta_value,
+						),
 					),
-				),
-			)
-		);
-		$ids = array_values( array_filter( array_map( 'absint', is_array( $query->posts ) ? $query->posts : array() ) ) );
+				)
+			);
+			$ids = array_values( array_filter( array_map( 'absint', is_array( $query->posts ) ? $query->posts : array() ) ) );
+		}
 		if ( 1 !== count( $ids ) ) {
 			/* Multiple trashed objects with one identity are ambiguous. The bounded
 			 * integrity stage reports duplicates; never guess which parent/history to restore. */
@@ -7370,7 +9164,7 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$cache_key = ( 'product_variation' === $post_type ? 'variation' : 'product' ) . '|' . $meta_value;
+		$cache_key = $this->connection_id() . '|' . ( 'product_variation' === $post_type ? 'variation' : 'product' ) . '|' . $meta_value;
 		unset( $this->blocked_status_cache[ $cache_key ] );
 		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
 			Mobo_Core_Runtime_Diagnostics::increment( 'repair_untrashed_object' );
@@ -7406,21 +9200,33 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$ids = get_posts(
-			array(
-				'post_type'      => 'product_variation',
-				'post_status'    => array( 'publish', 'private', 'draft', 'trash' ),
-				'fields'         => 'ids',
-				'posts_per_page' => 1,
-				'no_found_rows'  => true,
-				'meta_query'     => array(
-					array(
-						'key'   => 'variant_guid',
-						'value' => $guid,
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			global $wpdb;
+			$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_variation_id=p.ID WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','trash') AND c.variant_guid=%s ORDER BY p.ID ASC LIMIT 1",
+					$this->connection_id(),
+					$guid
+				)
+			);
+		} else {
+			$ids = get_posts(
+				array(
+					'post_type'      => 'product_variation',
+					'post_status'    => array( 'publish', 'private', 'draft', 'trash' ),
+					'fields'         => 'ids',
+					'posts_per_page' => 1,
+					'no_found_rows'  => true,
+					'meta_query'     => array(
+						array(
+							'key'   => 'variant_guid',
+							'value' => $guid,
+						),
 					),
-				),
-			)
-		);
+				)
+			);
+		}
 
 		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
 	}
@@ -7434,21 +9240,43 @@ class Mobo_Core_Product_Sync {
 			return 0;
 		}
 
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-				WHERE p.post_type = 'product_variation'
-				AND p.post_parent = %d
-				AND p.post_status IN ('publish','private','draft','pending')
-				AND pm.meta_key IN ('_mobo_portal_variant_id','mobo_portal_variant_id','portal_variant_id')
-				AND pm.meta_value = %s
-				ORDER BY p.ID ASC",
-				$parent_id,
-				(string) $portal_variant_id
-			)
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$table} c ON c.woo_variation_id = p.ID
+					WHERE p.post_type = 'product_variation'
+					AND p.post_parent = %d
+					AND p.post_status IN ('publish','private','draft','pending')
+					AND c.connection_id = %d
+					AND c.woo_product_id = %d
+					AND c.portal_variant_id = %d
+					ORDER BY p.ID ASC",
+					$parent_id,
+					$this->connection_id(),
+					$parent_id,
+					$portal_variant_id
+				)
+			);
+		} else {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					WHERE p.post_type = 'product_variation'
+					AND p.post_parent = %d
+					AND p.post_status IN ('publish','private','draft','pending')
+					AND pm.meta_key IN ('_mobo_portal_variant_id','mobo_portal_variant_id','portal_variant_id')
+					AND pm.meta_value = %s
+					ORDER BY p.ID ASC",
+					$parent_id,
+					(string) $portal_variant_id
+				)
+			);
+		}
 		$ids = array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
 		if ( empty( $ids ) ) {
 			return 0;
@@ -7527,10 +9355,27 @@ class Mobo_Core_Product_Sync {
 			return false;
 		}
 
+		// All Product Sync map writes must pass the same preflight; a new ID
+		// must never steal an existing GUID/parent without independently
+		// attested Source ownership. No automatic repair/reparent is performed.
+		if ( '1' === (string) get_option( 'mobo_core_parent_identity_fence_q2_enabled', '0' ) ) {
+			$trusted_new = isset( $this->q2_new_parent_authorizations[ $product_guid ] )
+				&& absint( $this->q2_new_parent_authorizations[ $product_guid ] ) === absint( $product_id );
+			Mobo_Core_Parent_Identity_Fence::assert_safe( $product_guid, $product_id, $trusted_new );
+		}
+
 		$last_hash = sanitize_text_field( (string) get_post_meta( absint( $product_id ), '_mobo_product_source_hash', true ) );
-		$stored = (bool) $this->product_map->upsert_product( $product_guid, $product_id, $last_hash, $sync_incomplete );
-		if ( ! $stored ) {
-			return false;
+		if ( class_exists( 'Mobo_Core_Storage_Legacy_Write_Suppression' ) ) {
+			$stored = Mobo_Core_Storage_Legacy_Write_Suppression::commit_product( $this->product_map, $product_guid, $product_id, $last_hash, $sync_incomplete );
+		} else {
+			$stored = (bool) $this->product_map->upsert_product( $product_guid, $product_id, $last_hash, $sync_incomplete );
+			if ( $stored && class_exists( 'Mobo_Core_Storage_Bridge' ) ) {
+				Mobo_Core_Storage_Bridge::mirror_product_legacy_state( $product_guid, $product_id, $sync_incomplete );
+			}
+		}
+		if ( ! $stored ) { return false; }
+		if ( isset( $this->q2_new_parent_authorizations[ $product_guid ] ) && absint( $this->q2_new_parent_authorizations[ $product_guid ] ) === absint( $product_id ) ) {
+			unset( $this->q2_new_parent_authorizations[ $product_guid ] );
 		}
 		if ( class_exists( 'Mobo_Core_Product_Ledger' ) ) {
 			Mobo_Core_Product_Ledger::record( $product_guid, $product_id, $this->is_repair_mode() ? 'repair' : 'sync', false );
@@ -7553,13 +9398,32 @@ class Mobo_Core_Product_Sync {
 		}
 
 		$last_hash = sanitize_text_field( (string) get_post_meta( absint( $variation_id ), '_mobo_variant_source_hash', true ) );
-		return (bool) $this->product_map->upsert_variation( $variant_guid, $variation_id, $product_guid, $last_hash, $sync_incomplete );
+		if ( class_exists( 'Mobo_Core_Storage_Legacy_Write_Suppression' ) ) {
+			$stored = Mobo_Core_Storage_Legacy_Write_Suppression::commit_variation( $this->product_map, $variant_guid, $variation_id, $product_guid, $last_hash, $sync_incomplete );
+		} else {
+			$stored = (bool) $this->product_map->upsert_variation( $variant_guid, $variation_id, $product_guid, $last_hash, $sync_incomplete );
+			if ( $stored && class_exists( 'Mobo_Core_Storage_Bridge' ) ) {
+				Mobo_Core_Storage_Bridge::mirror_variant_legacy_state( $variant_guid, $variation_id, $product_guid, $sync_incomplete );
+			}
+		}
+		return (bool) $stored;
 	}
 
 	private function find_post_id_by_meta( $post_type, $meta_key, $meta_value ) {
 		$meta_value = sanitize_text_field( (string) $meta_value );
 
 		if ( '' === $meta_value ) {
+			return 0;
+		}
+
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			global $wpdb;
+			$post_type = sanitize_key( (string) $post_type );
+			$meta_key = sanitize_key( (string) $meta_key );
+			if ( 'product' === $post_type && 'product_guid' === $meta_key ) {
+				$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+				return absint( $wpdb->get_var( $wpdb->prepare( "SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND p.post_status IN ('publish','draft','private','pending','inherit') AND c.product_guid=%s ORDER BY p.ID ASC LIMIT 1", $this->connection_id(), $meta_value ) ) );
+			}
 			return 0;
 		}
 
@@ -7588,30 +9452,35 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function persist_seen_variants_verified( $option_name, $seen ) {
-		$option_name = sanitize_key( (string) $option_name );
-		$seen        = is_array( $seen ) ? $seen : array();
-		if ( '' === $option_name ) {
-			return false;
-		}
-
-		update_option( $option_name, $seen, false );
-		wp_cache_delete( $option_name, 'options' );
-		$stored = get_option( $option_name, null );
-		return is_array( $stored ) && maybe_serialize( $stored ) === maybe_serialize( $seen );
+		/* Retained only for backward-compatible private method shape. New writes never
+		 * use wp_options; callers route through the scope-aware table methods below. */
+		unset( $option_name );
+		return is_array( $seen );
 	}
 
 	private function reset_seen_variants( $product_guid, $sync_id ) {
-		return $this->persist_seen_variants_verified( $this->seen_option_name( $product_guid, $sync_id ), array() );
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			return Mobo_Core_Seen_Variants_Store::reset( $product_guid, $sync_id );
+		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		$option = $this->seen_option_name( $product_guid, $sync_id );
+		delete_option( $option );
+		return Mobo_Core_Durable_State_Policy::update_option_verified( $option, array(), false );
 	}
 
 	private function initialize_seen_variants( $product_guid, $sync_id ) {
-		$option_name = $this->seen_option_name( $product_guid, $sync_id );
-		wp_cache_delete( $option_name, 'options' );
-		$existing = get_option( $option_name, null );
-		if ( is_array( $existing ) ) {
-			return true;
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			/* Legacy scope probing is upgrade-only; strict cutover creates table markers directly. */
+			if ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) && Mobo_Core_Seen_Variants_Store::migrate_legacy_scope( $product_guid, $sync_id ) ) {
+				return true;
+			}
+			return Mobo_Core_Seen_Variants_Store::initialize( $product_guid, $sync_id );
 		}
-		return $this->persist_seen_variants_verified( $option_name, array() );
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		$option = $this->seen_option_name( $product_guid, $sync_id );
+		$seen   = get_option( $option, null );
+		if ( is_array( $seen ) ) { return true; }
+		return Mobo_Core_Durable_State_Policy::update_option_verified( $option, array(), false );
 	}
 
 	private function mark_variant_seen( $product_guid, $sync_id, $variant_guid ) {
@@ -7619,43 +9488,35 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
-	 * Persist all variation GUIDs seen on one authoritative page with one option write.
+	 * Persist all variation GUIDs seen on one authoritative page as independent rows.
 	 *
 	 * @param string $product_guid Product GUID.
 	 * @param string $sync_id Sync ID.
 	 * @param array  $variant_guids Variation GUIDs.
-	 * @return void
+	 * @return bool
 	 */
 	private function mark_variants_seen_bulk( $product_guid, $sync_id, $variant_guids ) {
-		$option_name = $this->seen_option_name( $product_guid, $sync_id );
-		$seen        = get_option( $option_name, array() );
-		if ( ! is_array( $seen ) ) {
-			$seen = array();
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			return Mobo_Core_Seen_Variants_Store::add_many( $product_guid, $sync_id, $variant_guids );
 		}
-
-		$changed = false;
-		foreach ( is_array( $variant_guids ) ? $variant_guids : array() as $variant_guid ) {
-			$variant_guid = sanitize_text_field( (string) $variant_guid );
-			if ( '' === $variant_guid || isset( $seen[ $variant_guid ] ) ) {
-				continue;
-			}
-			$seen[ $variant_guid ] = 1;
-			$changed = true;
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		$option = $this->seen_option_name( $product_guid, $sync_id );
+		$seen   = get_option( $option, array() );
+		$seen   = is_array( $seen ) ? $seen : array();
+		foreach ( is_array( $variant_guids ) ? $variant_guids : array() as $guid ) {
+			$guid = sanitize_text_field( (string) $guid );
+			if ( '' !== $guid ) { $seen[ $guid ] = 1; }
 		}
-
-		if ( ! $changed ) {
-			return true;
-		}
-
-		return $this->persist_seen_variants_verified( $option_name, $seen );
+		return Mobo_Core_Durable_State_Policy::update_option_verified( $option, $seen, false );
 	}
 
 	private function count_seen_variants( $product_guid, $sync_id ) {
-		$option_name = $this->seen_option_name( $product_guid, $sync_id );
-		wp_cache_delete( $option_name, 'options' );
-		$seen = get_option( $option_name, null );
-
-		return is_array( $seen ) ? count( $seen ) : -1;
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			return Mobo_Core_Seen_Variants_Store::count( $product_guid, $sync_id );
+		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return -1; }
+		$seen = get_option( $this->seen_option_name( $product_guid, $sync_id ), null );
+		return is_array( $seen ) ? count( array_unique( array_map( 'strval', array_keys( $seen ) ) ) ) : -1;
 	}
 
 
@@ -7695,13 +9556,16 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function clear_seen_variants( $product_guid, $sync_id ) {
-		$option_name = $this->seen_option_name( $product_guid, $sync_id );
-		delete_option( $option_name );
-		wp_cache_delete( $option_name, 'options' );
-		return null === get_option( $option_name, null );
+		if ( class_exists( 'Mobo_Core_Seen_Variants_Store' ) && Mobo_Core_Seen_Variants_Store::is_available() ) {
+			return Mobo_Core_Seen_Variants_Store::clear( $product_guid, $sync_id );
+		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		delete_option( $this->seen_option_name( $product_guid, $sync_id ) );
+		return true;
 	}
 
 	private function seen_option_name( $product_guid, $sync_id ) {
+		/* Legacy key used only by lazy migration in Mobo_Core_Seen_Variants_Store. */
 		return 'mobo_seen_variants_' . md5( sanitize_text_field( (string) $product_guid ) . '|' . sanitize_text_field( (string) $sync_id ) );
 	}
 
@@ -7724,6 +9588,50 @@ class Mobo_Core_Product_Sync {
 	}
 
 
+
+
+	/** Provider-owned IDs are opaque strings: preserve case/content and never cast to numbers. */
+	private function extract_external_product_id( $data ) {
+		return $this->extract_opaque_external_id( $data, array( 'external_product_id', 'externalProductId', 'ExternalProductId' ) );
+	}
+
+	private function extract_external_variant_id( $data ) {
+		return $this->extract_opaque_external_id( $data, array( 'external_variant_id', 'externalVariantId', 'ExternalVariantId' ) );
+	}
+
+	private function extract_opaque_external_id( $data, $keys ) {
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+		foreach ( (array) $keys as $key ) {
+			$value = $this->get_value( $data, $key, null );
+			if ( null === $value || is_array( $value ) || is_object( $value ) ) {
+				continue;
+			}
+			$value = (string) $value;
+			if ( '' === $value ) {
+				continue;
+			}
+			/* The backend enforces its 512-character contract. Do not re-measure here
+			 * with byte-based strlen(), because opaque Unicode IDs must round-trip exactly. */
+			return $value;
+		}
+		return '';
+	}
+
+	private function has_stored_simple_variant_identity( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 ) {
+			return false;
+		}
+		if ( $this->get_stored_portal_variant_id( $product_id ) > 0 ) {
+			return true;
+		}
+		if ( '' !== (string) get_post_meta( $product_id, '_mobo_external_variant_id', true ) ) {
+			return true;
+		}
+		return Mobo_Core_Remote_Identity_Policy::is_valid( (string) get_post_meta( $product_id, 'variant_guid', true ) );
+	}
 
 
 	private function extract_portal_product_id( $data ) {
@@ -7919,7 +9827,8 @@ class Mobo_Core_Product_Sync {
 			$table = Mobo_Core_Product_Map::table_name();
 			$parent_guid = $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT parent_remote_guid FROM {$table} WHERE remote_guid = %s AND object_type = %s LIMIT 1",
+					"SELECT parent_remote_guid FROM {$table} WHERE connection_id = %d AND remote_guid = %s AND object_type = %s LIMIT 1",
+					$this->connection_id(),
 					$variant_guid,
 					Mobo_Core_Product_Map::TYPE_VARIATION
 				)
@@ -7930,13 +9839,21 @@ class Mobo_Core_Product_Sync {
 			return sanitize_text_field( (string) $parent_guid );
 		}
 
-		/* Simple products keep the remote variant GUID on the product post. */
-		$product_id = absint( $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID WHERE p.post_type = 'product' AND pm.meta_key IN ('variant_guid','mobo_variant_guid','_mobo_variant_guid') AND pm.meta_value = %s LIMIT 1",
-				$variant_guid
-			)
-		) );
+		/* Simple products carry their purchasable Variant identity in the Product
+		 * state row after the 10.33.95 terminal identity cutover. Never fall back to
+		 * physically retired postmeta once that fence exists. */
+		$product_id = 0;
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$product_id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT woo_product_id FROM {$table} WHERE connection_id=%d AND simple_variant_guid=%s LIMIT 1", $this->connection_id(), $variant_guid ) ) );
+		} else {
+			$product_id = absint( $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID WHERE p.post_type = 'product' AND pm.meta_key IN ('variant_guid','mobo_variant_guid','_mobo_variant_guid') AND pm.meta_value = %s LIMIT 1",
+					$variant_guid
+				)
+			) );
+		}
 
 		return $product_id > 0 ? sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) ) : '';
 	}

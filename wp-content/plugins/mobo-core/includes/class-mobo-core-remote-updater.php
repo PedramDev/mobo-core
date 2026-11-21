@@ -14,6 +14,13 @@ class Mobo_Core_Remote_Updater {
 	const STATUS_OPTION = 'mobo_core_remote_upgrade_status';
 	const HISTORY_OPTION = 'mobo_core_remote_upgrade_history';
 	const MAX_PACKAGE_BYTES = 52428800; // 50 MiB.
+	const MAX_TREE_FILES    = 5000;
+
+	/** @var array|null Request-local verified installed-build state. */
+	private static $build_integrity_cache = null;
+
+	/** @var array|null Request-local verified rollback snapshot state. */
+	private static $rollback_integrity_cache = null;
 
 	/**
 	 * Return compact deployment state.
@@ -25,20 +32,60 @@ class Mobo_Core_Remote_Updater {
 		if ( ! is_array( $status ) ) {
 			$status = array();
 		}
+		$build_integrity = self::get_build_integrity_status();
+		$rollback_integrity = self::get_rollback_integrity_status();
+		$barrier_status = class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' );
+		$upgrade_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'remote_plugin_upgrade' ) : array( 'active' => false );
+		$stored_status = isset( $status['status'] ) ? sanitize_key( (string) $status['status'] ) : 'idle';
+		$current_version = defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '';
+		$effective_status = $stored_status;
+		$interrupted = false;
+		$recovery_mode = '';
+		$recovery_hold = class_exists( 'Mobo_Core_Upgrade_Coordinator' )
+			&& false !== get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false );
+
+		$transient_stages = array( 'downloading', 'validating', 'draining', 'backing-up', 'installing', 'verifying' );
+		if ( in_array( $stored_status, $transient_stages, true ) && empty( $upgrade_lock['active'] ) && empty( $barrier_status['active'] ) ) {
+			$interrupted = true;
+			$target_version = isset( $status['targetVersion'] ) ? self::clean_version( $status['targetVersion'] ) : '';
+			$target_fingerprint = isset( $status['targetBuildFingerprint'] ) ? strtolower( trim( (string) $status['targetBuildFingerprint'] ) ) : '';
+			$installed_target = '' !== $target_version && hash_equals( $target_version, $current_version ) && ! empty( $build_integrity['ready'] );
+			if ( ! $recovery_hold && $installed_target && ( '' === $target_fingerprint || ( ! empty( $build_integrity['fingerprint'] ) && hash_equals( $target_fingerprint, (string) $build_integrity['fingerprint'] ) ) ) ) {
+				$effective_status = 'completed-recovered';
+				$recovery_mode = 'installed-build-verified';
+			} else {
+				$effective_status = 'interrupted';
+				$recovery_mode = $recovery_hold ? 'manual-recovery-required' : ( ! empty( $rollback_integrity['ready'] ) ? 'signed-retry-with-verified-backup' : 'manual-recovery-required' );
+			}
+		}
 
 		return array(
 			'success'        => true,
-			'status'         => isset( $status['status'] ) ? sanitize_key( (string) $status['status'] ) : 'idle',
-			'currentVersion' => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
-			'buildFingerprint' => self::get_build_fingerprint(),
+			'manualRecoveryHold' => $recovery_hold,
+			'status'         => $effective_status,
+			'storedStatus'   => $stored_status,
+			'interrupted'    => $interrupted,
+			'recoveryMode'   => $recovery_mode,
+			'currentVersion' => $current_version,
+			'buildFingerprint' => ! empty( $build_integrity['ready'] ) ? (string) $build_integrity['fingerprint'] : '',
+			'buildIntegrity' => $build_integrity,
 			'deploymentId'   => isset( $status['deploymentId'] ) ? sanitize_text_field( (string) $status['deploymentId'] ) : '',
 			'fromVersion'    => isset( $status['fromVersion'] ) ? sanitize_text_field( (string) $status['fromVersion'] ) : '',
 			'targetVersion'  => isset( $status['targetVersion'] ) ? sanitize_text_field( (string) $status['targetVersion'] ) : '',
+			'targetBuildFingerprint' => isset( $status['targetBuildFingerprint'] ) ? sanitize_text_field( (string) $status['targetBuildFingerprint'] ) : '',
 			'startedAt'      => isset( $status['startedAt'] ) ? sanitize_text_field( (string) $status['startedAt'] ) : '',
 			'completedAt'    => isset( $status['completedAt'] ) ? sanitize_text_field( (string) $status['completedAt'] ) : '',
-			'lastError'      => isset( $status['lastError'] ) ? sanitize_text_field( (string) $status['lastError'] ) : '',
-			'rollbackReady'  => is_dir( self::backup_plugin_dir() ),
-			'upgradeBarrier' => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
+			/* Older installations can retain an unredacted exception in status.
+			 * Never reflect legacy contents into REST/Health after upgrading. */
+			'lastError'      => self::safe_status_error_for_output( $status['lastError'] ?? '' ),
+			'rollbackReady'  => ! empty( $rollback_integrity['ready'] ),
+			'rollbackSnapshot' => $rollback_integrity,
+			'upgradeBarrier' => $barrier_status,
+			'upgradeLock'    => array(
+				'active' => ! empty( $upgrade_lock['active'] ),
+				'acquiredAt' => absint( $upgrade_lock['acquiredAt'] ?? 0 ),
+				'expiresAt' => absint( $upgrade_lock['expiresAt'] ?? 0 ),
+			),
 		);
 	}
 
@@ -82,6 +129,8 @@ class Mobo_Core_Remote_Updater {
 		}
 
 		$current_version = defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '';
+		$recovery_hold = class_exists( 'Mobo_Core_Upgrade_Coordinator' )
+			&& false !== get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false );
 		if ( '' !== $expected_current && ! hash_equals( $expected_current, $current_version ) ) {
 			return new WP_Error(
 				'mobo_core_upgrade_version_mismatch',
@@ -111,7 +160,10 @@ class Mobo_Core_Remote_Updater {
 					array( 'status' => 409, 'currentVersion' => $current_version, 'buildFingerprint' => $current_build_fingerprint )
 				);
 			}
-			if ( preg_match( '/^[a-f0-9]{64}$/', $current_build_fingerprint ) && hash_equals( $target_build_fingerprint, $current_build_fingerprint ) ) {
+			/* A manifest match cached in this request cannot waive a persisted
+			 * unverified-rollback hold. Require the full signed replacement path and
+			 * final forced disk verification before declaring queues resumable. */
+			if ( ! $recovery_hold && preg_match( '/^[a-f0-9]{64}$/', $current_build_fingerprint ) && hash_equals( $target_build_fingerprint, $current_build_fingerprint ) ) {
 				return array(
 					'success'          => true,
 					'status'           => 'already-current-build',
@@ -139,6 +191,7 @@ class Mobo_Core_Remote_Updater {
 		$tmp_file = '';
 		$staging_dir = '';
 		$backup_created = false;
+		$backup_meta = array();
 		$destination_touched = false;
 		$barrier_token = false;
 		$barrier_activated = false;
@@ -151,6 +204,7 @@ class Mobo_Core_Remote_Updater {
 				'deploymentId'  => $deployment_id,
 				'fromVersion'   => $current_version,
 				'targetVersion' => $target_version,
+				'targetBuildFingerprint' => $target_build_fingerprint,
 				'startedAt'     => gmdate( 'c' ),
 				'completedAt'   => '',
 				'lastError'     => '',
@@ -253,10 +307,11 @@ class Mobo_Core_Remote_Updater {
 			self::update_status_stage( 'backing-up' );
 			$barrier_result = 'backing-up';
 			Mobo_Core_Upgrade_Coordinator::mark_stage( $barrier_token, 'backing-up' );
-			$backup = self::create_backup();
+			$backup = self::create_backup( $deployment_id, $current_version );
 			if ( is_wp_error( $backup ) ) {
 				throw new RuntimeException( $backup->get_error_message() );
 			}
+			$backup_meta = is_array( $backup ) ? $backup : array();
 			$backup_created = true;
 
 			if ( ! Mobo_Core_Lock::renew( 'remote_plugin_upgrade', $lock, 900 ) || ! Mobo_Core_Upgrade_Coordinator::renew( $barrier_token, 900 ) ) {
@@ -280,9 +335,14 @@ class Mobo_Core_Remote_Updater {
 			if ( ! hash_equals( $target_version, $disk_version ) ) {
 				throw new RuntimeException( 'Installed files do not report the requested target version.' );
 			}
-			$disk_build_fingerprint = self::get_build_fingerprint();
+			$disk_integrity = self::get_build_integrity_status( true, $target_version );
+			if ( empty( $disk_integrity['ready'] ) ) {
+				$integrity_message = isset( $disk_integrity['message'] ) ? (string) $disk_integrity['message'] : 'Installed plugin file integrity verification failed.';
+				throw new RuntimeException( $integrity_message );
+			}
+			$disk_build_fingerprint = isset( $disk_integrity['fingerprint'] ) ? (string) $disk_integrity['fingerprint'] : '';
 			if ( '' !== $target_build_fingerprint && ! hash_equals( $target_build_fingerprint, $disk_build_fingerprint ) ) {
-				throw new RuntimeException( 'Installed files do not report the requested target build fingerprint.' );
+				throw new RuntimeException( 'Installed files do not match the requested target build fingerprint.' );
 			}
 
 			$completed = array(
@@ -295,6 +355,16 @@ class Mobo_Core_Remote_Updater {
 				'completedAt'   => gmdate( 'c' ),
 				'lastError'     => '',
 			);
+			/* A previous failed rollback may have left a durable recovery hold. It
+			 * can be retired only AFTER this replacement passed the on-disk manifest
+			 * and fingerprint readback above. A failed option delete is not success. */
+			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' )
+				&& false !== get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false ) ) {
+				delete_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION );
+				if ( false !== get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false ) ) {
+					throw new RuntimeException( 'The recovery hold could not be cleared after verified deployment.' );
+				}
+			}
 			self::write_status( $completed );
 			self::append_history( $completed );
 			$barrier_result = 'completed';
@@ -311,15 +381,38 @@ class Mobo_Core_Remote_Updater {
 				'queuesResumable'  => true,
 			);
 		} catch ( Throwable $e ) {
-			$rollback_error = '';
+			$rollback_failed = false;
 			if ( $backup_created && $destination_touched ) {
-				$rollback = self::restore_backup();
-				if ( is_wp_error( $rollback ) ) {
-					$rollback_error = ' Rollback failed: ' . $rollback->get_error_message();
+				try {
+					$rollback = self::restore_backup( $current_version, $backup_meta );
+				} catch ( Throwable $rollback_exception ) {
+					/* An exception during restore is just as unverified as WP_Error.
+					 * Never emit its raw message or skip the recovery hold. */
+					$rollback = false;
+				}
+				if ( true !== $rollback ) {
+					$rollback_failed = true;
 				}
 			}
 
-			$message = sanitize_text_field( $e->getMessage() . $rollback_error );
+			/* Third-party WP_Error/Exception messages can include signed URLs, paths,
+			 * SQL, tokens or request headers. Neither REST nor durable status/history
+			 * should copy them. Stage and rollback verification are stable evidence. */
+			$failed_stage = sanitize_key( (string) self::current_status_value( 'status' ) );
+			if ( ! in_array( $failed_stage, array( 'downloading', 'validating', 'draining', 'backing-up', 'installing', 'verifying' ), true ) ) {
+				$failed_stage = 'unknown';
+			}
+			$message = 'Plugin upgrade failed during ' . $failed_stage . '.';
+			if ( $rollback_failed ) {
+				$message .= ' Verified rollback was not completed; manual recovery is required.';
+				if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ) {
+					update_option(
+						Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION,
+						array( 'status' => 'rollback-unverified', 'deploymentId' => $deployment_id, 'failedAt' => time() ),
+						false
+					);
+				}
+			}
 			$barrier_result = 'failed';
 			$barrier_error  = $message;
 			if ( $barrier_activated && false !== $barrier_token && class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ) {
@@ -355,7 +448,9 @@ class Mobo_Core_Remote_Updater {
 			Mobo_Core_Lock::release( 'remote_plugin_upgrade', $lock );
 
 			/* Resume preserved queue/sync cursors after the barrier is gone. */
-			if ( $barrier_activated && class_exists( 'Mobo_Core_Self_Runner' ) ) {
+			if ( $barrier_activated && class_exists( 'Mobo_Core_Self_Runner' )
+				&& ( ! class_exists( 'Mobo_Core_Upgrade_Coordinator' )
+					|| false === get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false ) ) ) {
 				try {
 					Mobo_Core_Self_Runner::kick( 'plugin-upgrade-release', true );
 				} catch ( Throwable $ignored ) {
@@ -382,9 +477,14 @@ class Mobo_Core_Remote_Updater {
 			return max( 15, min( 300, absint( $configured ) ) );
 		}
 
-		$api_timeout      = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
-		$payload_timeout  = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
-		$checkout_timeout = Mobo_Core_Settings::get_int( 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
+		$api_timeout     = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
+		$payload_timeout = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
+
+		/* Plugin upgrade drain is installation-global and starts before any one
+		 * Connection can be authoritative for all in-flight work. Checkout timeout is
+		 * Source-owned, so a selected/default Connection must not size the global
+		 * barrier. Budget its documented upper bound to cover every Connection. */
+		$checkout_timeout = 20;
 		$blocking_timeout = max( 15, $api_timeout, $payload_timeout, $checkout_timeout );
 		$minimum_safe     = min( 300, $blocking_timeout + 30 );
 
@@ -422,7 +522,9 @@ class Mobo_Core_Remote_Updater {
 	}
 
 	private static function download_package( $url, $token ) {
-		$license_token = trim( (string) get_option( 'mobo_core_token', '' ) );
+		$license_token = class_exists( 'Mobo_Core_Connection_Repository' )
+			? trim( (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', get_option( 'mobo_core_token', '' ) ) )
+			: trim( (string) get_option( 'mobo_core_token', '' ) );
 		if ( '' === $license_token ) {
 			return new WP_Error( 'mobo_core_upgrade_missing_license_token', 'کد لایسنس برای دانلود بسته Deploy ثبت نشده است.' );
 		}
@@ -474,7 +576,7 @@ class Mobo_Core_Remote_Updater {
 
 			if ( is_wp_error( $response ) ) {
 				wp_delete_file( $tmp );
-				return $response;
+				return new WP_Error( 'mobo_core_upgrade_package_transport_failed', 'Portal package transport failed.', array( 'transportCode' => sanitize_key( (string) $response->get_error_code() ) ) );
 			}
 			$code = (int) wp_remote_retrieve_response_code( $response );
 			if ( ! in_array( $code, array( 301, 302, 303, 307, 308 ), true ) ) {
@@ -640,10 +742,74 @@ class Mobo_Core_Remote_Updater {
 
 	private static function validate_manifest( $staging, $expected_version ) {
 		$plugin_root = trailingslashit( $staging ) . 'mobo-core';
+		$inspection = self::inspect_manifest_root( $plugin_root, $expected_version );
+		if ( is_wp_error( $inspection ) ) {
+			return $inspection;
+		}
+
+		return isset( $inspection['fingerprint'] ) ? (string) $inspection['fingerprint'] : '';
+	}
+
+	/**
+	 * Verify the active plugin tree against the installed manifest, not merely the
+	 * hashes declared by the manifest. This is intentionally request-cached because
+	 * Health and upgrade status can ask for the same evidence more than once.
+	 *
+	 * @param bool $force Ignore the request-local cache.
+	 * @return array
+	 */
+	public static function get_build_integrity_status( $force = false, $expected_version = '' ) {
+		$expected_version = self::clean_version( $expected_version );
+		$default_expected = '' === $expected_version;
+		if ( $default_expected ) {
+			$expected_version = defined( 'MOBO_CORE_VERSION' ) ? self::clean_version( (string) MOBO_CORE_VERSION ) : '';
+		}
+		if ( $default_expected && ! $force && is_array( self::$build_integrity_cache ) ) {
+			return self::$build_integrity_cache;
+		}
+		$inspection = self::inspect_manifest_root( untrailingslashit( MOBO_CORE_PLUGIN_DIR ), $expected_version );
+		if ( is_wp_error( $inspection ) ) {
+			$result = array(
+				'ready'        => false,
+				'fingerprint'  => '',
+				'filesChecked' => 0,
+				'errorCode'    => sanitize_key( (string) $inspection->get_error_code() ),
+				'message'      => 'Installed plugin manifest verification failed.',
+			);
+			if ( $default_expected ) {
+				self::$build_integrity_cache = $result;
+			}
+			return $result;
+		}
+
+		$result = array(
+			'ready'        => true,
+			'fingerprint'  => isset( $inspection['fingerprint'] ) ? (string) $inspection['fingerprint'] : '',
+			'filesChecked' => absint( $inspection['filesChecked'] ?? 0 ),
+			'errorCode'    => '',
+			'message'      => 'Installed plugin files match the packaged manifest.',
+		);
+		if ( $default_expected ) {
+			self::$build_integrity_cache = $result;
+		}
+		return $result;
+	}
+
+	/**
+	 * Validate one plugin root against its manifest and reject missing, modified,
+	 * untracked or symlinked files. The manifest file itself is excluded from the
+	 * file map so build fingerprints stay stable across generatedAt changes.
+	 *
+	 * @param string $plugin_root Plugin root directory.
+	 * @param string $expected_version Expected plugin/manifest version.
+	 * @return array|WP_Error
+	 */
+	private static function inspect_manifest_root( $plugin_root, $expected_version ) {
+		$plugin_root = untrailingslashit( (string) $plugin_root );
 		$manifest_file = trailingslashit( $plugin_root ) . 'mobo-core-manifest.json';
 		$raw = @file_get_contents( $manifest_file );
 		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
-			return new WP_Error( 'mobo_core_upgrade_manifest_missing', 'Plugin package manifest could not be read.' );
+			return new WP_Error( 'mobo_core_upgrade_manifest_missing', 'Plugin manifest could not be read.' );
 		}
 
 		$manifest = json_decode( $raw, true );
@@ -651,9 +817,15 @@ class Mobo_Core_Remote_Updater {
 			empty( $manifest['files'] ) ||
 			! is_array( $manifest['files'] ) ||
 			'sha256' !== strtolower( isset( $manifest['algorithm'] ) ? (string) $manifest['algorithm'] : '' ) ||
-			! hash_equals( $expected_version, self::clean_version( isset( $manifest['version'] ) ? $manifest['version'] : '' ) ) ) {
-			return new WP_Error( 'mobo_core_upgrade_manifest_invalid', 'Plugin package manifest is invalid or does not match targetVersion.' );
+			( '' !== $expected_version && ! hash_equals( $expected_version, self::clean_version( isset( $manifest['version'] ) ? $manifest['version'] : '' ) ) ) ) {
+			return new WP_Error( 'mobo_core_upgrade_manifest_invalid', 'Plugin manifest is invalid or does not match the installed version.' );
 		}
+
+		$real_root = realpath( $plugin_root );
+		if ( false === $real_root || ! is_dir( $real_root ) ) {
+			return new WP_Error( 'mobo_core_upgrade_manifest_root_missing', 'Plugin root could not be resolved for integrity verification.' );
+		}
+		$real_root = trailingslashit( wp_normalize_path( $real_root ) );
 
 		$tracked = array();
 		foreach ( $manifest['files'] as $relative => $expected_hash ) {
@@ -668,25 +840,11 @@ class Mobo_Core_Remote_Updater {
 
 			$file = trailingslashit( $plugin_root ) . $relative;
 			if ( is_link( $file ) ) {
-				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin package must not contain symbolic links: ' . sanitize_text_field( $relative ) );
+				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin tree contains a symbolic link: ' . sanitize_text_field( $relative ) );
 			}
-			$real_root = realpath( $plugin_root );
 			$real_file = realpath( $file );
-
-			if ( false !== $real_root ) {
-				$real_root = trailingslashit( wp_normalize_path( $real_root ) );
-			}
-
-			if ( false !== $real_file ) {
-				$real_file = wp_normalize_path( $real_file );
-			}
-
-			if (
-				false === $real_root ||
-				false === $real_file ||
-				0 !== strpos( $real_file, $real_root ) ||
-				! is_file( $real_file )
-			) {
+			$real_file = false !== $real_file ? wp_normalize_path( $real_file ) : false;
+			if ( false === $real_file || 0 !== strpos( $real_file, $real_root ) || ! is_file( $real_file ) ) {
 				return new WP_Error( 'mobo_core_upgrade_manifest_file_missing', 'Plugin manifest references a missing file: ' . sanitize_text_field( $relative ) );
 			}
 
@@ -697,29 +855,44 @@ class Mobo_Core_Remote_Updater {
 			$tracked[ $relative ] = true;
 		}
 
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator( $plugin_root, FilesystemIterator::SKIP_DOTS ),
-			RecursiveIteratorIterator::LEAVES_ONLY
-		);
+		try {
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( $plugin_root, FilesystemIterator::SKIP_DOTS ),
+				RecursiveIteratorIterator::LEAVES_ONLY
+			);
+		} catch ( UnexpectedValueException $e ) {
+			return new WP_Error( 'mobo_core_upgrade_manifest_scan_failed', 'Plugin tree could not be scanned for untracked files.' );
+		}
+
 		foreach ( $iterator as $file_info ) {
 			if ( $file_info->isLink() ) {
-				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin package contains a symbolic link, which is not allowed.' );
+				return new WP_Error( 'mobo_core_upgrade_symlink_rejected', 'Plugin tree contains a symbolic link, which is not allowed.' );
 			}
 			if ( ! $file_info->isFile() ) {
 				continue;
 			}
-			$absolute = str_replace( '\\', '/', $file_info->getPathname() );
-			$root = trailingslashit( str_replace( '\\', '/', $plugin_root ) );
-			$relative = ltrim( substr( $absolute, strlen( $root ) ), '/' );
+			$absolute = wp_normalize_path( $file_info->getPathname() );
+			if ( 0 !== strpos( $absolute, $real_root ) ) {
+				return new WP_Error( 'mobo_core_upgrade_manifest_scan_escape', 'Plugin tree scan escaped the expected root.' );
+			}
+			$relative = ltrim( substr( $absolute, strlen( $real_root ) ), '/' );
 			if ( 'mobo-core-manifest.json' === $relative ) {
 				continue;
 			}
 			if ( ! isset( $tracked[ $relative ] ) ) {
-				return new WP_Error( 'mobo_core_upgrade_manifest_untracked_file', 'Plugin package contains an untracked file: ' . sanitize_text_field( $relative ) );
+				return new WP_Error( 'mobo_core_upgrade_manifest_untracked_file', 'Plugin tree contains an untracked file: ' . sanitize_text_field( $relative ) );
 			}
 		}
 
-		return self::build_fingerprint_from_files( $manifest['files'] );
+		$fingerprint = self::build_fingerprint_from_files( $manifest['files'] );
+		if ( ! preg_match( '/^[a-f0-9]{64}$/', $fingerprint ) ) {
+			return new WP_Error( 'mobo_core_upgrade_build_fingerprint_invalid', 'Plugin build fingerprint could not be computed.' );
+		}
+
+		return array(
+			'fingerprint'  => $fingerprint,
+			'filesChecked' => count( $tracked ),
+		);
 	}
 
 	private static function install_package( $zip_file ) {
@@ -762,35 +935,263 @@ class Mobo_Core_Remote_Updater {
 		return true;
 	}
 
-	private static function create_backup() {
+	/**
+	 * Create a verified rollback snapshot without destroying an already-good backup
+	 * until the replacement snapshot is complete. If the active plugin tree is
+	 * already damaged (for example after a killed previous install), preserve and
+	 * reuse a verified backup for the same source version instead of overwriting it.
+	 *
+	 * @param string $deployment_id Deployment identifier.
+	 * @param string $current_version Expected source version.
+	 * @return array|WP_Error
+	 */
+	private static function create_backup( $deployment_id, $current_version ) {
 		$source = untrailingslashit( MOBO_CORE_PLUGIN_DIR );
-		$backup_root = self::backup_root();
-		$backup = self::backup_plugin_dir();
+		$current_version = self::clean_version( $current_version );
+		$source_integrity = self::get_build_integrity_status( true );
 
-		self::delete_tree( $backup_root );
-		if ( ! wp_mkdir_p( $backup_root ) ) {
-			return new WP_Error( 'mobo_core_upgrade_backup_dir', 'Could not create plugin backup directory.' );
+		if ( empty( $source_integrity['ready'] ) ) {
+			$existing = self::verify_backup_snapshot( $current_version );
+			if ( ! is_wp_error( $existing ) ) {
+				$existing['reused'] = true;
+				return $existing;
+			}
+
+			return new WP_Error(
+				'mobo_core_upgrade_source_integrity_failed',
+				'Installed plugin files are not manifest-valid and no verified rollback backup for the current version is available.'
+			);
 		}
-		if ( ! self::copy_tree( $source, $backup ) ) {
-			self::delete_tree( $backup_root );
+
+		$source_tree = self::tree_snapshot( $source );
+		if ( is_wp_error( $source_tree ) ) {
+			return $source_tree;
+		}
+
+		$backup_container = self::backup_container_dir();
+		$pending_root = trailingslashit( $backup_container ) . 'pending-' . substr( hash( 'sha256', sanitize_text_field( (string) $deployment_id ) . '|' . wp_generate_uuid4() ), 0, 24 );
+		$pending_plugin = trailingslashit( $pending_root ) . 'mobo-core';
+		self::delete_tree( $pending_root );
+		if ( ! wp_mkdir_p( $pending_root ) ) {
+			return new WP_Error( 'mobo_core_upgrade_backup_dir', 'Could not create the pending rollback directory.' );
+		}
+
+		if ( ! self::copy_tree( $source, $pending_plugin ) ) {
+			self::delete_tree( $pending_root );
 			return new WP_Error( 'mobo_core_upgrade_backup_failed', 'Could not create a complete local plugin backup.' );
 		}
 
-		return true;
+		$pending_integrity = self::inspect_manifest_root( $pending_plugin, $current_version );
+		$pending_tree = self::tree_snapshot( $pending_plugin );
+		if ( is_wp_error( $pending_integrity ) || is_wp_error( $pending_tree ) ) {
+			self::delete_tree( $pending_root );
+			$message = is_wp_error( $pending_integrity ) ? $pending_integrity->get_error_message() : $pending_tree->get_error_message();
+			return new WP_Error( 'mobo_core_upgrade_backup_verify_failed', 'Rollback backup verification failed: ' . sanitize_text_field( (string) $message ) );
+		}
+
+		if ( ! hash_equals( (string) $source_tree['fingerprint'], (string) $pending_tree['fingerprint'] ) || absint( $source_tree['fileCount'] ) !== absint( $pending_tree['fileCount'] ) ) {
+			self::delete_tree( $pending_root );
+			return new WP_Error( 'mobo_core_upgrade_backup_tree_mismatch', 'Rollback backup bytes do not match the active plugin tree.' );
+		}
+
+		$backup_root = self::backup_root();
+		$previous_root = self::previous_backup_root();
+		self::delete_tree( $previous_root );
+		if ( is_dir( $backup_root ) && ! self::move_tree( $backup_root, $previous_root ) ) {
+			self::delete_tree( $pending_root );
+			return new WP_Error( 'mobo_core_upgrade_backup_rotate_failed', 'Could not rotate the previous rollback backup.' );
+		}
+
+		if ( ! self::move_tree( $pending_root, $backup_root ) ) {
+			if ( is_dir( $previous_root ) && ! is_dir( $backup_root ) ) {
+				self::move_tree( $previous_root, $backup_root );
+			}
+			self::delete_tree( $pending_root );
+			return new WP_Error( 'mobo_core_upgrade_backup_promote_failed', 'Could not promote the verified rollback backup.' );
+		}
+
+		$verified = self::verify_backup_snapshot( $current_version );
+		if ( is_wp_error( $verified ) ) {
+			self::delete_tree( $backup_root );
+			if ( is_dir( $previous_root ) ) {
+				self::move_tree( $previous_root, $backup_root );
+			}
+			return $verified;
+		}
+		self::delete_tree( $previous_root );
+		self::$rollback_integrity_cache = null;
+		$verified['reused'] = false;
+		return $verified;
 	}
 
-	private static function restore_backup() {
+	/**
+	 * Restore only from a backup that verifies before the live plugin directory is
+	 * touched, then prove the restored tree matches the backup byte-for-byte.
+	 *
+	 * @param string $expected_version Source version being restored.
+	 * @param array  $expected_meta Snapshot returned by create_backup().
+	 * @return true|WP_Error
+	 */
+	private static function restore_backup( $expected_version, $expected_meta = array() ) {
 		$backup = self::backup_plugin_dir();
 		$destination = untrailingslashit( MOBO_CORE_PLUGIN_DIR );
-		if ( ! is_dir( $backup ) ) {
-			return new WP_Error( 'mobo_core_upgrade_backup_missing', 'Local rollback backup is missing.' );
+		$verified = self::verify_backup_snapshot( $expected_version );
+		if ( is_wp_error( $verified ) ) {
+			return $verified;
+		}
+
+		if ( is_array( $expected_meta ) && ! empty( $expected_meta['treeFingerprint'] ) && ! hash_equals( (string) $expected_meta['treeFingerprint'], (string) $verified['treeFingerprint'] ) ) {
+			return new WP_Error( 'mobo_core_upgrade_backup_changed', 'Rollback backup changed after it was verified.' );
 		}
 
 		self::delete_tree( $destination );
 		if ( ! self::copy_tree( $backup, $destination ) ) {
 			return new WP_Error( 'mobo_core_upgrade_restore_failed', 'Could not restore the previous plugin files.' );
 		}
+
+		$restored_integrity = self::inspect_manifest_root( $destination, self::clean_version( $expected_version ) );
+		$restored_tree = self::tree_snapshot( $destination );
+		if ( is_wp_error( $restored_integrity ) || is_wp_error( $restored_tree ) ) {
+			return new WP_Error( 'mobo_core_upgrade_restore_verify_failed', 'Restored plugin files could not be verified.' );
+		}
+		if ( ! hash_equals( (string) $verified['treeFingerprint'], (string) $restored_tree['fingerprint'] ) || absint( $verified['fileCount'] ) !== absint( $restored_tree['fileCount'] ) ) {
+			return new WP_Error( 'mobo_core_upgrade_restore_tree_mismatch', 'Restored plugin bytes do not match the verified rollback backup.' );
+		}
+
+		self::$build_integrity_cache = null;
 		return true;
+	}
+
+	/**
+	 * Return bounded verified rollback evidence for Portal/status diagnostics.
+	 *
+	 * @param bool $force Ignore request-local cache.
+	 * @return array
+	 */
+	private static function get_rollback_integrity_status( $force = false ) {
+		if ( ! $force && is_array( self::$rollback_integrity_cache ) ) {
+			return self::$rollback_integrity_cache;
+		}
+
+		$backup = self::backup_plugin_dir();
+		$version = self::read_header_version( trailingslashit( $backup ) . 'mobo-core.php' );
+		if ( '' === $version ) {
+			$result = array( 'ready' => false, 'version' => '', 'buildFingerprint' => '', 'fileCount' => 0, 'message' => 'No verified rollback snapshot is available.' );
+			self::$rollback_integrity_cache = $result;
+			return $result;
+		}
+
+		$verified = self::verify_backup_snapshot( $version );
+		if ( is_wp_error( $verified ) ) {
+			$result = array(
+				'ready' => false,
+				'version' => $version,
+				'buildFingerprint' => '',
+				'fileCount' => 0,
+				'message' => 'Rollback backup could not be verified.',
+			);
+			self::$rollback_integrity_cache = $result;
+			return $result;
+		}
+
+		$result = array(
+			'ready' => true,
+			'version' => $version,
+			'buildFingerprint' => (string) ( $verified['buildFingerprint'] ?? '' ),
+			'fileCount' => absint( $verified['fileCount'] ?? 0 ),
+			'message' => 'Rollback snapshot is manifest-valid and byte-verifiable.',
+		);
+		self::$rollback_integrity_cache = $result;
+		return $result;
+	}
+
+	/** @return array|WP_Error */
+	private static function verify_backup_snapshot( $expected_version ) {
+		$backup = self::backup_plugin_dir();
+		if ( ! is_dir( $backup ) ) {
+			return new WP_Error( 'mobo_core_upgrade_backup_missing', 'Local rollback backup is missing.' );
+		}
+		$integrity = self::inspect_manifest_root( $backup, self::clean_version( $expected_version ) );
+		if ( is_wp_error( $integrity ) ) {
+			return new WP_Error( 'mobo_core_upgrade_backup_manifest_invalid', 'Rollback backup manifest verification failed: ' . sanitize_text_field( $integrity->get_error_message() ) );
+		}
+		$tree = self::tree_snapshot( $backup );
+		if ( is_wp_error( $tree ) ) {
+			return $tree;
+		}
+		return array(
+			'buildFingerprint' => isset( $integrity['fingerprint'] ) ? (string) $integrity['fingerprint'] : '',
+			'treeFingerprint'  => (string) $tree['fingerprint'],
+			'fileCount'        => absint( $tree['fileCount'] ),
+			'version'          => self::clean_version( $expected_version ),
+		);
+	}
+
+	/**
+	 * Build a deterministic digest of every actual file in a directory. This is a
+	 * copy/restore proof, separate from the release-manifest identity.
+	 *
+	 * @param string $root Root directory.
+	 * @return array|WP_Error
+	 */
+	private static function tree_snapshot( $root ) {
+		$root = untrailingslashit( (string) $root );
+		$real_root = realpath( $root );
+		if ( false === $real_root || ! is_dir( $real_root ) ) {
+			return new WP_Error( 'mobo_core_upgrade_tree_root_missing', 'Plugin tree could not be resolved.' );
+		}
+		$real_root = trailingslashit( wp_normalize_path( $real_root ) );
+		$files = array();
+		try {
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( $root, FilesystemIterator::SKIP_DOTS ),
+				RecursiveIteratorIterator::LEAVES_ONLY
+			);
+		} catch ( UnexpectedValueException $e ) {
+			return new WP_Error( 'mobo_core_upgrade_tree_scan_failed', 'Plugin tree could not be scanned.' );
+		}
+
+		foreach ( $iterator as $file_info ) {
+			if ( $file_info->isLink() ) {
+				return new WP_Error( 'mobo_core_upgrade_tree_symlink', 'Plugin tree contains a symbolic link.' );
+			}
+			if ( ! $file_info->isFile() ) {
+				continue;
+			}
+			$absolute = wp_normalize_path( $file_info->getPathname() );
+			if ( 0 !== strpos( $absolute, $real_root ) ) {
+				return new WP_Error( 'mobo_core_upgrade_tree_escape', 'Plugin tree scan escaped the expected root.' );
+			}
+			$relative = ltrim( substr( $absolute, strlen( $real_root ) ), '/' );
+			$hash = hash_file( 'sha256', $absolute );
+			if ( ! is_string( $hash ) || ! preg_match( '/^[a-f0-9]{64}$/', strtolower( $hash ) ) ) {
+				return new WP_Error( 'mobo_core_upgrade_tree_hash_failed', 'Could not hash plugin tree file: ' . sanitize_text_field( $relative ) );
+			}
+			$files[ $relative ] = strtolower( $hash );
+			if ( count( $files ) > self::MAX_TREE_FILES ) {
+				return new WP_Error( 'mobo_core_upgrade_tree_too_large', 'Plugin tree exceeds the bounded file-count limit.' );
+			}
+		}
+
+		ksort( $files, SORT_STRING );
+		$canonical = '';
+		foreach ( $files as $relative => $hash ) {
+			$canonical .= $relative . '=' . $hash . "\n";
+		}
+		return array(
+			'fingerprint' => hash( 'sha256', $canonical ),
+			'fileCount'   => count( $files ),
+		);
+	}
+
+	/** @return bool */
+	private static function move_tree( $source, $destination ) {
+		$filesystem = self::initialize_direct_filesystem();
+		if ( is_wp_error( $filesystem ) ) {
+			return false;
+		}
+		global $wp_filesystem;
+		return is_object( $wp_filesystem ) && (bool) $wp_filesystem->move( $source, $destination, true );
 	}
 
 	private static function copy_tree( $source, $destination ) {
@@ -852,7 +1253,10 @@ class Mobo_Core_Remote_Updater {
 			return false;
 		}
 
-		$security_code = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
+		$security_source = class_exists( 'Mobo_Core_Connection_Repository' )
+			? Mobo_Core_Connection_Repository::get_runtime_value( 'security_code', get_option( 'mobo_core_security_code', '' ) )
+			: get_option( 'mobo_core_security_code', '' );
+		$security_code = Mobo_Core_Settings::normalize_security_code( $security_source );
 		if ( '' === $security_code ) {
 			return false;
 		}
@@ -881,16 +1285,10 @@ class Mobo_Core_Remote_Updater {
 	 * @return string Lowercase SHA-256 hex, or empty when unavailable.
 	 */
 	public static function get_build_fingerprint() {
-		$manifest_file = untrailingslashit( MOBO_CORE_PLUGIN_DIR ) . '/mobo-core-manifest.json';
-		$raw = @file_get_contents( $manifest_file );
-		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
-			return '';
-		}
-		$manifest = json_decode( $raw, true );
-		if ( ! is_array( $manifest ) || empty( $manifest['files'] ) || ! is_array( $manifest['files'] ) ) {
-			return '';
-		}
-		return self::build_fingerprint_from_files( $manifest['files'] );
+		$integrity = self::get_build_integrity_status();
+		return ! empty( $integrity['ready'] ) && isset( $integrity['fingerprint'] )
+			? (string) $integrity['fingerprint']
+			: '';
 	}
 
 	/**
@@ -926,7 +1324,9 @@ class Mobo_Core_Remote_Updater {
 		if ( isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
 			return false;
 		}
-		if ( 'http' !== strtolower( (string) $parts['scheme'] ) && ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+		$scheme = strtolower( (string) $parts['scheme'] );
+		$debug_http_allowed = defined( 'WP_DEBUG' ) && WP_DEBUG && 'http' === $scheme;
+		if ( 'https' !== $scheme && ! $debug_http_allowed ) {
 			return false;
 		}
 		if ( false === strpos( (string) $parts['path'], '/api/plugin-packages/' ) ) {
@@ -939,7 +1339,12 @@ class Mobo_Core_Remote_Updater {
 		$allowed = array_values( array_unique( array_filter( array_map( 'strtolower', is_array( $allowed ) ? $allowed : array() ) ) ) );
 
 		if ( empty( $allowed ) ) {
-			$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+			$api_base = class_exists( 'Mobo_Core_Connection_Repository' )
+				? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( '' )
+				: '';
+			if ( '' === trim( (string) $api_base ) ) {
+				$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+			}
 			if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
 				$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
 			}
@@ -978,6 +1383,16 @@ class Mobo_Core_Remote_Updater {
 		return ( '' !== $value && strlen( $value ) <= 128 && preg_match( '/^[A-Za-z0-9._:-]+$/', $value ) ) ? $value : '';
 	}
 
+	/** Only explicitly generated bounded errors are allowed into public status. */
+	private static function safe_status_error_for_output( $message ) {
+		$message = (string) $message;
+		if ( '' === $message ) { return ''; }
+		if ( preg_match( '/\APlugin upgrade failed during (downloading|validating|draining|backing-up|installing|verifying|unknown)\.( Verified rollback was not completed; manual recovery is required\.)?\z/D', $message ) ) {
+			return $message;
+		}
+		return 'A previous upgrade error was withheld from public diagnostics.';
+	}
+
 	private static function write_status( $status ) {
 		update_option( self::STATUS_OPTION, is_array( $status ) ? $status : array(), false );
 	}
@@ -1006,11 +1421,24 @@ class Mobo_Core_Remote_Updater {
 		update_option( self::HISTORY_OPTION, $history, false );
 	}
 
+	private static function backup_container_dir() {
+		return trailingslashit( MOBO_CORE_DATA_DIR ) . 'upgrade-backups';
+	}
+
 	private static function backup_root() {
-		return trailingslashit( MOBO_CORE_DATA_DIR ) . 'upgrade-backups/latest';
+		return trailingslashit( self::backup_container_dir() ) . 'latest';
+	}
+
+	private static function previous_backup_root() {
+		return trailingslashit( self::backup_container_dir() ) . 'previous';
 	}
 
 	private static function backup_plugin_dir() {
-		return trailingslashit( self::backup_root() ) . 'mobo-core';
+		$latest = trailingslashit( self::backup_root() ) . 'mobo-core';
+		if ( is_dir( $latest ) ) {
+			return $latest;
+		}
+		$previous = trailingslashit( self::previous_backup_root() ) . 'mobo-core';
+		return is_dir( $previous ) ? $previous : $latest;
 	}
 }

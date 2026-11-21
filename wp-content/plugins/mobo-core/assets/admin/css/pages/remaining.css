@@ -1,0 +1,543 @@
+/* Final UX pass for remaining MoboCore admin pages. Fully scoped. */
+#mobo-core-admin .mobo-admin-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+#mobo-core-admin .mobo-admin-card-heading p {
+  margin: 6px 0 0;
+  color: var(--mobo-admin-muted);
+  line-height: 1.85;
+}
+
+#mobo-core-admin .mobo-ux-primary-card,
+#mobo-core-admin .mobo-ux-intro-card {
+  padding: 20px;
+  margin-bottom: 14px;
+}
+
+#mobo-core-admin .mobo-ux-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+#mobo-core-admin .mobo-ux-summary-grid--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+#mobo-core-admin .mobo-ux-summary-grid--4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+#mobo-core-admin .mobo-ux-summary-grid .mobo-status-box {
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 12px;
+  background: var(--mobo-admin-surface-soft);
+}
+
+#mobo-core-admin .mobo-ux-summary-grid .mobo-status-box span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin .mobo-ux-summary-grid .mobo-status-box strong {
+  margin-top: 5px;
+  color: var(--mobo-admin-text);
+  font-size: 14px;
+}
+
+#mobo-core-admin .mobo-ux-secondary-details {
+  margin: 14px 0;
+  border-color: var(--mobo-admin-border);
+  background: #fff;
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin .mobo-ux-secondary-details > summary {
+  padding: 15px 18px;
+  font-size: 14px;
+  color: var(--mobo-admin-text);
+  background: #fff;
+}
+
+#mobo-core-admin .mobo-ux-secondary-details[open] > summary {
+  border-bottom: 1px solid var(--mobo-admin-border);
+  background: #f8fbff;
+}
+
+#mobo-core-admin .mobo-ux-secondary-details > .mobo-admin-details__body {
+  padding: 16px;
+}
+
+#mobo-core-admin .mobo-ux-secondary-details .mobo-settings-form,
+#mobo-core-admin .mobo-ux-secondary-details .mobo-grid,
+#mobo-core-admin .mobo-ux-secondary-details .mobo-card {
+  max-width: 100%;
+  min-width: 0;
+}
+
+#mobo-core-admin .mobo-ux-secondary-details .mobo-card {
+  box-shadow: none;
+}
+
+#mobo-core-admin .mobo-ux-steps {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+#mobo-core-admin .mobo-ux-steps--compact {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+#mobo-core-admin .mobo-ux-steps span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 11px;
+  background: var(--mobo-admin-surface-soft);
+  color: #40516b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#mobo-core-admin .mobo-ux-steps b {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: #eaf2ff;
+  color: var(--mobo-admin-primary);
+}
+
+#mobo-core-admin .mobo-ux-settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#mobo-core-admin .mobo-category-map-card {
+  padding: 20px;
+  margin-top: 14px;
+}
+
+#mobo-core-admin .mobo-ux-filterbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 12px;
+}
+
+#mobo-core-admin .mobo-ux-filter-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 4px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 10px;
+  background: #f7f9fc;
+}
+
+#mobo-core-admin .mobo-ux-filter-tabs a {
+  padding: 6px 10px;
+  border-radius: 7px;
+  color: #41536d;
+  text-decoration: none;
+  font-weight: 800;
+  font-size: 11px;
+}
+
+#mobo-core-admin .mobo-ux-filter-tabs a.is-active {
+  background: #fff;
+  color: var(--mobo-admin-primary);
+  box-shadow: 0 1px 5px rgba(18,35,63,.08);
+}
+
+#mobo-core-admin .mobo-ux-table-search {
+  flex: 1 1 230px;
+  min-width: 160px;
+  min-height: 38px;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 9px;
+  background: #fff;
+}
+
+#mobo-core-admin .mobo-category-map-table-wrap {
+  max-height: 660px;
+  overflow: auto;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 12px;
+}
+
+#mobo-core-admin .mobo-category-map-table {
+  border: 0;
+}
+
+#mobo-core-admin .mobo-category-map-table th,
+#mobo-core-admin .mobo-category-map-table td {
+  vertical-align: middle;
+}
+
+#mobo-core-admin .mobo-category-map-table td:first-child {
+  min-width: 220px;
+}
+
+#mobo-core-admin .mobo-category-map-table td:last-child {
+  width: 40%;
+}
+
+#mobo-core-admin .mobo-ux-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+}
+
+#mobo-core-admin .mobo-ux-pagination > div {
+  display: flex;
+  gap: 7px;
+}
+
+/* Technical pages should not explode horizontally when opened. */
+#mobo-core-admin.mobo-admin--checkout .mobo-ux-secondary-details .mobo-table-wrap,
+#mobo-core-admin.mobo-admin--cron .mobo-ux-secondary-details .mobo-table-wrap,
+#mobo-core-admin.mobo-admin--health .mobo-ux-secondary-details .mobo-table-wrap,
+#mobo-core-admin.mobo-admin--sms .mobo-ux-secondary-details .mobo-table-wrap {
+  max-width: 100%;
+  overflow: auto;
+}
+
+/* Advanced navigation is intentionally short and distinct from manager navigation. */
+#mobo-core-admin .mobo-tabs--advanced {
+  border-color: #d7e3f5;
+  background: #f8fbff;
+}
+
+#mobo-core-admin .mobo-tabs--advanced .mobo-tab-view {
+  margin-inline-start: auto;
+  color: #31557e;
+  background: #fff;
+  border-color: #d7e3f5;
+}
+
+/* Keep image refresh focused: one command center, details secondary. */
+#mobo-core-admin.mobo-admin--image-refresh .mobo-card-wide {
+  max-width: 100%;
+}
+
+
+/* Pricing policy is disabled as one atomic form while a catalog Reprice is active. */
+#mobo-core-admin.mobo-admin--pricing .mobo-pricing-settings-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+#mobo-core-admin.mobo-admin--pricing .mobo-pricing-settings-fieldset[disabled] {
+  opacity: .68;
+}
+
+#mobo-core-admin.mobo-admin--pricing input[name="mobo_dynamic_low[]"][readonly] {
+  background: #f4f7fb;
+  color: #52647c;
+  cursor: not-allowed;
+}
+
+/* Pricing/category queue cards inside details don't need another floating shadow. */
+#mobo-core-admin.mobo-admin--pricing .mobo-ux-secondary-details #mobo-reprice-status-card,
+#mobo-core-admin.mobo-admin--categories .mobo-ux-secondary-details #mobo-recategorize-status-card {
+  margin: 0;
+  border: 0;
+  box-shadow: none;
+}
+
+@media (max-width: 900px) {
+  #mobo-core-admin .mobo-ux-summary-grid--3,
+  #mobo-core-admin .mobo-ux-summary-grid--4,
+  #mobo-core-admin .mobo-ux-steps--compact,
+  #mobo-core-admin .mobo-ux-settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin .mobo-admin-card-heading {
+    flex-direction: column;
+  }
+
+  #mobo-core-admin .mobo-ux-summary-grid,
+  #mobo-core-admin .mobo-ux-summary-grid--3,
+  #mobo-core-admin .mobo-ux-summary-grid--4,
+  #mobo-core-admin .mobo-ux-steps--compact,
+  #mobo-core-admin .mobo-ux-settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin .mobo-ux-filterbar,
+  #mobo-core-admin .mobo-ux-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  #mobo-core-admin .mobo-ux-filter-tabs,
+  #mobo-core-admin .mobo-ux-pagination > div,
+  #mobo-core-admin .mobo-ux-filterbar .mobo-btn {
+    width: 100%;
+  }
+
+  #mobo-core-admin .mobo-ux-filter-tabs a,
+  #mobo-core-admin .mobo-ux-pagination .mobo-btn {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+
+  #mobo-core-admin .mobo-category-map-table-wrap {
+    max-height: none;
+  }
+
+  #mobo-core-admin .mobo-category-map-table,
+  #mobo-core-admin .mobo-category-map-table tbody,
+  #mobo-core-admin .mobo-category-map-table tr,
+  #mobo-core-admin .mobo-category-map-table td {
+    display: block;
+    width: 100% !important;
+  }
+
+  #mobo-core-admin .mobo-category-map-table thead {
+    display: none;
+  }
+
+  #mobo-core-admin .mobo-category-map-table tr {
+    padding: 10px;
+    border-bottom: 1px solid var(--mobo-admin-border);
+  }
+
+  #mobo-core-admin .mobo-category-map-table td {
+    padding: 6px 0;
+    border: 0;
+  }
+}
+
+/* Technical panels already have their own explicit save/actions; avoid duplicate sticky save prompts. */
+#mobo-core-admin .mobo-ux-secondary-details .mobo-tab-savebar {
+  display: none !important;
+}
+
+#mobo-core-admin .mobo-ux-summary-grid--5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+#mobo-core-admin .mobo-category-map-table td:first-child strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+#mobo-core-admin .mobo-category-map-card > .mobo-note {
+  margin: 10px 0 2px;
+}
+
+@media (max-width: 1100px) {
+  #mobo-core-admin .mobo-ux-summary-grid--5 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin .mobo-ux-summary-grid--5 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Category UX: make policy/result state understandable without exposing identifiers. */
+#mobo-core-admin.mobo-admin--categories .mobo-category-result {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-result strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-result span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-result--success strong { color: #137a47; }
+#mobo-core-admin.mobo-admin--categories .mobo-category-result--warning strong { color: #a45d00; }
+#mobo-core-admin.mobo-admin--categories .mobo-category-result--info strong { color: #245f9e; }
+#mobo-core-admin.mobo-admin--categories .mobo-category-result--neutral strong { color: #465a70; }
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-suggestion-note {
+  display: block;
+  margin-top: 6px;
+  color: #8a5c00;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-suggestion-note[hidden] { display: none !important; }
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-map-table tr.is-auto-suggested td {
+  background: #fffaf0;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note {
+  margin-top: 12px;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-ux-filterbar [data-mobo-category-global-search] {
+  direction: rtl;
+}
+
+#mobo-core-admin.mobo-admin--categories #mobo-recategorize-status-card .mobo-status-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+@media (max-width: 1100px) {
+  #mobo-core-admin.mobo-admin--categories #mobo-recategorize-status-card .mobo-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--categories #mobo-recategorize-status-card .mobo-status-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--categories .mobo-category-map-table tr.is-auto-suggested td {
+    background: transparent;
+  }
+
+  #mobo-core-admin.mobo-admin--categories .mobo-category-map-table tr.is-auto-suggested {
+    background: #fffaf0;
+  }
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note > span {
+  min-width: 0;
+}
+
+#mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note .mobo-btn {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  #mobo-core-admin.mobo-admin--categories .mobo-category-after-save-note .mobo-btn {
+    width: 100%;
+    text-align: center;
+  }
+}
+
+/* UX14 — Sync Health: current-state clarity and bounded product evidence. */
+#mobo-core-admin.mobo-admin--sync-health .mobo-health-freshness {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: -2px 0 14px;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-health-freshness strong {
+  color: var(--mobo-admin-text);
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-list {
+  display: grid;
+  gap: 8px;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-row {
+  display: grid;
+  grid-template-columns: minmax(170px, .42fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 11px;
+  background: #fff;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-row > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-row > div:first-child span {
+  color: var(--mobo-admin-muted);
+  font-size: 10px;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-main {
+  min-width: 0;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-main > a,
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-main > strong {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-technical {
+  margin-top: 7px;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-technical > summary {
+  cursor: pointer;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+#mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-technical > div {
+  display: grid;
+  gap: 5px;
+  margin-top: 7px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--mobo-admin-surface-soft);
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--sync-health .mobo-sync-health-product-row {
+    grid-template-columns: 1fr;
+  }
+}

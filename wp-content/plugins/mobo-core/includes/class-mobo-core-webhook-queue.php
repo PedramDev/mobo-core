@@ -30,9 +30,29 @@ class Mobo_Core_Webhook_Queue {
 	 * @param array $payload Payload.
 	 * @return string|WP_Error
 	 */
-	public function store( $payload ) {
+	public function store( $payload, $connection_id = 0 ) {
 		if ( ! is_array( $payload ) ) {
 			return new WP_Error( 'mobo_core_invalid_webhook_payload', 'Invalid webhook payload.' );
+		}
+
+		$connection_id = absint( $connection_id );
+		if ( $connection_id <= 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$connection_id = Mobo_Core_Connection_Context::get_current_connection_id();
+		}
+		if ( $connection_id <= 0 && class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$default = Mobo_Core_Connection_Repository::get_default();
+			$connection_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
+		}
+		/* New events must have a real, enabled, durable owner. Do not write an
+		 * unprocessable connectionId=0 fallback JSON file, and never silently
+		 * reassign an explicitly invalid/disabled Source to Default. Existing
+		 * pre-Multi-Connection files are still read via the separate legacy path. */
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return new WP_Error( 'mobo_core_webhook_owner_missing', 'Webhook Connection is not available.' );
+		}
+		$owner = Mobo_Core_Connection_Repository::get_by_id( $connection_id );
+		if ( ! is_array( $owner ) || 1 !== absint( $owner['is_enabled'] ?? 0 ) ) {
+			return new WP_Error( 'mobo_core_webhook_owner_disabled', 'Webhook Connection is missing or disabled.' );
 		}
 
 		$this->ensure_dirs();
@@ -51,7 +71,7 @@ class Mobo_Core_Webhook_Queue {
 		 */
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) ) {
 			$event_store = new Mobo_Core_Sync_Event_Store();
-			$event_id    = $event_store->enqueue( $payload );
+			$event_id    = $event_store->enqueue( $payload, $connection_id );
 
 			if ( ! is_wp_error( $event_id ) && absint( $event_id ) > 0 ) {
 				return 'event:' . absint( $event_id );
@@ -59,6 +79,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$envelope = array(
+			'connectionId' => $connection_id,
 			'id'        => wp_generate_uuid4(),
 			'event'     => sanitize_text_field( (string) $event ),
 			'syncId'    => sanitize_text_field( (string) $sync_id ),
@@ -97,39 +118,221 @@ class Mobo_Core_Webhook_Queue {
 
 		$file_count = count( $this->get_queue_files() );
 		$table_pending = 0;
+		$table_processing = 0;
+		$table_active = 0;
 		$table_due = 0;
 		$table_failed = 0;
+		$table_actionable_failed = 0;
+		$table_historical_failed = 0;
 		$table_timing = array();
+		$table_metrics_available = false;
+		$table_metrics_read_failed = false;
 		$file_timing  = $this->get_file_timing_stats();
 
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
 			$store = new Mobo_Core_Sync_Event_Store();
 			$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
-			$table_pending = isset( $summary['pendingCount'] ) ? absint( $summary['pendingCount'] ) : $store->count_pending();
+			$table_metrics_available = ! empty( $summary['available'] );
+			$table_metrics_read_failed = ! empty( $summary['readFailed'] );
+			$table_active = isset( $summary['activeCount'] ) ? absint( $summary['activeCount'] ) : ( isset( $summary['pendingCount'] ) ? absint( $summary['pendingCount'] ) : $store->count_pending() );
+			$table_pending = isset( $summary['queuedPendingCount'] ) ? absint( $summary['queuedPendingCount'] ) : $table_active;
+			$table_processing = isset( $summary['processingCount'] ) ? absint( $summary['processingCount'] ) : 0;
 			$table_due = isset( $summary['dueCount'] ) ? absint( $summary['dueCount'] ) : ( method_exists( $store, 'count_due' ) ? $store->count_due() : $table_pending );
 			$table_failed = isset( $summary['failedCount'] ) ? absint( $summary['failedCount'] ) : $store->count_failed();
+			$table_actionable_failed = isset( $summary['actionableFailedCount'] ) ? absint( $summary['actionableFailedCount'] ) : $table_failed;
+			$table_historical_failed = isset( $summary['historicalFailedCount'] ) ? absint( $summary['historicalFailedCount'] ) : max( 0, $table_failed - $table_actionable_failed );
 			$table_timing = $this->get_table_timing_stats( $summary );
 		}
 
-		$last_result = get_option( 'mobo_core_webhook_queue_last_result', array() );
+		$last_result = Mobo_Core_Settings::get( 'mobo_core_webhook_queue_last_result', array() );
 		if ( ! is_array( $last_result ) ) {
 			$last_result = array();
 		}
 
 		return array(
+			'tableMetricsAvailable' => $table_metrics_available,
+			'tableMetricsReadFailed'=> $table_metrics_read_failed,
 			'pendingFiles'       => $file_count,
 			'pendingTableEvents' => $table_pending,
+			'processingTableEvents' => $table_processing,
+			'activeTableEvents'  => $table_active,
 			'dueTableEvents'     => $table_due,
-			'failedTableEvents'  => $table_failed,
-			'hasPending'         => $file_count > 0 || $table_pending > 0,
+			'failedTableEvents'  => $table_actionable_failed,
+			'failedTableEventsTotal' => $table_failed,
+			'historicalFailedTableEvents' => $table_historical_failed,
+			'hasPending'         => $file_count > 0 || $table_active > 0,
 			'hasDue'             => $file_count > 0 || $table_due > 0,
-			'lastAttemptAt'      => absint( get_option( 'mobo_core_webhook_queue_last_attempt_at', 0 ) ),
-			'lastSuccessAt'      => absint( get_option( 'mobo_core_webhook_queue_last_success_at', 0 ) ),
-			'lastActivityAt'     => absint( get_option( 'mobo_core_webhook_queue_last_activity_at', 0 ) ),
+			'lastAttemptAt'      => absint( Mobo_Core_Settings::get( 'mobo_core_webhook_queue_last_attempt_at', 0 ) ),
+			'lastSuccessAt'      => absint( Mobo_Core_Settings::get( 'mobo_core_webhook_queue_last_success_at', 0 ) ),
+			'lastActivityAt'     => absint( Mobo_Core_Settings::get( 'mobo_core_webhook_queue_last_activity_at', 0 ) ),
 			'lastResult'         => $last_result,
 			'tableTiming'        => $table_timing,
 			'fileTiming'         => $file_timing,
 		);
+	}
+
+
+	/**
+	 * Return installation-wide webhook queue status across all enabled Connections.
+	 *
+	 * The ordinary get_status() method remains Source-scoped. Installation-global
+	 * surfaces such as /worker/status must opt in to this aggregate explicitly so
+	 * an authenticated Default/Controller Connection cannot hide backlog owned by
+	 * another enabled Source.
+	 *
+	 * @return array
+	 */
+	public function get_installation_status() {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$status = $this->get_status();
+			$status['scope'] = 'installation';
+			$status['connectionCount'] = 0;
+			return $status;
+		}
+
+		$connections = Mobo_Core_Connection_Repository::list_enabled();
+		if ( empty( $connections ) ) {
+			$status = $this->get_status();
+			$status['scope'] = 'installation';
+			$status['connectionCount'] = 0;
+			return $status;
+		}
+
+		$aggregate = array(
+			'tableMetricsAvailable' => true,
+			'tableMetricsReadFailed'=> false,
+			'pendingFiles'          => 0,
+			'pendingTableEvents'    => 0,
+			'processingTableEvents' => 0,
+			'activeTableEvents'     => 0,
+			'dueTableEvents'        => 0,
+			'failedTableEvents'     => 0,
+			'failedTableEventsTotal'=> 0,
+			'historicalFailedTableEvents' => 0,
+			'hasPending'            => false,
+			'hasDue'                => false,
+			'lastAttemptAt'         => 0,
+			'lastSuccessAt'         => 0,
+			'lastActivityAt'        => 0,
+			'lastResult'            => array(),
+			'tableTiming'           => array(),
+			'fileTiming'            => array(),
+			'scope'                 => 'installation',
+			'connectionCount'       => 0,
+		);
+
+		$latest_result_attempt = 0;
+		foreach ( $connections as $connection ) {
+			$connection_id = is_array( $connection ) ? absint( $connection['id'] ?? 0 ) : 0;
+			if ( $connection_id <= 0 ) {
+				continue;
+			}
+
+			$status = Mobo_Core_Connection_Context::run(
+				$connection_id,
+				function () {
+					return $this->get_status();
+				}
+			);
+			if ( ! is_array( $status ) ) {
+				continue;
+			}
+
+			$aggregate['connectionCount']++;
+			$aggregate['tableMetricsAvailable'] = $aggregate['tableMetricsAvailable'] && ! empty( $status['tableMetricsAvailable'] );
+			$aggregate['tableMetricsReadFailed'] = $aggregate['tableMetricsReadFailed'] || ! empty( $status['tableMetricsReadFailed'] );
+
+			foreach ( array(
+				'pendingFiles',
+				'pendingTableEvents',
+				'processingTableEvents',
+				'activeTableEvents',
+				'dueTableEvents',
+				'failedTableEvents',
+				'failedTableEventsTotal',
+				'historicalFailedTableEvents',
+			) as $key ) {
+				$aggregate[ $key ] += absint( $status[ $key ] ?? 0 );
+			}
+
+			$aggregate['hasPending'] = $aggregate['hasPending'] || ! empty( $status['hasPending'] );
+			$aggregate['hasDue']     = $aggregate['hasDue'] || ! empty( $status['hasDue'] );
+			$aggregate['lastAttemptAt']  = max( $aggregate['lastAttemptAt'], absint( $status['lastAttemptAt'] ?? 0 ) );
+			$aggregate['lastSuccessAt']  = max( $aggregate['lastSuccessAt'], absint( $status['lastSuccessAt'] ?? 0 ) );
+			$aggregate['lastActivityAt'] = max( $aggregate['lastActivityAt'], absint( $status['lastActivityAt'] ?? 0 ) );
+
+			$attempt = absint( $status['lastAttemptAt'] ?? 0 );
+			if ( $attempt >= $latest_result_attempt && isset( $status['lastResult'] ) && is_array( $status['lastResult'] ) ) {
+				$latest_result_attempt = $attempt;
+				$aggregate['lastResult'] = $status['lastResult'];
+			}
+
+			$aggregate['tableTiming'] = $this->merge_installation_timing(
+				$aggregate['tableTiming'],
+				isset( $status['tableTiming'] ) && is_array( $status['tableTiming'] ) ? $status['tableTiming'] : array()
+			);
+			$aggregate['fileTiming'] = $this->merge_installation_timing(
+				$aggregate['fileTiming'],
+				isset( $status['fileTiming'] ) && is_array( $status['fileTiming'] ) ? $status['fileTiming'] : array()
+			);
+		}
+
+		return $aggregate;
+	}
+
+	/**
+	 * Merge timing evidence from one Source into installation-wide queue timing.
+	 *
+	 * @param array $current Current aggregate.
+	 * @param array $next One Source timing snapshot.
+	 * @return array
+	 */
+	private function merge_installation_timing( $current, $next ) {
+		$current = is_array( $current ) ? $current : array();
+		$next    = is_array( $next ) ? $next : array();
+
+		$oldest = absint( $current['oldestPendingAt'] ?? 0 );
+		$next_oldest = absint( $next['oldestPendingAt'] ?? 0 );
+		if ( $next_oldest > 0 && ( $oldest <= 0 || $next_oldest < $oldest ) ) {
+			$oldest = $next_oldest;
+		}
+
+		$newest = max(
+			absint( $current['newestPendingUpdateAt'] ?? 0 ),
+			absint( $next['newestPendingUpdateAt'] ?? 0 )
+		);
+
+		$next_deferred = absint( $current['nextDeferredAt'] ?? 0 );
+		$candidate_deferred = absint( $next['nextDeferredAt'] ?? 0 );
+		if ( $candidate_deferred > 0 && ( $next_deferred <= 0 || $candidate_deferred < $next_deferred ) ) {
+			$next_deferred = $candidate_deferred;
+		}
+
+		$merged = array(
+			'oldestPendingAt'       => $oldest,
+			'newestPendingUpdateAt' => $newest,
+			'nextDeferredAt'        => $next_deferred,
+		);
+
+		/* Table timing carries last-event diagnostics in addition to timestamps.
+		 * Keep the diagnostics from whichever Source has the newest update. */
+		$current_last = absint( $current['lastUpdatedAt'] ?? 0 );
+		$next_last    = absint( $next['lastUpdatedAt'] ?? 0 );
+		if ( $next_last >= $current_last && $next_last > 0 ) {
+			foreach ( array( 'lastEventType', 'lastStatus', 'lastTryCount', 'lastUpdatedAt', 'lastError' ) as $key ) {
+				if ( array_key_exists( $key, $next ) ) {
+					$merged[ $key ] = $next[ $key ];
+				}
+			}
+		} elseif ( $current_last > 0 ) {
+			foreach ( array( 'lastEventType', 'lastStatus', 'lastTryCount', 'lastUpdatedAt', 'lastError' ) as $key ) {
+				if ( array_key_exists( $key, $current ) ) {
+					$merged[ $key ] = $current[ $key ];
+				}
+			}
+		}
+
+		return $merged;
 	}
 
 	/**
@@ -216,7 +419,7 @@ class Mobo_Core_Webhook_Queue {
 		}
 
 		$this->ensure_dirs();
-		update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
 
 		$configured_budget = null === $time_budget
 			? Mobo_Core_Settings::get_int( 'mobo_core_sync_time_budget_seconds', 8, 2, 25 )
@@ -264,17 +467,17 @@ class Mobo_Core_Webhook_Queue {
 			$result = array( 'success' => false, 'status' => 'invalid-result' );
 		}
 
-		update_option( 'mobo_core_webhook_queue_last_result', $result, false );
+		Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_result', $result, false );
 
 		if ( ! empty( $result['success'] ) ) {
-			update_option( 'mobo_core_webhook_queue_last_success_at', time(), false );
+			Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_success_at', time(), false );
 		}
 
 		$processed = isset( $result['processed'] ) ? absint( $result['processed'] ) : 0;
 		$failed    = isset( $result['failed'] ) ? absint( $result['failed'] ) : 0;
 
 		if ( $processed > 0 || $failed > 0 ) {
-			update_option( 'mobo_core_webhook_queue_last_activity_at', time(), false );
+			Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_activity_at', time(), false );
 		}
 	}
 
@@ -297,14 +500,18 @@ class Mobo_Core_Webhook_Queue {
 			$summary = method_exists( $store, 'get_summary' ) ? $store->get_summary() : array();
 		}
 
-		$last = $wpdb->get_row(
-			"SELECT event_type, status, try_count, updated_at, last_error
-			FROM {$table}
-			WHERE status IN ('pending', 'processing', 'failed')
-			ORDER BY updated_at DESC, id DESC
-			LIMIT 1",
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$last = $connection_id > 0 ? $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT event_type, status, try_count, updated_at, last_error
+				FROM {$table}
+				WHERE connection_id = %d AND status IN ('pending', 'processing', 'failed')
+				ORDER BY updated_at DESC, id DESC
+				LIMIT 1",
+				$connection_id
+			),
 			ARRAY_A
-		);
+		) : null;
 
 		return array(
 			'oldestPendingAt'      => $this->mysql_gmt_to_timestamp( isset( $summary['oldestPendingAt'] ) ? $summary['oldestPendingAt'] : '' ),
@@ -594,7 +801,7 @@ class Mobo_Core_Webhook_Queue {
 				continue;
 			}
 
-			$result = $this->process_item_safely( $item );
+			$result = $this->process_item_in_connection_context( $item );
 
 			if ( ! is_array( $result ) ) {
 				$result = array(
@@ -602,6 +809,17 @@ class Mobo_Core_Webhook_Queue {
 					'message' => 'Invalid processor result.',
 					'data'    => array(),
 				);
+			}
+			/* An owner disabled after this file was selected must not exhaust
+			 * retries or allow its work to run under another Connection. */
+			if ( ! empty( $result['data']['ownerUnavailable'] ) ) {
+				$item['nextRetryAt'] = time() + 120;
+				$item['updatedAt']   = time();
+				$deferred = $this->write_item( $file, $item );
+				$messages[] = $deferred
+					? 'Webhook owner unavailable; file deferred without consuming an attempt.'
+					: 'Webhook owner unavailable; deferral write failed and original file remains active.';
+				break;
 			}
 
 			if ( ! empty( $result['success'] ) ) {
@@ -770,11 +988,11 @@ class Mobo_Core_Webhook_Queue {
 	private function process_webhook_delivery_status_payload( $payload ) {
 		$data = isset( $payload['data'] ) && is_array( $payload['data'] ) ? $payload['data'] : $payload;
 		$at   = time();
-		update_option( 'mobo_core_portal_webhook_delivery_status', $data, false );
-		update_option( 'mobo_core_portal_webhook_delivery_status_at', $at, false );
+		Mobo_Core_Settings::update( 'mobo_core_portal_webhook_delivery_status', $data, false );
+		Mobo_Core_Settings::update( 'mobo_core_portal_webhook_delivery_status_at', $at, false );
 
-		$stored_data = get_option( 'mobo_core_portal_webhook_delivery_status', null );
-		$stored_at   = absint( get_option( 'mobo_core_portal_webhook_delivery_status_at', 0 ) );
+		$stored_data = Mobo_Core_Settings::get( 'mobo_core_portal_webhook_delivery_status', null );
+		$stored_at   = absint( Mobo_Core_Settings::get( 'mobo_core_portal_webhook_delivery_status_at', 0 ) );
 		if ( maybe_serialize( $stored_data ) !== maybe_serialize( $data ) || $stored_at !== $at ) {
 			return array(
 				'success' => false,
@@ -946,7 +1164,7 @@ class Mobo_Core_Webhook_Queue {
 
 				$item = $store->row_to_item( $row );
 				if ( is_wp_error( $item ) ) {
-					if ( ! $store->mark_failure( $event_id, $item->get_error_message(), absint( $row['try_count'] ) + 1, true, $claim_token ) ) {
+					if ( ! $store->mark_failure( $event_id, 'Webhook payload row could not be decoded (' . sanitize_key( (string) $item->get_error_code() ) . ').', absint( $row['try_count'] ) + 1, true, $claim_token ) ) {
 						$messages[] = 'commit وضعیت payload نامعتبر به دلیل از دست رفتن claim یا خطای DB انجام نشد.';
 						break;
 					}
@@ -1009,13 +1227,28 @@ class Mobo_Core_Webhook_Queue {
 						$remaining_seconds - 1
 					)
 				);
-				$result = $this->process_item_safely( $item, $payload_timeout );
+				$result = $this->process_item_in_connection_context( $item, $payload_timeout );
 				if ( ! is_array( $result ) ) {
 					$result = array(
 						'success' => false,
 						'message' => 'Invalid processor result.',
 						'data'    => array(),
 					);
+				}
+				/* An administrative disable/removal is not a delivery failure.
+				 * Retain the original owner and try count, release the claim and
+				 * defer until an operator restores the Source. */
+				if ( ! empty( $result['data']['ownerUnavailable'] ) ) {
+					$deferred = $store->mark_pending_progress(
+						$event_id,
+						isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array(),
+						array( 'deferSeconds' => 120, 'ownerUnavailable' => true ),
+						$claim_token
+					);
+					$messages[] = $deferred
+						? 'Webhook owner unavailable; event deferred without consuming an attempt.'
+						: 'Webhook owner unavailable; claim deferral failed and no fallback owner was selected.';
+					break;
 				}
 
 				if ( ! empty( $result['success'] ) ) {
@@ -1074,11 +1307,14 @@ class Mobo_Core_Webhook_Queue {
 				$message   = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : 'Webhook event processing failed.';
 				$max_try   = Mobo_Core_Settings::get_int( 'mobo_core_webhook_max_try', 5, 1, 20 );
 				$data      = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+				$non_retryable = ! empty( $data['nonRetryable'] );
 				$is_payload_pull_failure = ! empty( $data['payloadPullFailed'] );
 
-				if ( $is_payload_pull_failure ) {
-					update_option( 'mobo_core_last_payload_pull_error', $message, false );
-					update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
+				if ( $non_retryable ) {
+					$transitioned = $store->mark_failure( $event_id, $message, $try_count, true, $claim_token );
+				} elseif ( $is_payload_pull_failure ) {
+					Mobo_Core_Settings::update( 'mobo_core_last_payload_pull_error', $message, false );
+					Mobo_Core_Settings::update( 'mobo_core_last_payload_pull_error_at', time(), false );
 
 					if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 						Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
@@ -1114,8 +1350,10 @@ class Mobo_Core_Webhook_Queue {
 				}
 
 				$failed++;
-				if ( $try_count >= $max_try ) {
-					$messages[] = 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
+				if ( $non_retryable || $try_count >= $max_try ) {
+					$messages[] = $non_retryable
+						? 'یک event وب‌هوک به دلیل ordering conflict غیرقابل‌اثبات به‌صورت fail-closed متوقف شد.'
+						: 'یک event وب‌هوک پس از چند تلاش ناموفق failed شد. پردازش در این اجرا متوقف شد.';
 				} else {
 					$messages[] = 'پردازش event وب‌هوک ناموفق بود و برای retry در صف ماند. پردازش در این اجرا متوقف شد.';
 				}
@@ -1141,6 +1379,43 @@ class Mobo_Core_Webhook_Queue {
 	}
 
 	/**
+	 * Execute one queue item under its durable connection owner.
+	 *
+	 * @param array    $item Queue item.
+	 * @param int|null $payload_timeout Optional payload timeout.
+	 * @return array
+	 */
+	private function process_item_in_connection_context( $item, $payload_timeout = null ) {
+		$explicit_owner = is_array( $item ) && array_key_exists( 'connectionId', $item );
+		$connection_id = $explicit_owner ? absint( $item['connectionId'] ) : 0;
+		if ( $explicit_owner && $connection_id <= 0 ) {
+			return array( 'success' => false, 'message' => 'Webhook owner is invalid.', 'data' => array( 'ownerUnavailable' => true ) );
+		}
+		if ( ! $explicit_owner && class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$default = Mobo_Core_Connection_Repository::get_default();
+			$connection_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
+		}
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return array( 'success' => false, 'message' => 'Webhook owner is not available.', 'data' => array( 'ownerUnavailable' => true ) );
+		}
+		$owner = Mobo_Core_Connection_Repository::get_by_id( $connection_id );
+		if ( ! is_array( $owner ) || ! Mobo_Core_Connection_Repository::is_enabled_owner_fresh( $connection_id ) ) {
+			return array( 'success' => false, 'message' => 'Webhook owner is missing or disabled.', 'data' => array( 'ownerUnavailable' => true ) );
+		}
+
+		if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			return Mobo_Core_Connection_Context::run(
+				$connection_id,
+				function () use ( $item, $payload_timeout ) {
+					return $this->process_item_safely( $item, $payload_timeout );
+				}
+			);
+		}
+
+		return $this->process_item_safely( $item, $payload_timeout );
+	}
+
+	/**
 	 * Process one webhook item.
 	 *
 	 * @param array $item Queue item.
@@ -1153,9 +1428,9 @@ class Mobo_Core_Webhook_Queue {
 		$payload_result = $this->resolve_lightweight_payload( $event, $payload, $payload_timeout );
 
 		if ( is_wp_error( $payload_result ) ) {
-			$message = $payload_result->get_error_message();
-			update_option( 'mobo_core_last_payload_pull_error', $message, false );
-			update_option( 'mobo_core_last_payload_pull_error_at', time(), false );
+			$message = 'Webhook payload pull failed (' . sanitize_key( (string) $payload_result->get_error_code() ) . ').';
+			Mobo_Core_Settings::update( 'mobo_core_last_payload_pull_error', $message, false );
+			Mobo_Core_Settings::update( 'mobo_core_last_payload_pull_error_at', time(), false );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				Mobo_Core_Logger::error( 'Mobo Core payload pull failed: ' . $message );
@@ -1201,6 +1476,14 @@ class Mobo_Core_Webhook_Queue {
 				$result = $product_sync->process_update_variant_payload( $payload );
 				if ( class_exists( 'Mobo_Core_Sync_Health' ) && is_array( $result ) ) {
 					Mobo_Core_Sync_Health::record_webhook_result( 'UpdateVariant', $payload, $result );
+				}
+				/* PERF10: a lightweight Portal notification resolves to immutable
+				 * EventWebhook.Data for its EventId. Preserve that resolved payload when
+				 * UpdateVariant is deferred (for example while waiting for its parent),
+				 * so mark_pending_progress()/file fallback can retry locally instead of
+				 * downloading the same payload again. ProductUpdated already does this. */
+				if ( is_array( $result ) ) {
+					$result['payload'] = $payload;
 				}
 				return $result;
 
@@ -1255,10 +1538,9 @@ class Mobo_Core_Webhook_Queue {
 		try {
 			$result = $this->process_item( $item, $payload_timeout );
 		} catch ( Throwable $throwable ) {
-			$message = sanitize_text_field( (string) $throwable->getMessage() );
-			if ( '' === $message ) {
-				$message = 'Unhandled webhook processor exception.';
-			}
+			/* Throwable messages can embed signed URLs, X-SEC or an absolute path;
+			 * neither the queue's last_error nor Logger may retain them. */
+			$message = 'Unhandled webhook processor exception (' . sanitize_key( get_class( $throwable ) ) . ').';
 
 			try {
 				Mobo_Core_Logger::error( 'Mobo Core webhook processor exception: ' . $message );
@@ -1567,13 +1849,38 @@ class Mobo_Core_Webhook_Queue {
 			return array();
 		}
 
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' )
+			? absint( Mobo_Core_Connection_Context::get_effective_connection_id() )
+			: 0;
+		$default_connection_id = 0;
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$default = Mobo_Core_Connection_Repository::get_default();
+			$default_connection_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
+		}
+
 		$files = array_filter(
 			$files,
-			function ( $file ) {
-				return is_string( $file )
-					&& is_file( $file )
-					&& is_readable( $file )
-					&& ! $this->has_terminal_marker( $file );
+			function ( $file ) use ( $current_connection_id, $default_connection_id ) {
+				if ( ! is_string( $file ) || ! is_file( $file ) || ! is_readable( $file ) || $this->has_terminal_marker( $file ) ) {
+					return false;
+				}
+
+				/* Legacy fallback files predate Connection ownership. Treat them as
+				 * Default-Connection work only. New envelopes persist connectionId and
+				 * must never be surfaced to another authenticated/dispatcher context. */
+				if ( $current_connection_id <= 0 ) {
+					return true;
+				}
+
+				$contents = file_get_contents( $file );
+				$data = is_string( $contents ) && '' !== trim( $contents ) ? json_decode( $contents, true ) : null;
+				if ( is_array( $data ) && array_key_exists( 'connectionId', $data ) ) {
+					return absint( $data['connectionId'] ) === $current_connection_id;
+				}
+
+				/* Unknown/malformed and raw pre-Multi-Connection files have no durable
+				 * owner. Only the Default Connection may retire/process them. */
+				return $default_connection_id > 0 && $current_connection_id === $default_connection_id;
 			}
 		);
 
@@ -1692,6 +1999,7 @@ class Mobo_Core_Webhook_Queue {
 		if ( isset( $data['payload'] ) && is_array( $data['payload'] ) ) {
 			$event = isset( $data['event'] ) ? sanitize_text_field( (string) $data['event'] ) : $this->detect_event( $data['payload'] );
 
+			$data['connectionId'] = isset( $data['connectionId'] ) ? absint( $data['connectionId'] ) : 0;
 			$data['event']     = $event;
 			$data['try']       = isset( $data['try'] ) ? absint( $data['try'] ) : 0;
 			$data['createdAt'] = isset( $data['createdAt'] ) ? absint( $data['createdAt'] ) : filemtime( $file );
@@ -1706,7 +2014,14 @@ class Mobo_Core_Webhook_Queue {
 		 */
 		$event = $this->detect_event( $data );
 
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? Mobo_Core_Connection_Context::get_current_connection_id() : 0;
+		if ( $connection_id <= 0 && class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$default = Mobo_Core_Connection_Repository::get_default();
+			$connection_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
+		}
+
 		return array(
+			'connectionId' => $connection_id,
 			'id'        => wp_generate_uuid4(),
 			'event'     => sanitize_text_field( (string) $event ),
 			'syncId'    => sanitize_text_field( (string) $this->get_value( $data, 'syncId', '' ) ),

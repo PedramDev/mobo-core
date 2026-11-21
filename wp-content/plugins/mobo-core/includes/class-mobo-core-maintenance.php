@@ -82,10 +82,8 @@ class Mobo_Core_Maintenance {
 			$result = array(
 				'success'        => false,
 				'status'         => 'exception',
-				'message'        => $e->getMessage(),
-				'exceptionClass' => get_class( $e ),
-				'file'           => $e->getFile(),
-				'line'           => $e->getLine(),
+				'message'        => 'Maintenance operation failed with an internal exception.',
+				'exceptionClass' => sanitize_key( get_class( $e ) ),
 				'executedAt'     => time(),
 			);
 		} finally {
@@ -256,17 +254,150 @@ class Mobo_Core_Maintenance {
 
 		$done   = self::delete_status_before( $table, 'done', $done_cutoff, 3500, $deadline );
 		$failed = self::has_time( $deadline, 0.03 )
-			? self::delete_status_before( $table, 'failed', $fail_cutoff, 1500, $deadline )
-			: array( 'deleted' => 0, 'likelyRemaining' => false, 'status' => 'skipped-budget' );
+			? self::cleanup_failed_sync_events( $table, $fail_cutoff, 1500, $deadline )
+			: array( 'deleted' => 0, 'preservedTerminalEvidence' => 0, 'likelyRemaining' => false, 'status' => 'skipped-budget' );
 
 		return array(
 			'status'              => 'ok',
 			'deletedDone'         => absint( $done['deleted'] ),
 			'deletedFailed'       => absint( $failed['deleted'] ),
+			'preservedTerminalEvidence' => absint( isset( $failed['preservedTerminalEvidence'] ) ? $failed['preservedTerminalEvidence'] : 0 ),
 			'doneRetentionDays'   => self::SYNC_DONE_RETENTION_DAYS,
 			'failedRetentionDays' => self::SYNC_FAILED_RETENTION_DAYS,
 			'likelyRemaining'     => ! empty( $done['likelyRemaining'] ) || ! empty( $failed['likelyRemaining'] ),
 		);
+	}
+
+
+	/**
+	 * Delete old failed sync events without erasing the only durable evidence that
+	 * an incomplete product is blocked by an upstream-invalid UpdateVariant.
+	 *
+	 * Terminal attribute failures are mirrored into Sync Health first, under their
+	 * own durable Connection context. Only after that write is verified may the old
+	 * queue row be deleted. Ordinary failed rows retain the historical retention
+	 * behavior. A raced row that is no longer failed is not deleted.
+	 *
+	 * @param string $table Sync-event table.
+	 * @param string $cutoff UTC cutoff.
+	 * @param int    $max_rows Maximum rows per slice.
+	 * @param float  $deadline Monotonic deadline.
+	 * @return array
+	 */
+	private static function cleanup_failed_sync_events( $table, $cutoff, $max_rows, $deadline ) {
+		global $wpdb;
+
+		$max_rows = max( 1, absint( $max_rows ) );
+		$total = 0;
+		$preserved = 0;
+		$blocked = 0;
+		$likely = false;
+
+		while ( self::has_time( $deadline, 0.03 ) && $total < $max_rows ) {
+			$limit = min( self::DELETE_CHUNK_SIZE, $max_rows - $total );
+			$wpdb->last_error = '';
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, connection_id, event_type, entity_type, entity_guid, event_version, try_count, payload_json, last_error, updated_at
+					 FROM {$table}
+					 WHERE status='failed' AND updated_at < %s
+					 ORDER BY id ASC
+					 LIMIT %d",
+					$cutoff,
+					$limit
+				),
+				ARRAY_A
+			);
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+				return array( 'status' => 'db-error', 'deleted' => $total, 'preservedTerminalEvidence' => $preserved, 'blocked' => $blocked, 'likelyRemaining' => true );
+			}
+			if ( empty( $rows ) ) {
+				$likely = false;
+				break;
+			}
+
+			$delete_ids = array();
+			foreach ( $rows as $row ) {
+				$id = absint( isset( $row['id'] ) ? $row['id'] : 0 );
+				if ( $id <= 0 ) {
+					continue;
+				}
+				$error = (string) ( isset( $row['last_error'] ) ? $row['last_error'] : '' );
+				$is_terminal = 'UpdateVariant' === (string) ( isset( $row['event_type'] ) ? $row['event_type'] : '' )
+					&& absint( isset( $row['try_count'] ) ? $row['try_count'] : 0 ) >= 5
+					&& 0 === strpos( $error, 'Incomplete Mobo variant attributes.' );
+
+				if ( $is_terminal ) {
+					$payload = json_decode( (string) ( isset( $row['payload_json'] ) ? $row['payload_json'] : '' ), true );
+					$connection_id = absint( isset( $row['connection_id'] ) ? $row['connection_id'] : 0 );
+					$ok = false;
+					if ( class_exists( 'Mobo_Core_Sync_Health' ) && method_exists( 'Mobo_Core_Sync_Health', 'preserve_terminal_update_variant_evidence' ) && $connection_id > 0 ) {
+						$callback = function () use ( $payload, $row, $error ) {
+							return Mobo_Core_Sync_Health::preserve_terminal_update_variant_evidence(
+								is_array( $payload ) ? $payload : array(),
+								isset( $row['event_version'] ) ? (string) $row['event_version'] : '',
+								$error,
+								isset( $row['entity_type'] ) ? (string) $row['entity_type'] : '',
+								isset( $row['entity_guid'] ) ? (string) $row['entity_guid'] : ''
+							);
+						};
+						$ok = class_exists( 'Mobo_Core_Connection_Context' )
+							? (bool) Mobo_Core_Connection_Context::run( $connection_id, $callback )
+							: (bool) call_user_func( $callback );
+					}
+					if ( ! $ok ) {
+						$blocked++;
+						continue;
+					}
+					$preserved++;
+				}
+
+				$delete_ids[] = $id;
+			}
+
+			$deleted = self::delete_failed_sync_event_ids( $table, $delete_ids, $cutoff );
+			if ( false === $deleted ) {
+				return array( 'status' => 'db-error', 'deleted' => $total, 'preservedTerminalEvidence' => $preserved, 'blocked' => $blocked, 'likelyRemaining' => true );
+			}
+			$total += absint( $deleted );
+			$likely = count( $rows ) >= $limit;
+
+			/* If preservation failed for a row, avoid spinning on that same oldest
+			 * evidence inside one maintenance slice. Keep it durably for retry. */
+			if ( $blocked > 0 ) {
+				$likely = true;
+				break;
+			}
+			if ( count( $rows ) < $limit ) {
+				$likely = false;
+				break;
+			}
+		}
+
+		return array(
+			'status'                    => 'ok',
+			'deleted'                   => $total,
+			'preservedTerminalEvidence' => $preserved,
+			'blocked'                   => $blocked,
+			'likelyRemaining'           => $likely,
+		);
+	}
+
+	/** Delete selected failed event IDs only if their retained state is unchanged. */
+	private static function delete_failed_sync_event_ids( $table, $ids, $cutoff ) {
+		global $wpdb;
+		$ids = self::normalize_ids( $ids );
+		if ( empty( $ids ) ) {
+			return 0;
+		}
+		if ( ! class_exists( 'Mobo_Core_Sync_Event_Store' ) || (string) $table !== (string) Mobo_Core_Sync_Event_Store::table_name() ) {
+			return false;
+		}
+		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$args = array_merge( array( $cutoff ), $ids );
+		$sql = "DELETE FROM {$table} WHERE status='failed' AND updated_at < %s AND id IN ({$placeholders})";
+		$rows = $wpdb->query( $wpdb->prepare( $sql, $args ) );
+		return false === $rows ? false : absint( $rows );
 	}
 
 	/**

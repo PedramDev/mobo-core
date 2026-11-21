@@ -46,35 +46,35 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	public static function get_status() {
-		$last = get_option( self::OPTION_LAST_RESULT, array() );
+		$last = Mobo_Core_Settings::get( self::OPTION_LAST_RESULT, array() );
 		$last = is_array( $last ) ? $last : array();
 
-		$tick_started  = absint( get_option( self::OPTION_LAST_TICK_STARTED_AT, 0 ) );
-		$tick_finished = absint( get_option( self::OPTION_LAST_TICK_FINISHED_AT, 0 ) );
+		$tick_started  = absint( Mobo_Core_Settings::get( self::OPTION_LAST_TICK_STARTED_AT, 0 ) );
+		$tick_finished = absint( Mobo_Core_Settings::get( self::OPTION_LAST_TICK_FINISHED_AT, 0 ) );
 		$lock_active   = class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( 'image_refresh_automation' );
 		$tick_open     = $tick_started > 0 && $tick_started > $tick_finished;
 		$tick_age      = $tick_open ? max( 0, time() - $tick_started ) : 0;
-		$generation_stats = get_option( self::OPTION_GENERATION_STATS, array() );
+		$generation_stats = Mobo_Core_Settings::get( self::OPTION_GENERATION_STATS, array() );
 		$generation_stats = is_array( $generation_stats ) ? $generation_stats : array();
 
 		return array(
 			'enabled'              => Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ),
 			'deleteOldApproved'    => Mobo_Core_Settings::enabled( 'mobo_core_image_refresh_delete_old', '0' ),
 			'deleteOrphanApproved' => Mobo_Core_Settings::enabled( self::OPTION_DELETE_ORPHAN_APPROVED, '0' ),
-			'startedAt'            => absint( get_option( self::OPTION_STARTED_AT, 0 ) ),
-			'completedAt'          => absint( get_option( self::OPTION_COMPLETED_AT, 0 ) ),
-			'lastRunAt'            => absint( get_option( self::OPTION_LAST_RUN_AT, 0 ) ),
+			'startedAt'            => absint( Mobo_Core_Settings::get( self::OPTION_STARTED_AT, 0 ) ),
+			'completedAt'          => absint( Mobo_Core_Settings::get( self::OPTION_COMPLETED_AT, 0 ) ),
+			'lastRunAt'            => absint( Mobo_Core_Settings::get( self::OPTION_LAST_RUN_AT, 0 ) ),
 			'lastTickStartedAt'    => $tick_started,
 			'lastTickFinishedAt'   => $tick_finished,
 			'lastTickDuration'     => $tick_started > 0 && $tick_finished >= $tick_started ? $tick_finished - $tick_started : 0,
-			'lastTickSource'       => sanitize_key( (string) get_option( self::OPTION_LAST_TICK_SOURCE, '' ) ),
+			'lastTickSource'       => sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_LAST_TICK_SOURCE, '' ) ),
 			'batchRunning'         => $lock_active && $tick_open && $tick_age <= 240,
 			'batchPossiblyStuck'   => $tick_open && $tick_age > 240,
 			'currentStep'          => absint( isset( $last['step'] ) ? $last['step'] : 0 ),
 			'status'               => isset( $last['status'] ) ? sanitize_key( (string) $last['status'] ) : 'idle',
 			'waitingApproval'      => isset( $last['waitingApproval'] ) ? sanitize_key( (string) $last['waitingApproval'] ) : '',
 				'message'              => isset( $last['message'] ) ? sanitize_text_field( (string) $last['message'] ) : '',
-				'generationId'         => sanitize_text_field( (string) get_option( self::OPTION_GENERATION_ID, '' ) ),
+				'generationId'         => sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_GENERATION_ID, '' ) ),
 				'generationStats'      => $generation_stats,
 				'lastResult'           => $last,
 		);
@@ -104,16 +104,33 @@ class Mobo_Core_Image_Refresh_Automation {
 			);
 		}
 
+		/* Product Repair is an independent administrator decision. Reject the start
+		 * before creating a generation, resetting cleanup state or retrying queue rows. */
+		$repair = $this->ensure_product_repair_ready();
+		if ( empty( $repair['ready'] ) ) {
+			return $this->save_result(
+				array(
+					'success'               => false,
+					'status'                => isset( $repair['status'] ) ? sanitize_key( (string) $repair['status'] ) : 'waiting-product-repair',
+					'step'                  => 0,
+					'needsContinuation'     => false,
+					'progressed'            => false,
+					'retriedLegacyFailures' => 0,
+					'message'               => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'پیش‌نیاز Repair محصولات تکمیل نشده است.',
+				)
+			);
+		}
+
 		if ( 'completed' === ( isset( $previous['status'] ) ? $previous['status'] : '' ) ) {
 			$this->reset_for_new_cycle();
 		}
 
-		$generation_id = sanitize_text_field( (string) get_option( self::OPTION_GENERATION_ID, '' ) );
+		$generation_id = sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_GENERATION_ID, '' ) );
 		if ( '' === $generation_id ) {
 			$generation_id = wp_generate_uuid4();
-			update_option( self::OPTION_GENERATION_ID, $generation_id, false );
-			update_option( self::OPTION_GENERATION_STARTED_AT, time(), false );
-			update_option(
+			Mobo_Core_Settings::update( self::OPTION_GENERATION_ID, $generation_id, false );
+			Mobo_Core_Settings::update( self::OPTION_GENERATION_STARTED_AT, time(), false );
+			Mobo_Core_Settings::update(
 				self::OPTION_GENERATION_STATS,
 				array(
 					'generationId'   => $generation_id,
@@ -126,9 +143,9 @@ class Mobo_Core_Image_Refresh_Automation {
 				false
 			);
 		}
-		update_option( 'mobo_core_image_refresh_force_source_reimport', '1', false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_force_source_reimport', '1', false );
 
-		delete_option( self::OPTION_PREFLIGHT_COMPLETED_AT );
+		Mobo_Core_Settings::delete( self::OPTION_PREFLIGHT_COMPLETED_AT );
 		if ( class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ) {
 			$cleanup = new Mobo_Core_Orphan_Image_Cleanup();
 			$cleanup->reset( true );
@@ -143,32 +160,17 @@ class Mobo_Core_Image_Refresh_Automation {
 		/* One click owns every workflow decision from here onward. Safe deletion is
 		 * still guarded by the per-attachment/per-family audits immediately before
 		 * mutation; these flags merely remove administrator approval gates. */
-		update_option( self::OPTION_ENABLED, '1', false );
-		update_option( self::OPTION_COMPLETED_AT, 0, false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
+		Mobo_Core_Settings::update( self::OPTION_COMPLETED_AT, 0, false );
 		/* Destructive switches stay off during replacement. The coordinator arms
 		 * them only when their dedicated safety-audit stage is reached. */
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
-		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
-		if ( absint( get_option( self::OPTION_STARTED_AT, 0 ) ) <= 0 ) {
-			update_option( self::OPTION_STARTED_AT, time(), false );
+		if ( absint( Mobo_Core_Settings::get( self::OPTION_STARTED_AT, 0 ) ) <= 0 ) {
+			Mobo_Core_Settings::update( self::OPTION_STARTED_AT, time(), false );
 		}
 
-		$repair = $this->ensure_product_repair_ready();
-		if ( empty( $repair['ready'] ) ) {
-			update_option( self::OPTION_ENABLED, '0', false );
-			return $this->save_result(
-				array(
-					'success'               => true,
-					'status'                => isset( $repair['status'] ) ? sanitize_key( (string) $repair['status'] ) : 'waiting-product-repair',
-					'step'                  => 0,
-					'needsContinuation'     => ! empty( $repair['needsContinuation'] ),
-					'progressed'            => ! empty( $repair['progressed'] ),
-					'retriedLegacyFailures' => absint( $retried_legacy_failures ),
-					'message'               => isset( $repair['message'] ) ? sanitize_text_field( (string) $repair['message'] ) : 'پیش‌نیاز Repair محصولات تکمیل نشده است.',
-				)
-			);
-		}
 
 		return $this->save_result(
 			array(
@@ -290,10 +292,10 @@ class Mobo_Core_Image_Refresh_Automation {
 			);
 		}
 
-		update_option( self::OPTION_ENABLED, '1', false );
-		update_option( self::OPTION_COMPLETED_AT, 0, false );
-		if ( absint( get_option( self::OPTION_STARTED_AT, 0 ) ) <= 0 ) {
-			update_option( self::OPTION_STARTED_AT, time(), false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
+		Mobo_Core_Settings::update( self::OPTION_COMPLETED_AT, 0, false );
+		if ( absint( Mobo_Core_Settings::get( self::OPTION_STARTED_AT, 0 ) ) <= 0 ) {
+			Mobo_Core_Settings::update( self::OPTION_STARTED_AT, time(), false );
 		}
 
 		return $this->save_result(
@@ -413,30 +415,28 @@ class Mobo_Core_Image_Refresh_Automation {
 		}
 
 		$tick_started = time();
-		$last_tick_telemetry_at = absint( get_option( self::OPTION_LAST_RUN_AT, 0 ) );
+		$last_tick_telemetry_at = absint( Mobo_Core_Settings::get( self::OPTION_LAST_RUN_AT, 0 ) );
 		$persist_tick_telemetry = 0 === $last_tick_telemetry_at || ( $tick_started - $last_tick_telemetry_at ) >= 5;
 
 		/* These options are UI telemetry, not workflow checkpoints. During a tight
 		 * self-runner continuation loop, persist them at most once every five
 		 * seconds instead of generating four option writes for every stage pass. */
 		if ( $persist_tick_telemetry ) {
-			update_option( self::OPTION_LAST_TICK_STARTED_AT, $tick_started, false );
-			update_option( self::OPTION_LAST_TICK_FINISHED_AT, 0, false );
-			update_option( self::OPTION_LAST_TICK_SOURCE, sanitize_key( (string) $source ), false );
-			update_option( self::OPTION_LAST_RUN_AT, $tick_started, false );
+			Mobo_Core_Settings::update( self::OPTION_LAST_TICK_STARTED_AT, $tick_started, false );
+			Mobo_Core_Settings::update( self::OPTION_LAST_TICK_FINISHED_AT, 0, false );
+			Mobo_Core_Settings::update( self::OPTION_LAST_TICK_SOURCE, sanitize_key( (string) $source ), false );
+			Mobo_Core_Settings::update( self::OPTION_LAST_RUN_AT, $tick_started, false );
 		}
 
 		try {
 			$result = $this->run_locked( sanitize_key( (string) $source ) );
 		} catch ( Throwable $e ) {
-			$result = $this->pause_for_error( 'یک اجرای نوسازی با خطای غیرمنتظره پایان یافت؛ چرخه فعال می ماند و خودکار دوباره تلاش می کند: ' . $e->getMessage(), 0, 'automation-exception' );
+			$result = $this->pause_for_error( 'یک اجرای نوسازی با خطای غیرمنتظره پایان یافت؛ چرخه فعال می ماند و خودکار دوباره تلاش می کند.', 0, 'automation-exception' );
 			$result['exceptionClass'] = get_class( $e );
-			$result['file']           = $e->getFile();
-			$result['line']           = $e->getLine();
 		} finally {
 			$tick_finished = time();
 			if ( $persist_tick_telemetry ) {
-				update_option( self::OPTION_LAST_TICK_FINISHED_AT, $tick_finished, false );
+				Mobo_Core_Settings::update( self::OPTION_LAST_TICK_FINISHED_AT, $tick_finished, false );
 			}
 			Mobo_Core_Lock::release( 'image_refresh_automation', $lock );
 			if ( class_exists( 'Mobo_Core_Recovery_Coordinator' ) ) {
@@ -460,7 +460,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	private function run_locked( $source ) {
 		$repair = $this->ensure_product_repair_ready();
 		if ( empty( $repair['ready'] ) ) {
-			update_option( self::OPTION_ENABLED, '0', false );
+			Mobo_Core_Settings::update( self::OPTION_ENABLED, '0', false );
 			return array(
 				'success'           => true,
 				'status'            => isset( $repair['status'] ) ? sanitize_key( (string) $repair['status'] ) : 'waiting-product-repair',
@@ -556,8 +556,8 @@ class Mobo_Core_Image_Refresh_Automation {
 			$hard_errors = absint( isset( $subsize_scan['unsupportedEditor'] ) ? $subsize_scan['unsupportedEditor'] : 0 )
 				+ absint( isset( $subsize_scan['missingOriginal'] ) ? $subsize_scan['missingOriginal'] : 0 );
 			if ( $hard_errors > 0 ) {
-				update_option( self::OPTION_SUBSIZE_QUARANTINED, '1', false );
-				delete_option( self::OPTION_SUBSIZE_RETRY_AT );
+				Mobo_Core_Settings::update( self::OPTION_SUBSIZE_QUARANTINED, '1', false );
+				Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_RETRY_AT );
 				return array(
 					'success'           => true,
 					'status'            => 'subsize-quarantined',
@@ -569,7 +569,7 @@ class Mobo_Core_Image_Refresh_Automation {
 			}
 
 			if ( absint( isset( $subsize_scan['needsRepair'] ) ? $subsize_scan['needsRepair'] : 0 ) > 0 ) {
-				$retry_at = absint( get_option( self::OPTION_SUBSIZE_RETRY_AT, 0 ) );
+				$retry_at = absint( Mobo_Core_Settings::get( self::OPTION_SUBSIZE_RETRY_AT, 0 ) );
 				if ( $retry_at > time() ) {
 					return array(
 						'success'           => true,
@@ -588,11 +588,11 @@ class Mobo_Core_Image_Refresh_Automation {
 
 				$operation = $service->audit_webp_subsizes( $scan_limit, true );
 				if ( ! empty( $operation['cycleComplete'] ) && absint( isset( $operation['failed'] ) ? $operation['failed'] : 0 ) > 0 ) {
-					$attempt = absint( get_option( self::OPTION_SUBSIZE_RETRY_COUNT, 0 ) ) + 1;
-					update_option( self::OPTION_SUBSIZE_RETRY_COUNT, $attempt, false );
+					$attempt = absint( Mobo_Core_Settings::get( self::OPTION_SUBSIZE_RETRY_COUNT, 0 ) ) + 1;
+					Mobo_Core_Settings::update( self::OPTION_SUBSIZE_RETRY_COUNT, $attempt, false );
 					if ( $attempt >= 3 ) {
-						update_option( self::OPTION_SUBSIZE_QUARANTINED, '1', false );
-						delete_option( self::OPTION_SUBSIZE_RETRY_AT );
+						Mobo_Core_Settings::update( self::OPTION_SUBSIZE_QUARANTINED, '1', false );
+						Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_RETRY_AT );
 						return array(
 							'success'           => true,
 							'status'            => 'subsize-quarantined',
@@ -603,7 +603,7 @@ class Mobo_Core_Image_Refresh_Automation {
 						);
 					}
 					$delay = Mobo_Core_Settings::get_int( 'mobo_core_image_long_retry_seconds', 21600, 3600, 604800 );
-					update_option( self::OPTION_SUBSIZE_RETRY_AT, time() + $delay, false );
+					Mobo_Core_Settings::update( self::OPTION_SUBSIZE_RETRY_AT, time() + $delay, false );
 					return array(
 						'success'           => true,
 						'status'            => 'waiting-subsize-retry',
@@ -613,7 +613,7 @@ class Mobo_Core_Image_Refresh_Automation {
 						'message'           => sprintf( 'بازسازی برخی برش ها کامل نشد؛ تلاش خودکار %d از 3 ثبت شد و بدون دخالت مدیر دوباره امتحان می شود.', $attempt ),
 					);
 				}
-				delete_option( self::OPTION_SUBSIZE_RETRY_AT );
+				Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_RETRY_AT );
 				return $this->operation_result( 5, 'repair-webp-subsizes', $operation, 'بازسازی خودکار برش های ناقص WebP', true );
 			}
 		}
@@ -641,7 +641,7 @@ class Mobo_Core_Image_Refresh_Automation {
 		$migration_candidates  = absint( isset( $replaced_scan['migrationCandidates'] ) ? $replaced_scan['migrationCandidates'] : 0 );
 		$replaced_actionable   = $replaced_ready + $migration_candidates;
 		if ( $replaced_actionable > 0 && ( ! $delete_newer || $delete_needs_followup ) ) {
-			update_option( 'mobo_core_image_refresh_delete_old', '1', false );
+			Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '1', false );
 			$operation = $service->audit_replaced_legacy_attachments( $scan_limit, true );
 			$result    = $this->operation_result( 7, 'delete-replaced-old', $operation, 'انتقال مراجع و حذف خودکار و امن پیوست های قدیمی', true );
 			if ( ! empty( $operation['cycleComplete'] ) && ! empty( $operation['needsAnotherPass'] ) ) {
@@ -657,7 +657,7 @@ class Mobo_Core_Image_Refresh_Automation {
 		if ( $delete_stable ) {
 			/* Stage 7 converged. Keep the global destructive switch scoped to this
 			 * stage so normal image replacement outside this workflow is unaffected. */
-			update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+			Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
 			if ( $replaced_actionable > 0 ) {
 				/* Remaining rows are safety-blocked and intentionally retained. */
 			}
@@ -686,7 +686,7 @@ class Mobo_Core_Image_Refresh_Automation {
 
 		$orphan_candidates = absint( isset( $orphan_status['actionable'] ) ? $orphan_status['actionable'] : ( isset( $orphan_status['candidate'] ) ? $orphan_status['candidate'] : 0 ) );
 		if ( $orphan_candidates > 0 ) {
-			update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
+			Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
 			update_option( 'mobo_core_orphan_image_cleanup_enabled', '1', false );
 			$operation = $cleanup->delete_candidates( Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 200 ) );
 			$remaining = absint( isset( $operation['remainingFamilies'] ) ? $operation['remainingFamilies'] : 0 );
@@ -706,7 +706,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	private function run_preflight_storage_cleanup( $scan_limit ) {
-		if ( absint( get_option( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) > 0 ) {
+		if ( absint( Mobo_Core_Settings::get( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) > 0 ) {
 			return array( 'ready' => true, 'status' => 'preflight-complete' );
 		}
 
@@ -751,7 +751,7 @@ class Mobo_Core_Image_Refresh_Automation {
 		$status     = $cleanup->get_status();
 		$actionable = absint( isset( $status['actionable'] ) ? $status['actionable'] : 0 );
 		if ( $actionable > 0 ) {
-			update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
+			Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '1', false );
 			update_option( 'mobo_core_orphan_image_cleanup_enabled', '1', false );
 			$operation = $cleanup->delete_candidates( Mobo_Core_Settings::get_int( 'mobo_core_orphan_image_delete_per_run', 20, 1, 100 ) );
 			return array(
@@ -792,8 +792,8 @@ class Mobo_Core_Image_Refresh_Automation {
 			);
 		}
 
-		update_option( self::OPTION_PREFLIGHT_COMPLETED_AT, time(), false );
-		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		Mobo_Core_Settings::update( self::OPTION_PREFLIGHT_COMPLETED_AT, time(), false );
+		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 		return array( 'ready' => true, 'status' => 'preflight-complete' );
 	}
@@ -806,8 +806,8 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	private function ensure_product_repair_ready() {
-		delete_option( self::OPTION_REPAIR_RETRY_COUNT );
-		delete_option( self::OPTION_REPAIR_RETRY_AT );
+		Mobo_Core_Settings::delete( self::OPTION_REPAIR_RETRY_COUNT );
+		Mobo_Core_Settings::delete( self::OPTION_REPAIR_RETRY_AT );
 
 		if ( class_exists( 'Mobo_Core_Product_Sync' ) && Mobo_Core_Product_Sync::is_repair_completed() ) {
 			return array( 'ready' => true, 'status' => 'repair-ready', 'needsContinuation' => true, 'progressed' => false );
@@ -862,7 +862,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return int
 	 */
 	private function detect_step() {
-		if ( absint( get_option( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) <= 0 ) {
+		if ( absint( Mobo_Core_Settings::get( self::OPTION_PREFLIGHT_COMPLETED_AT, 0 ) ) <= 0 ) {
 			return 0;
 		}
 
@@ -967,8 +967,8 @@ class Mobo_Core_Image_Refresh_Automation {
 	private function pause_for_error( $message, $step, $status ) {
 		/* Fail closed for the current mutation, but never strand the global workflow.
 		 * Real Cron/Self Runner will retry the stage later. */
-		update_option( self::OPTION_ENABLED, '1', false );
-		update_option( 'mobo_core_image_refresh_enabled', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_enabled', '0', false );
 
 		return array(
 			'success'           => false,
@@ -986,26 +986,34 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	private function complete() {
-		update_option( self::OPTION_ENABLED, '0', false );
-		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
-		update_option( self::OPTION_COMPLETED_AT, time(), false );
-		update_option( 'mobo_core_image_refresh_enabled', '0', false );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '0', false );
+		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		Mobo_Core_Settings::update( self::OPTION_COMPLETED_AT, time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_enabled', '0', false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
 
-		$stage7  = get_option( 'mobo_core_image_refresh_last_replaced_delete', array() );
+		$stage7  = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_replaced_delete', array() );
 		$stage7  = is_array( $stage7 ) ? $stage7 : array();
 		$blocked = absint( isset( $stage7['blocked'] ) ? $stage7['blocked'] : 0 );
 		$errors  = absint( isset( $stage7['errors'] ) ? $stage7['errors'] : 0 );
 		$queue_status = class_exists( 'Mobo_Core_Image_Refresh_Queue' ) ? ( new Mobo_Core_Image_Refresh_Queue() )->get_status() : array();
 		$quarantined_queue = absint( isset( $queue_status['failed'] ) ? $queue_status['failed'] : 0 );
 		$subsize_quarantined = Mobo_Core_Settings::enabled( self::OPTION_SUBSIZE_QUARANTINED, '0' );
-		$message = 'نوسازی تصاویر به نقطه پایدار رسید و تمام تصمیم های قابل انجام خودکار انجام شد. نیازی به اقدام دیگری از مدیر سایت نیست.';
+		$orphan_status = class_exists( 'Mobo_Core_Orphan_Image_Cleanup' ) ? ( new Mobo_Core_Orphan_Image_Cleanup() )->get_status() : array();
+		$orphan_failed = is_array( $orphan_status ) ? absint( isset( $orphan_status['failed'] ) ? $orphan_status['failed'] : 0 ) : 0;
+		$completed_with_retained = $quarantined_queue > 0 || $subsize_quarantined || $blocked > 0 || $errors > 0 || $orphan_failed > 0;
+		$message = $completed_with_retained
+			? 'نوسازی تصاویر به نقطه پایدار رسید، اما برخی مواردی که ایمن قابل ترمیم یا حذف نبودند عمداً حفظ شدند.'
+			: 'نوسازی تصاویر به نقطه پایدار رسید و تمام تصمیم های قابل انجام خودکار انجام شد. مورد نگه‌داشته‌شده یا خطای عملیاتی شناخته‌شده‌ای باقی نمانده است.';
 		if ( $quarantined_queue > 0 || $subsize_quarantined ) {
 			$message .= sprintf( ' %d تصویر در صف پس از Retryهای کافی قرنطینه شد%s؛ موارد ناامن حفظ شده اند و حذف نشده اند.', $quarantined_queue, $subsize_quarantined ? ' و برخی برش های WebP نیز برای این چرخه قابل تعمیر نبودند' : '' );
 		}
 		if ( $blocked > 0 || $errors > 0 ) {
 			$message .= sprintf( ' در آخرین گذر Stage 7، %d پیوست به دلیل Safety Audit نگه داشته شد و %d خطای عملیاتی ثبت شد؛ این موارد عمدا بدون حذف باقی مانده اند.', $blocked, $errors );
+		}
+		if ( $orphan_failed > 0 ) {
+			$message .= sprintf( ' پاک‌سازی orphan نیز %d خانواده ناموفق را بدون حذف نگه داشت تا یک چرخه آینده دوباره آن‌ها را ارزیابی کند.', $orphan_failed );
 		}
 
 		return array(
@@ -1039,19 +1047,19 @@ class Mobo_Core_Image_Refresh_Automation {
 			$cleanup->reset( false );
 		}
 
-		update_option( self::OPTION_STARTED_AT, 0, false );
-		update_option( self::OPTION_COMPLETED_AT, 0, false );
-		delete_option( self::OPTION_SUBSIZE_RETRY_COUNT );
-		delete_option( self::OPTION_SUBSIZE_RETRY_AT );
-		delete_option( self::OPTION_SUBSIZE_QUARANTINED );
-		delete_option( self::OPTION_REPAIR_RETRY_COUNT );
-		delete_option( self::OPTION_REPAIR_RETRY_AT );
-		delete_option( self::OPTION_PREFLIGHT_COMPLETED_AT );
-		delete_option( self::OPTION_GENERATION_ID );
-		delete_option( self::OPTION_GENERATION_STARTED_AT );
-		delete_option( self::OPTION_GENERATION_STATS );
-		update_option( 'mobo_core_image_refresh_delete_old', '0', false );
-		update_option( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
+		Mobo_Core_Settings::update( self::OPTION_STARTED_AT, 0, false );
+		Mobo_Core_Settings::update( self::OPTION_COMPLETED_AT, 0, false );
+		Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_RETRY_COUNT );
+		Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_RETRY_AT );
+		Mobo_Core_Settings::delete( self::OPTION_SUBSIZE_QUARANTINED );
+		Mobo_Core_Settings::delete( self::OPTION_REPAIR_RETRY_COUNT );
+		Mobo_Core_Settings::delete( self::OPTION_REPAIR_RETRY_AT );
+		Mobo_Core_Settings::delete( self::OPTION_PREFLIGHT_COMPLETED_AT );
+		Mobo_Core_Settings::delete( self::OPTION_GENERATION_ID );
+		Mobo_Core_Settings::delete( self::OPTION_GENERATION_STARTED_AT );
+		Mobo_Core_Settings::delete( self::OPTION_GENERATION_STATS );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_delete_old', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_DELETE_ORPHAN_APPROVED, '0', false );
 	}
 
 	/**
@@ -1123,7 +1131,10 @@ class Mobo_Core_Image_Refresh_Automation {
 	 * @return array
 	 */
 	private function array_option( $name ) {
-		$value = get_option( $name, array() );
+		$name = sanitize_key( (string) $name );
+		$value = class_exists( 'Mobo_Core_Settings' )
+			? Mobo_Core_Settings::get( $name, array() )
+			: array();
 		return is_array( $value ) ? $value : array();
 	}
 
@@ -1136,7 +1147,7 @@ class Mobo_Core_Image_Refresh_Automation {
 	private function save_result( $result ) {
 		$result = is_array( $result ) ? $result : array();
 		$result['updatedAt'] = time();
-		update_option( self::OPTION_LAST_RESULT, $result, false );
+		Mobo_Core_Settings::update( self::OPTION_LAST_RESULT, $result, false );
 		return $result;
 	}
 }

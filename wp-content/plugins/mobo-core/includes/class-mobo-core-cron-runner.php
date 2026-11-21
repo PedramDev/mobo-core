@@ -3,8 +3,10 @@
  * Real cron runner.
  *
  * This class is intentionally independent from WP-Cron. It is triggered by a
- * server/cPanel cron that calls /wp-json/mobo-core/v1/cron/run?token=...
- * or by WP-CLI/custom integrations.
+ * server/cPanel cron that executes mobo-cron.php directly, by the authenticated
+ * HTTP fallback (/wp-json/mobo-core/v1/cron/run with the Cron/Worker token in
+ * X-SEC), or by WP-CLI/custom integrations. Query-token HTTP authentication is
+ * retained only for backward compatibility and is not the preferred setup.
  *
  * PHP 7.4 compatible.
  */
@@ -15,6 +17,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Cron_Runner {
 
+	const SCHEDULE_TOLERANCE_SECONDS = 5;
 	const BASELINE_SUSPEND_OPTION = 'mobo_core_test_baseline_suspend_real_cron_until';
 
 	/** @var string Site-wide dispatcher lease token owned by this request. */
@@ -38,6 +41,7 @@ class Mobo_Core_Cron_Runner {
 
 		$source = sanitize_key( (string) $source );
 		$source = '' !== $source ? $source : 'real-cron';
+		$scheduler_hit_recorded = ! empty( $runtime_overrides['schedulerHitRecorded'] );
 
 		/* Deterministic WAMP baseline fence. This option is intentionally ignored
 		 * outside a clearly local/development site, is time bounded, and is checked
@@ -56,14 +60,74 @@ class Mobo_Core_Cron_Runner {
 			Mobo_Core_Settings::prime_runtime_options();
 		}
 
-		update_option( 'mobo_core_real_cron_last_hit_at', time(), false );
+		if ( self::is_real_scheduler_source( $source ) && ! $scheduler_hit_recorded ) {
+			self::record_real_cron_hit();
+		}
+
+
+		/* Database migration is driven by the customer's existing real cron and is no
+		 * longer coupled to storefront traffic. One cron invocation advances many
+		 * durable bounded batches inside a short wall-clock budget. Ordinary requests
+		 * still execute only the conservative single-step path on plugins_loaded. */
+		if ( class_exists( 'Mobo_Core_Migration' ) && Mobo_Core_Migration::needs_budgeted_migration_slice() ) {
+			$migration = Mobo_Core_Migration::run_budgeted_slice( $source, 12, 200 );
+			$result = array(
+				'success' => ! empty( $migration['success'] ),
+				'status' => ! empty( $migration['needsContinuation'] ) ? 'database-migration' : 'database-migration-complete',
+				'source' => $source,
+				'executedAt' => time(),
+				'needsContinuation' => ! empty( $migration['needsContinuation'] ),
+				'databaseMigration' => $migration,
+			);
+			/* Do not stack the ordinary queue runner onto the terminal migration request.
+			 * Even the completion slice stays bounded; normal work resumes on the next
+			 * scheduled Cron invocation. */
+			$this->save_last_result( $result );
+			return $result;
+		}
 
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
+			/* An administrator-started Unicode conversion intentionally owns the same
+			 * global runtime barrier as plugin upgrade work. While that specific
+			 * checkpointed workflow is active, Cron may advance exactly one bounded
+			 * database-maintenance step instead of starting ordinary Source workers. */
+			if ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) && Mobo_Core_Database_Unicode_Migration::should_continue_automatically() ) {
+				$migration = Mobo_Core_Database_Unicode_Migration::process_slice( $source );
+				$result = array(
+					'success'              => ! empty( $migration['success'] ),
+					'status'               => ! empty( $migration['success'] ) ? 'database-unicode-maintenance' : 'database-unicode-maintenance-failed',
+					'source'               => $source,
+					'executedAt'           => time(),
+					'needsContinuation'    => ! empty( $migration['needsContinuation'] ),
+					'databaseUnicodeMigration' => $migration,
+					'upgradeBarrier'       => Mobo_Core_Upgrade_Coordinator::get_status(),
+				);
+				$this->save_last_result( $result );
+				return $result;
+			}
+
 			$result               = Mobo_Core_Upgrade_Coordinator::paused_result( 'cron-runner' );
 			$result['source']     = $source;
 			$result['executedAt'] = time();
 			$this->save_last_result( $result );
 			return $result;
+		}
+
+		if ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) ) {
+			$unicode_migration = Mobo_Core_Database_Unicode_Migration::get_status();
+			if ( Mobo_Core_Database_Unicode_Migration::should_block_runtime_lock( 'real_cron_runner' ) ) {
+				$result = array(
+					'success' => true,
+					'status' => 'database-unicode-blocked',
+					'source' => $source,
+					'executedAt' => time(),
+					'needsContinuation' => false,
+					'databaseUnicodeMigration' => $unicode_migration,
+					'message' => 'Mobo workers remain fail-closed until the explicit database Unicode remediation reaches terminal verification.',
+				);
+				$this->save_last_result( $result );
+				return $result;
+			}
 		}
 
 		if ( function_exists( 'ignore_user_abort' ) ) {
@@ -115,7 +179,8 @@ class Mobo_Core_Cron_Runner {
 			}
 		} catch ( Throwable $e ) {
 			$stale_lock_recovery = array(
-				'error' => $e->getMessage(),
+				'error' => 'lock-recovery-exception',
+				'exceptionClass' => get_class( $e ),
 			);
 		}
 
@@ -124,7 +189,7 @@ class Mobo_Core_Cron_Runner {
 				Mobo_Core_API_Client::set_runtime_deadline( microtime( true ) + max( 1, (int) $config['effectiveTimeBudgetSeconds'] ), 1.0 );
 			}
 
-			$result = $this->run_locked( $source, $lock, $config );
+			$result = $this->run_connection_dispatcher_locked( $source, $lock, $config );
 		} catch ( Throwable $e ) {
 			$result = $this->exception_result(
 				'runner-exception',
@@ -162,8 +227,11 @@ class Mobo_Core_Cron_Runner {
 			}
 		}
 
-		/* Runtime diagnostics is one bounded aggregate write per runner request. */
-		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+		/* Connection-aware dispatch flushes diagnostics inside each Connection
+		 * context. Retain the legacy aggregate path only when the Connection layer
+		 * is unavailable during an old/partial upgrade. */
+		if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' )
+			&& ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! class_exists( 'Mobo_Core_Connection_Context' ) ) ) {
 			Mobo_Core_Runtime_Diagnostics::record_runner_result( $result );
 			Mobo_Core_Runtime_Diagnostics::flush();
 		}
@@ -238,8 +306,37 @@ class Mobo_Core_Cron_Runner {
 		return (bool) preg_match( '/(?:^|\.)(?:local|test)$/', $host );
 	}
 
+	/** Whether a runner source represents the externally scheduled Mobo Cron path. */
+	private static function is_real_scheduler_source( $source ) {
+		return in_array( sanitize_key( (string) $source ), array( 'real-cron', 'cpanel-local-php-cron' ), true );
+	}
+
+	/** Record one real scheduler hit while preserving the previous timestamp. */
+	public static function record_real_cron_hit( $timestamp = 0 ) {
+		$timestamp = absint( $timestamp );
+		if ( $timestamp <= 0 ) { $timestamp = time(); }
+		$last = absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
+		if ( $last > 0 && $timestamp >= $last ) {
+			update_option( 'mobo_core_real_cron_previous_hit_at', $last, false );
+		}
+		update_option( 'mobo_core_real_cron_last_hit_at', $timestamp, false );
+	}
+
 	/**
 	 * Build a secure cron URL for the current site.
+	 *
+	 * @return string
+	 */
+	public static function build_cron_endpoint() {
+		return rest_url( 'mobo-core/v1/cron/run' );
+	}
+
+	/**
+	 * Build the legacy authenticated cron URL.
+	 *
+	 * Kept for backward compatibility with older integrations. New admin UI does
+	 * not render this token-bearing URL; X-SEC is preferred so the secret does not
+	 * enter browser history or ordinary access logs.
 	 *
 	 * @return string
 	 */
@@ -252,7 +349,7 @@ class Mobo_Core_Cron_Runner {
 
 		return add_query_arg(
 			array( 'token' => rawurlencode( $token ) ),
-			rest_url( 'mobo-core/v1/cron/run' )
+			self::build_cron_endpoint()
 		);
 	}
 
@@ -265,29 +362,75 @@ class Mobo_Core_Cron_Runner {
 		$last_hit = absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
 		$last_ok  = absint( get_option( 'mobo_core_real_cron_last_success_at', 0 ) );
 		$last_res = get_option( 'mobo_core_real_cron_last_result', array() );
+		$scheduler_res = get_option( 'mobo_core_real_cron_last_scheduler_result', array() );
 
 		if ( ! is_array( $last_res ) ) {
 			$last_res = array();
 		}
+		if ( ! is_array( $scheduler_res ) ) {
+			$scheduler_res = array();
+		}
+		/*
+		 * Before UX17 the shared last-success option could be advanced by a
+		 * manual/self-runner slice, or by a partial slice. Until this build has
+		 * observed at least one result whose provenance is explicitly the real
+		 * scheduler, that historical timestamp is not trustworthy as proof of a
+		 * healthy scheduled run. Fail closed instead of bootstrapping green health
+		 * from legacy data.
+		 */
+		$has_verified_scheduler_history = ! empty( $scheduler_res )
+			&& isset( $scheduler_res['source'] )
+			&& self::is_real_scheduler_source( sanitize_key( (string) $scheduler_res['source'] ) );
+		$verified_last_ok = $has_verified_scheduler_history ? $last_ok : 0;
 
 		$expected_interval = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_expected_interval_seconds', 60, 60, 3600 );
+		$tolerance         = self::SCHEDULE_TOLERANCE_SECONDS;
+		$previous_hit      = absint( get_option( 'mobo_core_real_cron_previous_hit_at', 0 ) );
+		$last_interval     = $last_hit > 0 && $previous_hit > 0 && $last_hit >= $previous_hit ? $last_hit - $previous_hit : 0;
+		$interval_delta    = $last_interval > 0 ? $last_interval - $expected_interval : 0;
+		$schedule_status   = 'unknown';
+		if ( $last_interval > 0 ) {
+			$schedule_status = abs( $interval_delta ) <= $tolerance ? 'on-time' : ( $interval_delta > $tolerance ? 'late' : 'early' );
+		}
 		$next_estimated_at = $last_hit > 0 ? $last_hit + $expected_interval : 0;
-		$is_overdue        = $next_estimated_at > 0 && time() > ( $next_estimated_at + 30 );
+		$is_overdue        = $next_estimated_at > 0 && time() > ( $next_estimated_at + $tolerance );
 		$lock_status       = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'real_cron_runner' ) : array();
 
 		return array(
+			'cronEndpoint'            => self::build_cron_endpoint(),
 			'cronUrl'                 => self::build_cron_url(),
 			'lastHitAt'               => $last_hit,
-			'lastSuccessAt'           => $last_ok,
+			'lastSuccessAt'           => $verified_last_ok,
+			'schedulerHistoryVerified'=> $has_verified_scheduler_history,
 			'nextEstimatedAt'         => $next_estimated_at,
 			'expectedIntervalSeconds' => $expected_interval,
+			'scheduleToleranceSeconds'=> $tolerance,
+			'previousHitAt'            => $previous_hit,
+			'lastIntervalSeconds'      => $last_interval,
+			'lastIntervalDeltaSeconds' => $interval_delta,
+			'scheduleStatus'           => $schedule_status,
 			'isOverdue'               => $is_overdue,
 			'secondsSinceLastHit'     => $last_hit > 0 ? max( 0, time() - $last_hit ) : 0,
-			'secondsSinceLastSuccess' => $last_ok > 0 ? max( 0, time() - $last_ok ) : 0,
+			'secondsSinceLastSuccess' => $verified_last_ok > 0 ? max( 0, time() - $verified_last_ok ) : 0,
 			'isActive'                => $last_hit > 0 && ( time() - $last_hit ) < HOUR_IN_SECONDS,
 			'lock'                    => $lock_status,
 			'lastResult'              => $last_res,
+			'schedulerLastResult'     => $scheduler_res,
 		);
+	}
+
+	/**
+	 * Return scheduler status safe for authenticated remote diagnostics.
+	 *
+	 * The legacy runnable cronUrl embeds the Cron/Worker secret and must never be
+	 * returned through a status endpoint authenticated by a different credential.
+	 *
+	 * @return array
+	 */
+	public static function get_external_status() {
+		$status = self::get_status();
+		unset( $status['cronUrl'] );
+		return $status;
 	}
 
 	/**
@@ -297,7 +440,9 @@ class Mobo_Core_Cron_Runner {
 	 */
 	public static function get_health_status() {
 		$status = self::get_status();
-		$last   = isset( $status['lastResult'] ) && is_array( $status['lastResult'] ) ? $status['lastResult'] : array();
+		$last   = isset( $status['schedulerLastResult'] ) && is_array( $status['schedulerLastResult'] )
+			? $status['schedulerLastResult']
+			: array();
 		$runner = isset( $last['runner'] ) && is_array( $last['runner'] ) ? $last['runner'] : array();
 		$scheduler = isset( $last['scheduler'] ) && is_array( $last['scheduler'] ) ? $last['scheduler'] : array();
 
@@ -306,6 +451,10 @@ class Mobo_Core_Cron_Runner {
 			'lastHitAt'               => isset( $status['lastHitAt'] ) ? absint( $status['lastHitAt'] ) : 0,
 			'lastSuccessAt'           => isset( $status['lastSuccessAt'] ) ? absint( $status['lastSuccessAt'] ) : 0,
 			'expectedIntervalSeconds' => isset( $status['expectedIntervalSeconds'] ) ? absint( $status['expectedIntervalSeconds'] ) : 0,
+			'scheduleToleranceSeconds'=> isset( $status['scheduleToleranceSeconds'] ) ? absint( $status['scheduleToleranceSeconds'] ) : 0,
+			'lastIntervalSeconds'      => isset( $status['lastIntervalSeconds'] ) ? absint( $status['lastIntervalSeconds'] ) : 0,
+			'lastIntervalDeltaSeconds' => isset( $status['lastIntervalDeltaSeconds'] ) ? intval( $status['lastIntervalDeltaSeconds'] ) : 0,
+			'scheduleStatus'           => isset( $status['scheduleStatus'] ) ? sanitize_key( (string) $status['scheduleStatus'] ) : 'unknown',
 			'isOverdue'               => ! empty( $status['isOverdue'] ),
 			'lock'                    => isset( $status['lock'] ) && is_array( $status['lock'] ) ? $status['lock'] : array(),
 			'lastRun'                 => array(
@@ -374,9 +523,15 @@ class Mobo_Core_Cron_Runner {
 			$effective_budget = min( $configured_budget, max( 1, $php_limit - $safety_margin ) );
 		}
 
-		$api_timeout      = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
-		$payload_timeout  = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
-		$checkout_timeout = Mobo_Core_Settings::get_int( 'mobo_core_checkout_mobo_timeout_seconds', 8, 2, 20 );
+		$api_timeout     = Mobo_Core_Settings::get_int( 'mobo_core_api_request_timeout_seconds', 60, 5, 180 );
+		$payload_timeout = Mobo_Core_Settings::get_int( 'mobo_core_payload_pull_timeout_seconds', 60, 5, 180 );
+
+		/* The real-cron lease is installation-global and is acquired before any
+		 * Source/Connection context is selected. Checkout timeout is Connection-owned,
+		 * so reading it here would accidentally size the global lease from Default (or
+		 * from whatever request context happened to exist). Use the allowed upper bound
+		 * instead: the lease must safely cover every enabled Connection. */
+		$checkout_timeout = 20;
 		$blocking_timeout = max( 15, $api_timeout, $payload_timeout, $checkout_timeout );
 		$configured_ttl   = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_lock_ttl_seconds', 120, 30, 600 );
 		$lock_ttl         = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
@@ -416,6 +571,182 @@ class Mobo_Core_Cron_Runner {
 			'longestBlockingTimeout'      => $blocking_timeout,
 			'memoryLimitBytes'            => $memory_limit_bytes,
 			'memoryReserveBytes'          => $memory_reserve_bytes,
+		);
+	}
+
+	/**
+	 * Run Source-owned queues under explicit Connection contexts while retaining
+	 * one installation-wide real-cron lease. A round-robin cursor prevents a
+	 * consistently busy Default Connection from starving later Sources.
+	 *
+	 * Single-Connection installs use the exact same runtime path inside the Default
+	 * Connection context. Multi-Connection remains fail-closed until the ownership
+	 * migration publishes its durable readiness proof.
+	 */
+	private function run_connection_dispatcher_locked( $source, $lock_token, $config ) {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			return $this->run_locked( $source, $lock_token, $config );
+		}
+
+		$connections = Mobo_Core_Connection_Repository::list_enabled();
+		if ( empty( $connections ) ) {
+			return array(
+				'success' => false,
+				'status' => 'connection-missing',
+				'source' => $source,
+				'executedAt' => time(),
+				'message' => 'No enabled Mobo Connection is available for cron dispatch.',
+			);
+		}
+		if ( count( $connections ) > 1 && ! Mobo_Core_Connection_Repository::multi_connection_runtime_ready() ) {
+			return array(
+				'success' => false,
+				'status' => 'multi-connection-not-ready',
+				'source' => $source,
+				'executedAt' => time(),
+				'message' => 'Multi-Connection ownership migration is not complete.',
+			);
+		}
+
+		$cursor_id = absint( get_option( 'mobo_core_connection_dispatch_cursor_id', 0 ) );
+		$start = 0;
+		if ( count( $connections ) > 1 && $cursor_id > 0 ) {
+			foreach ( $connections as $index => $connection ) {
+				if ( absint( $connection['id'] ?? 0 ) === $cursor_id ) {
+					$start = ( $index + 1 ) % count( $connections );
+					break;
+				}
+			}
+		}
+		if ( $start > 0 ) {
+			$connections = array_merge( array_slice( $connections, $start ), array_slice( $connections, 0, $start ) );
+		}
+
+		$started_at = microtime( true );
+		$deadline = $started_at + max( 1, (int) $config['effectiveTimeBudgetSeconds'] );
+		$results = array();
+		$overall_success = true;
+		$needs_continuation = false;
+		$made_progress = false;
+		$last_processed_id = 0;
+		$dispatcher_renewals = 0;
+		$dispatcher_lock_lost = false;
+		$total = count( $connections );
+
+		/* A separate warmup turn prevents the general Connection dispatch cursor
+		 * from letting a high-volume Source consume every spare GET. Only due
+		 * Connections compete, and selection rotates after its own last turn. */
+		$warmup_turn_id = 0;
+		if ( $total > 1 && class_exists( 'Mobo_Core_Cache_Warmer' ) ) {
+			$last_warmup_id = absint( get_option( 'mobo_core_cache_warmup_dispatch_cursor_id', 0 ) );
+			$warmup_start = 0;
+			foreach ( $connections as $idx => $candidate ) {
+				if ( absint( $candidate['id'] ?? 0 ) === $last_warmup_id ) {
+					$warmup_start = ( $idx + 1 ) % $total;
+					break;
+				}
+			}
+			for ( $probe = 0; $probe < $total; $probe++ ) {
+				$candidate = $connections[ ( $warmup_start + $probe ) % $total ];
+				$candidate_id = absint( $candidate['id'] ?? 0 );
+				if ( $candidate_id <= 0 ) { continue; }
+				$due = Mobo_Core_Connection_Context::run( $candidate_id, static function () {
+					return Mobo_Core_Cache_Warmer::has_due_work();
+				} );
+				if ( $due ) { $warmup_turn_id = $candidate_id; break; }
+			}
+			/* UX60: do not advance this cursor until the selected Connection
+			 * actually enters its warmup stage. It may be skipped because earlier
+			 * foreground work consumed the entire request budget. */
+		}
+
+		foreach ( $connections as $index => $connection ) {
+			$connection_id = absint( $connection['id'] ?? 0 );
+			if ( $connection_id <= 0 ) { continue; }
+			$remaining = $deadline - microtime( true );
+			if ( $remaining <= 0.25 ) {
+				$needs_continuation = true;
+				break;
+			}
+			$left = max( 1, $total - $index );
+			$connection_config = $config;
+			$connection_config['effectiveTimeBudgetSeconds'] = max( 1, min( (int) ceil( $remaining ), (int) max( 1, floor( $remaining / $left ) ) ) );
+			$connection_config['maxRounds'] = max( 1, min( absint( $config['maxRounds'] ), (int) max( 1, ceil( absint( $config['maxRounds'] ) / $total ) ) ) );
+			if ( $total > 1 ) {
+				$connection_config['ux53MultiConnectionWarmup'] = true;
+				$connection_config['ux53WarmupSelected'] = $connection_id === $warmup_turn_id && $warmup_turn_id > 0;
+			}
+
+			/* UX60: the prior Source slice may have spent its entire TTL in a
+			 * blocking API call or diagnostic flush. Verify the installation-global
+			 * owner again before entering a *different* Source's mutation pipeline. */
+			if ( ! $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $dispatcher_renewals ) ) {
+				$dispatcher_lock_lost = true;
+				$overall_success = false;
+				$needs_continuation = true;
+				break;
+			}
+
+			$result = Mobo_Core_Connection_Context::run( $connection_id, function () use ( $source, $lock_token, $connection_config ) {
+				if ( class_exists( 'Mobo_Core_API_Client' ) && method_exists( 'Mobo_Core_API_Client', 'clear_request_context' ) ) {
+					Mobo_Core_API_Client::clear_request_context();
+				}
+				$connection_result = $this->run_locked( $source, $lock_token, $connection_config );
+				if ( class_exists( 'Mobo_Core_Runtime_Diagnostics' ) ) {
+					Mobo_Core_Runtime_Diagnostics::record_runner_result( $connection_result );
+					Mobo_Core_Runtime_Diagnostics::flush();
+				}
+				return $connection_result;
+			} );
+			$results[] = array(
+				'connectionId' => $connection_id,
+				'sourceKey' => sanitize_key( (string) ( $connection['source_key'] ?? '' ) ),
+				'displayName' => sanitize_text_field( (string) ( $connection['display_name'] ?? '' ) ),
+				'result' => $result,
+			);
+			$last_processed_id = $connection_id;
+			$overall_success = $overall_success && ! empty( $result['success'] );
+			$needs_continuation = $needs_continuation || ! empty( $result['needsContinuation'] );
+			$made_progress = $made_progress || ! empty( $result['runner']['madeProgress'] );
+			if ( ! empty( $result['runner']['lockLost'] ) || 'lock-lost' === ( isset( $result['status'] ) ? $result['status'] : '' ) ) {
+				/* An inner slice surrendered the global lease. Never dispatch the next
+				 * Connection in the same PHP process after another runner may own it. */
+				$dispatcher_lock_lost = true;
+				$overall_success = false;
+				$needs_continuation = true;
+				break;
+			}
+		}
+
+		if ( $last_processed_id > 0 ) {
+			update_option( 'mobo_core_connection_dispatch_cursor_id', $last_processed_id, false );
+		}
+		/* UX60: processing only the first of several configured Sources because
+		 * the budget expired (or the lease was lost) is NOT a single-Connection
+		 * installation. Preserve the aggregate continuation/error evidence. */
+		if ( 1 === $total && 1 === count( $results ) && ! $dispatcher_lock_lost ) {
+			$single = $results[0]['result'];
+			$single['connectionId'] = $results[0]['connectionId'];
+			$single['sourceKey'] = $results[0]['sourceKey'];
+			return $single;
+		}
+
+		return array(
+			'success' => $overall_success,
+			'status' => $dispatcher_lock_lost ? 'lock-lost' : ( $overall_success ? 'ok' : 'partial' ),
+			'source' => $source,
+			'executedAt' => time(),
+			'needsContinuation' => $needs_continuation,
+			'connections' => $results,
+			'runner' => array(
+				'multiConnection' => true,
+				'dispatcherLockLost' => $dispatcher_lock_lost,
+				'lockRenewals' => $dispatcher_renewals,
+				'connectionCount' => count( $results ),
+				'madeProgress' => $made_progress,
+				'elapsedMs' => max( 0, (int) round( ( microtime( true ) - $started_at ) * 1000 ) ),
+			),
+			'message' => 'Cron queue drain completed across enabled Mobo Connections.',
 		);
 	}
 
@@ -477,7 +808,9 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		/* Deferred category/tag/shop/home page-cache invalidation is driven by the real Mobo runner. */
-		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'process_due_archive_purge' ) ) {
+		if ( class_exists( 'Mobo_Core_Cache_Purger' ) && method_exists( 'Mobo_Core_Cache_Purger', 'process_due_archive_purge' ) && $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+			/* UX60: snapshot collection can be expensive; do not start the first
+			 * mutating archive purge without revalidating the outer runner owner. */
 			try {
 				$aggregate['archiveCachePurge'] = Mobo_Core_Cache_Purger::process_due_archive_purge( $source );
 			} catch ( Throwable $e ) {
@@ -520,6 +853,9 @@ class Mobo_Core_Cron_Runner {
 			);
 
 			$this->merge_round_result( $aggregate, $round );
+			if ( ! empty( $config['ux53MultiConnectionWarmup'] ) && ! empty( $round['queuePasses']['cacheWarmup'] ) ) {
+				$config['ux53WarmupTurnConsumed'] = true; // At most one warmup stage/GET in this Connection slice.
+			}
 			$made_progress  = $made_progress || ! empty( $round['madeProgress'] );
 			$immediate_work = ! empty( $round['hasImmediateWork'] );
 
@@ -637,7 +973,12 @@ class Mobo_Core_Cron_Runner {
 			'circuitBreakers'                 => isset( $config['circuitBreakers'] ) && is_array( $config['circuitBreakers'] ) ? $config['circuitBreakers'] : array(),
 		);
 
-		if ( ! $lock_lost ) {
+		/*
+		 * "Last success" must mean a fully healthy runner slice. A partial slice can
+		 * retain success=true for transport/backward-compatibility semantics while
+		 * still containing failed stages; do not let that overwrite healthy history.
+		 */
+		if ( 'ok' === $aggregate['status'] && self::is_real_scheduler_source( $source ) ) {
 			update_option( 'mobo_core_real_cron_last_success_at', time(), false );
 		}
 
@@ -720,6 +1061,9 @@ class Mobo_Core_Cron_Runner {
 		$allow_recategorize    = ! empty( $allow['recategorizeQueue'] );
 		$allow_image_refresh   = ! empty( $allow['imageRefreshQueue'] );
 		$allow_cache_warmup    = ! empty( $allow['cacheWarmup'] );
+		if ( ! empty( $config['ux53MultiConnectionWarmup'] ) ) {
+			$allow_cache_warmup = $allow_cache_warmup && ! empty( $config['ux53WarmupSelected'] ) && empty( $config['ux53WarmupTurnConsumed'] );
+		}
 		$allow_maintenance     = ! empty( $allow['maintenance'] );
 
 		$round['scheduler'] = $scheduler;
@@ -873,7 +1217,7 @@ class Mobo_Core_Cron_Runner {
 
 		/* Product image queue + bounded stale-media prune queue. */
 		$image_sync             = null;
-		$base_image_limit       = max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) );
+		$base_image_limit       = max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 1, 10 ) );
 		$configured_image_limit = isset( $config['adaptiveTuning']['limits']['imageQueue'] )
 			? max( 1, min( 10, absint( $config['adaptiveTuning']['limits']['imageQueue'] ) ) )
 			: $base_image_limit;
@@ -1155,9 +1499,25 @@ class Mobo_Core_Cron_Runner {
 			|| ! empty( $round['imageQueue']['remaining'] );
 		if ( Mobo_Core_Settings::enabled( 'mobo_core_cache_warmup_enabled', '1' ) && $this->option_queue_has_items( 'mobo_core_cache_warmup_queue', 'items' ) && class_exists( 'Mobo_Core_Cache_Warmer' ) && ! isset( $disabled_stages['cacheWarmup'] ) && $allow_cache_warmup && ! $this->stage_circuit_open( $config, 'cacheWarmup' ) && ! $cache_side_effect_pressure ) {
 			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				/* UX60: claim the durable fairness turn only at the actual execution
+				 * boundary. No work/GET is allowed when the cursor cannot be saved. */
+				if ( ! empty( $config['ux53MultiConnectionWarmup'] ) ) {
+					$warm_owner_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+					$warm_cursor_key = 'mobo_core_cache_warmup_dispatch_cursor_id';
+					if ( $warm_owner_id <= 0 || ( ! update_option( $warm_cursor_key, $warm_owner_id, false ) && absint( get_option( $warm_cursor_key, 0 ) ) !== $warm_owner_id ) ) {
+						$round['cacheWarmup']['status'] = 'fairness-cursor-persist-failed';
+						$round['cacheWarmup']['success'] = false;
+						$round['cacheWarmup']['remainingDue'] = true;
+						$disabled_stages['cacheWarmup'] = 'fairness-cursor-persist-failed';
+						$round['stageErrors']['cacheWarmup'] = 'fairness-cursor-persist-failed';
+						$this->finalize_round_state( $round, $disabled_stages );
+						return $round;
+					}
+				}
 				$warm_base   = Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_batch_size', 2, 1, 10 );
 				$warm_limit  = isset( $config['adaptiveTuning']['limits']['cacheWarmup'] ) ? max( 1, min( 10, absint( $config['adaptiveTuning']['limits']['cacheWarmup'] ) ) ) : $warm_base;
 				$warm_limit  = $this->stage_capacity_limit( $config, 'cacheWarmup', $warm_limit );
+				if ( ! empty( $config['ux53MultiConnectionWarmup'] ) ) { $warm_limit = 1; }
 				$warm_budget = $this->stage_budget_seconds( $config, 'cacheWarmup', 5, 1, 20 );
 				$warm_budget = min( $warm_budget, max( 1, (int) floor( $deadline - microtime( true ) - 0.25 ) ) );
 				$round['cacheWarmup'] = $this->execute_stage(
@@ -1181,6 +1541,165 @@ class Mobo_Core_Cron_Runner {
 					$round['stageErrors']
 				);
 				$round['queuePasses']['cacheWarmup']++;
+			}
+		}
+
+		/*
+		 * Custom-storage Product/Variation backfill is the lowest-priority bounded
+		 * stage. It runs at most once per runner invocation, never while foreground
+		 * queue families still report immediate work, and never creates its own
+		 * continuation chain. Dual-write keeps new commits current while old rows are
+		 * drained across ordinary real-cron/heartbeat invocations.
+		 */
+		$storage_backfill_pressure = $webhook_due_pressure
+			|| ! empty( $round['parentFinalize']['remainingDue'] )
+			|| ! empty( $round['imageQueue']['remaining'] )
+			|| ! empty( $round['imageRefreshQueue']['remaining'] )
+			|| ! empty( $round['productStatus']['shouldContinue'] )
+			|| ! empty( $round['repriceQueue']['remaining'] )
+			|| ! empty( $round['recategorizeQueue']['remaining'] )
+			|| ! empty( $round['orderSubmissions']['remaining'] )
+			|| ! empty( $round['cacheWarmup']['remainingDue'] );
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storageBackfill'] )
+			&& class_exists( 'Mobo_Core_Storage_Backfill' )
+			&& Mobo_Core_Storage_Backfill::should_run() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storageBackfill'] = $this->execute_stage(
+					'storageBackfill',
+					function () {
+						return Mobo_Core_Storage_Backfill::process_batch( Mobo_Core_Storage_Backfill::DEFAULT_BATCH );
+					},
+					array( 'success' => false, 'status' => 'exception', 'processed' => 0, 'mirrored' => 0, 'skipped' => 0, 'failed' => 1, 'remaining' => true ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+				$round['queuePasses']['storageBackfill']++;
+			}
+		}
+
+
+		/* 10.33.75: after backfill, bounded reconciliation refreshes Custom Storage
+		 * from authoritative Legacy state and cleans rows tied to retired Woo objects.
+		 * It remains low priority and never changes Legacy/Woo state. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storageReconciliation'] )
+			&& class_exists( 'Mobo_Core_Storage_Reconciler' )
+			&& Mobo_Core_Storage_Reconciler::should_run() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storageReconciliation'] = $this->execute_stage(
+					'storageReconciliation',
+					function () {
+						return Mobo_Core_Storage_Reconciler::process_batch( Mobo_Core_Storage_Reconciler::DEFAULT_BATCH );
+					},
+					array( 'success' => false, 'status' => 'exception', 'processed' => 0, 'mirrored' => 0, 'cleaned' => 0, 'failed' => 1, 'ambiguous' => 0 ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+				$round['queuePasses']['storageReconciliation']++;
+			}
+		}
+
+		/* 10.33.75: refresh the custom-primary promotion lease only
+		 * after foreground pressure is clear. This stage never changes storage mode
+		 * and is throttled internally to one checkpoint per five minutes. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storagePromotionGate'] )
+			&& class_exists( 'Mobo_Core_Storage_Promotion_Gate' )
+			&& Mobo_Core_Storage_Promotion_Gate::should_evaluate() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storagePromotionGate'] = $this->execute_stage(
+					'storagePromotionGate',
+					function () {
+						return Mobo_Core_Storage_Promotion_Gate::evaluate();
+					},
+					array( 'eligible' => false, 'status' => 'exception', 'blockers' => array( 'exception' ) ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		/* 10.33.79: collect/evaluate the stronger Custom-Only readiness lease only
+		 * after Custom-Primary itself is healthy. This stage is evidence-only and
+		 * never changes the requested/effective storage mode. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storageCustomOnlyGate'] )
+			&& class_exists( 'Mobo_Core_Storage_Custom_Only_Gate' )
+			&& Mobo_Core_Storage_Custom_Only_Gate::should_evaluate() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storageCustomOnlyGate'] = $this->execute_stage(
+					'storageCustomOnlyGate',
+					function () {
+						return Mobo_Core_Storage_Custom_Only_Gate::evaluate();
+					},
+					array( 'eligible' => false, 'status' => 'exception', 'blockers' => array( 'exception' ) ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		/* 10.33.82: evidence-only Legacy retirement readiness. This stage never
+		 * suppresses Product Map/postmeta writes; it only proves that effective
+		 * Custom-Only traffic no longer depends on Legacy reads. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storageLegacyRetirementGate'] )
+			&& class_exists( 'Mobo_Core_Storage_Legacy_Retirement_Gate' )
+			&& Mobo_Core_Storage_Legacy_Retirement_Gate::should_evaluate() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storageLegacyRetirementGate'] = $this->execute_stage(
+					'storageLegacyRetirementGate',
+					function () { return Mobo_Core_Storage_Legacy_Retirement_Gate::evaluate(); },
+					array( 'eligible'=>false, 'status'=>'exception', 'blockers'=>array('exception') ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		/* 10.33.84: per-key operational-postmeta suppression readiness. Evidence only;
+		 * this stage never suppresses or deletes postmeta. It runs after the global
+		 * Legacy retirement gate so each key is evaluated only against a proven
+		 * Custom-Only baseline. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storagePostmetaSuppressionReadiness'] )
+			&& class_exists( 'Mobo_Core_Storage_Postmeta_Suppression_Readiness' )
+			&& Mobo_Core_Storage_Postmeta_Suppression_Readiness::should_evaluate() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storagePostmetaSuppressionReadiness'] = $this->execute_stage(
+					'storagePostmetaSuppressionReadiness',
+					function () { return Mobo_Core_Storage_Postmeta_Suppression_Readiness::evaluate(); },
+					array( 'eligible'=>false, 'allEligible'=>false, 'status'=>'exception', 'eligibleKeys'=>array() ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
+			}
+		}
+
+		/* 10.33.95: terminal metadata-retirement evidence. This stage is
+		 * non-destructive and evaluates the already-migrated state: both the seven
+		 * operational keys and Product/Variation identity must have active durable
+		 * fences, completed migrations and exact zero-residue proofs. */
+		if ( 1 === absint( $round_number )
+			&& ! $storage_backfill_pressure
+			&& ! isset( $disabled_stages['storageRetirementFinalizer'] )
+			&& class_exists( 'Mobo_Core_Storage_Retirement_Finalizer' )
+			&& Mobo_Core_Storage_Retirement_Finalizer::should_evaluate() ) {
+			if ( $this->prepare_stage( $deadline, $config, $lock_token, $lock_renewals, $round, $disabled_stages ) ) {
+				$round['storageRetirementFinalizer'] = $this->execute_stage(
+					'storageRetirementFinalizer',
+					function () { return Mobo_Core_Storage_Retirement_Finalizer::evaluate(); },
+					array( 'logicalRetirementComplete'=>false, 'status'=>'exception', 'blockers'=>array('exception'), 'physicalDeletionAllowed'=>false ),
+					$disabled_stages,
+					$round['stageErrors']
+				);
 			}
 		}
 
@@ -1225,6 +1744,13 @@ class Mobo_Core_Cron_Runner {
 			'remoteShipping'         => array( 'status' => 'skipped' ),
 			'orderSubmissions'       => array( 'status' => 'skipped', 'processed' => 0, 'success' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => false ),
 			'cacheWarmup'           => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'warmed' => 0, 'failed' => 0, 'dropped' => 0, 'deferred' => 0, 'remaining' => false, 'remainingDue' => false, 'pendingCount' => 0, 'lastError' => '' ),
+			'storageBackfill'        => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'mirrored' => 0, 'skipped' => 0, 'failed' => 0, 'gaps' => 0, 'cursor' => 0, 'remaining' => false ),
+			'storageReconciliation'  => array( 'success' => true, 'status' => 'skipped', 'processed' => 0, 'mirrored' => 0, 'cleaned' => 0, 'failed' => 0, 'ambiguous' => 0 ),
+			'storagePromotionGate'   => array( 'eligible' => false, 'status' => 'skipped', 'blockers' => array() ),
+			'storageCustomOnlyGate'  => array( 'eligible' => false, 'status' => 'skipped', 'blockers' => array() ),
+			'storageLegacyRetirementGate' => array( 'eligible' => false, 'status' => 'skipped', 'blockers' => array() ),
+			'storagePostmetaSuppressionReadiness' => array( 'eligible' => false, 'allEligible' => false, 'status' => 'skipped', 'eligibleKeys' => array() ),
+			'storageRetirementFinalizer' => array( 'logicalRetirementComplete' => false, 'status' => 'skipped', 'blockers' => array(), 'physicalDeletionAllowed' => false ),
 			'maintenance'            => array( 'status' => 'skipped' ),
 			'scheduler'              => array( 'webhookPressure' => false, 'backgroundCapacity' => 0, 'selectedStages' => array(), 'deferredStages' => array(), 'allow' => array(), 'scores' => array() ),
 			'productSteps'           => 0,
@@ -1242,6 +1768,8 @@ class Mobo_Core_Cron_Runner {
 				'recategorizeQueue' => 0,
 				'orderSubmissions'  => 0,
 				'cacheWarmup'      => 0,
+				'storageBackfill'  => 0,
+				'storageReconciliation' => 0,
 			),
 		);
 	}
@@ -1313,15 +1841,21 @@ class Mobo_Core_Cron_Runner {
 			'backlog' => max( $webhook_due, $webhook_pending ),
 		);
 
-		$order_queue = get_option( 'mobo_core_mobo_order_submission_queue', array() );
-		$order_count = is_array( $order_queue ) ? count( $order_queue ) : 0;
+		$order_count = ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() )
+			? Mobo_Core_Work_Queue_Store::count( 'order_submission' )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? count( (array) get_option( 'mobo_core_mobo_order_submission_queue', array() ) )
+				: 0 );
 		$snapshot['orderSubmissions'] = array(
 			'active'  => Mobo_Core_Order_Submission_Policy::is_enabled() && $order_count > 0,
 			'backlog' => $order_count,
 		);
 
-		$parent_queue = get_option( 'mobo_core_parent_finalize_queue', array() );
-		$parent_count = is_array( $parent_queue ) ? count( $parent_queue ) : 0;
+		$parent_count = ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() )
+			? Mobo_Core_Work_Queue_Store::count( 'parent_finalize' )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? count( (array) get_option( 'mobo_core_parent_finalize_queue', array() ) )
+				: 0 );
 		$snapshot['parentFinalize'] = array( 'active' => $parent_count > 0, 'backlog' => $parent_count );
 
 		$image_pending = 0;
@@ -1356,7 +1890,11 @@ class Mobo_Core_Cron_Runner {
 		}
 		$snapshot['imageQueue'] = array( 'active' => $image_due > 0 || $image_pending > 0, 'backlog' => max( $image_due, $image_pending ) );
 
-		$sync_state = get_option( 'mobo_core_sync_state', array() );
+		$sync_state = ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() )
+			? Mobo_Core_State_Store::get( 'sync_state', array() )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? get_option( 'mobo_core_sync_state', array() )
+				: array() );
 		$sync_state = is_array( $sync_state ) ? $sync_state : array();
 		$product_queue_count = isset( $sync_state['productQueue'] ) && is_array( $sync_state['productQueue'] ) ? count( $sync_state['productQueue'] ) : 0;
 		$product_remaining   = absint( isset( $sync_state['remainingProducts'] ) ? $sync_state['remainingProducts'] : 0 );
@@ -1375,28 +1913,40 @@ class Mobo_Core_Cron_Runner {
 		$image_refresh_active = $this->image_refresh_workflow_active();
 		$snapshot['imageRefreshQueue'] = array( 'active' => $image_refresh_active, 'backlog' => $image_refresh_active ? 1 : 0 );
 
-		$reprice = get_option( 'mobo_core_reprice_state', array() );
+		$reprice = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+			? Mobo_Core_State_Store::get( 'mobo_core_reprice_state', array() )
+			: array();
 		$reprice = is_array( $reprice ) ? $reprice : array();
 		$reprice_active = 'running' === sanitize_key( (string) ( isset( $reprice['status'] ) ? $reprice['status'] : '' ) );
 		$reprice_backlog = $reprice_active ? max( 1, absint( isset( $reprice['total'] ) ? $reprice['total'] : 0 ) - absint( isset( $reprice['processed'] ) ? $reprice['processed'] : 0 ) ) : 0;
 		$snapshot['repriceQueue'] = array( 'active' => $reprice_active, 'backlog' => $reprice_backlog );
 
-		$recat = get_option( 'mobo_core_recategorize_state', array() );
+		$recat = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+			? Mobo_Core_State_Store::get( 'mobo_core_recategorize_state', array() )
+			: array();
 		$recat = is_array( $recat ) ? $recat : array();
 		$recat_active = 'running' === sanitize_key( (string) ( isset( $recat['status'] ) ? $recat['status'] : '' ) );
 		$recat_backlog = $recat_active ? max( 1, absint( isset( $recat['total'] ) ? $recat['total'] : 0 ) - absint( isset( $recat['processed'] ) ? $recat['processed'] : 0 ) ) : 0;
 		$snapshot['recategorizeQueue'] = array( 'active' => $recat_active, 'backlog' => $recat_backlog );
 
-		$warm_queue = get_option( 'mobo_core_cache_warmup_queue', array() );
-		$warm_items = isset( $warm_queue['items'] ) && is_array( $warm_queue['items'] ) ? $warm_queue['items'] : array();
-		$warm_due   = 0;
-		$now        = time();
-		foreach ( $warm_items as $warm_item ) {
-			if ( ! is_array( $warm_item ) || absint( isset( $warm_item['nextAttemptAt'] ) ? $warm_item['nextAttemptAt'] : 0 ) <= $now ) {
-				$warm_due++;
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			$warm_stats = Mobo_Core_Work_Queue_Store::queue_stats( 'cache_warmup' );
+			$hot_stats  = Mobo_Core_Work_Queue_Store::queue_stats( 'cache_warmup_hot' );
+			$warm_pending = $warm_stats['pending'] + $hot_stats['pending'];
+			$warm_due = $warm_stats['due'] + $hot_stats['due'];
+		} elseif ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) {
+			$warm_legacy = get_option( 'mobo_core_cache_warmup_queue', array() );
+			$warm_items  = isset( $warm_legacy['items'] ) && is_array( $warm_legacy['items'] ) ? $warm_legacy['items'] : array();
+			$warm_pending = count( $warm_items );
+			$warm_due = 0;
+			foreach ( $warm_items as $warm_item ) {
+				if ( is_array( $warm_item ) && absint( isset( $warm_item['nextAttemptAt'] ) ? $warm_item['nextAttemptAt'] : 0 ) <= time() ) { $warm_due++; }
 			}
+		} else {
+			$warm_pending = 0;
+			$warm_due = 0;
 		}
-		$snapshot['cacheWarmup'] = array( 'active' => ! empty( $warm_items ), 'backlog' => max( $warm_due, count( $warm_items ) ) );
+		$snapshot['cacheWarmup'] = array( 'active' => $warm_pending > 0, 'backlog' => max( $warm_due, $warm_pending ) );
 
 		$snapshot['maintenance']    = array( 'active' => true, 'backlog' => 1 );
 
@@ -1493,7 +2043,11 @@ class Mobo_Core_Cron_Runner {
 	 * @return bool
 	 */
 	private function sync_state_should_continue() {
-		$state = get_option( 'mobo_core_sync_state', array() );
+		$state = ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() )
+			? Mobo_Core_State_Store::get( 'sync_state', array() )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? get_option( 'mobo_core_sync_state', array() )
+				: array() );
 		if ( ! is_array( $state ) || empty( $state ) ) {
 			return false;
 		}
@@ -1520,7 +2074,14 @@ class Mobo_Core_Cron_Runner {
 	 * @return bool
 	 */
 	private function option_state_is_running( $option_name ) {
-		$state = get_option( sanitize_key( (string) $option_name ), array() );
+		$option_name = sanitize_key( (string) $option_name );
+		if ( in_array( $option_name, array( 'mobo_core_reprice_state', 'mobo_core_recategorize_state' ), true ) ) {
+			$state = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+				? Mobo_Core_State_Store::get( $option_name, array() )
+				: array();
+		} else {
+			$state = get_option( $option_name, array() );
+		}
 		return is_array( $state ) && 'running' === sanitize_key( (string) ( isset( $state['status'] ) ? $state['status'] : '' ) );
 	}
 
@@ -1534,15 +2095,39 @@ class Mobo_Core_Cron_Runner {
 	 * @return bool
 	 */
 	private function option_queue_has_items( $option_name, $items_key = '' ) {
-		$queue = get_option( sanitize_key( (string) $option_name ), array() );
-		if ( ! is_array( $queue ) ) {
+		unset( $items_key );
+		$map = array(
+			'mobo_core_parent_finalize_queue'      => 'parent_finalize',
+			'mobo_core_cache_warmup_queue'         => 'cache_warmup',
+			'mobo_core_mobo_order_submission_queue'=> 'order_submission',
+		);
+		$option_name = sanitize_key( (string) $option_name );
+		if ( isset( $map[ $option_name ] ) && class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			if ( 'mobo_core_cache_warmup_queue' === $option_name ) {
+				if ( Mobo_Core_Work_Queue_Store::has_due_one( 'cache_warmup_hot' ) || Mobo_Core_Work_Queue_Store::has_due_one( 'cache_warmup' ) ) { return true; }
+				// UX51 option queue can exist at the moment UX52 is installed, with no
+				// newer product mutation to trigger migration. Wake the worker once so
+				// Cache_Warmer::row_store_ready() imports this Default-owned legacy map.
+				if ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) &&
+					( ! class_exists( 'Mobo_Core_Connection_Context' ) || ! method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) || Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) ) {
+					$legacy = get_option( $option_name, array() );
+					return is_array( $legacy ) && ! empty( $legacy['items'] );
+				}
+				return false;
+			}
+			return Mobo_Core_Work_Queue_Store::count( $map[ $option_name ] ) > 0;
+		}
+		if ( isset( $map[ $option_name ] ) && class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) {
 			return false;
 		}
-		if ( '' !== (string) $items_key ) {
-			$items = isset( $queue[ $items_key ] ) && is_array( $queue[ $items_key ] ) ? $queue[ $items_key ] : array();
-			return ! empty( $items );
+		if ( isset( $map[ $option_name ] ) && class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) {
+			return false;
 		}
-		return ! empty( $queue );
+		$legacy = get_option( $option_name, array() );
+		if ( 'mobo_core_cache_warmup_queue' === $option_name ) {
+			return is_array( $legacy ) && ! empty( $legacy['items'] );
+		}
+		return is_array( $legacy ) && ! empty( $legacy );
 	}
 
 	/**
@@ -1602,7 +2187,7 @@ class Mobo_Core_Cron_Runner {
 			$disabled_stages[ (string) $stage ] = true;
 			$errors[] = $this->compact_stage_error( $stage, $e );
 			$fallback['exceptionClass'] = get_class( $e );
-			$fallback['message']        = $e->getMessage();
+			$fallback['message']        = 'Cron stage failed; see the stage and exception type in diagnostics.';
 			$result = $fallback;
 		}
 
@@ -1630,10 +2215,12 @@ class Mobo_Core_Cron_Runner {
 		$recat_processed   = absint( isset( $round['recategorizeQueue']['processed'] ) ? $round['recategorizeQueue']['processed'] : 0 );
 		$order_processed   = absint( isset( $round['orderSubmissions']['processed'] ) ? $round['orderSubmissions']['processed'] : 0 );
 		$warm_processed    = absint( isset( $round['cacheWarmup']['processed'] ) ? $round['cacheWarmup']['processed'] : 0 );
+		$backfill_processed = absint( isset( $round['storageBackfill']['processed'] ) ? $round['storageBackfill']['processed'] : 0 );
+		$reconciliation_processed = absint( isset( $round['storageReconciliation']['processed'] ) ? $round['storageReconciliation']['processed'] : 0 ) + absint( isset( $round['storageReconciliation']['cleaned'] ) ? $round['storageReconciliation']['cleaned'] : 0 );
 		$product_steps     = absint( isset( $round['productSteps'] ) ? $round['productSteps'] : 0 );
 		$automation_moved  = ! empty( $round['imageRefreshAutomation']['progressed'] );
 
-		$round['madeProgress'] = ( $webhook_processed + $parent_finalized + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $warm_processed + $product_steps ) > 0 || $automation_moved;
+		$round['madeProgress'] = ( $webhook_processed + $parent_finalized + $image_processed + $refresh_processed + $reprice_processed + $recat_processed + $order_processed + $warm_processed + $backfill_processed + $reconciliation_processed + $product_steps ) > 0 || $automation_moved;
 
 		/* Reuse the queue processor/scheduler result. Avoid a second table existence/
 		 * due-work probe at the end of every round. */
@@ -1714,6 +2301,27 @@ class Mobo_Core_Cron_Runner {
 			array( 'processed', 'warmed', 'failed', 'dropped' ),
 			array( 'remaining', 'remainingDue' )
 		);
+		$aggregate['storageBackfill'] = $this->merge_queue_counters(
+			$aggregate['storageBackfill'],
+			$round['storageBackfill'],
+			array( 'processed', 'mirrored', 'skipped', 'failed' ),
+			array( 'remaining' )
+		);
+		$aggregate['storageReconciliation'] = $this->merge_queue_counters(
+			$aggregate['storageReconciliation'],
+			$round['storageReconciliation'],
+			array( 'processed', 'mirrored', 'cleaned', 'failed', 'ambiguous' ),
+			array()
+		);
+		if ( isset( $round['storagePromotionGate'] ) && is_array( $round['storagePromotionGate'] ) && 'skipped' !== ( isset( $round['storagePromotionGate']['status'] ) ? $round['storagePromotionGate']['status'] : '' ) ) {
+			$aggregate['storagePromotionGate'] = $round['storagePromotionGate'];
+		}
+
+		foreach ( array( 'storageCustomOnlyGate', 'storageLegacyRetirementGate', 'storagePostmetaSuppressionReadiness', 'storageRetirementFinalizer' ) as $storage_gate_key ) {
+			if ( isset( $round[ $storage_gate_key ] ) && is_array( $round[ $storage_gate_key ] ) && 'skipped' !== ( isset( $round[ $storage_gate_key ]['status'] ) ? $round[ $storage_gate_key ]['status'] : '' ) ) {
+				$aggregate[ $storage_gate_key ] = $round[ $storage_gate_key ];
+			}
+		}
 
 		$aggregate['imageRefreshAutomation'] = $round['imageRefreshAutomation'];
 		if ( isset( $round['scheduler'] ) && is_array( $round['scheduler'] ) ) {
@@ -1868,10 +2476,8 @@ class Mobo_Core_Cron_Runner {
 	private function compact_stage_error( $stage, Throwable $e ) {
 		return array(
 			'stage'          => sanitize_key( (string) $stage ),
-			'message'        => sanitize_text_field( $e->getMessage() ),
+			'message'        => 'Cron stage raised an exception.',
 			'exceptionClass' => get_class( $e ),
-			'file'           => $e->getFile(),
-			'line'           => $e->getLine(),
 			'at'             => time(),
 		);
 	}
@@ -1884,6 +2490,29 @@ class Mobo_Core_Cron_Runner {
 	 */
 	private function save_last_result( $result ) {
 		update_option( 'mobo_core_real_cron_last_result', $result, false );
+
+		$source = is_array( $result ) && isset( $result['source'] ) ? sanitize_key( (string) $result['source'] ) : '';
+		if ( self::is_real_scheduler_source( $source ) ) {
+			$previous_scheduler_result = get_option( 'mobo_core_real_cron_last_scheduler_result', null );
+			$had_verified_scheduler_history = is_array( $previous_scheduler_result )
+				&& ! empty( $previous_scheduler_result )
+				&& isset( $previous_scheduler_result['source'] )
+				&& self::is_real_scheduler_source( sanitize_key( (string) $previous_scheduler_result['source'] ) );
+
+			/*
+			 * The pre-UX17 last-success option had broader semantics. On the first
+			 * scheduler result seen by the corrected provenance model, clear that
+			 * legacy value unless the new scheduler result itself is fully healthy.
+			 * A healthy result has already refreshed the timestamp before this method
+			 * runs; a partial/error result must not inherit stale green evidence.
+			 */
+			$result_status = is_array( $result ) && isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
+			if ( ! $had_verified_scheduler_history && 'ok' !== $result_status ) {
+				update_option( 'mobo_core_real_cron_last_success_at', 0, false );
+			}
+
+			update_option( 'mobo_core_real_cron_last_scheduler_result', $result, false );
+		}
 	}
 
 	/**
@@ -1898,10 +2527,8 @@ class Mobo_Core_Cron_Runner {
 		$result = array(
 			'success'        => false,
 			'status'         => sanitize_key( (string) $status ),
-			'message'        => $e->getMessage(),
+			'message'        => 'Cron runner raised an exception.',
 			'exceptionClass' => get_class( $e ),
-			'file'           => $e->getFile(),
-			'line'           => $e->getLine(),
 			'executedAt'     => time(),
 		);
 

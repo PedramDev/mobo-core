@@ -30,7 +30,7 @@ final class Mobo_Core_Category_Assignment_Policy {
 			'mapping_enabled'          => Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_enabled', '1' ),
 			'mapping_required'         => Mobo_Core_Settings::enabled( 'mobo_core_category_mapping_required', '0' ),
 			'auto_categories_enabled'  => $auto_categories,
-			'default_category_id'      => absint( get_option( 'mobo_default_category_id', 0 ) ),
+			'default_category_id'      => absint( Mobo_Core_Settings::get( 'mobo_default_category_id', 0 ) ),
 		);
 	}
 

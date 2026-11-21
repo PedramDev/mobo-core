@@ -1,3 +1,13 @@
+# UX62/UX63 targeted validation — Mobo Core 10.34.26
+
+Date: 2026-09-30. Baseline: UX61 10.34.24. Isolated target: actual modified Connection/REST/Upgrade Coordinator PHP methods plus mock WordPress/MySQL option/Connection rows. Prior historical validation follows below.
+
+- Targeted PHP source+mock assertions (credential/Token identity, authority, signed provisioning, CAS nonce, persistent recovery hold, barrier CAS, uninstall preservation): **38 PASS** at candidate checkpoint (plus ongoing final lint/manifest validation).
+- Full WordPress PHP lint and SHA-256 manifest/ZIP integrity are validated separately at package build time.
+- This record is not WAMP/Portal two-process signoff; see BF/BG permanent contracts and UX65 cross-pipeline handoff.
+
+---
+
 # Validation Report — Mobo Core 10.33.4
 
 Date: 2026-08-08

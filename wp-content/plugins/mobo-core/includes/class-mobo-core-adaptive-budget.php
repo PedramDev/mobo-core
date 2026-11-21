@@ -63,7 +63,7 @@ final class Mobo_Core_Adaptive_Budget {
 			'maintenance'       => 350,
 		);
 
-		$diagnostics = get_option( 'mobo_core_runtime_diagnostics', array() );
+		$diagnostics = Mobo_Core_Settings::get( 'mobo_core_runtime_diagnostics', array() );
 		$diagnostics = is_array( $diagnostics ) ? $diagnostics : array();
 		$stage_stats = isset( $diagnostics['stages'] ) && is_array( $diagnostics['stages'] ) ? $diagnostics['stages'] : array();
 		$previous_budget = isset( $diagnostics['adaptiveBudget'] ) && is_array( $diagnostics['adaptiveBudget'] ) ? $diagnostics['adaptiveBudget'] : array();

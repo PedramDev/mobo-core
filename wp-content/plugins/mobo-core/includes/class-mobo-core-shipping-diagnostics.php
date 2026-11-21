@@ -376,7 +376,7 @@ class Mobo_Core_Shipping_Diagnostics {
 		try {
 			$zone = WC_Shipping_Zones::get_zone_matching_package( $package );
 		} catch ( Exception $e ) {
-			return array( 'error' => $e->getMessage() );
+			return array( 'error' => 'shipping_zone_exception', 'exceptionClass' => get_class( $e ) );
 		}
 
 		if ( ! is_object( $zone ) ) {

@@ -31,8 +31,10 @@ final class Mobo_Core_Cache_Purger {
 	private static $suppressed_product_ids = array();
 
 	const OPTION_LAST_RESULT = 'mobo_core_cache_purge_last_result';
-	const OPTION_ARCHIVE_QUEUE = 'mobo_core_cache_archive_purge_queue';
-	const OPTION_ARCHIVE_LAST_RESULT = 'mobo_core_cache_archive_purge_last_result';
+	const OPTION_ARCHIVE_QUEUE = 'mobo_core_cache_archive_purge_queue'; // legacy migration source only
+	const STATE_ARCHIVE_QUEUE  = 'cache_archive_purge_queue';
+	const OPTION_ARCHIVE_LAST_RESULT = 'mobo_core_cache_archive_purge_last_result'; // legacy Default-only migration source
+	const STATE_ARCHIVE_LAST_RESULT  = 'cache_archive_purge_last_result';
 	const ARCHIVE_QUEUE_SCHEMA_VERSION = 1;
 	const ARCHIVE_QUEUE_MAX_URLS = 5000;
 	const ARCHIVE_QUEUE_MAX_PRODUCTS = 5000;
@@ -569,7 +571,8 @@ final class Mobo_Core_Cache_Purger {
 
 		try {
 			if ( $minutes <= 0 ) {
-				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
+				self::delete_legacy_archive_queue();
 				return;
 			}
 
@@ -606,7 +609,8 @@ final class Mobo_Core_Cache_Purger {
 
 		if ( $interval <= 0 ) {
 			if ( ! empty( $queue['urls'] ) ) {
-				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
+				self::delete_legacy_archive_queue();
 			}
 			return array( 'success' => true, 'status' => 'disabled', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
 		}
@@ -692,9 +696,11 @@ final class Mobo_Core_Cache_Purger {
 
 			$urls        = array_values( array_unique( array_filter( array_map( array( __CLASS__, 'normalize_url' ), $queue['urls'] ) ) ) );
 			$product_ids = array_values( array_unique( array_filter( array_map( 'absint', $queue['productIds'] ) ) ) );
+			$product_overflow = ! empty( $queue['productOverflow'] );
 			$reasons     = array_values( array_unique( array_filter( array_map( 'sanitize_key', $queue['reasons'] ) ) ) );
 			if ( empty( $urls ) ) {
-				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
+				self::delete_legacy_archive_queue();
 				self::release_archive_queue_lock( $lock );
 				$lock = false;
 				return array( 'success' => true, 'status' => 'empty-normalized', 'processed' => false, 'urlCount' => 0, 'productCount' => 0 );
@@ -741,8 +747,8 @@ final class Mobo_Core_Cache_Purger {
 			$integration_data['wpSuperCache'] = self::run_integration(
 				'wpSuperCache',
 				$inventory['wpSuperCache'],
-				static function () use ( $product_ids ) {
-					if ( ! self::purge_wp_super_cache_archive_products( $product_ids ) ) {
+				static function () use ( $product_ids, $product_overflow ) {
+					if ( ! self::purge_wp_super_cache_archive_products( $product_ids, $product_overflow ) ) {
 						throw new RuntimeException( 'WP Super Cache archive purge API is unavailable.' );
 					}
 				}
@@ -756,6 +762,7 @@ final class Mobo_Core_Cache_Purger {
 				'archivePurgeIntervalMinutes' => $interval,
 				'dueAt'                       => $due_at,
 				'integrationResults'          => $integration_data,
+				'productOverflow'             => $product_overflow,
 			);
 			try {
 				do_action( 'mobo_core_cache_purger_after_archive_flush', $context );
@@ -790,7 +797,7 @@ final class Mobo_Core_Cache_Purger {
 				'lastError'       => $last_error,
 				'integrations'    => $integration_data,
 			);
-			update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false );
+			self::persist_archive_last_result( $record );
 			return array( 'success' => false, 'status' => 'commit-lock-lost', 'processed' => true, 'urlCount' => count( $urls ), 'productCount' => count( $product_ids ), 'lastError' => $last_error );
 		}
 
@@ -801,7 +808,8 @@ final class Mobo_Core_Cache_Purger {
 				/* A newer enqueue/settings mutation owns the durable snapshot now. */
 				$overall_status = 'superseded';
 			} elseif ( 'failed' !== $overall_status && 'partial' !== $overall_status ) {
-				delete_option( self::OPTION_ARCHIVE_QUEUE );
+				if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::delete( self::STATE_ARCHIVE_QUEUE ); }
+				self::delete_legacy_archive_queue();
 			} else {
 				$current['dueAt']           = time() + ( $interval * MINUTE_IN_SECONDS );
 				$current['updatedAt']       = time();
@@ -825,7 +833,7 @@ final class Mobo_Core_Cache_Purger {
 				'lastError'       => $last_error,
 				'integrations'    => $integration_data,
 			);
-			update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false );
+			self::persist_archive_last_result( $record );
 		} finally {
 			self::release_archive_queue_lock( $lock );
 		}
@@ -848,12 +856,12 @@ final class Mobo_Core_Cache_Purger {
 	 */
 	public static function get_archive_queue_status() {
 		$queue = self::read_archive_queue();
-		$last  = get_option( self::OPTION_ARCHIVE_LAST_RESULT, array() );
-		$last  = is_array( $last ) ? $last : array();
+		$last  = self::read_archive_last_result();
 		return array(
 			'intervalMinutes' => self::archive_purge_interval_minutes(),
 			'pendingUrlCount' => isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? count( $queue['urls'] ) : 0,
 			'pendingProductCount' => isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? count( $queue['productIds'] ) : 0,
+			'requiresSitewideFallback' => ! empty( $queue['productOverflow'] ),
 			'queuedAt'        => self::format_timestamp( isset( $queue['queuedAt'] ) ? absint( $queue['queuedAt'] ) : 0 ),
 			'dueAt'           => self::format_timestamp( isset( $queue['dueAt'] ) ? absint( $queue['dueAt'] ) : 0 ),
 			'lastAttemptAt'   => self::format_timestamp( isset( $last['attemptedAt'] ) ? absint( $last['attemptedAt'] ) : 0 ),
@@ -886,6 +894,7 @@ final class Mobo_Core_Cache_Purger {
 			$merged_urls = array_values( array_unique( array_merge( $existing_urls, $urls ) ) );
 			$merged_products = array_values( array_unique( array_filter( array_map( 'absint', array_merge( $existing_products, (array) $product_ids ) ) ) ) );
 			$merged_reasons = array_values( array_unique( array_filter( array_map( 'sanitize_key', array_merge( $existing_reasons, (array) $reasons ) ) ) ) );
+			$product_overflow = ! empty( $queue['productOverflow'] ) || count( $merged_products ) > self::ARCHIVE_QUEUE_MAX_PRODUCTS;
 
 			$merged_urls     = array_slice( $merged_urls, 0, self::ARCHIVE_QUEUE_MAX_URLS );
 			$merged_products = array_slice( $merged_products, 0, self::ARCHIVE_QUEUE_MAX_PRODUCTS );
@@ -905,6 +914,7 @@ final class Mobo_Core_Cache_Purger {
 				'attempts'        => isset( $queue['attempts'] ) ? absint( $queue['attempts'] ) : 0,
 				'urls'            => $merged_urls,
 				'productIds'      => $merged_products,
+				'productOverflow' => $product_overflow,
 				'reasons'         => $merged_reasons,
 			);
 			self::write_archive_queue( $queue );
@@ -961,7 +971,14 @@ final class Mobo_Core_Cache_Purger {
 		return true;
 	}
 
-	private static function purge_wp_super_cache_archive_products( $product_ids ) {
+	private static function purge_wp_super_cache_archive_products( $product_ids, $overflow = false ) {
+		if ( $overflow ) {
+			// A bounded map cannot represent all archives after >5000 distinct products.
+			// Use an explicit fallback; never silently claim the omitted IDs were purged.
+			if ( ! function_exists( 'wp_cache_clear_cache' ) ) { return false; }
+			wp_cache_clear_cache();
+			return true;
+		}
 		if ( ! function_exists( 'wp_cache_post_change' ) ) {
 			return false;
 		}
@@ -975,10 +992,14 @@ final class Mobo_Core_Cache_Purger {
 	}
 
 	private static function read_archive_queue() {
-		$queue = get_option( self::OPTION_ARCHIVE_QUEUE, array() );
-		if ( ! is_array( $queue ) ) {
-			$queue = array();
+		$queue = array();
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_State_Store::migrate_option( self::OPTION_ARCHIVE_QUEUE, self::STATE_ARCHIVE_QUEUE ); }
+			$queue = Mobo_Core_State_Store::get( self::STATE_ARCHIVE_QUEUE, array() );
+		} elseif ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) && self::legacy_default_owner_allowed() ) {
+			$queue = get_option( self::OPTION_ARCHIVE_QUEUE, array() );
 		}
+		if ( ! is_array( $queue ) ) { $queue = array(); }
 		$queue['urls']       = isset( $queue['urls'] ) && is_array( $queue['urls'] ) ? $queue['urls'] : array();
 		$queue['productIds'] = isset( $queue['productIds'] ) && is_array( $queue['productIds'] ) ? $queue['productIds'] : array();
 		$queue['reasons']    = isset( $queue['reasons'] ) && is_array( $queue['reasons'] ) ? $queue['reasons'] : array();
@@ -986,11 +1007,47 @@ final class Mobo_Core_Cache_Purger {
 	}
 
 	private static function write_archive_queue( $queue ) {
-		if ( false === get_option( self::OPTION_ARCHIVE_QUEUE, false ) ) {
-			add_option( self::OPTION_ARCHIVE_QUEUE, $queue, '', false );
-		} else {
-			update_option( self::OPTION_ARCHIVE_QUEUE, $queue, false );
+		$queue = is_array( $queue ) ? $queue : array();
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			return Mobo_Core_State_Store::set( self::STATE_ARCHIVE_QUEUE, $queue );
 		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		if ( ! self::legacy_default_owner_allowed() ) { return false; }
+		return class_exists( 'Mobo_Core_Durable_State_Policy' )
+			? Mobo_Core_Durable_State_Policy::update_option_verified( self::OPTION_ARCHIVE_QUEUE, $queue, false )
+			: update_option( self::OPTION_ARCHIVE_QUEUE, $queue, false );
+	}
+
+	private static function persist_archive_last_result( $record ) {
+		$record = is_array( $record ) ? $record : array();
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			Mobo_Core_State_Store::set( self::STATE_ARCHIVE_LAST_RESULT, $record );
+			if ( self::legacy_default_owner_allowed() ) { delete_option( self::OPTION_ARCHIVE_LAST_RESULT ); }
+			return;
+		}
+		if ( self::legacy_default_owner_allowed() ) { update_option( self::OPTION_ARCHIVE_LAST_RESULT, $record, false ); }
+	}
+
+	private static function read_archive_last_result() {
+		if ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() ) {
+			if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_State_Store::migrate_option( self::OPTION_ARCHIVE_LAST_RESULT, self::STATE_ARCHIVE_LAST_RESULT ); }
+			$value = Mobo_Core_State_Store::get( self::STATE_ARCHIVE_LAST_RESULT, array() );
+			return is_array( $value ) ? $value : array();
+		}
+		if ( ! self::legacy_default_owner_allowed() || ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) { return array(); }
+		$value = get_option( self::OPTION_ARCHIVE_LAST_RESULT, array() );
+		return is_array( $value ) ? $value : array();
+	}
+
+	private static function delete_legacy_archive_queue() {
+		if ( self::legacy_default_owner_allowed() ) {
+			delete_option( self::OPTION_ARCHIVE_QUEUE );
+			wp_cache_delete( self::OPTION_ARCHIVE_QUEUE, 'options' );
+		}
+	}
+
+	private static function legacy_default_owner_allowed() {
+		return ! class_exists( 'Mobo_Core_Connection_Context' ) || ! method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) || Mobo_Core_Connection_Context::legacy_default_owner_allowed();
 	}
 
 	private static function acquire_archive_queue_lock() {
@@ -1166,9 +1223,11 @@ final class Mobo_Core_Cache_Purger {
 			}
 		}
 
-		$enabled = apply_filters(
+		// A trusted filter may decline to warm, never override absence/failure of
+		// a recognized targeted page-cache purge (unsafe fail-open in UX52).
+		$enabled = $detected && $purged && (bool) apply_filters(
 			'mobo_core_cache_warmup_product_enabled',
-			$detected && $purged,
+			true,
 			$product_ids,
 			$integration_data,
 			$reasons
@@ -1180,20 +1239,32 @@ final class Mobo_Core_Cache_Purger {
 
 		$queued = 0;
 		$pending = 0;
+		$admission = array( 'queued' => 0, 'skippedCold' => 0, 'capacityRejected' => 0, 'writeFailures' => 0 );
 		foreach ( array_values( array_unique( array_filter( array_map( 'absint', (array) $product_ids ) ) ) ) as $product_id ) {
 			$enqueue = Mobo_Core_Cache_Warmer::enqueue_product( $product_id, '', 'targeted-product-purge' );
 			if ( ! empty( $enqueue['queued'] ) ) {
 				$queued++;
+				$admission['queued']++;
+			} elseif ( isset( $enqueue['status'] ) && in_array( $enqueue['status'], array( 'skipped-cold', 'skipped-nonpublic' ), true ) ) {
+				$admission['skippedCold']++;
+			} elseif ( isset( $enqueue['status'] ) && 'queue-capacity' === $enqueue['status'] ) {
+				$admission['capacityRejected']++;
+			} elseif ( empty( $enqueue['success'] ) ) {
+				$admission['writeFailures']++;
 			}
 			if ( isset( $enqueue['pendingCount'] ) ) {
 				$pending = max( $pending, absint( $enqueue['pendingCount'] ) );
 			}
 		}
+		Mobo_Core_Cache_Warmer::record_admission_metrics( $admission );
+		// Never aggregate the whole 20K-row queue on every product update; this
+		// field is an O(1) admission hint. Site Health computes the exact count.
 
 		$result['queued']       = $queued > 0;
 		$result['queuedCount']  = $queued;
 		$result['pendingCount'] = $pending;
-		$result['status']       = $queued > 0 ? 'queued' : 'nothing-queued';
+		$result['status']       = $queued > 0 ? 'queued' : ( $admission['capacityRejected'] > 0 ? 'queue-capacity' : ( $admission['writeFailures'] > 0 ? 'queue-write-failed' : ( $admission['skippedCold'] > 0 ? 'skipped-cold' : 'nothing-queued' ) ) );
+		$result['admission']    = $admission;
 
 		/*
 		 * Wake the local bounded runner once for the whole batch. This happens at
@@ -1212,7 +1283,7 @@ final class Mobo_Core_Cache_Purger {
 				try {
 					Mobo_Core_Self_Runner::kick( 'cache-warmup-queued', false );
 				} catch ( Throwable $e ) {
-					self::log_warning( 'Product cache warmup was queued but the self-runner wake-up failed: ' . self::sanitize_error( $e->getMessage() ), array( 'integration' => 'cache-warmup' ) );
+					self::log_warning( 'Product cache warmup was queued but the self-runner wake-up failed with an internal exception.', array( 'integration' => 'cache-warmup' ) );
 				}
 			}
 		}

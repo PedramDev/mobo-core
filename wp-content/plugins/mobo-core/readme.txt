@@ -1,13 +1,13 @@
 === Mobo Core ===
 Contributors: pedramdev
-Tags: woocommerce, iran, product sync, mobomobo, order automation
+Tags: woocommerce, iran, product sync, provisioned-source, order automation
 Requires at least: 5.8
 Tested up to: 7.0
 Requires PHP: 7.4
 Requires Plugins: woocommerce, persian-woocommerce
 WC requires at least: 8.2
 WC tested up to: 10.9
-Stable tag: 10.33.67
+Stable tag: 10.34.77
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -15,7 +15,7 @@ Connect WooCommerce to MoboCore for product sync, webhook queues, shipping mappi
 
 == Description ==
 
-Mobo Core is a WooCommerce integration plugin built for stores operating in Iran and using the specific `mobomobo.ir` workflow as their Mobo/Mobomobo product and order source. This plugin is not presented as the official plugin of mobomobo.ir unless such authorization is explicitly stated by the service owner.
+Mobo Core is a WooCommerce integration plugin built for stores operating in Iran and using the specific `the provisioned Source` workflow as their Mobo/provisioned-source product and order source. This plugin is not presented as the official plugin of the provisioned Source unless such authorization is explicitly stated by the service owner.
 
 The plugin connects WooCommerce to the MoboCore service for product synchronization, webhook processing, shipping method mapping, checkout validation, automatic order submission, and operational health checks.
 
@@ -27,16 +27,16 @@ Main features:
 * Targeted WooCommerce object-cache and page-cache invalidation for updated Mobo products, including LiteSpeed Cache and WP Rocket integrations without Purge All.
 * Queue-based webhook processing to avoid timeout in WordPress requests.
 * Complete Mobo shipping-method details, WooCommerce mapping, and optional shipping-only class/API-price context for Mobo products.
-* Separate shipping mapping for Mobo-only orders and mixed Mobo/non-Mobo orders.
-* Optional automatic order submission for Mobo-only and mixed WooCommerce orders.
-* Address mapping for checkout country, state, and city values used in Iran.
+* WooCommerce shipping mappings are used only for eligible all-Mobo, single-Connection order submission; mixed and multi-Connection orders fail closed.
+* Optional automatic order submission for `processing` orders that are entirely Mobo-owned by one Connection; no partial Mobo submission is attempted for mixed orders.
+* Central Location Resolver for order country/state/city values, with optional local city-cache compatibility.
 * Image refresh workflow for legacy images after a full Repair run.
 * Always-on operational health reporting for cron, queue, PHP/image capabilities, memory, disk, and debug status.
 * Optional order SMS notifications through the Persian WooCommerce SMS plugin.
 
 This plugin requires an active MoboCore account/license for the external synchronization and order automation features. You can buy or manage access at:
 
-http://mobo.codeya.ir/
+the provisioned Backend
 
 Sales and activation contact:
 
@@ -52,15 +52,15 @@ Technical support contact:
 
 == External services ==
 
-This plugin is designed for Iranian WooCommerce stores and a specific external Mobo/Mobomobo source: `mobomobo.ir`.
+This plugin is designed for Iranian WooCommerce stores and a specific external Mobo/provisioned-source source: `the provisioned Source`.
 
 The plugin may connect to these external services depending on administrator settings:
 
-1. MoboCore service at `mobo.codeya.ir`
+1. MoboCore service at `the provisioned Backend`
 
 Used for license/account access, token-based connection, product synchronization orchestration, webhook processing, queue status, repair/sync workflows, health reporting, and order automation support.
 
-2. Mobo/Mobomobo source at `mobomobo.ir`
+2. Mobo/provisioned-source source at `the provisioned Source`
 
 Used when checkout validation, cart checking, shipping method retrieval, or automatic order submission is enabled. This is the specific source this plugin is built for.
 
@@ -72,19 +72,19 @@ The plugin may send or receive the following data depending on enabled settings:
 * WooCommerce order data needed for Mobo order submission, including customer name, phone, shipping address, selected shipping method, Mobo product/variation identifiers, and order item quantities.
 * Technical health data such as queue counts, cron state, PHP memory, disk space, and debug status.
 
-After the site administrator enters a Token, Mobo Core can communicate with the central service for licensing, synchronization, webhook processing, and always-on operational health reporting. Optional customer-facing workflows such as checkout validation, order submission, and address mapping remain controlled separately. Legacy image refresh no longer requires a redundant enable switch: the safe workflow becomes active when its automatic cycle is started, while destructive old-attachment deletion remains separately guarded and opt-in.
+After the site administrator enters a Token, Mobo Core can communicate with the central service for licensing, synchronization, webhook processing, and always-on operational health reporting. Optional customer-facing workflows such as checkout validation, automatic order submission, central Location Resolution, and shipping mapping remain controlled separately. Legacy image refresh no longer requires a redundant enable switch: the safe workflow becomes active when its automatic cycle is started, while destructive old-attachment deletion remains separately guarded and opt-in.
 
 Service website:
 
-http://mobo.codeya.ir/
+the provisioned Backend
 
 Terms of Service:
 
-http://mobo.codeya.ir/terms
+the provisioned Backendterms
 
 Privacy Policy:
 
-http://mobo.codeya.ir/privacy
+the provisioned Backendprivacy
 
 == Installation ==
 
@@ -93,14 +93,14 @@ http://mobo.codeya.ir/privacy
 3. Activate Mobo Core through the Plugins screen in WordPress.
 4. Go to **Mobo > خرید و فعال سازی** to buy or manage your MoboCore license.
 5. Go to **Mobo > اتصال** and enter the Token and Webhook Security Code from MoboCore.
-6. Complete address mapping and shipping method mapping before enabling automatic checkout/order workflows.
+6. Before enabling automatic order submission, configure the Mobo login/sender fields and map every active WooCommerce shipping method to a current Mobo shipping ID. Order addresses are resolved centrally from the native WooCommerce country/state/city values.
 7. If upgrading from old versions such as version 7, run one full Repair from the dashboard before using image refresh.
 
 == Frequently Asked Questions ==
 
 = Is this plugin for all countries? =
 
-No. This plugin is intended for WooCommerce stores operating in Iran and using the specific `mobomobo.ir` source/workflow.
+No. This plugin is intended for WooCommerce stores operating in Iran and using the specific `the provisioned Source` source/workflow.
 
 = Why does Mobo Core refuse to activate? =
 
@@ -110,7 +110,7 @@ Mobo Core requires both WooCommerce and Persian WooCommerce (`persian-woocommerc
 
 The admin screens can be opened, but synchronization, license status, webhook processing, health reporting, checkout validation, and Mobo order automation require an active MoboCore account and token.
 
-= Does this plugin connect to mobomobo.ir? =
+= Does this plugin connect to the provisioned Source? =
 
 Yes, when checkout validation, cart checking, shipping method retrieval, or automatic order submission is enabled. The plugin is built for that specific source.
 
@@ -124,7 +124,7 @@ No. When the shipping-package option is enabled, `mobo_api_price` is used only i
 
 = Does it send SMS directly? =
 
-No. SMS notifications are sent through the Persian WooCommerce SMS plugin if that plugin is installed, configured, and enabled.
+No. Mobo Core delegates SMS transport to the Persian WooCommerce SMS plugin. Order-SMS rules are store-wide and run when Checkout creates/processes the order, not after payment success. Wallet low-balance alerts are Connection-scoped, one-shot, and evaluated only after a durable successful automatic Mobo purchase when the active Provider supports wallet balance. Ambiguous remote/commit outcomes are fenced against automatic replay; gateway acceptance does not prove final handset delivery.
 
 = Is Repair required after upgrading from version 7? =
 
@@ -141,9 +141,345 @@ Yes. Legacy installations should run one full Repair so product maps, image queu
 
 = Does product synchronization clear page caches? =
 
-Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; custom integrations can opt in through the warmup filter. Mobo Core does not call wp_cache_flush(), rocket_clean_domain(), litespeed_purge_all, or another full-site purge. Since 10.33.16.2, after a successful targeted page-cache purge, only the current product permalink is queued for an anonymous GET warmup by the real Mobo cron. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
+Mobo Core always clears WooCommerce product transients, WordPress post/object caches, and the changed product URL. The site administrator can configure deferred archive cache invalidation for product-category/tag archives, Shop, and Home from the Product settings tab. New installations default to a 15-minute batching window; archive invalidation can still be disabled explicitly. LiteSpeed Cache, WP Rocket, W3 Total Cache, and WP Super Cache are handled through their targeted APIs when available; trusted integrations can only decline warmup through the warmup-enabled filter. Mobo Core normally uses targeted invalidation and does not call wp_cache_flush(), rocket_clean_domain(), or litespeed_purge_all. The one explicit exception in UX52 is WP Super Cache archive overflow (>5000 distinct product IDs in a deferred batch), where wp_cache_clear_cache() is used to avoid silently leaving omitted archive entries stale. Following successful targeted page-cache purge, the currently changed product permalink is eligible for an anonymous GET through the real Mobo cron: UX53 defaults to selective admission (COLD products are not prewarmed), and the previous all-products policy remains available. Category, tag, Shop, Home, and old permalinks are not preloaded by this warmup queue.
 
 == Changelog ==
+
+= 10.34.30 (UX67 — cumulative UX66+UX67 final-source audit) =
+* Checkout specialized shared-cart HTTP checks fresh durable Connection owner and complete route/credential fingerprint before Login and every outbound cart request; changed/disabled/reprovisioned owner fails closed without adopting Default.
+* Portal-origin external validation uses fresh owner Token/X-SEC and rechecks the route after request signing. Portal RSA signer uses a freshly read durable Token instead of an old request-local Token.
+* Targeted redaction of raw transport/exception text in checkout/admin login, cache warmup/purge, maintenance/storage, Webhook, Health/cPanel, image/media/image-refresh, shipping diagnostics, SMS gateway, upgrade, reprice and supporting workers; stable bounded codes retained. Ambiguous Wallet/SMS is not automatically replayed.
+* No schema/DDL changes, Unicode conversion, Portal payload model rename or customer-data purge. Candidate only: real dual-site/Woo/HPOS/MySQL/Portal and 30K+30K runtime gates remain required.
+
+= 10.34.28 (UX65 — cumulative UX64+UX65) =
+* UX64: Shared global Woo Product Map lock around cross-Source owner SELECT/write/legacy seeding, binary-exact opaque GUIDs, guarded Product/Variant desired and applied revision state.
+* UX65: Fresh credential and route fence per outbound general API GET/POST/redirect; admin/signed provisioning SQL preimage CAS and maintenance gating; redacted generic API Client transport and HTTP errors.
+* Candidate source/mock audit. No new tables or schema changes; live two-process MySQL/WAMP/Portal, external Wallet idempotency and 60K soak remain open in BH/BI. Frozen UX51 Suite unchanged.
+
+= 10.34.26 (UX63 — cumulative UX62+UX63) =
+* UX62: Fresh binary-exact REST owner/Token authentication; strict WebHookId validation; fix failed webhook-test authentication diagnostic; Source Context reset; installation-scope Default revalidation; CAS signed provisioning and replay-nonce retirement.
+* UX63: Redacted new/legacy public upgrade failures, durable hold after unverified filesystem rollback, verified-only hold retirement, per-owner barrier-state CAS and preservation of UX61 importer/order evidence during uninstall.
+* No schema/Swagger changes. Source/mock audit only; live WAMP/Portal/HPOS integration remains pending in backlog BF/BG. Frozen UX51 Suite unchanged.
+
+
+= 10.34.24 (UX61 — cumulative UX60+UX61) =
+* UX60 revalidates Unicode fail-closed after atomic lock insertion, renews site-wide runner ownership before each additional Connection and before archive purge, keeps multi-Connection continuation visible when only one Source fits, and persists the warmup fairness cursor only at actual stage entry.
+* UX61 imports legacy Parent/Order queues in bounded additive 100-row slices with verified checkpoints and source-byte CAS retirement, without overwriting newer table revisions. Invalid legacy identity/payload stops cutover without deletion.
+* Map reads validate serialized payload/hash and latch failure to block destructive replacement; replace_map changes/deletes use expected-hash CAS and protect live claims. No table DDL or business-data conversion; real MySQL/two-process evidence remains pending (BD/BE).
+
+= 10.34.22 (UX59 — cumulative UX58+UX59) =
+* UX58 serializes image desired-state updates, prune rechecks and Woo gallery linkage under one explicit Connection+product lease without holding locks during downloads; a stale explicit-empty snapshot cannot erase reintroduced images.
+* UX59 adds category API request-start generation, owner-scoped snapshot apply leases, durable committed watermark, and compare-and-clear retirement that cannot overwrite a concurrently changed synced term.
+* Recheck shared-term owner and active marker during retirement/resurrection; manual mapping is preserved. All runtime 2-process/MySQL/Portal tests are recorded in BB/BC and remain pending, not claimed PASS.
+* No schema change. Cumulative artifact includes UX58 internal checkpoint 10.34.21.
+
+= 10.34.20 (UX57 — cumulative UX56+UX57) =
+* Shipping snapshot GET-start and stored generation now use microseconds. A newer webhook beats an older in-flight GET even when both commit in one second and regardless of explicit changedAt on the old response.
+* Wallet Alert rechecks uncached durable Connection and cached route agreement before post-order balance requests. Delivery and explicit re-arm share the existing owner-scoped SMS lease; blocked re-arm never clears a live replay fence.
+* Remote wallet, SMS, address-mapping and shipping diagnostics persist stable error codes instead of raw upstream error messages. Missing Connection owner blocks Address Mapping / City Assets generation.
+* No database schema change and no Wallet automatic replay. UX56 order route/quarantine corrections are included in this cumulative archive. Carry BA regression contracts to the final Suite; runtime WAMP/Portal proof remains pending.
+
+= 10.34.19 (UX56) =
+* Full-order pipeline audit: uncached Connection route fingerprint guards disabled/deleted/reprovisioned owners between remote stages and immediately before Wallet. Never reuse Default or cross-route remote checkout/payment.
+* Stale running-order quarantine now requires the same purchase lease, fresh Woo CRUD read and verified uncertainty commit; a live request or durable success cannot be overwritten by another worker.
+* Failed/aborted orders with leftover recovery queue rows are not automatically resubmitted. No schema change; real Portal/HPOS chaos gate is pending.
+
+= 10.34.18 (UX55) =
+* Full/Repair Sync snapshots now capture the watermark before HTTP GET; a later foreground webhook causes exact-product rebase before image/variation stages, with under-lock Simple and paged Variant checks.
+* Reprice persists pending variable-parent recalculation with its cursor and safely retries it under Connection ownership and a shared product lock after crash.
+* Added permanent UX55 audit contracts. Live WAMP/Portal multi-process proof still pending; UX51 Plugin Gate remains on its frozen artifact.
+
+= 10.34.17 (UX54) =
+* First full plugin pipeline audit tranche: fail-closed durable Webhook owner validation for both table and file paths, fresh enabled-owner probe at process time, non-destructive owner-unavailable deferral, corrected uninstall DB scope, and bounded REST/Cron exception diagnostics. No schema change. Pending real WordPress/MySQL/Portal tests are recorded in docs/internal/full-plugin-pipeline-audit.md and admin-ux-test-backlog.md.
+
+= 10.34.16 (UX53) =
+* Hardened large-catalog warmup: bounded additive legacy import with a checkpoint and no destination-map replacement; 18K WARM admission reserve for 2K HOT rows within the 20K Connection cap.
+* Use indexed existence probes in Cron/due checks rather than recounting queue payloads. Multi-Connection dispatch uses a durable separate warmup cursor, selecting one due Connection with at most one GET/stage per dispatch.
+* Warm only canonical published parent products, without visitor cookies, and reject session/cart/action/private/non-HTML/Set-Cookie/bypass responses. Cache HIT requires explicit provider evidence; an ordinary HTTP 200 alone never proves cached output.
+* Scoped to single-language/single-currency sites; no automatic 30K crawl or new database table. Integration and 30K/60K MySQL stress tests remain pending.
+
+= 10.34.15 (UX52) =
+* Cache warmup for large catalogs: selective HOT/WARM/COLD admission (default), indexed row-based per-Connection queue, stable parent-product deduplication, and CAS claim/commit fencing. COLD products are purged but not prewarmed automatically; previously warmed pages can regenerate on normal customer visits.
+* An installation-wide bounded GET rate budget, HOT-first scheduling with WARM fairness, and no unbounded queue reads during Cron snapshot. Includes explicit capacity rejection and HIT/MISS/bypass evidence in Health.
+* Deferred WP Super Cache archive purge records product-ID overflow instead of silently dropping coverage; the documented overflow fallback may purge its entire page cache.
+* Operators can select legacy all-products warmup when necessary. No new DB table is required; existing work_queue indexes are reused. See docs/internal/cache-warmup-30k-policy.md.
+
+
+
+= 10.34.14 =
+* Finalized the Pricing admin UX/content audit: clearer policy hierarchy, safer dynamic-range editing, Reprice lifecycle states, and technical diagnostics moved out of the primary view.
+* Restored the pricing contract that a per-Variation `mobo_additional_price` is the highest-priority valid pricing override; parent Product percentage overrides apply only when the Variation has no dedicated profit.
+* Fixed decimal Dynamic percentage benefits (for example `12.5`) so they are no longer interpreted as `125`, and preserved decimal fixed benefits through the central calculator.
+* Reprice generations now fingerprint calculator-affecting global settings. Running policy edits are blocked in Admin, and a stopped/running generation whose policy changes cannot be resumed across mixed formulas.
+* Finalized the Product Exclusions admin audit: clarified that exclusions stop source-driven mutations without removing Mobo identity/order behavior, documented queued-work and re-enable lifecycle, canonicalized/deduplicated saved paths, rejected unusable URL entries, and verified Connection-scoped persistence before reporting success.
+
+= 10.34.13 =
+* Added the central Source Registry and durable `source_key` on Connections. The built-in `provisioned-source` source now owns Backend URL resolution; stored `api_base_url` remains only for migration/rollback compatibility and is not Connection identity.
+* Added `mobo_connection_settings` and idempotently migrated Source-dependent Product Update, Pricing, Category, Filter, and related business options into the Default Connection without changing License architecture.
+* The legacy single-source admin settings remain mirrored into Default Connection during the staged migration, but customer edits no longer change the API base URL. Multiple enabled Connections remain fail-closed until ownership/state isolation is complete.
+* WebHookId is internal Connection routing state: the admin UI shows only binding status, cannot edit/inject the raw identifier, and first-time binding is allowed only when X-SEC uniquely identifies one enabled unbound Connection.
+
+= 10.34.12 =
+* Added the first fail-closed Multi-Connection foundation: durable `mobo_connections` storage, automatic adoption of existing installs as one Default Connection, and per-request connection context.
+* Portal-to-WordPress requests resolve Connections through `X-Mobo-Webhook-Id`; an unbound Connection adopts a new WebHookId only when the supplied `X-SEC` uniquely identifies that Connection.
+* Durable webhook events now retain `connection_id`, and asynchronous payload processing restores the owning Connection before Portal API, image, health, signing, and remote-update calls.
+* Existing single-connection URL/Token/X-SEC options remain mirrored for backward-compatible UI and rollback. Multiple enabled Connections intentionally fail closed until product/category/repair/cleanup ownership is connection-scoped in the next migration stage.
+
+= 10.34.11 =
+* Fixed the terminal completion handoff so a clean Product/Variation Map cannot overwrite an explicit `mobo_sync_incomplete=1` marker with a contradictory aggregate-complete Custom Storage state before the final verified 1→0 mutation.
+* Product and Variation Storage Bridge snapshots now remain fail-closed while the explicit completion marker is still incomplete, then converge normally when the verified marker mutation succeeds.
+* No schema, API, Provider, Portal, or migration-fence contract changes.
+
+= 10.34.10 =
+* Fixed terminal Product Map mirroring so Operational metadata is read from the current Custom-authoritative WordPress meta view after the durable operational fence instead of from physically retired Legacy postmeta.
+* Product and Variation completion-marker presence/value, revisions, and source hashes are therefore preserved across Product Map mirrors after terminal retirement.
+* Pre-terminal behavior is unchanged: before the operational fence, Storage Bridge continues to snapshot authoritative Legacy postmeta exactly as before.
+
+= 10.34.09 =
+* Fixed WooCommerce terminal metadata namespace collision: generic Entity Meta synthetic IDs are now strictly bounded to the 4e18..5e18 range.
+* Specialized Operational (5e18..) and Identity (6e18..) synthetic rows can no longer be stripped by the priority-20 Entity Meta read bridge.
+* WC_Product::get_meta()/save_meta_data() therefore retains terminal typed metadata after physical postmeta retirement without relaxing Custom-only authority.
+
+= 10.34.08 =
+* Fixed authoritative Legacy identity snapshots after the terminal identity fence: Storage Bridge now scopes a bypass for both Custom-primary reads and terminal identity-read interception.
+* Parent-first identity materialization can therefore preserve legacy Portal Product ID and identity presence while still keeping normal runtime reads Custom-only.
+* The bypass is depth-counted and restored in finally blocks; it is migration-snapshot-only and does not relax terminal mutation or runtime ownership rules.
+
+= 10.34.07 =
+* Identity proof now materializes and validates a Variation's parent Product State before requiring full Variation custom-storage parity.
+* This fixes post-ID ordering where a live Variation can be proved before its higher-ID parent Product: exact parent GUID/Map/legacy evidence is resolved first, then the normal Product bridge creates the parent state.
+* Parent disagreement, malformed/missing durable identity, Product bridge failure, or post-write parity mismatch still fails closed; no GUID is generated and no parity exception is introduced.
+
+= 10.34.06 =
+* Fixed terminal Entity Meta migration readiness on Storage Schema v7: the retirement worker now trusts the current validated Storage Schema instead of requiring the obsolete exact schema-generation literal `6`.
+* This removes the post-Identity `pending` / null-residue deadlock that could otherwise loop until the terminal migration timeout even after Operational and Identity retirement were complete.
+* Entity Meta still fails closed unless the current Storage Schema validates successfully and the dedicated entity-meta table resolves normally.
+
+= 10.34.05 =
+* Trashed parent-only Variation residue can now be proven against either the exact Parent Product State row or a singular exact Parent Product Map binding, removing a false dependency on Product State backfill ordering.
+* All available parent Product GUID and Portal Product ID evidence must collapse to one identity; malformed, duplicate or conflicting State/Map/postmeta evidence still blocks cutover.
+* No Variant GUID is generated and no legacy row is deleted before the terminal fence.
+
+= 10.34.04 =
+* Identity proof recognizes trashed Woo variations that have no Variation identity of their own and only retain an exact stale copy of parent Product identity.
+* This bypass is fail-closed: any Variant GUID/Portal Variant ID, Variant State row, Variation Product Map binding, malformed value, or disagreement with Parent Product State still blocks cutover.
+* No GUID is generated and no legacy row is deleted before the terminal fence; recognized residue is removed only by the existing bounded physical cleanup.
+
+= 10.34.03 =
+* Terminal identity proof can conservatively recover a missing legacy Product/Variation GUID from a singular exact Product Map binding when Custom State is absent.
+* Variation recovery requires parent identity agreement across Woo parent, Product Map, Custom State and surviving legacy evidence.
+* Multiple reverse map bindings, malformed GUIDs and identity disagreements remain fail-closed; no GUID is invented.
+
+= 10.34.02 =
+* Identity-postmeta retirement can now recover a missing legacy Product/Variation GUID from the exact Custom Storage row bound to the same Woo object.
+* Recovery is fail-closed: legacy/custom disagreement, parent mismatch, malformed identity, missing canonical identity, or storage read errors still block cutover.
+* No synthetic GUIDs are generated and no conflicting identity is overwritten.
+
+= 10.34.01 =
+* Reconcile legacy operational Product/Variation metadata that has no Product Map row before terminal cutover.
+* Preserve recoverable trashed Mobo objects by safely rebuilding an unambiguous map row; prune only provably unowned auto-draft/trash operational residue.
+* Keep live objects with missing, duplicate or conflicting identity fail-closed instead of discarding state.
+* Continue the exact proof from newly synthesized map rows so Custom Storage receives the full legacy operational snapshot before physical cleanup.
+
+= 10.34.00 =
+* Shared-host migration hardening: normal WordPress requests now advance upgrades under an option-backed single-request mutex; no WP-CLI, SSH, shell cron, advisory DB locks or information_schema access is required.
+* Reduced Product/Category-map, terminal metadata, large-runtime recovery and cleanup batch sizes so upgrades remain resumable under conservative shared-host PHP execution limits.
+* Schema inspection continues to use SHOW COLUMNS / SHOW INDEX only on Mobo-owned tables; failed CREATE/ALTER/INDEX work remains fail-closed and retryable instead of stamping the DB version.
+
+= 10.33.99 =
+* Upgrades Custom Storage to Schema v7 with complete index postcondition validation and atomic same-name index repair.
+* Adds `mobo_entity_meta.object_order (woo_object_id,sort_order,id)` for all-meta reads and `mobo_image_queue.product_position (product_id,position_index,id)` for deterministic product image ordering.
+* Retires exact left-prefix duplicate `status_retry` indexes from image queue, image refresh queue, and sync event store after verifying the covering `status_retry_id` index.
+* Aligns Seen-Variant migration verification with the existing scope/id index instead of adding a high-churn GUID sort index.
+
+= 10.33.98 =
+* Makes the 10.33.94 operational-retirement bootstrap path safe at plugins_loaded by removing wc_get_product()/WC_Product dependencies from legacy Product-state mirroring. Simple-product Variant identity is mirrored directly from explicit legacy snapshot fields into Custom Storage.
+* Keeps Storage Schema v6 and all retirement scopes unchanged; this release is a migration-bootstrap/runtime safety fix on top of 10.33.97.
+
+= 10.33.97 =
+* Completes the terminal metadata compatibility surface after physical Product/Variation retirement: false-y values remain present for metadata_exists(), absent typed identity remains truly absent, and unrelated Woo products no longer receive a synthetic mobo_sync_incomplete fail-safe.
+* Adds a unified WordPress all-meta view so get_post_meta($id) and get_post_custom() include terminal operational, identity and generic Mobo metadata while ordinary native metadata stays in wp_postmeta.
+* Adds a specialized WooCommerce raw/by-meta-ID bridge for typed operational and identity metadata, keeping WC_Product get_meta/update_meta_data/delete_meta_data coherent with Custom Storage after physical cleanup.
+* Makes post-terminal generic late-write/delete cleanup durable: failed mirror/delete work sets a persistent repair marker, init performs bounded retry/drain, and the retirement finalizer blocks completion while repair remains pending.
+* Hardens explicit-key scoping and the final stale-mirror convergence proof without changing Storage Schema v6 or the 10.33.96 entity-meta migration target. 64-bit PHP is now explicitly enforced because stable WooCommerce terminal synthetic meta IDs require 64-bit integers.
+
+= 10.33.96 =
+* Adds Storage Schema v6 and the plugin-owned mobo_entity_meta table for the remaining Mobo-owned Product/Variation metadata while preserving WordPress multi-row ordering and exact source meta_id parity during migration.
+* Physically retires remaining Product/Variation _mobo_*/mobo_* metadata plus the legacy published_at key for identified Mobo objects. Typed operational and identity families remain in their dedicated Custom tables; WooCommerce-native metadata, attachments, orders and order items remain outside this scope.
+* Uses exact copy/parity proof, a durable transition marker, a 120-second in-flight-request grace, post-commit late-write mirroring, post-grace stale-mirror drain, re-mirror-before-delete cleanup, and final SQL zero-residue proof before the permanent fence and DB-version stamp.
+* Bridges WooCommerce raw metadata reads and synthetic by-meta-ID update/delete operations so WC_Product get_meta/update_meta_data/delete_meta_data continue to work after physical wp_postmeta cleanup.
+* Converts remaining generic-Mobo direct lookup paths, including image/reprice/repair flows and Repair generation-marker scanning, to terminal Custom Storage while retaining explicit pre-fence upgrade branches.
+* Upgrades retirement health to Finalizer gate v4: operational, identity and generic entity-meta fences must all be complete with exact zero Product/Variation residue.
+
+= 10.33.95 =
+* Physically retires Mobo Product/Variation identity postmeta after Storage Schema v5 backfill and exact parity proof. Product GUID, Variant GUID aliases, Portal Product ID aliases, and Portal Variant ID aliases become Custom-table authoritative.
+* Adds explicit Simple-product purchasable-Variant identity columns so Simple Products no longer need Variant GUID/Portal Variant ID identity in wp_postmeta.
+* Publishes a separate irreversible identity fence, waits a 120-second in-flight-request grace, cleans legacy identity rows in bounded batches, and blocks DB-version stamping until Product/Variation identity residue is exactly zero.
+* Keeps Product GUID ownership non-rebindable, allows a narrowly scoped same-Woo-Variation/same-parent Variant GUID rebind when the new GUID is unowned, and fails closed on collisions, malformed identity, alias conflicts, missing parent authority, or Custom-write failure.
+* Converts Repair, Sync, Concurrency, Missing Image Recovery, Recategorize, Product Ledger and other identity lookups to Custom Storage after the terminal fence while retaining recoverable Trash identity.
+* Upgrades the retirement finalizer to gate v3: release health is terminal only when both operational and identity retirement fences are complete with zero physical Product/Variation residue. Attachments, order-item identity snapshots, forensic markers, and WooCommerce/native metadata remain outside this scope.
+
+= 10.33.94 =
+* Physically retires seven high-churn Mobo operational metadata keys from wp_postmeta for WooCommerce Products and Variations after strict Custom Storage backfill and exact verification.
+* Publishes an irreversible terminal Custom-only fence before cleanup, keeps a redundant fail-closed fence marker, and blocks DB-version stamping until Product/Variation residue is exactly zero.
+* Intercepts managed add/update/delete metadata operations before WordPress can recreate retired rows; terminal mutations use Custom-state CAS and fail closed on missing rows, invalid values, conflicts, or revision regression.
+* Preserves attachment-level mobo_sync_incomplete and all WooCommerce/native, identity, media, pricing, and other out-of-scope metadata.
+* Adds bounded/resumable physical cleanup, a 120-second production grace for in-flight pre-fence requests, and terminal retirement health evidence.
+
+= 10.33.93 =
+* Makes the 10.33.92 large-runtime migration a strict, resumable cutover: the plugin DB version cannot advance while any retired fixed or prefixed heavy-state option remains.
+* Prevents post-cutover runtime fallback to retired heavy wp_options. Before the cutover stamp, legacy reads/writes remain available only as an upgrade safety path; after 10.33.93, missing custom tables fail closed instead of silently recreating legacy state.
+* Fixes authoritative variation finalization after Seen-Variant migration: finalization now loads the dedicated mobo_seen_variants set instead of reading the deleted mobo_seen_variants_* option.
+* Covers Cron scheduler preflight, Sync Settings Guard, Product Concurrency, City Assets, Cache Warm-up, Parent Finalize, Archive Purge, Product Sync, Checkout, Address Mapping, and Health snapshot consumers with the same strict storage policy.
+* Hardens migration verification itself: State/Queue read-back fails closed on database errors, Checkout debug-event migration verifies the bounded visible window, and legacy rows are retired only after verified destination persistence.
+* Keeps Storage Schema v4 unchanged. Small settings/version markers and the separately controlled Product/Variation operational-postmeta retirement remain independent storage phases.
+
+= 10.33.92 =
+* Moves high-churn/large runtime state out of wp_options into plugin-owned durable tables: row-based work queues, large state snapshots/checkpoints, authoritative seen-Variant sets, and bounded event history.
+* Migrates Cache Warm-up, Parent Finalize, Order Submission/Recovery, Cache Archive Purge state, manual Product Sync checkpoint, Address Mapping, Health last-good snapshots, Checkout debug history, and legacy seen-Variant generations with verified read-back before deleting legacy options.
+* Adds schema v4 tables mobo_state, mobo_work_queue, mobo_seen_variants, and mobo_events with indexed queue/dedupe access suitable for large catalogs.
+* Preserves fail-safe legacy option fallback only when the new schema is genuinely unavailable; successful schema creation/migration keeps normal runtime reads and writes off the retired heavy options.
+* Keeps small settings, version markers, feature flags, locks, and bounded last-result records in wp_options where WordPress option storage remains the correct abstraction.
+
+= 10.33.91 =
+* Hardens Repair liveness: category semantic defects use a bounded retry budget and degrade without blocking product Repair forever; stalled Product/Variation cursors fall back safely; repeated product-lock contention is bounded and quarantined diagnostically.
+* Adds non-destructive authoritative retirement for source categories absent from a complete category snapshot while preserving customer taxonomy/manual mappings and supporting in-place resurrection. Category retirement fails closed on mapping-read errors and retired parents cannot satisfy new child relationships.
+* Splits webhook queue metrics into exact pending, processing, due, actionable failed, and historical/superseded failed counts; Retry Failed re-arms only the latest unresolved failure for each identity. Queue read failures are reported as unavailable instead of synthetic zero counts.
+* Adds real-Cron interval measurement with an inclusive ±5 second on-time window; admin/manual Cron attempts can no longer forge the real scheduler hit timestamp.
+* Separates verified current Sync Health gaps from Health-only uncertainty so stale raw history is not reported as proven operational breakage or exposed as a Clean-Gate mutation target. Product Map, ownership and Health-history DB read failures now fail closed as unavailable.
+* Bounds main Product Repair lock contention and persists explicit incomplete/Product Map/Sync Health evidence when an object must be quarantined so one permanently locked object cannot block the entire site.
+* Prevents Variant Repair from advancing its page/cursor when payload handling reports waitingForProduct; retry budgets clear only after durable progress.
+* Makes Repair Integrity phase reads fail closed: duplicate, trash, signature, post-sync, legacy/map candidate, live-variation and shipping cleanup DB read failures retry without being mistaken for empty/completed phases or allowing cleanup mutation.
+
+= 10.33.90 =
+* Fix Real-Cron runner aggregation crash in storage reconciliation by supplying the required fourth merge_queue_counters() argument.
+* No Portal change. Custom Storage retirement behavior remains unchanged.
+
+= 10.33.89 =
+* Graduates `mobo_sync_incomplete` into controlled Custom-first suppression as the seventh operational postmeta key after a fresh exact-key readiness lease.
+* Adds authority-aware commit-group guards so a later hash/completion write does not require retired sibling postmeta to reconverge after those siblings have already become Custom-authoritative.
+* Product and Variation completion writes use bounded Custom CAS, preserve explicit metadata presence, recompute derived incomplete/status/dirty/revision/hash boundaries atomically, and fall back to Legacy immediately on drift, duplicate meta, identity mismatch, parent mismatch, race, or Custom failure.
+* Advances postmeta suppression readiness to v4 and exposes the currently runtime-eligible authority set in one bounded evaluation.
+* Removes Product Repair SQL dependence on retained `mobo_sync_incomplete=0`; Repair completion proof now resolves through the storage-mode-aware metadata API, so intentionally stale rollback postmeta cannot corrupt repair candidate selection.
+* Direct REST/add/delete metadata compatibility paths remain Legacy-first; attachment `mobo_sync_incomplete` is outside Product/Variation suppression.
+* Rejects malformed present retained completion markers during sibling parity checks; only exact `0`/`1` values may satisfy the Legacy side of the commit group.
+
+= 10.33.87 =
+* Fixes the Custom Storage source-hash width contract: Product Sync source hashes are canonical 32-character MD5 hex values, and all Custom mirror/read/parity/repository layers now use that same format.
+* Prevents valid `_mobo_product_source_hash` and `_mobo_variant_source_hash` values from being normalized to empty Custom state.
+* Keeps commit-group source-hash suppression fail-closed with immediate Legacy fallback on mismatch, race, missing row, or Custom failure.
+* `mobo_sync_incomplete`, REST mutations, add/delete metadata, and non-opted-in keys remain Legacy-authoritative.
+
+= 10.33.86 =
+* Graduated Product/Variation source-hash writes into controlled per-key suppression.
+* Hash suppression requires an exact retained-Legacy/Custom revision, presence, and incomplete-state commit-group match before Custom-first CAS may skip postmeta.
+* Any hash commit-group mismatch, CAS race, missing row, or Custom failure restores Legacy immediately and trips the request-local suppression breaker.
+* `mobo_sync_incomplete`, REST mutations, add/delete metadata, and non-opted-in keys remain Legacy-authoritative.
+* Per-key readiness moved to policy v3 so source hashes require fresh qualification before suppression.
+
+= 10.33.85 =
+* Adds controlled per-key operational-postmeta write suppression for the four monotonic Product/Variation revision watermarks.
+* Suppression is opt-in through `mobo_core_storage_postmeta_write_suppression_keys` and requires Custom-Only plus a fresh per-key readiness lease.
+* Custom state is committed first with bounded compare-and-swap protection; any Custom miss/race/failure restores Legacy `update_post_meta()` immediately and revokes suppression for the request.
+* Product/Variation source hashes, `mobo_sync_incomplete`, REST metadata writes, add-postmeta, and delete-postmeta remain Legacy-authoritative.
+* Postmeta suppression readiness policy v2 can sustain a previously qualified key using fresh successful suppression telemetry without mislabeling those writes as Legacy writes.
+
+= 10.33.84 =
+* Adds evidence-only per-key readiness telemetry for future operational-postmeta write suppression; no operational postmeta write is suppressed or deleted.
+* Tracks Custom reads, Legacy read dependencies, and retained Legacy writes independently for each revision/hash/incomplete key with request deduplication and set-based runtime persistence.
+* Adds a per-key 72-hour readiness gate requiring 250 fresh Custom reads, 50 exercised Legacy writes, recent evidence, zero Legacy read dependencies, and a valid global Legacy-retirement lease.
+* Keeps `mobo_sync_incomplete` independent from revision/hash keys so stricter presence/REST compatibility can remain blocked without delaying safer keys.
+* Exposes per-key eligibility in Site Health and the runner while leaving the existing Product Map no-op suppression option unchanged.
+
+= 10.33.83 =
+* Adds explicitly opted-in, retirement-gated suppression for redundant Product Map no-op writes emitted by the Product Sync commit boundary; default remains off.
+* Only already-canonical Product Map rows whose identity, parent, hash, incomplete flag, and reverse-map cardinality already match may be skipped after a successful Custom mirror; changed/new mappings still write Legacy normally.
+* If the Custom mirror fails, the same commit immediately writes the Product Map and disables suppression for the rest of the request.
+* Advances the Legacy Retirement Gate to v2 with a 15-minute runtime lease and same-request read-dependency checks before any write may be suppressed.
+* Adds suppression/fallback telemetry to Site Health; no existing Legacy data is deleted and rollback through retained identity postmeta remains available.
+
+= 10.33.82 =
+* Adds evidence-only Legacy retirement readiness telemetry while leaving all Product Map and operational postmeta writes enabled.
+* Counts Custom-Only reads that still require Legacy compatibility, including exact-meta absence and guarded bypass scopes; any new dependency resets retirement confidence.
+* Inventories retained Legacy Product Map/postmeta write volume separately so write cost can be measured without treating normal writes as readiness failures.
+* Adds a 72-hour retirement gate requiring 2,000 fresh Custom-Only identity hits, 500 fresh state hits, recent traffic evidence, zero new Legacy read dependencies, zero primary fallbacks, and zero Custom write failures.
+* Exposes Legacy dependency/write inventory and retirement readiness in Site Health; no storage mode or write behavior changes automatically.
+
+= 10.33.81 =
+* Treats fully dominated stale Product/Variation Custom Storage mirrors as successful idempotent no-ops instead of false repository failures.
+* Keeps same-revision/different-state and incomparable concurrent snapshots fail-closed so real drift is still surfaced to reconciliation and promotion gates.
+* Prevents benign stale delivery/replay from incrementing Custom write failure telemetry or revoking an otherwise healthy Custom-Primary/Custom-Only confidence window.
+
+= 10.33.80 =
+* Adds controlled Custom-Only cutover behind the independent short-lived readiness lease.
+* Healthy Custom-Only identity/state reads no longer depend on retained Mobo identity postmeta; Woo object existence/type/parent guards remain.
+* Any real Custom miss/invalid row or dual-write failure immediately revokes the request and degrades safely to guarded Custom-Primary/Legacy fallback.
+* Custom-Only readiness policy advances to v2 so prior readiness evidence must be re-established after upgrade.
+
+
+= 10.33.79 =
+* Adds bounded, request-deduplicated successful Custom-Primary identity/state usage telemetry stored only in `mobo_runtime`.
+* Adds a separate Custom-Only readiness gate requiring 1,000 identity hits, 250 exact-state hits, 24 clean hours, recent traffic evidence, zero new primary fallbacks, and zero new Custom write failures.
+* Custom-Only readiness is evidence-only: this release never removes Legacy fallback and never changes the requested storage mode automatically.
+* Adds Custom-Only readiness and primary-usage diagnostics to Site Health and evaluates the gate only as a low-priority runner stage after the existing promotion gate.
+
+= 10.33.78 =
+* Adds schema v3 metadata-presence fidelity so operational state preserves absent vs explicit zero/one semantics instead of collapsing them.
+* Enables promotion-gated Custom-Primary reads for exact Product/Variation revision/hash/incomplete state with mandatory Legacy fallback and retained Woo identity guards.
+* Pins operational metadata mutations to Legacy reads before WordPress write/no-op decisions; pending Metadata Commit Bridge objects also bypass Custom state reads.
+* Keeps REST operational metadata Legacy-primary in this rollout so REST duplicate/delete preflight cannot be influenced by Custom mirrors.
+* Present Custom values preserve `metadata_exists()` semantics, while exact Custom absence safely falls through to Legacy without poisoning primary fallback telemetry.
+* Advances State Parity to the v3 evidence namespace and Promotion Gate to v5; older leases fail closed.
+= 10.33.77 =
+* Adds lossless Custom Storage state watermarks for Product/Variation operational-state fidelity while Legacy remains authoritative.
+* Storage schema v2 preserves separate product/variant seen/applied revisions, source hashes, and exact sync-incomplete state.
+
+= 10.33.76 =
+* Adds bounded read-only parity for direct operational Product/Variation state reads that do not pass through Product Map identity lookup.
+* Revision, source-hash and completion reads remain exact Legacy postmeta values; Custom Storage is compared only as a side-channel observer.
+* Promotion Gate v3 requires a separate 100-comparison clean state-read window in addition to the existing identity parity window, and older promotion leases are invalidated fail-closed.
+* State parity is capped at 32 entities per request, stores at most five mismatch samples, and is exposed through Site Health without wp_options telemetry writes.
+
+= 10.33.75 =
+* Adds a bounded operational-metadata commit bridge so direct Product/Variation identity, Portal ID, revision, source-hash and `mobo_sync_incomplete` postmeta writes also mirror to Custom Storage.
+* Relevant changes dedupe by Woo object and flush at 100 unique entities or request shutdown; unrelated WordPress/WooCommerce metadata is rejected before the bridge class autoloads.
+* Legacy writes and operational state reads remain authoritative. Custom-Primary stays limited to promotion-gated Product/Variation identity lookup with Legacy fallback.
+* Custom-only remains capability-capped to Custom-Primary with Legacy fallback.
+
+= 10.33.73 =
+* Adds bounded Legacy-to-Custom Product/Variation reconciliation before promotion eligibility can start.
+* Reconciliation refreshes operational drift from authoritative Product Map/postmeta, cleans Custom rows tied to deleted/trashed Woo objects, and reports active identity collisions as ambiguous instead of rewriting them destructively.
+* Trash/delete/untrash lifecycle hooks keep Custom identity mirrors aligned without changing Legacy/Woo authority.
+* Promotion Gate now requires the latest reconciliation checkpoint to be clean; custom-primary/custom-only remain capped to shadow-read and are never auto-enabled.
+
+= 10.33.72 =
+* Adds a strict evidence-only promotion gate for future custom-primary Product/Variation reads; runtime remains capped at shadow-read.
+* Promotion requires gap-free backfill, exact active Legacy/Custom identity coverage, 500 clean shadow comparisons, six clean hours, fresh parity evidence, and no new dual-write failures.
+* Historical mismatch/write counters are baselined when a clean window starts; any new mismatch or custom write failure resets the window instead of permanently poisoning future eligibility.
+* Promotion evidence is stored in mobo_runtime and exposed through Site Health; this release never changes mobo_core_storage_mode automatically.
+
+= 10.33.71 =
+* Adds bounded read-only shadow parity for Product/Variation custom storage while Legacy remains authoritative.
+* Shadow comparisons cover Product Map single lookups, status lookups, and bulk Variation priming without changing returned Woo IDs/status.
+* Parity is capped per request, de-duplicated, aggregated once into mobo_runtime, and exposed through Site Health with mismatch samples/reasons.
+* custom-primary/custom-only remain disabled and capability-capped to shadow-read.
+
+= 10.33.70 =
+* Adds bounded, resumable Product/Variation custom-storage backfill sourced from the indexed legacy Product Map instead of catalog-wide postmeta scans.
+* Backfill runs only in dual-write-capable mode, at lowest real-runner priority, one batch per invocation, with a durable cursor in mobo_migrations.
+* Live mirror failures stop cursor advancement for retry; stale/deleted map rows are skipped safely and live unmappable gaps remain visible in migration status.
+* Adds custom-storage rollout/backfill observability to Site Health; runtime reads remain legacy-only.
+
+= 10.33.69 =
+* Adds capability-capped legacy-first dual write for Product/Variation operational state.
+* Custom-storage mirror failures are observable but never fail a successful legacy sync.
+* Read paths remain legacy-only; shadow/custom-primary/custom-only cannot become effective yet.
+
+= 10.33.68 =
+* Added phase-1 custom storage foundation with seven prefixed operational tables.
+* Added independent storage schema version/error boundary; legacy runtime remains available if custom DDL fails.
+* Added fail-closed rollout modes (legacy, dual-write, shadow-read, custom-primary, custom-only), defaulting to legacy.
+* Added Product/Variant state repositories without wiring existing sync behavior to custom storage yet.
 
 = 10.33.67 =
 * Added a WooCommerce Products-list filter with three states: all products (default), Mobo products, and non-Mobo products.

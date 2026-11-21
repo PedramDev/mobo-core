@@ -29,13 +29,28 @@ class Mobo_Core_Image_Prune_Queue {
 	/** @var bool|null */
 	private static $table_exists_cache = null;
 
-	/** @var array|null */
-	private static $summary_cache = null;
+	/** @var array<int,array> Per-Connection request-local summary cache. */
+	private static $summary_cache = array();
 
 	/** Return table name. */
 	public static function table_name() {
 		global $wpdb;
 		return $wpdb->prefix . 'mobo_image_prune_queue';
+	}
+
+	/** Active Source owner for Source-scoped cleanup debt. */
+	private static function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
+	/** Whether the active context is the enabled Default Connection. */
+	private static function is_default_connection_context() {
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return false;
+		}
+		$default = Mobo_Core_Connection_Repository::get_default();
+		return is_array( $default ) && $connection_id === absint( isset( $default['id'] ) ? $default['id'] : 0 );
 	}
 
 	/** Create/update durable cleanup table. */
@@ -44,9 +59,10 @@ class Mobo_Core_Image_Prune_Queue {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table           = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			connection_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			attachment_id bigint(20) unsigned NOT NULL,
 			owner_product_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			image_guid varchar(191) NOT NULL DEFAULT '',
@@ -64,17 +80,18 @@ class Mobo_Core_Image_Prune_Queue {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY (id),
-			UNIQUE KEY attachment_id (attachment_id),
-			KEY status_retry_id (status, next_retry_at, id),
-			KEY image_guid (image_guid),
-			KEY owner_product (owner_product_id, status),
-			KEY updated_id (updated_at, id),
-			KEY status_updated_id (status, updated_at, id)
+			UNIQUE KEY attachment_id (connection_id, attachment_id),
+			KEY status_retry_id (connection_id, status, next_retry_at, id),
+			KEY image_guid (connection_id, image_guid),
+			KEY owner_product (connection_id, owner_product_id, status),
+			KEY updated_id (connection_id, updated_at, id),
+			KEY status_updated_id (connection_id, status, updated_at, id),
+			KEY attachment_lookup (attachment_id)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
 		self::$table_exists_cache = null;
-		self::$summary_cache      = null;
+		self::$summary_cache      = array();
 	}
 
 	/** Whether the durable cleanup table exists. */
@@ -89,33 +106,34 @@ class Mobo_Core_Image_Prune_Queue {
 	}
 
 	private static function invalidate_summary() {
-		self::$summary_cache = null;
+		self::$summary_cache = array();
 	}
 
 	/** Compact queue summary for scheduler/admin health. */
 	public function get_summary() {
 		global $wpdb;
-		if ( is_array( self::$summary_cache ) ) {
-			return self::$summary_cache;
-		}
-		if ( ! self::table_exists() ) {
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return array( 'pending' => 0, 'due' => 0, 'failed' => 0, 'retained' => 0 );
+		}
+		if ( isset( self::$summary_cache[ $connection_id ] ) && is_array( self::$summary_cache[ $connection_id ] ) ) {
+			return self::$summary_cache[ $connection_id ];
 		}
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
-		/* Query only active/evidence states through the status indexes. Historical
-		 * done rows are intentionally excluded from every health probe. */
-		$pending  = absint( $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE status = 'pending'" ) );
-		$due      = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s)", $now ) ) );
-		$failed   = absint( $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE status = 'failed'" ) );
-		$retained = absint( $wpdb->get_var( "SELECT COUNT(*) FROM {$table} WHERE status = 'retained'" ) );
-		self::$summary_cache = array(
+		/* Query only this Source's active/evidence states through Connection-first
+		 * indexes. Historical done rows are intentionally excluded from health. */
+		$pending  = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'pending'", $connection_id ) ) );
+		$due      = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s)", $connection_id, $now ) ) );
+		$failed   = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'failed'", $connection_id ) ) );
+		$retained = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'retained'", $connection_id ) ) );
+		self::$summary_cache[ $connection_id ] = array(
 			'pending'  => $pending,
 			'due'      => $due,
 			'failed'   => $failed,
 			'retained' => $retained,
 		);
-		return self::$summary_cache;
+		return self::$summary_cache[ $connection_id ];
 	}
 
 	/** Cheap due-work predicate used by the fair scheduler. */
@@ -126,10 +144,11 @@ class Mobo_Core_Image_Prune_Queue {
 
 	/** Enqueue stale attachment IDs after product linkage has been detached. */
 	public function enqueue_attachments( $owner_product_id, $attachment_ids ) {
+		$connection_id    = self::connection_id();
 		$owner_product_id = absint( $owner_product_id );
 		$attachment_ids   = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
 		$result = array( 'queued' => 0, 'retained' => 0, 'skipped' => 0 );
-		if ( empty( $attachment_ids ) || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || empty( $attachment_ids ) || ! self::table_exists() ) {
 			return $result;
 		}
 		foreach ( $attachment_ids as $attachment_id ) {
@@ -146,8 +165,9 @@ class Mobo_Core_Image_Prune_Queue {
 	/** Queue one candidate using GUID-first ownership evidence. */
 	private function enqueue_attachment( $owner_product_id, $attachment_id ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 		$attachment_id = absint( $attachment_id );
-		if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
+		if ( $connection_id <= 0 || $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
 			return 'skipped';
 		}
 
@@ -169,9 +189,10 @@ class Mobo_Core_Image_Prune_Queue {
 		}
 
 		$table    = self::table_name();
-		$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE attachment_id = %d LIMIT 1", $attachment_id ), ARRAY_A );
+		$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE connection_id = %d AND attachment_id = %d LIMIT 1", $connection_id, $attachment_id ), ARRAY_A );
 		$now      = current_time( 'mysql', true );
 		$data = array(
+			'connection_id'    => $connection_id,
 			'owner_product_id' => absint( $owner_product_id ),
 			'image_guid'       => $identity['canonical'],
 			'legacy_img_guid'  => $identity['legacy'],
@@ -195,7 +216,7 @@ class Mobo_Core_Image_Prune_Queue {
 		}
 
 		if ( is_array( $existing ) ) {
-			$ok = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ) );
+			$ok = false !== $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ), 'connection_id' => $connection_id ) );
 		} else {
 			$data['attachment_id'] = $attachment_id;
 			$data['created_at']    = $now;
@@ -214,7 +235,8 @@ class Mobo_Core_Image_Prune_Queue {
 		$limit               = max( 1, min( 10, absint( $limit ) ) );
 		$time_budget_seconds = max( 1, min( 10, absint( $time_budget_seconds ) ) );
 		$result = array( 'processed' => 0, 'deleted' => 0, 'retained' => 0, 'failed' => 0, 'status' => 'empty', 'remaining' => false );
-		if ( ! self::table_exists() ) {
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			$result['status'] = 'unavailable';
 			return $result;
 		}
@@ -234,7 +256,8 @@ class Mobo_Core_Image_Prune_Queue {
 			$now   = current_time( 'mysql', true );
 			$rows  = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT * FROM {$table} WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s) ORDER BY id ASC LIMIT %d",
+					"SELECT * FROM {$table} WHERE connection_id = %d AND status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s) ORDER BY id ASC LIMIT %d",
+					$connection_id,
 					$now,
 					$limit
 				),
@@ -383,7 +406,7 @@ class Mobo_Core_Image_Prune_Queue {
 						'proof_pass'      => 1,
 						'updated_at'      => current_time( 'mysql', true ),
 					),
-					array( 'id' => $id )
+					array( 'id' => $id, 'connection_id' => self::connection_id() )
 				);
 				return 'processed';
 			}
@@ -417,20 +440,63 @@ class Mobo_Core_Image_Prune_Queue {
 			return 'retained';
 		}
 
-		$deleted = wp_delete_attachment( $attachment_id, true );
-		if ( false !== $deleted || 'attachment' !== get_post_type( $attachment_id ) ) {
-			$this->mark_status( $id, 'done', 'Stale Mobo attachment deleted after bounded reference proof.' );
-			delete_post_meta( $attachment_id, '_mobo_pruned_cleanup_owner_ids' );
-			return 'deleted';
+		/* Freeze every enabled Connection's image mutation workers at the final
+		 * physical boundary. The bounded proof above may take multiple requests; a
+		 * second Source must not attach/refresh this shared WordPress attachment in
+		 * the narrow interval between the final live-reference check and delete. */
+		$worker_locks = $this->acquire_all_image_worker_locks( 120 );
+		if ( false === $worker_locks ) {
+			$this->defer_without_penalty( $id, 30, 'Image workers are active; physical delete boundary deferred.' );
+			return 'processed';
 		}
 
-		$tries = absint( isset( $row['try_count'] ) ? $row['try_count'] : 0 ) + 1;
-		if ( $tries >= 3 ) {
-			$this->mark_status( $id, 'failed', 'WordPress refused permanent attachment deletion after three attempts.', $tries );
-			return 'failed';
+		$physical_lock_name = 'image_physical_delete_' . $attachment_id;
+		$physical_lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( $physical_lock_name, 120 ) : '__mobo_no_lock__';
+		if ( false === $physical_lock ) {
+			$this->release_all_image_worker_locks( $worker_locks );
+			$this->defer_without_penalty( $id, 30, 'Another physical media delete owns this attachment; deferred.' );
+			return 'processed';
 		}
-		$this->schedule_retry( $id, $tries, 'WordPress refused permanent attachment deletion.' );
-		return 'failed';
+
+		try {
+			/* Revalidate under the global media barrier; checks made before acquiring
+			 * the locks are not sufficient for a destructive shared-file operation. */
+			$identity = $this->read_attachment_identity( $attachment_id );
+			if ( ! empty( $identity['conflict'] ) || '' === $identity['canonical'] || ! hash_equals( $stored, $identity['canonical'] ) ) {
+				$this->mark_status( $id, 'retained', 'Image identity changed at locked delete boundary.' );
+				return 'retained';
+			}
+			$fast_reason = $this->fast_live_reference_reason( $attachment_id, $identity['canonical'] );
+			if ( '' !== $fast_reason ) {
+				$this->mark_status( $id, 'retained', $fast_reason );
+				return 'retained';
+			}
+			$path_reason = $this->attachment_delete_path_safety_reason( $attachment_id );
+			if ( '' !== $path_reason ) {
+				$this->mark_status( $id, 'retained', $path_reason );
+				return 'retained';
+			}
+
+			$deleted = wp_delete_attachment( $attachment_id, true );
+			if ( false !== $deleted || 'attachment' !== get_post_type( $attachment_id ) ) {
+				$this->mark_status( $id, 'done', 'Stale Mobo attachment deleted after bounded reference proof.' );
+				delete_post_meta( $attachment_id, '_mobo_pruned_cleanup_owner_ids' );
+				return 'deleted';
+			}
+
+			$tries = absint( isset( $row['try_count'] ) ? $row['try_count'] : 0 ) + 1;
+			if ( $tries >= 3 ) {
+				$this->mark_status( $id, 'failed', 'WordPress refused permanent attachment deletion after three attempts.', $tries );
+				return 'failed';
+			}
+			$this->schedule_retry( $id, $tries, 'WordPress refused permanent attachment deletion.' );
+			return 'failed';
+		} finally {
+			if ( class_exists( 'Mobo_Core_Lock' ) && '__mobo_no_lock__' !== $physical_lock ) {
+				Mobo_Core_Lock::release( $physical_lock_name, $physical_lock );
+			}
+			$this->release_all_image_worker_locks( $worker_locks );
+		}
 	}
 
 	/** GUID-first identity reader. */
@@ -459,9 +525,10 @@ class Mobo_Core_Image_Prune_Queue {
 	/** Fast indexed/exact live-reference checks before any broad bounded scan. */
 	private function fast_live_reference_reason( $attachment_id, $image_guid ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 		$attachment_id = absint( $attachment_id );
 		$image_guid    = strtolower( trim( sanitize_text_field( (string) $image_guid ) ) );
-		if ( $attachment_id <= 0 || '' === $image_guid ) {
+		if ( $connection_id <= 0 || $attachment_id <= 0 || '' === $image_guid ) {
 			return 'Missing GUID identity at live-reference boundary.';
 		}
 		if ( class_exists( 'Mobo_Core_Shared_Media' ) && method_exists( 'Mobo_Core_Shared_Media', 'is_shared_attachment' ) && Mobo_Core_Shared_Media::is_shared_attachment( $attachment_id ) ) {
@@ -469,7 +536,7 @@ class Mobo_Core_Image_Prune_Queue {
 		}
 		if ( class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
 			$table = Mobo_Core_Image_Queue::table_name();
-			$live = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE image_guid = %s OR attachment_id = %d LIMIT 1", $image_guid, $attachment_id ) );
+			$live = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE (connection_id = %d AND image_guid = %s) OR attachment_id = %d LIMIT 1", $connection_id, $image_guid, $attachment_id ) );
 			if ( absint( $live ) > 0 ) {
 				return 'Image GUID/attachment is still present in the authoritative Mobo image desired-state queue.';
 			}
@@ -478,7 +545,8 @@ class Mobo_Core_Image_Prune_Queue {
 			$table = Mobo_Core_Image_Refresh_Queue::table_name();
 			$live = $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT id FROM {$table} WHERE status IN ('pending','processing') AND (image_guid = %s OR old_attachment_id = %d OR new_attachment_id = %d) LIMIT 1",
+					"SELECT id FROM {$table} WHERE status IN ('pending','processing') AND ((connection_id = %d AND image_guid = %s) OR old_attachment_id = %d OR new_attachment_id = %d) LIMIT 1",
+					$connection_id,
 					$image_guid,
 					$attachment_id,
 					$attachment_id
@@ -734,6 +802,87 @@ class Mobo_Core_Image_Prune_Queue {
 		return false;
 	}
 
+	/** Freeze image mutation workers for every enabled Connection. @return array|false */
+	private function acquire_all_image_worker_locks( $ttl = 120 ) {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) ) { return array(); }
+
+		$connection_ids = array();
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			foreach ( Mobo_Core_Connection_Repository::list_enabled() as $connection ) {
+				$connection_id = is_array( $connection ) ? absint( isset( $connection['id'] ) ? $connection['id'] : 0 ) : 0;
+				if ( $connection_id > 0 ) { $connection_ids[] = $connection_id; }
+			}
+		}
+		$connection_ids = array_values( array_unique( $connection_ids ) );
+		sort( $connection_ids, SORT_NUMERIC );
+
+		if ( empty( $connection_ids ) ) {
+			$queue_token = Mobo_Core_Lock::acquire( 'image_queue_worker', $ttl );
+			if ( false === $queue_token ) { return false; }
+			$refresh_token = Mobo_Core_Lock::acquire( 'image_refresh_queue_worker', $ttl );
+			if ( false === $refresh_token ) {
+				Mobo_Core_Lock::release( 'image_queue_worker', $queue_token );
+				return false;
+			}
+			return array(
+				array( 'connection_id' => 0, 'name' => 'image_queue_worker', 'token' => $queue_token ),
+				array( 'connection_id' => 0, 'name' => 'image_refresh_queue_worker', 'token' => $refresh_token ),
+			);
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Connection_Context' ) ) { return false; }
+		$locks = array();
+		foreach ( $connection_ids as $connection_id ) {
+			foreach ( array( 'image_queue_worker', 'image_refresh_queue_worker' ) as $name ) {
+				$token = Mobo_Core_Connection_Context::run(
+					$connection_id,
+					static function () use ( $name, $ttl ) { return Mobo_Core_Lock::acquire( $name, $ttl ); }
+				);
+				if ( false === $token ) {
+					$this->release_all_image_worker_locks( $locks );
+					return false;
+				}
+				$locks[] = array( 'connection_id' => $connection_id, 'name' => $name, 'token' => $token );
+			}
+		}
+		return $locks;
+	}
+
+	/** Release locks returned by acquire_all_image_worker_locks(). */
+	private function release_all_image_worker_locks( $locks ) {
+		if ( ! class_exists( 'Mobo_Core_Lock' ) || ! is_array( $locks ) ) { return; }
+		foreach ( array_reverse( $locks ) as $lock ) {
+			$name = isset( $lock['name'] ) ? (string) $lock['name'] : '';
+			$token = isset( $lock['token'] ) ? (string) $lock['token'] : '';
+			$connection_id = isset( $lock['connection_id'] ) ? absint( $lock['connection_id'] ) : 0;
+			if ( '' === $name || '' === $token ) { continue; }
+			if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+				Mobo_Core_Connection_Context::run(
+					$connection_id,
+					static function () use ( $name, $token ) { Mobo_Core_Lock::release( $name, $token ); }
+				);
+			} else {
+				Mobo_Core_Lock::release( $name, $token );
+			}
+		}
+	}
+
+	/** Defer a benign lock-contention retry without consuming destructive retries. */
+	private function defer_without_penalty( $id, $seconds, $message ) {
+		global $wpdb;
+		$wpdb->update(
+			self::table_name(),
+			array(
+				'phase'         => 'finalize',
+				'next_retry_at' => gmdate( 'Y-m-d H:i:s', time() + max( 5, absint( $seconds ) ) ),
+				'last_error'    => sanitize_text_field( (string) $message ),
+				'updated_at'    => current_time( 'mysql', true ),
+			),
+			array( 'id' => absint( $id ), 'connection_id' => self::connection_id() )
+		);
+		self::invalidate_summary();
+	}
+
 	private function mark_status( $id, $status, $message, $try_count = null ) {
 		global $wpdb;
 		$data = array(
@@ -745,7 +894,7 @@ class Mobo_Core_Image_Prune_Queue {
 		if ( null !== $try_count ) {
 			$data['try_count'] = absint( $try_count );
 		}
-		$wpdb->update( self::table_name(), $data, array( 'id' => absint( $id ) ) );
+		$wpdb->update( self::table_name(), $data, array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
 		self::invalidate_summary();
 	}
 
@@ -755,12 +904,12 @@ class Mobo_Core_Image_Prune_Queue {
 		if ( ! in_array( $column, $allowed, true ) ) {
 			return;
 		}
-		$wpdb->update( self::table_name(), array( $column => absint( $cursor ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ) ) );
+		$wpdb->update( self::table_name(), array( $column => absint( $cursor ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
 	}
 
 	private function advance_phase( $id, $phase ) {
 		global $wpdb;
-		$wpdb->update( self::table_name(), array( 'phase' => sanitize_key( $phase ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ) ) );
+		$wpdb->update( self::table_name(), array( 'phase' => sanitize_key( $phase ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
 	}
 
 	private function schedule_retry( $id, $tries, $message ) {
@@ -775,7 +924,7 @@ class Mobo_Core_Image_Prune_Queue {
 				'last_error'    => sanitize_text_field( (string) $message ),
 				'updated_at'    => current_time( 'mysql', true ),
 			),
-			array( 'id' => absint( $id ) )
+			array( 'id' => absint( $id ), 'connection_id' => self::connection_id() )
 		);
 		self::invalidate_summary();
 	}
@@ -784,10 +933,13 @@ class Mobo_Core_Image_Prune_Queue {
 	private function cleanup_historical_rows() {
 		global $wpdb;
 		$table  = self::table_name();
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 ) { return; }
 		$cutoff = gmdate( 'Y-m-d H:i:s', time() - ( 30 * DAY_IN_SECONDS ) );
 		$deleted = $wpdb->query(
 			$wpdb->prepare(
-				"DELETE FROM {$table} WHERE status = 'done' AND updated_at < %s ORDER BY id ASC LIMIT 100",
+				"DELETE FROM {$table} WHERE connection_id = %d AND status = 'done' AND updated_at < %s ORDER BY id ASC LIMIT 100",
+				$connection_id,
 				$cutoff
 			)
 		);
@@ -798,6 +950,7 @@ class Mobo_Core_Image_Prune_Queue {
 
 	/** Whether legacy prune metadata still needs to be migrated into this table. */
 	private function legacy_seed_pending() {
+		if ( ! self::is_default_connection_context() ) { return false; }
 		$state = get_option( self::LEGACY_SEED_STATE_OPTION, array() );
 		return is_array( $state ) && empty( $state['complete'] );
 	}
@@ -806,6 +959,7 @@ class Mobo_Core_Image_Prune_Queue {
 	public function seed_legacy_candidates( $limit = 30 ) {
 		global $wpdb;
 		$limit = max( 1, min( 100, absint( $limit ) ) );
+		if ( ! self::is_default_connection_context() ) { return array( 'processed' => 0, 'complete' => true ); }
 		$state = get_option( self::LEGACY_SEED_STATE_OPTION, array() );
 		if ( ! is_array( $state ) || empty( $state ) ) {
 			return array( 'processed' => 0, 'complete' => true );

@@ -14,7 +14,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Checkout_Validator {
 
-	const ORDER_RECOVERY_OPTION_PREFIX = 'mobo_core_mobo_order_recovery_';
+	const ORDER_RECOVERY_OPTION_PREFIX = 'mobo_core_mobo_order_recovery_'; // legacy migration source only
+	const ORDER_QUEUE_TYPE            = 'order_submission';
+	const ORDER_RECOVERY_QUEUE_TYPE   = 'order_recovery';
 
 	/* Immutable order-line identity snapshot. Order submission must not depend on
 	 * the live WooCommerce catalogue after checkout has created the order. */
@@ -26,6 +28,28 @@ class Mobo_Core_Checkout_Validator {
 	const ITEM_META_PORTAL_VARIANT_ID = '_mobo_identity_portal_variant_id';
 	const ITEM_META_SKU               = '_mobo_identity_sku';
 	const ITEM_META_CAPTURED_AT       = '_mobo_identity_captured_at';
+	const ITEM_META_CONNECTION_ID     = '_mobo_identity_connection_id';
+
+	/**
+	 * Internal immutable line-item identity keys. These values are required for
+	 * fail-closed order ownership after checkout, but are never customer-facing
+	 * order attributes and must stay hidden from formatted WooCommerce item meta.
+	 *
+	 * @return string[]
+	 */
+	public static function get_internal_order_item_meta_keys() {
+		return array(
+			self::ITEM_META_IDENTITY_CAPTURED,
+			self::ITEM_META_IS_MOBO,
+			self::ITEM_META_PRODUCT_GUID,
+			self::ITEM_META_VARIANT_GUID,
+			self::ITEM_META_PORTAL_PRODUCT_ID,
+			self::ITEM_META_PORTAL_VARIANT_ID,
+			self::ITEM_META_SKU,
+			self::ITEM_META_CAPTURED_AT,
+			self::ITEM_META_CONNECTION_ID,
+		);
+	}
 
 	/**
 	 * Debug request id, shared by all events generated during the same PHP request.
@@ -34,11 +58,26 @@ class Mobo_Core_Checkout_Validator {
 	 */
 	private $debug_request_id = null;
 
+	/** @var Mobo_Core_Provider_Interface|null Request-local provider resolved from the active Connection Source. */
+	private $provider = null;
+
+	/** @var string Source key used to populate the request-local provider cache. */
+	private $provider_source_key = '';
+
 	/** @var string Active shared Mobo cart runtime-lock token. */
 	private $active_mobo_cart_lock_token = '';
 
 	/** @var int Active shared Mobo cart lock TTL. */
 	private $active_mobo_cart_lock_ttl = 60;
+
+	/**
+	 * True only after the current shared-cart lease has proven the remote cart
+	 * empty. Every add-to-cart mutation is fail-closed unless this rebuild gate
+	 * was opened by clear_shared_mobo_cart() under the same runtime lock.
+	 *
+	 * @var bool
+	 */
+	private $shared_mobo_cart_rebuild_ready = false;
 
 	/** @var string Active per-order submission lock name. */
 	private $active_order_submission_lock_name = '';
@@ -49,11 +88,222 @@ class Mobo_Core_Checkout_Validator {
 	/** @var int Active per-order submission lock TTL. */
 	private $active_order_submission_lock_ttl = 900;
 
+	/** @var string Request-local digest of the admitted server-provisioned route.
+	 * Never persist the digest or any credential from the Connection row to an order. */
+	private $active_order_route_fingerprint = '';
+	/** @var int Owner of the active order's admitted route. */
+	private $active_order_route_connection_id = 0;
+	/** PERF04: a bounded recovery read must never be interpreted as an empty queue on SQL/corruption failure. */
+	private $order_recovery_read_failed = false;
+
 	/**
 	 * Register validation hooks.
 	 *
 	 * @return void
 	 */
+
+	/**
+	 * Disposable NO-SEND preview; install only on isolated disposable WAMP, never production.
+	 * This barrier cannot authorize a provider dispatch, regardless of filters,
+	 * authentication, Woo status, a persisted PREPARED row, or local exceptions.
+	 */
+	private static function p17_blocked( $boundary ) {
+		return new WP_Error( 'mobo_p17_no_send_staged', 'Disposable staged: remote side effects are disabled.', array(
+			'boundary' => (string) $boundary,
+			'purchase_allowed' => false,
+			'provider_calls_permitted' => 0,
+			'requestMayHaveReachedServer' => false,
+			'productionSendAuthorized' => false,
+		) );
+	}
+
+	/** Operational candidate sink: explicit caller method, unchanged WP response/error semantics. */
+	private function production_candidate_transport( $method, $url, array $args ) {
+		$args['method'] = $method;
+		return wp_remote_request( $url, $args );
+	}
+
+	/**
+	 * INTEGRATION-04: local-only discovery fingerprint, not a Source quote.
+	 * Freeze the exact Woo item identity, variant attributes, quantities,
+	 * monetary fields, and local address *before* invoking any remote Location
+	 * Resolver. The digest is deliberately not an authorization token.
+	 * Never persist the PII snapshot; persist only its SHA-256 fingerprint.
+	 * A post-Location, Source-verified snapshot MUST use a distinct, versioned
+	 * authorization protocol in the later production implementation.
+	 */
+	private function p17_local_intent_fingerprint( $order, $scope, $items ) {
+		if ( ! $order instanceof WC_Order || ! is_array( $scope ) || ! is_array( $items )
+			|| absint( $order->get_id() ) < 1 || absint( $scope['connectionId'] ?? 0 ) < 1 || empty( $items ) ) {
+			return new WP_Error( 'mobo_p17_local_intent_unverifiable', 'Local order scope cannot be frozen.' );
+		}
+		$lines = array();
+		foreach ( $order->get_items( 'line_item' ) as $item_id => $line ) {
+			if ( ! $line instanceof WC_Order_Item_Product ) {
+				return new WP_Error( 'mobo_p17_local_intent_unverifiable', 'Order line cannot be frozen.' );
+			}
+			$meta = array();
+			foreach ( $line->get_meta_data() as $field ) {
+				if ( ! is_object( $field ) || ! method_exists( $field, 'get_data' ) ) {
+					return new WP_Error( 'mobo_p17_local_intent_unverifiable', 'Variant attributes cannot be frozen.' );
+				}
+				$meta[] = $field->get_data();
+			}
+			usort( $meta, function ( $a, $b ) { return strcmp( (string) ( $a['id'] ?? 0 ), (string) ( $b['id'] ?? 0 ) ); } );
+			$lines[] = array(
+				'itemId' => absint( $item_id ),
+				'productId' => absint( $line->get_product_id() ),
+				'variationId' => absint( $line->get_variation_id() ),
+				'quantity' => wc_format_decimal( $line->get_quantity(), 6 ),
+				'subtotal' => wc_format_decimal( $line->get_subtotal(), 6 ),
+				'total' => wc_format_decimal( $line->get_total(), 6 ),
+				'subtotalTax' => wc_format_decimal( $line->get_subtotal_tax(), 6 ),
+				'totalTax' => wc_format_decimal( $line->get_total_tax(), 6 ),
+				'attributesAndIdentityMeta' => $meta,
+			);
+		}
+		usort( $lines, function ( $a, $b ) { return $a['itemId'] <=> $b['itemId']; } );
+		$extra = array();
+		foreach ( array( 'shipping', 'fee', 'coupon', 'tax' ) as $type ) {
+			$extra[ $type ] = array();
+			foreach ( $order->get_items( $type ) as $line ) {
+				if ( ! is_object( $line ) || ! method_exists( $line, 'get_data' ) ) {
+					return new WP_Error( 'mobo_p17_local_intent_unverifiable', 'Order charges cannot be frozen.' );
+				}
+				$extra[ $type ][] = $line->get_data();
+			}
+		}
+		$payload = array(
+			'contract' => 'P17_LOCAL_ORDER_INTENT_V1_NOT_SOURCE_VERIFIED',
+			'orderId' => absint( $order->get_id() ),
+			'connectionId' => absint( $scope['connectionId'] ),
+			'currency' => (string) $order->get_currency(),
+			'orderTotal' => wc_format_decimal( $order->get_total(), 6 ),
+			'paymentMethod' => (string) $order->get_payment_method(),
+			'localBilling' => $order->get_address( 'billing' ),
+			'localShipping' => $order->get_address( 'shipping' ),
+			'items' => $items,
+			'lines' => $lines,
+			'otherOrderLines' => $extra,
+		);
+		$encoded = wp_json_encode( $payload );
+		if ( ! is_string( $encoded ) || '' === $encoded ) {
+			return new WP_Error( 'mobo_p17_local_intent_unverifiable', 'Local order fingerprint could not be encoded.' );
+		}
+		return hash( 'sha256', $encoded );
+	}
+
+	/**
+	 * INTEGRATION-05, STAGED ONLY. Reading an immutable, local order intent
+	 * must not depend on successful remote Source provisioning. Nevertheless,
+	 * the exact locally owned Connection must still exist and be enabled;
+	 * neither a missing row nor the Default Connection may be substituted.
+	 *
+	 * This is NOT a purchase-route check: no Provider or Wallet operation may
+	 * rely on it. The normal get_fresh_order_route_fingerprint() gate remains
+	 * mandatory for any production mutation.
+	 */
+	private function p17_local_owner_exists_for_no_send( $connection_id ) {
+		$connection_id = absint( $connection_id );
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' )
+			|| ! method_exists( 'Mobo_Core_Connection_Repository', 'get_by_id_fresh' ) ) {
+			return false;
+		}
+		$owner = Mobo_Core_Connection_Repository::get_by_id_fresh( $connection_id );
+		return is_array( $owner )
+			&& $connection_id === absint( $owner['id'] ?? 0 )
+			&& ! empty( $owner['is_enabled'] );
+	}
+
+	/**
+	 * I07 disposable-only WooCommerce safety: a NO-SEND intent must not
+	 * remain in processing/fulfilment. Only PROCESSING may move to ON-HOLD.
+	 * Never reopen cancelled/refunded orders or demote completed orders.
+	 * Status change is Woo CRUD / HPOS-safe. The processing->on-hold hook
+	 * cannot enqueue because the normal submission hook only accepts new
+	 * status=processing. This marker is NOT a Source quote or purchase grant.
+	 */
+	private function p17_hold_no_send( $order, $reason ) {
+		if ( ! $order instanceof WC_Order ) {
+			return false;
+		}
+		$staged_hold = defined( 'MOBO_CORE_PUBLISH_STAGED_NO_SEND' ) && MOBO_CORE_PUBLISH_STAGED_NO_SEND;
+		$order->update_meta_data( '_mobo_order_submit_status', 'held_no_send' );
+		$order->update_meta_data( '_mobo_order_requires_review', 'yes' );
+		$order->update_meta_data( '_mobo_order_last_error_code', $reason );
+		$order->update_meta_data( '_mobo_order_last_error', 'سفارش برای بررسی نگه داشته شد؛ هیچ خرید یا برداشت کیف پول انجام نشد.' );
+		$staged_mail_guard = null;
+		if ( $staged_hold && 'processing' === (string) $order->get_status() ) {
+			/* Disposable-only: suppress mail ONLY during this order's status save.
+			 * Do not leak the global WP filter into subsequent operations. */
+			if ( function_exists( 'add_filter' ) && function_exists( 'remove_filter' ) ) {
+				$staged_mail_guard = static function ( $preempt ) { return true; };
+				add_filter( 'pre_wp_mail', $staged_mail_guard, PHP_INT_MAX, 1 );
+			}
+		}
+		try {
+			if ( $staged_hold && 'processing' === (string) $order->get_status() ) {
+				$order->set_status( 'on-hold', 'ارسال موبو در نسخه آزمایشی مسدود است؛ سفارش برای بررسی نگه داشته شد.' );
+			}
+			$saved_id = absint( $order->save() );
+		} finally {
+			if ( null !== $staged_mail_guard ) {
+				remove_filter( 'pre_wp_mail', $staged_mail_guard, PHP_INT_MAX );
+			}
+		}
+		return $saved_id === absint( $order->get_id() )
+			&& ( ! $staged_hold || 'on-hold' === (string) $order->get_status() );
+	}
+
+	/**
+	 * P17 staged Outbox PREPARED-only wiring. The genuine pinned Store itself
+	 * returns purchase_allowed=false and provider_calls_permitted=0.
+	 * This function ALWAYS returns an error, even when prepare_intent succeeds.
+	 * No DDL, no migration, no authorization, no provider or wallet invocation.
+	 */
+	private function p17_prepare_outbox_no_send( $order, $scope, $business_snapshot ) {
+		$order_id = is_object( $order ) && method_exists( $order, 'get_id' ) ? absint( $order->get_id() ) : 0;
+		$connection_id = is_array( $scope ) && isset( $scope['connectionId'] ) ? absint( $scope['connectionId'] ) : 0;
+		$fingerprint = is_array( $business_snapshot ) && isset( $business_snapshot['fingerprint'] ) && is_string( $business_snapshot['fingerprint'] )
+			? $business_snapshot['fingerprint'] : '';
+		if ( 0 === $order_id || 0 === $connection_id || ! preg_match( '/^[a-f0-9]{64}$/D', $fingerprint ) ) {
+			$this->p17_hold_no_send( $order, 'staged_outbox_scope_unverified' );
+			return self::p17_blocked( 'invalid_outbox_scope' );
+		}
+		if ( ! class_exists( 'Mobo_Core_Purchase_Outbox_Store' ) || ! isset( $GLOBALS['wpdb'] ) || ! is_object( $GLOBALS['wpdb'] ) ) {
+			$this->p17_hold_no_send( $order, 'staged_outbox_store_unavailable' );
+			return self::p17_blocked( 'outbox_store_unavailable' );
+		}
+		$frozen = array(
+			'status' => 'FROZEN_NOT_AUTHORIZED',
+			'order_id' => $order_id,
+			'connection_id' => (string) $connection_id,
+			'generation' => 1, // P17 no-send discovery only; production generation model NOT defined.
+			'payload_fingerprint' => $fingerprint,
+			'idempotency_key' => 'mobo1_' . hash( 'sha256', 'p17-no-send' . "\0" . $order_id . "\0" . $connection_id . "\0" . $fingerprint ),
+			'purchase_allowed' => false,
+			'provider_calls_permitted' => 0,
+		);
+		$store = new Mobo_Core_Purchase_Outbox_Store( $GLOBALS['wpdb'] );
+		$result = $store->prepare_intent( $frozen );
+		/* A PREPARED or pre-existing row is NOT Source verification and does not
+		 * authorize purchase. Every other status remains held for review. */
+		$outbox_status = is_array( $result ) && isset( $result['status'] ) && is_string( $result['status'] ) ? $result['status'] : 'UNVERIFIED';
+		$known_durable = in_array( $outbox_status, array( 'PREPARED_DURABLE_NOT_AUTHORIZED', 'EXISTING_DURABLE_NOT_AUTHORIZED' ), true );
+		$saved_hold = $this->p17_hold_no_send( $order, $known_durable ? 'staged_outbox_no_send' : 'staged_outbox_unverified' );
+		$error = self::p17_blocked( 'outbox_prepared_but_dispatch_forbidden' );
+		// Do not expose credentials, raw request bodies, or DB error strings.
+		return new WP_Error( $error->get_error_code(), $error->get_error_message(), array(
+			'boundary' => 'outbox_prepared_but_dispatch_forbidden',
+			'wooHoldSaved' => $saved_hold,
+			'outboxStatus' => $outbox_status,
+			'purchase_allowed' => false,
+			'provider_calls_permitted' => 0,
+			'requestMayHaveReachedServer' => false,
+			'productionSendAuthorized' => false,
+		) );
+	}
+
 	public function init() {
 		add_action( 'woocommerce_check_cart_items', array( $this, 'validate_cart_notices' ), 20 );
 		add_action( 'woocommerce_after_checkout_validation', array( $this, 'validate_checkout_errors' ), 20, 2 );
@@ -171,15 +421,19 @@ class Mobo_Core_Checkout_Validator {
 		$variation_id = absint( $item->get_variation_id() );
 		$wc_id        = $product instanceof WC_Product ? absint( $product->get_id() ) : ( $variation_id > 0 ? $variation_id : $product_id );
 		$parent_id    = $product_id > 0 ? $product_id : $wc_id;
-		$product_guid = $this->get_remote_product_guid( $parent_id, $wc_id );
-		$variant_guid = $this->get_variant_guid( $variation_id, $wc_id );
-		$portal_product_id = $this->get_portal_product_id( $parent_id, $wc_id );
-		$portal_variant_id = $this->get_portal_variant_id( $variation_id, $wc_id );
-		$mobo_url = $parent_id > 0 ? sanitize_text_field( (string) get_post_meta( $parent_id, 'mobo_url', true ) ) : '';
-		if ( '' === $mobo_url && $wc_id > 0 ) {
-			$mobo_url = sanitize_text_field( (string) get_post_meta( $wc_id, 'mobo_url', true ) );
+		$connection_id = $this->resolve_woo_item_connection_id( $parent_id, $variation_id );
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) && $current_connection_id !== $connection_id ) {
+			Mobo_Core_Connection_Context::run( $connection_id, function () use ( $item, $product ) { $this->snapshot_order_line_item_identity( $item, $product ); } );
+			return;
 		}
-		$is_mobo = '' !== $product_guid || '' !== $variant_guid || $portal_product_id > 0 || $portal_variant_id > 0 || '' !== $mobo_url;
+		/* Terminal ownership is authoritative. Identity compatibility values are
+		 * meaningful only after Custom Storage proves the owning Connection. */
+		$is_mobo = $connection_id > 0;
+		$product_guid = $is_mobo ? $this->get_remote_product_guid( $parent_id, $wc_id ) : '';
+		$variant_guid = $is_mobo ? $this->get_variant_guid( $variation_id, $wc_id ) : '';
+		$portal_product_id = $is_mobo ? $this->get_portal_product_id( $parent_id, $wc_id ) : 0;
+		$portal_variant_id = $is_mobo ? $this->get_portal_variant_id( $variation_id, $wc_id ) : 0;
 
 		$item->update_meta_data( self::ITEM_META_IDENTITY_CAPTURED, 'yes' );
 		$item->update_meta_data( self::ITEM_META_IS_MOBO, $is_mobo ? 'yes' : 'no' );
@@ -189,6 +443,7 @@ class Mobo_Core_Checkout_Validator {
 		$item->update_meta_data( self::ITEM_META_PORTAL_PRODUCT_ID, $is_mobo ? $portal_product_id : 0 );
 		$item->update_meta_data( self::ITEM_META_PORTAL_VARIANT_ID, $is_mobo ? $portal_variant_id : 0 );
 		$item->update_meta_data( self::ITEM_META_SKU, $product instanceof WC_Product ? sanitize_text_field( (string) $product->get_sku() ) : '' );
+		$item->update_meta_data( self::ITEM_META_CONNECTION_ID, $is_mobo ? $connection_id : 0 );
 	}
 
 	/**
@@ -207,6 +462,7 @@ class Mobo_Core_Checkout_Validator {
 			'portalProductId' => 0,
 			'portalVariantId' => 0,
 			'sku'             => '',
+			'connectionId'    => 0,
 		);
 		if ( ! $item instanceof WC_Order_Item_Product ) {
 			return $out;
@@ -220,6 +476,7 @@ class Mobo_Core_Checkout_Validator {
 			$out['portalProductId'] = absint( $item->get_meta( self::ITEM_META_PORTAL_PRODUCT_ID, true ) );
 			$out['portalVariantId'] = absint( $item->get_meta( self::ITEM_META_PORTAL_VARIANT_ID, true ) );
 			$out['sku']             = sanitize_text_field( (string) $item->get_meta( self::ITEM_META_SKU, true ) );
+			$out['connectionId']    = absint( $item->get_meta( self::ITEM_META_CONNECTION_ID, true ) );
 			return $out;
 		}
 
@@ -227,17 +484,41 @@ class Mobo_Core_Checkout_Validator {
 		$variation_id = absint( $item->get_variation_id() );
 		$wc_id        = $product instanceof WC_Product ? absint( $product->get_id() ) : ( $variation_id > 0 ? $variation_id : $product_id );
 		$parent_id    = $product_id > 0 ? $product_id : $wc_id;
-		$out['productGuid']     = $this->get_remote_product_guid( $parent_id, $wc_id );
-		$out['variantGuid']     = $this->get_variant_guid( $variation_id, $wc_id );
-		$out['portalProductId'] = $this->get_portal_product_id( $parent_id, $wc_id );
-		$out['portalVariantId'] = $this->get_portal_variant_id( $variation_id, $wc_id );
-		$out['sku']             = $product instanceof WC_Product ? sanitize_text_field( (string) $product->get_sku() ) : '';
-		$mobo_url = $parent_id > 0 ? sanitize_text_field( (string) get_post_meta( $parent_id, 'mobo_url', true ) ) : '';
-		if ( '' === $mobo_url && $wc_id > 0 ) {
-			$mobo_url = sanitize_text_field( (string) get_post_meta( $wc_id, 'mobo_url', true ) );
+		$owner_connection_id = $this->resolve_woo_item_connection_id( $parent_id, $variation_id );
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $owner_connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) && $current_connection_id !== $owner_connection_id ) {
+			return Mobo_Core_Connection_Context::run( $owner_connection_id, function () use ( $item, $product ) { return $this->get_order_line_item_identity( $item, $product ); } );
 		}
-		$out['isMobo'] = '' !== $out['productGuid'] || '' !== $out['variantGuid'] || $out['portalProductId'] > 0 || $out['portalVariantId'] > 0 || '' !== $mobo_url;
+		$out['connectionId'] = $owner_connection_id;
+		$out['isMobo']       = $owner_connection_id > 0;
+		if ( $out['isMobo'] ) {
+			$out['productGuid']     = $this->get_remote_product_guid( $parent_id, $wc_id );
+			$out['variantGuid']     = $this->get_variant_guid( $variation_id, $wc_id );
+			$out['portalProductId'] = $this->get_portal_product_id( $parent_id, $wc_id );
+			$out['portalVariantId'] = $this->get_portal_variant_id( $variation_id, $wc_id );
+		}
+		$out['sku'] = $product instanceof WC_Product ? sanitize_text_field( (string) $product->get_sku() ) : '';
 		return $out;
+	}
+
+	/** Resolve the globally-owned Connection for one Woo line item. @return int */
+	private function resolve_woo_item_connection_id( $product_id, $variation_id = 0 ) {
+		$product_id   = absint( $product_id );
+		$variation_id = absint( $variation_id );
+		$product_owner_id = 0;
+		$variation_owner_id = 0;
+		if ( class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			if ( $variation_id > 0 && class_exists( 'Mobo_Core_Variant_State_Repository' ) ) {
+				$row = ( new Mobo_Core_Variant_State_Repository() )->get_owner_by_woo_variation_id( $variation_id );
+				$variation_owner_id = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+			}
+			if ( $product_id > 0 && class_exists( 'Mobo_Core_Product_State_Repository' ) ) {
+				$row = ( new Mobo_Core_Product_State_Repository() )->get_owner_by_woo_product_id( $product_id );
+				$product_owner_id = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+			}
+		}
+		if ( $variation_owner_id > 0 && $product_owner_id > 0 && $variation_owner_id !== $product_owner_id ) { return 0; }
+		return $variation_owner_id > 0 ? $variation_owner_id : $product_owner_id;
 	}
 
 	/**
@@ -246,7 +527,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function validate_cart_notices() {
-		if ( ! $this->has_active_checkout_validation_checks() ) {
+		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
 			return;
 		}
 
@@ -294,10 +575,24 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function validate_checkout_errors( $data, $errors ) {
-		if ( ! $this->has_active_checkout_validation_checks() || ! ( $errors instanceof WP_Error ) ) {
+		if ( ! ( $errors instanceof WP_Error ) ) {
 			return;
 		}
 
+		/* HARDEN10 financial boundary: automatic Mobo submission is all-or-nothing.
+		 * Reject a mixed, multi-Connection or ownership-ambiguous cart before the
+		 * payment gateway can create an otherwise-paid order that policy will later
+		 * refuse to submit remotely. Optional remote/cart validation switches remain
+		 * independent and are not forced on by this scope preflight. */
+		$scope_error = $this->validate_auto_order_cart_scope_pre_payment();
+		if ( is_wp_error( $scope_error ) ) {
+			$errors->add( 'mobo_core_checkout_order_scope', sanitize_text_field( (string) $scope_error->get_error_message() ) );
+			return;
+		}
+
+		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
+			return;
+		}
 
 		$result = $this->validate_current_cart( true );
 
@@ -330,7 +625,12 @@ class Mobo_Core_Checkout_Validator {
 		 * ownership before any payment can run, even when validation toggles are off. */
 		$this->snapshot_order_line_item_identities( $order );
 
-		if ( ! $this->has_active_checkout_validation_checks() ) {
+		$scope_error = $this->validate_auto_order_order_scope_pre_payment( $order );
+		if ( is_wp_error( $scope_error ) ) {
+			throw new Exception( sanitize_text_field( (string) $scope_error->get_error_message() ) );
+		}
+
+		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
 			return;
 		}
 
@@ -351,7 +651,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array
 	 */
 	public function get_last_status() {
-		$result = get_option( 'mobo_core_checkout_last_validation_result', array() );
+		$result = Mobo_Core_Settings::get( 'mobo_core_checkout_last_validation_result', array() );
 
 		if ( ! is_array( $result ) ) {
 			$result = array();
@@ -383,10 +683,10 @@ class Mobo_Core_Checkout_Validator {
 			'rawLocalStockEnabled' => $local_stock_raw,
 			'rawMoboCartEnabled'   => $mobo_cart_raw,
 			'rawExternalEnabled'   => $external_raw,
-			'lastAttemptAt'    => absint( get_option( 'mobo_core_checkout_last_validation_attempt_at', 0 ) ),
-			'lastSuccessAt'    => absint( get_option( 'mobo_core_checkout_last_validation_success_at', 0 ) ),
-			'lastMoboLoginAt'  => absint( get_option( 'mobo_core_checkout_mobo_login_success_at', 0 ) ),
-			'lastMoboCartAt'   => absint( get_option( 'mobo_core_checkout_mobo_cart_success_at', 0 ) ),
+			'lastAttemptAt'    => absint( Mobo_Core_Settings::get( 'mobo_core_checkout_last_validation_attempt_at', 0 ) ),
+			'lastSuccessAt'    => absint( Mobo_Core_Settings::get( 'mobo_core_checkout_last_validation_success_at', 0 ) ),
+			'lastMoboLoginAt'  => absint( Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_login_success_at', 0 ) ),
+			'lastMoboCartAt'   => absint( Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_cart_success_at', 0 ) ),
 			'lastResult'       => $result,
 		);
 	}
@@ -403,9 +703,9 @@ class Mobo_Core_Checkout_Validator {
 		if ( '' === $lock ) {
 			$lock = $this->acquire_mobo_cart_lock( 'admin_login_test' );
 			if ( is_wp_error( $lock ) ) {
-				update_option( 'mobo_core_checkout_mobo_login_test_at', time(), false );
-				update_option( 'mobo_core_checkout_mobo_login_test_result', 'ناموفق', false );
-				update_option( 'mobo_core_checkout_mobo_login_test_error', $lock->get_error_message(), false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_at', time(), false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_result', 'ناموفق', false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_error', 'Login check lock unavailable [' . substr( sanitize_key( (string) $lock->get_error_code() ), 0, 64 ) . '].', false );
 				return $lock;
 			}
 			$owns_lock = true;
@@ -415,16 +715,16 @@ class Mobo_Core_Checkout_Validator {
 			$this->clear_mobo_cookie_jar();
 			$result = $this->ensure_mobo_authenticated( true );
 
-			update_option( 'mobo_core_checkout_mobo_login_test_at', time(), false );
+			Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_at', time(), false );
 
 			if ( is_wp_error( $result ) ) {
-				update_option( 'mobo_core_checkout_mobo_login_test_result', 'ناموفق', false );
-				update_option( 'mobo_core_checkout_mobo_login_test_error', $result->get_error_message(), false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_result', 'ناموفق', false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_error', 'Login check failed [' . substr( sanitize_key( (string) $result->get_error_code() ), 0, 64 ) . '].', false );
 				return $result;
 			}
 
-			update_option( 'mobo_core_checkout_mobo_login_test_result', 'موفق', false );
-			delete_option( 'mobo_core_checkout_mobo_login_test_error' );
+			Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_test_result', 'موفق', false );
+			Mobo_Core_Settings::delete( 'mobo_core_checkout_mobo_login_test_error' );
 			return true;
 		} finally {
 			if ( $owns_lock ) {
@@ -445,6 +745,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return int|float|WP_Error
 	 */
 	public function get_mobo_wallet_balance() {
+
 		$owns_lock = false;
 		$lock      = sanitize_text_field( (string) $this->active_mobo_cart_lock_token );
 
@@ -462,7 +763,8 @@ class Mobo_Core_Checkout_Validator {
 				return $auth;
 			}
 
-			$path     = '/site/api/v1/user/billing/transactions/balance';
+			$path     = $this->get_provider_endpoint( 'wallet_balance' );
+			if ( '' === $path ) { return new WP_Error( 'mobo_core_provider_wallet_unsupported', 'The active Source provider does not support wallet balance.' ); }
 			$response = $this->mobo_request( 'GET', $path, null );
 
 			if ( $this->is_auth_error_response( $response ) ) {
@@ -482,26 +784,28 @@ class Mobo_Core_Checkout_Validator {
 				return new WP_Error( 'mobo_core_wallet_balance_http_error', 'Mobo wallet balance returned HTTP ' . $code . '.' );
 			}
 
-			$json = json_decode( (string) wp_remote_retrieve_body( $response ), true );
-			if ( ! is_array( $json ) ) {
-				return new WP_Error( 'mobo_core_wallet_balance_json_error', 'Mobo wallet balance response was not valid JSON.' );
-			}
-
-			if ( isset( $json['success'] ) && ! $this->to_bool( $json['success'] ) ) {
-				$message = isset( $json['description'] ) ? sanitize_text_field( (string) $json['description'] ) : 'Mobo wallet balance response was not successful.';
+			/* CP34: preserve the original JSON numeric literal from the HTTP body
+			 * before json_decode can silently round it. Display-only; never an
+			 * authorization to debit Wallet or purchase from the Provider. */
+			$raw_wallet_response = (string) wp_remote_retrieve_body( $response );
+			$observation = Mobo_Core_Wallet_Balance_Observation::inspect_raw_response( $raw_wallet_response );
+			if ( 'RESPONSE_NOT_SUCCESS' === $observation['status'] ) {
+				$message = 'Mobo wallet balance response was not successful.';
 				return new WP_Error( 'mobo_core_wallet_balance_not_success', $message );
 			}
-
-			if ( ! array_key_exists( 'amount', $json ) || ! is_numeric( $json['amount'] ) ) {
-				return new WP_Error( 'mobo_core_wallet_balance_missing_amount', 'Mobo wallet balance response did not include a numeric amount.' );
+			if ( in_array( $observation['status'], array( 'INVALID_RAW_RESPONSE', 'INVALID_RESPONSE_ENVELOPE', 'DUPLICATE_WIRE_FIELD' ), true ) ) {
+				return new WP_Error( 'mobo_core_wallet_balance_json_error', 'Mobo wallet balance JSON response failed wire verification.' );
 			}
-
-			$amount = (float) $json['amount'];
-			if ( $amount >= 0 && floor( $amount ) === $amount && $amount <= PHP_INT_MAX ) {
-				return (int) $amount;
+			if ( 'MISSING_AMOUNT' === $observation['status'] ) {
+				return new WP_Error( 'mobo_core_wallet_balance_missing_amount', 'Mobo wallet balance response did not include an amount.' );
 			}
-
-			return $amount;
+			if ( 'INVALID_SUCCESS_ACKNOWLEDGEMENT' === $observation['status'] ) {
+				return new WP_Error( 'mobo_core_wallet_balance_invalid_success_ack', 'Mobo wallet balance response success acknowledgement is malformed.' );
+			}
+			if ( 'DISPLAY_ONLY_UNVERIFIED_UNIT' !== $observation['status'] ) {
+				return new WP_Error( 'mobo_core_wallet_balance_invalid_amount', 'Mobo wallet balance amount is not safely representable.' );
+			}
+			return $observation['balance'];
 		} finally {
 			if ( $owns_lock ) {
 				$this->release_mobo_cart_lock( $lock );
@@ -516,8 +820,50 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array
 	 */
 	public function validate_current_cart( $include_external = true ) {
+		$connection_ids = $this->get_current_cart_mobo_connection_ids();
+		if ( 1 === count( $connection_ids ) && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$connection_id = absint( reset( $connection_ids ) );
+			return Mobo_Core_Connection_Context::run( $connection_id, function () use ( $include_external, $connection_id ) { return $this->validate_current_cart_in_connection( $include_external, $connection_id ); } );
+		}
+
+		/* A cart spanning multiple Sources has no single shared remote account/cart.
+		 * Validate each Source-owned subset inside its own Connection context instead
+		 * of skipping configured pre-purchase checks or probing the Default Connection.
+		 * Automatic order submission remains independently fail-closed for the final
+		 * multi-Connection order. */
+		if ( count( $connection_ids ) > 1 ) {
+			$errors = array();
+			$items  = array();
+			$parts  = array();
+			foreach ( $connection_ids as $connection_id ) {
+				$connection_id = absint( $connection_id );
+				if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+					continue;
+				}
+				$part = Mobo_Core_Connection_Context::run( $connection_id, function () use ( $include_external, $connection_id ) {
+					return $this->validate_current_cart_in_connection( $include_external, $connection_id );
+				} );
+				if ( is_array( $part ) ) {
+					$parts[ $connection_id ] = $part;
+					if ( isset( $part['errors'] ) && is_array( $part['errors'] ) ) {
+						$errors = array_merge( $errors, $part['errors'] );
+					}
+					if ( isset( $part['meta']['items'] ) && is_array( $part['meta']['items'] ) ) {
+						$items = array_merge( $items, $part['meta']['items'] );
+					}
+				}
+			}
+			$errors = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $errors ) ) ) );
+			return $this->result( empty( $errors ), $errors, array( 'items' => $items, 'connectionIds' => $connection_ids, 'connectionResults' => $parts ) );
+		}
+
+		return $this->validate_current_cart_in_connection( $include_external, 0 );
+	}
+
+	/** Validate the active cart inside its owning Connection context. @return array */
+	private function validate_current_cart_in_connection( $include_external = true, $target_connection_id = 0 ) {
 		$errors = array();
-		$items  = $this->build_cart_items_payload( $errors );
+		$items  = $this->build_cart_items_payload( $errors, $target_connection_id );
 
 		if ( empty( $items ) && empty( $errors ) ) {
 			return $this->result( true, array(), array( 'items' => array() ) );
@@ -545,9 +891,10 @@ class Mobo_Core_Checkout_Validator {
 		 * boundary. Third-party filters may add diagnostics, but must not accidentally
 		 * erase a core Mobo/cart validation failure and let payment continue. Preserve
 		 * historical filter replacement semantics when auto-order is disabled. */
-		$errors = $this->is_order_submission_enabled()
-			? array_merge( $core_errors, $filtered_errors )
-			: $filtered_errors;
+		/* Core validation errors are a customer-safety boundary whenever the merchant
+		 * enabled the corresponding check. Third-party filters may add diagnostics or
+		 * stricter validation, but they must never erase built-in failures. */
+		$errors = array_merge( $core_errors, $filtered_errors );
 
 		$sanitized_errors = array();
 		foreach ( $errors as $error ) {
@@ -562,6 +909,136 @@ class Mobo_Core_Checkout_Validator {
 		$errors = array_values( array_unique( $sanitized_errors ) );
 
 		return $this->result( empty( $errors ), $errors, array( 'items' => $items ) );
+	}
+
+	/** Return unique Connection owners represented by Mobo items in the live cart. @return array<int,int> */
+	private function get_current_cart_mobo_connection_ids() {
+		if ( ! function_exists( 'WC' ) || ! WC()->cart ) { return array(); }
+		$cart = WC()->cart->get_cart();
+		if ( ! is_array( $cart ) ) { return array(); }
+		$ids = array();
+		foreach ( $cart as $cart_item ) {
+			$product_id = absint( isset( $cart_item['product_id'] ) ? $cart_item['product_id'] : 0 );
+			$variation_id = absint( isset( $cart_item['variation_id'] ) ? $cart_item['variation_id'] : 0 );
+			$id = $this->resolve_woo_item_connection_id( $product_id, $variation_id );
+			if ( $id > 0 ) { $ids[ $id ] = $id; }
+		}
+		return array_values( $ids );
+	}
+
+	/** Evaluate validation switches in the owning Connection rather than Default. @return bool */
+	private function has_active_checkout_validation_checks_for_current_cart() {
+		$ids = $this->get_current_cart_mobo_connection_ids();
+		if ( empty( $ids ) ) { return false; }
+		foreach ( $ids as $id ) {
+			$active = class_exists( 'Mobo_Core_Connection_Context' )
+				? Mobo_Core_Connection_Context::run( $id, function () { return $this->has_active_checkout_validation_checks(); } )
+				: $this->has_active_checkout_validation_checks();
+			if ( $active ) { return true; }
+		}
+		return false;
+	}
+
+
+	/**
+	 * Classify the live WooCommerce cart for the automatic-order all-or-nothing
+	 * pre-payment boundary. This intentionally performs no remote request.
+	 *
+	 * @return array
+	 */
+	private function get_current_cart_order_scope() {
+		$scope = array(
+			'status'        => 'empty',
+			'total'         => 0,
+			'mobo'          => 0,
+			'nonMobo'       => 0,
+			'invalid'       => 0,
+			'connectionId'  => 0,
+			'connectionIds' => array(),
+		);
+		if ( ! function_exists( 'WC' ) || ! WC()->cart ) { return $scope; }
+		$cart = WC()->cart->get_cart();
+		if ( ! is_array( $cart ) ) { return $scope; }
+		$connections = array();
+		foreach ( $cart as $cart_item ) {
+			if ( ! is_array( $cart_item ) ) { $scope['invalid']++; $scope['total']++; continue; }
+			$product_id   = absint( isset( $cart_item['product_id'] ) ? $cart_item['product_id'] : 0 );
+			$variation_id = absint( isset( $cart_item['variation_id'] ) ? $cart_item['variation_id'] : 0 );
+			$scope['total']++;
+			if ( $product_id <= 0 && $variation_id <= 0 ) { $scope['invalid']++; continue; }
+			$connection_id = $this->resolve_woo_item_connection_id( $product_id, $variation_id );
+			if ( $connection_id > 0 ) {
+				$scope['mobo']++;
+				$connections[ $connection_id ] = true;
+			} else {
+				$scope['nonMobo']++;
+			}
+		}
+		$scope['connectionIds'] = array_values( array_map( 'absint', array_keys( $connections ) ) );
+		if ( 1 === count( $scope['connectionIds'] ) ) { $scope['connectionId'] = absint( $scope['connectionIds'][0] ); }
+		if ( $scope['total'] <= 0 ) {
+			$scope['status'] = 'empty';
+		} elseif ( $scope['invalid'] > 0 ) {
+			$scope['status'] = 'invalid';
+		} elseif ( $scope['nonMobo'] > 0 && $scope['mobo'] > 0 ) {
+			$scope['status'] = 'mixed';
+		} elseif ( count( $scope['connectionIds'] ) > 1 ) {
+			$scope['status'] = 'multi_connection';
+		} elseif ( $scope['mobo'] > 0 ) {
+			$scope['status'] = 'all_mobo';
+		} else {
+			$scope['status'] = 'non_mobo';
+		}
+		return $scope;
+	}
+
+	/**
+	 * Whether automatic submission is enabled for at least one Mobo owner that is
+	 * actually represented by this checkout. An unrelated enabled Connection must
+	 * never make an otherwise non-Mobo cart fail.
+	 *
+	 * @param array $connection_ids Cart/order owner ids.
+	 * @return bool
+	 */
+	private function auto_order_enabled_for_connection_ids( $connection_ids ) {
+		if ( ! class_exists( 'Mobo_Core_Order_Submission_Policy' ) ) { return false; }
+		$connection_ids = is_array( $connection_ids ) ? array_values( array_unique( array_filter( array_map( 'absint', $connection_ids ) ) ) ) : array();
+		foreach ( $connection_ids as $connection_id ) {
+			$enabled = class_exists( 'Mobo_Core_Connection_Context' )
+				? Mobo_Core_Connection_Context::run( $connection_id, function () { return Mobo_Core_Order_Submission_Policy::is_enabled(); } )
+				: Mobo_Core_Order_Submission_Policy::is_enabled();
+			if ( $enabled ) { return true; }
+		}
+		return false;
+	}
+
+	/** Build the customer-safe error for a pre-payment automatic-order scope block. */
+	private function auto_order_scope_pre_payment_error( $scope ) {
+		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
+		if ( 'mixed' === $status ) {
+			return new WP_Error( 'mobo_core_checkout_mixed_order_blocked', 'این سبد خرید شامل محصول موبو و غیرموبو است. برای جلوگیری از پرداخت سفارشی که امکان ارسال کامل خودکار آن وجود ندارد، پرداخت متوقف شد.' );
+		}
+		if ( 'multi_connection' === $status ) {
+			return new WP_Error( 'mobo_core_checkout_multi_connection_blocked', 'این سبد خرید شامل محصولات متعلق به بیش از یک منبع موبو است. تا زمان تعریف Split Order، پرداخت این سبد برای ارسال خودکار متوقف است.' );
+		}
+		if ( 'invalid' === $status ) {
+			return new WP_Error( 'mobo_core_checkout_owner_ambiguous', 'مالکیت حداقل یک آیتم سبد خرید قابل اثبات نیست. برای جلوگیری از خرید ناقص، پرداخت متوقف شد.' );
+		}
+		return true;
+	}
+
+	/** Classic checkout pre-payment all-or-nothing automatic-order guard. */
+	private function validate_auto_order_cart_scope_pre_payment() {
+		$scope = $this->get_current_cart_order_scope();
+		if ( ! $this->auto_order_enabled_for_connection_ids( $scope['connectionIds'] ?? array() ) ) { return true; }
+		return $this->auto_order_scope_pre_payment_error( $scope );
+	}
+
+	/** Checkout Block/Store API equivalent using the already-frozen order identity. */
+	private function validate_auto_order_order_scope_pre_payment( $order ) {
+		$scope = $this->get_order_mobo_item_scope( $order );
+		if ( ! $this->auto_order_enabled_for_connection_ids( $scope['connectionIds'] ?? array() ) ) { return true; }
+		return $this->auto_order_scope_pre_payment_error( $scope );
 	}
 
 	/**
@@ -708,7 +1185,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @param array $errors Output errors.
 	 * @return array
 	 */
-	private function build_cart_items_payload( &$errors ) {
+	private function build_cart_items_payload( &$errors, $target_connection_id = 0 ) {
 		$errors = is_array( $errors ) ? $errors : array();
 
 		if ( ! function_exists( 'WC' ) || ! WC()->cart ) {
@@ -750,15 +1227,30 @@ class Mobo_Core_Checkout_Validator {
 				$parent_id = $product_id;
 			}
 
-			$product_guid      = $this->get_remote_product_guid( $parent_id, $product_id );
-			$variant_guid      = $variation_id > 0 ? sanitize_text_field( (string) get_post_meta( $variation_id, 'variant_guid', true ) ) : '';
-			$portal_product_id = $this->get_portal_product_id( $parent_id, $product_id );
-			$portal_variant_id = $this->get_portal_variant_id( $variation_id, $product_id );
-			$is_mobo_item      = '' !== $product_guid || '' !== $variant_guid || $portal_product_id > 0 || $portal_variant_id > 0 || '' !== sanitize_text_field( (string) get_post_meta( $parent_id, 'mobo_url', true ) );
+			$connection_id = $this->resolve_woo_item_connection_id( $parent_id, $variation_id );
+			$target_connection_id = absint( $target_connection_id );
+			if ( $target_connection_id > 0 && $connection_id > 0 && $connection_id !== $target_connection_id ) {
+				/* Multi-Connection validation is intentionally partitioned by durable owner. */
+				continue;
+			}
+			$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id > 0 && $current_connection_id > 0 && $connection_id !== $current_connection_id ) {
+				$errors[] = 'مالک Connection یکی از محصولات سبد خرید با context اعتبارسنجی همخوانی ندارد.';
+				continue;
+			}
 
+			/* Terminal Custom Storage ownership is the authority for whether an item is
+			 * Mobo-owned. Compatibility meta may expose identity values, but stale/legacy
+			 * postmeta alone must never resurrect Mobo checkout ownership. */
+			$is_mobo_item = $connection_id > 0;
 			if ( $only_mobo_products && ! $is_mobo_item ) {
 				continue;
 			}
+
+			$product_guid      = $this->get_remote_product_guid( $parent_id, $product_id );
+			$variant_guid      = $this->get_variant_guid( $variation_id, $product_id );
+			$portal_product_id = $this->get_portal_product_id( $parent_id, $product_id );
+			$portal_variant_id = $this->get_portal_variant_id( $variation_id, $product_id );
 
 			$name = wp_strip_all_tags( $product->get_name() );
 
@@ -805,6 +1297,7 @@ class Mobo_Core_Checkout_Validator {
 				'portalProductId'  => $portal_product_id,
 				'portalVariantId'  => $portal_variant_id,
 				'isMoboItem'       => $is_mobo_item,
+				'connectionId'     => $connection_id,
 				'price'            => wc_format_decimal( $product->get_price(), wc_get_price_decimals() ),
 				'stockQuantity'    => null === $product->get_stock_quantity() ? null : (float) $product->get_stock_quantity(),
 				'stockStatus'      => sanitize_key( (string) $product->get_stock_status() ),
@@ -841,7 +1334,7 @@ class Mobo_Core_Checkout_Validator {
 			return array_values( array_unique( $aggregate_errors ) );
 		}
 
-		update_option( 'mobo_core_checkout_last_validation_attempt_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_checkout_last_validation_attempt_at', time(), false );
 		$this->debug_log( 'shared_cart_validation_start', array( 'itemCount' => count( $items ), 'cartUpdate' => $this->is_woocommerce_cart_update_request() ) );
 
 		$lock = $this->acquire_mobo_cart_lock( 'checkout_validation' );
@@ -886,15 +1379,15 @@ class Mobo_Core_Checkout_Validator {
 				$response = $this->add_mobo_cart_item_by_variant( $portal_variant_id, $quantity );
 
 				if ( $this->is_auth_error_response( $response ) ) {
-					$auth = $this->ensure_mobo_authenticated( true );
-
-					if ( is_wp_error( $auth ) ) {
-						$this->store_mobo_validation_result( false, 0, 'login_failed', $auth->get_error_message(), $results );
-						$errors[] = 'ورود به سرویس موبو برای بررسی موجودی انجام نشد.';
-						break;
-					}
-
-					$response = $this->add_mobo_cart_item_by_variant( $portal_variant_id, $quantity );
+					/*
+					 * Never re-authenticate and retry an individual Add in-place. Authentication
+					 * can switch the remote cart/session, which invalidates the preceding Clear.
+					 * The next validation attempt must restart the whole Clear -> Add All flow.
+					 */
+					$this->shared_mobo_cart_rebuild_ready = false;
+					$this->debug_log( 'shared_cart_add_auth_changed_rebuild_required', array( 'portalVariantId' => $portal_variant_id ) );
+					$errors[] = 'نشست موبو هنگام بازسازی سبد منقضی شد؛ برای جلوگیری از ترکیب سبد قدیمی و جدید، بازسازی باید از مرحله پاک‌سازی کامل دوباره شروع شود.';
+					break;
 				}
 
 				$code      = is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) );
@@ -922,7 +1415,11 @@ class Mobo_Core_Checkout_Validator {
 				/* update=true is the authoritative storefront refresh used before checkout. */
 				$snapshot = $this->get_mobo_cart_snapshot_json( true );
 
-				if ( is_wp_error( $snapshot ) ) {
+				if ( $this->is_auth_error_response( $snapshot ) ) {
+					$this->shared_mobo_cart_rebuild_ready = false;
+					$this->debug_log( 'shared_cart_snapshot_auth_changed_rebuild_required', array() );
+					$errors[] = 'نشست موبو پیش از تأیید نهایی سبد منقضی شد؛ بازسازی سبد باید از مرحله پاک‌سازی کامل دوباره انجام شود.';
+				} elseif ( is_wp_error( $snapshot ) ) {
 					$this->debug_log( 'shared_cart_snapshot_failed', array( 'error' => $snapshot->get_error_message() ) );
 					$errors[] = 'خواندن snapshot سبد موبو بعد از آماده‌سازی انجام نشد.';
 				} else {
@@ -930,6 +1427,9 @@ class Mobo_Core_Checkout_Validator {
 
 					if ( ! empty( $compare_errors ) ) {
 						$errors = array_merge( $errors, $compare_errors );
+					} else {
+						/* Rebuild is complete; no later add may reuse this clear proof. */
+						$this->shared_mobo_cart_rebuild_ready = false;
 					}
 				}
 			}
@@ -938,8 +1438,8 @@ class Mobo_Core_Checkout_Validator {
 			$this->debug_log( 'shared_cart_validation_finish', array( 'success' => empty( $errors ), 'errorCount' => count( $errors ), 'resultCount' => count( $results ) ) );
 
 			if ( empty( $errors ) ) {
-				update_option( 'mobo_core_checkout_last_validation_success_at', time(), false );
-				update_option( 'mobo_core_checkout_mobo_cart_success_at', time(), false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_last_validation_success_at', time(), false );
+				Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_cart_success_at', time(), false );
 			}
 
 			return $errors;
@@ -948,184 +1448,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 	}
 
-	/**
-	 * Mirror WooCommerce cart item removal to the Mobo storefront cart.
-	 *
-	 * WooCommerce removes the local cart row first and keeps the removed row in
-	 * WC_Cart::$removed_cart_contents. Mobo requires DELETE /site/api/v1/cart/{cart_item_id},
-	 * so the cart item ID is resolved from the latest Mobo snapshot by matching
-	 * items[].product.variant.id with the saved portal_variant_id.
-	 *
-	 * @param string  $cart_item_key WooCommerce cart item key.
-	 * @param WC_Cart $cart WooCommerce cart object.
-	 * @return void
-	 */
-	public function handle_wc_cart_item_removed( $cart_item_key, $cart ) {
-		/* Single shared Mobo cart mode: live WooCommerce removals must not touch Mobo. */
-		return;
-
-		if ( ! $this->is_mobo_cart_validation_effective() ) {
-			return;
-		}
-
-		$cart_item = null;
-
-		if ( is_object( $cart ) && isset( $cart->removed_cart_contents ) && is_array( $cart->removed_cart_contents ) && isset( $cart->removed_cart_contents[ $cart_item_key ] ) ) {
-			$cart_item = $cart->removed_cart_contents[ $cart_item_key ];
-		}
-
-		if ( ! is_array( $cart_item ) ) {
-			return;
-		}
-
-		$variation_id = absint( isset( $cart_item['variation_id'] ) ? $cart_item['variation_id'] : 0 );
-		$product_id   = absint( isset( $cart_item['product_id'] ) ? $cart_item['product_id'] : 0 );
-		$product      = isset( $cart_item['data'] ) ? $cart_item['data'] : null;
-		$wc_id        = $product instanceof WC_Product ? absint( $product->get_id() ) : $product_id;
-		$name         = $product instanceof WC_Product ? wp_strip_all_tags( $product->get_name() ) : 'محصول';
-
-		$portal_variant_id = $this->get_portal_variant_id( $variation_id, $wc_id );
-
-		if ( $portal_variant_id <= 0 ) {
-			return;
-		}
-
-		$this->debug_log( 'wc_remove_item', array( 'portalVariantId' => $portal_variant_id, 'cartKey' => sanitize_text_field( (string) $cart_item_key ) ) );
-
-		$result = $this->delete_mobo_cart_item_for_variant( $portal_variant_id );
-
-		if ( true === $result ) {
-			$this->debug_log( 'wc_remove_item_success', array( 'portalVariantId' => $portal_variant_id ) );
-			update_option( 'mobo_core_checkout_mobo_cart_delete_success_at', time(), false );
-			update_option(
-				'mobo_core_checkout_mobo_cart_delete_last_result',
-				array(
-					'success'         => true,
-					'portalVariantId' => $portal_variant_id,
-					'timestamp'       => time(),
-				),
-				false
-			);
-			return;
-		}
-
-		$message = is_wp_error( $result ) ? $result->get_error_message() : 'خطای نامشخص در حذف آیتم از سبد موبو.';
-		$this->debug_log( 'wc_remove_item_failed', array( 'portalVariantId' => $portal_variant_id, 'error' => $message ) );
-
-		update_option(
-			'mobo_core_checkout_mobo_cart_delete_last_result',
-			array(
-				'success'         => false,
-				'portalVariantId' => $portal_variant_id,
-				'error'           => sanitize_text_field( $message ),
-				'timestamp'       => time(),
-			),
-			false
-		);
-
-		if ( function_exists( 'wc_add_notice' ) ) {
-			wc_add_notice( sprintf( 'حذف محصول «%s» از سبد موبو انجام نشد. لطفاً سبد خرید را دوباره بروزرسانی کنید.', sanitize_text_field( $name ) ), 'error' );
-		}
-	}
-
-	/**
-	 * Delete a Mobo cart row for a MoboCore variant ID.
-	 *
-	 * @param int $portal_variant_id MoboCore variant ID.
-	 * @return true|WP_Error
-	 */
-	private function delete_mobo_cart_item_for_variant( $portal_variant_id ) {
-		$portal_variant_id = absint( $portal_variant_id );
-
-		if ( $portal_variant_id <= 0 ) {
-			return new WP_Error( 'mobo_core_invalid_portal_variant_id', 'Invalid portal_variant_id.' );
-		}
-
-		$auth = $this->ensure_mobo_authenticated( false );
-
-		if ( is_wp_error( $auth ) ) {
-			return $auth;
-		}
-
-		$cart_item_id = $this->get_mobo_cart_item_id_for_variant( $portal_variant_id );
-		$this->debug_log( 'delete_resolve_start', array( 'portalVariantId' => $portal_variant_id, 'cartItemId' => $cart_item_id ) );
-
-		if ( $cart_item_id <= 0 ) {
-			$snapshot = $this->refresh_mobo_cart_snapshot();
-
-			if ( $this->is_auth_error_response( $snapshot ) ) {
-				$auth = $this->ensure_mobo_authenticated( true );
-
-				if ( is_wp_error( $auth ) ) {
-					return $auth;
-				}
-
-				$snapshot = $this->refresh_mobo_cart_snapshot();
-			}
-
-			if ( is_wp_error( $snapshot ) ) {
-				return $snapshot;
-			}
-
-			$cart_item_id = $this->get_mobo_cart_item_id_for_variant( $portal_variant_id );
-		}
-
-		/*
-		 * If the item is already absent from the Mobo cart, local removal is complete.
-		 */
-		if ( $cart_item_id <= 0 ) {
-			$this->debug_log( 'delete_item_absent', array( 'portalVariantId' => $portal_variant_id ) );
-			$this->remove_mobo_cart_item_id_for_variant( $portal_variant_id );
-			return true;
-		}
-
-		$this->debug_log( 'delete_request', array( 'portalVariantId' => $portal_variant_id, 'cartItemId' => $cart_item_id ) );
-
-		$response = $this->mobo_request(
-			'DELETE',
-			'/site/api/v1/cart/' . rawurlencode( (string) $cart_item_id ),
-			null
-		);
-
-		if ( $this->is_auth_error_response( $response ) ) {
-			$auth = $this->ensure_mobo_authenticated( true );
-
-			if ( is_wp_error( $auth ) ) {
-				return $auth;
-			}
-
-			$response = $this->mobo_request(
-				'DELETE',
-				'/site/api/v1/cart/' . rawurlencode( (string) $cart_item_id ),
-				null
-			);
-		}
-
-		if ( is_wp_error( $response ) ) {
-			$this->debug_log( 'delete_wp_error', array( 'portalVariantId' => $portal_variant_id, 'cartItemId' => $cart_item_id, 'error' => $response->get_error_message() ) );
-			return $response;
-		}
-
-		$code = absint( wp_remote_retrieve_response_code( $response ) );
-
-		if ( $code < 200 || $code >= 300 ) {
-			$this->debug_log( 'delete_http_error', array( 'portalVariantId' => $portal_variant_id, 'cartItemId' => $cart_item_id, 'httpStatus' => $code ) );
-			return new WP_Error( 'mobo_core_mobo_cart_delete_http_error', 'Mobo cart delete failed with HTTP status ' . $code );
-		}
-
-		$this->debug_log( 'delete_success', array( 'portalVariantId' => $portal_variant_id, 'cartItemId' => $cart_item_id, 'httpStatus' => $code ) );
-		$this->remove_mobo_cart_item_id_for_variant( $portal_variant_id );
-		$snapshot = $this->refresh_mobo_cart_snapshot();
-
-		if ( $this->is_auth_error_response( $snapshot ) || is_wp_error( $snapshot ) ) {
-			/* Deletion itself succeeded; snapshot refresh failure should not undo it. */
-			return true;
-		}
-
-		return true;
-	}
-
-	/**
+			/**
 	 * Acquire a global lock for the one shared Mobo cart.
 	 *
 	 * @param string $purpose Lock purpose.
@@ -1150,18 +1473,20 @@ class Mobo_Core_Checkout_Validator {
 			if ( false !== $token ) {
 				$this->active_mobo_cart_lock_token = sanitize_text_field( (string) $token );
 				$this->active_mobo_cart_lock_ttl   = $ttl;
+				/* A new lease never inherits proof that a previous rebuild started empty. */
+				$this->shared_mobo_cart_rebuild_ready = false;
 
 				/* Credential changes request a cookie reset without mutating the shared
 				 * session underneath an active checkout. Apply that reset only after this
 				 * request owns the same cart/session lease. */
-				if ( '1' === (string) get_option( 'mobo_core_checkout_mobo_cookie_reset_pending', '0' ) ) {
-					delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
-					if ( null !== get_option( 'mobo_core_checkout_mobo_cookie_jar', null ) ) {
+				if ( '1' === (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_cookie_reset_pending', '0' ) ) {
+					Mobo_Core_Settings::delete( 'mobo_core_checkout_mobo_cookie_jar' );
+					if ( null !== Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_cookie_jar', null ) ) {
 						Mobo_Core_Lock::release( 'shared_mobo_cart', $this->active_mobo_cart_lock_token );
 						$this->active_mobo_cart_lock_token = '';
 						return new WP_Error( 'mobo_core_shared_cart_cookie_reset_failed', 'Shared Mobo session reset is pending because the cookie jar could not be cleared.' );
 					}
-					delete_option( 'mobo_core_checkout_mobo_cookie_reset_pending' );
+					Mobo_Core_Settings::delete( 'mobo_core_checkout_mobo_cookie_reset_pending' );
 				}
 
 				$this->debug_log( 'shared_cart_lock_acquired', array( 'purpose' => $purpose, 'ttl' => $ttl, 'waited' => time() - $started_at ) );
@@ -1226,6 +1551,8 @@ class Mobo_Core_Checkout_Validator {
 		if ( '' !== $this->active_mobo_cart_lock_token && hash_equals( (string) $this->active_mobo_cart_lock_token, $token ) ) {
 			$this->active_mobo_cart_lock_token = '';
 		}
+		/* Never allow a later add to reuse clear-proof from a released lease. */
+		$this->shared_mobo_cart_rebuild_ready = false;
 		$this->debug_log( 'shared_cart_lock_released', array() );
 	}
 
@@ -1235,6 +1562,13 @@ class Mobo_Core_Checkout_Validator {
 	 * @return true|WP_Error
 	 */
 	private function clear_shared_mobo_cart() {
+
+		/* Clear proof is per-attempt: close the add gate until emptiness is proven. */
+		$this->shared_mobo_cart_rebuild_ready = false;
+
+		if ( ! $this->provider_uses_replace_cart_sync() ) {
+			return new WP_Error( 'mobo_core_provider_cart_strategy_unsupported', 'The active Source provider does not support replace/rebuild cart synchronization.' );
+		}
 		$this->debug_log( 'shared_cart_clear_start', array() );
 
 		/*
@@ -1270,6 +1604,7 @@ class Mobo_Core_Checkout_Validator {
 
 			if ( empty( $items ) ) {
 				$this->set_mobo_cart_item_map( array() );
+				$this->shared_mobo_cart_rebuild_ready = true;
 				$this->debug_log( 'shared_cart_clear_finish', array( 'deletedCount' => $deleted_count, 'passes' => $pass ) );
 				return true;
 			}
@@ -1284,14 +1619,16 @@ class Mobo_Core_Checkout_Validator {
 				}
 
 				$this->debug_log( 'shared_cart_delete_existing', array( 'pass' => $pass, 'cartItemId' => $cart_item_id, 'portalVariantId' => $variant_id, 'schemaValid' => ! empty( $item['schemaValid'] ) ) );
-				$response = $this->mobo_request( 'DELETE', '/site/api/v1/cart/' . rawurlencode( (string) $cart_item_id ), null );
+				$clear_path = $this->get_provider_endpoint( 'cart_clear_item', array( 'cart_item_id' => $cart_item_id ) );
+				if ( '' === $clear_path ) { return new WP_Error( 'mobo_core_provider_cart_clear_unsupported', 'The active Source provider cannot clear the remote cart safely.' ); }
+				$response = $this->mobo_request( 'DELETE', $clear_path, null );
 
 				if ( $this->is_auth_error_response( $response ) ) {
 					$auth = $this->ensure_mobo_authenticated( true );
 					if ( is_wp_error( $auth ) ) {
 						return $auth;
 					}
-					$response = $this->mobo_request( 'DELETE', '/site/api/v1/cart/' . rawurlencode( (string) $cart_item_id ), null );
+					$response = $this->mobo_request( 'DELETE', $clear_path, null );
 				}
 
 				if ( is_wp_error( $response ) ) {
@@ -1333,6 +1670,7 @@ class Mobo_Core_Checkout_Validator {
 			$leftovers = $this->parse_mobo_snapshot_items( $verify );
 			if ( empty( $leftovers ) ) {
 				$this->set_mobo_cart_item_map( array() );
+				$this->shared_mobo_cart_rebuild_ready = true;
 				$this->debug_log( 'shared_cart_clear_finish', array( 'deletedCount' => $deleted_count, 'passes' => $pass ) );
 				return true;
 			}
@@ -1357,10 +1695,12 @@ class Mobo_Core_Checkout_Validator {
 	 * Add one MoboCore variant to the shared Mobo cart.
 	 *
 	 * @param int   $portal_variant_id MoboCore variant ID.
-	 * @param float $quantity Quantity.
+	 * @param float         $quantity Quantity.
+	 * @param WC_Order|null $order Optional order for durable request logging.
 	 * @return array|WP_Error
 	 */
-	private function add_mobo_cart_item_by_variant( $portal_variant_id, $quantity ) {
+	private function add_mobo_cart_item_by_variant( $portal_variant_id, $quantity, $order = null ) {
+
 		$portal_variant_id = absint( $portal_variant_id );
 		$quantity          = max( 0, (float) $quantity );
 
@@ -1368,14 +1708,45 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_invalid_portal_variant_id', 'Invalid portal_variant_id.' );
 		}
 
-		return $this->mobo_request(
-			'POST',
-			'/site/api/v1/cart',
-			array(
-				'quantity'   => $quantity,
-				'variant_id' => $portal_variant_id,
-			)
-		);
+		/*
+		 * Deterministic replace/rebuild invariant: no POST /cart is legal until the
+		 * current shared-cart lease has read the authoritative remote cart, removed
+		 * every existing row and proven it empty. This makes Clear -> Add All a
+		 * runtime rule instead of only a call-site convention.
+		 */
+		if ( ! $this->shared_mobo_cart_rebuild_ready || '' === sanitize_text_field( (string) $this->active_mobo_cart_lock_token ) ) {
+			return new WP_Error(
+				'mobo_core_shared_cart_clear_required_before_add',
+				'Remote cart add was blocked because the cart was not proven empty under the active shared-cart lock.'
+			);
+		}
+
+		$provider = $this->get_mobo_provider();
+		$path = $this->get_provider_endpoint( 'cart_add' );
+		if ( ! $provider instanceof Mobo_Core_Provider_Interface || '' === $path ) {
+			return new WP_Error( 'mobo_core_provider_cart_add_unsupported', 'The active Source provider does not support cart rebuild.' );
+		}
+
+		$payload  = $provider->build_cart_add_payload( $portal_variant_id, $quantity );
+		$response = $this->mobo_request( 'POST', $path, $payload );
+
+		/*
+		 * Cart Add intentionally bypasses order_mobo_request()'s generic auth retry.
+		 * Re-authentication may bind a different remote cart, so only a complete
+		 * rebuild beginning with clear_shared_mobo_cart() may retry this mutation.
+		 */
+		if ( $order instanceof WC_Order ) {
+			$this->append_order_log( $order, 'cart_add_item', array(
+				'method'     => 'POST',
+				'path'       => $this->sanitize_mobo_log_path( $path ),
+				'httpStatus' => is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) ),
+				'cookieJar'  => $this->mask_cookie_jar( $this->get_mobo_cookie_jar() ),
+				'payload'    => $this->sanitize_order_log_value( $payload ),
+				'response'   => is_wp_error( $response ) ? array( 'error' => $response->get_error_message() ) : $this->sanitize_order_response_body( wp_remote_retrieve_body( $response ) ),
+			) );
+		}
+
+		return $response;
 	}
 
 	/**
@@ -1785,122 +2156,19 @@ class Mobo_Core_Checkout_Validator {
 		return array_values( array_unique( $errors ) );
 	}
 
-	/**
-	 * Send add/update cart request to Mobo API.
-	 *
-	 * Flow used by mobomobo.ir:
-	 * 1) POST /site/api/v1/cart creates/adds a variant with variant_id = portal_variant_id.
-	 * 2) GET /site/api/v1/cart?update=false returns cart.items[].id; update=true refreshes checkout data.
-	 * 3) Later quantity changes must use PUT /site/api/v1/cart/{cart_item_id}.
-	 *
-	 * The cart item ID is discovered by matching:
-	 * cart.items[].product.variant.id == portal_variant_id.
-	 *
-	 * @param int   $portal_variant_id MoboCore variant ID.
-	 * @param float $quantity Quantity.
-	 * @param bool  $prefer_put Prefer PUT when a cart item ID can be resolved.
-	 * @return array|WP_Error
-	 */
-	private function send_mobo_cart_item( $portal_variant_id, $quantity, $prefer_put = false ) {
-		$portal_variant_id = absint( $portal_variant_id );
-		$quantity          = max( 0, (float) $quantity );
-
-		if ( $portal_variant_id <= 0 ) {
-			return new WP_Error( 'mobo_core_invalid_portal_variant_id', 'Invalid portal_variant_id.' );
-		}
-
-		$cart_item_id = $this->get_mobo_cart_item_id_for_variant( $portal_variant_id );
-		$this->debug_log( 'send_item_start', array( 'portalVariantId' => $portal_variant_id, 'quantity' => $quantity, 'preferPut' => $prefer_put, 'cartItemId' => $cart_item_id ) );
-
-		if ( $prefer_put && $cart_item_id <= 0 ) {
-			$snapshot = $this->refresh_mobo_cart_snapshot();
-
-			if ( $this->is_auth_error_response( $snapshot ) ) {
-				return $snapshot;
-			}
-
-			if ( is_wp_error( $snapshot ) ) {
-				return $snapshot;
-			}
-
-			$cart_item_id = $this->get_mobo_cart_item_id_for_variant( $portal_variant_id );
-		}
-
-		if ( $cart_item_id > 0 ) {
-			$response = $this->mobo_request(
-				'PUT',
-				'/site/api/v1/cart/' . rawurlencode( (string) $cart_item_id ),
-				array( 'quantity' => $quantity )
-			);
-
-			$code = is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) );
-
-			if ( $this->is_auth_error_response( $response ) ) {
-				return $response;
-			}
-
-			if ( 200 === $code ) {
-				$snapshot = $this->refresh_mobo_cart_snapshot();
-
-				if ( $this->is_auth_error_response( $snapshot ) || is_wp_error( $snapshot ) ) {
-					return $snapshot;
-				}
-
-				if ( $quantity > 0 && $this->get_mobo_cart_item_id_for_variant( $portal_variant_id ) <= 0 ) {
-					return new WP_Error( 'mobo_core_mobo_cart_item_not_found_after_put', 'Mobo cart snapshot did not contain the updated variant.' );
-				}
-
-				return $response;
-			}
-
-			/*
-			 * If the remote cart row disappeared, forget the stale line ID and add it again.
-			 */
-			$this->remove_mobo_cart_item_id_for_variant( $portal_variant_id );
-		}
-
-		$response = $this->mobo_request(
-			'POST',
-			'/site/api/v1/cart',
-			array(
-				'quantity'   => $quantity,
-				'variant_id' => $portal_variant_id,
-			)
-		);
-
-		$code = is_wp_error( $response ) ? 0 : absint( wp_remote_retrieve_response_code( $response ) );
-
-		if ( $this->is_auth_error_response( $response ) || 200 !== $code ) {
-			return $response;
-		}
-
-		$snapshot = $this->refresh_mobo_cart_snapshot();
-
-		if ( $this->is_auth_error_response( $snapshot ) || is_wp_error( $snapshot ) ) {
-			return $snapshot;
-		}
-
-		if ( $quantity > 0 && $this->get_mobo_cart_item_id_for_variant( $portal_variant_id ) <= 0 ) {
-			return new WP_Error( 'mobo_core_mobo_cart_item_not_found_after_post', 'Mobo cart snapshot did not contain the added variant.' );
-		}
-
-		return $response;
-	}
-
-	/**
+		/**
 	 * Ensure Mobo session is authenticated.
 	 *
 	 * @param bool $force Force login.
 	 * @return true|WP_Error
 	 */
 	private function ensure_mobo_authenticated( $force = false ) {
-		$jar = $this->get_mobo_cookie_jar();
 
-		if ( ! $force && ! empty( $jar['userauth'] ) ) {
-			$this->debug_log( 'login_reuse_cookie', array( 'cookieJar' => $this->mask_cookie_jar( $jar ) ) );
-			return true;
+		$route = $this->fresh_checkout_route_preflight();
+		if ( is_wp_error( $route ) ) { return $route; }
+		if ( '' === $this->get_mobo_site_url() ) {
+			return new WP_Error( 'mobo_core_source_checkout_unavailable', 'The active Mobo source does not define a checkout storefront URL.' );
 		}
-
 		$username = trim( (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_username', '' ) );
 		$password = (string) Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_password', '' );
 
@@ -1908,16 +2176,38 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_mobo_credentials_missing', 'Mobo username or password is missing.' );
 		}
 
+		$provider = $this->get_mobo_provider();
+		if ( ! $provider instanceof Mobo_Core_Provider_Interface ) {
+			return new WP_Error( 'mobo_core_provider_unavailable', 'No supported provider is bound to the active Connection Source.' );
+		}
+		$preflight_path = $this->get_provider_endpoint( 'auth_preflight' );
+		$login_path = $this->get_provider_endpoint( 'auth_login' );
+		$auth_cookie_name = sanitize_key( (string) $provider->get_auth_cookie_name() );
+		if ( '' === $preflight_path || '' === $login_path || '' === $auth_cookie_name ) {
+			return new WP_Error( 'mobo_core_provider_auth_unsupported', 'The active Source provider does not support storefront authentication.' );
+		}
+
+		$jar = $this->get_mobo_cookie_jar();
+		if ( ! $force && ! empty( $jar[ $auth_cookie_name ] ) ) {
+			$this->debug_log( 'login_reuse_cookie', array( 'provider' => $provider->get_key(), 'cookieJar' => $this->mask_cookie_jar( $jar ) ) );
+			return true;
+		}
+
 		$jar = array();
-		$this->debug_log( 'login_start', array( 'force' => $force, 'username' => $username ) );
+		$this->debug_log( 'login_start', array( 'force' => $force, 'username' => $username, 'provider' => $provider->get_key() ) );
 
 		$lease = $this->renew_active_mobo_cart_lock();
 		if ( is_wp_error( $lease ) ) {
 			return $lease;
 		}
 
-		$pre = wp_remote_get(
-			$this->mobo_url( '/site/signin' ),
+		$route = $this->fresh_checkout_route_preflight();
+		if ( is_wp_error( $route ) ) { return $route; }
+		$dependency_check = class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::before_request( 'provider_storefront' ) : true;
+		if ( is_wp_error( $dependency_check ) ) { return $dependency_check; }
+		$pre = $this->production_candidate_transport(
+			'GET',
+			$this->mobo_url( $preflight_path ),
 			array(
 				'timeout'     => $this->get_mobo_timeout(),
 				'redirection' => 3,
@@ -1929,7 +2219,13 @@ class Mobo_Core_Checkout_Validator {
 			)
 		);
 
-		if ( ! is_wp_error( $pre ) ) {
+		if ( is_wp_error( $pre ) && class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+			Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', Mobo_Core_Network_Resilience::classify_transport_error( $pre ) );
+		} elseif ( ! is_wp_error( $pre ) ) {
+			$pre_code = absint( wp_remote_retrieve_response_code( $pre ) );
+			if ( $pre_code >= 400 && class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+				Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', Mobo_Core_Network_Resilience::classify_http_status( $pre_code, (string) wp_remote_retrieve_header( $pre, 'retry-after' ) ) );
+			}
 			$jar = $this->merge_cookie_jar_from_response( $jar, $pre );
 		}
 
@@ -1938,8 +2234,13 @@ class Mobo_Core_Checkout_Validator {
 			return $lease;
 		}
 
-		$response = wp_remote_post(
-			$this->mobo_url( '/site/api/v1/user/signin' ),
+		$route = $this->fresh_checkout_route_preflight();
+		if ( is_wp_error( $route ) ) { return $route; }
+		$dependency_check = class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::before_request( 'provider_storefront' ) : true;
+		if ( is_wp_error( $dependency_check ) ) { return $dependency_check; }
+		$response = $this->production_candidate_transport(
+			'POST',
+			$this->mobo_url( $login_path ),
 			array(
 				'timeout'     => $this->get_mobo_timeout(),
 				'redirection' => 0,
@@ -1948,36 +2249,43 @@ class Mobo_Core_Checkout_Validator {
 					'Accept'       => 'application/json, text/plain, */*',
 					'Content-Type' => 'application/json; charset=utf-8',
 					'Origin'       => untrailingslashit( $this->get_mobo_site_url() ),
-					'Referer'      => trailingslashit( $this->get_mobo_site_url() ) . 'site/signin',
+					'Referer'      => trailingslashit( $this->get_mobo_site_url() ) . ltrim( $preflight_path, '/' ),
 					'User-Agent'   => 'MoboCore-CheckoutValidator/' . ( defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '1.0' ),
 					'Cookie'       => $this->cookie_header( $jar ),
 				),
 				'body'        => wp_json_encode(
-					array(
-						'return_url' => '',
-						'username'   => $username,
-						'password'   => $password,
-					),
+					$provider->build_login_payload( $username, $password ),
 					JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
 				),
 			)
 		);
 
 		if ( is_wp_error( $response ) ) {
-			$this->debug_log( 'login_wp_error', array( 'error' => $response->get_error_message() ) );
-			return $response;
+			$this->debug_log( 'login_wp_error', array( 'errorCode' => sanitize_key( (string) $response->get_error_code() ) ) );
+			if ( class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+				$failure = Mobo_Core_Network_Resilience::classify_transport_error( $response );
+				Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', $failure );
+				return Mobo_Core_Network_Resilience::to_wp_error( 'mobo_core_mobo_login_transport_error', 'Mobo storefront authentication transport failed.', $failure, array( 'requestMayHaveReachedServer' => true ) );
+			}
+			return new WP_Error( 'mobo_core_mobo_login_transport_error', 'Mobo storefront authentication transport failed.', array( 'transportCode' => sanitize_key( (string) $response->get_error_code() ), 'requestMayHaveReachedServer' => true ) );
 		}
 
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
 
 		if ( $code < 200 || $code >= 300 ) {
 			$this->debug_log( 'login_http_error', array( 'httpStatus' => $code ) );
+			if ( class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+				$failure = Mobo_Core_Network_Resilience::classify_http_status( $code, (string) wp_remote_retrieve_header( $response, 'retry-after' ) );
+				Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', $failure );
+				return Mobo_Core_Network_Resilience::to_wp_error( 'mobo_core_mobo_login_http_error', 'Mobo storefront authentication was rejected.', $failure, array( 'requestMayHaveReachedServer' => true ) );
+			}
 			return new WP_Error( 'mobo_core_mobo_login_http_error', 'Mobo login failed with HTTP status ' . $code );
 		}
+		if ( class_exists( 'Mobo_Core_Network_Resilience' ) ) { Mobo_Core_Network_Resilience::record_success( 'provider_storefront' ); }
 
 		$jar = $this->merge_cookie_jar_from_response( $jar, $response );
 
-		if ( empty( $jar['userauth'] ) ) {
+		if ( empty( $jar[ $auth_cookie_name ] ) ) {
 			$this->debug_log( 'login_missing_userauth', array( 'cookieJar' => $this->mask_cookie_jar( $jar ) ) );
 			return new WP_Error( 'mobo_core_mobo_login_missing_cookie', 'Mobo login response did not return userauth cookie.' );
 		}
@@ -1986,7 +2294,7 @@ class Mobo_Core_Checkout_Validator {
 			return new WP_Error( 'mobo_core_mobo_cookie_persist_failed', 'Mobo login succeeded but the shared session cookie could not be persisted locally.' );
 		}
 		$this->debug_log( 'login_success', array( 'httpStatus' => $code, 'cookieJar' => $this->mask_cookie_jar( $jar ) ) );
-		update_option( 'mobo_core_checkout_mobo_login_success_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_login_success_at', time(), false );
 
 		return true;
 	}
@@ -2003,16 +2311,30 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array|WP_Error
 	 */
 	private function mobo_request( $method, $path, $payload = array() ) {
+
+		$path = (string) $path;
+		if ( '' === trim( $path ) ) {
+			return new WP_Error( 'mobo_core_provider_operation_unsupported', 'The active Source provider does not expose the requested remote operation.' );
+		}
+		if ( '' === $this->get_mobo_site_url() ) {
+			return new WP_Error( 'mobo_core_source_checkout_unavailable', 'The active Mobo source does not define a checkout storefront URL.' );
+		}
 		$lease = $this->renew_active_mobo_cart_lock();
 		if ( is_wp_error( $lease ) ) {
 			return $lease;
 		}
+		/* The order lock is not a provisioning lock. Re-read the actual route
+		 * before every outbound request: a request-local cached row could otherwise
+		 * combine a cart prepared for Source A with a new Source B's wallet route. */
+		$route = $this->fresh_checkout_route_preflight();
+		if ( is_wp_error( $route ) ) { return $route; }
 
 		$jar     = $this->get_mobo_cookie_jar();
+		$cart_page_path = $this->get_provider_endpoint( 'cart_page' );
 		$headers = array(
 			'Accept'     => 'application/json, text/plain, */*',
 			'Origin'     => untrailingslashit( $this->get_mobo_site_url() ),
-			'Referer'    => trailingslashit( $this->get_mobo_site_url() ) . 'site/cart',
+			'Referer'    => trailingslashit( $this->get_mobo_site_url() ) . ltrim( '' !== $cart_page_path ? $cart_page_path : '/', '/' ),
 			'User-Agent' => 'MoboCore-CheckoutValidator/' . ( defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '1.0' ),
 			'Cookie'     => $this->cookie_header( $jar ),
 		);
@@ -2038,13 +2360,35 @@ class Mobo_Core_Checkout_Validator {
 
 		$this->debug_log( 'api_request', array( 'method' => strtoupper( (string) $method ), 'path' => $this->sanitize_mobo_log_path( $path ), 'payload' => $this->sanitize_debug_payload( $payload ), 'cookieJar' => $this->mask_cookie_jar( $jar ) ) );
 
-		$response = wp_remote_request( $this->mobo_url( $path ), $args );
+		/* Keep the pre-send fence as close to the transport as possible. */
+		$route = $this->fresh_checkout_route_preflight();
+		if ( is_wp_error( $route ) ) { return $route; }
+		$dependency_check = class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::before_request( 'provider_storefront' ) : true;
+		if ( is_wp_error( $dependency_check ) ) { return $dependency_check; }
+		$response = $this->production_candidate_transport( $args['method'], $this->mobo_url( $path ), $args );
 
 		if ( is_wp_error( $response ) ) {
-			$this->debug_log( 'api_response_error', array( 'method' => strtoupper( (string) $method ), 'path' => $this->sanitize_mobo_log_path( $path ), 'error' => $response->get_error_message() ) );
+			/* The WordPress transport message may contain URL/query/cookie/credentials.
+			 * Preserve uncertainty for Wallet, but never persist or return raw text. */
+			$transport_code = sanitize_key( (string) $response->get_error_code() );
+			$this->debug_log( 'api_response_error', array( 'method' => strtoupper( (string) $method ), 'path' => $this->sanitize_mobo_log_path( $path ), 'errorCode' => $transport_code ) );
+			if ( class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+				$failure = Mobo_Core_Network_Resilience::classify_transport_error( $response );
+				Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', $failure );
+				return Mobo_Core_Network_Resilience::to_wp_error( 'mobo_core_mobo_transport_error', 'Mobo storefront HTTP transport failed.', $failure, array( 'requestMayHaveReachedServer' => true ) );
+			}
+			return new WP_Error( 'mobo_core_mobo_transport_error', 'Mobo storefront HTTP transport failed.', array( 'transportCode' => $transport_code, 'requestMayHaveReachedServer' => true ) );
 		}
 
 		if ( ! is_wp_error( $response ) ) {
+			$response_code = absint( wp_remote_retrieve_response_code( $response ) );
+			if ( class_exists( 'Mobo_Core_Network_Resilience' ) ) {
+				if ( $response_code >= 400 ) {
+					Mobo_Core_Network_Resilience::record_failure( 'provider_storefront', Mobo_Core_Network_Resilience::classify_http_status( $response_code, (string) wp_remote_retrieve_header( $response, 'retry-after' ) ) );
+				} elseif ( $response_code >= 200 && $response_code < 400 ) {
+					Mobo_Core_Network_Resilience::record_success( 'provider_storefront' );
+				}
+			}
 			$jar = $this->merge_cookie_jar_from_response( $jar, $response );
 			if ( ! $this->set_mobo_cookie_jar( $jar ) ) {
 				$this->debug_log( 'api_cookie_persist_failed', array( 'method' => strtoupper( (string) $method ), 'path' => $this->sanitize_mobo_log_path( $path ) ) );
@@ -2067,6 +2411,12 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array Errors.
 	 */
 	private function validate_external( $items ) {
+		/* Checkout can record an order in the disposable shop when its optional
+		 * external-validation feature is disabled. Enabled validation NEVER
+		 * downgrades absent Source evidence to an allow decision. */
+		if ( ! $this->is_external_validation_effective() ) { return array(); }
+		return array( 'External Source validation is unavailable in staged NO-SEND mode.' );
+
 		if ( ! $this->is_external_validation_effective() ) {
 			return array();
 		}
@@ -2107,8 +2457,26 @@ class Mobo_Core_Checkout_Validator {
 		/* The generic validation URL may intentionally point to a third-party service.
 		 * Portal credentials must never follow that configurable URL. Attach Token/X-SEC
 		 * only when the destination is exactly the configured Portal API origin. */
+		$portal_validation_fingerprint = '';
+		$portal_validation_owner_id = 0;
 		if ( $this->external_validation_uses_portal_origin( $url ) ) {
-			$security_code = Mobo_Core_Settings::normalize_security_code( Mobo_Core_Settings::get( 'mobo_core_security_code', '' ) );
+			$security_source = Mobo_Core_Settings::get( 'mobo_core_security_code', '' );
+			$token_source = Mobo_Core_Settings::get( 'mobo_core_token', '' );
+			if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() ) {
+				$portal_validation_owner_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+				$portal_validation_fingerprint = $this->get_fresh_order_route_fingerprint( $portal_validation_owner_id );
+				$fresh_owner = Mobo_Core_Connection_Repository::get_by_id_fresh( $portal_validation_owner_id );
+				$fresh_portal_url = is_array( $fresh_owner )
+					? Mobo_Core_Connection_Repository::resolve_api_base_url( (string) ( $fresh_owner['api_base_url'] ?? '' ) )
+					: '';
+				if ( '' === $portal_validation_fingerprint || ! is_array( $fresh_owner )
+					|| ! $this->external_validation_uses_portal_origin( $url, $fresh_portal_url ) ) {
+					return $this->external_error_result( 'مسیر اتصال سرویس اعتبارسنجی تغییر کرده است؛ درخواست ارسال نشد.' );
+				}
+				$security_source = (string) $fresh_owner['security_code'];
+				$token_source = (string) $fresh_owner['license_token'];
+			}
+			$security_code = Mobo_Core_Settings::normalize_security_code( $security_source );
 			if ( '' !== $security_code ) {
 				if ( ! Mobo_Core_Settings::is_valid_security_code( $security_code ) ) {
 					return $this->external_error_result( Mobo_Core_Settings::get_security_code_validation_error( $security_code ) );
@@ -2117,7 +2485,7 @@ class Mobo_Core_Checkout_Validator {
 				$headers['X-SEC'] = $security_code;
 			}
 
-			$token = trim( (string) Mobo_Core_Settings::get( 'mobo_core_token', '' ) );
+			$token = trim( (string) $token_source );
 			if ( '' !== $token ) {
 				$headers['Token'] = $token;
 			}
@@ -2129,7 +2497,14 @@ class Mobo_Core_Checkout_Validator {
 			$headers = $signed_headers;
 		}
 
-		$response = wp_remote_post(
+		if ( '' !== $portal_validation_fingerprint ) {
+			$current_fingerprint = $this->get_fresh_order_route_fingerprint( $portal_validation_owner_id );
+			if ( '' === $current_fingerprint || ! hash_equals( $portal_validation_fingerprint, $current_fingerprint ) ) {
+				return $this->external_error_result( 'مسیر اتصال سرویس اعتبارسنجی پیش از ارسال تغییر کرد.' );
+			}
+		}
+		$response = $this->production_candidate_transport(
+			'POST',
 			esc_url_raw( $url ),
 			array(
 				'timeout'     => $timeout,
@@ -2167,8 +2542,8 @@ class Mobo_Core_Checkout_Validator {
 	 * @param string $url Validation URL.
 	 * @return bool
 	 */
-	private function external_validation_uses_portal_origin( $url ) {
-		$portal = apply_filters( 'mobo_core_api_base_url', '' );
+	private function external_validation_uses_portal_origin( $url, $portal_override = '' ) {
+		$portal = '' !== trim( (string) $portal_override ) ? (string) $portal_override : apply_filters( 'mobo_core_api_base_url', '' );
 		if ( ! is_string( $portal ) || '' === trim( $portal ) ) {
 			$portal = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
 		}
@@ -2387,7 +2762,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	private function store_mobo_validation_result( $success, $status, $code, $message, $items ) {
-		update_option(
+		Mobo_Core_Settings::update(
 			'mobo_core_checkout_last_validation_result',
 			array(
 				'success' => (bool) $success,
@@ -2506,12 +2881,66 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	/**
+	 * Resolve the internal provider adapter from the active provisioned Connection.
+	 *
+	 * Provider choice is server-owned and is never editable by the customer.
+	 *
+	 * @return Mobo_Core_Provider_Interface|null
+	 */
+	private function get_mobo_provider() {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! class_exists( 'Mobo_Core_Provider_Registry' ) ) {
+			return null;
+		}
+		$connection = Mobo_Core_Connection_Repository::get_runtime_connection();
+		if ( ! is_array( $connection ) || ! Mobo_Core_Connection_Repository::is_provisioned( $connection ) ) {
+			$this->provider = null;
+			$this->provider_source_key = '';
+			return null;
+		}
+		$provider_key = Mobo_Core_Provider_Registry::normalize_key( $connection['provider_key'] ?? '' );
+		if ( '' === $provider_key ) {
+			$this->provider = null;
+			$this->provider_source_key = '';
+			return null;
+		}
+		if ( $this->provider instanceof Mobo_Core_Provider_Interface && hash_equals( $this->provider_source_key, $provider_key ) ) {
+			return $this->provider;
+		}
+		$this->provider = Mobo_Core_Provider_Registry::get( $provider_key );
+		$this->provider_source_key = $provider_key;
+		return $this->provider instanceof Mobo_Core_Provider_Interface ? $this->provider : null;
+	}
+
+	/** Resolve one provider protocol endpoint. @return string */
+	private function get_provider_endpoint( $operation, $args = array() ) {
+		$provider = $this->get_mobo_provider();
+		if ( ! $provider instanceof Mobo_Core_Provider_Interface ) { return ''; }
+		return (string) $provider->get_endpoint( $operation, is_array( $args ) ? $args : array() );
+	}
+
+	/**
+	 * Mobo checkout uses deterministic replace/rebuild cart synchronization.
+	 * Incremental update/delete operations are intentionally not part of the
+	 * provider contract.
+	 *
+	 * @return bool
+	 */
+	private function provider_uses_replace_cart_sync() {
+		$provider = $this->get_mobo_provider();
+		return $provider instanceof Mobo_Core_Provider_Interface
+			&& 'replace' === sanitize_key( (string) $provider->get_cart_sync_strategy() );
+	}
+
+	/**
 	 * Mobo site URL.
 	 *
 	 * @return string
 	 */
 	private function get_mobo_site_url() {
-		return 'https://mobomobo.ir';
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return Mobo_Core_Connection_Repository::get_runtime_source_site_url( '' );
+		}
+		return '';
 	}
 
 	/**
@@ -2521,7 +2950,8 @@ class Mobo_Core_Checkout_Validator {
 	 * @return string
 	 */
 	private function mobo_url( $path ) {
-		return $this->get_mobo_site_url() . '/' . ltrim( (string) $path, '/' );
+		$site_url = $this->get_mobo_site_url();
+		return '' !== $site_url ? $site_url . '/' . ltrim( (string) $path, '/' ) : '';
 	}
 
 	/**
@@ -2543,7 +2973,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array
 	 */
 	private function get_mobo_cookie_jar() {
-		$jar = get_option( 'mobo_core_checkout_mobo_cookie_jar', array() );
+		$jar = Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_cookie_jar', array() );
 
 		return is_array( $jar ) ? $jar : array();
 	}
@@ -2556,8 +2986,8 @@ class Mobo_Core_Checkout_Validator {
 	 */
 	private function set_mobo_cookie_jar( $jar ) {
 		$jar = is_array( $jar ) ? $jar : array();
-		update_option( 'mobo_core_checkout_mobo_cookie_jar', $jar, false );
-		$stored = get_option( 'mobo_core_checkout_mobo_cookie_jar', array() );
+		Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_cookie_jar', $jar, false );
+		$stored = Mobo_Core_Settings::get( 'mobo_core_checkout_mobo_cookie_jar', array() );
 		return is_array( $stored ) && $stored === $jar;
 	}
 
@@ -2567,7 +2997,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	private function clear_mobo_cookie_jar() {
-		delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
+		Mobo_Core_Settings::delete( 'mobo_core_checkout_mobo_cookie_jar' );
 	}
 
 	/**
@@ -2672,7 +3102,9 @@ class Mobo_Core_Checkout_Validator {
 	private function refresh_mobo_cart_snapshot( $update = false ) {
 		$update = (bool) $update;
 		$this->debug_log( 'snapshot_request', array( 'update' => $update ) );
-		$response = $this->mobo_request( 'GET', '/site/api/v1/cart?update=' . ( $update ? 'true' : 'false' ), null );
+		$path = $this->get_provider_endpoint( 'cart_snapshot', array( 'update' => (bool) $update ) );
+		if ( '' === $path ) { return new WP_Error( 'mobo_core_provider_cart_snapshot_unsupported', 'The active Source provider does not expose a cart snapshot.' ); }
+		$response = $this->mobo_request( 'GET', $path, null );
 
 		if ( is_wp_error( $response ) ) {
 			return $response;
@@ -2697,7 +3129,7 @@ class Mobo_Core_Checkout_Validator {
 
 		$this->store_mobo_cart_item_map_from_snapshot( $json );
 		$this->debug_log( 'snapshot_success', array( 'itemCount' => isset( $json['cart']['items'] ) && is_array( $json['cart']['items'] ) ? count( $json['cart']['items'] ) : 0 ) );
-		update_option( 'mobo_core_checkout_mobo_cart_snapshot_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_cart_snapshot_at', time(), false );
 
 		return $response;
 	}
@@ -2749,7 +3181,7 @@ class Mobo_Core_Checkout_Validator {
 
 		$this->set_mobo_cart_item_map( $map );
 		$this->debug_log( 'cart_map_updated', array( 'map' => $map, 'mapCount' => count( $map ) ) );
-		update_option( 'mobo_core_checkout_mobo_cart_item_map_count', count( $map ), false );
+		Mobo_Core_Settings::update( 'mobo_core_checkout_mobo_cart_item_map_count', count( $map ), false );
 	}
 
 	/**
@@ -2823,15 +3255,35 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 
+
+	/**
+	 * Legacy checkout debug option is a pre-Connection global artifact. Only the
+	 * enabled Default Connection may read/migrate/delete it during rollback-safe
+	 * fallback. Additional Connections fail closed when the event store is absent.
+	 *
+	 * @return bool
+	 */
+	private function legacy_mobo_debug_option_allowed() {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
+			return true;
+		}
+		$runtime = Mobo_Core_Connection_Repository::get_runtime_connection();
+		return is_array( $runtime ) && ! empty( $runtime['is_default'] );
+	}
+
 	/**
 	 * Return recent Mobo cart debug log entries for admin UI.
 	 *
 	 * @return array
 	 */
 	public function get_mobo_debug_log() {
-		$log = get_option( 'mobo_core_checkout_mobo_debug_log', array() );
-
-		return is_array( $log ) ? $log : array();
+		if ( class_exists( 'Mobo_Core_Event_Store' ) && Mobo_Core_Event_Store::is_available() ) {
+			if ( $this->legacy_mobo_debug_option_allowed() && ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) { Mobo_Core_Event_Store::migrate_option_log( 'mobo_core_checkout_mobo_debug_log', 'checkout_debug', 500 ); }
+			return Mobo_Core_Event_Store::latest( 'checkout_debug', 500 );
+		}
+		if ( ! $this->legacy_mobo_debug_option_allowed() || ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) { return array(); }
+		$legacy = get_option( 'mobo_core_checkout_mobo_debug_log', array() );
+		return is_array( $legacy ) ? array_slice( $legacy, 0, 500 ) : array();
 	}
 
 	/**
@@ -2840,7 +3292,12 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function clear_mobo_debug_log() {
-		delete_option( 'mobo_core_checkout_mobo_debug_log' );
+		if ( class_exists( 'Mobo_Core_Event_Store' ) ) {
+			Mobo_Core_Event_Store::clear( 'checkout_debug' );
+		}
+		if ( $this->legacy_mobo_debug_option_allowed() ) {
+			delete_option( 'mobo_core_checkout_mobo_debug_log' );
+		}
 	}
 
 	/**
@@ -2855,12 +3312,6 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
-		$log = get_option( 'mobo_core_checkout_mobo_debug_log', array() );
-
-		if ( ! is_array( $log ) ) {
-			$log = array();
-		}
-
 		$session_meta = $this->get_debug_session_meta();
 
 		$entry = array(
@@ -2873,10 +3324,20 @@ class Mobo_Core_Checkout_Validator {
 			'uri'         => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( (string) wp_parse_url( wp_unslash( $_SERVER['REQUEST_URI'] ), PHP_URL_PATH ) ) : '',
 		);
 
-		array_unshift( $log, $entry );
-		$log = array_slice( $log, 0, 500 );
-
-		update_option( 'mobo_core_checkout_mobo_debug_log', $log, false );
+		if ( class_exists( 'Mobo_Core_Event_Store' ) && Mobo_Core_Event_Store::is_available() ) {
+			Mobo_Core_Event_Store::append( 'checkout_debug', $entry, 500 );
+			return;
+		}
+		if ( ! $this->legacy_mobo_debug_option_allowed() || ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) { return; }
+		$legacy = get_option( 'mobo_core_checkout_mobo_debug_log', array() );
+		$legacy = is_array( $legacy ) ? $legacy : array();
+		array_unshift( $legacy, $entry );
+		$legacy = array_slice( $legacy, 0, 500 );
+		if ( class_exists( 'Mobo_Core_Durable_State_Policy' ) ) {
+			Mobo_Core_Durable_State_Policy::update_option_verified( 'mobo_core_checkout_mobo_debug_log', $legacy, false );
+		} else {
+			update_option( 'mobo_core_checkout_mobo_debug_log', $legacy, false );
+		}
 	}
 
 	/**
@@ -3095,20 +3556,13 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
-		if ( ! $this->is_order_submission_enabled() ) {
-			return;
-		}
-
 		$order_object = $order instanceof WC_Order ? $order : ( function_exists( 'wc_get_order' ) ? wc_get_order( absint( $order_id ) ) : null );
 		$scope        = $this->get_order_mobo_item_scope( $order_object );
 
 		if ( 'invalid' === sanitize_key( (string) ( isset( $scope['status'] ) ? $scope['status'] : '' ) ) ) {
-			/* Queue only for durable local inspection; the processor will mark review and
-			 * must not perform any Mobo network mutation for an unknown legacy line. */
-			$this->queue_mobo_order_id_for_later(
-				absint( $order_id ),
-				array( 'trigger' => 'status_processing_invalid_scope', 'oldStatus' => $old_status, 'newStatus' => $new_status )
-			);
+			/* Unknown legacy ownership must never be guessed. Keep this order completely
+			 * outside remote submission and leave an informational note only. */
+			$this->add_unsubmittable_order_note( absint( $order_id ), $scope, 'status_processing_invalid_scope' );
 			return;
 		}
 
@@ -3117,19 +3571,37 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
-		/*
-		 * Never touch/save the WC_Order object during the status transition. Some
-		 * HPOS/admin save flows can lose the requested status if another save is
-		 * performed from this hook. Only enqueue the order id in wp_options and let
-		 * cron inspect the already-saved order later.
-		 */
-		$this->queue_mobo_order_id_for_later(
-			absint( $order_id ),
-			array(
-				'trigger'   => 'status_processing',
-				'oldStatus' => $old_status,
-				'newStatus' => $new_status,
-			)
+		/* Mixed Mobo/non-Mobo orders and all-Mobo orders spanning more than one
+		 * Connection are intentionally fail-closed. Split-order behavior is not
+		 * implemented and no partial remote purchase is allowed. */
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$this->add_unsubmittable_order_note( absint( $order_id ), $scope, 'status_processing' );
+			return;
+		}
+
+		$connection_id = absint( isset( $scope['connectionId'] ) ? $scope['connectionId'] : 0 );
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$this->add_unsubmittable_order_note( absint( $order_id ), $scope, 'status_processing_missing_connection_context' );
+			return;
+		}
+
+		/* Read the Source-owned enable flag and persist the queue under the order's
+		 * owning Connection. Checkout/status hooks otherwise have no explicit Source
+		 * context and would silently enqueue Connection B work into Default/A. */
+		Mobo_Core_Connection_Context::run(
+			$connection_id,
+			function () use ( $order_id, $old_status, $new_status, $connection_id ) {
+				if ( ! $this->is_order_submission_enabled() ) { return; }
+				$this->queue_mobo_order_id_for_later(
+					absint( $order_id ),
+					array(
+						'trigger'      => 'status_processing',
+						'oldStatus'    => $old_status,
+						'newStatus'    => $new_status,
+						'connectionId' => $connection_id,
+					)
+				);
+			}
 		);
 	}
 
@@ -3141,7 +3613,23 @@ class Mobo_Core_Checkout_Validator {
 	 * @return void
 	 */
 	public function handle_scheduled_order_queue( $order_id, $context = array() ) {
-		$this->queue_mobo_order_id_for_later( absint( $order_id ), is_array( $context ) ? $context : array() );
+		$order_id = absint( $order_id );
+		$order = $order_id > 0 && function_exists( 'wc_get_order' ) ? wc_get_order( $order_id ) : null;
+		$scope = $this->get_order_mobo_item_scope( $order );
+		if ( ! $this->order_scope_is_submittable( $scope ) || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			if ( $order_id > 0 && $this->order_scope_has_mobo_items( $scope ) ) { $this->add_unsubmittable_order_note( $order_id, $scope, 'scheduled_queue' ); }
+			return;
+		}
+		$connection_id = absint( $scope['connectionId'] );
+		Mobo_Core_Connection_Context::run(
+			$connection_id,
+			function () use ( $order_id, $context, $connection_id ) {
+				if ( ! $this->is_order_submission_enabled() ) { return; }
+				$context = is_array( $context ) ? $context : array();
+				$context['connectionId'] = $connection_id;
+				$this->queue_mobo_order_id_for_later( $order_id, $context );
+			}
+		);
 	}
 
 	/**
@@ -3169,13 +3657,18 @@ class Mobo_Core_Checkout_Validator {
 		$token = str_replace( '-', '', wp_generate_uuid4() );
 		$locked = $this->with_order_queue_state_lock(
 			function () use ( $order_id, $context, $token ) {
-				$queue = $this->get_option_backed_order_queue();
-				$queue[ (string) $order_id ] = array(
+				$item = array(
 					'orderId'    => $order_id,
 					'queueToken' => $token,
 					'queuedAt'   => time(),
 					'context'    => $this->sanitize_order_log_value( is_array( $context ) ? $context : array() ),
 				);
+				if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+					return $this->primary_order_row_store_ready()
+						&& Mobo_Core_Work_Queue_Store::put( self::ORDER_QUEUE_TYPE, (string) $order_id, $item );
+				}
+				$queue = $this->get_option_backed_order_queue();
+				$queue[ (string) $order_id ] = $item;
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
@@ -3204,6 +3697,25 @@ class Mobo_Core_Checkout_Validator {
 		return true;
 	}
 
+	/** Legacy wp_options order-queue fallback is safe only for a single enabled Connection. @return bool */
+	private function legacy_order_queue_fallback_allowed() {
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) { return false; }
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() && Mobo_Core_Connection_Repository::count_enabled() > 1 ) { return false; }
+		return true;
+	}
+
+	/**
+	 * PERF06: keep terminal Default-only legacy import ahead of direct primary
+	 * row operations. Incomplete cutover is never interpreted as an empty queue.
+	 */
+	private function primary_order_row_store_ready() {
+		if ( ! class_exists( 'Mobo_Core_Work_Queue_Store' ) || ! Mobo_Core_Work_Queue_Store::is_available() ) { return false; }
+		if ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+			&& ! Mobo_Core_Work_Queue_Store::migrate_option_map( 'mobo_core_mobo_order_submission_queue', self::ORDER_QUEUE_TYPE ) ) { return false; }
+		return true;
+	}
+
 	/**
 	 * Persist an independent recovery marker when the shared queue lock is busy.
 	 *
@@ -3219,7 +3731,7 @@ class Mobo_Core_Checkout_Validator {
 			return false;
 		}
 
-		$option_name = self::ORDER_RECOVERY_OPTION_PREFIX . $order_id . '_' . substr( strtolower( $token ), 0, 24 );
+		$key = $order_id . '_' . substr( strtolower( $token ), 0, 24 );
 		$value = array(
 			'orderId'    => $order_id,
 			'queueToken' => $token,
@@ -3227,7 +3739,14 @@ class Mobo_Core_Checkout_Validator {
 			'context'    => $this->sanitize_order_log_value( is_array( $context ) ? $context : array() ),
 		);
 
-		return (bool) add_option( $option_name, $value, '', 'no' );
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			return Mobo_Core_Work_Queue_Store::put( self::ORDER_RECOVERY_QUEUE_TYPE, $key, $value );
+		}
+		if ( ! $this->legacy_order_queue_fallback_allowed() ) { return false; }
+		$option = self::ORDER_RECOVERY_OPTION_PREFIX . $key;
+		return class_exists( 'Mobo_Core_Durable_State_Policy' )
+			? Mobo_Core_Durable_State_Policy::update_option_verified( $option, $value, false )
+			: update_option( $option, $value, false );
 	}
 
 	/**
@@ -3237,33 +3756,66 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array
 	 */
 	private function get_order_queue_recovery_items( $limit ) {
-		global $wpdb;
-
 		$limit = max( 1, min( 10, absint( $limit ) ) );
-		$like  = $wpdb->esc_like( self::ORDER_RECOVERY_OPTION_PREFIX ) . '%';
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Bounded recovery scan of plugin-owned non-autoload options.
-		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_id ASC LIMIT %d", $like, $limit ), ARRAY_A );
-		$out  = array();
-
-		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
-			$option_name = isset( $row['option_name'] ) ? sanitize_key( (string) $row['option_name'] ) : '';
-			$item        = isset( $row['option_value'] ) ? maybe_unserialize( $row['option_value'] ) : array();
-			$order_id    = is_array( $item ) && isset( $item['orderId'] ) ? absint( $item['orderId'] ) : 0;
-			if ( '' === $option_name || $order_id <= 0 ) {
-				if ( '' !== $option_name ) {
-					delete_option( $option_name );
+		$this->order_recovery_read_failed = false;
+		if ( ! class_exists( 'Mobo_Core_Work_Queue_Store' ) || ! Mobo_Core_Work_Queue_Store::is_available() ) {
+			if ( ! $this->legacy_order_queue_fallback_allowed() ) { return array(); }
+			global $wpdb;
+			$like  = $wpdb->esc_like( self::ORDER_RECOVERY_OPTION_PREFIX ) . '%';
+			$names = $wpdb->get_col( $wpdb->prepare( "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_id ASC LIMIT %d", $like, $limit ) );
+			$out   = array();
+			foreach ( is_array( $names ) ? $names : array() as $name ) {
+				$item = get_option( $name, array() );
+				$order_id = is_array( $item ) && isset( $item['orderId'] ) ? absint( $item['orderId'] ) : 0;
+				if ( $order_id <= 0 ) { delete_option( $name ); continue; }
+				$out[] = array(
+					'queueKey' => null, 'queueToken' => '',
+					'recoveryKey' => substr( (string) $name, strlen( self::ORDER_RECOVERY_OPTION_PREFIX ) ),
+					'orderId' => $order_id,
+					'context' => isset( $item['context'] ) && is_array( $item['context'] ) ? $item['context'] : array(),
+				);
+			}
+			return $out;
+		}
+		/* Migrate any pre-10.33.92 independent recovery options before reading rows. */
+		if ( class_exists( 'Mobo_Core_State_Store' ) && ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) ) {
+			Mobo_Core_State_Store::migrate_option_prefix( self::ORDER_RECOVERY_OPTION_PREFIX, 10000 );
+			foreach ( Mobo_Core_State_Store::list_prefix( self::ORDER_RECOVERY_OPTION_PREFIX, 10000 ) as $legacy_key => $legacy_item ) {
+				if ( ! is_array( $legacy_item ) || empty( $legacy_item['orderId'] ) ) {
+					Mobo_Core_State_Store::delete( $legacy_key );
+					continue;
 				}
+				$key = substr( $legacy_key, strlen( self::ORDER_RECOVERY_OPTION_PREFIX ) );
+				if ( Mobo_Core_Work_Queue_Store::put( self::ORDER_RECOVERY_QUEUE_TYPE, $key, $legacy_item ) ) {
+					Mobo_Core_State_Store::delete( $legacy_key );
+				}
+			}
+		}
+		/* PERF04: ORDER BY id keeps the legacy load_map()/array_slice() FIFO,
+		 * but only the requested page is loaded/decoded. Do not process a partial
+		 * page when any row on it has failed the digest/payload check. */
+		$page = Mobo_Core_Work_Queue_Store::first_rows_checked( self::ORDER_RECOVERY_QUEUE_TYPE, $limit );
+		$this->order_recovery_read_failed = 'ok' !== $page['status'];
+		if ( $this->order_recovery_read_failed ) {
+			return array();
+		}
+		$out  = array();
+		foreach ( $page['rows'] as $key => $row ) {
+			$item = $row['payload'];
+			$order_id = is_array( $item ) && isset( $item['orderId'] ) ? absint( $item['orderId'] ) : 0;
+			if ( $order_id <= 0 ) {
+				Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::ORDER_RECOVERY_QUEUE_TYPE, $key, $row['payload_hash'] );
 				continue;
 			}
 			$out[] = array(
 				'queueKey'       => null,
 				'queueToken'     => '',
-				'recoveryOption' => $option_name,
+				'recoveryKey'    => (string) $key,
+				'recoveryHash'   => (string) $row['payload_hash'],
 				'orderId'        => $order_id,
 				'context'        => isset( $item['context'] ) && is_array( $item['context'] ) ? $item['context'] : array(),
 			);
 		}
-
 		return $out;
 	}
 
@@ -3278,10 +3830,19 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 		if ( array_key_exists( 'queueKey', $queue_item ) && null !== $queue_item['queueKey'] ) {
-			$this->remove_order_queue_item_if_token_matches( $queue_item['queueKey'], isset( $queue_item['queueToken'] ) ? $queue_item['queueToken'] : '' );
+			$this->remove_order_queue_item_if_token_matches( $queue_item['queueKey'], isset( $queue_item['queueToken'] ) ? $queue_item['queueToken'] : '', isset( $queue_item['queueHash'] ) ? $queue_item['queueHash'] : '' );
 		}
-		if ( ! empty( $queue_item['recoveryOption'] ) ) {
-			delete_option( sanitize_key( (string) $queue_item['recoveryOption'] ) );
+		if ( ! empty( $queue_item['recoveryKey'] ) ) {
+			$recovery_key = (string) $queue_item['recoveryKey'];
+			if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+				/* Never erase an emergency marker that was re-enqueued after this
+				 * snapshot was read. Its exact payload hash is the cleanup preimage. */
+				if ( ! empty( $queue_item['recoveryHash'] ) ) {
+					Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::ORDER_RECOVERY_QUEUE_TYPE, $recovery_key, $queue_item['recoveryHash'] );
+				}
+			} elseif ( $this->legacy_order_queue_fallback_allowed() ) {
+				Mobo_Core_Settings::delete( self::ORDER_RECOVERY_OPTION_PREFIX . $recovery_key );
+			}
 		}
 	}
 
@@ -3304,8 +3865,10 @@ class Mobo_Core_Checkout_Validator {
 		 * without participating in Mobo_Core_Lock's upgrade barrier.
 		 */
 		global $wpdb;
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 ) { return false; }
 		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
-		$lock_name = 'mobo_order_q_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+		$lock_name = 'mobo_order_q_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $connection_id ), 0, 40 );
 		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 2 ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic option queue guard.
 		if ( '1' !== (string) $acquired ) {
 			return false;
@@ -3341,28 +3904,32 @@ class Mobo_Core_Checkout_Validator {
 	 * @param string     $expected_token Snapshot token.
 	 * @return bool
 	 */
-	private function remove_order_queue_item_if_token_matches( $key, $expected_token ) {
+	private function remove_order_queue_item_if_token_matches( $key, $expected_token, $snapshot_hash = '' ) {
 		$key            = (string) $key;
 		$expected_token = sanitize_text_field( (string) $expected_token );
-		if ( '' === $key || '' === $expected_token ) {
-			return false;
-		}
+		if ( '' === $key || '' === $expected_token ) { return false; }
 
 		$result = $this->with_order_queue_state_lock(
-			function () use ( $key, $expected_token ) {
+			function () use ( $key, $expected_token, $snapshot_hash ) {
+				if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+					if ( ! $this->primary_order_row_store_ready() ) { return false; }
+					$read = Mobo_Core_Work_Queue_Store::read_one_checked( self::ORDER_QUEUE_TYPE, $key );
+					if ( 'missing' === $read['status'] ) { return true; }
+					if ( 'ok' !== $read['status'] ) { return false; }
+					$current_token = $this->order_queue_item_token( $read['row']['payload'], $key );
+					if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
+					$hash = (string) $read['row']['payload_hash'];
+					if ( '' !== $snapshot_hash && ! hash_equals( (string) $snapshot_hash, $hash ) ) { return false; }
+					return Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::ORDER_QUEUE_TYPE, $key, $hash );
+				}
 				$queue = $this->get_option_backed_order_queue();
-				if ( ! array_key_exists( $key, $queue ) ) {
-					return true;
-				}
+				if ( ! array_key_exists( $key, $queue ) ) { return true; }
 				$current_token = $this->order_queue_item_token( $queue[ $key ], $key );
-				if ( ! hash_equals( $expected_token, $current_token ) ) {
-					return false;
-				}
+				if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
 				unset( $queue[ $key ] );
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
-
 		return true === $result;
 	}
 
@@ -3372,8 +3939,13 @@ class Mobo_Core_Checkout_Validator {
 	 * @return array
 	 */
 	private function get_option_backed_order_queue() {
-		$queue = get_option( 'mobo_core_mobo_order_submission_queue', array() );
-		return is_array( $queue ) ? $queue : array();
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_Work_Queue_Store::migrate_option_map( 'mobo_core_mobo_order_submission_queue', self::ORDER_QUEUE_TYPE ); }
+			return Mobo_Core_Work_Queue_Store::load_map( self::ORDER_QUEUE_TYPE );
+		}
+		if ( ! $this->legacy_order_queue_fallback_allowed() ) { return array(); }
+		$legacy = get_option( 'mobo_core_mobo_order_submission_queue', array() );
+		return is_array( $legacy ) ? $legacy : array();
 	}
 
 	/**
@@ -3383,18 +3955,14 @@ class Mobo_Core_Checkout_Validator {
 	 * @return bool
 	 */
 	private function save_option_backed_order_queue( $queue ) {
-		$option_name = 'mobo_core_mobo_order_submission_queue';
-		$queue       = is_array( $queue ) ? $queue : array();
-
-		if ( empty( $queue ) ) {
-			delete_option( $option_name );
-			$current = get_option( $option_name, null );
-			return null === $current || false === $current || array() === $current;
+		$queue = is_array( $queue ) ? $queue : array();
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			return Mobo_Core_Work_Queue_Store::replace_map( self::ORDER_QUEUE_TYPE, $queue );
 		}
-
-		update_option( $option_name, $queue, false );
-		$current = get_option( $option_name, array() );
-		return is_array( $current ) && $current === $queue;
+		if ( ! $this->legacy_order_queue_fallback_allowed() ) { return false; }
+		return class_exists( 'Mobo_Core_Durable_State_Policy' )
+			? Mobo_Core_Durable_State_Policy::update_option_verified( 'mobo_core_mobo_order_submission_queue', $queue, false )
+			: update_option( 'mobo_core_mobo_order_submission_queue', $queue, false );
 	}
 
 	/**
@@ -3421,6 +3989,18 @@ class Mobo_Core_Checkout_Validator {
 		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
 			$this->mark_order_as_not_mobo( $order, $scope, 'queue_request' );
 			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش مربوط به موبو نیست.' );
+		}
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$this->mark_order_scope_unsubmittable( $order, $scope, 'queue_request' );
+			return new WP_Error( 'mobo_core_order_scope_not_submittable', 'این سفارش طبق سیاست فعلی قابل ارسال خودکار به موبو نیست.' );
+		}
+		$connection_block_reason = $this->get_order_submission_connection_block_reason( $scope );
+		if ( '' !== $connection_block_reason ) {
+			$this->append_order_log( $order, 'order_submission_money_or_connection_blocked', array(
+				'reason' => $connection_block_reason,
+				'connectionId' => absint( $scope['connectionId'] ?? 0 ),
+			) );
+			return new WP_Error( 'mobo_core_order_connection_blocked', $connection_block_reason );
 		}
 
 		$status = (string) $order->get_meta( '_mobo_order_submit_status', true );
@@ -3470,22 +4050,52 @@ class Mobo_Core_Checkout_Validator {
 			return $result;
 		}
 
-		$queue       = $this->get_option_backed_order_queue();
+		$row_mode = class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available();
+		$primary_page_full = false;
+		$primary_hashes = array();
+		if ( $row_mode ) {
+			if ( ! $this->primary_order_row_store_ready() ) {
+				$result['status'] = 'queue-read-failed';
+				$result['remaining'] = true;
+				return $result;
+			}
+			/* PERF06: inspect a bounded FIFO page. A full page may conceal an
+			 * additional primary row: never promote a recovery marker or legacy
+			 * Woo lookup ahead of an unseen owner-scoped primary queue record. */
+			$page_size = max( 16, $limit + 1 );
+			$page = Mobo_Core_Work_Queue_Store::first_rows_checked( self::ORDER_QUEUE_TYPE, $page_size );
+			if ( 'ok' !== $page['status'] ) {
+				$result['status'] = 'queue-read-failed';
+				$result['remaining'] = true;
+				return $result;
+			}
+			$primary_page_full = count( $page['rows'] ) >= $page_size;
+			$queue = array();
+			foreach ( $page['rows'] as $key => $row ) {
+				$queue[ $key ] = $row['payload'];
+				$primary_hashes[ $key ] = $row['payload_hash'];
+			}
+		} else {
+			$queue = $this->get_option_backed_order_queue();
+		}
 		$queue_items = array();
 		foreach ( $queue as $key => $item ) {
 			$order_id = is_array( $item ) && isset( $item['orderId'] ) ? absint( $item['orderId'] ) : absint( $key );
 			if ( $order_id <= 0 ) {
-				$this->remove_order_queue_item_if_token_matches( $key, $this->order_queue_item_token( $item, $key ) );
+				$removed = $this->remove_order_queue_item_if_token_matches( $key, $this->order_queue_item_token( $item, $key ), isset( $primary_hashes[ $key ] ) ? $primary_hashes[ $key ] : '' );
+				if ( ! $removed ) { $result['remaining'] = true; }
 				continue;
 			}
 			$queue_items[] = array(
 				'queueKey'       => $key,
 				'queueToken'     => $this->order_queue_item_token( $item, $key ),
+				'queueHash'      => isset( $primary_hashes[ $key ] ) ? $primary_hashes[ $key ] : '',
 				'recoveryOption' => '',
 				'orderId'        => $order_id,
 				'context'        => is_array( $item ) && isset( $item['context'] ) && is_array( $item['context'] ) ? $item['context'] : array(),
 			);
 		}
+		if ( $primary_page_full ) { $result['remaining'] = true; }
 
 		$seen_order_ids = array();
 		foreach ( $queue_items as $item ) {
@@ -3494,7 +4104,15 @@ class Mobo_Core_Checkout_Validator {
 				$seen_order_ids[ $seen_id ] = true;
 			}
 		}
-		foreach ( $this->get_order_queue_recovery_items( $limit + 1 ) as $recovery_item ) {
+		$recovery_items = ( ! $primary_page_full && count( $queue_items ) < $limit )
+			? $this->get_order_queue_recovery_items( $limit + 1 )
+			: array();
+		if ( $this->order_recovery_read_failed ) {
+			$result['status'] = 'queue-read-failed';
+			$result['remaining'] = true;
+			return $result;
+		}
+		foreach ( $recovery_items as $recovery_item ) {
 			$recovery_order_id = absint( isset( $recovery_item['orderId'] ) ? $recovery_item['orderId'] : 0 );
 			if ( $recovery_order_id > 0 && isset( $seen_order_ids[ $recovery_order_id ] ) ) {
 				/* The shared queue now contains this order; its emergency marker is redundant. */
@@ -3512,7 +4130,7 @@ class Mobo_Core_Checkout_Validator {
 			$queue_items = array_slice( $queue_items, 0, $limit );
 		}
 
-		if ( empty( $queue_items ) && function_exists( 'wc_get_orders' ) ) {
+		if ( empty( $queue_items ) && ! $primary_page_full && function_exists( 'wc_get_orders' ) ) {
 			$legacy_orders = wc_get_orders(
 				array(
 					'limit'      => $limit + 1,
@@ -3543,7 +4161,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		if ( empty( $queue_items ) ) {
-			$result['status'] = 'empty';
+			$result['status'] = $result['remaining'] ? 'waiting' : 'empty';
 			return $result;
 		}
 
@@ -3573,6 +4191,36 @@ class Mobo_Core_Checkout_Validator {
 			}
 
 			if ( 'processing' !== sanitize_key( (string) $order->get_status() ) ) {
+				$nonprocessing_attempt_state = $this->get_order_submission_attempt_state( $order );
+				if ( 'running_recent' === $nonprocessing_attempt_state ) {
+					/* The remote payment may be live: do not overwrite running with
+					 * aborted from another worker's stale order snapshot. */
+					$result['skipped']++;
+					$result['remaining'] = true;
+					continue;
+				}
+				if ( 'running_stale' === $nonprocessing_attempt_state ) {
+					$quarantined = $this->quarantine_stale_queued_order_attempt( $order_id );
+					if ( 'uncertain' === $quarantined ) {
+						$fresh_uncertain = wc_get_order( $order_id );
+						$reconciled = $fresh_uncertain instanceof WC_Order ? $this->reconcile_uncertain_paid_order_with_cart_lock( $fresh_uncertain ) : false;
+						if ( true === $reconciled ) { $result['success']++; } else { $result['skipped']++; }
+						$this->cleanup_order_queue_item( $queue_item );
+					} elseif ( 'already_sent' === $quarantined ) {
+						$result['skipped']++;
+						$this->cleanup_order_queue_item( $queue_item );
+					} else {
+						$result['skipped']++;
+						$result['remaining'] = true;
+					}
+					continue;
+				}
+				if ( 'uncertain' === $nonprocessing_attempt_state ) {
+					$reconciled = $this->reconcile_uncertain_paid_order_with_cart_lock( $order );
+					if ( true === $reconciled ) { $result['success']++; } else { $result['skipped']++; }
+					$this->cleanup_order_queue_item( $queue_item );
+					continue;
+				}
 				/* A cancelled/refunded/on-hold order must not remain visually "queued" after
 				 * its durable queue marker is removed. Record a terminal pre-payment abort. */
 				if ( 'queued' === sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) ) ) {
@@ -3591,6 +4239,15 @@ class Mobo_Core_Checkout_Validator {
 				continue;
 			}
 
+			/* A historical failed/aborted purchase must never be revived just
+			 * because an old recovery row survived a crash or a queue rewrite.
+			 * Only a separately authorized administrator action may retry it. */
+			$durable_submit_status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
+			if ( in_array( $durable_submit_status, array( 'failed', 'aborted' ), true ) ) {
+				$result['skipped']++;
+				$this->cleanup_order_queue_item( $queue_item );
+				continue;
+			}
 			$attempt_state = $this->get_order_submission_attempt_state( $order );
 			if ( 'running_recent' === $attempt_state ) {
 				/* The original request may still be alive. Never overlap a second purchase attempt. */
@@ -3598,9 +4255,25 @@ class Mobo_Core_Checkout_Validator {
 				$result['remaining'] = true;
 				continue;
 			}
-			if ( 'running_stale' === $attempt_state || 'uncertain' === $attempt_state ) {
-				$this->mark_order_submission_uncertain( $order );
-				$result['skipped']++;
+			if ( 'running_stale' === $attempt_state ) {
+				$quarantined = $this->quarantine_stale_queued_order_attempt( $order_id );
+				if ( 'uncertain' === $quarantined ) {
+					$fresh_uncertain = wc_get_order( $order_id );
+					$reconciled = $fresh_uncertain instanceof WC_Order ? $this->reconcile_uncertain_paid_order_with_cart_lock( $fresh_uncertain ) : false;
+					if ( true === $reconciled ) { $result['success']++; } else { $result['skipped']++; }
+					$this->cleanup_order_queue_item( $queue_item );
+				} elseif ( 'already_sent' === $quarantined ) {
+					$result['skipped']++;
+					$this->cleanup_order_queue_item( $queue_item );
+				} else {
+					$result['skipped']++;
+					$result['remaining'] = true;
+				}
+				continue;
+			}
+			if ( 'uncertain' === $attempt_state ) {
+				$reconciled = $this->reconcile_uncertain_paid_order_with_cart_lock( $order );
+				if ( true === $reconciled ) { $result['success']++; } else { $result['skipped']++; }
 				$this->cleanup_order_queue_item( $queue_item );
 				continue;
 			}
@@ -3618,14 +4291,38 @@ class Mobo_Core_Checkout_Validator {
 				$this->cleanup_order_queue_item( $queue_item );
 				continue;
 			}
+			if ( ! $this->order_scope_is_submittable( $scope ) ) {
+				$result['skipped']++;
+				$this->mark_order_scope_unsubmittable( $order, $scope, 'queue_processor' );
+				$this->cleanup_order_queue_item( $queue_item );
+				continue;
+			}
+			$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $current_connection_id <= 0 || $current_connection_id !== absint( $scope['connectionId'] ) ) {
+				/* Never mutate another Connection's Woo order state from this worker. A
+				 * correctly scoped work-queue row cannot reach this branch; legacy/global
+				 * evidence is left intact for the owning Connection to consume. */
+				$result['skipped']++;
+				$result['remaining'] = true;
+				continue;
+			}
 
 			$context = is_array( $queue_item['context'] ) ? $queue_item['context'] : array();
+			$context['connectionId'] = $current_connection_id;
 			$context['processor'] = $source;
 
 			$result['processed']++;
 			$submit = $this->submit_order_to_mobo( $order, $context );
 
 			if ( is_wp_error( $submit ) && in_array( $submit->get_error_code(), array( 'mobo_core_order_submission_busy', 'mobo_core_order_submission_lock_unavailable', 'mobo_core_order_submission_state_persist_failed', 'mobo_core_order_submission_deferred' ), true ) ) {
+				$result['skipped']++;
+				$result['remaining'] = true;
+				continue;
+			}
+			if ( is_wp_error( $submit ) && 'mobo_core_order_submission_uncertain' === $submit->get_error_code() ) {
+				/* Keep the exact queue row for one later positive-only reconciliation pass.
+				 * The next pass never replays Checkout/Wallet: the uncertain-state branch
+				 * above only performs GET Details reconciliation, then retires the row. */
 				$result['skipped']++;
 				$result['remaining'] = true;
 				continue;
@@ -3662,21 +4359,6 @@ class Mobo_Core_Checkout_Validator {
 						'order_submission_status_transition_suppressed',
 						array( 'status' => $current_status, 'postPaymentDiverged' => $post_payment_diverged )
 					);
-				} elseif ( $completed_order instanceof WC_Order && 'mixed' === (string) $scope['status'] ) {
-					$note = 'اقلام موبو با موفقیت در موبو ثبت شدند. این سفارش ترکیبی است و برای پردازش اقلام غیرموبو در وضعیت در حال انجام باقی می‌ماند.';
-					$completed_order->update_meta_data( '_mobo_order_scope_status', 'mixed' );
-					$completed_order->update_meta_data( '_mobo_order_kept_processing', 'yes' );
-					$completed_order->save();
-					$completed_order->add_order_note( $note );
-
-					$this->append_order_log(
-						$completed_order,
-						'order_submission_mixed_kept_processing',
-						array(
-							'moboItems'    => isset( $scope['mobo'] ) ? absint( $scope['mobo'] ) : 0,
-							'nonMoboItems' => isset( $scope['nonMobo'] ) ? absint( $scope['nonMobo'] ) : 0,
-						)
-					);
 				} elseif (
 					$completed_order instanceof WC_Order
 					&& 'all_mobo' === (string) $scope['status']
@@ -3689,7 +4371,19 @@ class Mobo_Core_Checkout_Validator {
 			}
 		}
 
-		if ( ! empty( $this->get_option_backed_order_queue() ) || ! empty( $this->get_order_queue_recovery_items( 1 ) ) ) {
+		/* PERF06: end-of-batch continuation must not re-materialize the full
+		 * primary queue. A count failure is an error, not an empty queue. */
+		$primary_count = $row_mode ? Mobo_Core_Work_Queue_Store::count_strict( self::ORDER_QUEUE_TYPE ) : count( $this->get_option_backed_order_queue() );
+		if ( $primary_count < 0 ) {
+			$result['status'] = 'queue-read-failed';
+			$result['remaining'] = true;
+			return $result;
+		}
+		if ( $primary_count > 0 || ! empty( $this->get_order_queue_recovery_items( 1 ) ) ) {
+			$result['remaining'] = true;
+		}
+		if ( $this->order_recovery_read_failed ) {
+			$result['status'] = 'queue-read-failed';
 			$result['remaining'] = true;
 		}
 		return $result;
@@ -3725,6 +4419,23 @@ class Mobo_Core_Checkout_Validator {
 			return 'uncertain';
 		}
 		if ( 'running' !== $status || 'yes' !== (string) $order->get_meta( '_mobo_order_submit_attempted', true ) ) {
+			/* A partial/older recovery record is not evidence of a fresh attempt.
+			 * Preserve confirmed success, but never lose remote-attempt evidence
+			 * merely because the summary status/attempted flag is missing. */
+			if ( $this->order_was_already_sent_to_mobo( $order ) ) {
+				return 'none';
+			}
+			if ( 'running' === $status
+				|| absint( $order->get_meta( '_mobo_order_pending_remote_id', true ) ) > 0
+				|| absint( $order->get_meta( '_mobo_order_pending_shipping_id', true ) ) > 0 ) {
+				return 'uncertain';
+			}
+			foreach ( array( '_mobo_order_pending_stage', '_mobo_order_pending_attempt_key', '_mobo_order_pending_token', '_mobo_order_pending_token_sha256' ) as $key ) {
+				$checkpoint = $order->get_meta( $key, true );
+				if ( is_string( $checkpoint ) ? '' !== trim( $checkpoint ) : ! empty( $checkpoint ) ) {
+					return 'uncertain';
+				}
+			}
 			return 'none';
 		}
 		$attempted_at = absint( $order->get_meta( '_mobo_order_submit_attempted_at', true ) );
@@ -3792,6 +4503,201 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 
+	/** Generate a durable logical identity for one remote purchase attempt. */
+	private function generate_order_submission_attempt_key( $order_id ) {
+		$order_id = absint( $order_id );
+		$uuid = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : uniqid( 'mobo-', true );
+		return hash( 'sha256', $order_id . '|' . (string) $uuid . '|' . microtime( true ) );
+	}
+
+	/**
+	 * Persist positive remote-order evidence before any later stage can fail.
+	 * The opaque cart token is private Woo order metadata; logs only expose hashes.
+	 */
+	private function persist_order_remote_checkpoint( $order, $stage, $token = '', $remote_order_id = 0, $shipping_id = 0, $business_fingerprint = '' ) {
+		if ( ! $order instanceof WC_Order ) { return false; }
+		$stage = sanitize_key( (string) $stage );
+		$token = $this->parse_mobo_cart_token( $token );
+		$remote_order_id = absint( $remote_order_id );
+		$shipping_id = absint( $shipping_id );
+		$attempt_key = sanitize_text_field( (string) $order->get_meta( '_mobo_order_submit_attempt_key', true ) );
+		if ( '' === $stage || '' === $attempt_key ) { return false; }
+
+		$order->update_meta_data( '_mobo_order_pending_stage', $stage );
+		$order->update_meta_data( '_mobo_order_pending_attempt_key', $attempt_key );
+		$order->update_meta_data( '_mobo_order_pending_updated_at', time() );
+		if ( '' !== $token ) {
+			$order->update_meta_data( '_mobo_order_pending_token', $token );
+			$order->update_meta_data( '_mobo_order_pending_token_sha256', hash( 'sha256', $token ) );
+		}
+		if ( $remote_order_id > 0 ) { $order->update_meta_data( '_mobo_order_pending_remote_id', $remote_order_id ); }
+		if ( $shipping_id > 0 ) { $order->update_meta_data( '_mobo_order_pending_shipping_id', $shipping_id ); }
+		if ( '' !== (string) $business_fingerprint ) { $order->update_meta_data( '_mobo_order_pending_business_fingerprint', sanitize_text_field( (string) $business_fingerprint ) ); }
+		$saved_id = absint( $order->save() );
+		if ( $saved_id <= 0 ) { return false; }
+		$fresh = wc_get_order( $saved_id );
+		if ( ! $fresh instanceof WC_Order ) { return false; }
+		if ( $stage !== sanitize_key( (string) $fresh->get_meta( '_mobo_order_pending_stage', true ) ) ) { return false; }
+		if ( ! hash_equals( $attempt_key, sanitize_text_field( (string) $fresh->get_meta( '_mobo_order_pending_attempt_key', true ) ) ) ) { return false; }
+		if ( '' !== $token && ! hash_equals( hash( 'sha256', $token ), sanitize_text_field( (string) $fresh->get_meta( '_mobo_order_pending_token_sha256', true ) ) ) ) { return false; }
+		if ( $remote_order_id > 0 && $remote_order_id !== absint( $fresh->get_meta( '_mobo_order_pending_remote_id', true ) ) ) { return false; }
+		if ( $shipping_id > 0 && $shipping_id !== absint( $fresh->get_meta( '_mobo_order_pending_shipping_id', true ) ) ) { return false; }
+		return true;
+	}
+
+	private function clear_order_remote_checkpoint( $order, $clear_attempt_key = false ) {
+		if ( ! $order instanceof WC_Order ) { return false; }
+		foreach ( array( '_mobo_order_pending_stage', '_mobo_order_pending_attempt_key', '_mobo_order_pending_updated_at', '_mobo_order_pending_token', '_mobo_order_pending_token_sha256', '_mobo_order_pending_remote_id', '_mobo_order_pending_shipping_id', '_mobo_order_pending_business_fingerprint' ) as $key ) {
+			$order->delete_meta_data( $key );
+		}
+		if ( $clear_attempt_key ) { $order->delete_meta_data( '_mobo_order_submit_attempt_key' ); }
+		$order_id = absint( $order->save() );
+		if ( $order_id <= 0 ) { return false; }
+		$fresh = wc_get_order( $order_id );
+		if ( ! $fresh instanceof WC_Order ) { return false; }
+		return '' === (string) $fresh->get_meta( '_mobo_order_pending_stage', true )
+			&& '' === (string) $fresh->get_meta( '_mobo_order_pending_token', true )
+			&& 0 === absint( $fresh->get_meta( '_mobo_order_pending_remote_id', true ) );
+	}
+
+	private function order_request_error_is_ambiguous( $error ) {
+		if ( ! is_wp_error( $error ) ) { return false; }
+		$data = $error->get_error_data();
+		if ( is_array( $data ) && ! empty( $data['requestMayHaveReachedServer'] ) ) { return true; }
+		if ( 'mobo_core_http_error' === (string) $error->get_error_code() ) {
+			$status = is_array( $data ) && isset( $data['httpStatus'] ) ? absint( $data['httpStatus'] ) : 0;
+			return 0 === $status || 408 === $status || 409 === $status || 425 === $status || 429 === $status || $status >= 500;
+		}
+		return 'mobo_core_mobo_transport_error' === (string) $error->get_error_code();
+	}
+
+	/** Positive-only reconciliation. Missing/negative evidence never proves safe replay. */
+	private function reconcile_remote_order_details( $order, $token, $expected_order_id = 0 ) {
+		$token = $this->parse_mobo_cart_token( $token );
+		if ( ! $order instanceof WC_Order || '' === $token ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_missing_token', 'Remote order reconciliation has no durable cart token.' );
+		}
+		$response = $this->order_mobo_request( $order, 'GET', $this->get_provider_endpoint( 'cart_details', array( 'token' => $token ) ), null, 'order_reconcile_details' );
+		if ( is_wp_error( $response ) ) { return $response; }
+		$json = $this->decode_mobo_response_json( $response );
+		if ( is_wp_error( $json ) ) { return $json; }
+		$provider = $this->get_mobo_provider();
+		if ( ! $provider instanceof Mobo_Core_Provider_Interface || ! method_exists( $provider, 'interpret_order_reconciliation_details' ) ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_unsupported', 'The active provider cannot interpret remote order reconciliation evidence.' );
+		}
+		$state = $provider->interpret_order_reconciliation_details( $json, absint( $expected_order_id ) );
+		if ( ! is_array( $state ) || empty( $state['remoteOrderPresent'] ) || empty( $state['idMatches'] ) || absint( $state['remoteOrderId'] ?? 0 ) <= 0 ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_inconclusive', 'Remote order details did not positively prove the expected order.' );
+		}
+		return $state;
+	}
+
+	/**
+	 * Heal an uncertain local state only when Provider details positively prove that
+	 * the exact known remote order is paid. It never treats paid=false/missing as
+	 * proof that another Wallet POST is safe.
+	 */
+	private function reconcile_uncertain_paid_order( $order ) {
+		if ( ! $order instanceof WC_Order ) { return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' ); }
+		$token = $this->parse_mobo_cart_token( $order->get_meta( '_mobo_order_pending_token', true ) );
+		$remote_id = absint( $order->get_meta( '_mobo_order_pending_remote_id', true ) );
+		$shipping_id = absint( $order->get_meta( '_mobo_order_pending_shipping_id', true ) );
+		if ( '' === $token || $remote_id <= 0 ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_missing_identity', 'No durable remote order identity is available for automatic reconciliation.' );
+		}
+		$state = $this->reconcile_remote_order_details( $order, $token, $remote_id );
+		if ( is_wp_error( $state ) ) { return $state; }
+		if ( empty( $state['paidKnown'] ) || empty( $state['paid'] ) ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_payment_inconclusive', 'The remote order exists, but paid=true was not positively proven. Automatic replay remains blocked.', array( 'remoteOrderId' => $remote_id ) );
+		}
+		$payment_json = array( 'success' => true, 'paid' => true, 'id' => $remote_id, 'reconciled' => true );
+		if ( ! $this->mark_mobo_order_submission_success( $order, $remote_id, $token, $shipping_id, $payment_json ) ) {
+			return new WP_Error( 'mobo_core_order_reconciliation_local_commit_failed', 'Remote paid order was proven but local success could not be committed durably.' );
+		}
+		$this->clear_order_payment_guard( absint( $order->get_id() ) );
+		$fresh = wc_get_order( absint( $order->get_id() ) );
+		if ( $fresh instanceof WC_Order ) {
+			$fresh->update_meta_data( '_mobo_order_reconciled_at', time() );
+			$fresh->update_meta_data( '_mobo_order_reconciled', 'yes' );
+			$fresh->save();
+			$this->append_order_log( $fresh, 'order_submission_reconciled_paid', array( 'moboOrderId' => $remote_id ) );
+		}
+		return true;
+	}
+
+	/** Run positive-only reconciliation while owning the shared Provider session. */
+	private function reconcile_uncertain_paid_order_with_cart_lock( $order ) {
+		if ( ! $order instanceof WC_Order || ! class_exists( 'Mobo_Core_Lock' ) ) { return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order or lock service unavailable.' ); }
+		$order_id = absint( $order->get_id() );
+		$order_lock_name = 'order_submission_' . $order_id;
+		$order_lock_ttl = max( 120, absint( apply_filters( 'mobo_core_order_reconciliation_lock_ttl', 300, $order_id ) ) );
+		$order_lock_token = Mobo_Core_Lock::acquire( $order_lock_name, $order_lock_ttl );
+		if ( false === $order_lock_token ) { return new WP_Error( 'mobo_core_order_submission_busy', 'Another request owns this order submission/reconciliation.' ); }
+		$this->active_order_submission_lock_name = $order_lock_name;
+		$this->active_order_submission_lock_token = sanitize_text_field( (string) $order_lock_token );
+		$this->active_order_submission_lock_ttl = $order_lock_ttl;
+		$lock = $this->acquire_mobo_cart_lock( 'order_reconcile_' . $order_id );
+		if ( is_wp_error( $lock ) ) {
+			Mobo_Core_Lock::release( $order_lock_name, $order_lock_token );
+			$this->active_order_submission_lock_name = '';
+			$this->active_order_submission_lock_token = '';
+			return $lock;
+		}
+		$result = null;
+		try {
+			$fresh = wc_get_order( $order_id );
+			if ( ! $fresh instanceof WC_Order || $this->order_was_already_sent_to_mobo( $fresh ) ) {
+				/* Already-sent is a terminal no-op, not a newly reconciled transition.
+				 * Returning a distinct value prevents post-success listeners from being
+				 * fired a second time by a stale queue/admin reconciliation request. */
+				$result = $fresh instanceof WC_Order ? 'already_sent' : new WP_Error( 'mobo_core_invalid_order', 'Order disappeared before reconciliation.' );
+			} else {
+				$auth = $this->ensure_mobo_authenticated( true );
+				$result = is_wp_error( $auth ) ? $auth : $this->reconcile_uncertain_paid_order( $fresh );
+			}
+		} finally {
+			$this->release_mobo_cart_lock( $lock );
+			Mobo_Core_Lock::release( $order_lock_name, $order_lock_token );
+			$this->active_order_submission_lock_name = '';
+			$this->active_order_submission_lock_token = '';
+		}
+		if ( true === $result ) {
+			$fresh = wc_get_order( $order_id );
+			if ( $fresh instanceof WC_Order ) {
+				$fingerprint = sanitize_text_field( (string) $fresh->get_meta( '_mobo_order_purchase_business_fingerprint', true ) );
+				if ( '' !== $fingerprint ) {
+					$this->mark_post_payment_order_divergence( $order_id, array( 'fingerprint' => $fingerprint ) );
+					$fresh = wc_get_order( $order_id );
+				}
+				$mobo_order_id = $fresh instanceof WC_Order ? absint( $fresh->get_meta( '_mobo_order_id', true ) ) : 0;
+				if ( $mobo_order_id > 0 ) {
+					$reconcile_payment = array( 'success' => true, 'paid' => true, 'id' => $mobo_order_id, 'reconciled' => true );
+					/* Secondary post-success listeners can themselves have side effects.
+					 * Fence the reconciled dispatch durably before invoking them so a stale
+					 * queue/admin request cannot replay those listeners after local success.
+					 * Listener failure is review-only, matching the normal purchase path. */
+					if ( 'yes' !== sanitize_key( (string) $fresh->get_meta( '_mobo_order_reconcile_post_success_dispatched', true ) ) ) {
+						$fresh->update_meta_data( '_mobo_order_reconcile_post_success_dispatched', 'yes' );
+						$fresh->update_meta_data( '_mobo_order_reconcile_post_success_dispatched_at', time() );
+						$fresh->save();
+						try {
+							do_action( 'mobo_core_mobo_order_submission_success', $order_id, $mobo_order_id, $reconcile_payment );
+						} catch ( Throwable $post_success_error ) {
+							$fresh = wc_get_order( $order_id );
+							if ( $fresh instanceof WC_Order ) {
+								$fresh->update_meta_data( '_mobo_order_post_success_hook_failed', 'yes' );
+								$fresh->update_meta_data( '_mobo_order_requires_review', 'yes' );
+								$fresh->save();
+							}
+						}
+					}
+				}
+			}
+		}
+		return $result;
+	}
+
+
 	/**
 	 * Private filesystem directory for payment uncertainty fences.
 	 *
@@ -3801,6 +4707,40 @@ class Mobo_Core_Checkout_Validator {
 	 *
 	 * @return string
 	 */
+	/**
+	 * Quarantine a stale running order only after acquiring the SAME per-order
+	 * lease used by the purchasing worker. A second cron pass must never overwrite
+	 * a live Wallet success using an old WC_Order object. Unknown lock/DB state
+	 * leaves the queue intact; cleanup is allowed only after durable re-read.
+	 *
+	 * @return string uncertain|already_sent|busy|changed|persist_failed
+	 */
+	private function quarantine_stale_queued_order_attempt( $order_id ) {
+		$order_id = absint( $order_id );
+		if ( $order_id <= 0 || ! class_exists( 'Mobo_Core_Lock' ) || ! function_exists( 'wc_get_order' ) ) {
+			return 'busy';
+		}
+		$lock_name = 'order_submission_' . $order_id;
+		$token = Mobo_Core_Lock::acquire( $lock_name, 60 );
+		if ( false === $token ) { return 'busy'; }
+		try {
+			$fresh = wc_get_order( $order_id );
+			if ( ! $fresh instanceof WC_Order ) { return 'changed'; }
+			if ( $this->order_was_already_sent_to_mobo( $fresh ) ) { return 'already_sent'; }
+			$status = $this->get_order_submission_attempt_state( $fresh );
+			if ( 'uncertain' === $status ) { return 'uncertain'; }
+			if ( 'running_stale' !== $status ) { return 'changed'; }
+			$this->mark_order_submission_uncertain( $fresh );
+			$verified = wc_get_order( $order_id );
+			if ( ! $verified instanceof WC_Order ) { return 'persist_failed'; }
+			if ( $this->order_was_already_sent_to_mobo( $verified ) ) { return 'already_sent'; }
+			return 'uncertain' === sanitize_key( (string) $verified->get_meta( '_mobo_order_submit_status', true ) )
+				? 'uncertain' : 'persist_failed';
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $token );
+		}
+	}
+
 	private function order_payment_guard_dir() {
 		$uploads = wp_upload_dir( null, false );
 		$base    = isset( $uploads['basedir'] ) ? (string) $uploads['basedir'] : '';
@@ -3914,38 +4854,44 @@ class Mobo_Core_Checkout_Validator {
 	/**
 	 * Inspect order line items and decide how much of the order belongs to Mobo.
 	 *
-	 * Orders with at least one Mobo item can enter the Mobo submission queue.
-	 * In mixed orders, non-Mobo items stay only inside WooCommerce and are not sent to Mobo.
+	 * Only all-Mobo orders owned by exactly one Connection may enter remote
+	 * submission. Mixed and multi-Connection orders are classified here so callers
+	 * can fail closed without partial purchasing.
 	 *
 	 * @param WC_Order|null $order Order object.
 	 * @return array
 	 */
 	private function get_order_mobo_item_scope( $order ) {
 		$scope = array(
-			'status'    => 'invalid',
-			'total'     => 0,
-			'mobo'      => 0,
-			'nonMobo'   => 0,
-			'invalid'   => 0,
-			'nonMoboNames' => array(),
+			'status'        => 'invalid',
+			'total'         => 0,
+			'mobo'          => 0,
+			'nonMobo'       => 0,
+			'invalid'       => 0,
+			'connectionId'  => 0,
+			'connectionIds' => array(),
+			'nonMoboNames'  => array(),
 		);
 
-		if ( ! $order instanceof WC_Order ) {
-			return $scope;
-		}
+		if ( ! $order instanceof WC_Order ) { return $scope; }
 
+		$connections = array();
 		foreach ( $order->get_items( 'line_item' ) as $line_item ) {
-			if ( ! $line_item instanceof WC_Order_Item_Product ) {
-				continue;
-			}
-
+			if ( ! $line_item instanceof WC_Order_Item_Product ) { continue; }
 			$scope['total']++;
 			$product  = $line_item->get_product();
 			$name     = wp_strip_all_tags( $line_item->get_name() );
 			$identity = $this->get_order_line_item_identity( $line_item, $product );
 
 			if ( ! empty( $identity['isMobo'] ) ) {
+				$connection_id = absint( $identity['connectionId'] ?? 0 );
+				if ( $connection_id <= 0 ) {
+					$scope['invalid']++;
+					$scope['nonMoboNames'][] = '' !== $name ? $name : 'محصول موبو با مالک نامشخص';
+					continue;
+				}
 				$scope['mobo']++;
+				$connections[ $connection_id ] = true;
 				continue;
 			}
 
@@ -3954,22 +4900,23 @@ class Mobo_Core_Checkout_Validator {
 				$scope['nonMoboNames'][] = '' !== $name ? $name : 'محصول نامشخص';
 				continue;
 			}
-
 			$scope['nonMobo']++;
 			$scope['nonMoboNames'][] = '' !== $name ? $name : 'محصول';
 		}
 
+		$scope['connectionIds'] = array_values( array_map( 'absint', array_keys( $connections ) ) );
+		if ( 1 === count( $scope['connectionIds'] ) ) { $scope['connectionId'] = absint( $scope['connectionIds'][0] ); }
+
 		if ( $scope['total'] <= 0 ) {
 			$scope['status'] = 'empty';
 		} elseif ( $scope['invalid'] > 0 ) {
-			/* An uncaptured legacy line whose catalogue object disappeared has unknown
-			 * ownership. Never downgrade that uncertainty to mixed/non-Mobo and buy only
-			 * the visible subset of the order. */
 			$scope['status'] = 'invalid';
 		} elseif ( $scope['nonMobo'] > 0 && $scope['mobo'] > 0 ) {
 			$scope['status'] = 'mixed';
 		} elseif ( $scope['nonMobo'] > 0 && $scope['mobo'] <= 0 ) {
 			$scope['status'] = 'non_mobo';
+		} elseif ( count( $scope['connectionIds'] ) > 1 ) {
+			$scope['status'] = 'multi_connection';
 		} else {
 			$scope['status'] = 'all_mobo';
 		}
@@ -3996,14 +4943,22 @@ class Mobo_Core_Checkout_Validator {
 	/**
 	 * True when the order contains at least one Mobo item.
 	 *
-	 * Mixed orders are allowed; only their Mobo line items are sent to Mobo.
-	 * Orders with no Mobo item must stay completely outside the Mobo submission flow.
+	 * This helper only reports presence. It does not mean the order may be submitted:
+	 * mixed orders and multi-Connection orders are blocked by order_scope_is_submittable().
 	 *
 	 * @param array $scope Scope from get_order_mobo_item_scope().
 	 * @return bool
 	 */
 	private function order_scope_has_mobo_items( $scope ) {
 		return is_array( $scope ) && isset( $scope['mobo'] ) && absint( $scope['mobo'] ) > 0;
+	}
+
+	/** Only an all-Mobo order owned by exactly one Connection may mutate a remote Source. */
+	private function order_scope_is_submittable( $scope ) {
+		return is_array( $scope )
+			&& 'all_mobo' === sanitize_key( (string) ( $scope['status'] ?? '' ) )
+			&& absint( $scope['connectionId'] ?? 0 ) > 0
+			&& 1 === count( is_array( $scope['connectionIds'] ?? null ) ? $scope['connectionIds'] : array() );
 	}
 
 	/**
@@ -4037,6 +4992,59 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		set_transient( $transient_key, '1', DAY_IN_SECONDS );
+	}
+
+	/**
+	 * Add a note from status/scheduled hooks without saving the WC_Order row.
+	 * This is used for expected fail-closed scopes where remote mutation is forbidden.
+	 */
+	private function add_unsubmittable_order_note( $order_id, $scope, $source = '' ) {
+		$order_id = absint( $order_id );
+		if ( $order_id <= 0 ) { return; }
+		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
+		$transient_key = 'mobo_core_unsubmittable_note_' . $order_id . '_' . $status . '_' . sanitize_key( (string) $source );
+		if ( get_transient( $transient_key ) ) { return; }
+		$message = $this->build_unsubmittable_order_message( $scope );
+		if ( function_exists( 'wc_create_order_note' ) ) {
+			wc_create_order_note( $order_id, $message, false, true );
+		}
+		set_transient( $transient_key, '1', DAY_IN_SECONDS );
+	}
+
+	/** Persist a terminal local block for a scope that must never mutate Mobo. */
+	private function mark_order_scope_unsubmittable( $order, $scope, $source = '' ) {
+		if ( ! $order instanceof WC_Order ) { return; }
+		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
+		$message = $this->build_unsubmittable_order_message( $scope );
+		$order->delete_meta_data( '_mobo_order_submit_queued' );
+		$order->delete_meta_data( '_mobo_order_submit_context' );
+		$order->delete_meta_data( '_mobo_order_submit_attempted' );
+		$order->delete_meta_data( '_mobo_order_submit_attempted_at' );
+		$order->update_meta_data( '_mobo_order_scope_status', $status );
+		$order->update_meta_data( '_mobo_order_submit_status', 'blocked_' . $status );
+		$order->update_meta_data( '_mobo_order_last_error_code', 'order_scope_' . $status );
+		$order->update_meta_data( '_mobo_order_last_error', $message );
+		if ( in_array( $status, array( 'multi_connection', 'invalid' ), true ) ) {
+			$order->update_meta_data( '_mobo_order_requires_review', 'yes' );
+		}
+		$order->save();
+		$order->add_order_note( $message );
+		$this->append_order_log( $order, 'order_submission_blocked_scope', array( 'source' => sanitize_key( (string) $source ), 'scope' => $scope ) );
+	}
+
+	/** Human-readable explanation for the current fail-closed order policy. */
+	private function build_unsubmittable_order_message( $scope ) {
+		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
+		if ( 'mixed' === $status ) {
+			return 'این سفارش شامل محصول موبو و غیرموبو است. طبق سیاست فعلی، برای جلوگیری از خرید ناقص هیچ بخشی از سفارش به موبو ارسال نمی‌شود.';
+		}
+		if ( 'multi_connection' === $status ) {
+			return 'این سفارش شامل محصولات متعلق به بیش از یک منبع موبو است. تا زمان تعریف سیاست Split Order، ارسال خودکار کل سفارش به موبو متوقف است.';
+		}
+		if ( 'invalid' === $status ) {
+			return 'ارسال سفارش به موبو متوقف شد چون مالکیت حداقل یک آیتم سفارش قابل اثبات نیست.';
+		}
+		return 'این سفارش طبق سیاست فعلی برای ارسال خودکار به موبو معتبر نیست.';
 	}
 
 	/**
@@ -4147,6 +5155,107 @@ class Mobo_Core_Checkout_Validator {
 		if ( ! $order instanceof WC_Order ) {
 			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
 		}
+		$scope = $this->get_order_mobo_item_scope( $order );
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
+			$this->mark_order_as_not_mobo( $order, $scope, 'submit_entry' );
+			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش محصول موبو ندارد.' );
+		}
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$this->mark_order_scope_unsubmittable( $order, $scope, 'submit_entry' );
+			return new WP_Error( 'mobo_core_order_scope_not_submittable', 'این سفارش طبق سیاست فعلی قابل ارسال خودکار به موبو نیست.' );
+		}
+		$connection_id = absint( $scope['connectionId'] );
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			return new WP_Error( 'mobo_core_order_connection_context_missing', 'Order Source context is unavailable.' );
+		}
+		return Mobo_Core_Connection_Context::run(
+			$connection_id,
+			function () use ( $order, $context, $connection_id ) {
+				$context = is_array( $context ) ? $context : array();
+				$context['connectionId'] = $connection_id;
+				return $this->submit_order_to_mobo_in_connection( $order, $context, $connection_id );
+			}
+		);
+	}
+
+	/** Execute the one-shot purchase while the owning Connection context is active. */
+	/**
+	 * Compare the server-owned route without relying on request-local Connection caches.
+	 * Covers disable/delete/reprovision between remote cart preparation and Wallet.
+	 * No raw credentials or route are written into order meta/diagnostic logs.
+	 * This check narrows the race; it is not a transactional disable/HTTP barrier.
+	 *
+	 * @return string SHA-256 digest or empty string if the owner is not eligible.
+	 */
+	/**
+	 * Shared-cart and admin-login HTTP must observe the same durable owner that
+	 * populated their request-local URL/provider/cookie context. A disabled or
+	 * reprovisioned Source cannot be silently replaced by Default. This is a
+	 * pre-send fence, NOT a cross-process HTTP cancellation protocol.
+	 * @return true|WP_Error
+	 */
+	private function fresh_checkout_route_preflight() {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
+			return true; // Only for pre-Connection-table upgrade compatibility.
+		}
+		$id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$fresh = $id > 0 ? Mobo_Core_Connection_Repository::get_by_id_fresh( $id ) : null;
+		$cached = Mobo_Core_Connection_Repository::get_runtime_connection();
+		$valid = $id > 0 && is_array( $fresh ) && is_array( $cached )
+			&& absint( $cached['id'] ?? 0 ) === $id
+			&& ! empty( $fresh['is_enabled'] )
+			&& Mobo_Core_Connection_Repository::is_provisioned( $fresh );
+		if ( $valid ) {
+			foreach ( array( 'provider_key', 'source_key', 'source_site_url', 'api_base_url', 'connection_key', 'license_token', 'security_code', 'money_unit', 'money_fraction_digits', 'money_price_representation', 'money_contract_version' ) as $field ) {
+				if ( ! hash_equals( (string) ( $cached[ $field ] ?? '' ), (string) ( $fresh[ $field ] ?? '' ) ) ) {
+					$valid = false;
+					break;
+				}
+			}
+		}
+		if ( $valid && '' !== $this->active_order_route_fingerprint ) {
+			$valid = $id === absint( $this->active_order_route_connection_id ) && $this->active_order_route_is_current();
+		}
+		return $valid ? true : new WP_Error( 'mobo_core_order_connection_changed', 'Connection routing changed before the remote request; it was not sent.', array( 'requestMayHaveReachedServer' => false ) );
+	}
+
+	private function get_fresh_order_route_fingerprint( $connection_id ) {
+		$connection_id = absint( $connection_id );
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' )
+			|| ! method_exists( 'Mobo_Core_Connection_Repository', 'get_by_id_fresh' ) ) {
+			return '';
+		}
+		$row = Mobo_Core_Connection_Repository::get_by_id_fresh( $connection_id );
+		if ( ! is_array( $row ) || empty( $row['is_enabled'] )
+			|| ! Mobo_Core_Connection_Repository::is_provisioned( $row ) ) {
+			return '';
+		}
+		$parts = array( (string) $connection_id );
+		foreach ( array( 'provider_key', 'source_key', 'source_site_url', 'api_base_url', 'connection_key', 'license_token', 'security_code', 'money_unit', 'money_fraction_digits', 'money_price_representation', 'money_contract_version' ) as $field ) {
+			$parts[] = isset( $row[ $field ] ) ? (string) $row[ $field ] : '';
+		}
+		$encoded = wp_json_encode( $parts, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+		return is_string( $encoded ) && '' !== $encoded ? hash( 'sha256', $encoded ) : '';
+	}
+
+	/** Return true only while the current attempt still owns its original live route. */
+	private function active_order_route_is_current() {
+		$expected = (string) $this->active_order_route_fingerprint;
+		$id = absint( $this->active_order_route_connection_id );
+		if ( '' === $expected || $id <= 0 ) { return false; }
+		$current = $this->get_fresh_order_route_fingerprint( $id );
+		return '' !== $current && hash_equals( $expected, $current );
+	}
+
+	private function submit_order_to_mobo_in_connection( $order, $context, $expected_connection_id ) {
+		if ( ! $order instanceof WC_Order ) {
+			return new WP_Error( 'mobo_core_invalid_order', 'Invalid WooCommerce order.' );
+		}
+		$expected_connection_id = absint( $expected_connection_id );
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $expected_connection_id <= 0 || $current_connection_id !== $expected_connection_id ) {
+			return new WP_Error( 'mobo_core_order_connection_context_mismatch', 'Order Source context does not match the active Connection.' );
+		}
 
 		$order_id = absint( $order->get_id() );
 		if ( $order_id <= 0 || ! class_exists( 'Mobo_Core_Lock' ) ) {
@@ -4168,6 +5277,48 @@ class Mobo_Core_Checkout_Validator {
 		$this->active_order_submission_lock_ttl   = $lock_ttl;
 
 		try {
+			if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+				return $this->fail_mobo_order_submission( $order, 'money_policy_unavailable', 'Monetary compatibility policy is unavailable; order was not sent.' );
+			}
+			$staged_no_send = defined( 'MOBO_CORE_PUBLISH_STAGED_NO_SEND' ) && MOBO_CORE_PUBLISH_STAGED_NO_SEND;
+			/* Store the LOCAL observation without making any assertion about remote
+			 * provisioning. The production execution MUST retain Source money and
+			 * fresh-route gates; no staged PREPARED record may authorize sending. */
+			if ( $staged_no_send ) {
+				if ( ! $this->p17_local_owner_exists_for_no_send( $expected_connection_id ) ) {
+					$this->p17_hold_no_send( $order, 'staged_local_connection_missing_or_disabled' );
+					return self::p17_blocked( 'staged_local_owner_unavailable' );
+				}
+			} else {
+				$money_compatibility = Mobo_Core_Money_Policy::assert_compatible( $expected_connection_id, true );
+				if ( is_wp_error( $money_compatibility ) ) {
+					return $this->fail_mobo_order_submission(
+						$order,
+						'money_contract_incompatible',
+						$money_compatibility->get_error_message()
+					);
+				}
+			}
+			/* Immutable Woo order unit must match the local shop even for NO-SEND.
+			 * Neither IRR/IRT exchange nor Source money claims are inferred here. */
+			$order_unit = Mobo_Core_Money_Policy::normalize_unit( $order->get_currency() );
+			if ( '' === $order_unit || $order_unit !== Mobo_Core_Money_Policy::store_unit() ) {
+				if ( $staged_no_send ) {
+					$this->p17_hold_no_send( $order, 'staged_order_currency_mismatch' );
+					return self::p17_blocked( 'staged_order_currency_mismatch' );
+				}
+				return $this->fail_mobo_order_submission( $order, 'order_currency_mismatch', 'ارز ثبت‌شده روی سفارش با ارز فعلی فروشگاه یکسان نیست؛ خرید موبو متوقف شد.' );
+			}
+			if ( ! $staged_no_send ) {
+				$route_fingerprint = $this->get_fresh_order_route_fingerprint( $expected_connection_id );
+				if ( '' === $route_fingerprint ) {
+					/* No blind default-Source fallback and no remote side effects. */
+					return new WP_Error( 'mobo_core_order_submission_deferred', 'Order owner is disabled, missing or not currently provisioned.' );
+				}
+				$this->active_order_route_connection_id = $expected_connection_id;
+				$this->active_order_route_fingerprint   = $route_fingerprint;
+			}
+
 			$fresh = wc_get_order( $order_id );
 			if ( ! $fresh instanceof WC_Order ) {
 				return new WP_Error( 'mobo_core_invalid_order', 'WooCommerce order disappeared before submission.' );
@@ -4191,8 +5342,11 @@ class Mobo_Core_Checkout_Validator {
 				return new WP_Error( 'mobo_core_order_submission_uncertain', 'A previous payment attempt has a durable uncertainty guard and must be verified before retry.' );
 			}
 
-			if ( 'uncertain' === $fresh_status && ! ( $explicit_admin_retry && $verified_absent ) ) {
-				return new WP_Error( 'mobo_core_order_submission_uncertain', 'A previous submission attempt is uncertain and must be verified before retry.' );
+			/* Every entry point must honor recovery evidence, not just the queue
+			 * consumer. Owning a new lease does not retire an older remote attempt. */
+			$attempt_state = $this->get_order_submission_attempt_state( $fresh );
+			if ( in_array( $attempt_state, array( 'uncertain', 'running_recent', 'running_stale' ), true ) && ! ( $explicit_admin_retry && $verified_absent ) ) {
+				return new WP_Error( 'mobo_core_order_submission_uncertain', 'A previous submission attempt is running or uncertain and must be verified before retry.' );
 			}
 
 			/* A different request may have completed a failed/uncertain attempt between
@@ -4205,15 +5359,25 @@ class Mobo_Core_Checkout_Validator {
 			}
 
 			if ( $explicit_admin_retry ) {
+				$pending_remote_id = absint( $fresh->get_meta( '_mobo_order_pending_remote_id', true ) );
+				if ( $pending_remote_id > 0 ) {
+					return new WP_Error( 'mobo_core_order_submission_uncertain', 'A durable remote order ID exists; manual absence override cannot start a second Checkout.' );
+				}
 				if ( $verified_absent && ! $this->clear_order_payment_guard( $order_id ) ) {
 					return new WP_Error( 'mobo_core_order_payment_guard_clear_failed', 'The durable payment uncertainty guard could not be cleared after verification.' );
 				}
+				if ( $verified_absent && ! $this->clear_order_remote_checkpoint( $fresh, true ) ) {
+					return new WP_Error( 'mobo_core_order_remote_checkpoint_clear_failed', 'The remote-attempt checkpoint could not be retired after verified absence.' );
+				}
+				$fresh = wc_get_order( $order_id );
+				if ( ! $fresh instanceof WC_Order ) { return new WP_Error( 'mobo_core_invalid_order', 'Order disappeared after retry checkpoint cleanup.' ); }
 
 				/* Reset retry state only after this request owns the per-order lease. If an
 				 * upgrade barrier or another worker owns the order, the previous durable
 				 * failed/uncertain state must remain intact. */
 				$fresh->delete_meta_data( '_mobo_order_submit_attempted' );
 				$fresh->delete_meta_data( '_mobo_order_submit_attempted_at' );
+				$fresh->delete_meta_data( '_mobo_order_submit_attempt_key' );
 				$fresh->delete_meta_data( '_mobo_order_submit_queued' );
 				$fresh->delete_meta_data( '_mobo_order_submit_queued_at' );
 				$fresh->delete_meta_data( '_mobo_order_submit_context' );
@@ -4227,6 +5391,10 @@ class Mobo_Core_Checkout_Validator {
 
 			return $this->submit_order_to_mobo_owned( $fresh, is_array( $context ) ? $context : array() );
 		} finally {
+			/* No route snapshot may survive this order's lease or bleed into the
+			 * next order processed by the same validator instance. */
+			$this->active_order_route_fingerprint = '';
+			$this->active_order_route_connection_id = 0;
 			Mobo_Core_Lock::release( $lock_name, $lock_token );
 			$this->active_order_submission_lock_name  = '';
 			$this->active_order_submission_lock_token = '';
@@ -4253,11 +5421,20 @@ class Mobo_Core_Checkout_Validator {
 			$this->mark_order_as_not_mobo( $order, $scope, 'submit_guard' );
 			return new WP_Error( 'mobo_core_order_not_mobo', 'این سفارش محصول موبو ندارد.' );
 		}
-
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$this->mark_order_scope_unsubmittable( $order, $scope, 'submit_guard' );
+			return new WP_Error( 'mobo_core_order_scope_not_submittable', 'این سفارش طبق سیاست فعلی قابل ارسال خودکار به موبو نیست.' );
+		}
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $current_connection_id <= 0 || $current_connection_id !== absint( $scope['connectionId'] ) ) {
+			return new WP_Error( 'mobo_core_order_connection_context_mismatch', 'Order Source context changed before remote submission.' );
+		}
 
 		$attempted_at = time();
+		$attempt_key = $this->generate_order_submission_attempt_key( $order_id );
 		$order->update_meta_data( '_mobo_order_submit_attempted', 'yes' );
 		$order->update_meta_data( '_mobo_order_submit_attempted_at', $attempted_at );
+		$order->update_meta_data( '_mobo_order_submit_attempt_key', $attempt_key );
 		$order->update_meta_data( '_mobo_order_submit_status', 'running' );
 		$order->delete_meta_data( '_mobo_order_last_error' );
 		$saved_id = absint( $order->save() );
@@ -4273,6 +5450,7 @@ class Mobo_Core_Checkout_Validator {
 			|| 'yes' !== (string) $durable_order->get_meta( '_mobo_order_submit_attempted', true )
 			|| 'running' !== sanitize_key( (string) $durable_order->get_meta( '_mobo_order_submit_status', true ) )
 			|| absint( $durable_order->get_meta( '_mobo_order_submit_attempted_at', true ) ) !== $attempted_at
+			|| ! hash_equals( $attempt_key, sanitize_text_field( (string) $durable_order->get_meta( '_mobo_order_submit_attempt_key', true ) ) )
 		) {
 			return new WP_Error( 'mobo_core_order_submission_state_persist_failed', 'Order submission was not started because the durable running checkpoint could not be verified.' );
 		}
@@ -4307,6 +5485,18 @@ class Mobo_Core_Checkout_Validator {
 			return $this->fail_mobo_order_submission( $order, $error_code, implode( ' | ', $errors ) );
 		}
 
+		/* INTEGRATION-04: the staged path must freeze a strictly local order
+		 * intent BEFORE any remote Location Resolver, cart or Provider access.
+		 * This is NOT a Source-verified business quote or a send authorization. */
+		if ( defined( 'MOBO_CORE_PUBLISH_STAGED_NO_SEND' ) && MOBO_CORE_PUBLISH_STAGED_NO_SEND ) {
+			$local_fingerprint = $this->p17_local_intent_fingerprint( $order, $scope, $items );
+			if ( is_wp_error( $local_fingerprint ) ) {
+				$this->p17_hold_no_send( $order, 'staged_local_intent_unverifiable' );
+				return self::p17_blocked( 'local_intent_unverifiable' );
+			}
+			return $this->p17_prepare_outbox_no_send( $order, $scope, array( 'fingerprint' => $local_fingerprint ) );
+		}
+
 		/*
 		 * Resolve and validate the checkout contact before touching the shared Mobo
 		 * session/cart. Local mapping errors must fail without remote side effects.
@@ -4318,13 +5508,23 @@ class Mobo_Core_Checkout_Validator {
 				'message' => $contact_preflight->get_error_message(),
 				'data'    => $contact_preflight->get_error_data(),
 			) );
+			$error_data = $contact_preflight->get_error_data();
+			if ( is_array( $error_data ) && 'defer' === sanitize_key( (string) ( $error_data['action'] ?? '' ) ) ) {
+				return $this->defer_mobo_order_submission( $order, 'location_resolution_pending', $contact_preflight->get_error_message(), array( 'remoteSideEffectsStarted' => false ) );
+			}
 			return $this->fail_mobo_order_submission( $order, 'checkout_payload_failed', $contact_preflight->get_error_message() );
+		}
+
+		if ( ! $this->provider_uses_replace_cart_sync() ) {
+			return $this->fail_mobo_order_submission( $order, 'provider_cart_strategy_unsupported', 'The active Source provider does not support deterministic replace/rebuild cart synchronization.' );
 		}
 
 		$business_snapshot = $this->build_order_submission_business_snapshot( $order, $items, $contact_preflight );
 		if ( is_wp_error( $business_snapshot ) ) {
 			return $this->fail_mobo_order_submission( $order, 'business_snapshot_failed', $business_snapshot->get_error_message() );
 		}
+
+		/* Operational candidate: continue into the existing guarded submission lifecycle. */
 
 		$lock = $this->acquire_mobo_cart_lock( 'order_submission_' . $order_id );
 		if ( is_wp_error( $lock ) ) {
@@ -4358,7 +5558,16 @@ class Mobo_Core_Checkout_Validator {
 				$quantity          = isset( $item['quantity'] ) ? (float) $item['quantity'] : 0;
 				$name              = isset( $item['name'] ) ? sanitize_text_field( (string) $item['name'] ) : 'محصول';
 
-				$response  = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart', array( 'quantity' => $quantity, 'variant_id' => $portal_variant_id ), 'cart_add_item' );
+				$response  = $this->add_mobo_cart_item_by_variant( $portal_variant_id, $quantity, $order );
+				if ( $this->is_auth_error_response( $response ) ) {
+					$this->shared_mobo_cart_rebuild_ready = false;
+					return $this->defer_mobo_order_submission(
+						$order,
+						'cart_rebuild_auth_changed',
+						'Mobo authentication changed during cart rebuild; the complete Clear -> Add All sequence will be restarted before any checkout/payment step.',
+						array( 'remoteSideEffectsStarted' => true, 'portalVariantId' => $portal_variant_id )
+					);
+				}
 				$add_check = $this->validate_mobo_cart_add_response( $response, $portal_variant_id, $name );
 
 				if ( is_wp_error( $add_check ) ) {
@@ -4366,8 +5575,17 @@ class Mobo_Core_Checkout_Validator {
 				}
 			}
 
-			/* Match mobomobo.ir checkout flow: refresh cart with update=true. */
+			/* Provider storefront cart flow may require refresh with update=true. */
 			$snapshot = $this->get_mobo_cart_snapshot_json( true );
+			if ( $this->is_auth_error_response( $snapshot ) ) {
+				$this->shared_mobo_cart_rebuild_ready = false;
+				return $this->defer_mobo_order_submission(
+					$order,
+					'cart_rebuild_verify_auth_changed',
+					'Mobo authentication changed before final cart verification; the complete Clear -> Add All sequence will be restarted.',
+					array( 'remoteSideEffectsStarted' => true )
+				);
+			}
 			if ( is_wp_error( $snapshot ) ) {
 				return $this->fail_mobo_order_submission( $order, 'cart_snapshot_failed', $snapshot->get_error_message() );
 			}
@@ -4376,90 +5594,121 @@ class Mobo_Core_Checkout_Validator {
 			if ( ! empty( $compare_errors ) ) {
 				return $this->fail_mobo_order_submission( $order, 'cart_compare_failed', implode( ' | ', $compare_errors ) );
 			}
+			/* The final authoritative snapshot seals this Clear -> Add All rebuild. */
+			$this->shared_mobo_cart_rebuild_ready = false;
 
-			$checkout_payload = $this->build_mobo_checkout_payload( $order, $snapshot );
+			$checkout_payload = $this->build_mobo_checkout_payload( $order, $snapshot, $contact_preflight );
 			if ( is_wp_error( $checkout_payload ) ) {
 				return $this->fail_mobo_order_submission( $order, 'checkout_payload_failed', $checkout_payload->get_error_message() );
 			}
 
-			$checkout = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart/checkout', $checkout_payload, 'cart_checkout' );
+			$token = isset( $checkout_payload['token'] ) && is_scalar( $checkout_payload['token'] ) ? $this->parse_mobo_cart_token( $checkout_payload['token'] ) : '';
+			if ( '' === $token ) {
+				return $this->fail_mobo_order_submission( $order, 'checkout_token_missing', 'Mobo checkout token is missing.' );
+			}
+			$business_fingerprint = isset( $business_snapshot['fingerprint'] ) ? sanitize_text_field( (string) $business_snapshot['fingerprint'] ) : '';
+			if ( ! $this->persist_order_remote_checkpoint( $order, 'checkout_prepared', $token, 0, 0, $business_fingerprint ) ) {
+				return $this->fail_mobo_order_submission( $order, 'checkout_checkpoint_persist_failed', 'Checkout was not sent because the durable remote-attempt checkpoint could not be verified.' );
+			}
+
+			$checkout = $this->order_mobo_request( $order, 'POST', $this->get_provider_endpoint( 'cart_checkout' ), $checkout_payload, 'cart_checkout' );
+			$checkout_needs_positive_reconcile = false;
 			if ( is_wp_error( $checkout ) ) {
-				return $this->fail_mobo_order_submission( $order, 'checkout_failed', $checkout->get_error_message() );
-			}
-
-			$checkout_code = absint( wp_remote_retrieve_response_code( $checkout ) );
-			if ( 200 !== $checkout_code ) {
-				return $this->fail_mobo_order_submission( $order, 'checkout_http_failed', 'Mobo checkout returned HTTP ' . $checkout_code );
-			}
-
-			/* Preserve backwards compatibility with historical empty 200 responses, but
-			 * never ignore an explicit semantic rejection or malformed non-empty JSON. */
-			$checkout_raw = trim( (string) wp_remote_retrieve_body( $checkout ) );
-			if ( '' !== $checkout_raw ) {
-				$checkout_json = json_decode( $checkout_raw, true );
-				if ( ! is_array( $checkout_json ) ) {
-					return $this->fail_mobo_order_submission( $order, 'checkout_json_failed', 'Mobo checkout returned a non-empty body that was not valid JSON.' );
+				if ( ! $this->order_request_error_is_ambiguous( $checkout ) ) {
+					$this->clear_order_remote_checkpoint( $order, false );
+					return $this->fail_mobo_order_submission( $order, 'checkout_failed', $checkout->get_error_message() );
 				}
-				if ( array_key_exists( 'success', $checkout_json ) && ! $this->to_bool( $checkout_json['success'] ) ) {
-					$message = $this->first_non_empty_scalar(
-						array(
+				$checkout_needs_positive_reconcile = true;
+			}
+
+			if ( ! is_wp_error( $checkout ) ) {
+				$checkout_code = absint( wp_remote_retrieve_response_code( $checkout ) );
+				if ( 200 !== $checkout_code ) {
+					$checkout_needs_positive_reconcile = true;
+				}
+
+				/* Preserve historical empty-200 compatibility. Malformed non-empty 2xx is
+				 * ambiguous because Checkout may already have created the remote order. */
+				$checkout_raw = trim( (string) wp_remote_retrieve_body( $checkout ) );
+				if ( '' !== $checkout_raw ) {
+					$checkout_json = json_decode( $checkout_raw, true );
+					if ( ! is_array( $checkout_json ) ) {
+						$checkout_needs_positive_reconcile = true;
+					} elseif ( array_key_exists( 'success', $checkout_json ) && ! $this->to_bool( $checkout_json['success'] ) ) {
+						$message = $this->first_non_empty_scalar( array(
 							isset( $checkout_json['description'] ) ? $checkout_json['description'] : '',
 							isset( $checkout_json['message'] ) ? $checkout_json['message'] : '',
 							'Mobo checkout explicitly rejected the order.',
-						)
-					);
-					return $this->fail_mobo_order_submission( $order, 'checkout_not_success', sanitize_text_field( $message ) );
+						) );
+						$this->clear_order_remote_checkpoint( $order, false );
+						return $this->fail_mobo_order_submission( $order, 'checkout_not_success', sanitize_text_field( $message ) );
+					}
 				}
-			}
-
-			$token = isset( $checkout_payload['token'] ) && is_scalar( $checkout_payload['token'] ) ? trim( (string) $checkout_payload['token'] ) : '';
-			if ( '' === $token ) {
-				return $this->fail_mobo_order_submission( $order, 'checkout_token_missing', 'Mobo checkout token is missing.' );
 			}
 
 			$details_json = $this->get_mobo_order_details( $order, $token );
 			if ( is_wp_error( $details_json ) ) {
-				return $this->fail_mobo_order_submission( $order, 'details_failed', $details_json->get_error_message() );
+				return $this->mark_order_submission_uncertain(
+					$order,
+					$checkout_needs_positive_reconcile ? 'checkout_result_uncertain' : 'checkout_committed_details_unavailable',
+					'Checkout may have created a remote order, but its durable identity could not be positively reconciled. Automatic resubmission is blocked.',
+					array( 'remoteStage' => 'checkout', 'tokenSha256' => hash( 'sha256', $token ) )
+				);
 			}
 
 			$details = isset( $details_json['details'] ) && is_array( $details_json['details'] ) ? $details_json['details'] : array();
-			if ( empty( $details ) ) {
-				return $this->fail_mobo_order_submission( $order, 'details_empty', 'Mobo order details response is empty.' );
+			$details_mobo_order_id = array_key_exists( 'id', $details ) ? $this->parse_positive_integer_id( $details['id'] ) : 0;
+			if ( empty( $details ) || $details_mobo_order_id <= 0 ) {
+				return $this->mark_order_submission_uncertain(
+					$order,
+					'checkout_reconciliation_inconclusive',
+					'Checkout returned or may have returned successfully, but Details did not positively expose a remote order ID. Automatic replay is blocked.',
+					array( 'remoteStage' => 'checkout', 'tokenSha256' => hash( 'sha256', $token ) )
+				);
+			}
+			if ( ! $this->persist_order_remote_checkpoint( $order, 'remote_order_known', $token, $details_mobo_order_id, 0, $business_fingerprint ) ) {
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_checkpoint_failed', 'A remote Mobo order exists, but its identity could not be committed locally. Automatic replay is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
+			}
+			if ( $checkout_needs_positive_reconcile ) {
+				$this->append_order_log( $order, 'checkout_positive_reconciliation', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 
 			$shippings_json = $this->get_mobo_order_shippings( $order, $token );
 			if ( is_wp_error( $shippings_json ) ) {
-				return $this->fail_mobo_order_submission( $order, 'shippings_failed', $shippings_json->get_error_message() );
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_shipping_options_unavailable', 'The remote order exists but shipping options could not be retrieved. Automatic replay from Checkout is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 
 			$shipping_id = $this->resolve_mobo_shipping_id( $order, $shippings_json );
 			if ( is_wp_error( $shipping_id ) ) {
-				return $this->fail_mobo_order_submission( $order, 'shipping_resolve_failed', $shipping_id->get_error_message() );
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_shipping_resolution_failed', 'The remote order exists but its shipping method could not be resolved safely. Automatic replay from Checkout is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 
 			$shipping_payload = $this->build_mobo_order_stage_payload( $details, $shipping_id, 'wallet', null );
-			$shipping = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart/shipping', $shipping_payload, 'cart_shipping' );
+			$shipping = $this->order_mobo_request( $order, 'POST', $this->get_provider_endpoint( 'cart_shipping' ), $shipping_payload, 'cart_shipping' );
 			if ( is_wp_error( $shipping ) ) {
-				return $this->fail_mobo_order_submission( $order, 'shipping_failed', $shipping->get_error_message() );
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_shipping_request_uncertain', 'The remote order already exists, but the Shipping mutation was not positively acknowledged. Automatic Checkout replay is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 
 			$shipping_json = $this->decode_mobo_response_json( $shipping );
 			if ( is_wp_error( $shipping_json ) ) {
-				return $this->fail_mobo_order_submission( $order, 'shipping_json_failed', $shipping_json->get_error_message() );
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_shipping_response_unreadable', 'The remote order already exists and Shipping returned an unreadable response. Automatic Checkout replay is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 			if ( isset( $shipping_json['success'] ) && ! $this->to_bool( $shipping_json['success'] ) ) {
-				return $this->fail_mobo_order_submission( $order, 'shipping_not_success', isset( $shipping_json['description'] ) ? sanitize_text_field( (string) $shipping_json['description'] ) : 'Mobo shipping response was not successful.' );
+				return $this->mark_order_submission_uncertain( $order, 'remote_order_shipping_rejected', isset( $shipping_json['description'] ) ? sanitize_text_field( (string) $shipping_json['description'] ) : 'The remote order exists but Shipping was rejected; automatic Checkout replay is blocked.', array( 'moboOrderId' => $details_mobo_order_id ) );
 			}
 
 			$payment_details = isset( $shipping_json['details'] ) && is_array( $shipping_json['details'] ) ? $shipping_json['details'] : $details;
 			$details_mobo_order_id = array_key_exists( 'id', $details ) ? $this->parse_positive_integer_id( $details['id'] ) : 0;
 			$shipping_mobo_order_id = array_key_exists( 'id', $payment_details ) ? $this->parse_positive_integer_id( $payment_details['id'] ) : 0;
 			if ( $details_mobo_order_id > 0 && $shipping_mobo_order_id > 0 && $details_mobo_order_id !== $shipping_mobo_order_id ) {
-				return $this->fail_mobo_order_submission( $order, 'mobo_order_id_changed_before_payment', 'شناسه سفارش موبو بین مرحله Details و Shipping تغییر کرد؛ برای جلوگیری از پرداخت روی سفارش اشتباه، Wallet شروع نشد.' );
+				return $this->mark_order_submission_uncertain( $order, 'mobo_order_id_changed_before_payment', 'Remote order identity changed between Details and Shipping. Wallet was not started and automatic Checkout replay is blocked.', array( 'detailsMoboOrderId' => $details_mobo_order_id, 'shippingMoboOrderId' => $shipping_mobo_order_id ) );
 			}
 			$pre_payment_mobo_order_id = $shipping_mobo_order_id > 0 ? $shipping_mobo_order_id : $details_mobo_order_id;
 			if ( $pre_payment_mobo_order_id <= 0 ) {
-				return $this->fail_mobo_order_submission( $order, 'mobo_order_id_missing_before_payment', 'شناسه سفارش موبو قبل از مرحله Wallet موجود نیست؛ برای جلوگیری از پرداختی که بعداً قابل تطبیق نباشد، پرداخت شروع نشد.' );
+				return $this->mark_order_submission_uncertain( $order, 'mobo_order_id_missing_before_payment', 'A remote Checkout exists but its order ID is not provable before Wallet. Automatic replay is blocked.' );
+			}
+			if ( ! $this->persist_order_remote_checkpoint( $order, 'shipping_applied', $token, $pre_payment_mobo_order_id, $shipping_id, $business_fingerprint ) ) {
+				return $this->mark_order_submission_uncertain( $order, 'pre_payment_checkpoint_failed', 'The remote order exists, but its pre-payment checkpoint could not be persisted. Wallet was not sent and automatic Checkout replay is blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
 			}
 
 			/* Re-read the WooCommerce order at the last reversible boundary. An admin,
@@ -4467,50 +5716,71 @@ class Mobo_Core_Checkout_Validator {
 			 * status/items/address/shipping while the remote cart was being prepared. */
 			$final_guard = $this->validate_order_before_wallet_payment( $order_id, $business_snapshot, $shipping_id, $shippings_json );
 			if ( is_wp_error( $final_guard ) ) {
-				$guard_data = $final_guard->get_error_data();
-				$guard_action = is_array( $guard_data ) && isset( $guard_data['action'] ) ? sanitize_key( (string) $guard_data['action'] ) : 'fail';
-				if ( 'abort' === $guard_action ) {
-					return $this->abort_mobo_order_submission_before_payment( $order, $final_guard->get_error_code(), $final_guard->get_error_message() );
-				}
-				if ( 'defer' === $guard_action ) {
-					return $this->defer_mobo_order_submission( $order, $final_guard->get_error_code(), $final_guard->get_error_message(), array( 'remoteSideEffectsStarted' => true ) );
-				}
-				return $this->fail_mobo_order_submission( $order, $final_guard->get_error_code(), $final_guard->get_error_message() );
+				/* A remote order already exists. Even though Wallet has not started,
+				 * rebuilding Checkout on a later automatic attempt could create a second
+				 * remote order. Quarantine the attempt instead of returning retryable. */
+				return $this->mark_order_submission_uncertain(
+					$order,
+					$final_guard->get_error_code(),
+					$final_guard->get_error_message(),
+					array( 'remoteSideEffectsStarted' => true, 'moboOrderId' => $pre_payment_mobo_order_id, 'remoteStage' => 'pre_payment_guard' )
+				);
 			}
 			$order = $final_guard;
+			if ( ! $this->active_order_route_is_current() ) {
+				return $this->mark_order_submission_uncertain( $order, 'order_connection_changed_before_payment', 'Connection routing changed after a remote order was created. Wallet was not sent; automatic Checkout replay is blocked.', array( 'remoteSideEffectsStarted' => true, 'moboOrderId' => $pre_payment_mobo_order_id ) );
+			}
 			$payment_payload = $this->build_mobo_order_stage_payload( $payment_details, $shipping_id, 'wallet', null );
 
 			/* Persist an out-of-database fence immediately before the irreversible Wallet
 			 * Payment POST. If MySQL dies after Mobo receives the request, the next PHP
 			 * process still has durable evidence that automatic retry is unsafe. */
-			if ( ! $this->persist_order_payment_guard( $order_id, 'payment_inflight', array( 'attemptedAt' => $attempted_at ) ) ) {
-				return $this->fail_mobo_order_submission( $order, 'payment_guard_persist_failed', 'پرداخت به موبو شروع نشد چون نشانگر ایمنی مستقل پرداخت روی دیسک قابل ذخیره نبود.' );
+			if ( ! $this->persist_order_payment_guard( $order_id, 'payment_inflight', array( 'attemptedAt' => $attempted_at, 'moboOrderId' => $pre_payment_mobo_order_id, 'attemptKey' => sanitize_text_field( (string) $order->get_meta( '_mobo_order_submit_attempt_key', true ) ) ) ) ) {
+				return $this->mark_order_submission_uncertain( $order, 'payment_guard_persist_failed', 'A remote order exists but the independent pre-payment fence could not be persisted. Wallet was not sent; automatic Checkout replay is blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+			}
+			if ( ! $this->persist_order_remote_checkpoint( $order, 'payment_inflight', $token, $pre_payment_mobo_order_id, $shipping_id, $business_fingerprint ) ) {
+				return $this->mark_order_submission_uncertain( $order, 'payment_checkpoint_persist_failed', 'The remote order exists but the payment checkpoint could not be committed. Wallet was not sent; automatic replay is blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
 			}
 
 			/* Never replay the irreversible wallet call after an auth-shaped response.
 			 * Any non-successful acknowledgement is handled below as uncertain unless
 			 * Mobo explicitly proves that the wallet was not charged. */
-			$payment = $this->order_mobo_request( $order, 'POST', '/site/api/v1/cart/payment/wallet', $payment_payload, 'cart_payment_wallet', false );
+			$payment = $this->order_mobo_request( $order, 'POST', $this->get_provider_endpoint( 'cart_wallet_payment' ), $payment_payload, 'cart_payment_wallet', false );
+			$payment_json = null;
 			if ( is_wp_error( $payment ) ) {
-				if ( $this->payment_error_is_ambiguous( $payment ) ) {
-					return $this->mark_order_submission_uncertain(
-						$order,
-						'payment_result_uncertain',
-						'درخواست پرداخت به موبو ارسال شد اما نتیجه قابل اثبات نیست. قبل از Retry، وضعیت سفارش/پرداخت در موبو بررسی شود.',
-						array( 'remoteError' => $payment->get_error_message() )
-					);
+				if ( 'mobo_core_order_connection_changed' === $payment->get_error_code() ) {
+					if ( ! $this->clear_order_payment_guard( $order_id ) ) {
+						return $this->mark_order_submission_uncertain( $order, 'payment_guard_clear_failed', 'The payment was not sent, but its filesystem guard could not be retired safely.' );
+					}
+					return $this->mark_order_submission_uncertain( $order, 'order_connection_changed_before_wallet_request', 'The remote order exists but routing changed before Wallet was sent. Automatic Checkout replay is blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
 				}
-				$this->clear_order_payment_guard( $order_id );
-				return $this->fail_mobo_order_submission( $order, 'payment_failed', $payment->get_error_message() );
+				if ( $this->payment_error_is_ambiguous( $payment ) ) {
+					$reconcile = $this->reconcile_remote_order_details( $order, $token, $pre_payment_mobo_order_id );
+					if ( ! is_wp_error( $reconcile ) && ! empty( $reconcile['paidKnown'] ) && ! empty( $reconcile['paid'] ) ) {
+						$payment_json = array( 'success' => true, 'paid' => true, 'id' => $pre_payment_mobo_order_id, 'reconciled' => true );
+						$this->append_order_log( $order, 'wallet_positive_reconciliation', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+					} else {
+						return $this->mark_order_submission_uncertain( $order, 'payment_result_uncertain', 'Wallet may have reached Mobo and paid=true could not be positively reconciled. Automatic replay remains blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+					}
+				} else {
+					/* Even a definite local/pre-request Wallet error occurs after the remote
+					 * order exists. Do not rebuild Checkout automatically. */
+					$this->clear_order_payment_guard( $order_id );
+					return $this->mark_order_submission_uncertain( $order, 'payment_not_sent_remote_order_exists', $payment->get_error_message(), array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+				}
 			}
 
-			$payment_json = $this->decode_mobo_response_json( $payment );
-			if ( is_wp_error( $payment_json ) ) {
-				return $this->mark_order_submission_uncertain(
-					$order,
-					'payment_response_unreadable',
-					'موبو پاسخ موفق HTTP به مرحله پرداخت داد اما بدنه پاسخ قابل تفسیر نبود. قبل از Retry، وضعیت پرداخت در موبو بررسی شود.'
-				);
+			if ( null === $payment_json ) {
+				$payment_json = $this->decode_mobo_response_json( $payment );
+				if ( is_wp_error( $payment_json ) ) {
+					$reconcile = $this->reconcile_remote_order_details( $order, $token, $pre_payment_mobo_order_id );
+					if ( ! is_wp_error( $reconcile ) && ! empty( $reconcile['paidKnown'] ) && ! empty( $reconcile['paid'] ) ) {
+						$payment_json = array( 'success' => true, 'paid' => true, 'id' => $pre_payment_mobo_order_id, 'reconciled' => true );
+						$this->append_order_log( $order, 'wallet_unreadable_response_reconciled', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+					} else {
+						return $this->mark_order_submission_uncertain( $order, 'payment_response_unreadable', 'Wallet returned an unreadable response and paid=true could not be positively reconciled. Automatic replay remains blocked.', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+					}
+				}
 			}
 
 			$payment_success_state = array_key_exists( 'success', $payment_json )
@@ -4545,22 +5815,37 @@ class Mobo_Core_Checkout_Validator {
 				);
 			}
 
-			/* A definitive unpaid acknowledgement is safe to classify as failed only
-			 * when Mobo returned an explicitly recognized boolean false. Values such as
-			 * null, "pending", arrays, or arbitrary numerics are not proof that the
-			 * irreversible Wallet POST did not charge and therefore remain uncertain. */
+			/* Even an explicit paid=false is not proof that creating a second remote
+			 * order is safe: Checkout already produced a durable remote identity.
+			 * Values such as null, "pending", arrays, or arbitrary numerics are even
+			 * less conclusive. All of these remain quarantined from Checkout replay. */
 			if ( $payment_paid_known && ! $payment_paid ) {
 				$this->clear_order_payment_guard( $order_id );
-				return $this->fail_mobo_order_submission( $order, 'payment_not_paid', isset( $payment_json['description'] ) ? sanitize_text_field( (string) $payment_json['description'] ) : 'Mobo wallet payment explicitly reported paid=false.' );
+				return $this->mark_order_submission_uncertain(
+					$order,
+					'payment_not_paid_remote_order_exists',
+					isset( $payment_json['description'] ) ? sanitize_text_field( (string) $payment_json['description'] ) : 'Mobo explicitly reported paid=false, but the remote order already exists. Automatic Checkout replay is blocked.',
+					array( 'moboOrderId' => $pre_payment_mobo_order_id )
+				);
 			}
 
 			if ( ! $payment_success_known || ! $payment_paid_known || ! $payment_success || ! $payment_paid ) {
-				return $this->mark_order_submission_uncertain(
-					$order,
-					'payment_ack_incomplete',
-					'پاسخ مرحله پرداخت، موفقیت و پرداخت قطعی را به‌صورت صریح و سازگار تأیید نکرد. قبل از Retry، وضعیت سفارش در موبو بررسی شود.',
-					array( 'response' => $this->sanitize_order_log_value( $payment_json ) )
-				);
+				$reconcile = $this->reconcile_remote_order_details( $order, $token, $pre_payment_mobo_order_id );
+				if ( ! is_wp_error( $reconcile ) && ! empty( $reconcile['paidKnown'] ) && ! empty( $reconcile['paid'] ) ) {
+					$payment_json = array( 'success' => true, 'paid' => true, 'id' => $pre_payment_mobo_order_id, 'reconciled' => true );
+					$payment_success_known = true;
+					$payment_paid_known = true;
+					$payment_success = true;
+					$payment_paid = true;
+					$this->append_order_log( $order, 'wallet_incomplete_ack_reconciled', array( 'moboOrderId' => $pre_payment_mobo_order_id ) );
+				} else {
+					return $this->mark_order_submission_uncertain(
+						$order,
+						'payment_ack_incomplete',
+						'Wallet acknowledgement was incomplete and paid=true could not be positively reconciled. Automatic replay remains blocked.',
+						array( 'moboOrderId' => $pre_payment_mobo_order_id, 'response' => $this->sanitize_order_log_value( $payment_json ) )
+					);
+				}
 			}
 
 			$mobo_order_id = $pre_payment_mobo_order_id;
@@ -4652,7 +5937,13 @@ class Mobo_Core_Checkout_Validator {
 			$name         = wp_strip_all_tags( $line_item->get_name() );
 
 			if ( empty( $identity['isMobo'] ) ) {
-				/* Mixed orders are valid. Non-Mobo items stay in WooCommerce only. */
+				$errors[] = sprintf( 'سفارش ترکیبی است؛ آیتم غیرموبو «%s» اجازه ارسال جزئی سفارش به موبو را نمی‌دهد.', $name );
+				continue;
+			}
+			$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			$item_connection_id = absint( isset( $identity['connectionId'] ) ? $identity['connectionId'] : 0 );
+			if ( $current_connection_id <= 0 || $item_connection_id <= 0 || $item_connection_id !== $current_connection_id ) {
+				$errors[] = sprintf( 'مالکیت منبع آیتم «%s» با Connection فعال سفارش سازگار نیست.', $name );
 				continue;
 			}
 
@@ -4769,7 +6060,7 @@ class Mobo_Core_Checkout_Validator {
 		return $token;
 	}
 
-	private function build_mobo_checkout_payload( $order, $snapshot ) {
+	private function build_mobo_checkout_payload( $order, $snapshot, $contact = null ) {
 		if ( ! isset( $snapshot['cart'] ) || ! is_array( $snapshot['cart'] ) ) {
 			return new WP_Error( 'mobo_core_cart_snapshot_missing', 'Mobo cart snapshot does not contain cart.' );
 		}
@@ -4781,7 +6072,9 @@ class Mobo_Core_Checkout_Validator {
 		}
 		$cart['token'] = $token;
 
-		$contact = $this->build_mobo_order_contact_payload( $order );
+		if ( ! is_array( $contact ) ) {
+			$contact = $this->build_mobo_order_contact_payload( $order );
+		}
 		if ( is_wp_error( $contact ) ) {
 			return $contact;
 		}
@@ -4798,9 +6091,18 @@ class Mobo_Core_Checkout_Validator {
 		$cart['address']     = $contact['address'];
 		$cart['latitude']    = $contact['latitude'];
 		$cart['longitude']   = $contact['longitude'];
-		$cart['country_id']  = $contact['countryId'];
-		$cart['state_id']    = $contact['stateId'];
-		$cart['city_id']     = $contact['cityId'];
+
+		$provider = $this->get_mobo_provider();
+		if ( ! $provider instanceof Mobo_Core_Provider_Interface ) {
+			return new WP_Error( 'mobo_core_provider_unavailable', 'No supported provider is bound to the active Connection Source.' );
+		}
+		$location_fields = $provider->build_order_location_payload( isset( $contact['resolvedLocation'] ) ? $contact['resolvedLocation'] : array() );
+		if ( is_wp_error( $location_fields ) ) {
+			return $location_fields;
+		}
+		foreach ( is_array( $location_fields ) ? $location_fields : array() as $field => $value ) {
+			$cart[ $field ] = $value;
+		}
 
 		return $cart;
 	}
@@ -4840,30 +6142,23 @@ class Mobo_Core_Checkout_Validator {
 			}
 		}
 
-		$country_id = absint( $order->get_meta( '_mobo_' . $group . '_country_id', true ) );
-		$state_id   = absint( $order->get_meta( '_mobo_' . $group . '_state_id', true ) );
-		$city_id    = absint( $order->get_meta( '_mobo_' . $group . '_city_id', true ) );
-
-		if ( ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) && class_exists( 'Mobo_Core_Address_Mapping' ) ) {
-			$address_mapping = new Mobo_Core_Address_Mapping();
-			if ( method_exists( $address_mapping, 'resolve_order_group' ) ) {
-				$resolved = $address_mapping->resolve_order_group( $order, $group );
-				if ( is_wp_error( $resolved ) ) {
-					return $resolved;
-				}
-
-				$country_id = absint( isset( $resolved['countryId'] ) ? $resolved['countryId'] : 0 );
-				$state_id   = absint( isset( $resolved['stateId'] ) ? $resolved['stateId'] : 0 );
-				$city_id    = absint( isset( $resolved['cityId'] ) ? $resolved['cityId'] : 0 );
-				if ( method_exists( $address_mapping, 'write_order_group_location_meta' ) ) {
-					$address_mapping->write_order_group_location_meta( $order, $group, $resolved );
-				}
-			}
+		if ( ! class_exists( 'Mobo_Core_Address_Mapping' ) ) {
+			return new WP_Error( 'mobo_core_location_resolver_unavailable', 'Central location resolver integration is unavailable.', array( 'action' => 'defer' ) );
 		}
-
-		if ( $country_id <= 0 || $state_id <= 0 || $city_id <= 0 ) {
-			return new WP_Error( 'mobo_core_location_ids_missing', 'شناسه کشور، استان یا شهر موبو روی سفارش کامل نیست. نگاشت کشور و استان و وضعیت فایل شهرهای موبو را در تب اعتبارسنجی خرید بررسی کنید.' );
+		$address_mapping = new Mobo_Core_Address_Mapping();
+		if ( ! method_exists( $address_mapping, 'resolve_order_group_via_backend' ) ) {
+			return new WP_Error( 'mobo_core_location_resolver_unavailable', 'Central location resolver integration is unavailable.', array( 'action' => 'defer' ) );
 		}
+		$resolved = $address_mapping->resolve_order_group_via_backend( $order, $group );
+		if ( is_wp_error( $resolved ) ) {
+			return $resolved;
+		}
+		if ( method_exists( $address_mapping, 'write_order_group_location_meta' ) ) {
+			$address_mapping->write_order_group_location_meta( $order, $group, $resolved );
+		}
+		$country_id = absint( $resolved['countryId'] ?? 0 );
+		$state_id   = absint( $resolved['stateId'] ?? 0 );
+		$city_id    = absint( $resolved['cityId'] ?? 0 );
 
 		$address_1 = 'shipping' === $group ? $order->get_shipping_address_1() : $order->get_billing_address_1();
 		$address_2 = 'shipping' === $group ? $order->get_shipping_address_2() : $order->get_billing_address_2();
@@ -4893,6 +6188,10 @@ class Mobo_Core_Checkout_Validator {
 			'countryId'       => $country_id,
 			'stateId'         => $state_id,
 			'cityId'          => $city_id,
+			'countryExternalId' => sanitize_text_field( (string) ( $resolved['countryExternalId'] ?? '' ) ),
+			'stateExternalId'   => sanitize_text_field( (string) ( $resolved['stateExternalId'] ?? '' ) ),
+			'cityExternalId'    => sanitize_text_field( (string) ( $resolved['cityExternalId'] ?? '' ) ),
+			'resolvedLocation'  => $resolved,
 			'latitude'        => $this->order_meta_float_or_null( $order, '_mobo_' . $group . '_city_latitude' ),
 			'longitude'       => $this->order_meta_float_or_null( $order, '_mobo_' . $group . '_city_longitude' ),
 		);
@@ -5037,6 +6336,9 @@ class Mobo_Core_Checkout_Validator {
 			'addressGroup'    => sanitize_key( (string) ( isset( $contact['addressGroup'] ) ? $contact['addressGroup'] : '' ) ),
 			'zipcode'         => sanitize_text_field( (string) $contact['zipcode'] ),
 			'address'         => sanitize_text_field( (string) $contact['address'] ),
+			'countryExternalId' => sanitize_text_field( (string) ( $contact['countryExternalId'] ?? '' ) ),
+			'stateExternalId'   => sanitize_text_field( (string) ( $contact['stateExternalId'] ?? '' ) ),
+			'cityExternalId'    => sanitize_text_field( (string) ( $contact['cityExternalId'] ?? '' ) ),
 			'countryId'       => absint( $contact['countryId'] ),
 			'stateId'         => absint( $contact['stateId'] ),
 			'cityId'          => absint( $contact['cityId'] ),
@@ -5087,6 +6389,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @return WC_Order|WP_Error
 	 */
 	private function validate_order_before_wallet_payment( $order_id, $expected_snapshot, $expected_shipping_id, $shippings_json ) {
+
 		/* Auto-order may be switched off while this worker is preparing the remote cart.
 		 * The shared-cart work is reversible; Wallet Payment is not. Pause at this last
 		 * boundary and leave the order durably queued until the merchant enables it again. */
@@ -5104,6 +6407,17 @@ class Mobo_Core_Checkout_Validator {
 		}
 		if ( 'processing' !== sanitize_key( (string) $fresh->get_status() ) ) {
 			return new WP_Error( 'mobo_core_final_order_status_changed', 'وضعیت سفارش WooCommerce قبل از پرداخت موبو از «در حال انجام» خارج شد؛ پرداخت موبو متوقف شد.', array( 'action' => 'abort', 'status' => $fresh->get_status() ) );
+		}
+
+		/* Last irreversible boundary: neither a Store currency switch nor a
+		 * changed signed Source monetary contract may reach Wallet unnoticed. */
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$final_money = class_exists( 'Mobo_Core_Money_Policy' ) && $current_connection_id > 0
+			? Mobo_Core_Money_Policy::assert_compatible( $current_connection_id, true )
+			: new WP_Error( 'mobo_core_money_context_missing', 'Order monetary Connection is unavailable.' );
+		if ( is_wp_error( $final_money ) || ! class_exists( 'Mobo_Core_Money_Policy' ) || '' === Mobo_Core_Money_Policy::normalize_unit( $fresh->get_currency() )
+			|| Mobo_Core_Money_Policy::normalize_unit( $fresh->get_currency() ) !== Mobo_Core_Money_Policy::store_unit() ) {
+			return new WP_Error( 'mobo_core_final_order_currency_changed', 'ارز سفارش یا قرارداد Source قبل از پرداخت موبو تغییر کرده است؛ Wallet اجرا نمی‌شود.', array( 'action' => 'abort' ) );
 		}
 
 		$current_snapshot = $this->build_order_submission_business_snapshot( $fresh );
@@ -5156,7 +6470,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function get_mobo_order_details( $order, $token ) {
-		$response = $this->order_mobo_request( $order, 'GET', '/site/api/v1/cart/details?token=' . rawurlencode( (string) $token ), null, 'cart_details' );
+		$response = $this->order_mobo_request( $order, 'GET', $this->get_provider_endpoint( 'cart_details', array( 'token' => (string) $token ) ), null, 'cart_details' );
 		if ( is_wp_error( $response ) ) {
 			return $response;
 		}
@@ -5171,7 +6485,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function get_mobo_order_shippings( $order, $token ) {
-		$response = $this->order_mobo_request( $order, 'GET', '/site/api/v1/cart/shippings?token=' . rawurlencode( (string) $token ), null, 'cart_shippings' );
+		$response = $this->order_mobo_request( $order, 'GET', $this->get_provider_endpoint( 'cart_shippings', array( 'token' => (string) $token ) ), null, 'cart_shippings' );
 		if ( is_wp_error( $response ) ) {
 			return $response;
 		}
@@ -5223,6 +6537,7 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	private function order_mobo_request( $order, $method, $path, $payload, $step, $allow_auth_retry = true ) {
+
 		$response = $this->mobo_request( $method, $path, $payload );
 		if ( $allow_auth_retry && $this->is_auth_error_response( $response ) ) {
 			$this->append_order_log( $order, $step . '_auth_retry', array(
@@ -5389,10 +6704,15 @@ class Mobo_Core_Checkout_Validator {
 		$order->update_meta_data( '_mobo_order_token', sanitize_text_field( (string) $token ) );
 		$order->update_meta_data( '_mobo_order_shipping_id', absint( $shipping_id ) );
 		$order->update_meta_data( '_mobo_order_paid', ! empty( $payment_json['paid'] ) && $this->to_bool( $payment_json['paid'] ) ? 'yes' : 'no' );
+		$pending_business_fingerprint = sanitize_text_field( (string) $order->get_meta( '_mobo_order_pending_business_fingerprint', true ) );
+		if ( '' !== $pending_business_fingerprint ) { $order->update_meta_data( '_mobo_order_purchase_business_fingerprint', $pending_business_fingerprint ); }
 		$order->delete_meta_data( '_mobo_order_last_error_code' );
 		$order->delete_meta_data( '_mobo_order_last_error' );
 		$order->delete_meta_data( '_mobo_order_failed_at' );
 		$order->delete_meta_data( '_mobo_order_uncertain_at' );
+		foreach ( array( '_mobo_order_pending_stage', '_mobo_order_pending_attempt_key', '_mobo_order_pending_updated_at', '_mobo_order_pending_token', '_mobo_order_pending_token_sha256', '_mobo_order_pending_remote_id', '_mobo_order_pending_shipping_id', '_mobo_order_pending_business_fingerprint' ) as $pending_key ) {
+			$order->delete_meta_data( $pending_key );
+		}
 		$saved_id = absint( $order->save() );
 		if ( $saved_id <= 0 ) {
 			return false;
@@ -5591,7 +6911,12 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	public function handle_admin_retry_mobo_order_submission() {
-		$order_id = isset( $_REQUEST['order_id'] ) ? absint( wp_unslash( $_REQUEST['order_id'] ) ) : 0;
+		$request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
+		if ( 'POST' !== $request_method ) {
+			wp_die( esc_html__( 'این عملیات فقط با درخواست امن POST مجاز است.', 'mobo-core' ), '', array( 'response' => 405 ) );
+		}
+
+		$order_id = isset( $_POST['order_id'] ) ? absint( wp_unslash( $_POST['order_id'] ) ) : 0;
 		if ( $order_id <= 0 || ! current_user_can( 'edit_shop_order', $order_id ) ) {
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
@@ -5618,17 +6943,13 @@ class Mobo_Core_Checkout_Validator {
 
 		$attempt_state    = $this->get_order_submission_attempt_state( $order );
 		$submit_status    = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
-		$verified_absent  = isset( $_REQUEST['verified_absent'] ) && '1' === sanitize_text_field( wp_unslash( $_REQUEST['verified_absent'] ) );
+		$verified_absent  = isset( $_POST['verified_absent'] ) && '1' === sanitize_text_field( wp_unslash( $_POST['verified_absent'] ) );
 		$currently_queued = 'queued' === $submit_status || $this->is_order_id_in_option_queue( $order_id );
+		$pending_remote_id = absint( $order->get_meta( '_mobo_order_pending_remote_id', true ) );
+		$pending_token = $this->parse_mobo_cart_token( $order->get_meta( '_mobo_order_pending_token', true ) );
 
 		if ( 'running_recent' === $attempt_state || $currently_queued ) {
 			$order->add_order_note( 'ارسال مجدد به موبو انجام نشد، چون تلاش قبلی هنوز در حال اجرا یا در صف است.' );
-			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
-			exit;
-		}
-
-		if ( in_array( $attempt_state, array( 'running_stale', 'uncertain' ), true ) && ! $verified_absent ) {
-			$order->add_order_note( 'Retry این سفارش مسدود شد: نتیجه تلاش قبلی قطعی نیست. ابتدا در موبو بررسی کنید که سفارش/پرداخت ایجاد نشده باشد؛ سپس از دکمه تأییدشده Retry استفاده کنید.' );
 			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
 			exit;
 		}
@@ -5643,6 +6964,39 @@ class Mobo_Core_Checkout_Validator {
 			$this->mark_order_as_not_mobo( $order, $scope, 'admin_manual_retry' );
 			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
 			exit;
+		}
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$this->mark_order_scope_unsubmittable( $order, $scope, 'admin_manual_retry' );
+			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+			exit;
+		}
+
+		$connection_block_reason = $this->get_order_submission_connection_block_reason( $scope );
+		if ( '' !== $connection_block_reason ) {
+			$order->add_order_note( 'ارسال دستی به موبو انجام نشد: ' . $connection_block_reason );
+			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+			exit;
+		}
+
+		if ( in_array( $attempt_state, array( 'running_stale', 'uncertain' ), true ) ) {
+			if ( $pending_remote_id > 0 && '' !== $pending_token && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+				$connection_id = absint( isset( $scope['connectionId'] ) ? $scope['connectionId'] : 0 );
+				$reconciled = $connection_id > 0 ? Mobo_Core_Connection_Context::run( $connection_id, function () use ( $order ) { return $this->reconcile_uncertain_paid_order_with_cart_lock( $order ); } ) : new WP_Error( 'mobo_core_order_connection_context_missing', 'Order Source context is unavailable.' );
+				if ( true === $reconciled ) {
+					$order = wc_get_order( $order_id );
+					if ( $order instanceof WC_Order ) { $order->add_order_note( 'وضعیت مبهم با استعلام مثبت از موبو بازیابی شد؛ سفارش قبلی پرداخت‌شده بود و Retry انجام نشد.' ); }
+					wp_safe_redirect( wp_get_referer() ? wp_get_referer() : ( $order instanceof WC_Order ? $order->get_edit_order_url() : admin_url( 'edit.php?post_type=shop_order' ) ) );
+					exit;
+				}
+				$order->add_order_note( 'Retry مسدود شد: یک Mobo Order ID durable برای تلاش قبلی وجود دارد و paid=true هنوز به‌صورت مثبت اثبات نشده است. تأیید دستیِ «عدم وجود سفارش» نمی‌تواند این evidence را override کند.' );
+				wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+				exit;
+			}
+			if ( ! $verified_absent ) {
+				$order->add_order_note( 'Retry این سفارش مسدود شد: نتیجه تلاش قبلی قطعی نیست و هیچ remote identity قابل reconciliation موجود نیست. ابتدا عدم وجود سفارش/پرداخت در موبو را بررسی و سپس Retry تأییدشده را استفاده کنید.' );
+				wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+				exit;
+			}
 		}
 
 		$this->append_order_log(
@@ -5682,11 +7036,6 @@ class Mobo_Core_Checkout_Validator {
 							'postPaymentDiverged' => $post_payment_diverged,
 						)
 					);
-				} elseif ( 'mixed' === (string) $scope['status'] ) {
-					$order->update_meta_data( '_mobo_order_scope_status', 'mixed' );
-					$order->update_meta_data( '_mobo_order_kept_processing', 'yes' );
-					$order->save();
-					$order->add_order_note( 'اقلام موبو ثبت شدند؛ سفارش ترکیبی برای پردازش اقلام غیرموبو در وضعیت در حال انجام باقی ماند.' );
 				} elseif (
 					'all_mobo' === (string) $scope['status']
 					&& Mobo_Core_Settings::enabled( 'mobo_core_mobo_order_auto_complete_enabled', '1' )
@@ -5701,7 +7050,12 @@ class Mobo_Core_Checkout_Validator {
 	}
 
 	public function handle_admin_clear_mobo_order_log() {
-		$order_id = isset( $_REQUEST['order_id'] ) ? absint( wp_unslash( $_REQUEST['order_id'] ) ) : 0;
+		$request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : '';
+		if ( 'POST' !== $request_method ) {
+			wp_die( esc_html__( 'این عملیات فقط با درخواست امن POST مجاز است.', 'mobo-core' ), '', array( 'response' => 405 ) );
+		}
+
+		$order_id = isset( $_POST['order_id'] ) ? absint( wp_unslash( $_POST['order_id'] ) ) : 0;
 		if ( $order_id <= 0 || ! current_user_can( 'edit_shop_order', $order_id ) ) {
 			wp_die( esc_html__( 'شما دسترسی لازم را ندارید.', 'mobo-core' ) );
 		}
@@ -5717,6 +7071,193 @@ class Mobo_Core_Checkout_Validator {
 		exit;
 	}
 
+	/** Return an operator-facing reason when the order owner's Connection cannot mutate runtime state. */
+	private function get_order_submission_connection_block_reason( $scope ) {
+		$connection_id = is_array( $scope ) && isset( $scope['connectionId'] ) ? absint( $scope['connectionId'] ) : 0;
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return 'اتصال مالک این سفارش قابل تشخیص نیست؛ ارسال به موبو متوقف است.';
+		}
+		$connection = Mobo_Core_Connection_Repository::get_by_id( $connection_id );
+		if ( ! is_array( $connection ) ) {
+			return 'اتصال مالک این سفارش دیگر در دسترس نیست؛ ارسال به موبو متوقف است.';
+		}
+		if ( empty( $connection['is_enabled'] ) ) {
+			return 'اتصال مالک این سفارش غیرفعال است. ابتدا وضعیت Connection را بررسی کنید.';
+		}
+		if ( ! Mobo_Core_Connection_Repository::is_provisioned( $connection ) ) {
+			return 'اتصال مالک این سفارش هنوز Provision نشده است. ابتدا صفحه «اتصال و لایسنس» را تکمیل/بررسی کنید.';
+		}
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			return 'سیاست واحد پول موبو در دسترس نیست؛ ارسال سفارش Fail-Closed متوقف شده است.';
+		}
+		$money_status = Mobo_Core_Money_Policy::compatibility_status( $connection_id, true );
+		if ( empty( $money_status['compatible'] ) ) {
+			$source_unit = sanitize_text_field( (string) ( $money_status['sourceUnit'] ?? '' ) );
+			$store_unit = sanitize_text_field( (string) ( $money_status['storeUnit'] ?? '' ) );
+			if ( '' !== $source_unit && '' !== $store_unit ) {
+				return sprintf( 'واحد پول Source (%s) با واحد پول WooCommerce (%s) سازگار نیست؛ ارسال سفارش متوقف است.', $source_unit, $store_unit );
+			}
+			return 'قرارداد واحد پول این Connection ناقص است؛ Backend باید Connection را مجدداً Provision کند.';
+		}
+		static $multi_runtime_ready = null;
+		if ( null === $multi_runtime_ready ) {
+			$multi_runtime_ready = Mobo_Core_Connection_Repository::multi_connection_runtime_ready();
+		}
+		if ( ! $multi_runtime_ready ) {
+			return 'مالکیت Multi-Connection هنوز برای runtime آماده نیست؛ ارسال سفارش Fail-Closed باقی می‌ماند.';
+		}
+		return '';
+	}
+
+	/**
+	 * Build one authoritative administrator-facing state for Order List and Order Detail.
+	 *
+	 * @param WC_Order $order Order.
+	 * @return array
+	 */
+	private function get_order_admin_submission_state( $order ) {
+		$state = array(
+			'label'                  => '—',
+			'message'                => '',
+			'tone'                   => 'neutral',
+			'canRetry'               => false,
+			'requiresVerifiedAbsent' => false,
+			'retryLabel'             => 'ارسال به موبو',
+			'scope'                  => array(),
+		);
+		if ( ! $order instanceof WC_Order ) {
+			return $state;
+		}
+
+		$requires_review       = 'yes' === (string) $order->get_meta( '_mobo_order_requires_review', true );
+		$post_payment_diverged = 'yes' === (string) $order->get_meta( '_mobo_order_post_payment_diverged', true );
+		$submitted             = 'yes' === (string) $order->get_meta( '_mobo_order_submitted', true );
+		$mobo_order_id         = absint( $order->get_meta( '_mobo_order_id', true ) );
+
+		/* Submitted orders do not need a fresh catalogue/scope walk merely to render
+		 * the order list. Their durable remote-success/review evidence is authoritative. */
+		if ( $submitted || $mobo_order_id > 0 ) {
+			if ( $requires_review || $post_payment_diverged ) {
+				$state['label']   = 'ثبت شد؛ نیازمند بررسی';
+				$state['tone']    = 'warning';
+				$state['message'] = $post_payment_diverged
+					? 'سفارش/پرداخت در موبو ثبت شده است، اما وضعیت تجاری WooCommerce پس از مرز پرداخت تغییر کرده یا قابل تأیید نبوده است. Retry نکنید؛ اقلام، تعداد، آدرس و روش ارسال را با سفارش موبو تطبیق دهید.'
+					: 'سفارش در موبو ثبت شده است اما یک وضعیت پس از ثبت نیازمند بررسی مدیر است. Retry نکنید و جزئیات فنی/یادداشت‌های سفارش را بررسی کنید.';
+			} else {
+				$state['label']   = $mobo_order_id > 0 ? 'ثبت شد #' . $mobo_order_id : 'ثبت شد';
+				$state['tone']    = 'success';
+				$state['message'] = 'این سفارش در موبو ثبت شده است و ارسال مجدد مجاز نیست.';
+			}
+			return $state;
+		}
+
+		$scope                 = $this->get_order_mobo_item_scope( $order );
+		$scope_status          = sanitize_key( (string) ( isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
+		$submit_status         = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
+		$attempt_state         = $this->get_order_submission_attempt_state( $order );
+		$currently_queued      = 'queued' === $submit_status || $this->is_order_id_in_option_queue( $order->get_id() );
+		$last_error            = sanitize_text_field( (string) $order->get_meta( '_mobo_order_last_error', true ) );
+		$state['scope']        = $scope;
+
+		if ( 'invalid' === $scope_status ) {
+			$state['label']   = 'هویت نامشخص؛ نیازمند بررسی';
+			$state['tone']    = 'error';
+			$state['message'] = $this->build_unsubmittable_order_message( $scope );
+			return $state;
+		}
+		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
+			$state['label']   = 'مربوط به موبو نیست';
+			$state['message'] = 'این سفارش آیتم موبوی قابل ارسال ندارد و هیچ عملیات ارسال به موبو برای آن لازم نیست.';
+			return $state;
+		}
+		if ( ! $this->order_scope_is_submittable( $scope ) ) {
+			$state['label']   = 'multi_connection' === $scope_status ? 'چند اتصال؛ ارسال نمی‌شود' : ( 'mixed' === $scope_status ? 'ترکیبی؛ ارسال نمی‌شود' : 'ارسال مسدود است' );
+			$state['tone']    = in_array( $scope_status, array( 'multi_connection', 'invalid' ), true ) ? 'error' : 'warning';
+			$state['message'] = $this->build_unsubmittable_order_message( $scope );
+			return $state;
+		}
+
+		$connection_block_reason = $this->get_order_submission_connection_block_reason( $scope );
+		if ( '' !== $connection_block_reason ) {
+			$state['label']   = 'اتصال مالک آماده نیست';
+			$state['tone']    = 'error';
+			$state['message'] = $connection_block_reason;
+			return $state;
+		}
+
+		if ( 'processing' !== sanitize_key( (string) $order->get_status() ) ) {
+			$state['label']   = 'خارج از وضعیت ارسال';
+			$state['message'] = 'ارسال سفارش موبو فقط زمانی مجاز است که سفارش WooCommerce در وضعیت «در حال انجام (processing)» باشد.';
+			return $state;
+		}
+
+		if ( 'running_recent' === $attempt_state ) {
+			$state['label']   = 'در حال ارسال';
+			$state['tone']    = 'info';
+			$state['message'] = 'یک تلاش ارسال هنوز در حال اجرا است. برای جلوگیری از سفارش تکراری، Retry در دسترس نیست.';
+			return $state;
+		}
+		if ( $currently_queued ) {
+			$state['label']   = 'در صف ارسال';
+			$state['tone']    = 'info';
+			$state['message'] = 'سفارش در صف پردازش موبو قرار دارد. تا تعیین نتیجه صف، Retry در دسترس نیست.';
+			return $state;
+		}
+		if ( in_array( $attempt_state, array( 'running_stale', 'uncertain' ), true ) ) {
+			$state['label']                  = 'نتیجه نامشخص؛ بررسی در موبو';
+			$state['tone']                   = 'error';
+			$state['message']                = 'ممکن است تلاش قبلی در موبو سفارش یا پرداخت ایجاد کرده باشد. قبل از هر Retry، وجود سفارش/پرداخت را در پنل موبو بررسی کنید.';
+			$state['canRetry']               = true;
+			$state['requiresVerifiedAbsent'] = true;
+			$state['retryLabel']             = 'تأیید عدم ثبت در موبو و ارسال مجدد';
+			return $state;
+		}
+
+		if ( 'failed' === $submit_status ) {
+			$state['label']      = 'ارسال ناموفق';
+			$state['tone']       = 'error';
+			$state['message']    = '' !== $last_error ? 'آخرین تلاش ناموفق بود: ' . $last_error : 'آخرین تلاش ارسال ناموفق بود. جزئیات فنی را بررسی کنید و در صورت رفع علت Retry کنید.';
+			$state['canRetry']   = true;
+			$state['retryLabel'] = 'ارسال مجدد به موبو';
+			return $state;
+		}
+		if ( 'aborted' === $submit_status ) {
+			$state['label']      = 'ارسال قبل از پرداخت متوقف شد';
+			$state['tone']       = 'warning';
+			$state['message']    = '' !== $last_error ? $last_error : 'تلاش قبلی قبل از Wallet Payment متوقف شد. اگر علت برطرف شده است، ارسال مجدد مجاز است.';
+			$state['canRetry']   = true;
+			$state['retryLabel'] = 'ارسال مجدد به موبو';
+			return $state;
+		}
+
+		$state['label']      = 'آماده ارسال';
+		$state['message']    = 'این سفارش تماماً موبو، متعلق به یک Connection و در وضعیت processing است. ارسال دستی در صورت نیاز مجاز است.';
+		$state['canRetry']   = true;
+		$state['retryLabel'] = 'ارسال به موبو';
+		return $state;
+	}
+
+	/** Render a POST-only submission action after the same fail-closed state classification used by the list. */
+	private function render_admin_order_action_form( $order_id, $state ) {
+		$order_id = absint( $order_id );
+		if ( $order_id <= 0 || ! is_array( $state ) || empty( $state['canRetry'] ) ) {
+			return;
+		}
+		$verified_absent = ! empty( $state['requiresVerifiedAbsent'] );
+		$confirm = $verified_absent
+			? 'تأیید می‌کنم در موبو بررسی کرده‌ام و این سفارش/پرداخت ایجاد نشده است. ارسال مجدد انجام شود؟'
+			: 'ارسال این سفارش به موبو انجام شود؟';
+		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="margin-top:10px;">';
+		echo '<input type="hidden" name="action" value="mobo_core_retry_mobo_order_submission">';
+		echo '<input type="hidden" name="order_id" value="' . esc_attr( (string) $order_id ) . '">';
+		if ( $verified_absent ) {
+			echo '<input type="hidden" name="verified_absent" value="1">';
+		}
+		wp_nonce_field( 'mobo_core_retry_mobo_order_submission_' . $order_id );
+		echo '<button type="submit" class="button button-primary" onclick="return confirm(' . esc_attr( wp_json_encode( $confirm ) ) . ');">' . esc_html( (string) $state['retryLabel'] ) . '</button>';
+		echo '</form>';
+	}
+
 	public function render_order_meta_box( $object ) {
 		$order = $this->resolve_admin_order_object( $object );
 		if ( ! $order instanceof WC_Order ) {
@@ -5724,68 +7265,51 @@ class Mobo_Core_Checkout_Validator {
 			return;
 		}
 
-		$order_id = $order->get_id();
-		$status = $this->get_order_mobo_submission_label( $order );
-		$log    = $order->get_meta( '_mobo_order_submission_log', true );
-		$log_array = is_array( $log ) ? $log : array();
-		$copy   = wp_json_encode( $log_array, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
-		$last_entry = ! empty( $log_array ) ? end( $log_array ) : array();
+		$order_id    = $order->get_id();
+		$state       = $this->get_order_admin_submission_state( $order );
+		$log         = $order->get_meta( '_mobo_order_submission_log', true );
+		$log_array   = is_array( $log ) ? $log : array();
+		$copy        = wp_json_encode( $log_array, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		$last_entry  = ! empty( $log_array ) ? end( $log_array ) : array();
 		$last_action = is_array( $last_entry ) && isset( $last_entry['action'] ) ? (string) $last_entry['action'] : '—';
-		$last_http = '—';
+		$last_http   = '—';
 		if ( is_array( $last_entry ) && isset( $last_entry['context'] ) && is_array( $last_entry['context'] ) && isset( $last_entry['context']['httpstatus'] ) ) {
 			$last_http = (string) $last_entry['context']['httpstatus'];
 		}
 
-		echo '<p><strong>وضعیت:</strong> ' . esc_html( $status ) . '</p>';
+		echo '<div id="mobo-order-admin-state">';
+		echo '<p><strong>وضعیت موبو:</strong> ' . esc_html( (string) $state['label'] ) . '</p>';
+		if ( '' !== (string) $state['message'] ) {
+			echo '<p>' . esc_html( (string) $state['message'] ) . '</p>';
+		}
+		if ( ! empty( $state['requiresVerifiedAbsent'] ) ) {
+			echo '<p><strong>اقدام لازم:</strong> قبل از Retry، سفارش/پرداخت را در پنل موبو جستجو کنید. Retry بدون این بررسی می‌تواند سفارش تکراری ایجاد کند.</p>';
+		}
+		$this->render_admin_order_action_form( $order_id, $state );
+
+		echo '<details style="margin-top:12px;">';
+		echo '<summary style="cursor:pointer;font-weight:600;">جزئیات فنی</summary>';
+		echo '<div style="margin-top:10px;">';
 		echo '<p><strong>Mobo Order ID:</strong> ' . esc_html( (string) $order->get_meta( '_mobo_order_id', true ) ) . '</p>';
 		$stored_token = (string) $order->get_meta( '_mobo_order_token', true );
-		$masked_token = '' === $stored_token ? '' : ( strlen( $stored_token ) <= 6 ? '••••••' : '••••••' . substr( $stored_token, -6 ) );
-		echo '<p><strong>Token:</strong> ' . esc_html( $masked_token ) . '</p>';
-		echo '<p><strong>کد خطا:</strong> ' . esc_html( (string) $order->get_meta( '_mobo_order_last_error_code', true ) ) . '</p>';
-		echo '<p><strong>آخرین خطا:</strong> ' . esc_html( (string) $order->get_meta( '_mobo_order_last_error', true ) ) . '</p>';
+		$masked_token = '' === $stored_token ? '—' : ( strlen( $stored_token ) <= 6 ? '••••••' : '••••••' . substr( $stored_token, -6 ) );
+		echo '<p><strong>توکن سفارش (ماسک‌شده):</strong> ' . esc_html( $masked_token ) . '</p>';
+		echo '<p><strong>کد وضعیت/خطا:</strong> ' . esc_html( (string) $order->get_meta( '_mobo_order_last_error_code', true ) ) . '</p>';
+		echo '<p><strong>آخرین پیام:</strong> ' . esc_html( (string) $order->get_meta( '_mobo_order_last_error', true ) ) . '</p>';
 		echo '<p><strong>آخرین مرحله لاگ:</strong> ' . esc_html( $last_action ) . ' / HTTP: ' . esc_html( $last_http ) . '</p>';
-
-		echo '<textarea readonly onclick="this.select();" style="width:100%;min-height:260px;font-family:monospace;font-size:11px;direction:ltr;">' . esc_textarea( $copy ) . '</textarea>';
-		echo '<p class="description">این لاگ برای کپی کردن و ارسال به پشتیبان نرم‌افزار است. رمز و cookie داخل آن ذخیره نمی‌شود. روی textarea کلیک کنید تا متن انتخاب شود.</p>';
-
-		if ( 'yes' !== (string) $order->get_meta( '_mobo_order_submitted', true ) && '' === (string) $order->get_meta( '_mobo_order_id', true ) ) {
-			$attempt_state    = $this->get_order_submission_attempt_state( $order );
-			$submit_status    = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
-			$currently_queued = 'queued' === $submit_status || $this->is_order_id_in_option_queue( $order_id );
-
-			if ( 'running_recent' === $attempt_state || $currently_queued ) {
-				echo '<p class="description" style="color:#996800;">Retry در دسترس نیست؛ تلاش قبلی هنوز در صف یا در حال اجرا است.</p>';
-			} else {
-				$verified_absent = in_array( $attempt_state, array( 'running_stale', 'uncertain' ), true );
-				$args = array(
-					'action'   => 'mobo_core_retry_mobo_order_submission',
-					'order_id' => $order_id,
-				);
-				if ( $verified_absent ) {
-					$args['verified_absent'] = '1';
-				}
-				$retry_url = wp_nonce_url( add_query_arg( $args, admin_url( 'admin-post.php' ) ), 'mobo_core_retry_mobo_order_submission_' . $order_id );
-
-				if ( $verified_absent ) {
-					echo '<p class="description" style="color:#b32d2e;"><strong>هشدار:</strong> نتیجه تلاش قبلی قطعی نیست. فقط اگر در پنل موبو بررسی کرده‌اید و مطمئن هستید سفارش/پرداخت ایجاد نشده است Retry کنید.</p>';
-					echo '<p style="margin-top:10px;"><a href="' . esc_url( $retry_url ) . '" class="button button-primary" onclick="return confirm(&quot;تأیید می‌کنم در موبو بررسی کرده‌ام و این سفارش/پرداخت ایجاد نشده است. ارسال مجدد انجام شود؟&quot;);">تأیید عدم ثبت در موبو و ارسال مجدد</a></p>';
-				} else {
-					echo '<p style="margin-top:10px;"><a href="' . esc_url( $retry_url ) . '" class="button button-primary" onclick="return confirm(&quot;ارسال مجدد این سفارش به موبو انجام شود؟&quot;);">ارسال مجدد به موبو</a></p>';
-				}
-			}
+		if ( ! empty( $log_array ) ) {
+			echo '<textarea readonly onclick="this.select();" style="width:100%;min-height:220px;font-family:monospace;font-size:11px;direction:ltr;">' . esc_textarea( $copy ) . '</textarea>';
+			echo '<p class="description">این لاگ برای پشتیبانی است. فیلدهای حساس شناخته‌شده ماسک می‌شوند و body غیر JSON به‌صورت خام ذخیره نمی‌شود. پاک‌کردن لاگ، وضعیت ارسال/Retry guard یا شناسه سفارش موبو را تغییر نمی‌دهد.</p>';
+			echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="margin-top:8px;">';
+			echo '<input type="hidden" name="action" value="mobo_core_clear_mobo_order_log">';
+			echo '<input type="hidden" name="order_id" value="' . esc_attr( (string) $order_id ) . '">';
+			wp_nonce_field( 'mobo_core_clear_mobo_order_log_' . $order_id );
+			echo '<button type="submit" class="button" onclick="return confirm(&quot;فقط لاگ فنی این سفارش پاک شود؟ وضعیت ارسال و guardهای ایمنی حفظ می‌شوند.&quot;);">پاک کردن لاگ فنی</button>';
+			echo '</form>';
+		} else {
+			echo '<p class="description">برای این سفارش هنوز لاگ فنی موبو ثبت نشده است.</p>';
 		}
-
-		$clear_url = wp_nonce_url(
-			add_query_arg(
-				array(
-					'action'   => 'mobo_core_clear_mobo_order_log',
-					'order_id' => $order_id,
-				),
-				admin_url( 'admin-post.php' )
-			),
-			'mobo_core_clear_mobo_order_log_' . $order_id
-		);
-		echo '<p style="margin-top:8px;"><a href="' . esc_url( $clear_url ) . '" class="button" onclick="return confirm(&quot;لاگ موبو این سفارش پاک شود؟&quot;);">پاک کردن لاگ موبو</a></p>';
+		echo '</div></details></div>';
 	}
 
 	public function add_legacy_order_column( $columns ) {
@@ -5848,6 +7372,13 @@ class Mobo_Core_Checkout_Validator {
 		if ( $order_id <= 0 ) {
 			return false;
 		}
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			/* This probe also gates administrator manual Retry. SQL/cutover failure
+			 * means UNKNOWN, never 'not queued' (which could allow another payment). */
+			if ( ! $this->primary_order_row_store_ready() ) { return true; }
+			$read = Mobo_Core_Work_Queue_Store::read_one_checked( self::ORDER_QUEUE_TYPE, (string) $order_id );
+			return 'missing' !== $read['status'];
+		}
 		$queue = $this->get_option_backed_order_queue();
 		return isset( $queue[ (string) $order_id ] );
 	}
@@ -5856,31 +7387,9 @@ class Mobo_Core_Checkout_Validator {
 		if ( ! $order instanceof WC_Order ) {
 			return '—';
 		}
-		if ( 'yes' === (string) $order->get_meta( '_mobo_order_submitted', true ) ) {
-			$id = absint( $order->get_meta( '_mobo_order_id', true ) );
-			return $id > 0 ? 'ثبت شد #' . $id : 'ثبت شد';
-		}
-		$status = (string) $order->get_meta( '_mobo_order_submit_status', true );
-		if ( 'not_mobo' === $status ) {
-			return 'مربوط به موبو نیست';
-		}
-		$scope = $this->get_order_mobo_item_scope( $order );
-		if ( ! $this->order_scope_has_mobo_items( $scope ) ) {
-			return 'مربوط به موبو نیست';
-		}
-		if ( 'failed' === $status ) {
-			return 'خطا';
-		}
-		if ( 'uncertain' === $status ) {
-			return 'نیازمند بررسی در موبو';
-		}
-		if ( 'queued' === (string) $order->get_meta( '_mobo_order_submit_status', true ) || $this->is_order_id_in_option_queue( $order->get_id() ) ) {
-			return 'در صف ارسال';
-		}
-		if ( 'yes' === (string) $order->get_meta( '_mobo_order_submit_attempted', true ) ) {
-			return 'ارسال شده / منتظر نتیجه';
-		}
-		return 'ارسال نشده';
+		$state = $this->get_order_admin_submission_state( $order );
+		return isset( $state['label'] ) ? sanitize_text_field( (string) $state['label'] ) : '—';
 	}
+
 
 }

@@ -107,7 +107,28 @@ class Mobo_Core_Self_Runner {
 			);
 		}
 
-		$now      = time();
+		$now = time();
+
+		/* Scheduler fairness: an internal continuation must not monopolize the
+		 * dispatcher when repeated real scheduler hits show an active schedule
+		 * and the last *actual* scheduler success is becoming stale. Preserve the
+		 * durable pending wake-up above; the next real cron may claim it. External
+		 * producers (webhooks, manual/heartbeat kicks) are not suppressed, and
+		 * when real cron stops arriving continuations resume normally. Never
+		 * manufacture a scheduler success or preempt a currently owned lease. */
+		if ( self::should_yield_continuation_to_real_cron( $reason, $now ) ) {
+			return self::save_kick_result(
+				array(
+					'success'     => true,
+					'status'      => 'scheduler-yield',
+					'message'     => 'Internal continuation yielded the next dispatcher claim to an active real cron schedule.',
+					'reason'      => $reason,
+					'lastHitAt'   => absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) ),
+					'lastSuccessAt' => absint( get_option( 'mobo_core_real_cron_last_success_at', 0 ) ),
+				)
+			);
+		}
+
 		$retry_at = absint( get_option( self::OPTION_DISPATCH_RETRY_AT, 0 ) );
 		if ( $retry_at > $now ) {
 			return self::save_kick_result(
@@ -174,11 +195,21 @@ class Mobo_Core_Self_Runner {
 
 		$timeout = Mobo_Core_Settings::get_int( 'mobo_core_self_runner_http_timeout_seconds', 1, 1, 10 );
 		$token   = (string) get_option( 'mobo_core_cron_token', '' );
+
+		/* This request is a same-site WordPress loopback, not an outbound provider/API
+		 * call. Follow WordPress core's local HTTPS policy so installations using a
+		 * locally-trusted/private certificate can still wake their own worker. External
+		 * MoboCore/provider/image requests keep their existing default sslverify=true.
+		 * The Mobo filter remains the final extension point for installations that
+		 * deliberately want stricter local verification. */
+		$sslverify = (bool) apply_filters( 'https_local_ssl_verify', false, $url );
+		$sslverify = (bool) apply_filters( 'mobo_core_http_sslverify', $sslverify, 'self_runner' );
+
 		$args    = array(
 			'timeout'     => $timeout,
 			'redirection' => 0,
 			'blocking'    => false,
-			'sslverify'   => (bool) apply_filters( 'mobo_core_http_sslverify', true, 'self_runner' ),
+			'sslverify'   => $sslverify,
 			'headers'     => array(
 				'Accept'                => 'application/json',
 				'X-SEC'                 => $token,
@@ -212,7 +243,8 @@ class Mobo_Core_Self_Runner {
 				array(
 					'success'     => false,
 					'status'      => 'request-failed',
-					'message'     => $response->get_error_message(),
+					'message'     => 'Self-runner HTTP dispatch failed; transport details were withheld.',
+					'transportCode' => sanitize_key( (string) $response->get_error_code() ),
 					'attempts'    => $attempts,
 					'nextRetryAt' => time() + $delay,
 				)
@@ -231,6 +263,112 @@ class Mobo_Core_Self_Runner {
 				'dispatchId' => $dispatch_id,
 			)
 		);
+	}
+
+	/**
+	 * Yield a continuation to a recently observed *recurring* real cron.
+	 *
+	 * No site writes occur in this decision. Both consecutive hit timestamps
+	 * are required: a one-off manual/test invocation cannot park a continuation.
+	 * A bounded freshness window means a stopped scheduler cannot suppress
+	 * later worker wake-ups indefinitely. This is a handoff decision, not an
+	 * assertion that the running scheduler is healthy.
+	 *
+	 * @param string $reason Kick reason.
+	 * @param int    $now    Timestamp; injectable for deterministic tests.
+	 * @return bool
+	 */
+	public static function should_yield_continuation_to_real_cron( $reason, $now = 0 ) {
+		$reason = sanitize_key( (string) $reason );
+		if ( ! in_array( $reason, array( 'worker-continuation', 'cron-continuation', 'php-cron-continuation', 'heartbeat-continuation', 'admin-cron-continuation', 'deferred-pending-dispatch' ), true ) ) {
+			return false;
+		}
+
+		$now = absint( $now );
+		if ( 0 === $now ) { $now = time(); }
+		/* A long-lived PHP worker can hold per-request wp_options cache entries
+		 * from before a separate Real-Cron process recorded its latest hit. In
+		 * this narrow fairness decision use a single read-only options-table
+		 * snapshot to see the cross-process schedule, not cached get_option().
+		 * Missing/inaccessible rows safely fall back to the existing behavior. */
+		$markers = self::read_fresh_real_cron_markers();
+		$hit = isset( $markers['mobo_core_real_cron_last_hit_at'] )
+			? $markers['mobo_core_real_cron_last_hit_at']
+			: absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) );
+		$previous = isset( $markers['mobo_core_real_cron_previous_hit_at'] )
+			? $markers['mobo_core_real_cron_previous_hit_at']
+			: absint( get_option( 'mobo_core_real_cron_previous_hit_at', 0 ) );
+		$success = isset( $markers['mobo_core_real_cron_last_success_at'] )
+			? $markers['mobo_core_real_cron_last_success_at']
+			: absint( get_option( 'mobo_core_real_cron_last_success_at', 0 ) );
+		$expected = Mobo_Core_Settings::get_int( 'mobo_core_real_cron_expected_interval_seconds', 60, 60, 3600 );
+		$interval = $hit - $previous;
+
+		/* A recurring scheduler must have hit recently at a credible cadence.
+		 * The 5-second floor excludes near-simultaneous manual probes; the 180s
+		 * ceiling avoids claiming fairness for very infrequent cron schedules. */
+		if ( $previous <= 0 || $hit > $now || $previous > $hit || $interval < 5 || $interval > min( 180, 2 * $expected ) ) {
+			return false;
+		}
+		if ( ( $now - $hit ) > min( 120, $expected + 30 ) ) {
+			return false;
+		}
+
+		/* Reserve an earlier claim for a recurring real cron. With 60-second cron
+		 * hits and near-60-second work slices, allowing continuations for a full
+		 * 60 seconds after a success can defer the next successful slice by over
+		 * 180 seconds. A bounded half-interval grace still allows immediate
+		 * continuation after a fresh success, but yields once that grace expires.
+		 * A stopped/irregular scheduler is protected by the hit checks above. */
+		$success_grace = min( 60, max( 30, (int) floor( $expected / 2 ) ) );
+		if ( $success > $now || ( $success > 0 && ( $now - $success ) < $success_grace ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Read Real-Cron markers across PHP requests without wp_options cache.
+	 * A single indexed, read-only SELECT is used only for internal continuations.
+	 * SQL errors leave the caller's pre-existing fallback unchanged.
+	 *
+	 * @return array<string,int> Fresh values, or an empty/partial map on failure.
+	 */
+	private static function read_fresh_real_cron_markers() {
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || empty( $wpdb->options )
+			|| ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_results' ) ) {
+			return array();
+		}
+
+		$names = array(
+			'mobo_core_real_cron_last_hit_at',
+			'mobo_core_real_cron_previous_hit_at',
+			'mobo_core_real_cron_last_success_at',
+		);
+		$query = $wpdb->prepare(
+			"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name IN (%s, %s, %s)",
+			$names[0], $names[1], $names[2]
+		);
+		if ( ! is_string( $query ) || '' === $query ) {
+			return array();
+		}
+		$rows = $wpdb->get_results( $query, ARRAY_A );
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+		$values = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || ! isset( $row['option_name'], $row['option_value'] ) ) {
+				continue;
+			}
+			$name = (string) $row['option_name'];
+			if ( in_array( $name, $names, true ) && is_scalar( $row['option_value'] ) ) {
+				$values[ $name ] = absint( $row['option_value'] );
+			}
+		}
+		return $values;
 	}
 
 	/**
@@ -408,7 +546,8 @@ class Mobo_Core_Self_Runner {
 		update_option( 'mobo_core_self_runner_last_run_at', time(), false );
 		update_option( 'mobo_core_self_runner_last_run_result', $result, false );
 
-		if ( ! empty( $result['success'] ) ) {
+		$status = isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
+		if ( ! empty( $result['success'] ) && 'ok' === $status ) {
 			update_option( 'mobo_core_self_runner_last_run_success_at', time(), false );
 		}
 
@@ -512,7 +651,9 @@ class Mobo_Core_Self_Runner {
 
 		if ( class_exists( 'Mobo_Core_Webhook_Queue' ) ) {
 			$queue = new Mobo_Core_Webhook_Queue();
-			$queue_status = $queue->get_status();
+			$queue_status = method_exists( $queue, 'get_installation_status' )
+				? $queue->get_installation_status()
+				: $queue->get_status();
 		}
 
 		return array(
@@ -549,7 +690,7 @@ class Mobo_Core_Self_Runner {
 		 * actual dispatch/failure transitions durable, but rate-limit identical noisy
 		 * statuses to one write per 30 seconds. */
 		$status = isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
-		$noisy  = in_array( $status, array( 'throttled', 'kick-locked', 'dispatcher-locked', 'dispatch-backoff', 'dispatch-timeout-backoff', 'deferred-until-init', 'disabled' ), true );
+		$noisy  = in_array( $status, array( 'throttled', 'kick-locked', 'dispatcher-locked', 'dispatch-backoff', 'dispatch-timeout-backoff', 'scheduler-yield', 'deferred-until-init', 'disabled' ), true );
 
 		if ( $noisy ) {
 			$previous = get_option( 'mobo_core_self_runner_last_kick_result', array() );

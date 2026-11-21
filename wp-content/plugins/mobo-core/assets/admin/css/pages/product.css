@@ -1,0 +1,259 @@
+/* Product settings page — scoped to the MoboCore admin root. */
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-shell {
+  display: grid;
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 18px;
+  border: 1px solid #dbe8f7;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #fbfdff 0%, #f3f8ff 100%);
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-intro h2 {
+  margin: 0 0 5px;
+  color: var(--mobo-admin-text);
+  font-size: 17px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-intro p {
+  max-width: 780px;
+  margin: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+  line-height: 1.9;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-intro__badge {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 1px solid #cfe0fb;
+  border-radius: 999px;
+  background: #edf5ff;
+  color: #245aa8;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group {
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 16px;
+  background: var(--mobo-admin-surface);
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group__head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 13px;
+  padding-bottom: 11px;
+  border-bottom: 1px solid #edf1f6;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: #edf5ff;
+  color: var(--mobo-admin-primary);
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group__icon .dashicons {
+  width: 18px;
+  height: 18px;
+  font-size: 18px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group__head h3 {
+  margin: 0 0 3px;
+  color: var(--mobo-admin-text);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group__head p {
+  margin: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-fields-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 9px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(105px, 128px);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #e7edf5;
+  border-radius: 12px;
+  background: #f9fbfd;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field > label {
+  margin: 0;
+  color: #263952;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field select {
+  min-width: 0;
+  width: 100%;
+  min-height: 36px;
+  padding-block: 4px;
+  border-radius: 9px;
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field small,
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-help {
+  grid-column: 1 / -1;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-notes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-notes .mobo-note {
+  margin: 0;
+  min-height: 100%;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-help-stack {
+  display: grid;
+  gap: 10px;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-help-stack .mobo-admin-details {
+  margin: 0;
+  background: #fff;
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-help-stack .mobo-guide-box {
+  margin: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-save-bar {
+  position: sticky;
+  z-index: 3;
+  bottom: 12px;
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 0;
+  padding: 10px;
+  border: 1px solid #dbe5f3;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .94);
+  box-shadow: 0 10px 28px rgba(18, 35, 63, .10);
+  backdrop-filter: blur(8px);
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-save-bar .mobo-save-row {
+  width: auto;
+  margin: 0;
+  padding: 0;
+}
+
+@media (max-width: 1040px) {
+  #mobo-core-admin.mobo-admin--product .mobo-product-settings-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--product .mobo-product-settings-intro {
+    flex-direction: column;
+  }
+
+  #mobo-core-admin.mobo-admin--product .mobo-product-settings-intro__badge {
+    white-space: normal;
+  }
+
+  #mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field,
+  #mobo-core-admin.mobo-admin--product .mobo-product-notes {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--product .mobo-product-save-bar,
+  #mobo-core-admin.mobo-admin--product .mobo-product-save-bar .mobo-save-row,
+  #mobo-core-admin.mobo-admin--product .mobo-product-save-bar .mobo-btn {
+    width: 100%;
+  }
+}
+
+/* Phase 2.2: settings behave like decisions, not dropdown-heavy forms. */
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-toggle-field {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-toggle-field .mobo-bool-control {
+  justify-self: end;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-technical-notes {
+  margin-top: 0;
+  background: #fbfcfe;
+  box-shadow: none;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-technical-notes .mobo-product-notes {
+  padding-top: 2px;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-toggle-field {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-toggle-field .mobo-bool-control {
+    justify-self: stretch;
+  }
+}
+
+/* FINAL UX10: settings explain consequences at the point of decision. */
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-toggle-field .mobo-help {
+  margin-top: 1px;
+  font-size: 10.5px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field optgroup {
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--product .mobo-product-setting-group .mobo-field option {
+  font-weight: 400;
+}

@@ -27,6 +27,19 @@ final class Mobo_Core_Order_Submission_Policy {
 	}
 
 	/**
+	 * Bootstrap helper: whether any enabled Connection has automatic submission on.
+	 * Runtime submission must still be evaluated inside the order owner's context.
+	 *
+	 * @return bool
+	 */
+	public static function is_enabled_for_any_connection() {
+		if ( class_exists( 'Mobo_Core_Connection_Settings' ) ) {
+			return Mobo_Core_Connection_Settings::any_enabled_boolean( self::OPTION_ENABLED, '0' );
+		}
+		return self::is_enabled();
+	}
+
+	/**
 	 * Whether remote-shipping runtime is needed by any feature that consumes it.
 	 *
 	 * Keep this composition here so shipping discovery and diagnostics cannot use
@@ -50,7 +63,10 @@ final class Mobo_Core_Order_Submission_Policy {
 	 * @return bool
 	 */
 	private static function option_enabled( $option, $default = '0' ) {
-		$value = get_option( sanitize_key( (string) $option ), $default );
+		$option = sanitize_key( (string) $option );
+		$value = class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $option )
+			? Mobo_Core_Connection_Settings::get_option( $option, $default )
+			: get_option( $option, $default );
 		return in_array( strtolower( trim( (string) $value ) ), array( '1', 'true', 'yes', 'on' ), true );
 	}
 }

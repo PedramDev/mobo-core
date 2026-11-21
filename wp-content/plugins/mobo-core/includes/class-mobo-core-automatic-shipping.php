@@ -17,6 +17,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Mobo_Core_Automatic_Shipping {
 
+	/** @var bool|null Request-local proof that the retired custom method is disabled. */
+	private $legacy_runtime_retired_cache = null;
+
+	/** @var array<int,array|null> Request-local Woo shipping-zone row cache. */
+	private $legacy_zone_method_row_cache = array();
+
 	const METHOD_ID             = 'mobo_core_shipping';
 	const CLASS_SLUG            = 'mobo-products';
 	const CLASS_NAME            = 'محصولات موبو';
@@ -46,22 +52,38 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return void
 	 */
 	public function init() {
-		// Mapping-only policy: Mobo never registers or injects a checkout shipping method.
+		/* Mapping-only policy is an invariant, not merely an installer preference.
+		 * Remove the retired Mobo shipping method even if stale/third-party code
+		 * attempts to register our legacy callback again. */
+		add_filter( 'woocommerce_shipping_methods', array( $this, 'enforce_mapping_only_shipping_methods' ), PHP_INT_MAX );
+	}
+
+	/**
+	 * Keep the retired custom shipping method out of WooCommerce runtime.
+	 *
+	 * @param array $methods Shipping method classes.
+	 * @return array
+	 */
+	public function enforce_mapping_only_shipping_methods( $methods ) {
+		$methods = is_array( $methods ) ? $methods : array();
+		unset( $methods[ self::METHOD_ID ] );
+		return $methods;
 	}
 
 	/**
 	 * Disable shipping configuration created by legacy automatic-shipping builds.
 	 *
-	 * This does not touch merchant-owned WooCommerce methods. Only instances that
-	 * are recorded in Mobo Core's managed option maps are disabled. The cleanup is
-	 * idempotent and is also used by the admin repair action.
+	 * This does not touch merchant-owned WooCommerce methods. Every instance using
+	 * Mobo Core's plugin-owned retired method id is disabled, including untracked
+	 * residue, while fallback/mirror methods are touched only when durable legacy
+	 * ownership maps prove Mobo Core created them. The cleanup is idempotent.
 	 *
 	 * @param string $source Cleanup source.
 	 * @return array
 	 */
 	public function retire_legacy_runtime( $source = 'mapping-only' ) {
 		$policy_version = '1';
-		$already_applied = (string) get_option( 'mobo_core_shipping_mapping_only_policy_version', '' ) === $policy_version;
+		$already_applied = (string) Mobo_Core_Settings::get( 'mobo_core_shipping_mapping_only_policy_version', '' ) === $policy_version;
 		$result = array(
 			'success' => true,
 			'source' => sanitize_key( (string) $source ),
@@ -73,17 +95,36 @@ class Mobo_Core_Automatic_Shipping {
 		);
 		$source_key = sanitize_key( (string) $source );
 		$force = in_array( $source_key, array( 'admin-mapping-repair', 'repair-integrity' ), true );
+		$managed = Mobo_Core_Settings::get( self::OPTION_MANAGED_RATES, array() );
+		$fallbacks = Mobo_Core_Settings::get( self::OPTION_STORE_FALLBACKS, array() );
+		$mirrors = Mobo_Core_Settings::get( self::OPTION_STORE_EXISTING_MIRRORS, array() );
+		/* The policy marker is only a migration checkpoint. Re-prove all plugin-owned
+		 * residues on wp-admin: the retired custom method plus recorded fallback/mirror
+		 * instances. Ordinary storefront requests rely on the registry fail-closed
+		 * filter and keep the historical cheap early-return. */
 		if ( $already_applied && ! $force ) {
-			return $result;
+			if ( ! is_admin() || ( $this->legacy_mobo_runtime_is_retired() && $this->legacy_auxiliary_runtime_is_retired( $fallbacks, $mirrors ) ) ) {
+				return $result;
+			}
 		}
 
 		$failures = array();
-		$managed = get_option( self::OPTION_MANAGED_RATES, array() );
+		$legacy_mobo_instances = array();
 		foreach ( is_array( $managed ) ? $managed : array() as $entry ) {
 			$instance_id = is_array( $entry ) ? absint( isset( $entry['instanceId'] ) ? $entry['instanceId'] : 0 ) : 0;
-			if ( $instance_id <= 0 ) {
-				continue;
+			if ( $instance_id > 0 ) {
+				$legacy_mobo_instances[ $instance_id ] = true;
 			}
+		}
+		/* A previous build/manual DB edit may have left a Mobo method outside the
+		 * historical managed option map. The method id itself is plugin-owned, so it
+		 * is safe to discover and disable every such residue. */
+		foreach ( $this->find_legacy_mobo_instance_ids() as $instance_id ) {
+			$legacy_mobo_instances[ absint( $instance_id ) ] = true;
+		}
+		foreach ( array_keys( $legacy_mobo_instances ) as $instance_id ) {
+			$instance_id = absint( $instance_id );
+			if ( $instance_id <= 0 ) { continue; }
 			$disabled = $this->disable_legacy_instance_result( self::METHOD_ID, $instance_id );
 			if ( ! empty( $disabled['wasEnabled'] ) ) {
 				$result['disabledMoboMethods']++;
@@ -93,7 +134,6 @@ class Mobo_Core_Automatic_Shipping {
 			}
 		}
 
-		$fallbacks = get_option( self::OPTION_STORE_FALLBACKS, array() );
 		foreach ( is_array( $fallbacks ) ? $fallbacks : array() as $instance_id ) {
 			$instance_id = absint( $instance_id );
 			if ( $instance_id <= 0 ) {
@@ -108,7 +148,6 @@ class Mobo_Core_Automatic_Shipping {
 			}
 		}
 
-		$mirrors = get_option( self::OPTION_STORE_EXISTING_MIRRORS, array() );
 		foreach ( is_array( $mirrors ) ? $mirrors : array() as $zone_map ) {
 			foreach ( is_array( $zone_map ) ? $zone_map : array() as $source_key => $instance_id ) {
 				$parts = explode( ':', (string) $source_key );
@@ -128,22 +167,155 @@ class Mobo_Core_Automatic_Shipping {
 		}
 
 		$result['deletedLegacyZones'] = $this->delete_empty_legacy_mobo_zones( $managed, $fallbacks, $mirrors );
+		if ( empty( $failures ) && ! $this->legacy_mobo_runtime_is_retired() ) {
+			$failures[] = array( 'methodId' => self::METHOD_ID, 'reason' => 'legacy-mobo-method-still-active' );
+		}
+		if ( empty( $failures ) && ! $this->legacy_auxiliary_runtime_is_retired( $fallbacks, $mirrors ) ) {
+			$failures[] = array( 'reason' => 'legacy-auxiliary-shipping-still-active' );
+		}
 		$result['failures'] = $failures;
 		$result['success'] = empty( $failures );
 
-		update_option( self::OPTION_ENABLED, '0', false );
-		update_option( 'mobo_core_mobo_shipping_package_enabled', '0', false );
-		update_option( 'mobo_core_mobo_shipping_use_api_price', '0', false );
-		update_option( 'mobo_core_shipping_wizard_completed', '0', false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '0', false );
+		Mobo_Core_Settings::update( 'mobo_core_mobo_shipping_package_enabled', '0', false );
+		Mobo_Core_Settings::update( 'mobo_core_mobo_shipping_use_api_price', '0', false );
+		Mobo_Core_Settings::update( 'mobo_core_shipping_wizard_completed', '0', false );
 		if ( $result['success'] ) {
-			update_option( 'mobo_core_shipping_mapping_only_policy_version', $policy_version, false );
-			if ( (string) get_option( 'mobo_core_shipping_mapping_only_policy_version', '' ) !== $policy_version ) {
+			Mobo_Core_Settings::update( 'mobo_core_shipping_mapping_only_policy_version', $policy_version, false );
+			if ( (string) Mobo_Core_Settings::get( 'mobo_core_shipping_mapping_only_policy_version', '' ) !== $policy_version ) {
 				$result['success'] = false;
 				$result['failures'][] = array( 'reason' => 'policy-version-not-persisted' );
 			}
 		}
-		update_option( 'mobo_core_shipping_mapping_only_last_cleanup', array_merge( $result, array( 'at' => time() ) ), false );
+		Mobo_Core_Settings::update( 'mobo_core_shipping_mapping_only_last_cleanup', array_merge( $result, array( 'at' => time() ) ), false );
 		return $result;
+	}
+
+
+	/**
+	 * Discover every WooCommerce zone row using Mobo Core's retired method id.
+	 *
+	 * @return array<int,int>
+	 */
+	private function find_legacy_mobo_instance_ids() {
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'get_col' ) || empty( $wpdb->prefix ) ) {
+			return array();
+		}
+		$table = $wpdb->prefix . 'woocommerce_shipping_zone_methods';
+		$rows = $wpdb->get_col( $wpdb->prepare( "SELECT instance_id FROM {$table} WHERE method_id=%s", self::METHOD_ID ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- bounded plugin-owned legacy residue audit.
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+		return array_values( array_unique( array_filter( array_map( 'absint', $rows ) ) ) );
+	}
+
+	/**
+	 * Prove the retired custom method cannot currently participate in checkout.
+	 * Both WooCommerce's zone-row state and the instance option are checked.
+	 *
+	 * @return bool
+	 */
+	private function legacy_mobo_runtime_is_retired() {
+		if ( null !== $this->legacy_runtime_retired_cache ) {
+			return (bool) $this->legacy_runtime_retired_cache;
+		}
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'get_results' ) || empty( $wpdb->prefix ) ) {
+			return false;
+		}
+		$table = $wpdb->prefix . 'woocommerce_shipping_zone_methods';
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT instance_id,is_enabled FROM {$table} WHERE method_id=%s", self::METHOD_ID ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- authoritative Woo shipping-zone state.
+		if ( ! is_array( $rows ) ) {
+			return false;
+		}
+		foreach ( $rows as $row ) {
+			$instance_id = absint( isset( $row['instance_id'] ) ? $row['instance_id'] : 0 );
+			if ( ! empty( $row['is_enabled'] ) ) {
+				$this->legacy_runtime_retired_cache = false;
+				return false;
+			}
+			if ( $instance_id > 0 ) {
+				$settings = get_option( 'woocommerce_' . self::METHOD_ID . '_' . $instance_id . '_settings', array() );
+				if ( is_array( $settings ) && 'yes' === ( isset( $settings['enabled'] ) ? (string) $settings['enabled'] : 'no' ) ) {
+					$this->legacy_runtime_retired_cache = false;
+					return false;
+				}
+			}
+		}
+		$this->legacy_runtime_retired_cache = true;
+		return true;
+	}
+
+
+	/**
+	 * Prove recorded legacy fallback/mirror instances cannot publish a rate.
+	 *
+	 * @param array $fallbacks Recorded Mobo-created fallback instance ids.
+	 * @param array $mirrors Recorded Mobo-created mirror maps.
+	 * @return bool
+	 */
+	private function legacy_auxiliary_runtime_is_retired( $fallbacks, $mirrors ) {
+		foreach ( is_array( $fallbacks ) ? $fallbacks : array() as $instance_id ) {
+			if ( ! $this->legacy_instance_is_disabled( 'flat_rate', absint( $instance_id ) ) ) {
+				return false;
+			}
+		}
+		foreach ( is_array( $mirrors ) ? $mirrors : array() as $zone_map ) {
+			foreach ( is_array( $zone_map ) ? $zone_map : array() as $source_key => $instance_id ) {
+				$parts = explode( ':', (string) $source_key );
+				$method_id = isset( $parts[1] ) ? sanitize_key( (string) $parts[1] ) : '';
+				if ( '' !== $method_id && ! $this->legacy_instance_is_disabled( $method_id, absint( $instance_id ) ) ) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Check one historically Mobo-owned Woo shipping instance without mutating it.
+	 * A missing row or a row whose method id no longer matches the historical map is
+	 * treated as retired/preserved; stale ownership must never disable a merchant row.
+	 *
+	 * @param string $method_id Expected Woo method id.
+	 * @param int    $instance_id Instance id.
+	 * @return bool
+	 */
+	private function legacy_instance_is_disabled( $method_id, $instance_id ) {
+		$method_id = sanitize_key( (string) $method_id );
+		$instance_id = absint( $instance_id );
+		if ( '' === $method_id || $instance_id <= 0 ) { return true; }
+		$row = $this->get_legacy_zone_method_row( $instance_id );
+		if ( null === $row ) { return true; }
+		$actual_method = sanitize_key( (string) ( isset( $row['method_id'] ) ? $row['method_id'] : '' ) );
+		if ( $actual_method !== $method_id ) { return true; }
+		if ( ! empty( $row['is_enabled'] ) ) { return false; }
+		$settings = get_option( 'woocommerce_' . $method_id . '_' . $instance_id . '_settings', array() );
+		return ! ( is_array( $settings ) && 'yes' === ( isset( $settings['enabled'] ) ? (string) $settings['enabled'] : 'no' ) );
+	}
+
+	/**
+	 * Read one Woo shipping-zone row with request-local caching.
+	 *
+	 * @param int $instance_id Instance id.
+	 * @return array|null
+	 */
+	private function get_legacy_zone_method_row( $instance_id ) {
+		$instance_id = absint( $instance_id );
+		if ( $instance_id <= 0 ) { return null; }
+		if ( array_key_exists( $instance_id, $this->legacy_zone_method_row_cache ) ) {
+			return $this->legacy_zone_method_row_cache[ $instance_id ];
+		}
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'get_row' ) || empty( $wpdb->prefix ) ) {
+			return null;
+		}
+		$table = $wpdb->prefix . 'woocommerce_shipping_zone_methods';
+		$row = $wpdb->get_row( $wpdb->prepare( "SELECT instance_id,method_id,is_enabled FROM {$table} WHERE instance_id=%d LIMIT 1", $instance_id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- authoritative Woo shipping-zone state.
+		$row = is_array( $row ) ? $row : null;
+		$this->legacy_zone_method_row_cache[ $instance_id ] = $row;
+		return $row;
 	}
 
 	/**
@@ -177,7 +349,7 @@ class Mobo_Core_Automatic_Shipping {
 		}
 
 		$deleted = 0;
-		foreach ( (array) get_option( self::OPTION_MANAGED_ZONES, array() ) as $zone_id ) {
+		foreach ( (array) Mobo_Core_Settings::get( self::OPTION_MANAGED_ZONES, array() ) as $zone_id ) {
 			$zone_id = absint( $zone_id );
 			if ( $zone_id <= 0 ) { continue; }
 			try {
@@ -224,11 +396,26 @@ class Mobo_Core_Automatic_Shipping {
 	 */
 	private function disable_legacy_instance_result( $method_id, $instance_id ) {
 		$method_id = sanitize_key( (string) $method_id );
+		if ( self::METHOD_ID === $method_id ) {
+			$this->legacy_runtime_retired_cache = null;
+		}
+		unset( $this->legacy_zone_method_row_cache[ absint( $instance_id ) ] );
 		$instance_id = absint( $instance_id );
 		$result = array( 'success' => false, 'wasEnabled' => false, 'reason' => '' );
 		if ( '' === $method_id || $instance_id <= 0 ) {
 			$result['reason'] = 'invalid-instance';
 			return $result;
+		}
+		$row = $this->get_legacy_zone_method_row( $instance_id );
+		if ( is_array( $row ) ) {
+			$actual_method = sanitize_key( (string) ( isset( $row['method_id'] ) ? $row['method_id'] : '' ) );
+			if ( '' !== $actual_method && $actual_method !== $method_id ) {
+				/* Historical ownership pointers can become stale after manual DB imports.
+				 * Never disable a row whose live Woo method id no longer matches. */
+				$result['success'] = true;
+				$result['reason'] = 'instance-method-mismatch-preserved';
+				return $result;
+			}
 		}
 
 		$option_key = 'woocommerce_' . $method_id . '_' . $instance_id . '_settings';
@@ -247,30 +434,22 @@ class Mobo_Core_Automatic_Shipping {
 			$result['reason'] = 'zone-state-not-persisted';
 			return $result;
 		}
+		unset( $this->legacy_zone_method_row_cache[ $instance_id ] );
 
 		$result['success'] = true;
 		return $result;
 	}
 
 	/**
-	 * Register the custom shipping method after WooCommerce has loaded its base class.
+	 * Backward-compatible callback from pre-mapping-only builds. Never registers the retired method.
 	 *
 	 * @param array $methods Shipping method classes.
 	 * @return array
 	 */
 	public function register_shipping_method( $methods ) {
-		if ( ! is_array( $methods ) ) {
-			$methods = array();
-		}
-
-		if ( class_exists( 'WC_Shipping_Method' ) ) {
-			require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-wc-mobo-core-shipping-method.php';
-			if ( class_exists( 'WC_Mobo_Core_Shipping_Method' ) ) {
-				$methods[ self::METHOD_ID ] = 'WC_Mobo_Core_Shipping_Method';
-			}
-		}
-
-		return $methods;
+		/* Backward-compatible callable retained for old integrations. Current policy
+		 * is mapping-only, so this callback must never re-register the retired rate. */
+		return $this->enforce_mapping_only_shipping_methods( $methods );
 	}
 
 	/**
@@ -344,7 +523,7 @@ class Mobo_Core_Automatic_Shipping {
 			'message'           => '',
 		);
 
-		update_option( self::OPTION_LAST_RUN, time(), false );
+		Mobo_Core_Settings::update( self::OPTION_LAST_RUN, time(), false );
 
 		if ( ! class_exists( 'WooCommerce' ) || ! class_exists( 'WC_Shipping_Zone' ) || ! class_exists( 'WC_Shipping_Zones' ) ) {
 			return $this->store_result( $this->fail_result( $result, 'WooCommerce shipping classes are not available.' ) );
@@ -374,10 +553,10 @@ class Mobo_Core_Automatic_Shipping {
 		$result['classId']       = absint( $class_id );
 		$result['activeMethods'] = count( $methods );
 
-		update_option( 'mobo_core_mobo_shipping_class_id', absint( $class_id ), false );
-		update_option( 'mobo_core_mobo_shipping_package_enabled', '1', false );
-		update_option( 'mobo_core_mobo_shipping_use_api_price', '1', false );
-		update_option( self::OPTION_ENABLED, '1', false );
+		Mobo_Core_Settings::update( 'mobo_core_mobo_shipping_class_id', absint( $class_id ), false );
+		Mobo_Core_Settings::update( 'mobo_core_mobo_shipping_package_enabled', '1', false );
+		Mobo_Core_Settings::update( 'mobo_core_mobo_shipping_use_api_price', '1', false );
+		Mobo_Core_Settings::update( self::OPTION_ENABLED, '1', false );
 
 		$zones = $this->get_or_create_iran_zones( $result );
 		if ( empty( $zones ) ) {
@@ -399,9 +578,9 @@ class Mobo_Core_Automatic_Shipping {
 			$result['warnings'] = array_merge( $result['warnings'], $store_setup['warnings'] );
 		}
 
-		update_option( self::OPTION_STORE_RATE_MODE, $store_config['mode'], false );
-		update_option( self::OPTION_STORE_RATE_TITLE, $store_config['title'], false );
-		update_option( self::OPTION_STORE_RATE_COST, $store_config['cost'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_MODE, $store_config['mode'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_TITLE, $store_config['title'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_COST, $store_config['cost'], false );
 
 		$active_ids       = array();
 		$managed_instances = array();
@@ -458,8 +637,8 @@ class Mobo_Core_Automatic_Shipping {
 		$this->merge_cod_method_restrictions( $support_cod_rate_ids );
 
 		$result['zoneIds'] = array_values( array_unique( array_map( 'absint', array_keys( $zones ) ) ) );
-		update_option( self::OPTION_MANAGED_ZONES, $result['zoneIds'], false );
-		update_option( self::OPTION_MANAGED_RATES, $managed_instances, false );
+		Mobo_Core_Settings::update( self::OPTION_MANAGED_ZONES, $result['zoneIds'], false );
+		Mobo_Core_Settings::update( self::OPTION_MANAGED_RATES, $managed_instances, false );
 
 		$result['manualReviewMethods'] = array_values( $result['manualReviewMethods'] );
 		$result['success'] = true;
@@ -487,14 +666,14 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return array
 	 */
 	public function get_status() {
-		$last = get_option( self::OPTION_LAST_RESULT, array() );
+		$last = Mobo_Core_Settings::get( self::OPTION_LAST_RESULT, array() );
 		if ( ! is_array( $last ) ) {
 			$last = array();
 		}
 
 		$class_id = Mobo_Core_Settings::get_int( 'mobo_core_mobo_shipping_class_id', 0, 0, PHP_INT_MAX );
-		$zones    = get_option( self::OPTION_MANAGED_ZONES, array() );
-		$rates    = get_option( self::OPTION_MANAGED_RATES, array() );
+		$zones    = Mobo_Core_Settings::get( self::OPTION_MANAGED_ZONES, array() );
+		$rates    = Mobo_Core_Settings::get( self::OPTION_MANAGED_RATES, array() );
 
 		$store_status = $this->inspect_store_shipping();
 
@@ -504,11 +683,11 @@ class Mobo_Core_Automatic_Shipping {
 			'classReady'       => $class_id > 0 && term_exists( $class_id, 'product_shipping_class' ),
 			'zoneCount'        => is_array( $zones ) ? count( $zones ) : 0,
 			'instanceCount'    => is_array( $rates ) ? count( $rates ) : 0,
-			'storeRateMode'    => sanitize_key( (string) get_option( self::OPTION_STORE_RATE_MODE, self::STORE_RATE_MODE_EXISTING ) ),
-			'storeRateTitle'   => sanitize_text_field( (string) get_option( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) ),
-			'storeRateCost'    => (string) get_option( self::OPTION_STORE_RATE_COST, '0' ),
+			'storeRateMode'    => sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_MODE, self::STORE_RATE_MODE_EXISTING ) ),
+			'storeRateTitle'   => sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) ),
+			'storeRateCost'    => (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_COST, '0' ),
 			'storeShipping'    => $store_status,
-			'lastRunAt'        => absint( get_option( self::OPTION_LAST_RUN, 0 ) ),
+			'lastRunAt'        => absint( Mobo_Core_Settings::get( self::OPTION_LAST_RUN, 0 ) ),
 			'lastResult'       => $last,
 		);
 	}
@@ -591,9 +770,9 @@ class Mobo_Core_Automatic_Shipping {
 	 * @return array
 	 */
 	private function sanitize_store_rate_config( $config ) {
-		$saved_mode  = sanitize_key( (string) get_option( self::OPTION_STORE_RATE_MODE, self::STORE_RATE_MODE_EXISTING ) );
-		$saved_title = sanitize_text_field( (string) get_option( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) );
-		$saved_cost  = (string) get_option( self::OPTION_STORE_RATE_COST, '0' );
+		$saved_mode  = sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_MODE, self::STORE_RATE_MODE_EXISTING ) );
+		$saved_title = sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) );
+		$saved_cost  = (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_COST, '0' );
 
 		$mode = isset( $config['mode'] ) ? sanitize_key( (string) $config['mode'] ) : $saved_mode;
 		if ( ! in_array( $mode, array( self::STORE_RATE_MODE_EXISTING, self::STORE_RATE_MODE_ENSURE_FLAT_RATE ), true ) ) {
@@ -700,7 +879,7 @@ class Mobo_Core_Automatic_Shipping {
 		$instance_id = 0;
 		$created = false;
 		$zone_id = method_exists( $zone, 'get_id' ) ? absint( $zone->get_id() ) : 0;
-		$fallback_map = get_option( self::OPTION_STORE_FALLBACKS, array() );
+		$fallback_map = Mobo_Core_Settings::get( self::OPTION_STORE_FALLBACKS, array() );
 		$fallback_map = is_array( $fallback_map ) ? $fallback_map : array();
 		$mapped_instance_id = $zone_id > 0 && isset( $fallback_map[ $zone_id ] ) ? absint( $fallback_map[ $zone_id ] ) : 0;
 
@@ -741,7 +920,7 @@ class Mobo_Core_Automatic_Shipping {
 		$this->set_zone_method_state( $instance_id, true, 900 );
 		if ( $zone_id > 0 ) {
 			$fallback_map[ $zone_id ] = $instance_id;
-			update_option( self::OPTION_STORE_FALLBACKS, $fallback_map, false );
+			Mobo_Core_Settings::update( self::OPTION_STORE_FALLBACKS, $fallback_map, false );
 		}
 		return array( 'instanceId' => $instance_id, 'created' => $created );
 	}
@@ -866,7 +1045,7 @@ class Mobo_Core_Automatic_Shipping {
 		}
 		$result = array( 'created' => 0, 'updated' => 0, 'disabled' => 0 );
 		$zone_id = method_exists( $zone, 'get_id' ) ? absint( $zone->get_id() ) : 0;
-		$map = get_option( self::OPTION_STORE_EXISTING_MIRRORS, array() );
+		$map = Mobo_Core_Settings::get( self::OPTION_STORE_EXISTING_MIRRORS, array() );
 		$map = is_array( $map ) ? $map : array();
 		if ( ! isset( $map[ $zone_id ] ) || ! is_array( $map[ $zone_id ] ) ) {
 			$map[ $zone_id ] = array();
@@ -957,7 +1136,7 @@ class Mobo_Core_Automatic_Shipping {
 			}
 		}
 
-		update_option( self::OPTION_STORE_EXISTING_MIRRORS, $map, false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_EXISTING_MIRRORS, $map, false );
 		return $result;
 	}
 
@@ -1024,7 +1203,7 @@ class Mobo_Core_Automatic_Shipping {
 			return $output;
 		}
 		$zone_id = method_exists( $zone, 'get_id' ) ? absint( $zone->get_id() ) : 0;
-		$fallback_map = get_option( self::OPTION_STORE_FALLBACKS, array() );
+		$fallback_map = Mobo_Core_Settings::get( self::OPTION_STORE_FALLBACKS, array() );
 		$fallback_map = is_array( $fallback_map ) ? $fallback_map : array();
 		$mapped_instance_id = $zone_id > 0 && isset( $fallback_map[ $zone_id ] ) ? absint( $fallback_map[ $zone_id ] ) : 0;
 		foreach ( $zone->get_shipping_methods( false, 'admin' ) as $method ) {
@@ -1074,7 +1253,7 @@ class Mobo_Core_Automatic_Shipping {
 	 */
 	private function disable_managed_store_fallbacks( $zones ) {
 		$count = 0;
-		$fallback_map = get_option( self::OPTION_STORE_FALLBACKS, array() );
+		$fallback_map = Mobo_Core_Settings::get( self::OPTION_STORE_FALLBACKS, array() );
 		$fallback_map = is_array( $fallback_map ) ? $fallback_map : array();
 		foreach ( $zones as $zone ) {
 			if ( ! $zone instanceof WC_Shipping_Zone ) {
@@ -1147,6 +1326,16 @@ class Mobo_Core_Automatic_Shipping {
 		if ( ! Mobo_Core_Settings::enabled( self::OPTION_ENABLED, '0' ) || ! class_exists( 'Mobo_Core_Remote_Shipping_Methods' ) ) {
 			return $unavailable;
 		}
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			$unavailable['reason'] = 'money-policy-unavailable';
+			return $unavailable;
+		}
+		$money_status = Mobo_Core_Money_Policy::compatibility_status();
+		if ( ! Mobo_Core_Money_Policy::shipping_currency_ready() ) {
+			$unavailable['reason'] = 'money-contract';
+			$unavailable['moneyContract'] = $money_status;
+			return $unavailable;
+		}
 
 		$manager = new Mobo_Core_Remote_Shipping_Methods();
 		$method  = null;
@@ -1183,9 +1372,15 @@ class Mobo_Core_Automatic_Shipping {
 			return $unavailable;
 		}
 
+		$store_cost = Mobo_Core_Money_Policy::shipping_source_to_store( $source_cost );
+		if ( null === $store_cost ) {
+			$unavailable['reason'] = 'money-contract';
+			$unavailable['moneyContract'] = Mobo_Core_Money_Policy::compatibility_status();
+			return $unavailable;
+		}
 		return array(
 			'available' => true,
-			'cost'      => Mobo_Core_Money_Policy::source_amount_to_store_amount( $source_cost ),
+			'cost'      => $store_cost,
 			'sourceCost'=> $source_cost,
 			'reason'    => 'ok',
 			'method'    => $method,
@@ -1508,10 +1703,10 @@ class Mobo_Core_Automatic_Shipping {
 	private function save_automatic_mapping( $remote, $zone_id, $instance_id, $shipping_id ) {
 		foreach ( array( 'mobo_only', 'mixed' ) as $scenario ) {
 			$key = $remote->build_wc_method_rule_option_key( $zone_id, self::METHOD_ID, $instance_id, $scenario );
-			update_option( $key, absint( $shipping_id ), false );
+			Mobo_Core_Settings::update( $key, absint( $shipping_id ), false );
 		}
 		$legacy = $remote->build_legacy_wc_method_rule_option_key( $zone_id, self::METHOD_ID, $instance_id );
-		update_option( $legacy, absint( $shipping_id ), false );
+		Mobo_Core_Settings::update( $legacy, absint( $shipping_id ), false );
 	}
 
 	/**
@@ -1579,7 +1774,17 @@ class Mobo_Core_Automatic_Shipping {
 				$subtotal += $api_price * $quantity;
 			} else {
 				$line_total = isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
-				$subtotal  += Mobo_Core_Money_Policy::store_amount_to_source_amount( $line_total );
+				$source_line_total = Mobo_Core_Money_Policy::shipping_store_to_source( $line_total );
+				if ( null === $source_line_total ) {
+					return array(
+						'moboItemCount' => 0,
+						'moboSubtotal' => 0.0,
+						'moboWeightGrams' => 0.0,
+						'destination' => self::normalize_destination( isset( $package['destination'] ) && is_array( $package['destination'] ) ? $package['destination'] : array() ),
+						'moneyContractInvalid' => true,
+					);
+				}
+				$subtotal += $source_line_total;
 			}
 
 			if ( $product && method_exists( $product, 'get_weight' ) ) {
@@ -1845,7 +2050,7 @@ class Mobo_Core_Automatic_Shipping {
 	}
 
 	private function store_result( $result ) {
-		update_option( self::OPTION_LAST_RESULT, $result, false );
+		Mobo_Core_Settings::update( self::OPTION_LAST_RESULT, $result, false );
 		return $result;
 	}
 }

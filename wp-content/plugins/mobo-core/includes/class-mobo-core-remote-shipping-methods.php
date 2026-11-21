@@ -45,7 +45,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		}
 
 		$interval_hours = Mobo_Core_Settings::get_int( 'mobo_core_remote_shipping_sync_interval_hours', 1, 1, 168 );
-		$last_success   = absint( get_option( self::OPTION_LAST_SUCCESS, 0 ) );
+		$last_success   = absint( Mobo_Core_Settings::get( self::OPTION_LAST_SUCCESS, 0 ) );
 
 		if ( ! $force && $last_success > 0 && ( time() - $last_success ) < ( $interval_hours * HOUR_IN_SECONDS ) ) {
 			return array(
@@ -67,25 +67,30 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @return array
 	 */
 	public function sync_now( $source = 'manual', $force = true ) {
-		update_option( self::OPTION_LAST_ATTEMPT, time(), false );
+		Mobo_Core_Settings::update( self::OPTION_LAST_ATTEMPT, time(), false );
 
-		$request_started_at = time();
+		/* Microsecond local HTTP-start fence. A webhook can commit within the same
+		 * wall-clock second; second precision would let the older GET overwrite it. */
+		$request_started_at = (int) floor( microtime( true ) * 1000000 );
 		$api                = new Mobo_Core_API_Client();
 		$result             = method_exists( $api, 'get_mobo_shipping_methods' ) ? $api->get_mobo_shipping_methods() : new WP_Error( 'mobo_core_missing_shipping_api', 'MoboCore shipping-methods API is not available in this plugin build.' );
 
 		if ( is_wp_error( $result ) ) {
-			update_option( self::OPTION_LAST_ERROR, $result->get_error_message(), false );
-			return array( 'success' => false, 'status' => 'failed', 'message' => $result->get_error_message() );
+			/* Do not persist opaque upstream URL/token/response text as diagnostics. */
+			$error_code = sanitize_key( (string) $result->get_error_code() );
+			$message = 'Remote shipping request failed (' . substr( $error_code, 0, 64 ) . ').';
+			Mobo_Core_Settings::update( self::OPTION_LAST_ERROR, $message, false );
+			return array( 'success' => false, 'status' => 'failed', 'message' => $message );
 		}
 
 		$stored = $this->store_snapshot( $result, $source, $request_started_at );
 		if ( empty( $stored['success'] ) ) {
-			update_option( self::OPTION_LAST_ERROR, isset( $stored['message'] ) ? $stored['message'] : 'Invalid Mobo shipping-methods payload.', false );
+			Mobo_Core_Settings::update( self::OPTION_LAST_ERROR, isset( $stored['message'] ) ? $stored['message'] : 'Invalid Mobo shipping-methods payload.', false );
 			return $stored;
 		}
 
-		update_option( self::OPTION_LAST_SUCCESS, time(), false );
-		delete_option( self::OPTION_LAST_ERROR );
+		Mobo_Core_Settings::update( self::OPTION_LAST_SUCCESS, time(), false );
+		Mobo_Core_Settings::delete( self::OPTION_LAST_ERROR );
 
 		return array(
 			'success' => true,
@@ -110,7 +115,8 @@ class Mobo_Core_Remote_Shipping_Methods {
 
 		global $wpdb;
 		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
-		$lock_name = 'mobo_ship_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$lock_name = 'mobo_ship_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $connection_id ), 0, 40 );
 		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 3 ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic authoritative snapshot replacement.
 		if ( '1' !== (string) $acquired ) {
 			return array( 'success' => false, 'status' => 'busy', 'message' => 'Mobo shipping snapshot is being updated by another request.' );
@@ -132,6 +138,57 @@ class Mobo_Core_Remote_Shipping_Methods {
 		 * authoritative state meaning Mobo currently exposes no active methods. */
 		if ( ! is_array( $raw_methods ) ) {
 			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods payload is missing an explicit methods collection.' );
+		}
+
+
+		/* Backwards-compatible additive money metadata from Backend. Never
+		 * interpret tariffs as WooCurrency when Source declaration conflicts with
+		 * this Connection's signed provisioning contract. Check before any write. */
+		// New deployments must not silently accept a half-present money
+		// declaration. Only fully legacy payloads may omit both fields.
+		$has_money_unit = array_key_exists( 'money_unit', $data );
+		$has_money_version = array_key_exists( 'money_contract_version', $data );
+		if ( $has_money_unit !== $has_money_version ) {
+			return array( 'success' => false, 'status' => 'money-contract-partial', 'message' => 'Shipping monetary metadata is incomplete.' );
+		}
+		if ( $has_money_version && null === $data['money_contract_version'] ) {
+			return array( 'success' => false, 'status' => 'money-version-missing', 'message' => 'Shipping money contract version is missing.' );
+		}
+		if ( $has_money_unit ) {
+			$declared_unit = class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::normalize_unit( $data['money_unit'] ) : '';
+			$signed = class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::get_source_contract( $connection_id ) : array();
+			if ( '' === $declared_unit || empty( $signed['unit'] ) || $declared_unit !== $signed['unit'] ) {
+				return array( 'success' => false, 'status' => 'money-unit-mismatch', 'message' => 'Shipping Source money unit differs from signed Connection provisioning.' );
+			}
+		}
+
+ 		if ( array_key_exists( 'money_contract_version', $data ) && null !== $data['money_contract_version'] ) {
+			$declared_version = class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::normalize_contract_version( $data['money_contract_version'] ) : 0;
+			$signed_version = class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::get_source_contract( $connection_id ) : array();
+			if ( $declared_version <= 0 || $declared_version !== (int) ( $signed_version['contractVersion'] ?? 0 ) ) {
+				return array( 'success' => false, 'status' => 'money-version-mismatch', 'message' => 'Shipping money contract version differs from signed Connection provisioning.' );
+			}
+		}
+
+		// Fractional scale/representation are additive and checked when
+		// supplied; new Backend versions publish both. Unknown units cannot
+		// mutate the cached shipping catalog.
+		if ( array_key_exists( 'money_fraction_digits', $data ) || array_key_exists( 'money_price_representation', $data ) ) {
+			$signed = class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::get_source_contract( $connection_id ) : array();
+			$digits = array_key_exists( 'money_fraction_digits', $data ) && class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::normalize_fraction_digits( $data['money_fraction_digits'] ) : -1;
+			$representation = array_key_exists( 'money_price_representation', $data ) && class_exists( 'Mobo_Core_Money_Policy' )
+				? Mobo_Core_Money_Policy::normalize_representation( $data['money_price_representation'] ) : '';
+			if ( ! $has_money_unit || ! $has_money_version || $digits < 0
+				|| $digits !== (int) ( $signed['fractionDigits'] ?? -1 )
+				|| '' === $representation || $representation !== (string) ( $signed['priceRepresentation'] ?? '' ) ) {
+				return array( 'success' => false, 'status' => 'money-shape-mismatch', 'message' => 'Shipping monetary precision or representation does not match Connection provisioning.' );
+			}
 		}
 
 		$seen_method_ids = array();
@@ -160,17 +217,24 @@ class Mobo_Core_Remote_Shipping_Methods {
 			return array( 'success' => false, 'status' => 'invalid', 'message' => 'Mobo shipping methods changedAt value is invalid.' );
 		}
 
-		$current = get_option( self::OPTION_SNAPSHOT, array() );
+		$current = Mobo_Core_Settings::get( self::OPTION_SNAPSHOT, array() );
 		$current = is_array( $current ) ? $current : array();
 		$current_changed_at       = absint( isset( $current['changedAt'] ) ? $current['changedAt'] : 0 );
 		$current_changed_explicit = ! empty( $current['changedAtExplicit'] );
 		$current_synced_at        = absint( isset( $current['syncedAt'] ) ? $current['syncedAt'] : 0 );
-		$request_started_at       = absint( $request_started_at );
+		$current_synced_us        = isset( $current['syncedAtUs'] ) ? absint( $current['syncedAtUs'] ) : ( $current_synced_at * 1000000 );
+		/* Public store_snapshot() previously accepted seconds. Preserve legacy callers
+		 * while using microseconds for UX57 HTTP-origin snapshots. */
+		$request_started_at       = (float) $request_started_at;
+		$request_started_us       = $request_started_at > 100000000000 ? (int) $request_started_at : ( absint( $request_started_at ) * 1000000 );
 
 		if ( $changed_explicit && $current_changed_explicit && $current_changed_at > 0 && $changed_at < $current_changed_at ) {
 			return array( 'success' => true, 'status' => 'stale-ignored', 'count' => count( isset( $current['shippings'] ) && is_array( $current['shippings'] ) ? $current['shippings'] : array() ) );
 		}
-		if ( ! $changed_explicit && $request_started_at > 0 && $current_synced_at > $request_started_at ) {
+		/* A newer commit must beat an in-flight API response whether or not the
+		 * response supplies changedAt. Compare actual arrival generations, not
+		 * second-resolution syncedAt (or mixed source/Provider timestamps). */
+		if ( $request_started_us > 0 && $current_synced_us > $request_started_us ) {
 			return array( 'success' => true, 'status' => 'stale-ignored', 'count' => count( isset( $current['shippings'] ) && is_array( $current['shippings'] ) ? $current['shippings'] : array() ) );
 		}
 
@@ -178,19 +242,20 @@ class Mobo_Core_Remote_Shipping_Methods {
 			'success'           => true,
 			'source'            => sanitize_key( (string) $source ),
 			'syncedAt'          => time(),
+			'syncedAtUs'        => (int) floor( microtime( true ) * 1000000 ),
 			'changedAt'         => $changed_at,
 			'changedAtExplicit' => $changed_explicit,
 			'shippings'         => $methods,
 		);
 
-			update_option( self::OPTION_SNAPSHOT, $snapshot, false );
-			$stored_snapshot = get_option( self::OPTION_SNAPSHOT, array() );
+			Mobo_Core_Settings::update( self::OPTION_SNAPSHOT, $snapshot, false );
+			$stored_snapshot = Mobo_Core_Settings::get( self::OPTION_SNAPSHOT, array() );
 			if ( ! is_array( $stored_snapshot ) || $stored_snapshot !== $snapshot ) {
 				return array( 'success' => false, 'status' => 'storage-failed', 'message' => 'Could not persist the Mobo shipping methods snapshot.' );
 			}
 
-			update_option( self::OPTION_CHANGED_AT, $changed_at, false );
-			if ( absint( get_option( self::OPTION_CHANGED_AT, 0 ) ) !== absint( $changed_at ) ) {
+			Mobo_Core_Settings::update( self::OPTION_CHANGED_AT, $changed_at, false );
+			if ( absint( Mobo_Core_Settings::get( self::OPTION_CHANGED_AT, 0 ) ) !== absint( $changed_at ) ) {
 				return array( 'success' => false, 'status' => 'storage-failed', 'message' => 'Could not persist the Mobo shipping methods revision.' );
 			}
 
@@ -206,7 +271,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 * @return array
 	 */
 	public function get_methods() {
-		$snapshot = get_option( self::OPTION_SNAPSHOT, array() );
+		$snapshot = Mobo_Core_Settings::get( self::OPTION_SNAPSHOT, array() );
 		$methods  = isset( $snapshot['shippings'] ) && is_array( $snapshot['shippings'] ) ? $snapshot['shippings'] : array();
 		return $this->normalize_methods( $methods );
 	}
@@ -225,10 +290,10 @@ class Mobo_Core_Remote_Shipping_Methods {
 			'shippingClassId'      => Mobo_Core_Settings::get_int( 'mobo_core_mobo_shipping_class_id', 0, 0, PHP_INT_MAX ),
 			'usesMoboApiPrice'     => Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_use_api_price', '1' ),
 			'count'                => count( $methods ),
-			'lastAttemptAt'        => absint( get_option( self::OPTION_LAST_ATTEMPT, 0 ) ),
-			'lastSuccessAt'        => absint( get_option( self::OPTION_LAST_SUCCESS, 0 ) ),
-			'lastChangedAt'        => absint( get_option( self::OPTION_CHANGED_AT, 0 ) ),
-			'lastError'            => (string) get_option( self::OPTION_LAST_ERROR, '' ),
+			'lastAttemptAt'        => absint( Mobo_Core_Settings::get( self::OPTION_LAST_ATTEMPT, 0 ) ),
+			'lastSuccessAt'        => absint( Mobo_Core_Settings::get( self::OPTION_LAST_SUCCESS, 0 ) ),
+			'lastChangedAt'        => absint( Mobo_Core_Settings::get( self::OPTION_CHANGED_AT, 0 ) ),
+			'lastError'            => (string) Mobo_Core_Settings::get( self::OPTION_LAST_ERROR, '' ),
 			'rules'                => $this->get_rules(),
 			'wordpressTime'        => $this->get_wordpress_time_status(),
 		);
@@ -246,6 +311,12 @@ class Mobo_Core_Remote_Shipping_Methods {
 	 */
 	public function filter_cart_shipping_packages( $packages ) {
 		if ( ! is_array( $packages ) || ! Mobo_Core_Settings::enabled( 'mobo_core_mobo_shipping_package_enabled', '0' ) ) {
+			return $packages;
+		}
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) || ! Mobo_Core_Money_Policy::shipping_currency_ready() ) {
+			/* Never reinterpret Source prices under a mismatched WooCommerce unit.
+			 * Leave WooCommerce's original package untouched and let health/admin
+			 * surface the provisioning/configuration fault. */
 			return $packages;
 		}
 
@@ -277,7 +348,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 				$line_total = isset( $item['line_total'] ) ? (float) $item['line_total'] : 0.0;
 				$api_price  = $use_api_price ? Mobo_Core_Money_Policy::get_mobo_api_price( $variation_id, $product_id ) : null;
 
-				$shipping_api_price = null !== $api_price ? Mobo_Core_Money_Policy::source_amount_to_store_amount( $api_price ) : null;
+				$shipping_api_price = null !== $api_price ? Mobo_Core_Money_Policy::shipping_source_to_store( $api_price ) : null;
 				if ( null !== $shipping_api_price ) {
 					$quantity   = isset( $item['quantity'] ) ? max( 0.0, (float) $item['quantity'] ) : 0.0;
 					$line_total = $shipping_api_price * $quantity;
@@ -336,6 +407,9 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$scenario = $this->classify_order( $order );
 		if ( 'non_mobo_only' === $scenario ) {
 			return new WP_Error( 'mobo_core_shipping_not_needed', 'این سفارش محصول موبو ندارد و نیازی به روش ارسال موبو نیست.' );
+		}
+		if ( 'mixed' === $scenario ) {
+			return new WP_Error( 'mobo_core_shipping_mixed_order_blocked', 'سفارش ترکیبی طبق سیاست Fail-Closed قابل ارسال به موبو نیست و نباید shipping_id موبو برای آن resolve شود.' );
 		}
 
 		$available = $this->normalize_methods( $available_shippings );
@@ -400,7 +474,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	/**
-	 * Scenario definitions used for Mobo submission. Non-Mobo-only orders are ignored.
+	 * Legacy scenario definitions retained only for migration/diagnostics. Current automatic submission accepts only all-Mobo orders owned by one Connection.
 	 *
 	 * @return array
 	 */
@@ -478,7 +552,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$instance_id = absint( $instance_id );
 
 		$key = $this->build_legacy_wc_method_rule_option_key( $zone_id, $method_id, $instance_id );
-		$id  = absint( get_option( $key, 0 ) );
+		$id  = absint( Mobo_Core_Settings::get( $key, 0 ) );
 		if ( $id > 0 ) {
 			return array( 'shippingId' => $id, 'zoneId' => $zone_id );
 		}
@@ -488,7 +562,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		// explicit administrator choice in the new single mapping UI.
 		$legacy_ids = array();
 		foreach ( array( 'mobo_only', 'mixed' ) as $legacy_scenario ) {
-			$legacy_id = absint( get_option( $this->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $legacy_scenario ), 0 ) );
+			$legacy_id = absint( Mobo_Core_Settings::get( $this->build_wc_method_rule_option_key( $zone_id, $method_id, $instance_id, $legacy_scenario ), 0 ) );
 			if ( $legacy_id > 0 ) {
 				$legacy_ids[] = $legacy_id;
 			}
@@ -496,7 +570,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 		$legacy_ids = array_values( array_unique( $legacy_ids ) );
 		if ( 1 === count( $legacy_ids ) ) {
 			$id = absint( $legacy_ids[0] );
-			update_option( $key, (string) $id, false );
+			Mobo_Core_Settings::update( $key, (string) $id, false );
 			return array( 'shippingId' => $id, 'zoneId' => $zone_id );
 		}
 
@@ -508,7 +582,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 				continue;
 			}
 			$candidate_key = $this->build_legacy_wc_method_rule_option_key( $candidate_zone_id, $method_id, $instance_id );
-			$candidate_id  = absint( get_option( $candidate_key, 0 ) );
+			$candidate_id  = absint( Mobo_Core_Settings::get( $candidate_key, 0 ) );
 			if ( $candidate_id > 0 ) {
 				return array( 'shippingId' => $candidate_id, 'zoneId' => $candidate_zone_id );
 			}
@@ -801,7 +875,7 @@ class Mobo_Core_Remote_Shipping_Methods {
 	}
 
 	private function parse_allowed_ids_option( $key ) {
-		$value = get_option( $key, '' );
+		$value = Mobo_Core_Settings::get( $key, '' );
 		if ( is_array( $value ) ) {
 			$parts = $value;
 		} else {

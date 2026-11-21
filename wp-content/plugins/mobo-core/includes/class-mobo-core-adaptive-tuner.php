@@ -40,7 +40,7 @@ final class Mobo_Core_Adaptive_Tuner {
 		$baseline = array(
 			'webhookQueue'   => Mobo_Core_Settings::get_int( 'mobo_core_webhook_files_per_run', 4, 1, 10 ),
 			'parentFinalize' => Mobo_Core_Settings::get_int( 'mobo_core_parent_finalize_batch_size', 10, 1, 50 ),
-			'imageQueue'     => max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 0, 10 ) ),
+			'imageQueue'     => max( 1, Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 3, 1, 10 ) ),
 			'repriceQueue'   => Mobo_Core_Settings::get_int( 'mobo_core_reprice_batch_size', 20, 1, 200 ),
 			'recategorizeQueue' => Mobo_Core_Settings::get_int( 'mobo_core_recategorize_batch_size', 20, 1, 200 ),
 			'cacheWarmup'    => Mobo_Core_Settings::get_int( 'mobo_core_cache_warmup_batch_size', 2, 1, 10 ),
@@ -72,7 +72,7 @@ final class Mobo_Core_Adaptive_Tuner {
 			return $profile;
 		}
 
-		$diagnostics = get_option( self::DIAGNOSTICS_OPTION, array() );
+		$diagnostics = Mobo_Core_Settings::get( self::DIAGNOSTICS_OPTION, array() );
 		$diagnostics = is_array( $diagnostics ) ? $diagnostics : array();
 		$stages      = isset( $diagnostics['stages'] ) && is_array( $diagnostics['stages'] ) ? $diagnostics['stages'] : array();
 		$runner      = isset( $diagnostics['runner'] ) && is_array( $diagnostics['runner'] ) ? $diagnostics['runner'] : array();

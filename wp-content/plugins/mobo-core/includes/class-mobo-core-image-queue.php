@@ -26,7 +26,7 @@ class Mobo_Core_Image_Queue {
 	private static $table_exists_cache = null;
 
 	/** @var array|null Request-local queue summary cache. */
-	private static $summary_cache = null;
+	private static $summary_cache = array();
 
 	/**
 	 * Return table name.
@@ -37,6 +37,11 @@ class Mobo_Core_Image_Queue {
 		global $wpdb;
 
 		return $wpdb->prefix . 'mobo_image_queue';
+	}
+
+	/** @return int */
+	private static function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
 	}
 
 	/**
@@ -50,10 +55,11 @@ class Mobo_Core_Image_Queue {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			connection_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			queue_key varchar(191) NOT NULL,
 			product_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			product_guid varchar(191) NOT NULL DEFAULT '',
@@ -69,21 +75,21 @@ class Mobo_Core_Image_Queue {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY queue_key (queue_key),
-			KEY product_status (product_id, status, next_retry_at),
-			KEY image_guid (image_guid),
-			KEY status_retry (status, next_retry_at),
-			KEY status_retry_id (status, next_retry_at, id),
-			KEY locked_until (locked_until),
-			KEY status_locked_id (status, locked_until, id),
-			KEY status_updated_id (status, updated_at, id),
-			KEY updated_id (updated_at, id),
-			KEY attachment_id (attachment_id)
+			UNIQUE KEY queue_key (connection_id, queue_key),
+			KEY product_status (connection_id, product_id, status, next_retry_at),
+			KEY product_position (connection_id, product_id, position_index, id),
+			KEY image_guid (connection_id, image_guid(160)),
+			KEY status_retry_id (connection_id, status, next_retry_at, id),
+			KEY locked_until (connection_id, locked_until),
+			KEY status_locked_id (connection_id, status, locked_until, id),
+			KEY status_updated_id (connection_id, status, updated_at, id),
+			KEY updated_id (connection_id, updated_at, id),
+			KEY attachment_id (connection_id, attachment_id)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
 		self::$table_exists_cache = null;
-		self::$summary_cache      = null;
+		self::$summary_cache      = array();
 	}
 
 	/**
@@ -106,7 +112,24 @@ class Mobo_Core_Image_Queue {
 
 	/** @return void */
 	private static function invalidate_summary_cache() {
-		self::$summary_cache = null;
+		self::$summary_cache = array();
+	}
+
+	/**
+	 * Shared image desired-state lease for one Connection and Woo parent. The
+	 * Connection is encoded explicitly because dynamically named locks do not
+	 * participate in Mobo_Core_Lock's fixed source-owned-name lookup.
+	 *
+	 * Both queue replacement/pruning and Woo gallery linkage must hold this lease;
+	 * downloading or editing the physical image must NOT hold it.
+	 */
+	public static function desired_state_lock_name( $product_id ) {
+		$connection_id = self::connection_id();
+		$product_id = absint( $product_id );
+		if ( $connection_id <= 0 || $product_id <= 0 ) {
+			return '';
+		}
+		return 'image_desired_c' . $connection_id . '_p' . $product_id;
 	}
 
 	/**
@@ -118,12 +141,30 @@ class Mobo_Core_Image_Queue {
 	 * @return array
 	 */
 	public function enqueue_product_images( $product_id, $product_guid, $images ) {
+		$lock_name = self::desired_state_lock_name( $product_id );
+		if ( '' === $lock_name || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => 'Image desired-state owner or lock is unavailable.' );
+		}
+		$lock_token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+		if ( false === $lock_token ) {
+			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => 'Image desired-state update is busy; retry without pruning.' );
+		}
+		try {
+			return $this->enqueue_product_images_locked( $product_id, $product_guid, $images );
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $lock_token );
+		}
+	}
+
+	/** Queue mutation, only with the per-Connection/product desired-state lease held. */
+	private function enqueue_product_images_locked( $product_id, $product_guid, $images ) {
 		global $wpdb;
 
+		$connection_id = self::connection_id();
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
 
-		if ( $product_id <= 0 || ! is_array( $images ) ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! is_array( $images ) ) {
 			return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'error' => '' );
 		}
 		if ( ! self::table_exists() ) {
@@ -137,7 +178,8 @@ class Mobo_Core_Image_Queue {
 			$wpdb->last_error = '';
 			$removed_attachment_ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT DISTINCT attachment_id FROM {$table} WHERE product_id = %d AND attachment_id > 0",
+					"SELECT DISTINCT attachment_id FROM {$table} WHERE connection_id = %d AND product_id = %d AND attachment_id > 0",
+					$connection_id,
 					$product_id
 				)
 			);
@@ -147,7 +189,7 @@ class Mobo_Core_Image_Queue {
 
 			$removed_attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $removed_attachment_ids ) ? $removed_attachment_ids : array() ) ) ) );
 			$wpdb->last_error = '';
-			$removed = $wpdb->delete( $table, array( 'product_id' => $product_id ), array( '%d' ) );
+			$removed = $wpdb->delete( $table, array( 'connection_id' => $connection_id, 'product_id' => $product_id ), array( '%d', '%d' ) );
 			if ( false === $removed ) {
 				return array( 'enqueued' => 0, 'skipped' => 0, 'removed' => 0, 'removedAttachmentIds' => array(), 'error' => 'Could not clear obsolete image queue rows.' );
 			}
@@ -198,9 +240,9 @@ class Mobo_Core_Image_Queue {
 		/* One lookup for the full product image set instead of one SELECT per image. */
 		$keys         = array_values( array_unique( array_filter( array_map( 'strval', wp_list_pluck( $normalized, 'key' ) ) ) ) );
 		$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
-		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE queue_key IN ({$placeholders})";
+		$query        = "SELECT id, queue_key, status, attachment_id, source_url FROM {$table} WHERE connection_id = %d AND queue_key IN ({$placeholders})";
 		$wpdb->last_error = '';
-		$rows         = $wpdb->get_results( $wpdb->prepare( $query, $keys ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all values are bound by wpdb::prepare().
+		$rows         = $wpdb->get_results( $wpdb->prepare( $query, array_merge( array( $connection_id ), $keys ) ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all values are bound by wpdb::prepare().
 		if ( ! is_array( $rows ) && '' !== (string) $wpdb->last_error ) {
 			return array( 'enqueued' => 0, 'skipped' => $skip, 'removed' => 0, 'error' => 'Could not read the image queue.' );
 		}
@@ -231,7 +273,8 @@ class Mobo_Core_Image_Queue {
 			$wpdb->last_error = '';
 			$legacy_rows = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT id, queue_key, status, attachment_id, source_url, image_guid FROM {$table} WHERE product_id = %d",
+					"SELECT id, queue_key, status, attachment_id, source_url, image_guid FROM {$table} WHERE connection_id = %d AND product_id = %d",
+					$connection_id,
 					$product_id
 				),
 				ARRAY_A
@@ -286,9 +329,9 @@ class Mobo_Core_Image_Queue {
 						'position_index' => $position,
 						'updated_at'     => $now,
 					),
-					array( 'id' => absint( $existing['id'] ) ),
+					array( 'id' => absint( $existing['id'] ), 'connection_id' => $connection_id ),
 					array( '%s', '%d', '%s', '%s', '%d', '%s' ),
-					array( '%d' )
+					array( '%d', '%d' )
 				);
 				if ( false === $write_result ) {
 					$db_error = 'Could not refresh an existing image queue row.';
@@ -299,6 +342,7 @@ class Mobo_Core_Image_Queue {
 			}
 
 			$data = array(
+				'connection_id' => $connection_id,
 				'queue_key'      => $key,
 				'product_id'     => $product_id,
 				'product_guid'   => $product_guid,
@@ -336,7 +380,7 @@ class Mobo_Core_Image_Queue {
 					$superseded_attachment_id = $attachment_id;
 				}
 
-				$write_result = $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ) ), null, array( '%d' ) );
+				$write_result = $wpdb->update( $table, $data, array( 'id' => absint( $existing['id'] ), 'connection_id' => $connection_id ), null, array( '%d', '%d' ) );
 			} else {
 				$data['attachment_id'] = 0;
 				$data['try_count']     = 0;
@@ -407,17 +451,18 @@ class Mobo_Core_Image_Queue {
 
 		$error                  = '';
 		$removed_attachment_ids = array();
+		$connection_id          = self::connection_id();
 		$product_id             = absint( $product_id );
 		$keep_keys              = array_values( array_unique( array_filter( array_map( 'strval', is_array( $keep_keys ) ? $keep_keys : array() ) ) ) );
 
-		if ( $product_id <= 0 || empty( $keep_keys ) || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || empty( $keep_keys ) || ! self::table_exists() ) {
 			return 0;
 		}
 
 		$table        = self::table_name();
 		$placeholders = implode( ',', array_fill( 0, count( $keep_keys ), '%s' ) );
-		$args         = array_merge( array( $product_id ), $keep_keys );
-		$select_query = "SELECT DISTINCT attachment_id FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders}) AND attachment_id > 0";
+		$args         = array_merge( array( $connection_id, $product_id ), $keep_keys );
+		$select_query = "SELECT DISTINCT attachment_id FROM {$table} WHERE connection_id = %d AND product_id = %d AND queue_key NOT IN ({$placeholders}) AND attachment_id > 0";
 		$wpdb->last_error = '';
 		$candidates = $wpdb->get_col( $wpdb->prepare( $select_query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
 		if ( ! is_array( $candidates ) && '' !== (string) $wpdb->last_error ) {
@@ -425,7 +470,7 @@ class Mobo_Core_Image_Queue {
 			return 0;
 		}
 
-		$query   = "DELETE FROM {$table} WHERE product_id = %d AND queue_key NOT IN ({$placeholders})";
+		$query   = "DELETE FROM {$table} WHERE connection_id = %d AND product_id = %d AND queue_key NOT IN ({$placeholders})";
 		$deleted = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are internal; all values are prepared.
 
 		if ( false === $deleted ) {
@@ -447,11 +492,12 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_due_product_images( $product_id, $limit ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
 		$limit      = max( 1, min( 50, absint( $limit ) ) );
 
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return array();
 		}
 
@@ -461,13 +507,14 @@ class Mobo_Core_Image_Queue {
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT * FROM {$table}
-				WHERE product_id = %d
+				WHERE connection_id = %d AND product_id = %d
 				AND (
 					(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)
 				ORDER BY position_index ASC, id ASC
 				LIMIT %d",
+				$connection_id,
 				$product_id,
 				$now,
 				$now,
@@ -487,10 +534,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function count_due_by_product( $product_id ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
 
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return 0;
 		}
 
@@ -501,11 +549,12 @@ class Mobo_Core_Image_Queue {
 			$wpdb->get_var(
 				$wpdb->prepare(
 					"SELECT COUNT(*) FROM {$table}
-					WHERE product_id = %d
+					WHERE connection_id = %d AND product_id = %d
 					AND (
 						(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 					)",
+					$connection_id,
 					$product_id,
 					$now,
 					$now
@@ -522,9 +571,10 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_product_summary( $product_id ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return array( 'pending' => 0, 'due' => 0 );
 		}
 
@@ -537,9 +587,10 @@ class Mobo_Core_Image_Queue {
 					SUM(CASE WHEN (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s) THEN 1 ELSE 0 END) AS due_count
 				FROM {$table}
-				WHERE product_id = %d",
+				WHERE connection_id = %d AND product_id = %d",
 				$now,
 				$now,
+				$connection_id,
 				$product_id
 			),
 			ARRAY_A
@@ -558,8 +609,9 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function has_due() {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
-		if ( ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -568,9 +620,10 @@ class Mobo_Core_Image_Queue {
 		$id    = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT id FROM {$table}
-				WHERE (status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				WHERE connection_id = %d AND ((status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))
 				LIMIT 1",
+				$connection_id,
 				$now,
 				$now
 			)
@@ -587,12 +640,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_summary( $force = false ) {
 		global $wpdb;
-
-		if ( ! $force && is_array( self::$summary_cache ) ) {
-			return self::$summary_cache;
-		}
+		$connection_id = self::connection_id();
 
 		$empty = array(
+			'available'       => false,
+			'readFailed'      => false,
 			'pending'         => 0,
 			'due'             => 0,
 			'failed'          => 0,
@@ -601,13 +653,20 @@ class Mobo_Core_Image_Queue {
 			'oldestPendingAt' => '',
 		);
 
+		if ( $connection_id <= 0 ) {
+			return $empty;
+		}
+		if ( ! $force && isset( self::$summary_cache[ $connection_id ] ) && is_array( self::$summary_cache[ $connection_id ] ) ) {
+			return self::$summary_cache[ $connection_id ];
+		}
 		if ( ! self::table_exists() ) {
-			self::$summary_cache = $empty;
+			self::$summary_cache[ $connection_id ] = $empty;
 			return $empty;
 		}
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$wpdb->last_error = '';
 		$row   = $wpdb->get_row(
 			$wpdb->prepare(
 				"SELECT
@@ -619,19 +678,23 @@ class Mobo_Core_Image_Queue {
 					MIN(CASE WHEN status IN ('pending','processing','attaching') THEN created_at ELSE NULL END) AS oldest_pending_at,
 					MIN(CASE WHEN status IN ('pending','attaching') AND next_retry_at IS NOT NULL THEN next_retry_at ELSE NULL END) AS next_retry_at
 				FROM {$table}
-				WHERE status IN ('pending','processing','attaching','failed')",
+				WHERE connection_id = %d AND status IN ('pending','processing','attaching','failed')",
 				$now,
-				$now
+				$now,
+				$connection_id
 			),
 			ARRAY_A
 		);
 
-		if ( ! is_array( $row ) ) {
-			self::$summary_cache = $empty;
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $row ) ) {
+			$empty['readFailed'] = true;
+			self::$summary_cache[ $connection_id ] = $empty;
 			return $empty;
 		}
 
-		self::$summary_cache = array(
+		self::$summary_cache[ $connection_id ] = array(
+			'available'       => true,
+			'readFailed'      => false,
 			'pending'         => absint( isset( $row['pending_count'] ) ? $row['pending_count'] : 0 ),
 			'due'             => absint( isset( $row['due_count'] ) ? $row['due_count'] : 0 ),
 			'failed'          => absint( isset( $row['failed_count'] ) ? $row['failed_count'] : 0 ),
@@ -640,7 +703,7 @@ class Mobo_Core_Image_Queue {
 			'oldestPendingAt' => isset( $row['oldest_pending_at'] ) ? (string) $row['oldest_pending_at'] : '',
 		);
 
-		return self::$summary_cache;
+		return self::$summary_cache[ $connection_id ];
 	}
 
 	/**
@@ -656,6 +719,7 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function terminalize_due_missing_products( $limit = 100 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 500, absint( $limit ) ) );
 		if ( ! self::table_exists() ) {
@@ -671,13 +735,15 @@ class Mobo_Core_Image_Queue {
 				LEFT JOIN {$wpdb->posts} p
 					ON p.ID = q.product_id
 					AND p.post_type = 'product'
-				WHERE p.ID IS NULL
+				WHERE q.connection_id = %d
+					AND p.ID IS NULL
 					AND (
 						(q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
 						OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s)
 					)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$now,
 				$limit
@@ -690,7 +756,7 @@ class Mobo_Core_Image_Queue {
 		}
 
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-		$args            = array_merge( array( $now ), $ids, array( $now, $now ) );
+		$args            = array_merge( array( $now, $connection_id ), $ids, array( $now, $now ) );
 		$updated         = $wpdb->query(
 			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- dynamic ID placeholders are generated from integer IDs only.
 				"UPDATE {$table}
@@ -701,7 +767,7 @@ class Mobo_Core_Image_Queue {
 					locked_until = NULL,
 					last_error = 'Permanent: Product does not exist.',
 					updated_at = %s
-				WHERE id IN ({$id_placeholders})
+				WHERE connection_id = %d AND id IN ({$id_placeholders})
 					AND NOT EXISTS (
 						SELECT 1 FROM {$wpdb->posts} p
 						WHERE p.ID = {$table}.product_id AND p.post_type = 'product'
@@ -731,6 +797,7 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function claim_due_images( $limit, $ttl = 120 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 50, absint( $limit ) ) );
 		$ttl   = max( 30, min( 300, absint( $ttl ) ) );
@@ -746,10 +813,11 @@ class Mobo_Core_Image_Queue {
 				INNER JOIN {$wpdb->posts} p
 					ON p.ID = q.product_id
 					AND p.post_type = 'product'
-				WHERE (q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
-					OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s)
+				WHERE q.connection_id = %d AND ((q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
+					OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s))
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$now,
 				$limit
@@ -763,12 +831,12 @@ class Mobo_Core_Image_Queue {
 
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
-		$update_args     = array_merge( array( $locked_until, $now ), $ids, array( $now, $now ) );
+		$update_args     = array_merge( array( $locked_until, $now, $connection_id ), $ids, array( $now, $now ) );
 		$updated         = $wpdb->query(
 			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, updated_at = %s
-				WHERE id IN ({$id_placeholders})
+				WHERE connection_id = %d AND id IN ({$id_placeholders})
 					AND ((status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
 				$update_args
@@ -780,12 +848,12 @@ class Mobo_Core_Image_Queue {
 		}
 
 		self::invalidate_summary_cache();
-		$select_args = array_merge( $ids, array( $locked_until ) );
+		$select_args = array_merge( array( $connection_id ), $ids, array( $locked_until ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT id, product_id, product_guid, image_guid, source_url, position_index, attachment_id, try_count, last_error, locked_until, updated_at
 				FROM {$table}
-				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
+				WHERE connection_id = %d AND id IN ({$id_placeholders}) AND status = 'processing' AND locked_until = %s
 				ORDER BY updated_at ASC, id ASC",
 				$select_args
 			),
@@ -814,6 +882,7 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function release_claimed_images( $ids, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$ids         = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
 		$claim_token = sanitize_text_field( (string) $claim_token );
@@ -824,12 +893,12 @@ class Mobo_Core_Image_Queue {
 		$table          = self::table_name();
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$now            = current_time( 'mysql', true );
-		$args           = array_merge( array( $now ), $ids, array( $claim_token ) );
+		$args           = array_merge( array( $now, $connection_id ), $ids, array( $claim_token ) );
 		$updated        = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'pending', locked_until = NULL, updated_at = %s
-				WHERE status = 'processing' AND id IN ({$id_placeholders}) AND locked_until = %s",
+				WHERE connection_id = %d AND status = 'processing' AND id IN ({$id_placeholders}) AND locked_until = %s",
 				$args
 			)
 		);
@@ -849,6 +918,7 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_due_images( $limit ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 50, absint( $limit ) ) );
 
@@ -862,12 +932,13 @@ class Mobo_Core_Image_Queue {
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT * FROM {$table}
-				WHERE (
+				WHERE connection_id = %d AND (
 					(status IN ('pending','attaching') AND (next_retry_at IS NULL OR next_retry_at <= %s))
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)
 				ORDER BY updated_at ASC, id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$now,
 				$limit
@@ -902,9 +973,10 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function lock_with_token( $id, $ttl = 90 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id = absint( $id );
-		if ( $id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || ! self::table_exists() ) {
 			return '';
 		}
 
@@ -915,19 +987,19 @@ class Mobo_Core_Image_Queue {
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, updated_at = %s
-				WHERE id = %d
+				WHERE connection_id = %d AND id = %d
 				AND (
 					status IN ('pending','attaching')
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
 				)",
-				$until, $now, $id, $now
+				$until, $now, $connection_id, $id, $now
 			)
 		);
 		if ( 1 !== absint( $updated ) ) {
 			return '';
 		}
 
-		$persisted = sanitize_text_field( (string) $wpdb->get_var( $wpdb->prepare( "SELECT locked_until FROM {$table} WHERE id = %d AND status = 'processing' LIMIT 1", $id ) ) );
+		$persisted = sanitize_text_field( (string) $wpdb->get_var( $wpdb->prepare( "SELECT locked_until FROM {$table} WHERE connection_id = %d AND id = %d AND status = 'processing' LIMIT 1", $connection_id, $id ) ) );
 		if ( '' === $persisted || ! hash_equals( $until, $persisted ) ) {
 			return '';
 		}
@@ -944,24 +1016,25 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $source_url, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 		$id         = absint( $id );
 		$try_count  = max( 1, absint( $try_count ) );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$source_url = esc_url_raw( (string) $source_url );
 		$claim_token = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
 		$table = self::table_name();
 		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
-		$args = array( $try_count, current_time( 'mysql', true ), $id, $try_count, $product_id, $image_guid, $source_url );
+		$args = array( $try_count, current_time( 'mysql', true ), $connection_id, $id, $try_count, $product_id, $image_guid, $source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table} SET try_count = %d, updated_at = %s
-				WHERE id = %d AND status = 'processing' AND try_count < %d
+				WHERE connection_id = %d AND id = %d AND status = 'processing' AND try_count < %d
 					AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}",
 				$args
 			)
@@ -1006,6 +1079,7 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function mark_attaching_if_current( $id, $attachment_id, $product_id, $image_guid, $source_url, $retry_delay = 0, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id            = absint( $id );
 		$attachment_id = absint( $attachment_id );
@@ -1014,7 +1088,7 @@ class Mobo_Core_Image_Queue {
 		$source_url    = esc_url_raw( (string) $source_url );
 		$retry_delay   = max( 0, min( 300, absint( $retry_delay ) ) );
 		$claim_token   = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || $attachment_id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || $attachment_id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -1022,13 +1096,13 @@ class Mobo_Core_Image_Queue {
 		$now   = current_time( 'mysql', true );
 		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
 		if ( $retry_delay > 0 ) {
-			$args = array( $attachment_id, gmdate( 'Y-m-d H:i:s', time() + $retry_delay ), $now, $id, $product_id, $image_guid, $source_url );
+			$args = array( $attachment_id, gmdate( 'Y-m-d H:i:s', time() + $retry_delay ), $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 			if ( '' !== $claim_token ) { $args[] = $claim_token; }
-			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = %s, locked_until = NULL, last_error = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = %s, locked_until = NULL, last_error = NULL, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		} else {
-			$args = array( $attachment_id, $now, $id, $product_id, $image_guid, $source_url );
+			$args = array( $attachment_id, $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 			if ( '' !== $claim_token ) { $args[] = $claim_token; }
-			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+			$sql = "UPDATE {$table} SET status = 'attaching', attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		}
 		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
 		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
@@ -1068,21 +1142,22 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function mark_done_many( $ids ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$ids = array_values( array_unique( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
-		if ( empty( $ids ) || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || empty( $ids ) || ! self::table_exists() ) {
 			return 0;
 		}
 
 		$table           = self::table_name();
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$now             = current_time( 'mysql', true );
-		$args            = array_merge( array( $now ), $ids );
+		$args            = array_merge( array( $now, $connection_id ), $ids );
 		$updated         = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'done', next_retry_at = NULL, locked_until = NULL, last_error = NULL, updated_at = %s
-				WHERE id IN ({$id_placeholders}) AND status = 'attaching' AND attachment_id > 0",
+				WHERE connection_id = %d AND id IN ({$id_placeholders}) AND status = 'attaching' AND attachment_id > 0",
 				$args
 			)
 		);
@@ -1143,11 +1218,12 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function mark_failure_if_claimed( $id, $message, $try_count, $final_failed = false, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id          = absint( $id );
 		$try_count   = max( 1, absint( $try_count ) );
 		$claim_token = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || '' === $claim_token || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || '' === $claim_token || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -1165,11 +1241,12 @@ class Mobo_Core_Image_Queue {
 				$wpdb->prepare(
 					"UPDATE {$table}
 					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND locked_until = %s",
+					WHERE connection_id = %d AND id = %d AND status = 'processing' AND locked_until = %s",
 					$status,
 					$try_count,
 					$message,
 					$now,
+					$connection_id,
 					$id,
 					$claim_token
 				)
@@ -1179,12 +1256,13 @@ class Mobo_Core_Image_Queue {
 				$wpdb->prepare(
 					"UPDATE {$table}
 					SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
-					WHERE id = %d AND status = 'processing' AND locked_until = %s",
+					WHERE connection_id = %d AND id = %d AND status = 'processing' AND locked_until = %s",
 					$status,
 					$try_count,
 					gmdate( 'Y-m-d H:i:s', time() + $delay ),
 					$message,
 					$now,
+					$connection_id,
 					$id,
 					$claim_token
 				)
@@ -1219,12 +1297,13 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function schedule_repair_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 		$id         = absint( $id );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$source_url = esc_url_raw( (string) $source_url );
 		$try_count  = max( 1, absint( $try_count ) );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -1234,11 +1313,12 @@ class Mobo_Core_Image_Queue {
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'pending', attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
-				WHERE id = %d AND status IN ('done','attaching') AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
+				WHERE connection_id = %d AND id = %d AND status IN ('done','attaching') AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s",
 				$try_count,
 				gmdate( 'Y-m-d H:i:s', time() + $delay ),
 				sanitize_text_field( (string) $message ),
 				current_time( 'mysql', true ),
+				$connection_id,
 				$id,
 				$product_id,
 				$image_guid,
@@ -1254,19 +1334,20 @@ class Mobo_Core_Image_Queue {
 
 	public function release_if_superseded( $id, $product_id, $image_guid, $source_url, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 		$id         = absint( $id );
 		$product_id = absint( $product_id );
 		$image_guid = sanitize_text_field( (string) $image_guid );
 		$source_url = esc_url_raw( (string) $source_url );
 		$claim_token = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
+		if ( $connection_id <= 0 || $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
-		$args = array( $now, $id, $product_id, $image_guid, $source_url );
+		$args = array( $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
-		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s WHERE id = %d AND status = 'processing' AND NOT (product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s){$lease_sql}", $args ) );
+		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND NOT (product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s){$lease_sql}", $args ) );
 		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
 		return false;
 	}
@@ -1283,25 +1364,26 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function mark_excluded_if_current( $id, $product_id, $image_guid, $source_url, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id          = absint( $id );
 		$product_id  = absint( $product_id );
 		$image_guid  = sanitize_text_field( (string) $image_guid );
 		$source_url  = esc_url_raw( (string) $source_url );
 		$claim_token = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) {
 			return false;
 		}
 
 		$table     = self::table_name();
 		$now       = current_time( 'mysql', true );
 		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
-		$args      = array( $now, $id, $product_id, $image_guid, $source_url );
+		$args      = array( $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 		if ( '' !== $claim_token ) {
 			$args[] = $claim_token;
 		}
 
-		$sql = "UPDATE {$table} SET status = 'excluded', attachment_id = 0, next_retry_at = NULL, locked_until = NULL, last_error = 'Product excluded by administrator URL policy.', updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+		$sql = "UPDATE {$table} SET status = 'excluded', attachment_id = 0, next_retry_at = NULL, locked_until = NULL, last_error = 'Product excluded by administrator URL policy.', updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
 		if ( 1 === absint( $updated ) ) {
 			self::invalidate_summary_cache();
@@ -1313,6 +1395,7 @@ class Mobo_Core_Image_Queue {
 
 	public function mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $source_url, $final_failed = false, $claim_token = '' ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id         = absint( $id );
 		$product_id = absint( $product_id );
@@ -1320,7 +1403,7 @@ class Mobo_Core_Image_Queue {
 		$source_url = esc_url_raw( (string) $source_url );
 		$try_count  = max( 1, absint( $try_count ) );
 		$claim_token = sanitize_text_field( (string) $claim_token );
-		if ( $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
+		if ( $connection_id <= 0 || $id <= 0 || $product_id <= 0 || '' === $image_guid || '' === $source_url || ! self::table_exists() ) { return false; }
 
 		$status  = $final_failed ? 'failed' : 'pending';
 		$delay   = $final_failed ? null : $this->calculate_retry_delay( $id, $try_count );
@@ -1330,13 +1413,13 @@ class Mobo_Core_Image_Queue {
 		$now   = current_time( 'mysql', true );
 		$lease_sql = '' !== $claim_token ? ' AND locked_until = %s' : '';
 		if ( null === $delay ) {
-			$args = array( $status, $try_count, $message, $now, $id, $product_id, $image_guid, $source_url );
+			$args = array( $status, $try_count, $message, $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 			if ( '' !== $claim_token ) { $args[] = $claim_token; }
-			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		} else {
-			$args = array( $status, $try_count, gmdate( 'Y-m-d H:i:s', time() + $delay ), $message, $now, $id, $product_id, $image_guid, $source_url );
+			$args = array( $status, $try_count, gmdate( 'Y-m-d H:i:s', time() + $delay ), $message, $now, $connection_id, $id, $product_id, $image_guid, $source_url );
 			if ( '' !== $claim_token ) { $args[] = $claim_token; }
-			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s WHERE id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
+			$sql = "UPDATE {$table} SET status = %s, attachment_id = 0, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND BINARY source_url = BINARY %s{$lease_sql}";
 		}
 		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
 		if ( 1 === absint( $updated ) ) { self::invalidate_summary_cache(); return true; }
@@ -1381,20 +1464,21 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function count_pending_by_product( $product_id, $include_failed = false ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
 
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return 0;
 		}
 
 		$table = self::table_name();
 
 		if ( $include_failed ) {
-			return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE product_id = %d AND status <> 'done'", $product_id ) ) );
+			return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND product_id = %d AND status <> 'done'", $connection_id, $product_id ) ) );
 		}
 
-		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE product_id = %d AND status IN ('pending', 'processing', 'attaching')", $product_id ) ) );
+		return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND product_id = %d AND status IN ('pending', 'processing', 'attaching')", $connection_id, $product_id ) ) );
 	}
 
 	/**
@@ -1405,10 +1489,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_done_attachment_ids_for_product( $product_id ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
 
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return array();
 		}
 
@@ -1416,8 +1501,9 @@ class Mobo_Core_Image_Queue {
 		$ids   = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT attachment_id FROM {$table}
-				WHERE product_id = %d AND status = 'done' AND attachment_id > 0
+				WHERE connection_id = %d AND product_id = %d AND status = 'done' AND attachment_id > 0
 				ORDER BY position_index ASC, id ASC",
+				$connection_id,
 				$product_id
 			)
 		);
@@ -1438,10 +1524,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public function get_ordered_rows_for_product( $product_id ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$product_id = absint( $product_id );
 
-		if ( $product_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $product_id <= 0 || ! self::table_exists() ) {
 			return array();
 		}
 
@@ -1450,8 +1537,9 @@ class Mobo_Core_Image_Queue {
 			$wpdb->prepare(
 				"SELECT id, image_guid, source_url, position_index, attachment_id, status, try_count
 				FROM {$table}
-				WHERE product_id = %d
+				WHERE connection_id = %d AND product_id = %d
 				ORDER BY position_index ASC, id ASC",
+				$connection_id,
 				$product_id
 			),
 			ARRAY_A
@@ -1522,10 +1610,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public static function recover_legacy_failed( $limit = 500 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 5000, absint( $limit ) ) );
 
-		if ( ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return array( 'status' => 'missing-table', 'recovered' => 0, 'remaining' => 0 );
 		}
 
@@ -1540,7 +1629,7 @@ class Mobo_Core_Image_Queue {
 					ON p.ID = q.product_id
 					AND p.post_type = 'product'
 					AND p.post_status NOT IN ('trash','auto-draft')
-				WHERE q.status = 'failed'
+				WHERE q.connection_id = %d AND q.status = 'failed'
 					AND q.image_guid <> ''
 					AND q.source_url IS NOT NULL
 					AND q.source_url <> ''
@@ -1548,6 +1637,7 @@ class Mobo_Core_Image_Queue {
 					AND (q.last_error IS NULL OR q.last_error NOT LIKE %s)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
+				$connection_id,
 				$permanent_like,
 				$limit
 			)
@@ -1558,7 +1648,7 @@ class Mobo_Core_Image_Queue {
 
 		if ( ! empty( $ids ) ) {
 			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-			$args         = array_merge( array( $now, $now ), $ids );
+			$args         = array_merge( array( $now, $now, $connection_id ), $ids );
 			$query        = "UPDATE {$table}
 				SET status = 'pending',
 					try_count = 0,
@@ -1566,7 +1656,7 @@ class Mobo_Core_Image_Queue {
 					locked_until = NULL,
 					last_error = 'Recovered legacy terminal image failure; retry scheduled.',
 					updated_at = %s
-				WHERE id IN ({$placeholders})";
+				WHERE connection_id = %d AND id IN ({$placeholders})";
 
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
 			$updated   = $wpdb->query( $wpdb->prepare( $query, $args ) );
@@ -1578,18 +1668,21 @@ class Mobo_Core_Image_Queue {
 
 		$remaining = absint(
 			$wpdb->get_var(
-				"SELECT COUNT(*)
-				FROM {$table} q
-				INNER JOIN {$wpdb->posts} p
-					ON p.ID = q.product_id
-					AND p.post_type = 'product'
-					AND p.post_status NOT IN ('trash','auto-draft')
-				WHERE q.status = 'failed'
-					AND q.image_guid <> ''
-					AND q.source_url IS NOT NULL
-					AND q.source_url <> ''
-					AND q.source_url REGEXP '^https?://'
-					AND (q.last_error IS NULL OR q.last_error NOT LIKE 'Permanent:%')"
+				$wpdb->prepare(
+					"SELECT COUNT(*)
+					FROM {$table} q
+					INNER JOIN {$wpdb->posts} p
+						ON p.ID = q.product_id
+						AND p.post_type = 'product'
+						AND p.post_status NOT IN ('trash','auto-draft')
+					WHERE q.connection_id = %d AND q.status = 'failed'
+						AND q.image_guid <> ''
+						AND q.source_url IS NOT NULL
+						AND q.source_url <> ''
+						AND q.source_url REGEXP '^https?://'
+						AND (q.last_error IS NULL OR q.last_error NOT LIKE 'Permanent:%')",
+					$connection_id
+				)
 			)
 		);
 
@@ -1612,10 +1705,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	public static function schedule_linkage_repairs( $limit = 100 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 1000, absint( $limit ) ) );
 
-		if ( ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return array( 'status' => 'missing-table', 'scheduled' => 0 );
 		}
 
@@ -1638,7 +1732,7 @@ class Mobo_Core_Image_Queue {
 				LEFT JOIN {$wpdb->postmeta} gallery
 					ON gallery.post_id = q.product_id
 					AND gallery.meta_key = '_product_image_gallery'
-				WHERE q.status = 'done'
+				WHERE q.connection_id = %d AND q.status = 'done'
 					AND q.attachment_id > 0
 					AND (
 						( q.position_index = 0 AND (
@@ -1651,6 +1745,7 @@ class Mobo_Core_Image_Queue {
 					)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
+				$connection_id,
 				$limit
 			),
 			ARRAY_A
@@ -1670,14 +1765,14 @@ class Mobo_Core_Image_Queue {
 
 		if ( ! empty( $ids ) ) {
 			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-			$args         = array_merge( array( $now, $now ), $ids );
+			$args         = array_merge( array( $now, $now, $connection_id ), $ids );
 			$query        = "UPDATE {$table}
 				SET status = 'attaching',
 					next_retry_at = %s,
 					locked_until = NULL,
 					last_error = 'Product image linkage recovery scheduled.',
 					updated_at = %s
-				WHERE status = 'done'
+				WHERE connection_id = %d AND status = 'done'
 					AND id IN ({$placeholders})";
 
 			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- query text is built only from an internal table name and a generated list of %d placeholders.
@@ -1704,25 +1799,27 @@ class Mobo_Core_Image_Queue {
 	 */
 	public static function schedule_file_repairs( $limit = 75 ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$limit = max( 1, min( 500, absint( $limit ) ) );
-		if ( ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return array( 'status' => 'missing-table', 'scheduled' => 0, 'scanned' => 0, 'cycleComplete' => true );
 		}
 
 		$table       = self::table_name();
 		$cursor_key  = 'mobo_core_image_queue_file_audit_cursor';
-		$cursor      = absint( get_option( $cursor_key, 0 ) );
+		$cursor      = class_exists( 'Mobo_Core_State_Store' ) ? absint( Mobo_Core_State_Store::get( $cursor_key, 0 ) ) : 0;
 		$scan_limit  = max( 100, min( 1000, $limit * 8 ) );
 		$rows        = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT id, attachment_id, image_guid, source_url
 				FROM {$table}
-				WHERE status = 'done'
+				WHERE connection_id = %d AND status = 'done'
 					AND attachment_id > 0
 					AND id > %d
 				ORDER BY id ASC
 				LIMIT %d",
+				$connection_id,
 				$cursor,
 				$scan_limit
 			),
@@ -1770,13 +1867,13 @@ class Mobo_Core_Image_Queue {
 		if ( ! empty( $repair_ids ) ) {
 			$now          = current_time( 'mysql', true );
 			$placeholders = implode( ',', array_fill( 0, count( $repair_ids ), '%d' ) );
-			$args         = array_merge( array( $now, $now ), $repair_ids );
+			$args         = array_merge( array( $now, $now, $connection_id ), $repair_ids );
 			$query        = "UPDATE {$table}
 				SET status = 'pending', attachment_id = 0, try_count = 0,
 					next_retry_at = %s, locked_until = NULL,
 					last_error = 'Completed image file was missing, corrupt, or source-mismatched; source retry scheduled.',
 					updated_at = %s
-				WHERE status = 'done' AND id IN ({$placeholders})";
+				WHERE connection_id = %d AND status = 'done' AND id IN ({$placeholders})";
 			$updated      = $wpdb->query( $wpdb->prepare( $query, $args ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Internal table name and generated %d placeholder list; all values are bound.
 			$scheduled    = absint( false === $updated ? 0 : $updated );
 			if ( $scheduled > 0 ) {
@@ -1786,9 +1883,9 @@ class Mobo_Core_Image_Queue {
 
 		$cycle_complete = ! $stopped_for_limit && count( $rows ) < $scan_limit;
 		if ( $cycle_complete ) {
-			update_option( $cursor_key, 0, false );
+			if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::set( $cursor_key, 0 ); }
 		} elseif ( $cursor_end > 0 ) {
-			update_option( $cursor_key, $cursor_end, false );
+			if ( class_exists( 'Mobo_Core_State_Store' ) ) { Mobo_Core_State_Store::set( $cursor_key, $cursor_end ); }
 		}
 
 		return array(
@@ -1828,10 +1925,11 @@ class Mobo_Core_Image_Queue {
 	 */
 	private function update_status( $id, $status, $fields = array() ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
 		$id = absint( $id );
 
-		if ( $id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || $id <= 0 || ! self::table_exists() ) {
 			return;
 		}
 
@@ -1853,7 +1951,7 @@ class Mobo_Core_Image_Queue {
 			}
 		}
 
-		$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+		$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id, 'connection_id' => $connection_id ), $formats, array( '%d', '%d' ) );
 		if ( false !== $updated ) {
 			self::invalidate_summary_cache();
 		}
@@ -1867,8 +1965,9 @@ class Mobo_Core_Image_Queue {
 	 */
 	private function count_by_statuses( $statuses ) {
 		global $wpdb;
+		$connection_id = self::connection_id();
 
-		if ( ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! self::table_exists() ) {
 			return 0;
 		}
 
@@ -1879,9 +1978,9 @@ class Mobo_Core_Image_Queue {
 
 		$table        = self::table_name();
 		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
-		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
+		$query        = "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status IN ({$placeholders})";
 
-		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, array_merge( array( $connection_id ), $statuses ) ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
 	}
 
 	/**

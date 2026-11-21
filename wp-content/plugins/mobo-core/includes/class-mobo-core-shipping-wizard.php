@@ -128,14 +128,14 @@ class Mobo_Core_Shipping_Wizard {
 			return $this->store_result( $result );
 		}
 
-		update_option( self::OPTION_PROFILE, $config['profile'], false );
-		update_option( self::OPTION_STORE_LOCATION, $config['storeLocation'], false );
-		update_option( self::OPTION_MIXED_FULFILLMENT_ID, absint( $config['fulfillmentId'] ), false );
+		Mobo_Core_Settings::update( self::OPTION_PROFILE, $config['profile'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_LOCATION, $config['storeLocation'], false );
+		Mobo_Core_Settings::update( self::OPTION_MIXED_FULFILLMENT_ID, absint( $config['fulfillmentId'] ), false );
 		update_option( self::OPTION_BLOCK_MESSAGE, $config['blockMessage'], false );
-		update_option( self::OPTION_STORE_RATE_MODE, $config['storeRateMode'], false );
-		update_option( self::OPTION_STORE_RATE_TITLE, $config['storeRateTitle'], false );
-		update_option( self::OPTION_STORE_RATE_COST, $config['storeRateCost'], false );
-		update_option( self::OPTION_COMPLETED, '1', false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_MODE, $config['storeRateMode'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_TITLE, $config['storeRateTitle'], false );
+		Mobo_Core_Settings::update( self::OPTION_STORE_RATE_COST, $config['storeRateCost'], false );
+		Mobo_Core_Settings::update( self::OPTION_COMPLETED, '1', false );
 		update_option( self::OPTION_LAST_APPLIED_AT, time(), false );
 
 		$result['success']       = true;
@@ -325,12 +325,12 @@ class Mobo_Core_Shipping_Wizard {
 			'completed'       => $this->is_completed(),
 			'profile'         => $profile,
 			'profileLabel'    => isset( $labels[ $profile ] ) ? $labels[ $profile ] : $profile,
-			'storeLocation'   => sanitize_key( (string) get_option( self::OPTION_STORE_LOCATION, $defaults['storeLocation'] ) ),
+			'storeLocation'   => sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_STORE_LOCATION, $defaults['storeLocation'] ) ),
 			'fulfillmentId'   => $this->get_mixed_fulfillment_shipping_id(),
 			'blockMessage'    => $this->get_block_message(),
-			'storeRateMode'   => sanitize_key( (string) get_option( self::OPTION_STORE_RATE_MODE, $defaults['storeRateMode'] ) ),
-			'storeRateTitle'  => sanitize_text_field( (string) get_option( self::OPTION_STORE_RATE_TITLE, $defaults['storeRateTitle'] ) ),
-			'storeRateCost'   => (string) get_option( self::OPTION_STORE_RATE_COST, $defaults['storeRateCost'] ),
+			'storeRateMode'   => sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_MODE, $defaults['storeRateMode'] ) ),
+			'storeRateTitle'  => sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_TITLE, $defaults['storeRateTitle'] ) ),
+			'storeRateCost'   => (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_COST, $defaults['storeRateCost'] ),
 			'storeShipping'   => isset( $defaults['storeShipping'] ) ? $defaults['storeShipping'] : array(),
 			'lastAppliedAt'   => absint( get_option( self::OPTION_LAST_APPLIED_AT, 0 ) ),
 			'lastResult'      => get_option( self::OPTION_LAST_RESULT, array() ),
@@ -354,7 +354,7 @@ class Mobo_Core_Shipping_Wizard {
 			}
 		}
 
-		$saved_mode = sanitize_key( (string) get_option( self::OPTION_STORE_RATE_MODE, '' ) );
+		$saved_mode = sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_MODE, '' ) );
 		$allowed_modes = array( Mobo_Core_Automatic_Shipping::STORE_RATE_MODE_EXISTING, Mobo_Core_Automatic_Shipping::STORE_RATE_MODE_ENSURE_FLAT_RATE );
 		if ( ! in_array( $saved_mode, $allowed_modes, true ) ) {
 			$saved_mode = ! empty( $store_shipping['existingReady'] ) ? Mobo_Core_Automatic_Shipping::STORE_RATE_MODE_EXISTING : Mobo_Core_Automatic_Shipping::STORE_RATE_MODE_ENSURE_FLAT_RATE;
@@ -363,11 +363,11 @@ class Mobo_Core_Shipping_Wizard {
 		return array(
 			'storeLocation'  => $is_tehran ? 'tehran' : 'outside_tehran',
 			'profile'        => $is_tehran ? self::PROFILE_TEHRAN_CONSOLIDATED : self::PROFILE_SPLIT_SHIPMENTS,
-			'fulfillmentId'  => absint( get_option( self::OPTION_MIXED_FULFILLMENT_ID, 0 ) ),
+			'fulfillmentId'  => absint( Mobo_Core_Settings::get( self::OPTION_MIXED_FULFILLMENT_ID, 0 ) ),
 			'blockMessage'   => $this->default_block_message(),
 			'storeRateMode'  => $saved_mode,
-			'storeRateTitle' => sanitize_text_field( (string) get_option( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) ),
-			'storeRateCost'  => (string) get_option( self::OPTION_STORE_RATE_COST, '0' ),
+			'storeRateTitle' => sanitize_text_field( (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_TITLE, 'ارسال محصولات فروشگاه' ) ),
+			'storeRateCost'  => (string) Mobo_Core_Settings::get( self::OPTION_STORE_RATE_COST, '0' ),
 			'storeShipping'  => $store_shipping,
 			'inferredTehran' => $is_tehran,
 		);
@@ -393,7 +393,7 @@ class Mobo_Core_Shipping_Wizard {
 	 */
 	public function get_profile() {
 		$defaults = $this->get_defaults();
-		$profile  = sanitize_key( (string) get_option( self::OPTION_PROFILE, $defaults['profile'] ) );
+		$profile  = sanitize_key( (string) Mobo_Core_Settings::get( self::OPTION_PROFILE, $defaults['profile'] ) );
 		return in_array( $profile, array_keys( $this->get_profile_labels() ), true ) ? $profile : $defaults['profile'];
 	}
 
@@ -403,7 +403,7 @@ class Mobo_Core_Shipping_Wizard {
 	 * @return bool
 	 */
 	public function is_completed() {
-		return '1' === (string) get_option( self::OPTION_COMPLETED, '0' );
+		return '1' === (string) Mobo_Core_Settings::get( self::OPTION_COMPLETED, '0' );
 	}
 
 	/**
@@ -412,7 +412,7 @@ class Mobo_Core_Shipping_Wizard {
 	 * @return int
 	 */
 	public function get_mixed_fulfillment_shipping_id() {
-		return absint( get_option( self::OPTION_MIXED_FULFILLMENT_ID, 0 ) );
+		return absint( Mobo_Core_Settings::get( self::OPTION_MIXED_FULFILLMENT_ID, 0 ) );
 	}
 
 	/**

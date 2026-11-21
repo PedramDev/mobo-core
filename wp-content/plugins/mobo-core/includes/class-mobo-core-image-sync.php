@@ -103,7 +103,10 @@ class Mobo_Core_Image_Sync {
 	private function process_images_guarded( $product_id, $images, $offset, $blocking_override = null ) {
 		$product_id = absint( $product_id );
 		$offset     = max( 0, absint( $offset ) );
-		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
+		/* Zero is not a safe 'disabled' value: returning done before Desired State is
+		 * enqueued can make callers mark images converged without durable queue evidence.
+		 * Image updates are disabled by product policy/queue mode, not by a zero batch. */
+		$limit      = Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 1, 10 );
 
 		if ( $product_id <= 0 || ! is_array( $images ) ) {
 			return array(
@@ -183,22 +186,26 @@ class Mobo_Core_Image_Sync {
 			$this->get_pending_pruned_cleanup_ids( $product_id ),
 			$removed_attachment_ids
 		) ) );
+		$unlink_ok = true;
 		if ( $queue instanceof Mobo_Core_Image_Queue ) {
-			$removed_attachment_ids = $this->filter_pruned_attachment_candidates( $product_id, $queue, $removed_attachment_ids, $images );
+			/* Queue is authoritative; do not trust the older payload's image array if
+			 * another request has replaced the desired set since our enqueue. */
+			$pruned_unlink = $this->unlink_pruned_against_current_desired( $product_id, $queue, $removed_attachment_ids );
+			$removed_attachment_ids = isset( $pruned_unlink['ids'] ) ? (array) $pruned_unlink['ids'] : array();
+			$unlink_ok = ! empty( $pruned_unlink['success'] );
 		} else {
-			/* If the queue table itself is unavailable, derive conservative stale
-			 * candidates from the product's CURRENT Woo image linkage. Only valid,
-			 * conflict-free image_guid/img_guid ownership is eligible; URL alone never
-			 * authorizes destructive cleanup. */
+			/* Legacy direct fallback: only explicitly owned GUIDs from current Woo
+			 * linkage can become candidates; URL is not destructive authority. */
 			$removed_attachment_ids = array_values( array_unique( array_merge(
 				$removed_attachment_ids,
 				$this->get_direct_pruned_attachment_candidates( $product_id, $images )
 			) ) );
 			$removed_attachment_ids = $this->filter_pruned_attachment_candidates_against_images( $removed_attachment_ids, $images );
+			$this->set_pending_pruned_cleanup_ids( $product_id, $removed_attachment_ids );
+			$unlink_ok = empty( $removed_attachment_ids ) || $this->unlink_pruned_attachments_from_product( $product_id, $removed_attachment_ids );
 		}
-		$this->set_pending_pruned_cleanup_ids( $product_id, $removed_attachment_ids );
 
-		if ( ! empty( $removed_attachment_ids ) && ! $this->unlink_pruned_attachments_from_product( $product_id, $removed_attachment_ids ) ) {
+		if ( ! $unlink_ok ) {
 			return array(
 				'done'       => false,
 				'nextOffset' => 0,
@@ -295,7 +302,7 @@ class Mobo_Core_Image_Sync {
 				);
 			}
 
-			$limit = $limit > 0 ? absint( $limit ) : Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 0, 10 );
+			$limit = $limit > 0 ? absint( $limit ) : Mobo_Core_Settings::get_int( 'mobo_core_images_per_run', 1, 1, 10 );
 
 			if ( $limit <= 0 ) {
 				$queue = new Mobo_Core_Image_Queue();
@@ -473,14 +480,9 @@ class Mobo_Core_Image_Sync {
 			$this->get_pending_pruned_cleanup_ids( $product_id ),
 			$removed_attachment_ids
 		) ) );
-		$removed_attachment_ids = $this->filter_pruned_attachment_candidates( $product_id, $queue, $removed_attachment_ids );
-
-		/* Persist only candidates that remain absent from the current Desired State
-		 * before touching WooCommerce linkage. If a transient product save/read-back
-		 * failure happens after queue rows were pruned, the next sync can retry safely. */
-		$this->set_pending_pruned_cleanup_ids( $product_id, $removed_attachment_ids );
-
-		if ( ! empty( $removed_attachment_ids ) && ! $this->unlink_pruned_attachments_from_product( $product_id, $removed_attachment_ids ) ) {
+		$pruned_unlink = $this->unlink_pruned_against_current_desired( $product_id, $queue, $removed_attachment_ids );
+		$removed_attachment_ids = isset( $pruned_unlink['ids'] ) ? (array) $pruned_unlink['ids'] : array();
+		if ( empty( $pruned_unlink['success'] ) ) {
 			return array(
 				'done'        => false,
 				'nextOffset'  => 0,
@@ -516,25 +518,24 @@ class Mobo_Core_Image_Sync {
 			$result = $this->process_queue_rows( $queue, $rows, $limit );
 		}
 
-		/* Attach any rows that had already completed in an earlier runner pass.
-		 * An explicit empty desired set must also remove old WooCommerce linkage. */
+		/* Linkage must be fenced by the SAME desired-state lease as enqueue/prune.
+		 * In particular, an old explicit-empty payload must not clear a gallery
+		 * which a newer webhook reintroduced after enqueue released its lease. */
 		if ( empty( $images ) ) {
-			$product = wc_get_product( $product_id );
-			if ( ! $product instanceof WC_Product ) {
-				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'Product could not be reloaded while committing an explicit empty image desired state.' );
-			}
-			if ( absint( $product->get_image_id() ) > 0 || ! empty( $product->get_gallery_image_ids() ) ) {
-				$product->set_image_id( 0 );
-				$product->set_gallery_image_ids( array() );
-				if ( absint( $product->save() ) !== $product_id ) {
-					return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'WooCommerce did not confirm the explicit empty image desired-state save.' );
-				}
-			}
-			$fresh_product = wc_get_product( $product_id );
-			if ( ! $fresh_product instanceof WC_Product || absint( $fresh_product->get_image_id() ) > 0 || ! empty( $fresh_product->get_gallery_image_ids() ) ) {
-				return array( 'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1, 'skipped' => 0, 'queued' => 0, 'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0, 'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false, 'error' => 'Explicit empty image desired state did not persist after read-back.' );
+			/* Explicit empty is a destructive Woo commit, not an async queue hint. */
+			if ( ! $this->commit_explicit_empty_image_desired_state( $product_id, $queue ) ) {
+				return array(
+					'done' => false, 'nextOffset' => 0, 'processed' => 0, 'failed' => 1,
+					'skipped' => isset( $enqueue['skipped'] ) ? absint( $enqueue['skipped'] ) : 0,
+					'queued' => isset( $enqueue['enqueued'] ) ? absint( $enqueue['enqueued'] ) : 0,
+					'removed' => isset( $enqueue['removed'] ) ? absint( $enqueue['removed'] ) : 0,
+					'pending' => 0, 'due' => 0, 'blocking' => false, 'queuedAsync' => false,
+					'error' => 'Explicit empty image snapshot was superseded or could not be committed safely.',
+				);
 			}
 		} else {
+			/* Non-empty linkage can legitimately return false while async rows have not
+			 * downloaded yet. They stay durable; the image runner links them later. */
 			$this->sync_woocommerce_product_image_objects_from_queue( $product_id, $queue );
 		}
 
@@ -850,6 +851,59 @@ class Mobo_Core_Image_Sync {
 		}
 
 		return array_values( array_unique( $filtered ) );
+	}
+
+	/**
+	 * UX58: Re-evaluate prune candidates and detach Woo links under the same
+	 * Connection/product lease used by image desired-state replacement. A newer
+	 * webhook cannot reintroduce an image between the last queue read and the
+	 * WooCommerce save. No image download or editor work occurs under this lock.
+	 *
+	 * @return array{success:bool,ids:array}
+	 */
+	/** UX58: explicit empty image set is a Woo mutation and needs the same lease. */
+	private function commit_explicit_empty_image_desired_state( $product_id, Mobo_Core_Image_Queue $queue ) {
+		$product_id = absint( $product_id );
+		$lock_name = Mobo_Core_Image_Queue::desired_state_lock_name( $product_id );
+		if ( $product_id <= 0 || '' === $lock_name || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return false;
+		}
+		$token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+		if ( false === $token ) { return false; }
+		try {
+			/* An overlapping newer enqueue supersedes this empty snapshot. */
+			if ( ! empty( $queue->get_ordered_rows_for_product( $product_id ) ) ) { return false; }
+			$product = wc_get_product( $product_id );
+			if ( ! $product instanceof WC_Product ) { return false; }
+			if ( absint( $product->get_image_id() ) > 0 || ! empty( $product->get_gallery_image_ids() ) ) {
+				$product->set_image_id( 0 );
+				$product->set_gallery_image_ids( array() );
+				if ( absint( $product->save() ) !== $product_id ) { return false; }
+			}
+			$fresh = wc_get_product( $product_id );
+			return $fresh instanceof WC_Product && absint( $fresh->get_image_id() ) === 0 && empty( $fresh->get_gallery_image_ids() );
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $token );
+		}
+	}
+
+	private function unlink_pruned_against_current_desired( $product_id, Mobo_Core_Image_Queue $queue, $attachment_ids ) {
+		$lock_name = Mobo_Core_Image_Queue::desired_state_lock_name( $product_id );
+		if ( '' === $lock_name || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return array( 'success' => false, 'ids' => array() );
+		}
+		$lock_token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+		if ( false === $lock_token ) {
+			return array( 'success' => false, 'ids' => array() );
+		}
+		try {
+			$ids = $this->filter_pruned_attachment_candidates( $product_id, $queue, $attachment_ids );
+			$this->set_pending_pruned_cleanup_ids( $product_id, $ids );
+			$success = empty( $ids ) || $this->unlink_pruned_attachments_from_product( $product_id, $ids );
+			return array( 'success' => $success, 'ids' => $ids );
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $lock_token );
+		}
 	}
 
 	/**
@@ -1341,7 +1395,7 @@ class Mobo_Core_Image_Sync {
 					$link_ok = false;
 					$failed++;
 					if ( class_exists( 'Mobo_Core_Logger' ) ) {
-						Mobo_Core_Logger::error( 'Image product linkage failed for product ' . $product_id . ': ' . $e->getMessage() );
+						Mobo_Core_Logger::error( 'Image product linkage failed for product ' . $product_id . ' [' . get_class( $e ) . '].' );
 					}
 				}
 
@@ -1656,7 +1710,7 @@ class Mobo_Core_Image_Sync {
 			}
 
 			if ( is_wp_error( $attachment_id ) ) {
-				$error_message = $attachment_id->get_error_message();
+				$error_message = 'wp_media_' . substr( sanitize_key( (string) $attachment_id->get_error_code() ), 0, 64 );
 				$this->set_last_image_error( 'WordPress image sideload failed: ' . $error_message );
 
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
@@ -1738,8 +1792,8 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * The compatibility flag above intentionally remains TRUE, but that must not turn
 	 * arbitrary queue payload URLs into a general SSRF primitive. Private fallback is
-	 * limited to the configured Mobo API host or the owned codeya.ir namespace, the
-	 * dedicated /images/ path, and the known HTTP(S)/development image ports.
+	 * limited to the exact server-configured Mobo API/source origin and the
+	 * dedicated /images/ path. Scheme and effective port are part of that origin.
 	 *
 	 * @param string $url Image URL.
 	 * @return bool
@@ -1753,7 +1807,6 @@ class Mobo_Core_Image_Sync {
 		$scheme = isset( $parts['scheme'] ) ? strtolower( (string) $parts['scheme'] ) : '';
 		$host   = isset( $parts['host'] ) ? strtolower( rtrim( (string) $parts['host'], '.' ) ) : '';
 		$path   = isset( $parts['path'] ) ? (string) $parts['path'] : '';
-		$port   = isset( $parts['port'] ) ? absint( $parts['port'] ) : ( 'https' === $scheme ? 443 : 80 );
 
 		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) || '' === $host ) {
 			return false;
@@ -1764,34 +1817,73 @@ class Mobo_Core_Image_Sync {
 		if ( 0 !== strpos( $path, '/images/' ) ) {
 			return false;
 		}
-		if ( ! in_array( $port, array( 80, 443, 5015 ), true ) ) {
-			return false;
-		}
 
-		$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+		$api_base = class_exists( 'Mobo_Core_Connection_Repository' )
+			? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( '' )
+			: '';
+		if ( '' === trim( (string) $api_base ) ) {
+			$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+		}
 		if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
 			$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
 		}
 		if ( '' === trim( $api_base ) && defined( 'MOBO_API_BASE_URL' ) ) {
 			$api_base = (string) MOBO_API_BASE_URL;
 		}
-		$api_host = strtolower( rtrim( (string) wp_parse_url( esc_url_raw( $api_base ), PHP_URL_HOST ), '.' ) );
 
-		/*
-		 * PRODUCTION DEPLOYMENT CONTRACT — DO NOT "UPGRADE" THIS TO HTTPS.
-		 * The production Mobo Portal/image origin is exactly http://mobo.codeya.ir
-		 * on port 80. It does not serve HTTPS. Keep HTTP valid permanently and make
-		 * an accidental HTTPS-only refactor fail closed instead of silently changing
-		 * the production origin contract.
-		 */
-		if ( 'mobo.codeya.ir' === $host ) {
-			return 'http' === $scheme && 80 === $port;
+		$source_site = class_exists( 'Mobo_Core_Connection_Repository' )
+			? (string) Mobo_Core_Connection_Repository::get_runtime_source_site_url( '' )
+			: '';
+
+		/* Unsafe-local transport is allowed only for the exact configured origin.
+		 * Host-only matching would let a payload silently switch scheme or probe a
+		 * different private service port on the same host. */
+		return $this->configured_image_origin_matches( $parts, $api_base )
+			|| $this->configured_image_origin_matches( $parts, $source_site );
+	}
+
+	/**
+	 * Compare a parsed image URL to one server-owned configured HTTP(S) origin.
+	 * Paths on the configured base URL are intentionally ignored; image downloads
+	 * remain constrained separately to the dedicated /images/ path.
+	 *
+	 * @param array  $target_parts Parsed target URL.
+	 * @param string $configured_url Server-provisioned API/source URL.
+	 * @return bool
+	 */
+	private function configured_image_origin_matches( $target_parts, $configured_url ) {
+		$configured_url = trim( (string) $configured_url );
+		if ( '' === $configured_url || ! is_array( $target_parts ) ) {
+			return false;
 		}
 
-		$owned_codeya_host = 'codeya.ir' === $host || substr( $host, -10 ) === '.codeya.ir';
-		$configured_host   = '' !== $api_host && hash_equals( $api_host, $host );
+		$configured = wp_parse_url( esc_url_raw( $configured_url ) );
+		if ( ! is_array( $configured ) || isset( $configured['user'] ) || isset( $configured['pass'] ) ) {
+			return false;
+		}
 
-		return $owned_codeya_host || $configured_host;
+		$target_scheme = isset( $target_parts['scheme'] ) ? strtolower( (string) $target_parts['scheme'] ) : '';
+		$target_host   = isset( $target_parts['host'] ) ? strtolower( rtrim( (string) $target_parts['host'], '.' ) ) : '';
+		$config_scheme = isset( $configured['scheme'] ) ? strtolower( (string) $configured['scheme'] ) : '';
+		$config_host   = isset( $configured['host'] ) ? strtolower( rtrim( (string) $configured['host'], '.' ) ) : '';
+
+		if ( ! in_array( $target_scheme, array( 'http', 'https' ), true )
+			|| ! in_array( $config_scheme, array( 'http', 'https' ), true )
+			|| '' === $target_host
+			|| '' === $config_host ) {
+			return false;
+		}
+
+		$target_port = isset( $target_parts['port'] )
+			? absint( $target_parts['port'] )
+			: ( 'https' === $target_scheme ? 443 : 80 );
+		$config_port = isset( $configured['port'] )
+			? absint( $configured['port'] )
+			: ( 'https' === $config_scheme ? 443 : 80 );
+
+		return hash_equals( $config_scheme, $target_scheme )
+			&& hash_equals( $config_host, $target_host )
+			&& $config_port === $target_port;
 	}
 
 	/**
@@ -1850,7 +1942,7 @@ class Mobo_Core_Image_Sync {
 
 		if ( is_wp_error( $response ) ) {
 			wp_delete_file( $tmp_file );
-			$error_message = $response->get_error_message();
+			$error_message = 'http_' . substr( sanitize_key( (string) $response->get_error_code() ), 0, 64 );
 			$this->set_last_image_error( 'Image HTTP request failed: ' . $error_message );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
@@ -1867,7 +1959,7 @@ class Mobo_Core_Image_Sync {
 			$this->set_last_image_error( 'Image HTTP response was ' . $code . ' or the response body was empty.' );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed with HTTP ' . $code . ': ' . $url );
+				Mobo_Core_Logger::error( 'Mobo Core image fallback download failed with HTTP ' . $code . '.' );
 			}
 
 			return 0;
@@ -1895,7 +1987,7 @@ class Mobo_Core_Image_Sync {
 
 		if ( is_wp_error( $attachment_id ) ) {
 			wp_delete_file( $tmp_file );
-			$error_message = $attachment_id->get_error_message();
+			$error_message = 'wp_media_' . substr( sanitize_key( (string) $attachment_id->get_error_code() ), 0, 64 );
 			$this->set_last_image_error( 'WordPress media import failed: ' . $error_message );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
@@ -2033,7 +2125,10 @@ class Mobo_Core_Image_Sync {
 
 	private function build_safe_local_image_host_filter( $url ) {
 		$image_host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
-		$api_host   = strtolower( (string) wp_parse_url( (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' ), PHP_URL_HOST ) );
+		$api_base   = class_exists( 'Mobo_Core_Connection_Repository' )
+			? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' ) )
+			: (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+		$api_host   = strtolower( (string) wp_parse_url( $api_base, PHP_URL_HOST ) );
 
 		$allowed_hosts = array_filter(
 			array_unique(
@@ -2278,13 +2373,24 @@ class Mobo_Core_Image_Sync {
 		global $wpdb;
 
 		$limit = max( 1, min( 20, absint( $limit ) ) );
-		$ids   = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY post_id ASC LIMIT %d",
-				'_mobo_product_images_pending_source_hash',
-				$limit
-			)
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) && Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative() ) {
+			$table = Mobo_Core_Storage_Entity_Meta_Retirement::table_name();
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT woo_object_id FROM {$table} WHERE meta_key=%s AND COALESCE(meta_value,'')<>'' ORDER BY woo_object_id ASC LIMIT %d",
+					'_mobo_product_images_pending_source_hash',
+					$limit
+				)
+			);
+		} else {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY post_id ASC LIMIT %d",
+					'_mobo_product_images_pending_source_hash',
+					$limit
+				)
+			);
+		}
 		$promoted = 0;
 		foreach ( is_array( $ids ) ? $ids : array() as $product_id ) {
 			if ( $this->promote_pending_image_hash_if_converged( absint( $product_id ), $queue, false ) ) {
@@ -2312,6 +2418,25 @@ class Mobo_Core_Image_Sync {
 	}
 
 	private function sync_woocommerce_product_image_objects_from_queue( $product_id, Mobo_Core_Image_Queue $queue ) {
+		$lock_name = Mobo_Core_Image_Queue::desired_state_lock_name( $product_id );
+		if ( '' === $lock_name || ! class_exists( 'Mobo_Core_Lock' ) ) {
+			return false;
+		}
+		$lock_token = Mobo_Core_Lock::acquire( $lock_name, 300 );
+		if ( false === $lock_token ) {
+			/* The new desired set may be replacing/pruning queue rows. Leave rows in
+			 * attaching state; the next pass retries rather than saving an old gallery. */
+			return false;
+		}
+		try {
+			return $this->sync_woocommerce_product_image_objects_from_queue_locked( $product_id, $queue );
+		} finally {
+			Mobo_Core_Lock::release( $lock_name, $lock_token );
+		}
+	}
+
+	/** Build and save gallery while the same desired-state lease as enqueue is held. */
+	private function sync_woocommerce_product_image_objects_from_queue_locked( $product_id, Mobo_Core_Image_Queue $queue ) {
 		$product_id = absint( $product_id );
 
 		if ( $product_id <= 0 ) {
@@ -3007,13 +3132,9 @@ class Mobo_Core_Image_Sync {
 			return '';
 		}
 
-		$product = wc_get_product( $product_id );
-
-		if ( $product instanceof WC_Product ) {
-			$guid = $product->get_meta( 'product_guid', true );
-			return sanitize_text_field( (string) $guid );
-		}
-
+		/* Product identity is terminal Custom Storage after 10.33.95. Always use
+		 * the metadata API here so the identity retirement filter remains authoritative;
+		 * WC_Product::get_meta() reads raw wp_postmeta and cannot see the typed row. */
 		return sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) );
 	}
 

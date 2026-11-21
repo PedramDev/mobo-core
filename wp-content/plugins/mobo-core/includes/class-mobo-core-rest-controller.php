@@ -27,6 +27,31 @@ class Mobo_Core_Rest_Controller {
 	 */
 	public function init() {
 		add_action( 'rest_api_init', array( $this, 'register_routes' ) );
+		add_filter( 'rest_post_dispatch', array( $this, 'harden_rest_response_cache' ), 10, 3 );
+	}
+
+	/**
+	 * Prevent authenticated Mobo REST responses from being stored by reverse
+	 * proxies/CDNs/browser caches. This applies to the whole namespace, including
+	 * Source-scoped settings/status responses and mutating acknowledgements.
+	 *
+	 * @param WP_HTTP_Response $response Response.
+	 * @param WP_REST_Server   $server   Server.
+	 * @param WP_REST_Request  $request  Request.
+	 * @return WP_HTTP_Response
+	 */
+	public function harden_rest_response_cache( $response, $server, $request ) {
+		if ( ! $request instanceof WP_REST_Request || 0 !== strpos( (string) $request->get_route(), '/mobo-core/v1/' ) ) {
+			return $response;
+		}
+
+		if ( $response instanceof WP_REST_Response ) {
+			$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+			$response->header( 'Pragma', 'no-cache' );
+			$response->header( 'Expires', 'Wed, 11 Jan 1984 05:00:00 GMT' );
+		}
+
+		return $response;
 	}
 
 	/**
@@ -62,7 +87,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'GET',
 				'callback'            => array( $this, 'get_real_cron_status' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -82,7 +107,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'GET',
 				'callback'            => array( $this, 'get_self_worker_status' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -92,7 +117,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'GET',
 				'callback'            => array( $this, 'get_health' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -103,7 +128,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'run_heartbeat' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -114,7 +139,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'GET',
 				'callback'            => array( $this, 'get_upgrade_status' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -124,7 +149,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => 'POST',
 				'callback'            => array( $this, 'apply_remote_upgrade' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -134,7 +159,7 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'methods'             => array( 'GET', 'POST' ),
 				'callback'            => array( $this, 'send_health_report_now' ),
-				'permission_callback' => array( $this, 'check_security' ),
+				'permission_callback' => array( $this, 'check_installation_security' ),
 			)
 		);
 
@@ -188,6 +213,17 @@ class Mobo_Core_Rest_Controller {
 			)
 		);
 
+
+
+		register_rest_route(
+			'mobo-core/v1',
+			'/connection/provision',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'provision_connection' ),
+				'permission_callback' => array( $this, 'check_provisioning_signature' ),
+			)
+		);
 
 		register_rest_route(
 			'mobo-core/v1',
@@ -280,58 +316,258 @@ class Mobo_Core_Rest_Controller {
 	 * @return bool|WP_Error
 	 */
 	public function check_security( $request ) {
-		$expected = Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
+		/* REST permission callbacks can be invoked more than once in one PHP
+		 * process. Failed authentication must never inherit a prior Source context. */
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			Mobo_Core_Connection_Context::clear();
+		}
 		$record_test = class_exists( 'Mobo_Core_Webhook_Auth_Status' ) && Mobo_Core_Webhook_Auth_Status::should_record_request( $request );
-
-		if ( '' === $expected ) {
-			if ( $record_test ) {
-				Mobo_Core_Webhook_Auth_Status::record( 'missing', 'portal', 'کد امنیتی وب‌هوک در افزونه ثبت نشده است.' );
-			}
-
-			return new WP_Error(
-				'mobo_core_security_missing',
-				'Security code is not configured.',
-				array( 'status' => 403 )
-			);
+		$provided = (string) $request->get_header( 'X-SEC' );
+		if ( '' === $provided ) {
+			$provided = (string) $request->get_header( 'x-sec' );
+		}
+		$webhook_id = (string) $request->get_header( 'X-Mobo-Webhook-Id' );
+		if ( '' === $webhook_id ) {
+			$webhook_id = (string) $request->get_header( 'x-mobo-webhook-id' );
 		}
 
-		if ( ! Mobo_Core_Settings::is_valid_security_code( $expected ) ) {
-			if ( $record_test ) {
-				Mobo_Core_Webhook_Auth_Status::record( 'misconfigured', 'portal', 'ساختار کد امنیتی ذخیره‌شده در افزونه برای Header معتبر نیست.' );
+		/* Connection-aware path. WebHookId selects a connection; X-SEC authenticates
+		 * that exact row. A single upgraded installation may adopt its first WebHookId
+		 * only after X-SEC matches the migrated Default Connection. */
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() ) {
+			$connection = Mobo_Core_Connection_Repository::authenticate_inbound( $webhook_id, $provided );
+			if ( is_wp_error( $connection ) ) {
+				if ( $record_test ) {
+					$status = 'mobo_core_security_missing' === $connection->get_error_code() ? 'missing' : ( 'mobo_core_security_invalid' === $connection->get_error_code() ? 'misconfigured' : 'invalid' );
+					$this->record_webhook_auth_status_for_candidate( $webhook_id, $status, $connection->get_error_message() );
+				}
+				return $connection;
 			}
 
+			$connection_id = absint( $connection['id'] ?? 0 );
+			if ( $connection_id <= 0 ) {
+				return new WP_Error( 'mobo_core_connection_resolution_failed', 'Resolved connection is invalid.', array( 'status' => 503 ) );
+			}
+			if ( class_exists( 'Mobo_Core_Connection_Context' ) ) {
+				Mobo_Core_Connection_Context::set_current_connection_id( $connection_id );
+			}
+			if ( $record_test ) {
+				Mobo_Core_Webhook_Auth_Status::record( 'valid', 'portal', 'کد وب‌هوک Portal و افزونه برای Connection صحیح معتبر است.' );
+			}
+			return true;
+		}
+
+		/* Terminal multi-Connection runtime: inbound REST authentication requires the
+		 * durable Connection table. Falling back to the legacy installation-wide
+		 * X-SEC while that authority is missing would authenticate a request without
+		 * proving its owner and could cross Source boundaries. Provisioning uses its
+		 * separate signed-token endpoint and therefore does not need this fallback. */
+		if ( $record_test ) {
+			Mobo_Core_Webhook_Auth_Status::record( 'misconfigured', 'portal', 'ذخیره‌سازی Connection در دسترس نیست؛ احراز هویت Runtime تا بازیابی آن متوقف است.' );
+		}
+		return new WP_Error(
+			'mobo_core_connection_storage_unavailable',
+			'Connection authentication storage is unavailable.',
+			array( 'status' => 503 )
+		);
+	}
+
+
+
+	/**
+	 * Authorize an installation-global REST surface.
+	 *
+	 * Source-scoped credentials authenticate only their own Source operations.
+	 * Site-wide Health/Worker visibility and plugin upgrades are controlled by the
+	 * enabled Default Connection, which acts as the Installation Controller.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return bool|WP_Error
+	 */
+	public function check_installation_security( $request ) {
+		$authenticated = $this->check_security( $request );
+		if ( is_wp_error( $authenticated ) ) {
+			return $authenticated;
+		}
+
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
 			return new WP_Error(
-				'mobo_core_security_invalid',
-				'Configured security code is not a valid visible-ASCII HTTP header value.',
+				'mobo_core_installation_controller_unavailable',
+				'Installation controller is unavailable.',
 				array( 'status' => 503 )
 			);
 		}
 
-		$provided = (string) $request->get_header( 'X-SEC' );
-
-		if ( '' === $provided ) {
-			$provided = (string) $request->get_header( 'x-sec' );
-		}
-
-		if ( '' === $provided || ! hash_equals( $expected, $provided ) ) {
-			if ( $record_test ) {
-				Mobo_Core_Webhook_Auth_Status::record( 'invalid', 'portal', 'کد وب‌هوک ثبت‌شده در Portal با کد این افزونه یکسان نیست.' );
-			}
-
+		$current_id = class_exists( 'Mobo_Core_Connection_Context' )
+			? absint( Mobo_Core_Connection_Context::get_current_connection_id() )
+			: 0;
+		/* The administrative request-local Default cache may predate an admin
+		 * change. Revalidate the authenticated owner, including its enabled and
+		 * installation-controller role, against the durable row. */
+		$fresh_owner = $current_id > 0 ? Mobo_Core_Connection_Repository::get_by_id_fresh( $current_id ) : null;
+		$controller = Mobo_Core_Connection_Repository::get_default_fresh();
+		if ( $current_id <= 0 || ! is_array( $fresh_owner ) || empty( $fresh_owner['is_enabled'] ) || ! is_array( $controller ) ) {
 			return new WP_Error(
-				'mobo_core_unauthorized',
-				'Unauthorized.',
-				array( 'status' => 401 )
+				'mobo_core_installation_controller_unavailable',
+				'Installation controller is unavailable.',
+				array( 'status' => 503 )
 			);
 		}
 
-		if ( $record_test ) {
-			Mobo_Core_Webhook_Auth_Status::record( 'valid', 'portal', 'کد وب‌هوک Portal و افزونه یکسان است.' );
+		/* If bad historical data has two is_default rows, only the same
+		 * canonical controller returned by fresh ordered lookup may exercise
+		 * installation-wide authority. */
+		if ( empty( $fresh_owner['is_default'] ) || $current_id !== absint( $controller['id'] ?? 0 ) ) {
+			return new WP_Error(
+				'mobo_core_installation_scope_forbidden',
+				'This route is restricted to the installation controller Connection.',
+				array( 'status' => 403 )
+			);
 		}
 
 		return true;
 	}
 
+
+
+	/**
+	 * Record explicit webhook-auth diagnostics under the Connection identified by
+	 * WebHookId without treating that identifier as authentication. The candidate
+	 * context is used only for the scoped diagnostic write; the request still fails
+	 * unless authenticate_inbound() has independently validated X-SEC.
+	 *
+	 * @param string $webhook_id WebHookId header value.
+	 * @param string $status     valid|invalid|missing|misconfigured.
+	 * @param string $message    Safe diagnostic message.
+	 * @return void
+	 */
+	private function record_webhook_auth_status_for_candidate( $webhook_id, $status, $message ) {
+		$callback = static function () use ( $status, $message ) {
+			Mobo_Core_Webhook_Auth_Status::record( $status, 'portal', $message );
+		};
+
+		$candidate = null;
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() ) {
+			$normalized_webhook_id = Mobo_Core_Connection_Repository::normalize_webhook_id( $webhook_id );
+			if ( '' !== $normalized_webhook_id ) {
+				$candidate = Mobo_Core_Connection_Repository::get_by_webhook_id( $normalized_webhook_id );
+			} elseif ( 1 === Mobo_Core_Connection_Repository::count_enabled() ) {
+				/* With exactly one enabled Connection the diagnostic owner is
+				 * unambiguous even when that Connection is not the Default. This
+				 * does not authenticate the request; X-SEC remains mandatory. */
+				$enabled = Mobo_Core_Connection_Repository::list_enabled();
+				$candidate = 1 === count( $enabled ) ? $enabled[0] : null;
+			}
+		}
+
+		$connection_id = is_array( $candidate ) ? absint( $candidate['id'] ?? 0 ) : 0;
+		if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			Mobo_Core_Connection_Context::run( $connection_id, $callback );
+			return;
+		}
+
+		call_user_func( $callback );
+	}
+
+
+
+	/**
+	 * Authenticate .NET -> WordPress Connection provisioning with the License Token
+	 * already stored by the customer. No Source URL or provider is needed locally.
+	 *
+	 * Signature = HMAC-SHA256(token, timestamp + "\n" + nonce + "\n" + rawBody)
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return bool|WP_Error
+	 */
+	public function check_provisioning_signature( $request ) {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
+			return new WP_Error( 'mobo_core_provision_storage_missing', 'Connection storage is unavailable.', array( 'status' => 503 ) );
+		}
+		$params = $request->get_json_params();
+		$params = is_array( $params ) ? $params : array();
+		$token = Mobo_Core_Settings::normalize_opaque_secret( $params['token'] ?? '', 191 );
+		if ( '' === $token || ! is_array( Mobo_Core_Connection_Repository::get_by_license_token( $token ) ) ) {
+			return new WP_Error( 'mobo_core_provision_unauthorized', 'Unauthorized.', array( 'status' => 401 ) );
+		}
+		$timestamp = trim( (string) $request->get_header( 'X-Mobo-Provision-Timestamp' ) );
+		$nonce = trim( (string) $request->get_header( 'X-Mobo-Provision-Nonce' ) );
+		$signature = strtolower( trim( (string) $request->get_header( 'X-Mobo-Provision-Signature' ) ) );
+		if ( ! ctype_digit( $timestamp ) || '' === $nonce || strlen( $nonce ) > 128 || ! preg_match( '/^[a-f0-9]{64}$/', $signature ) ) {
+			return new WP_Error( 'mobo_core_provision_signature_invalid', 'Provisioning signature headers are invalid.', array( 'status' => 401 ) );
+		}
+		if ( abs( time() - (int) $timestamp ) > 300 ) {
+			return new WP_Error( 'mobo_core_provision_signature_expired', 'Provisioning request timestamp is outside the allowed window.', array( 'status' => 401 ) );
+		}
+		$raw = (string) $request->get_body();
+		$expected = hash_hmac( 'sha256', $timestamp . "\n" . $nonce . "\n" . $raw, $token );
+		if ( ! hash_equals( $expected, $signature ) ) {
+			return new WP_Error( 'mobo_core_provision_unauthorized', 'Unauthorized.', array( 'status' => 401 ) );
+		}
+
+		/* Replay reservation must be atomic. The expired-row cleanup must ALSO be
+		 * conditional: delete_option() after a stale get_option() could delete a newer
+		 * nonce reservation made by another concurrent valid signed request. */
+		$nonce_key = '_mobo_provision_nonce_' . hash( 'sha256', $token . "\n" . $nonce );
+		$expires_at = time() + ( 10 * MINUTE_IN_SECONDS );
+		global $wpdb;
+		$existing_raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $nonce_key ) );
+		if ( null !== $existing_raw ) {
+			if ( ! ctype_digit( (string) $existing_raw ) || (int) $existing_raw >= time() ) {
+				return new WP_Error( 'mobo_core_provision_replay', 'Provisioning request was already used.', array( 'status' => 409 ) );
+			}
+			$deleted = $wpdb->query( $wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND BINARY option_value = BINARY %s",
+				$nonce_key, (string) $existing_raw
+			) );
+			if ( 1 !== $deleted ) {
+				return new WP_Error( 'mobo_core_provision_replay', 'Provisioning request was already used.', array( 'status' => 409 ) );
+			}
+			/* Direct SQL bypasses WordPress's option caches. Invalidate the exact
+			 * key before using its atomic unique-index INSERT via add_option(). */
+			wp_cache_delete( $nonce_key, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+		}
+		if ( ! add_option( $nonce_key, $expires_at, '', false ) ) {
+			return new WP_Error( 'mobo_core_provision_replay', 'Provisioning request was already used.', array( 'status' => 409 ) );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Apply server-owned Source/Provider routing to the Token-selected Connection.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function provision_connection( $request ) {
+		$params = $request->get_json_params();
+		$params = is_array( $params ) ? $params : array();
+		$token = Mobo_Core_Settings::normalize_opaque_secret( $params['token'] ?? '', 191 );
+		$result = Mobo_Core_Connection_Repository::provision_by_token( $token, $params );
+		if ( is_wp_error( $result ) ) { return $result; }
+		$money_status = class_exists( 'Mobo_Core_Money_Policy' )
+			? Mobo_Core_Money_Policy::compatibility_status_for_row( $result )
+			: array( 'compatible' => false, 'code' => 'money_policy_unavailable' );
+		return rest_ensure_response(
+			array(
+				'success' => true,
+				'status' => ! empty( $result['is_enabled'] ) ? 'active' : 'disabled',
+				'connection' => array(
+					'id' => absint( $result['id'] ?? 0 ),
+					'source_key' => sanitize_key( (string) ( $result['source_key'] ?? '' ) ),
+					'provider_key' => class_exists( 'Mobo_Core_Provider_Registry' ) ? Mobo_Core_Provider_Registry::normalize_key( $result['provider_key'] ?? '' ) : '',
+					'provisioned' => Mobo_Core_Connection_Repository::is_provisioned( $result ),
+					'money_unit' => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::normalize_unit( $result['money_unit'] ?? '' ) : '',
+					'money_fraction_digits' => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::normalize_fraction_digits( $result['money_fraction_digits'] ?? -1 ) : -1,
+					'money_price_representation' => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::normalize_representation( $result['money_price_representation'] ?? '' ) : '',
+					'money_contract_version' => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::normalize_contract_version( $result['money_contract_version'] ?? 0 ) : 0,
+					'money_compatible' => ! empty( $money_status['compatible'] ),
+				),
+			)
+		);
+	}
 
 
 	/**
@@ -460,7 +696,8 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		$queue = new Mobo_Core_Webhook_Queue();
-		$file  = $queue->store( $payload );
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? Mobo_Core_Connection_Context::get_current_connection_id() : 0;
+		$file  = $queue->store( $payload, $connection_id );
 
 		if ( is_wp_error( $file ) ) {
 			return $file;
@@ -508,6 +745,10 @@ class Mobo_Core_Rest_Controller {
 	 * @return WP_REST_Response
 	 */
 	public function run_real_cron( $request ) {
+		if ( class_exists( 'Mobo_Core_Cron_Runner' ) ) {
+			Mobo_Core_Cron_Runner::record_real_cron_hit();
+		}
+
 		$claim = class_exists( 'Mobo_Core_Self_Runner' )
 			? Mobo_Core_Self_Runner::claim_worker_request( '' )
 			: array( 'success' => true, 'token' => '' );
@@ -526,7 +767,7 @@ class Mobo_Core_Rest_Controller {
 		$token  = isset( $claim['token'] ) ? (string) $claim['token'] : '';
 		$runner = new Mobo_Core_Cron_Runner();
 		try {
-			$result = $runner->run( 'real-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $token ) );
+			$result = $runner->run( 'real-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $token, 'schedulerHitRecorded' => true ) );
 		} finally {
 			if ( '' !== $token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 				Mobo_Core_Self_Runner::release_worker_request( $token );
@@ -554,7 +795,9 @@ class Mobo_Core_Rest_Controller {
 			array(
 				'success' => true,
 				'status'  => 'ok',
-				'data'    => Mobo_Core_Cron_Runner::get_status(),
+				'data'    => method_exists( 'Mobo_Core_Cron_Runner', 'get_external_status' )
+					? Mobo_Core_Cron_Runner::get_external_status()
+					: Mobo_Core_Cron_Runner::get_status(),
 			)
 		);
 	}
@@ -662,7 +905,7 @@ class Mobo_Core_Rest_Controller {
 		$started_at = microtime( true );
 		$attempt_at = time();
 
-		update_option( 'mobo_core_portal_heartbeat_last_attempt_at', $attempt_at, false );
+		Mobo_Core_Settings::update( 'mobo_core_portal_heartbeat_last_attempt_at', $attempt_at, false );
 
 		$work = array(
 			'success' => false,
@@ -713,11 +956,11 @@ class Mobo_Core_Rest_Controller {
 				);
 			}
 		} catch ( Throwable $e ) {
+			$this->record_rest_exception( 'heartbeat-runner', $e );
 			$work = array(
-				'success'        => false,
-				'status'         => 'heartbeat-runner-exception',
-				'message'        => $e->getMessage(),
-				'exceptionClass' => get_class( $e ),
+				'success' => false,
+				'status'  => 'heartbeat-runner-exception',
+				'message' => 'Heartbeat worker failed. See local MoboCore diagnostics.',
 			);
 		} finally {
 			if ( '' !== $dispatch_token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
@@ -760,8 +1003,8 @@ class Mobo_Core_Rest_Controller {
 			'worker'        => $result['worker'],
 		);
 
-		update_option( 'mobo_core_portal_heartbeat_last_success_at', time(), false );
-		update_option( 'mobo_core_portal_heartbeat_last_result', $stored_result, false );
+		Mobo_Core_Settings::update( 'mobo_core_portal_heartbeat_last_success_at', time(), false );
+		Mobo_Core_Settings::update( 'mobo_core_portal_heartbeat_last_result', $stored_result, false );
 
 		$response = new WP_REST_Response( $result, 200 );
 		$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
@@ -787,6 +1030,22 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		$runner = isset( $work['runner'] ) && is_array( $work['runner'] ) ? $work['runner'] : array();
+		$connection_count = 0;
+		$successful_connections = 0;
+		$failed_connections = 0;
+		if ( isset( $work['connections'] ) && is_array( $work['connections'] ) ) {
+			foreach ( $work['connections'] as $connection_result ) {
+				if ( ! is_array( $connection_result ) || empty( $connection_result['result'] ) || ! is_array( $connection_result['result'] ) ) {
+					continue;
+				}
+				$connection_count++;
+				if ( ! empty( $connection_result['result']['success'] ) ) {
+					$successful_connections++;
+				} else {
+					$failed_connections++;
+				}
+			}
+		}
 
 		return array(
 			'success'           => ! empty( $work['success'] ),
@@ -800,6 +1059,10 @@ class Mobo_Core_Rest_Controller {
 				'stopReason'      => isset( $runner['stopReason'] ) ? sanitize_key( (string) $runner['stopReason'] ) : '',
 				'madeProgress'    => ! empty( $runner['madeProgress'] ),
 				'hasImmediateWork' => ! empty( $runner['hasImmediateWork'] ),
+				'multiConnection' => ! empty( $runner['multiConnection'] ) || $connection_count > 1,
+				'connectionCount' => $connection_count > 0 ? $connection_count : absint( $runner['connectionCount'] ?? 0 ),
+				'successfulConnections' => $successful_connections,
+				'failedConnections' => $failed_connections,
 			),
 			'webhookQueue'      => isset( $work['webhookQueue'] ) && is_array( $work['webhookQueue'] ) ? $work['webhookQueue'] : array(),
 			'productStatus'     => isset( $work['productStatus'] ) && is_array( $work['productStatus'] ) ? $work['productStatus'] : array(),
@@ -861,20 +1124,18 @@ class Mobo_Core_Rest_Controller {
 			$queue = new Mobo_Core_Webhook_Queue();
 			return rest_ensure_response( $queue->process() );
 		} catch ( Throwable $e ) {
+			$this->record_rest_exception( 'webhook-queue', $e );
 			$result = array(
-				'success'        => false,
-				'status'         => 'webhook-queue-exception',
-				'processed'      => 0,
-				'failed'         => 1,
-				'remaining'      => true,
-				'message'        => $e->getMessage(),
-				'exceptionClass' => get_class( $e ),
-				'file'           => $e->getFile(),
-				'line'           => $e->getLine(),
+				'success'   => false,
+				'status'    => 'webhook-queue-exception',
+				'processed' => 0,
+				'failed'    => 1,
+				'remaining' => true,
+				'message'   => 'Webhook queue execution failed. See local MoboCore diagnostics.',
 			);
 
-			update_option( 'mobo_core_webhook_queue_last_result', $result, false );
-			update_option( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
+			Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_result', $result, false );
+			Mobo_Core_Settings::update( 'mobo_core_webhook_queue_last_attempt_at', time(), false );
 
 			return rest_ensure_response( $result );
 		}
@@ -975,12 +1236,25 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		$ledger = new Mobo_Core_Revenue_Ledger();
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' )
+			? absint( Mobo_Core_Connection_Context::get_effective_connection_id() )
+			: 0;
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() && $connection_id <= 0 ) {
+			return new WP_Error(
+				'mobo_core_revenue_connection_scope_missing',
+				'Revenue summary requires an authenticated Connection scope.',
+				array( 'status' => 503 )
+			);
+		}
 
 		return array(
-			'success' => true,
-			'status'  => 'ok',
-			'message' => 'Revenue summary generated from immutable completed-order ledger records.',
-			'data'    => $ledger->get_summary(),
+			'success'      => true,
+			'status'       => 'ok',
+			'connectionId' => $connection_id,
+			'message'      => $connection_id > 0
+				? 'Revenue summary generated from immutable completed-order ledger records for the authenticated Connection.'
+				: 'Revenue summary generated from immutable completed-order ledger records.',
+			'data'         => $ledger->get_summary( $connection_id ),
 		);
 	}
 
@@ -1039,6 +1313,31 @@ class Mobo_Core_Rest_Controller {
 	 */
 	public function cancel_portal_operation( $request ) {
 		return rest_ensure_response( Mobo_Core_Remote_Control::cancel_operation() );
+	}
+
+	/**
+	 * Record bounded, non-secret exception diagnostics. Exception messages can
+	 * contain request URLs, tokens, headers and SQL parameters; even a local PHP
+	 * error log is not a suitable place to persist those unfiltered values.
+	 *
+	 * @param string    $scope Stable operation label.
+	 * @param Throwable $error Exception.
+	 * @return void
+	 */
+	private function record_rest_exception( $scope, $error ) {
+		$scope = sanitize_key( (string) $scope );
+		if ( ! ( $error instanceof Throwable ) ) {
+			return;
+		}
+		if ( class_exists( 'Mobo_Core_Logger' ) ) {
+			Mobo_Core_Logger::error(
+				'An internal REST operation failed.',
+				array(
+					'mobo_scope'           => $scope,
+					'mobo_exception_class' => sanitize_text_field( get_class( $error ) ),
+				)
+			);
+		}
 	}
 
 	private function to_bool( $value ) {

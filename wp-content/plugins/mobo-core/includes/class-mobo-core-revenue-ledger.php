@@ -4,7 +4,7 @@
  *
  * Source cost is frozen before/at successful Mobo submission. One immutable
  * financial record is created when the WooCommerce order reaches completed.
- * Mixed orders include only Mobo line items.
+ * Only successfully submitted all-Mobo / single-Connection orders are eligible.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -18,6 +18,7 @@ class Mobo_Core_Revenue_Ledger {
 	const META_LEDGER_VERSION = '_mobo_revenue_ledger_version';
 	const META_LEDGER_RECORD  = '_mobo_revenue_ledger_v1';
 	const META_CALCULATED_AT  = '_mobo_revenue_calculated_at';
+	const META_CONNECTION_ID  = '_mobo_revenue_connection_id';
 
 	const ITEM_META_SOURCE_UNIT_COST   = '_mobo_revenue_source_unit_cost';
 	const ITEM_META_SOURCE_SNAPSHOT_AT = '_mobo_revenue_source_snapshot_at';
@@ -33,17 +34,27 @@ class Mobo_Core_Revenue_Ledger {
 	 * @return string[]
 	 */
 	public static function get_hidden_item_meta_keys() {
-		return array(
-			self::ITEM_META_SOURCE_UNIT_COST,
-			self::ITEM_META_SOURCE_SNAPSHOT_AT,
-			'_mobo_identity_captured',
-			'_mobo_identity_is_mobo',
-			'_mobo_identity_product_guid',
-			'_mobo_identity_variant_guid',
-			'_mobo_identity_portal_product_id',
-			'_mobo_identity_portal_variant_id',
-			'_mobo_identity_sku',
-			'_mobo_identity_captured_at',
+		$identity_keys = method_exists( 'Mobo_Core_Checkout_Validator', 'get_internal_order_item_meta_keys' )
+			? Mobo_Core_Checkout_Validator::get_internal_order_item_meta_keys()
+			: array(
+				'_mobo_identity_captured',
+				'_mobo_identity_is_mobo',
+				'_mobo_identity_product_guid',
+				'_mobo_identity_variant_guid',
+				'_mobo_identity_portal_product_id',
+				'_mobo_identity_portal_variant_id',
+				'_mobo_identity_sku',
+				'_mobo_identity_captured_at',
+				'_mobo_identity_connection_id',
+			);
+
+		return array_values(
+			array_unique(
+				array_merge(
+					array( self::ITEM_META_SOURCE_UNIT_COST, self::ITEM_META_SOURCE_SNAPSHOT_AT ),
+					$identity_keys
+				)
+			)
 		);
 	}
 
@@ -99,20 +110,30 @@ class Mobo_Core_Revenue_Ledger {
 		$product = isset( $values['data'] ) && $values['data'] instanceof WC_Product
 			? $values['data']
 			: $item->get_product();
+		$identity = $this->get_line_item_identity( $item, $product, true );
 
-		if ( ! $product instanceof WC_Product || ! $this->is_mobo_product( $product ) ) {
+		if ( empty( $identity['known'] ) || empty( $identity['isMobo'] ) || absint( $identity['connectionId'] ?? 0 ) <= 0 ) {
 			return;
 		}
 
-		$cost = $this->get_source_unit_cost(
-			absint( $item->get_product_id() ),
-			absint( $item->get_variation_id() ),
-			$product
-		);
+		$connection_id = absint( $identity['connectionId'] );
+		$callback = function () use ( $item, $product ) {
+			$cost = $this->get_source_unit_cost(
+				absint( $item->get_product_id() ),
+				absint( $item->get_variation_id() ),
+				$product
+			);
+			if ( null !== $cost ) {
+				$this->persist_item_cost_snapshot( $item, $cost );
+			}
+		};
 
-		if ( null !== $cost ) {
-			$this->persist_item_cost_snapshot( $item, $cost );
+		$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && $current_connection_id !== $connection_id ) {
+			Mobo_Core_Connection_Context::run( $connection_id, $callback );
+			return;
 		}
+		$callback();
 	}
 
 	public function handle_mobo_order_submission_success( $order_id, $mobo_order_id = 0, $payment_json = array() ) {
@@ -157,15 +178,17 @@ class Mobo_Core_Revenue_Ledger {
 			}
 
 			$product = $item->get_product();
-			$identity_captured = 'yes' === (string) $item->get_meta( '_mobo_identity_captured', true );
-			$is_mobo_item = $identity_captured
-				? 'yes' === (string) $item->get_meta( '_mobo_identity_is_mobo', true )
-				: ( $product instanceof WC_Product && $this->is_mobo_product( $product ) );
-			if ( ! $is_mobo_item ) {
+			$identity = $this->get_line_item_identity( $item, $product, true );
+			if ( empty( $identity['known'] ) || empty( $identity['isMobo'] ) ) {
 				continue;
 			}
 
 			$result['moboItems']++;
+			$connection_id = absint( $identity['connectionId'] ?? 0 );
+			if ( $connection_id <= 0 ) {
+				$result['missing']++;
+				continue;
+			}
 
 			if ( null !== $this->get_item_cost_snapshot( $item ) ) {
 				continue;
@@ -176,11 +199,17 @@ class Mobo_Core_Revenue_Ledger {
 				continue;
 			}
 
-			$cost = $this->get_source_unit_cost(
-				absint( $item->get_product_id() ),
-				absint( $item->get_variation_id() ),
-				$product
-			);
+			$cost_callback = function () use ( $item, $product ) {
+				return $this->get_source_unit_cost(
+					absint( $item->get_product_id() ),
+					absint( $item->get_variation_id() ),
+					$product
+				);
+			};
+			$current_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			$cost = class_exists( 'Mobo_Core_Connection_Context' ) && $current_connection_id !== $connection_id
+				? Mobo_Core_Connection_Context::run( $connection_id, $cost_callback )
+				: $cost_callback();
 
 			if ( null === $cost ) {
 				$result['missing']++;
@@ -251,6 +280,12 @@ class Mobo_Core_Revenue_Ledger {
 				return $existing;
 			}
 
+			$scope = $this->resolve_order_connection_scope( $order, false );
+			if ( is_wp_error( $scope ) ) {
+				return $scope;
+			}
+			$connection_id = absint( $scope['connectionId'] ?? 0 );
+
 			$snapshot = $this->snapshot_missing_source_costs( $order );
 			if ( absint( $snapshot['moboItems'] ) <= 0 ) {
 				return new WP_Error( 'mobo_core_revenue_no_mobo_items', 'Completed order contains no Mobo line item.' );
@@ -273,13 +308,9 @@ class Mobo_Core_Revenue_Ledger {
 					continue;
 				}
 
-				$product = $item->get_product();
-				$identity_captured = 'yes' === (string) $item->get_meta( '_mobo_identity_captured', true );
-				$is_mobo_item = $identity_captured
-					? 'yes' === (string) $item->get_meta( '_mobo_identity_is_mobo', true )
-					: ( $product instanceof WC_Product && $this->is_mobo_product( $product ) );
-				if ( ! $is_mobo_item ) {
-					continue;
+				$identity = $this->get_line_item_identity( $item, $item->get_product(), false );
+				if ( empty( $identity['known'] ) || empty( $identity['isMobo'] ) || absint( $identity['connectionId'] ?? 0 ) !== $connection_id ) {
+					return new WP_Error( 'mobo_core_revenue_order_scope_changed', 'Immutable order ownership no longer matches the revenue ledger Connection.' );
 				}
 
 				$unit_cost = $this->get_item_cost_snapshot( $item );
@@ -305,6 +336,7 @@ class Mobo_Core_Revenue_Ledger {
 				'schemaVersion'        => self::LEDGER_VERSION,
 				'orderId'              => $order_id,
 				'moboOrderId'          => absint( $order->get_meta( '_mobo_order_id', true ) ),
+				'connectionId'         => $connection_id,
 				'currency'             => strtoupper( sanitize_text_field( (string) $order->get_currency() ) ),
 				'itemCount'            => $item_count,
 				'quantity'             => $this->round_number( $quantity ),
@@ -323,6 +355,7 @@ class Mobo_Core_Revenue_Ledger {
 			$order->update_meta_data( self::META_LEDGER_VERSION, (string) self::LEDGER_VERSION );
 			$order->update_meta_data( self::META_LEDGER_RECORD, $record );
 			$order->update_meta_data( self::META_CALCULATED_AT, $calculated_at );
+			$order->update_meta_data( self::META_CONNECTION_ID, $connection_id );
 			$saved_order_id = absint( $order->save() );
 			if ( $saved_order_id !== $order_id ) {
 				return new WP_Error( 'mobo_core_revenue_ledger_persist_failed', 'Revenue ledger could not be persisted on the WooCommerce order.' );
@@ -335,6 +368,8 @@ class Mobo_Core_Revenue_Ledger {
 				|| absint( isset( $fresh_record['orderId'] ) ? $fresh_record['orderId'] : 0 ) !== $order_id
 				|| absint( $fresh_order->get_meta( self::META_LEDGER_VERSION, true ) ) !== self::LEDGER_VERSION
 				|| absint( $fresh_order->get_meta( self::META_CALCULATED_AT, true ) ) !== $calculated_at
+				|| absint( $fresh_order->get_meta( self::META_CONNECTION_ID, true ) ) !== $connection_id
+				|| absint( $fresh_record['connectionId'] ?? 0 ) !== $connection_id
 			) {
 				return new WP_Error( 'mobo_core_revenue_ledger_postcondition_failed', 'Revenue ledger save failed its durable post-write verification.' );
 			}
@@ -350,32 +385,121 @@ class Mobo_Core_Revenue_Ledger {
 		}
 	}
 
-	public function get_summary() {
+	/**
+	 * Backfill Connection ownership for pre-Multi-Connection immutable ledgers.
+	 *
+	 * Financial fields are never recalculated. Only missing ownership metadata is
+	 * enriched, and only when ownership is provable from durable evidence:
+	 * - embedded ledger Connection id;
+	 * - order-level revenue Connection id;
+	 * - one unambiguous immutable line-item Connection id; or
+	 * - a single Connection installation (the historical pre-Multi-Connection case).
+	 *
+	 * Ambiguous/multi-Connection evidence is preserved fail-closed.
+	 *
+	 * @param int $limit Maximum candidate orders to inspect.
+	 * @return array
+	 */
+	public function backfill_legacy_connection_ownership( $limit = 100 ) {
+		global $wpdb;
+		$limit = max( 1, min( 500, absint( $limit ) ) );
+		$result = array( 'status'=>'ok','inspected'=>0,'updated'=>0,'blocked'=>0,'remaining'=>0,'blockedIds'=>array() );
+		if ( ! function_exists( 'wc_get_order' ) || ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$result['status']='unavailable'; return $result;
+		}
+		$connections = Mobo_Core_Connection_Repository::list_all();
+		$connections = is_array($connections)?$connections:array(); $known=array();
+		foreach($connections as $row){$id=absint(is_array($row)?($row['id']??0):0);if($id>0){$known[$id]=true;}}
+		$sole_connection_id = 1===count($known)?(int)array_key_first($known):0;
+
+		/* Pre-HPOS ledgers can survive only in wp_postmeta even when current order
+		 * authority is HPOS. Discover that durable legacy evidence directly, then
+		 * perform every mutation and postcondition through WooCommerce CRUD. */
+		$cursor = absint( get_option( 'mobo_core_103477_revenue_ledger_backfill_cursor', 0 ) );
+		$blocked_ids = get_option( 'mobo_core_103477_revenue_ledger_backfill_blocked_ids', array() );
+		$blocked_ids = is_array($blocked_ids)?array_values(array_unique(array_filter(array_map('absint',$blocked_ids)))):array();
+		$ids = $wpdb->get_col( $wpdb->prepare(
+			"SELECT DISTINCT v.post_id FROM {$wpdb->postmeta} v INNER JOIN {$wpdb->postmeta} r ON r.post_id=v.post_id AND r.meta_key=%s WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d ORDER BY v.post_id ASC LIMIT %d",
+			self::META_LEDGER_RECORD, self::META_LEDGER_VERSION, (string)self::LEDGER_VERSION, $cursor, $limit
+		) );
+		$ids=is_array($ids)?array_values(array_filter(array_map('absint',$ids))):array();
+		$last_cursor=$cursor;
+
+		foreach($ids as $order_id){
+			$result['inspected']++; $last_cursor=max($last_cursor,$order_id);
+			$order=wc_get_order($order_id); if(!$order instanceof WC_Order){$blocked_ids[]=$order_id;continue;}
+			$order_record=$order->get_meta(self::META_LEDGER_RECORD,true);
+			$legacy_record=get_post_meta($order_id,self::META_LEDGER_RECORD,true);
+			$order_record=is_array($order_record)?$order_record:array(); $legacy_record=is_array($legacy_record)?$legacy_record:array();
+			$record=!empty($order_record)?$order_record:$legacy_record;
+			if(empty($record)||absint($record['schemaVersion']??0)!==self::LEDGER_VERSION||absint($record['orderId']??0)!==$order_id){$blocked_ids[]=$order_id;continue;}
+			if(!empty($order_record)&&!empty($legacy_record)){
+				$a=$order_record;$b=$legacy_record;unset($a['connectionId'],$b['connectionId']);
+				if(maybe_serialize($a)!==maybe_serialize($b)){$blocked_ids[]=$order_id;continue;}
+			}
+			$evidence=array(); $embedded=absint($record['connectionId']??0); if($embedded>0)$evidence[$embedded]=true;
+			$order_owner=absint($order->get_meta(self::META_CONNECTION_ID,true)); if($order_owner>0)$evidence[$order_owner]=true;
+			foreach($order->get_items('line_item') as $item){if(!is_object($item)||!method_exists($item,'get_meta'))continue;$cid=absint($item->get_meta('_mobo_identity_connection_id',true));if($cid>0)$evidence[$cid]=true;}
+			if(count($evidence)>1){$blocked_ids[]=$order_id;continue;}
+			$connection_id=1===count($evidence)?(int)array_key_first($evidence):$sole_connection_id;
+			if($connection_id<=0||!isset($known[$connection_id])){$blocked_ids[]=$order_id;continue;}
+			$already_embedded=absint($record['connectionId']??0)===$connection_id;
+			$already_owner=absint($order->get_meta(self::META_CONNECTION_ID,true))===$connection_id;
+			$record['connectionId']=$connection_id;
+			$order->update_meta_data(self::META_LEDGER_RECORD,$record); $order->update_meta_data(self::META_CONNECTION_ID,$connection_id);
+			$saved=absint($order->save()); if($saved!==$order_id){$blocked_ids[]=$order_id;continue;}
+			/* Enrich the legacy shadow too when it exists. This is ownership metadata
+			 * only; immutable financial values are byte-for-byte preserved above. */
+			if(!empty($legacy_record)){update_post_meta($order_id,self::META_LEDGER_RECORD,$record);update_post_meta($order_id,self::META_CONNECTION_ID,$connection_id);}
+			$fresh=wc_get_order($order_id);$fresh_record=$fresh instanceof WC_Order?$fresh->get_meta(self::META_LEDGER_RECORD,true):null;
+			$legacy_fresh=get_post_meta($order_id,self::META_LEDGER_RECORD,true);
+			if(!$fresh instanceof WC_Order||absint($fresh->get_meta(self::META_CONNECTION_ID,true))!==$connection_id||!is_array($fresh_record)||absint($fresh_record['connectionId']??0)!==$connection_id||(!empty($legacy_record)&&(!is_array($legacy_fresh)||absint($legacy_fresh['connectionId']??0)!==$connection_id))){$blocked_ids[]=$order_id;continue;}
+			$blocked_ids=array_values(array_diff($blocked_ids,array($order_id))); if(!$already_embedded||!$already_owner)$result['updated']++;
+		}
+		update_option('mobo_core_103477_revenue_ledger_backfill_cursor',$last_cursor,false);
+		$more=absint($wpdb->get_var($wpdb->prepare("SELECT MIN(v.post_id) FROM {$wpdb->postmeta} v WHERE v.meta_key=%s AND v.meta_value=%s AND v.post_id>%d",self::META_LEDGER_VERSION,(string)self::LEDGER_VERSION,$last_cursor)));
+		$blocked_ids=array_values(array_unique(array_filter(array_map('absint',$blocked_ids)))); update_option('mobo_core_103477_revenue_ledger_backfill_blocked_ids',$blocked_ids,false);
+		if($more>0){$result['remaining']=1;}else{delete_option('mobo_core_103477_revenue_ledger_backfill_cursor');$result['remaining']=count($blocked_ids);}
+		$result['blocked']=count($blocked_ids);$result['blockedIds']=array_slice($blocked_ids,0,25);if($result['remaining']>0&&$result['updated']===0)$result['status']='blocked';
+		if($result['updated']>0)$this->invalidate_summary_cache(); return $result;
+	}
+
+
+	/**
+	 * Build a revenue summary. A positive Connection id scopes every record to the
+	 * authenticated owner; zero preserves the historical installation-wide helper
+	 * for internal/backward-compatible callers only.
+	 *
+	 * @param int $connection_id Optional owner scope.
+	 * @return array
+	 */
+	public function get_summary( $connection_id = 0 ) {
+		$connection_id = absint( $connection_id );
 		$revision = absint( get_option( self::OPTION_REVISION, 0 ) );
+		$scope_key = $connection_id > 0 ? 'connection:' . $connection_id : 'all';
 		$cache = get_option( self::OPTION_CACHE, array() );
 
-		if (
-			is_array( $cache )
-			&& isset( $cache['revision'], $cache['summary'] )
-			&& absint( $cache['revision'] ) === $revision
-			&& is_array( $cache['summary'] )
-		) {
-			$summary = $cache['summary'];
+		if ( ! is_array( $cache ) || absint( $cache['revision'] ?? -1 ) !== $revision || ! isset( $cache['summaries'] ) || ! is_array( $cache['summaries'] ) ) {
+			$cache = array( 'revision' => $revision, 'summaries' => array() );
+		}
+
+		if ( isset( $cache['summaries'][ $scope_key ] ) && is_array( $cache['summaries'][ $scope_key ] ) ) {
+			$summary = $cache['summaries'][ $scope_key ];
 		} else {
-			$summary = $this->build_summary();
-			update_option(
-				self::OPTION_CACHE,
-				array( 'revision' => $revision, 'summary' => $summary ),
-				false
-			);
+			$summary = $this->build_summary( $connection_id );
+			$cache['summaries'][ $scope_key ] = $summary;
+			update_option( self::OPTION_CACHE, $cache, false );
 		}
 
 		$summary['generatedAt'] = gmdate( 'c' );
 		$summary['pluginVersion'] = defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '';
+		$summary['scope'] = $connection_id > 0 ? 'connection' : 'installation';
+		$summary['connectionId'] = $connection_id;
 		return $summary;
 	}
 
-	private function build_summary() {
+	private function build_summary( $connection_id = 0 ) {
+		$connection_id = absint( $connection_id );
 		$all_time = array();
 		$last_30 = array();
 		$recent = array();
@@ -416,6 +540,17 @@ class Mobo_Core_Revenue_Ledger {
 				$record = $order->get_meta( self::META_LEDGER_RECORD, true );
 				if ( ! is_array( $record ) || empty( $record ) ) {
 					continue;
+				}
+
+				if ( $connection_id > 0 ) {
+					$record_connection_id = $this->resolve_record_connection_id( $record, $order );
+					if ( $record_connection_id !== $connection_id ) {
+						continue;
+					}
+					if ( absint( $record['connectionId'] ?? 0 ) <= 0 ) {
+						/* Response-only normalization for pre-UX28 immutable records. */
+						$record['connectionId'] = $record_connection_id;
+					}
 				}
 
 				$record_count++;
@@ -512,6 +647,7 @@ class Mobo_Core_Revenue_Ledger {
 		return array(
 			'orderId'            => absint( isset( $record['orderId'] ) ? $record['orderId'] : 0 ),
 			'moboOrderId'        => absint( isset( $record['moboOrderId'] ) ? $record['moboOrderId'] : 0 ),
+			'connectionId'       => absint( isset( $record['connectionId'] ) ? $record['connectionId'] : 0 ),
 			'currency'           => isset( $record['currency'] ) ? (string) $record['currency'] : '-',
 			'itemCount'          => absint( isset( $record['itemCount'] ) ? $record['itemCount'] : 0 ),
 			'quantity'           => (float) ( isset( $record['quantity'] ) ? $record['quantity'] : 0 ),
@@ -558,28 +694,124 @@ class Mobo_Core_Revenue_Ledger {
 		return null;
 	}
 
-	private function is_mobo_product( $product ) {
-		if ( ! $product instanceof WC_Product ) {
-			return false;
+	/**
+	 * Resolve immutable/current line ownership without inheriting the ambient
+	 * Connection. Captured order-item metadata wins; live Product ownership is a
+	 * checkout-time compatibility fallback only and is never used for ledger scope.
+	 *
+	 * @return array{known:bool,isMobo:bool,connectionId:int}
+	 */
+	private function get_line_item_identity( $item, $product = null, $allow_live_fallback = false ) {
+		$out = array( 'known' => false, 'isMobo' => false, 'connectionId' => 0 );
+		if ( ! $item instanceof WC_Order_Item_Product ) {
+			return $out;
 		}
 
-		$product_id = absint( $product->get_id() );
-		$parent_id = $product->is_type( 'variation' ) ? absint( $product->get_parent_id() ) : $product_id;
-		$ids = array_values( array_unique( array_filter( array( $product_id, $parent_id ) ) ) );
+		if ( 'yes' === (string) $item->get_meta( '_mobo_identity_captured', true ) ) {
+			$out['known'] = true;
+			$out['isMobo'] = 'yes' === (string) $item->get_meta( '_mobo_identity_is_mobo', true );
+			$out['connectionId'] = absint( $item->get_meta( '_mobo_identity_connection_id', true ) );
+			return $out;
+		}
 
-		foreach ( $ids as $id ) {
-			if (
-				'' !== trim( (string) get_post_meta( $id, 'product_guid', true ) )
-				|| '' !== trim( (string) get_post_meta( $id, 'variant_guid', true ) )
-				|| absint( get_post_meta( $id, 'portal_product_id', true ) ) > 0
-				|| absint( get_post_meta( $id, 'portal_variant_id', true ) ) > 0
-				|| '' !== trim( (string) get_post_meta( $id, 'mobo_url', true ) )
-			) {
-				return true;
+		if ( ! $allow_live_fallback || ! $product instanceof WC_Product ) {
+			return $out;
+		}
+
+		$product_id = absint( $item->get_product_id() );
+		$variation_id = absint( $item->get_variation_id() );
+		$connection_id = $this->resolve_product_owner_connection_id( $product_id, $variation_id );
+		$out['known'] = class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready();
+		$out['isMobo'] = $connection_id > 0;
+		$out['connectionId'] = $connection_id;
+		return $out;
+	}
+
+	/** Resolve installation-global Product/Variation ownership. @return int */
+	private function resolve_product_owner_connection_id( $product_id, $variation_id = 0 ) {
+		$product_id = absint( $product_id );
+		$variation_id = absint( $variation_id );
+		if ( ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			return 0;
+		}
+
+		$product_owner = 0;
+		$variation_owner = 0;
+		if ( $product_id > 0 && class_exists( 'Mobo_Core_Product_State_Repository' ) ) {
+			$row = ( new Mobo_Core_Product_State_Repository() )->get_owner_by_woo_product_id( $product_id );
+			$product_owner = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+		}
+		if ( $variation_id > 0 && class_exists( 'Mobo_Core_Variant_State_Repository' ) ) {
+			$row = ( new Mobo_Core_Variant_State_Repository() )->get_owner_by_woo_variation_id( $variation_id );
+			$variation_owner = is_array( $row ) ? absint( $row['connection_id'] ?? 0 ) : 0;
+		}
+
+		if ( $product_owner > 0 && $variation_owner > 0 && $product_owner !== $variation_owner ) {
+			return 0;
+		}
+		return $variation_owner > 0 ? $variation_owner : $product_owner;
+	}
+
+	/**
+	 * Revenue is valid only for the same all-Mobo/single-Connection ownership
+	 * invariant required by automatic submission. Ledger creation never guesses
+	 * ownership from the current catalogue when immutable line snapshots are absent.
+	 *
+	 * @return array|WP_Error
+	 */
+	private function resolve_order_connection_scope( $order, $allow_live_fallback = false ) {
+		if ( ! $order instanceof WC_Order ) {
+			return new WP_Error( 'mobo_core_revenue_invalid_order_scope', 'Revenue ownership requires a valid WooCommerce order.' );
+		}
+
+		$connection_id = 0;
+		$mobo_items = 0;
+		foreach ( $order->get_items( 'line_item' ) as $item ) {
+			if ( ! $item instanceof WC_Order_Item_Product ) {
+				continue;
+			}
+			$identity = $this->get_line_item_identity( $item, $item->get_product(), $allow_live_fallback );
+			if ( empty( $identity['known'] ) ) {
+				return new WP_Error( 'mobo_core_revenue_identity_unavailable', 'Immutable Mobo line-item ownership is unavailable.' );
+			}
+			if ( empty( $identity['isMobo'] ) ) {
+				return new WP_Error( 'mobo_core_revenue_mixed_order_rejected', 'Mixed/non-Mobo orders are not eligible for the Mobo revenue ledger.' );
+			}
+			$item_connection_id = absint( $identity['connectionId'] ?? 0 );
+			if ( $item_connection_id <= 0 ) {
+				return new WP_Error( 'mobo_core_revenue_connection_unknown', 'Mobo line-item Connection ownership is unavailable.' );
+			}
+			if ( $connection_id > 0 && $connection_id !== $item_connection_id ) {
+				return new WP_Error( 'mobo_core_revenue_multi_connection_rejected', 'Multi-Connection orders are not eligible for the Mobo revenue ledger.' );
+			}
+			$connection_id = $item_connection_id;
+			$mobo_items++;
+		}
+
+		if ( $mobo_items <= 0 || $connection_id <= 0 ) {
+			return new WP_Error( 'mobo_core_revenue_no_mobo_items', 'Completed order contains no immutable Mobo line item.' );
+		}
+
+		return array( 'connectionId' => $connection_id, 'moboItems' => $mobo_items );
+	}
+
+	/** Resolve one immutable ledger record owner without cross-Connection guessing. @return int */
+	private function resolve_record_connection_id( $record, $order ) {
+		$connection_id = absint( is_array( $record ) ? ( $record['connectionId'] ?? 0 ) : 0 );
+		if ( $connection_id > 0 ) {
+			return $connection_id;
+		}
+		if ( $order instanceof WC_Order ) {
+			$connection_id = absint( $order->get_meta( self::META_CONNECTION_ID, true ) );
+			if ( $connection_id > 0 ) {
+				return $connection_id;
+			}
+			$scope = $this->resolve_order_connection_scope( $order, false );
+			if ( ! is_wp_error( $scope ) ) {
+				return absint( $scope['connectionId'] ?? 0 );
 			}
 		}
-
-		return false;
+		return 0;
 	}
 
 	private function invalidate_summary_cache() {

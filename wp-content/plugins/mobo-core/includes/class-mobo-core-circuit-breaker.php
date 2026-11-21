@@ -22,7 +22,7 @@ final class Mobo_Core_Circuit_Breaker {
 
 	/** Build circuit state for the current request. */
 	public static function build_profile() {
-		$diagnostics = get_option( 'mobo_core_runtime_diagnostics', array() );
+		$diagnostics = Mobo_Core_Settings::get( 'mobo_core_runtime_diagnostics', array() );
 		$diagnostics = is_array( $diagnostics ) ? $diagnostics : array();
 		$stages      = isset( $diagnostics['stages'] ) && is_array( $diagnostics['stages'] ) ? $diagnostics['stages'] : array();
 		$previous    = isset( $diagnostics['circuitBreakers'] ) && is_array( $diagnostics['circuitBreakers'] ) ? $diagnostics['circuitBreakers'] : array();

@@ -1,5 +1,50 @@
 # Legacy Mobo Core Changelog
 
+## UX57 / 10.34.20 — cart/shipping/address/wallet source audit, September 30, 2026
+
+- Shipping API snapshots capture the local request start in microseconds. `syncedAtUs` under the existing per-owner MySQL snapshot lock prevents a GET started before a newer webhook from overwriting it even when both commit during the same second. Legacy second-based callers remain accepted.
+- Wallet after-purchase balance checks re-read the owning Connection and compare it with the request-local route, rejecting disable/reprovision without a wrong-owner HTTP request. SMS delivery and explicit admin re-arm serialize on the same *existing* `wallet_alert_sms` logical lease, which `Mobo_Core_Lock` already scopes by Connection; no second ad hoc lease namespace is introduced.
+- Wallet SMS/balance, shipping API and address mapping API diagnostics use stable categories/error codes rather than raw upstream error strings. One-shot ambiguity retains its durable replay fence; an unsuccessful re-arm cannot clear an active sender's fence.
+- Address Mapping / City Asset generation requires a positive owner before mutation and retains their existing logical lock names. `Mobo_Core_Lock::option_key()` already namespaces both names by Connection; no duplicate lock namespace or schema migration is introduced.
+- Carry final 2-site Classic + HPOS, HTTP overlap, disabled/reprovisioned Source, independent one-shot SMS, and shipping reconciliation cases into Deep Test Suite. UX56 mock + UX57 mock are isolated PHP proofs, not live remote purchase tests. Section BA in permanent test backlog.
+
+## UX56 / 10.34.19 — order-submission route and recovery fences, September 30, 2026
+
+- New uncached Connection row read. For an in-flight order, a request-local fingerprint of the authoritative Source/Provider/routing/credentials is compared before each remote request and before the irreversible Wallet boundary; disabled, deleted, unprovisioned or changed routing must not fall back to Default or mix remote cart and payment routes.
+- Route change before outbound Wallet GET/POST is known-unsent; an independent payment fence is only retired after verified removal. Uncertain transport/payment acknowledgements still require manual verification, never automatic Wallet replay.
+- A second worker cannot mark an old running order uncertain or aborted while the original per-order lock is live. On recovered lock, reread Woo CRUD, preserve committed remote success, and verify uncertainty before removing the exact queue token.
+- Old queue/recovery rows do not automatically revive failed or aborted purchases. Added contracts AZ. Source/mock checks only; real WAMP/Portal concurrency remains pending. UX55 and pinned r8.3.178 Suite untouched. No schema migration.
+
+## UX55 / 10.34.18 — full sync/webhook and repricing durability, September 30, 2026
+
+- Manual/Repair page and exact-product snapshots are fenced immediately before HTTP GET, rather than after response. Legacy queue items without a snapshot timestamp require a fresh exact GET and cannot acquire a fictitious new timestamp for an old payload.
+- After parent upsert and before the later image/simple/variant stages, re-check the applied foreground webhook watermark. A superseded in-flight parent is marked incomplete, an exact fresh parent is requeued, all old stage cursors/seen-sets are reset and no duplicate processedProducts increment is allowed; API failures keep the original checkpoint for retry.
+- Simple-variant commit and Manual/Repair authoritative variant page both re-check the same parent snapshot against webhook watermark while holding the shared product lock; stale pages return a rebase signal before identity/topology mutations.
+- Reprice tracks `pendingParentIds` in the same durable state as its variation cursor. Start/recovery settles parent derived-price sync before advancing/overwriting a generation, retries incomplete/failed parent work without dropping the debt, confirms ownership and product GUID, and requires the shared product lock before WC parent sync. In-batch policy fingerprint checks avoid falsely declaring convergence under a modified policy.
+- Redacts raw parent-sync exception text from new Reprice diagnostics. Adds isolated PHPUnit-free mock proofs and permanent contracts AY. WordPress/Portal/real DB multi-process release testing is explicitly still pending; UX51 gate remains frozen.
+
+## UX54 / 10.34.17 — first full pipeline audit tranche, September 30, 2026
+
+- Fixed `uninstall.php` database global scope before its first warmup-admission cleanup query.
+- Redacted raw exception messages and PHP paths from REST error logger and Cron stage/last-result diagnostics; stable scope/status/type remain.
+- New Webhook/Event Store events now require a positive existing enabled Connection owner; no new zero-owner fallback files or disabled/unrecognized-owner table rows.
+- On processing, a fresh owner-enabled database probe bypasses stale in-request Connection cache; unavailable-owner events remain retryable under their original owner without consuming attempts. Existing orphan inventory and true disable/worker atomic barrier are explicit open items, not claimed fixed.
+- Added `full-plugin-pipeline-audit.md` and regression contracts AX; pending WordPress/Portal/MySQL multi-process gate explicitly required. UX51 and frozen Suite unchanged. No new table, column or schema migration.
+
+## UX53 / 10.34.16 — cache warmup fairness and safety, September 30, 2026
+
+- Bounded 100-item legacy queue import under the warmup mutex, with checkpoint/retry. It uses insert-if-absent, does not overwrite fresh revisions or clear unrelated destination rows; invalidates the admission counter on import, including an interrupted slice.
+- Fast indexed due-row existence instead of COUNT/SUM in frequent scheduler checks. Health may still use bounded SQL aggregate counts.
+- WARM admissions capped at 18,000 of 20,000 total per Connection, reserving at least 2,000 slots for HOT; failure to persist capacity state rejects new admission. No automatic silent eviction.
+- Independent installation-level Connection round-robin for eligible Warmup work; at most one selected Connection and one warmup stage (single GET) per multi-Connection dispatch. Foreground queues retain their original schedule and all outbound GETs retain one global lease/rate budget.
+- Fail-closed warmup: published canonical product pages only, no cart/account/action URLs, no browser cookies. Set-Cookie, private/no-store/no-cache, bypass/dynamic, non-HTML and unsafe redirects do not count as successful cache warming; explicit provider HIT is required for verified-hit evidence. Trusted filters cannot bypass an unsuccessful targeted purge.
+- Documented UX53 regressions in `admin-ux-test-backlog.md` section AW; no new database table/automatic DDL and no multilingual or multicurrency feature additions. This is a separate artifact; UX51's frozen Suite must remain on UX51 until repinned.
+
+## UX52 / 10.34.15 — cache warmup throughput, September 30, 2026
+
+Introduces selective admission (cold lazy, historically sold warm, external traffic filter for hot), two indexed row-based per-Connection queues, stable parent dedupe with revision/claim CAS, installation-global GET budgeting and compact Health. Repairs no-mutation legacy queue pickup; explicitly reports 5K deferred archive product ID overflow and WP Super Cache fallback. Test contracts in `admin-ux-test-backlog.md` section AV, operational defaults in `cache-warmup-30k-policy.md`. This independent build is not covered by frozen UX51/r8.3.177 gate.
+
+
 = 10.33.17.2 =
 * Hardened Mobo wallet/order SMS delivery through Persian WooCommerce SMS: third-party bootstrap, shortcode rendering, recipient validation and gateway send exceptions are now converted to bounded WP_Error diagnostics instead of escaping checkout/order hooks.
 * Iranian recipient numbers are normalized from Persian/Arabic digits and common +98/0098/98/9xxxxxxxxx forms before PWSMS validation, reducing silent recipient rejection caused by formatting differences.
@@ -654,15 +699,66 @@ Adds bounded targeted-cache purge telemetry, per-integration status/version repo
 * Enabled SSL verification by default for outbound HTTP requests.
 * Disabled sensitive external workflows by default on fresh installs: automatic order submission, health reporting, address mapping, and legacy image refresh.
 * Added a developer-only opt-in filter for unsafe local/private image downloads used in local test environments.
-* Clarified that this is an integration for a specific mobomobo.ir workflow and not presented as an official mobomobo.ir plugin unless separately authorized.
+* Clarified that this is an integration for a specific the provisioned Source workflow and not presented as an official the provisioned Source plugin unless separately authorized.
 
 = 10.31.43 =
-* Added ready-to-publish Terms and Privacy pages for mobo.codeya.ir.
-* Clarified that the plugin is intended for Iranian stores and the specific mobomobo.ir source.
-* Updated external service disclosure with mobo.codeya.ir and mobomobo.ir.
-* Updated purchase/activation UI text for the Iran-only and mobomobo.ir workflow.
+* Added ready-to-publish Terms and Privacy pages for the provisioned Backend.
+* Clarified that the plugin is intended for Iranian stores and the specific the provisioned Source source.
+* Updated external service disclosure with the provisioned Backend and the provisioned Source.
+* Updated purchase/activation UI text for the Iran-only and the provisioned Source workflow.
 
 = 10.31.42 =
-* Added purchase and activation screen linked to mobo.codeya.ir.
+* Added purchase and activation screen linked to the provisioned Backend.
 * Added WordPress.org-ready readme.txt and external service disclosure.
 * Updated plugin metadata, license headers, and GitHub URL.
+
+= 10.34.14 Admin UX continuation (UX14-UX15) =
+* Hardened Sync Health so unavailable audits cannot appear healthy, last-good snapshots survive failed refreshes, excluded products leave the active denominator, and Health observation does not mutate exclusion evidence.
+* Reworked Site Health classification around real Cron evidence, Connection/X-SEC plus multi-Connection ownership readiness, DB schema state, runtime version minimums, active failed Webhook/Image queues, image environment readiness, and explicit storage/quota failures; local auth readiness is not presented as proof of Portal network reachability.
+* Corrected Health vs Heartbeat wording: `/health` is read-only reporting; `/heartbeat` is the separate no-cache bounded-recovery runner path.
+* Removed the misleading Save form from the read-only Site Health diagnostics UI and separated account quota from raw server-filesystem capacity.
+* Added a central Admin UX regression-test backlog covering all closed redesign pages and cross-page isolation/RTL/mobile/error-lifecycle contracts.
+
+
+= 10.34.14 Admin/REST continuation (UX32-UX34) =
+* Scoped Portal remote-control `lastOperation` metadata to the authenticated Connection so request IDs and operation history cannot leak across Sources.
+* Replaced provisioning replay protection's raceable transient check/set with an atomic durable nonce reservation after successful HMAC verification.
+* Added namespace-wide no-store/no-cache response headers for every `/mobo-core/v1/` REST response, covering Source-scoped and installation-global authenticated surfaces.
+
+
+= 10.34.14 Runtime/Deployment continuation (UX35-UX40) =
+* Locked in Source-owned Webhook queue isolation contracts for authenticated foreground execution, legacy file fallback ownership and fair shared-worker dispatch.
+* Added explicit installation-wide Webhook queue status aggregation for Worker status and Health so non-default Source backlog cannot be hidden behind the Default Connection context.
+* Aggregated Health Image Queue pending/attaching/due/failed counters and timing across all enabled Connections.
+* Preserved multi-Connection Cron/Heartbeat operational evidence by resolving per-Connection webhook success and exposing bounded Connection success/failure counts in the compact Heartbeat result.
+* Corrected release manifest compatibility with Remote Updater's canonical `algorithm=sha256` and `path => hash` schema; final packaging now regenerates the manifest from packaged bytes.
+* Corrected Remote Updater package transport policy so production requires HTTPS; plain HTTP is limited to explicit WP_DEBUG development use.
+
+= 10.34.14 Database Unicode enforcement foundation (UX41) =
+* Added a central full-Unicode readiness authority that audits WordPress configuration, live DB connection charsets, database defaults, Mobo-owned columns and the WordPress/WooCommerce text destinations used by Mobo Core.
+* Changed Mobo-owned schema creation to request utf8mb4 explicitly instead of inheriting a possible utf8/utf8mb3 `$wpdb->get_charset_collate()` result.
+* Gated custom-storage and overall database Schema readiness on actual utf8mb4 compatibility and exposed bounded failure evidence in Site Health.
+* Added an explicit temporary-table supplementary-Unicode round-trip probe for release/maintenance verification without persistent probe data.
+* Kept broad charset conversion out of activation/page-load/routine update paths; a locked, checkpointed Database Unicode Upgrade remains the explicit maintenance step required for existing incompatible databases.
+
+
+= 10.34.14 Explicit Database Unicode remediation (UX42-UX46) =
+- Added an administrator-started, resumable utf8mb4 migration planner for the active WordPress site prefix.
+- Database default and tables convert one DDL boundary per slice with durable checkpoints and post-DDL verification.
+- Reused the global runtime barrier to drain Mobo workers before DDL; added a dedicated migration-step lease to prevent concurrent ALTER operations.
+- Cron can advance exactly one migration slice only after an administrator has started the workflow; ordinary Source workers stay paused behind the barrier.
+- Added safe Pause semantics: a concurrent Pause during ALTER records a request and releases the barrier only after the running DDL is verified/checkpointed.
+- Added Health controls/status for Start, Resume/Re-check and Pause, with bounded progress/error evidence and no barrier token exposure.
+- Physical conversion never edits wp-config.php. Legacy DB_CHARSET/connection state ends in `awaiting-config` until the operator switches WordPress to utf8mb4.
+- Terminal completion requires a fresh physical re-plan plus the existing byte-exact 4-byte Unicode round-trip probe.
+- Added a conservative bounded index-width preflight before DDL so provably incompatible utf8mb4 key definitions fail before conversion starts.
+- Closed the Pause/pre-DDL race by re-reading durable state after exclusive step-lease acquisition and re-validating the barrier/drain boundary before any ALTER.
+- Preserved the extended database-maintenance barrier TTL after coordinator stage marking instead of allowing the generic 900-second stage renewal to shorten it.
+
+= 10.34.14 Remote deployment / Unicode continuation (UX47-UX50) =
+- Made remote-upgrade build identity evidence byte-backed: installed files are hashed against the manifest, and missing/modified/untracked/symlinked files can no longer pass because the manifest merely declares a valid fingerprint.
+- Corrected the same-request version boundary so post-install verification checks the explicit targetVersion rather than the old MOBO_CORE_VERSION constant already loaded in PHP memory.
+- Reworked rollback snapshots into a verified pending/promote flow with deterministic whole-tree hashes; rollback verifies the snapshot before removing the live plugin and verifies the restored destination again afterward.
+- Preserved a previously verified same-version backup when a prior killed upgrade leaves the active tree damaged; a signed retry can reuse that recovery boundary instead of overwriting it with partial files.
+- Added interrupted-deployment status reconciliation: stale transient stages with no live upgrade lease/barrier are reported as interrupted, while a fully installed target with verified bytes can be reported as completed-recovered.
+- Added a bounded textual foreign-key preflight to the utf8mb4 migration planner so one-table-at-a-time conversion fails before any DDL when changing one FK side would create incompatible character definitions.

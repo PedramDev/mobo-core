@@ -2,7 +2,7 @@
 /**
  * Settings helper.
  *
- * Preserves legacy option names while removing WP-Cron dependency.
+ * Preserves public setting keys while routing Source-owned values to Connection storage.
  * PHP 7.4 compatible.
  */
 
@@ -69,16 +69,21 @@ class Mobo_Core_Settings {
 			'mobo_core_cache_archive_purge_interval_minutes' => '15',
 			// Exact product-page cache warmup after successful targeted purge.
 			'mobo_core_cache_warmup_enabled'             => '1',
+			'mobo_core_cache_warmup_policy'              => 'selective',
 			'mobo_core_cache_warmup_batch_size'          => 2,
 			'mobo_core_cache_warmup_debounce_seconds'    => 15,
 			'mobo_core_cache_warmup_timeout_seconds'     => 8,
 			'mobo_core_cache_warmup_max_attempts'        => 5,
 			'mobo_core_category_mapping_enabled'  => '1',
 			'mobo_core_category_mapping_required' => '0',
+			'mobo_core_category_mapping_active_guids' => array(),
+			'mobo_core_category_mapping_active_snapshot_at' => 0,
 			'mobo_core_address_mapping_show_all_countries' => '0',
 
 			'mobo_default_category_id'            => '0',
 
+			// C75B-P4G-P2: store-wide destination selection; conversion stays inactive.
+			'mobo_core_money_target_preference'   => 'store',
 			'mobo_price_type'                     => 'static-price',
 			'global_additional_price'             => '0',
 			'global_additional_percentage'        => '0',
@@ -149,8 +154,10 @@ class Mobo_Core_Settings {
 			// Real cron is the primary execution path on customer hosts.
 			'mobo_core_cron_token'                    => '',
 			'mobo_core_real_cron_last_hit_at'          => 0,
+			'mobo_core_real_cron_previous_hit_at'      => 0,
 			'mobo_core_real_cron_last_success_at'      => 0,
 			'mobo_core_real_cron_last_result'          => array(),
+			'mobo_core_real_cron_last_scheduler_result'=> array(),
 			'mobo_core_real_cron_time_budget_seconds'  => 25,
 			'mobo_core_real_cron_max_sync_steps'       => 3,
 			'mobo_core_real_cron_max_rounds'           => 100,
@@ -194,7 +201,7 @@ class Mobo_Core_Settings {
 			'mobo_core_checkout_mobo_cart_validation_enabled' => '0',
 			'mobo_core_checkout_mobo_debug_enabled'           => '0',
 			'mobo_core_shipping_diagnostics_enabled'              => '0',
-			'mobo_core_checkout_mobo_site_url'                => 'https://mobomobo.ir',
+			'mobo_core_checkout_mobo_site_url'                => '',
 			'mobo_core_checkout_mobo_username'                => '',
 			'mobo_core_checkout_mobo_password'                => '',
 			'mobo_core_checkout_mobo_timeout_seconds'         => 8,
@@ -255,6 +262,11 @@ class Mobo_Core_Settings {
 			'mobo_core_wallet_alert_threshold'              => 0,
 			'mobo_core_wallet_alert_recipients'             => '',
 			'mobo_core_wallet_alert_template'               => '',
+			'mobo_core_wallet_alert_delivery_fence_at'      => 0,
+			'mobo_core_wallet_test_sms_last_attempt_at'      => 0,
+			'mobo_core_wallet_test_sms_last_success_at'      => 0,
+			'mobo_core_wallet_test_sms_last_error'           => '',
+			'mobo_core_wallet_test_sms_last_result'          => '',
 		);
 
 		return self::$defaults_cache;
@@ -279,6 +291,12 @@ class Mobo_Core_Settings {
 		foreach ( $keys as $key ) {
 			$key = is_string( $key ) ? trim( $key ) : '';
 			if ( '' === $key || isset( self::$primed_options[ $key ] ) ) {
+				continue;
+			}
+			/* Source-owned settings are never wp_options runtime state after the
+			 * terminal Connection Settings cutover. */
+			if ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $key ) ) {
+				self::$primed_options[ $key ] = true;
 				continue;
 			}
 			self::$primed_options[ $key ] = true;
@@ -382,7 +400,6 @@ class Mobo_Core_Settings {
 				'mobo_core_self_runner_continue_enabled',
 				'mobo_core_self_runner_min_interval_seconds',
 				'mobo_core_self_runner_http_timeout_seconds',
-				'mobo_core_checkout_mobo_timeout_seconds',
 			)
 		);
 	}
@@ -405,7 +422,57 @@ class Mobo_Core_Settings {
 			return self::$runtime_overrides[ $key ];
 		}
 
+		/* Backend routing is Source Registry-owned once a durable Connection exists.
+		 * An unknown/non-registered source must fail closed instead of falling back to
+		 * the Default Source or a stale legacy URL from another Connection. */
+		if ( 'mobo_core_api_base_url' === (string) $key ) {
+			if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() ) {
+				/* Durable Connection ownership is authoritative. An explicit owner that
+				 * is disabled/deleted, or a missing Default row, must not fall through
+				 * to the built-in Default Source URL. */
+				return Mobo_Core_Connection_Repository::get_runtime_base_url( '' );
+			}
+
+		}
+
+		if ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $key ) ) {
+			return Mobo_Core_Connection_Settings::get_option( $key, $fallback );
+		}
+
 		return get_option( $key, $fallback );
+	}
+
+
+	/**
+	 * Update a plugin setting through the active ownership boundary.
+	 * Source-owned settings are written to the current Connection; installation
+	 * settings retain their historical wp_options storage.
+	 *
+	 * @param string $key Option key.
+	 * @param mixed  $value Value.
+	 * @param bool   $autoload WordPress autoload preference for global settings.
+	 * @return bool
+	 */
+	public static function update( $key, $value, $autoload = false ) {
+		$key = (string) $key;
+		if ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $key ) ) {
+			return Mobo_Core_Connection_Settings::update_option( $key, $value, $autoload );
+		}
+		return update_option( $key, $value, $autoload );
+	}
+
+	/**
+	 * Delete a plugin setting through the active ownership boundary.
+	 *
+	 * @param string $key Option key.
+	 * @return bool
+	 */
+	public static function delete( $key ) {
+		$key = (string) $key;
+		if ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $key ) ) {
+			return Mobo_Core_Connection_Settings::delete_option( $key );
+		}
+		return delete_option( $key );
 	}
 
 	/**
@@ -420,7 +487,7 @@ class Mobo_Core_Settings {
 	public static function get_int( $key, $default, $min, $max ) {
 		$value = array_key_exists( $key, self::$runtime_overrides )
 			? absint( self::$runtime_overrides[ $key ] )
-			: absint( get_option( $key, $default ) );
+			: absint( self::get( $key, $default ) );
 
 		if ( $value < $min ) {
 			return $min;
@@ -462,7 +529,7 @@ class Mobo_Core_Settings {
 	 * @return bool
 	 */
 	public static function enabled( $key, $default = '0' ) {
-		$value = get_option( $key, $default );
+		$value = self::get( $key, $default );
 
 		return in_array( strtolower( (string) $value ), array( '1', 'yes', 'true', 'on' ), true );
 	}
@@ -571,27 +638,28 @@ class Mobo_Core_Settings {
 				update_option( 'mobo_core_security_code', $security_code, false );
 			}
 		}
-		self::save_url( $post, 'mobo_core_api_base_url' );
+		/* Base URL is server-provisioned on the durable Connection. Keep any existing
+		 * legacy option untouched for rollback, but do not accept new admin edits. */
 		self::save_text( $post, 'mobo_core_token' );
 		self::save_text( $post, 'mobo_core_cron_token' );
 		delete_option( 'mobo_core_health_report_url' );
 		update_option( 'mobo_core_health_report_enabled', '0', false );
 		self::save_url( $post, 'mobo_core_checkout_external_validation_url' );
-		update_option( 'mobo_core_checkout_mobo_site_url', defined( 'MOBO_CORE_CHECKOUT_SITE_URL' ) ? MOBO_CORE_CHECKOUT_SITE_URL : 'https://mobomobo.ir', false );
-		$previous_mobo_username = (string) get_option( 'mobo_core_checkout_mobo_username', '' );
+		delete_option( 'mobo_core_checkout_mobo_site_url' );
+		$previous_mobo_username = (string) self::get( 'mobo_core_checkout_mobo_username', '' );
 		self::save_text( $post, 'mobo_core_checkout_mobo_username' );
-		$current_mobo_username = (string) get_option( 'mobo_core_checkout_mobo_username', '' );
+		$current_mobo_username = (string) self::get( 'mobo_core_checkout_mobo_username', '' );
 		if ( ! hash_equals( $previous_mobo_username, $current_mobo_username ) ) {
 			/* Username-only account switches must not keep a cookie authenticated for
 			 * the previous Mobo account. The reset is applied under the shared-cart lock. */
-			update_option( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
+			self::update( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
 		}
 		if ( isset( $post['mobo_core_checkout_mobo_password'] ) ) {
 			$password = self::normalize_opaque_secret( wp_unslash( $post['mobo_core_checkout_mobo_password'] ) );
 
 			if ( '' !== $password ) {
-				update_option( 'mobo_core_checkout_mobo_password', $password, false );
-				update_option( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
+				self::update( 'mobo_core_checkout_mobo_password', $password, false );
+				self::update( 'mobo_core_checkout_mobo_cookie_reset_pending', '1', false );
 			}
 		}
 
@@ -607,14 +675,14 @@ class Mobo_Core_Settings {
 		self::save_bool( $post, 'mobo_core_category_mapping_required' );
 
 		if ( isset( $post['mobo_core_excluded_product_urls'] ) ) {
-			update_option(
+			self::update(
 				'mobo_core_excluded_product_urls',
 				sanitize_textarea_field( wp_unslash( $post['mobo_core_excluded_product_urls'] ) ),
 				false
 			);
 		}
 
-		update_option(
+		self::update(
 			'mobo_default_category_id',
 			absint( isset( $post['mobo_default_category_id'] ) ? wp_unslash( $post['mobo_default_category_id'] ) : 0 ),
 			false
@@ -632,23 +700,23 @@ class Mobo_Core_Settings {
 			$price_type = 'static-price';
 		}
 
-		update_option( 'mobo_price_type', $price_type, false );
+		self::update( 'mobo_price_type', $price_type, false );
 
 		/*
 		 * Preserve old option names, but only save the relevant value based on selected price type.
 		 */
 		if ( 'static-price' === $price_type ) {
 			self::save_decimal( $post, 'global_additional_price' );
-			update_option( 'global_additional_percentage', '0', false );
-			update_option( 'mobo_dynamic_price', '[]', false );
+			self::update( 'global_additional_percentage', '0', false );
+			self::update( 'mobo_dynamic_price', '[]', false );
 		} elseif ( 'static-percentage' === $price_type ) {
-			update_option( 'global_additional_price', '0', false );
+			self::update( 'global_additional_price', '0', false );
 			self::save_decimal( $post, 'global_additional_percentage' );
-			update_option( 'mobo_dynamic_price', '[]', false );
+			self::update( 'mobo_dynamic_price', '[]', false );
 		} else {
-			update_option( 'global_additional_price', '0', false );
-			update_option( 'global_additional_percentage', '0', false );
-			update_option( 'mobo_dynamic_price', self::sanitize_dynamic_price_rows( $post ), false );
+			self::update( 'global_additional_price', '0', false );
+			self::update( 'global_additional_percentage', '0', false );
+			self::update( 'mobo_dynamic_price', self::sanitize_dynamic_price_rows( $post ), false );
 		}
 
 		self::save_int( $post, 'mobo_core_sync_time_budget_seconds', 8, 2, 25 );
@@ -667,7 +735,7 @@ class Mobo_Core_Settings {
 		self::save_bool_if_present( $post, 'mobo_core_product_cursor_sync_enabled' );
 		self::save_int( $post, 'mobo_core_variants_per_page', 5, 1, 100 );
 		self::save_bool_if_present( $post, 'mobo_core_variant_cursor_sync_enabled' );
-		self::save_int( $post, 'mobo_core_images_per_run', 1, 0, 10 );
+		self::save_int( $post, 'mobo_core_images_per_run', 1, 1, 10 );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_enabled' );
 		self::save_bool_if_present( $post, 'mobo_core_image_queue_blocking' );
 		self::save_cache_archive_purge_interval_if_present( $post );
@@ -692,9 +760,9 @@ class Mobo_Core_Settings {
 		self::save_int( $post, 'mobo_core_health_report_timeout_seconds', 15, 5, 60 );
 
 		self::save_bool_if_present( $post, 'mobo_core_checkout_validation_enabled' );
-		update_option( 'mobo_core_checkout_validate_only_mobo_products', '1', false );
-		update_option( 'mobo_core_checkout_require_remote_guid', '1', false );
-		update_option( 'mobo_core_checkout_block_incomplete_sync', '1', false );
+		self::update( 'mobo_core_checkout_validate_only_mobo_products', '1', false );
+		self::update( 'mobo_core_checkout_require_remote_guid', '1', false );
+		self::update( 'mobo_core_checkout_block_incomplete_sync', '1', false );
 		if ( ! self::enabled( 'mobo_core_checkout_validation_enabled', '0' ) ) {
 			delete_option( 'mobo_core_shared_mobo_cart_lock' );
 		}
@@ -717,7 +785,7 @@ class Mobo_Core_Settings {
 			$checkout_error_behavior = 'allow';
 		}
 
-		update_option( 'mobo_core_checkout_external_error_behavior', $checkout_error_behavior, false );
+		self::update( 'mobo_core_checkout_external_error_behavior', $checkout_error_behavior, false );
 
 		$behavior = isset( $post['mobo_core_missing_variants_behavior'] )
 			? sanitize_key( wp_unslash( $post['mobo_core_missing_variants_behavior'] ) )
@@ -727,7 +795,14 @@ class Mobo_Core_Settings {
 			$behavior = 'outofstock';
 		}
 
-		update_option( 'mobo_core_missing_variants_behavior', $behavior, false );
+		self::update( 'mobo_core_missing_variants_behavior', $behavior, false );
+
+		/* The current legacy credential fields still feed Default Connection metadata
+		 * until the Connection UI owns those fields. Business/scoped settings are NOT
+		 * mirrored: mobo_connection_settings is their sole runtime authority. */
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && Mobo_Core_Connection_Repository::table_exists() ) {
+			Mobo_Core_Connection_Repository::sync_default_from_legacy_options( 0, true );
+		}
 	}
 
 
@@ -757,13 +832,17 @@ class Mobo_Core_Settings {
 			}
 
 			$value = self::get( $key, $default );
-			$source = false === get_option( $key, false ) ? 'default' : 'option';
+			$source = ( class_exists( 'Mobo_Core_Connection_Settings' ) && Mobo_Core_Connection_Settings::is_scoped_key( $key ) )
+				? ( Mobo_Core_Connection_Settings::has( 0, $key ) ? 'connection' : 'default' )
+				: ( false === get_option( $key, false ) ? 'default' : 'option' );
 
 			if ( 'mobo_core_api_base_url' === $key ) {
-				$effective = apply_filters( 'mobo_core_api_base_url', '' );
+				$effective = class_exists( 'Mobo_Core_Connection_Repository' )
+					? Mobo_Core_Connection_Repository::get_runtime_base_url( '' )
+					: apply_filters( 'mobo_core_api_base_url', '' );
 				if ( is_string( $effective ) && '' !== trim( $effective ) ) {
 					$value = $effective;
-					$source = defined( 'MOBO_API_BASE_URL' ) && trim( (string) MOBO_API_BASE_URL ) === trim( $effective ) ? 'constant' : 'filter';
+					$source = 'source-registry';
 				}
 			}
 
@@ -775,7 +854,7 @@ class Mobo_Core_Settings {
 				'value'    => self::normalize_portal_setting_value( $value ),
 				'default'  => self::normalize_portal_setting_value( $default ),
 				'source'   => $source,
-				'readOnly' => 'constant' === $source || 'filter' === $source,
+				'readOnly' => in_array( $source, array( 'constant', 'filter', 'source-registry' ), true ),
 			);
 		}
 
@@ -840,6 +919,7 @@ class Mobo_Core_Settings {
 			'mobo_core_categories_last_sync_at',
 			'mobo_core_health_last_report_result',
 			'mobo_core_real_cron_last_result',
+			'mobo_core_real_cron_last_scheduler_result',
 			'mobo_core_self_runner_last_kick_result',
 			'mobo_core_self_runner_last_run_result',
 			'mobo_core_image_refresh_automation_last_result',
@@ -854,15 +934,15 @@ class Mobo_Core_Settings {
 		$labels = array(
 			'mobo_core_api_base_url' => 'نشانی API پرتال',
 			'mobo_core_only_in_stock' => 'دریافت فقط محصولات موجود',
-			'global_product_auto_stock' => 'بروزرسانی خودکار موجودی',
-			'global_product_auto_price' => 'بروزرسانی خودکار قیمت',
-			'global_product_auto_title' => 'بروزرسانی خودکار عنوان',
-			'global_product_auto_compare_price' => 'بروزرسانی قیمت مقایسه‌ای',
-			'global_product_auto_slug' => 'بروزرسانی نامک محصول',
+			'global_product_auto_stock' => 'بروزرسانی موجودی',
+			'global_product_auto_price' => 'بروزرسانی قیمت از منبع',
+			'global_product_auto_title' => 'بروزرسانی عنوان محصول',
+			'global_product_auto_compare_price' => 'اعمال قیمت تخفیف منبع',
+			'global_product_auto_slug' => 'بروزرسانی نامک و آدرس محصول',
 			'global_update_categories' => 'بروزرسانی دسته‌بندی‌ها',
-			'global_update_images' => 'بروزرسانی تصاویر',
-			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی کش آرشیوهای محصول',
-			'mobo_core_cache_warmup_enabled' => 'پیش‌بارگذاری خودکار صفحه همان محصول',
+			'global_update_images' => 'بروزرسانی تصاویر محصول',
+			'mobo_core_cache_archive_purge_interval_minutes' => 'فاصله پاک‌سازی صفحات مرتبط',
+			'mobo_core_cache_warmup_enabled' => 'پیش‌بارگذاری صفحه محصول بعد از بروزرسانی',
 			'mobo_core_category_mapping_enabled' => 'فعال‌سازی نگاشت دسته‌بندی',
 			'mobo_core_category_mapping_required' => 'اجباری بودن نگاشت دسته‌بندی',
 			'mobo_default_category_id' => 'دسته‌بندی پیش‌فرض',
@@ -1053,7 +1133,7 @@ class Mobo_Core_Settings {
 	 * @return void
 	 */
 	private static function save_text( $post, $key ) {
-		update_option(
+		self::update(
 			$key,
 			isset( $post[ $key ] ) ? sanitize_text_field( wp_unslash( $post[ $key ] ) ) : '',
 			false
@@ -1068,7 +1148,7 @@ class Mobo_Core_Settings {
 	 * @return void
 	 */
 	private static function save_url( $post, $key ) {
-		update_option(
+		self::update(
 			$key,
 			isset( $post[ $key ] ) ? esc_url_raw( wp_unslash( $post[ $key ] ) ) : '',
 			false
@@ -1168,7 +1248,7 @@ class Mobo_Core_Settings {
 	 * @return void
 	 */
 	private static function save_bool( $post, $key ) {
-		update_option(
+		self::update(
 			$key,
 			isset( $post[ $key ] ) && in_array( strtolower( sanitize_text_field( wp_unslash( $post[ $key ] ) ) ), array( '1', 'yes', 'true', 'on' ), true ) ? '1' : '0',
 			false
@@ -1187,7 +1267,7 @@ class Mobo_Core_Settings {
 		$value = wc_format_decimal( $value );
 		$value = is_numeric( $value ) ? max( 0, (float) $value ) : 0;
 
-		update_option( $key, wc_format_decimal( $value ), false );
+		self::update( $key, wc_format_decimal( $value ), false );
 	}
 
 	/**
@@ -1204,6 +1284,6 @@ class Mobo_Core_Settings {
 		$value = isset( $post[ $key ] ) ? absint( wp_unslash( $post[ $key ] ) ) : $default;
 		$value = min( $max, max( $min, $value ) );
 
-		update_option( $key, $value, false );
+		self::update( $key, $value, false );
 	}
 }

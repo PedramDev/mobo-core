@@ -15,8 +15,6 @@ class Mobo_Core_Dependencies {
 
 	const WOOCOMMERCE_PLUGIN_FILE         = 'woocommerce/woocommerce.php';
 	const WOOCOMMERCE_SLUG                = 'woocommerce';
-	const PERSIAN_WOOCOMMERCE_PLUGIN_FILE = 'persian-woocommerce/woocommerce-persian.php';
-	const PERSIAN_WOOCOMMERCE_SLUG        = 'persian-woocommerce';
 
 	/**
 	 * Return missing required plugins.
@@ -30,12 +28,6 @@ class Mobo_Core_Dependencies {
 				'plugin_file' => self::WOOCOMMERCE_PLUGIN_FILE,
 				'slug'        => self::WOOCOMMERCE_SLUG,
 				'active'      => self::is_woocommerce_active(),
-			),
-			array(
-				'name'        => 'ووکامرس فارسی',
-				'plugin_file' => self::PERSIAN_WOOCOMMERCE_PLUGIN_FILE,
-				'slug'        => self::PERSIAN_WOOCOMMERCE_SLUG,
-				'active'      => self::is_persian_woocommerce_active(),
 			),
 		);
 
@@ -58,7 +50,16 @@ class Mobo_Core_Dependencies {
 	 * @return bool
 	 */
 	public static function requirements_met() {
-		return empty( self::get_missing_dependencies() );
+		return self::platform_requirements_met() && empty( self::get_missing_dependencies() );
+	}
+
+	/**
+	 * Stable terminal Woo metadata IDs require a 64-bit PHP integer runtime.
+	 *
+	 * @return bool
+	 */
+	public static function platform_requirements_met() {
+		return PHP_INT_SIZE >= 8;
 	}
 
 	/**
@@ -73,38 +74,20 @@ class Mobo_Core_Dependencies {
 	}
 
 	/**
-	 * Whether the official WordPress.org Persian WooCommerce plugin is active.
-	 *
-	 * The plugin file check is the canonical signal. The class/global fallbacks
-	 * support installations where the plugin directory was renamed manually.
-	 *
-	 * @return bool
-	 */
-	public static function is_persian_woocommerce_active() {
-		/*
-		 * plugins_loaded runs after active plugins were included. Prefer runtime
-		 * signals first so normal storefront requests do not load wp-admin's
-		 * plugin.php merely to confirm an already-loaded dependency.
-		 */
-		if ( class_exists( 'PersianWooommercePlugin' ) ) {
-			return true;
-		}
-
-		global $woocommerce_persian;
-		if ( is_object( $woocommerce_persian ) ) {
-			return true;
-		}
-
-		return self::is_plugin_active_safe( self::PERSIAN_WOOCOMMERCE_PLUGIN_FILE )
-			|| self::is_plugin_slug_active( self::PERSIAN_WOOCOMMERCE_SLUG );
-	}
-
-	/**
 	 * Stop activation on WordPress versions that do not enforce Requires Plugins.
 	 *
 	 * @return void
 	 */
 	public static function enforce_activation_requirements() {
+		if ( ! self::platform_requirements_met() ) {
+			self::load_plugin_api();
+			if ( function_exists( 'deactivate_plugins' ) ) { deactivate_plugins( plugin_basename( MOBO_CORE_PLUGIN_FILE ) ); }
+			wp_die(
+				wp_kses_post( '<p><strong>' . esc_html__( 'Mobo Core فعال نشد.', 'mobo-core' ) . '</strong></p><p>' . esc_html__( 'نسخه 10.33.97 و جدیدتر برای نگهداری امن شناسه های متادیتای WooCommerce به PHP 64-bit نیاز دارد.', 'mobo-core' ) . '</p>' ),
+				esc_html__( 'معماری PHP پشتیبانی نمی شود', 'mobo-core' ),
+				array( 'back_link' => true )
+			);
+		}
 		$missing = self::get_missing_dependencies();
 		if ( empty( $missing ) ) {
 			return;
@@ -132,12 +115,26 @@ class Mobo_Core_Dependencies {
 		);
 	}
 
+	/** Whether the current administrator can repair plugin dependencies. @return bool */
+	private static function current_user_can_manage_plugins() {
+		return current_user_can( 'activate_plugins' ) || ( is_multisite() && current_user_can( 'manage_network_plugins' ) );
+	}
+
 	/**
 	 * Register persistent admin notices when a dependency is removed later.
 	 *
 	 * @param array<int,array<string,mixed>>|null $missing Missing dependencies.
 	 * @return void
 	 */
+	public static function register_platform_notice() {
+		$callback = function () {
+			if ( ! self::current_user_can_manage_plugins() ) { return; }
+			echo '<div class="notice notice-error"><p><strong>' . esc_html__( 'Mobo Core غیرفعال است:', 'mobo-core' ) . '</strong> ' . esc_html__( 'این نسخه برای متادیتای terminal WooCommerce به PHP 64-bit نیاز دارد.', 'mobo-core' ) . '</p></div>';
+		};
+		add_action( 'admin_notices', $callback );
+		add_action( 'network_admin_notices', $callback );
+	}
+
 	public static function register_admin_notices( $missing = null ) {
 		if ( null === $missing ) {
 			$missing = self::get_missing_dependencies();
@@ -162,25 +159,21 @@ class Mobo_Core_Dependencies {
 	 * @return void
 	 */
 	private static function render_admin_notice( $missing ) {
-		if ( ! current_user_can( 'activate_plugins' ) ) {
+		if ( ! self::current_user_can_manage_plugins() ) {
 			return;
 		}
 
-		$names = array();
+		$states = array();
 		foreach ( $missing as $dependency ) {
-			$names[] = isset( $dependency['name'] ) ? (string) $dependency['name'] : '';
+			$name = isset( $dependency['name'] ) ? sanitize_text_field( (string) $dependency['name'] ) : '';
+			if ( '' === $name ) { continue; }
+			$states[] = $name . ( ! empty( $dependency['installed'] ) ? ' (نصب شده ولی غیرفعال)' : ' (نصب نشده)' );
 		}
-		$names = array_values( array_filter( $names ) );
 
 		echo '<div class="notice notice-error"><p><strong>';
 		echo esc_html__( 'Mobo Core غیرفعال است:', 'mobo-core' );
 		echo '</strong> ';
-		echo esc_html(
-			sprintf(
-				'برای اجرای افزونه باید %s نصب و فعال باشد.',
-				implode( ' و ', $names )
-			)
-		);
+		echo esc_html( 'پیش نیازها کامل نیستند: ' . implode( '، ', $states ) . '.' );
 		echo ' <a href="' . esc_url( self_admin_url( 'plugins.php' ) ) . '">';
 		echo esc_html__( 'مدیریت افزونه ها', 'mobo-core' );
 		echo '</a></p></div>';

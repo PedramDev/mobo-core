@@ -1,0 +1,282 @@
+/* Purchase and activation page — scoped to the MoboCore admin root. */
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-layout {
+  display: grid;
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-primary {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr);
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-callout {
+  position: relative;
+  overflow: hidden;
+  padding: 20px;
+  border: 1px solid #d5e5ff;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #ffffff 0%, #f3f8ff 65%, #eaf2ff 100%);
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-callout::after {
+  content: "";
+  position: absolute;
+  inset-inline-start: -90px;
+  bottom: -120px;
+  width: 320px;
+  height: 220px;
+  border-radius: 50%;
+  background: rgba(20, 101, 243, .05);
+  pointer-events: none;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-callout__eyebrow {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: #245aa8;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-callout h2 {
+  position: relative;
+  z-index: 1;
+  margin: 0 0 8px;
+  color: var(--mobo-admin-text);
+  font-size: 20px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-callout p {
+  position: relative;
+  z-index: 1;
+  max-width: 720px;
+  margin: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+  line-height: 1.95;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-actions {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  padding: 14px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid #e6ecf4;
+  border-radius: 12px;
+  background: #f9fbfd;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item span,
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item strong {
+  display: block;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item span {
+  margin-bottom: 5px;
+  color: var(--mobo-admin-muted);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item strong {
+  overflow-wrap: anywhere;
+  color: var(--mobo-admin-text);
+  font-size: 12px;
+  line-height: 1.6;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item.is-success {
+  border-color: #ccebd9;
+  background: #f2fbf6;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item.is-success strong {
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item.is-warning {
+  border-color: #efdca9;
+  background: #fffaf0;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-status__item.is-warning strong {
+  color: var(--mobo-admin-warning);
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-secondary {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr);
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-card {
+  padding: 17px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-card__head {
+  margin-bottom: 14px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-card__head h3 {
+  margin: 0 0 5px;
+  color: var(--mobo-admin-text);
+  font-size: 16px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-card__head p {
+  margin: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.85;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-steps {
+  display: grid;
+  gap: 8px;
+  counter-reset: mobo-purchase-step;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px 11px;
+  border: 1px solid #e7edf5;
+  border-radius: 12px;
+  background: #f9fbfd;
+  counter-increment: mobo-purchase-step;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step::before {
+  content: counter(mobo-purchase-step, decimal-leading-zero);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: #eaf2ff;
+  color: #1557c0;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step strong,
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step span {
+  display: block;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step strong {
+  margin-bottom: 3px;
+  color: #263952;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-step span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 9px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact {
+  padding: 12px;
+  border: 1px solid #e5ebf3;
+  border-radius: 13px;
+  background: #f9fbfd;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact__title strong {
+  color: var(--mobo-admin-text);
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact__title span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact .mobo-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact .mobo-btn {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-technical {
+  margin: 0;
+  background: #fff;
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--purchase .mobo-purchase-technical .mobo-note {
+  margin: 0;
+}
+
+@media (max-width: 980px) {
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-primary,
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-secondary {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-status,
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-contact .mobo-actions {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-actions,
+  #mobo-core-admin.mobo-admin--purchase .mobo-purchase-actions .mobo-btn {
+    width: 100%;
+  }
+}

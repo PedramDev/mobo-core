@@ -519,7 +519,20 @@ final class Mobo_Core_Portal_Request_Signer {
 	}
 
 	private static function license_token() {
+		/* The signature must bind the CURRENT durable Source, not a request-local
+		 * Token that another request rotated after the Connection was first read. */
 		$token = trim( (string) get_option( 'mobo_core_token', '' ) );
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			if ( Mobo_Core_Connection_Repository::table_exists() ) {
+				$id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+				$row = $id > 0 ? Mobo_Core_Connection_Repository::get_by_id_fresh( $id ) : null;
+				$token = is_array( $row ) && ! empty( $row['is_enabled'] )
+					&& Mobo_Core_Connection_Repository::is_provisioned( $row )
+					? trim( (string) ( $row['license_token'] ?? '' ) ) : '';
+			} else {
+				$token = trim( (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', $token ) );
+			}
+		}
 		if ( ! self::is_uuid( $token ) ) {
 			return new WP_Error( 'mobo_core_installation_missing_license_token', 'Token معتبر برای امضای درخواست Portal ثبت نشده است.' );
 		}

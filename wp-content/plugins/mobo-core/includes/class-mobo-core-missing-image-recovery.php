@@ -54,37 +54,72 @@ class Mobo_Core_Missing_Image_Recovery {
 		 * value can still point at a deleted, zero-byte or non-image file. The
 		 * bounded runtime check below is the authoritative health test.
 		 */
-		$estimated_total = absint(
-			$wpdb->get_var(
-				"SELECT COUNT(DISTINCT p.ID)
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} guid_meta
-					ON guid_meta.post_id = p.ID
-					AND guid_meta.meta_key = 'product_guid'
-					AND guid_meta.meta_value <> ''
-				WHERE p.post_type = 'product'
-					AND p.post_status NOT IN ('trash', 'auto-draft')"
-			)
-		);
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID, guid_meta.meta_value AS product_guid
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} guid_meta
-					ON guid_meta.post_id = p.ID
-					AND guid_meta.meta_key = 'product_guid'
-					AND guid_meta.meta_value <> ''
-				WHERE p.post_type = 'product'
-					AND p.post_status NOT IN ('trash', 'auto-draft')
-					AND p.ID > %d
-				ORDER BY p.ID ASC
-				LIMIT %d",
-				$after_id,
-				$fetch_limit
-			),
-			ARRAY_A
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id <= 0 ) {
+				return array( 'rows' => array(), 'scanned' => 0, 'cursorStart' => $after_id, 'cursorEnd' => $after_id, 'cycleComplete' => true, 'estimatedTotal' => 0 );
+			}
+			$estimated_total = absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT COUNT(DISTINCT p.ID)
+						FROM {$wpdb->posts} p
+						INNER JOIN {$table} c ON c.woo_product_id=p.ID
+						WHERE c.connection_id=%d
+							AND p.post_type='product'
+							AND p.post_status NOT IN ('trash','auto-draft')
+							AND c.product_guid<>''",
+						$connection_id
+					)
+				)
+			);
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID,c.product_guid
+					FROM {$wpdb->posts} p
+					INNER JOIN {$table} c ON c.woo_product_id=p.ID
+					WHERE c.connection_id=%d
+						AND p.post_type='product'
+						AND p.post_status NOT IN ('trash','auto-draft')
+						AND c.product_guid<>''
+						AND p.ID>%d
+					ORDER BY p.ID ASC LIMIT %d",
+					$connection_id, $after_id, $fetch_limit
+				), ARRAY_A
+			);
+		} else {
+			$estimated_total = absint(
+				$wpdb->get_var(
+					"SELECT COUNT(DISTINCT p.ID)
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} guid_meta
+						ON guid_meta.post_id = p.ID
+						AND guid_meta.meta_key = 'product_guid'
+						AND guid_meta.meta_value <> ''
+					WHERE p.post_type = 'product'
+						AND p.post_status NOT IN ('trash', 'auto-draft')"
+				)
+			);
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID, guid_meta.meta_value AS product_guid
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} guid_meta
+						ON guid_meta.post_id = p.ID
+						AND guid_meta.meta_key = 'product_guid'
+						AND guid_meta.meta_value <> ''
+					WHERE p.post_type = 'product'
+						AND p.post_status NOT IN ('trash', 'auto-draft')
+						AND p.ID > %d
+					ORDER BY p.ID ASC
+					LIMIT %d",
+					$after_id,
+					$fetch_limit
+				),
+				ARRAY_A
+			);
+		}
 
 		$rows       = is_array( $rows ) ? $rows : array();
 		$has_more   = count( $rows ) > $limit;

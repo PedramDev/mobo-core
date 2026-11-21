@@ -1,0 +1,462 @@
+/* Shared MoboCore admin components. Scoped by #mobo-core-admin. */
+#mobo-core-admin .mobo-admin-btn,
+#mobo-core-admin .mobo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 8px 16px;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 11px;
+  background: var(--mobo-admin-surface);
+  color: var(--mobo-admin-text);
+  text-decoration: none;
+  font-weight: 800;
+  line-height: 1.2;
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color .15s ease, background .15s ease, color .15s ease, transform .15s ease, box-shadow .15s ease;
+}
+
+#mobo-core-admin .mobo-admin-btn:hover,
+#mobo-core-admin .mobo-btn:hover {
+  border-color: #aebdd1;
+  color: var(--mobo-admin-text);
+  transform: translateY(-1px);
+}
+
+#mobo-core-admin .mobo-admin-btn--primary,
+#mobo-core-admin .mobo-btn-primary {
+  border-color: var(--mobo-admin-primary);
+  background: var(--mobo-admin-primary);
+  color: #fff;
+  box-shadow: 0 7px 16px rgba(20, 101, 243, .18);
+}
+
+#mobo-core-admin .mobo-admin-btn--primary:hover,
+#mobo-core-admin .mobo-btn-primary:hover {
+  border-color: var(--mobo-admin-primary-dark);
+  background: var(--mobo-admin-primary-dark);
+  color: #fff;
+}
+
+#mobo-core-admin .mobo-card {
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: var(--mobo-admin-radius);
+  background: var(--mobo-admin-surface);
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin .mobo-card-head {
+  border-bottom-color: #edf1f6;
+}
+
+#mobo-core-admin .mobo-card-head h2 {
+  color: var(--mobo-admin-text);
+}
+
+#mobo-core-admin .mobo-card-head p,
+#mobo-core-admin .mobo-help {
+  color: var(--mobo-admin-muted);
+}
+
+#mobo-core-admin .mobo-field input,
+#mobo-core-admin .mobo-field select,
+#mobo-core-admin .mobo-field textarea {
+  border-color: var(--mobo-admin-border-strong);
+  background: #fff;
+  color: var(--mobo-admin-text);
+  box-shadow: none;
+}
+
+#mobo-core-admin .mobo-field input:focus,
+#mobo-core-admin .mobo-field select:focus,
+#mobo-core-admin .mobo-field textarea:focus {
+  border-color: var(--mobo-admin-primary);
+  box-shadow: 0 0 0 2px rgba(20, 101, 243, .10);
+  outline: none;
+}
+
+#mobo-core-admin .mobo-admin-section-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  color: var(--mobo-admin-text);
+  font-size: 17px;
+  font-weight: 900;
+}
+
+#mobo-core-admin .mobo-admin-section-title .dashicons {
+  color: var(--mobo-admin-primary);
+}
+
+#mobo-core-admin .mobo-admin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.3;
+  font-weight: 800;
+  border: 1px solid transparent;
+}
+
+#mobo-core-admin .mobo-admin-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+#mobo-core-admin .mobo-admin-badge--success {
+  color: var(--mobo-admin-success);
+  background: var(--mobo-admin-success-bg);
+  border-color: #c9f0d9;
+}
+
+#mobo-core-admin .mobo-admin-badge--warning {
+  color: var(--mobo-admin-warning);
+  background: var(--mobo-admin-warning-bg);
+  border-color: #f2dfad;
+}
+
+#mobo-core-admin .mobo-admin-badge--danger {
+  color: var(--mobo-admin-danger);
+  background: var(--mobo-admin-danger-bg);
+  border-color: #f4c7c7;
+}
+
+#mobo-core-admin .mobo-admin-badge--info {
+  color: var(--mobo-admin-info);
+  background: var(--mobo-admin-info-bg);
+  border-color: #cfe0fa;
+}
+
+#mobo-core-admin .mobo-admin-details {
+  margin-top: 14px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 13px;
+  background: var(--mobo-admin-surface-soft);
+  overflow: hidden;
+}
+
+#mobo-core-admin .mobo-admin-details > summary {
+  cursor: pointer;
+  padding: 13px 15px;
+  color: #33445d;
+  font-size: 13px;
+  font-weight: 900;
+  list-style-position: inside;
+}
+
+#mobo-core-admin .mobo-admin-details__body {
+  padding: 0 15px 15px;
+}
+
+#mobo-core-admin .mobo-admin-copy-button,
+#mobo-core-admin .mobo-admin-secret-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 9px;
+  background: #fff;
+  color: #66758d;
+  cursor: pointer;
+}
+
+#mobo-core-admin .mobo-admin-copy-button:hover,
+#mobo-core-admin .mobo-admin-secret-toggle:hover {
+  border-color: #b8c7da;
+  color: var(--mobo-admin-primary);
+}
+
+#mobo-core-admin .mobo-admin-secret-row {
+  display: flex;
+  align-items: stretch;
+  gap: 7px;
+}
+
+#mobo-core-admin .mobo-admin-secret-row input {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+#mobo-core-admin .mobo-admin-toast {
+  position: fixed;
+  z-index: 100100;
+  inset-inline-start: 24px;
+  bottom: 24px;
+  max-width: min(340px, calc(100vw - 48px));
+  padding: 10px 14px;
+  border-radius: 11px;
+  background: #16243a;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, .18);
+}
+
+/* Segmented boolean control: keeps simple on/off settings independent from Select2. */
+#mobo-core-admin .mobo-bool-control {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 146px;
+  padding: 3px;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 10px;
+  background: #f3f6fa;
+}
+
+#mobo-core-admin .mobo-bool-control__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#mobo-core-admin .mobo-bool-control__option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 31px;
+  margin: 0;
+  padding: 5px 10px;
+  border-radius: 7px;
+  color: #6b778b;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, box-shadow .15s ease;
+}
+
+#mobo-core-admin .mobo-bool-control__input:checked + .mobo-bool-control__option {
+  background: #fff;
+  color: var(--mobo-admin-primary);
+  box-shadow: 0 2px 8px rgba(26, 55, 94, .10);
+}
+
+#mobo-core-admin .mobo-bool-control__input:focus-visible + .mobo-bool-control__option {
+  outline: 2px solid rgba(20, 101, 243, .30);
+  outline-offset: 1px;
+}
+
+#mobo-core-admin .mobo-bool-control__input:disabled + .mobo-bool-control__option {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+#mobo-core-admin .mobo-toggle-field__label {
+  color: #263952;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.7;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin .mobo-bool-control {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+#mobo-core-admin .mobo-bool-control__input[value="1"]:checked + .mobo-bool-control__option {
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin .mobo-bool-control__input[value="0"]:checked + .mobo-bool-control__option {
+  color: #536176;
+}
+
+/* MoboCore searchable picker: replaces Select2/SelectWoo to avoid wp-admin plugin conflicts. */
+#mobo-core-admin select.mobo-picker-native {
+  display: none !important;
+}
+
+#mobo-core-admin .mobo-picker-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  margin: 0;
+  padding: 7px 10px 7px 9px;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--mobo-admin-text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.55;
+  text-align: right;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+#mobo-core-admin .mobo-picker-trigger:hover,
+#mobo-core-admin .mobo-picker-trigger:focus-visible,
+#mobo-core-admin .mobo-picker-trigger[aria-expanded="true"] {
+  border-color: var(--mobo-admin-primary);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(34, 113, 177, .10);
+}
+
+#mobo-core-admin .mobo-picker-trigger.is-placeholder .mobo-picker-trigger__label {
+  color: var(--mobo-admin-muted);
+  font-weight: 600;
+}
+
+#mobo-core-admin .mobo-picker-trigger__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mobo-core-admin .mobo-picker-trigger .dashicons {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  font-size: 18px;
+  color: #60738f;
+}
+
+#mobo-core-admin .mobo-picker-popover {
+  position: fixed;
+  z-index: 100300;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  padding: 8px;
+  overflow: hidden;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(18, 35, 63, .22);
+  direction: rtl;
+}
+
+#mobo-core-admin .mobo-picker-popover[hidden] {
+  display: none !important;
+}
+
+#mobo-core-admin .mobo-picker-search-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  padding-bottom: 7px;
+}
+
+#mobo-core-admin .mobo-picker-search-wrap .dashicons {
+  position: absolute;
+  inset-inline-start: 10px;
+  top: 10px;
+  z-index: 1;
+  color: #718198;
+  pointer-events: none;
+}
+
+#mobo-core-admin .mobo-picker-search {
+  width: 100%;
+  min-height: 38px;
+  margin: 0;
+  padding: 7px 34px 7px 10px;
+  border: 1px solid var(--mobo-admin-border-strong);
+  border-radius: 9px;
+  background: #f9fbfe;
+  color: var(--mobo-admin-text);
+  font: inherit;
+  direction: rtl;
+  box-shadow: none;
+}
+
+#mobo-core-admin .mobo-picker-search:focus {
+  border-color: var(--mobo-admin-primary);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(34, 113, 177, .10);
+}
+
+#mobo-core-admin .mobo-picker-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+#mobo-core-admin .mobo-picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  margin: 0;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mobo-admin-text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: right;
+  cursor: pointer;
+}
+
+#mobo-core-admin .mobo-picker-option:hover,
+#mobo-core-admin .mobo-picker-option:focus-visible {
+  background: #edf5ff;
+  outline: none;
+}
+
+#mobo-core-admin .mobo-picker-option.is-selected {
+  background: #eaf3ff;
+  color: #145dab;
+  font-weight: 800;
+}
+
+#mobo-core-admin .mobo-picker-option__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#mobo-core-admin .mobo-picker-option .dashicons {
+  flex: 0 0 auto;
+  color: #16854e;
+}
+
+#mobo-core-admin .mobo-picker-empty {
+  padding: 20px 10px;
+  color: var(--mobo-admin-muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+#mobo-core-admin .mobo-category-map-table .mobo-picker-trigger {
+  min-height: 36px;
+  font-size: 11px;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin select.mobo-picker-native {
+    display: block !important;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  #mobo-core-admin .mobo-picker-trigger,
+  #mobo-core-admin .mobo-picker-popover {
+    display: none !important;
+  }
+}

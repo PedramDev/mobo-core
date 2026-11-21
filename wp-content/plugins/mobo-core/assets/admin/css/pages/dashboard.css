@@ -1,0 +1,661 @@
+/* Dashboard page — scoped to the MoboCore admin root. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item {
+  min-width: 0;
+  padding: 14px 15px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 14px;
+  background: var(--mobo-admin-surface);
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 7px;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__label .dashicons {
+  width: 16px;
+  height: 16px;
+  color: #72839a;
+  font-size: 16px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__value {
+  display: block;
+  overflow: hidden;
+  color: var(--mobo-admin-text);
+  font-size: 14px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-success {
+  border-color: #ccebd9;
+  background: #f2fbf6;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-success .mobo-dashboard-summary__value {
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-danger {
+  border-color: #f0caca;
+  background: #fff5f5;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-danger .mobo-dashboard-summary__value {
+  color: var(--mobo-admin-danger);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-warning {
+  border-color: #efdca9;
+  background: #fffaed;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__item.is-warning .mobo-dashboard-summary__value {
+  color: var(--mobo-admin-warning);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card {
+  margin-bottom: 14px;
+  padding: 16px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card .mobo-card-head {
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card .mobo-status-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card .mobo-status-box {
+  min-height: 72px;
+  padding: 11px 12px;
+  border-color: #e5ebf3;
+  background: #f9fbfd;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-grid-dashboard {
+  align-items: start;
+  grid-template-columns: minmax(0, 1.55fr) minmax(260px, .55fr);
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard #mobo-sync-status-card {
+  padding: 18px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard #mobo-sync-status-card .mobo-status-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard #mobo-sync-status-card .mobo-status-box {
+  min-height: 72px;
+  padding: 11px 12px;
+  border-color: #e5ebf3;
+  background: #f9fbfd;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card {
+  position: sticky;
+  top: 46px;
+  padding: 16px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card .mobo-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card .mobo-actions form,
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card .mobo-actions .mobo-btn {
+  width: 100%;
+  margin: 0;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card .mobo-note {
+  margin-top: 12px;
+  padding: 11px 12px;
+  font-size: 11px;
+  line-height: 1.9;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-progress-wrap {
+  margin: 0 0 14px;
+  padding: 12px 13px;
+  border: 1px solid #e6edf6;
+  border-radius: 13px;
+  background: #f9fbfe;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-auto-refresh {
+  margin-top: 12px;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard > .mobo-panel > .mobo-card:last-child {
+  margin-top: 14px;
+}
+
+@media (max-width: 1040px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card .mobo-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-grid-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-actions-card {
+    position: static;
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-build-card .mobo-status-grid,
+  #mobo-core-admin.mobo-admin--dashboard #mobo-sync-status-card .mobo-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__value {
+    white-space: normal;
+  }
+}
+
+/* Phase 2.1: keep everyday sync actions simple; maintenance tools stay secondary. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-primary-action {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid #e4ebf4;
+  border-radius: 14px;
+  background: #f9fbfe;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-action-copy {
+  display: grid;
+  gap: 4px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-action-copy strong {
+  color: var(--mobo-admin-text);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-action-copy span,
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-advanced-intro {
+  margin: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.9;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-primary-action form,
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-primary-action .mobo-btn {
+  width: 100%;
+  margin: 0;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-advanced-actions {
+  margin-top: 10px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-advanced-actions .mobo-actions {
+  margin-top: 10px;
+}
+
+/* Phase 2.2: keep the overview operational; technical detail stays secondary. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  margin: 0 0 14px;
+  padding: 11px 13px;
+  border: 1px solid #efdca9;
+  border-radius: 13px;
+  background: #fffaed;
+  color: #6e5311;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention > .dashicons {
+  color: #bb8312;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention strong {
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention span:not(.dashicons) {
+  color: #806a37;
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention .mobo-btn {
+  min-height: 34px;
+  padding: 6px 11px;
+  white-space: nowrap;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-details {
+  margin-top: 12px;
+  box-shadow: none;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-secondary-stack {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-secondary-stack > .mobo-admin-details {
+  margin-top: 0;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-technical-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-detail-state {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-detail-state.is-ok {
+  color: var(--mobo-admin-success);
+  background: var(--mobo-admin-success-bg);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-detail-state.is-error {
+  color: var(--mobo-admin-danger);
+  background: var(--mobo-admin-danger-bg);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-wallet-details .mobo-card {
+  border: 0;
+  box-shadow: none;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-wallet-details .mobo-card-head {
+  padding-top: 0;
+}
+
+@media (max-width: 1040px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-attention .mobo-btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Dashboard license summary: keep the compact card readable without loading page-specific connection CSS. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, .72fr) minmax(0, 1.28fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-grid.is-error-only {
+  grid-template-columns: 1fr;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-facts {
+  display: grid;
+  gap: 8px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-fact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 40px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--mobo-admin-surface-soft);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-fact span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-fact strong {
+  color: var(--mobo-admin-text);
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 112px;
+  padding: 16px;
+  border: 1px solid #dfe7f0;
+  border-radius: 13px;
+  background: #fff;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state--danger {
+  border-color: #efc2c2;
+  background: var(--mobo-admin-danger-bg);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state--success {
+  border-color: #c8ead7;
+  background: var(--mobo-admin-success-bg);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state p {
+  margin: 0;
+  color: #5f6e83;
+  font-size: 11px;
+  line-height: 1.9;
+  overflow-wrap: anywhere;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-admin-inline-details {
+  margin-top: 10px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-admin-inline-details > summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-admin-file-list {
+  margin: 10px 0 0;
+  padding: 0 18px 0 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-admin-file-list li {
+  margin: 5px 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Active duplicate-product incident: keep remediation readable and actionable. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-incident > p {
+  margin: 8px 0 0;
+  color: var(--mobo-admin-muted);
+  line-height: 1.9;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-groups {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group {
+  padding: 10px;
+  border: 1px solid #efc2c2;
+  border-radius: 12px;
+  background: rgba(255,255,255,.72);
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid #f0dcdc;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group__head span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group__head code {
+  max-width: 72%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-products {
+  display: grid;
+  gap: 7px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product {
+  display: grid;
+  grid-template-columns: minmax(130px, .45fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid #ead4d4;
+  border-radius: 10px;
+  background: #fff;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product.is-canonical {
+  border-color: #bfe7cf;
+  background: #f4fcf7;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product > div span {
+  color: var(--mobo-admin-muted);
+  font-size: 10px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 800;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-product {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group__head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-duplicate-group__head code {
+    max-width: 100%;
+  }
+}
+
+/* FINAL UX6: make the dashboard concise and readable at narrow widths. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-idle {
+  margin: 0 0 12px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts.is-idle {
+  grid-template-columns: 1fr;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-details .mobo-status-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-details .mobo-status-box {
+  min-height: 62px;
+  padding: 9px 10px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-admin-technical-error {
+  display: block;
+  width: 100%;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid #ead4d4;
+  border-radius: 9px;
+  background: #fff;
+  color: #7c3434;
+  font-size: 11px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  text-align: left;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts:not(.is-idle),
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-details .mobo-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table thead {
+    display: none;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table tbody,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table tr,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table td {
+    display: block;
+    width: 100%;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table tr {
+    margin-bottom: 8px;
+    padding: 9px 10px;
+    border: 1px solid var(--mobo-admin-border);
+    border-radius: 10px;
+    background: #fff;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table td {
+    padding: 3px 0;
+    border: 0;
+    overflow-wrap: anywhere;
+  }
+
+  #mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-guide-table td:first-child {
+    color: var(--mobo-admin-muted);
+    font-size: 10px;
+  }
+}
+
+@media (max-width: 430px) {
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary,
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-primary-facts:not(.is-idle),
+  #mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-sync-details .mobo-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Final overview polish: freshness hints, clean state and safe busy actions. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-summary__meta {
+  display: block;
+  margin-top: 6px;
+  color: var(--mobo-admin-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.6;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-clean-state {
+  display: grid;
+  gap: 3px;
+  margin: 0 0 14px;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-dashboard-clean-state strong {
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--dashboard form[data-mobo-busy-submit] .mobo-btn.is-busy,
+#mobo-core-admin.mobo-admin--dashboard form[data-mobo-busy-submit] button[aria-busy="true"] {
+  cursor: wait;
+  opacity: .72;
+}
+
+/* License semantic states shared with the Connection page. */
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state--warning {
+  border-color: #f0d693;
+  background: #fff9e9;
+}
+
+#mobo-core-admin.mobo-admin--dashboard .mobo-card-license .mobo-admin-license-state--info {
+  border-color: #d2e2fa;
+  background: #f5f9ff;
+}

@@ -1,5 +1,8 @@
 # Mobo Core 10.33.0 — Shipping Mapping Only
 
+> Historical note: the mixed-order partial-submission policy documented in this release was superseded by the current fail-closed policy. Current builds submit only all-Mobo, single-Connection orders and never partially submit mixed orders.
+
+
 ## سیاست جدید
 
 از این نسخه Mobo Core هیچ روش ارسال، Shipping Zone، Shipping Package یا Rate به Checkout ووکامرس اضافه یا تحمیل نمی‌کند. Checkout و هزینه ارسال کاملاً تحت مالکیت WooCommerce و افزونه‌های حمل‌ونقل فروشگاه است.

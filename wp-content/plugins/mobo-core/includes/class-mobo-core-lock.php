@@ -40,6 +40,13 @@ class Mobo_Core_Lock {
 			return false;
 		}
 
+		/* Once an explicit database Unicode conversion has started, partial,
+		 * paused, failed and awaiting-config states remain fail-closed for ordinary
+		 * Mobo mutation leases even after the long-lived global barrier is released. */
+		if ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) && Mobo_Core_Database_Unicode_Migration::should_block_runtime_lock( $name ) ) {
+			return false;
+		}
+
 		/*
 		 * Once an upgrade barrier is active, no new sync/queue/maintenance lease
 		 * may start. Existing owners can still renew and release their own lease,
@@ -88,6 +95,13 @@ class Mobo_Core_Lock {
 		 * installed after our first check, surrender only the lease we just created.
 		 */
 		if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::should_block_lock( $name ) ) {
+			self::release( $name, $token );
+			return false;
+		}
+		/* UX60: the Unicode fail-closed state is independent of the temporary
+		 * upgrade barrier. Recheck it after INSERT as well: a migration may start
+		 * between the initial preflight and atomic lock creation. */
+		if ( class_exists( 'Mobo_Core_Database_Unicode_Migration' ) && Mobo_Core_Database_Unicode_Migration::should_block_runtime_lock( $name ) ) {
 			self::release( $name, $token );
 			return false;
 		}
@@ -601,7 +615,7 @@ class Mobo_Core_Lock {
 
 	/** Hard ceiling used only to detect corrupted far-future leases. */
 	private static function hard_stale_ceiling( $name ) {
-		$name = sanitize_key( (string) $name );
+		$name = self::base_lock_name( $name );
 		$ceilings = array(
 			'manual_sync_start'          => 120,
 			'manual_sync'                => 420,
@@ -645,8 +659,46 @@ class Mobo_Core_Lock {
 	 * @param string $name Lock name.
 	 * @return string
 	 */
+	/** Source-owned lock names that must not serialize unrelated Connections. */
+	private static function scoped_lock_names() {
+		return array_fill_keys(
+			array(
+				'manual_sync_start', 'manual_sync', 'webhook_queue',
+				'image_queue_worker', 'image_refresh_queue_worker', 'image_prune_worker',
+				'reprice_queue_worker', 'recategorize_queue_worker', 'parent_finalize_queue',
+				'cache_warmup_queue', 'cache_archive_purge_queue', 'maintenance_cleanup',
+				'shared_mobo_cart', 'address_mapping_sync', 'image_refresh_automation',
+				'wallet_alert_sms', 'city_assets_generate', 'health_snapshot_refresh',
+			),
+			true
+		);
+	}
+
+	/** Return the logical lock name without an encoded Connection prefix. */
+	private static function base_lock_name( $name ) {
+		$name = sanitize_key( (string) $name );
+		if ( preg_match( '/^c\d+__(.+)$/', $name, $matches ) ) {
+			return sanitize_key( (string) $matches[1] );
+		}
+		return $name;
+	}
+
+	/** Resolve the durable option key, namespacing Source-owned leases by Connection. */
 	private static function option_key( $name ) {
-		return 'mobo_core_runtime_lock_' . sanitize_key( (string) $name );
+		$name = sanitize_key( (string) $name );
+		if ( '' === $name ) { return 'mobo_core_runtime_lock_'; }
+		/* Names discovered by an all-lock scan are already fully qualified. */
+		if ( preg_match( '/^c\d+__/', $name ) ) {
+			return 'mobo_core_runtime_lock_' . $name;
+		}
+		$scoped = self::scoped_lock_names();
+		if ( isset( $scoped[ $name ] ) && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$connection_id = absint( Mobo_Core_Connection_Context::get_effective_connection_id() );
+			if ( $connection_id > 0 ) {
+				return 'mobo_core_runtime_lock_c' . $connection_id . '__' . $name;
+			}
+		}
+		return 'mobo_core_runtime_lock_' . $name;
 	}
 
 	/**

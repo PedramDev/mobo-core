@@ -16,13 +16,17 @@
  *    regular_price = price
  *    sale_price    = empty
  *
- * 4. If mobo_additional_price exists on current object:
+ * 4. If mobo_additional_price exists on the current variation/object:
  *    regular/sale + mobo_additional_price
- *    global price rules are skipped.
+ *    every parent/global pricing rule is skipped. This is the highest-priority
+ *    Mobo pricing override.
  *
- * 5. Otherwise mobo_price_type is used:
+ * 5. Otherwise, if a parent-level product percentage override is enabled:
+ *    regular/sale * (1 + percentage / 100).
+ *
+ * 6. Otherwise mobo_price_type is used:
  *    - static-price      => + global_additional_price
- *    - static-percentage => * floatval('1.' . global_additional_percentage)
+ *    - static-percentage => * (1 + global_additional_percentage / 100)
  *    - dynamic-price     => first active matching condition from mobo_dynamic_price
  *
  * PHP 7.4 compatible.
@@ -68,19 +72,109 @@ class Mobo_Core_Price_Calculator {
 			);
 		}
 
-		$normalized_price = $this->normalize_source_number( $price );
-		if ( null === $normalized_price || $normalized_price < 0 || $normalized_price > PHP_INT_MAX ) {
+		if ( ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			return $this->invalid_price_pair( 'Mobo monetary policy is unavailable.' );
+		}
+		$money_compatibility = Mobo_Core_Money_Policy::assert_compatible();
+		if ( is_wp_error( $money_compatibility ) ) {
+			// Only an explicit store-currency choice can enable a mismatch bridge.
+			// Other monetary errors retain the V1 fail-closed behavior.
+			if ( 'mobo_core_money_unit_mismatch' !== $money_compatibility->get_error_code() ) {
+				return $this->invalid_price_pair( $money_compatibility->get_error_message() );
+			}
+			$pricing_context = Mobo_Core_Money_Policy::pricing_conversion_context();
+			if ( is_wp_error( $pricing_context ) ) {
+				return $this->invalid_price_pair( $pricing_context->get_error_message() );
+			}
+			if ( ! class_exists( 'Mobo_Core_Money_Price_Input_Plan' ) ) {
+				return $this->invalid_price_pair( 'Price input currency conversion is unavailable.' );
+			}
+			$plan = Mobo_Core_Money_Price_Input_Plan::prepare(
+				$price, $compare_price, $pricing_context['id'], $pricing_context['row'],
+				$pricing_context['store'], $pricing_context['preference'], $pricing_context['digits']
+			);
+			if ( empty( $plan['ok'] ) ) {
+				return $this->invalid_price_pair( 'Price input conversion rejected: ' . sanitize_key( (string) ( $plan['code'] ?? 'unknown' ) ) );
+			}
+			// Source amounts and their postmeta are not changed. All downstream fixed
+			// margins/thresholds are evaluated in WooCommerce store currency.
+			$store_price = (string) $plan['price'];
+			$store_compare = $plan['comparePrice'];
+			$pair = $this->calculate_prevalidated_price_pair(
+				$object_id, $store_price, $store_compare, $context, $parent_id,
+				(float) $store_price, null === $store_compare ? null : (float) $store_compare
+			);
+			if ( empty( $pair['error'] ) ) {
+				$pair['money_source_unit'] = (string) $plan['sourceUnit'];
+				$pair['money_store_unit'] = (string) $plan['targetUnit'];
+				$pair['money_converted_once'] = true;
+			}
+			return $pair;
+		}
+		$price_valid = Mobo_Core_Money_Policy::validate_source_amount( $price );
+		if ( is_wp_error( $price_valid ) ) {
+			return $this->invalid_price_pair( $price_valid->get_error_message() );
+		}
+		$normalized_price = Mobo_Core_Money_Policy::normalize_source_number( $price );
+		if ( null === $normalized_price ) {
 			return $this->invalid_price_pair( 'API price is present but is not a valid numeric value.' );
 		}
 
 		$normalized_compare_price = null;
 		if ( null !== $compare_price && '' !== $compare_price ) {
-			$normalized_compare_price = $this->normalize_source_number( $compare_price );
-			if ( null === $normalized_compare_price || $normalized_compare_price < 0 || $normalized_compare_price > PHP_INT_MAX ) {
+			$compare_valid = Mobo_Core_Money_Policy::validate_source_amount( $compare_price );
+			if ( is_wp_error( $compare_valid ) ) {
+				return $this->invalid_price_pair( $compare_valid->get_error_message() );
+			}
+			$normalized_compare_price = Mobo_Core_Money_Policy::normalize_source_number( $compare_price );
+			if ( null === $normalized_compare_price ) {
 				return $this->invalid_price_pair( 'API comparePrice is present but is not a valid numeric value.' );
 			}
 		}
 
+        return $this->calculate_prevalidated_price_pair(
+            $object_id, $price, $compare_price, $context, $parent_id,
+            $normalized_price, $normalized_compare_price
+        );
+    }
+
+    /**
+     * STAGED ONLY: preview the legacy markup and comparePrice calculation using
+     * exact, owner-verified store-currency INPUTS. This is NOT invoked from Sync,
+     * Reprice, Shipping, Checkout, or any hook. V1 calculate_price_pair() keeps
+     * its original strict mismatch gate until all financial boundaries are proven.
+     */
+    public function preview_converted_price_pair( $object_id, $price, $compare_price,
+        $context, $parent_id, $owner_connection_id, $connection_row,
+        $woo_currency, $target_preference, $woo_digits ) {
+        if ( ! class_exists( 'Mobo_Core_Money_Price_Input_Plan' ) ) {
+            return $this->invalid_price_pair( 'Conversion input planner is unavailable.' );
+        }
+        $plan = Mobo_Core_Money_Price_Input_Plan::prepare(
+            $price, $compare_price, $owner_connection_id, $connection_row,
+            $woo_currency, $target_preference, $woo_digits
+        );
+        if ( empty( $plan['ok'] ) || ! empty( $plan['runtimeEnabled'] ) ) {
+            return $this->invalid_price_pair( 'Staged conversion input rejected: ' . (string) ( $plan['code'] ?? 'unknown' ) );
+        }
+        // Values are canonical integer strings from the exact converter.
+        // The existing profit/threshold algorithm expects WooCommerce units.
+        $store_price = (string) $plan['price'];
+        $store_compare = $plan['comparePrice'];
+        $preview = $this->calculate_prevalidated_price_pair(
+            $object_id, $store_price, $store_compare, $context, $parent_id,
+            (float) $store_price, null === $store_compare ? null : (float) $store_compare
+        );
+        $preview['preview_only'] = true;
+        $preview['source_unit'] = (string) $plan['sourceUnit'];
+        $preview['store_unit'] = (string) $plan['targetUnit'];
+        $preview['runtime_enabled'] = false;
+        return $preview;
+    }
+
+    /** Reuse the canonical pricing algorithm; no duplicated markup rules. */
+    private function calculate_prevalidated_price_pair( $object_id, $price, $compare_price,
+        $context, $parent_id, $normalized_price, $normalized_compare_price ) {
 		$options = $this->rules->get_options();
 
 		$auto_compare = isset( $options['global_product_auto_compare_price'] )
@@ -116,28 +210,9 @@ class Mobo_Core_Price_Calculator {
 			return $this->invalid_price_pair( 'Mobo product pricing override identity is ambiguous: ' . sanitize_text_field( (string) $product_override['error'] ) );
 		}
 
-		/* Parent-level custom pricing is intentionally above the legacy per-variation
-		 * fixed add-on. When the parent override is disabled, the old behavior resumes
-		 * unchanged. */
-		if ( ! empty( $product_override['enabled'] ) ) {
-			$percentage = isset( $product_override['value'] ) && is_numeric( $product_override['value'] ) ? (float) $product_override['value'] : 0.0;
-			$factor = 1 + ( $percentage / 100 );
-			$regular_price = (float) $regular_base * $factor;
-			$sale_price = '';
-			if ( '' !== $sale_base ) {
-				$sale_price = (float) $sale_base * $factor;
-			}
-			return $this->format_pair(
-				$regular_price,
-				$sale_price,
-				$price,
-				$compare_price,
-				$options,
-				'product-percentage-override',
-				$context
-			);
-		}
-
+		/* A variation/object-specific fixed profit is the strongest valid pricing
+		 * intent. Identity/ownership ambiguity still fails closed before any price
+		 * mutation, but this value wins over parent and global pricing rules. */
 		$additional_price = $this->get_object_additional_price( $object_id );
 
 		if ( null !== $additional_price ) {
@@ -155,6 +230,27 @@ class Mobo_Core_Price_Calculator {
 				$compare_price,
 				$options,
 				'object-additional-price',
+				$context
+			);
+		}
+
+		/* Parent-level custom pricing is below a variation-specific fixed profit, but
+		 * above the global pricing policy. */
+		if ( ! empty( $product_override['enabled'] ) ) {
+			$percentage = isset( $product_override['value'] ) && is_numeric( $product_override['value'] ) ? (float) $product_override['value'] : 0.0;
+			$factor = 1 + ( $percentage / 100 );
+			$regular_price = (float) $regular_base * $factor;
+			$sale_price = '';
+			if ( '' !== $sale_base ) {
+				$sale_price = (float) $sale_base * $factor;
+			}
+			return $this->format_pair(
+				$regular_price,
+				$sale_price,
+				$price,
+				$compare_price,
+				$options,
+				'product-percentage-override',
 				$context
 			);
 		}
@@ -359,27 +455,17 @@ class Mobo_Core_Price_Calculator {
 				? sanitize_key( (string) $condition['benefit_type'] )
 				: 'static';
 
-			$benefit = isset( $condition['benefit'] )
-				? preg_replace( '/[^0-9]/', '', (string) $condition['benefit'] )
-				: '0';
-
-			if ( '' === $benefit ) {
-				$benefit = '0';
-			}
+			$benefit_raw = isset( $condition['benefit'] ) ? (string) $condition['benefit'] : '0';
+			$benefit = function_exists( 'wc_format_decimal' ) ? wc_format_decimal( $benefit_raw, false ) : trim( $benefit_raw );
+			$benefit_value = is_numeric( $benefit ) ? max( 0, (float) $benefit ) : 0.0;
 
 			if ( 'static' === $benefit_type ) {
-				$regular_price = intval( $regular_base ) + intval( $benefit );
+				$regular_price = (float) $regular_base + $benefit_value;
 
 				if ( '' !== $sale_base ) {
-					$sale_price = intval( $sale_base ) + intval( $benefit );
+					$sale_price = (float) $sale_base + $benefit_value;
 				}
 			} else {
-				$benefit_value = is_numeric( $benefit ) ? (float) $benefit : 0.0;
-
-				if ( $benefit_value < 0 ) {
-					$benefit_value = 0.0;
-				}
-
 				$factor = 1 + ( $benefit_value / 100 );
 
 				$regular_price = (float) $regular_base * $factor;
@@ -521,45 +607,9 @@ class Mobo_Core_Price_Calculator {
 	 * @return float|null
 	 */
 	private function normalize_source_number( $value ) {
-		if ( ! is_scalar( $value ) ) {
-			return null;
-		}
-
-		$raw = trim( (string) $value );
-		if ( '' === $raw ) {
-			return null;
-		}
-
-		// API numeric fields must be numbers, not human-formatted or partially numeric strings.
-		// wc_format_decimal() is intentionally not used as the first validator because
-		// it can strip arbitrary characters (for example, "12abc" -> "12").
-		$canonical = str_replace( array( "\xC2\xA0", ' ' ), '', $raw );
-
-		/*
-		 * Source prices are decimal values, never scientific notation. is_numeric()
-		 * accepts strings such as "1e999999"; passing those through
-		 * wc_format_decimal() can strip the exponent marker and silently turn a
-		 * malformed source value into an unrelated finite price. Validate the raw
-		 * grammar first, then normalize a single decimal comma when present.
-		 */
-		if ( 1 === preg_match( '/^[+-]?[0-9]+(?:\.[0-9]+)?$/D', $canonical ) ) {
-			$normalized = $canonical;
-		} elseif ( 1 === preg_match( '/^[+-]?[0-9]+(?:,[0-9]+)?$/D', $canonical ) ) {
-			// Accept a single decimal comma, but reject thousands/mixed separators.
-			$normalized = str_replace( ',', '.', $canonical );
-		} else {
-			return null;
-		}
-
-		if ( function_exists( 'wc_format_decimal' ) ) {
-			$normalized = wc_format_decimal( $normalized, false );
-		}
-		if ( '' === (string) $normalized || ! is_numeric( $normalized ) ) {
-			return null;
-		}
-
-		$number = (float) $normalized;
-		return is_finite( $number ) ? $number : null;
+		return class_exists( 'Mobo_Core_Money_Policy' )
+			? Mobo_Core_Money_Policy::normalize_source_number( $value )
+			: null;
 	}
 
 	/** @return array */

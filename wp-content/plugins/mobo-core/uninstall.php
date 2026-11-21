@@ -46,6 +46,10 @@ function mobo_core_uninstall_filesystem() {
  * @return void
  */
 function mobo_core_uninstall_runtime_state() {
+	/* The WordPress database handle is function-scoped. Declare it before the
+	 * first warmup-admission cleanup query, not halfway through uninstall. */
+	global $wpdb;
+
 	/*
 	 * Remove runtime sync state.
 	 */
@@ -67,15 +71,22 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_missing_variants_behavior' );
 	delete_option( 'mobo_core_cron_token' );
 	delete_option( 'mobo_core_real_cron_last_hit_at' );
+	delete_option( 'mobo_core_real_cron_previous_hit_at' );
 	delete_option( 'mobo_core_real_cron_last_success_at' );
 	delete_option( 'mobo_core_real_cron_last_result' );
+	delete_option( 'mobo_core_real_cron_last_scheduler_result' );
 	delete_option( 'mobo_core_runtime_diagnostics' );
 	delete_option( 'mobo_core_checkout_mobo_cookie_jar' );
 	delete_option( 'mobo_core_checkout_mobo_cookie_reset_pending' );
 	delete_option( 'mobo_core_checkout_mobo_debug_log' );
-	delete_option( 'mobo_core_mobo_order_submission_queue' );
+	/* UX63: do not discard an unfinished UX61 bounded importer source. The old
+	 * Order/Parent options are transitional durable business queues until their
+	 * destination-table import has completed and atomically retired each source.
+	 * Removing them on uninstall can lose all items beyond the last 100-row slice. */
 	delete_option( 'mobo_core_cache_warmup_queue' );
-	delete_option( 'mobo_core_parent_finalize_queue' );
+	delete_option( 'mobo_core_cache_warmup_request_started_at' );
+	$wpdb->query( $wpdb->prepare( 'DELETE FROM ' . $wpdb->options . ' WHERE option_name LIKE %s', $wpdb->esc_like( 'mobo_core_warmup_admission_' ) . '%' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- uninstall cleanup.
+	/* Preserve mobo_core_parent_finalize_queue until verified migration. */
 	delete_option( 'mobo_core_reprice_state' );
 	delete_option( 'mobo_core_recategorize_state' );
 	delete_option( 'mobo_core_real_cron_time_budget_seconds' );
@@ -94,9 +105,14 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_portal_heartbeat_last_success_at' );
 	delete_option( 'mobo_core_portal_heartbeat_last_result' );
 	delete_option( 'mobo_core_webhook_auth_status' );
-	delete_option( 'mobo_core_remote_upgrade_status' );
-	delete_option( 'mobo_core_remote_upgrade_history' );
-	delete_option( 'mobo_core_upgrade_barrier_state' );
+	/* A failed verified rollback leaves a persistent recovery hold. Keep its
+	 * evidence and status over an uninstall/reinstall cycle, rather than masking
+	 * the unsafe filesystem state as a fresh, resumable installation. */
+	if ( false === get_option( 'mobo_core_upgrade_manual_recovery_hold', false ) ) {
+		delete_option( 'mobo_core_remote_upgrade_status' );
+		delete_option( 'mobo_core_remote_upgrade_history' );
+		delete_option( 'mobo_core_upgrade_barrier_state' );
+	}
 	delete_option( 'mobo_core_upgrade_drain_timeout_seconds' );
 	delete_option( 'mobo_core_remote_update_allowed_hosts' );
 	delete_option( 'mobo_core_webhook_queue_last_attempt_at' );
@@ -181,16 +197,11 @@ function mobo_core_uninstall_runtime_state() {
 	/*
 	 * Remove temporary seen-variant options.
 	 */
-	global $wpdb;
-
 	$prefix          = $wpdb->esc_like( 'mobo_seen_variants_' ) . '%';
-	$recovery_prefix = $wpdb->esc_like( 'mobo_core_mobo_order_recovery_' ) . '%';
-
 	$option_names = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-			$prefix,
-			$recovery_prefix
+			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+			$prefix
 		)
 	);
 
@@ -200,9 +211,10 @@ function mobo_core_uninstall_runtime_state() {
 		}
 	}
 
-	/*
-	 * Remove current atomic runtime locks and legacy transient locks.
-	 */
+	/* Preserve unresolved Order recovery markers: UX56 treats ambiguous remote
+	 * payment as durable evidence, not disposable runtime cache. Remove expired
+	 * current locks by exact-byte CAS only; never force-release a live worker's
+	 * token during concurrent uninstall. Legacy transient locks can be removed. */
 	$current_lock_prefix = $wpdb->esc_like( 'mobo_core_runtime_lock_' ) . '%';
 	$lock_prefix         = $wpdb->esc_like( '_transient_mobo_core_lock_' ) . '%';
 	$timeout_prefix      = $wpdb->esc_like( '_transient_timeout_mobo_core_lock_' ) . '%';
@@ -218,6 +230,19 @@ function mobo_core_uninstall_runtime_state() {
 
 	if ( is_array( $transient_names ) ) {
 		foreach ( $transient_names as $transient_name ) {
+			if ( 0 === strpos( (string) $transient_name, 'mobo_core_runtime_lock_' ) ) {
+				$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $transient_name ) );
+				$payload = is_string( $raw ) ? json_decode( $raw, true ) : null;
+				if ( ! is_array( $payload ) || absint( $payload['expires_at'] ?? 0 ) > time() ) {
+					continue;
+				}
+				$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND BINARY option_value = BINARY %s", $transient_name, $raw ) );
+				if ( 1 === $deleted ) {
+					wp_cache_delete( $transient_name, 'options' );
+					wp_cache_delete( 'notoptions', 'options' );
+				}
+				continue;
+			}
 			delete_option( $transient_name );
 		}
 	}

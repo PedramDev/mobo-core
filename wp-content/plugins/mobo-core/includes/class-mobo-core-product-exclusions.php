@@ -32,12 +32,23 @@ final class Mobo_Core_Product_Exclusions {
 			return '';
 		}
 
-		$path = wp_parse_url( $url, PHP_URL_PATH );
-		if ( ! is_string( $path ) || '' === $path ) {
+		$path   = wp_parse_url( $url, PHP_URL_PATH );
+		$host   = wp_parse_url( $url, PHP_URL_HOST );
+		$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+
+		/* An absolute URL without a product path is not a usable exclusion. Older
+		 * normalization could turn `https://source.example` into the synthetic path
+		 * `/https://source.example`, which never matched a product but looked valid in
+		 * Admin. Path-only input remains supported for backward compatibility. */
+		if ( ( is_string( $host ) && '' !== $host ) || ( is_string( $scheme ) && '' !== $scheme ) ) {
+			if ( ! is_string( $path ) || '' === trim( $path ) ) {
+				return '';
+			}
+		} elseif ( ! is_string( $path ) || '' === $path ) {
 			$path = $url;
 		}
 
-		$path = trim( $path );
+		$path = trim( (string) $path );
 		if ( '' === $path ) {
 			return '';
 		}
@@ -49,30 +60,72 @@ final class Mobo_Core_Product_Exclusions {
 	}
 
 	/**
+	 * Parse administrator input into the exact normalized list used by runtime.
+	 *
+	 * Empty lines are ignored. Duplicate representations (for example a full URL
+	 * and the same path) collapse to one canonical path. Non-empty lines which do
+	 * not produce a usable product path are reported instead of silently looking
+	 * active in Admin.
+	 *
+	 * @param mixed $raw Newline-separated URLs/paths.
+	 * @return array{paths:array<int,string>,canonical:string,inputCount:int,duplicateCount:int,invalidCount:int}
+	 */
+	public static function parse_input( $raw ) {
+		$raw = (string) $raw;
+		if ( '' === trim( $raw ) ) {
+			return array(
+				'paths'          => array(),
+				'canonical'      => '',
+				'inputCount'     => 0,
+				'duplicateCount' => 0,
+				'invalidCount'   => 0,
+			);
+		}
+
+		$lines = preg_split( '/\r\n|\r|\n/', $raw );
+		$lines = is_array( $lines ) ? $lines : array();
+		$paths = array();
+		$seen  = array();
+		$input_count = 0;
+		$duplicate_count = 0;
+		$invalid_count = 0;
+
+		foreach ( $lines as $line ) {
+			$line = trim( sanitize_text_field( (string) $line ) );
+			if ( '' === $line ) {
+				continue;
+			}
+			$input_count++;
+			$normalized = self::normalize_url( $line );
+			if ( '' === $normalized ) {
+				$invalid_count++;
+				continue;
+			}
+			if ( isset( $seen[ $normalized ] ) ) {
+				$duplicate_count++;
+				continue;
+			}
+			$seen[ $normalized ] = true;
+			$paths[] = $normalized;
+		}
+
+		return array(
+			'paths'          => $paths,
+			'canonical'      => implode( "\n", $paths ),
+			'inputCount'     => $input_count,
+			'duplicateCount' => $duplicate_count,
+			'invalidCount'   => $invalid_count,
+		);
+	}
+
+	/**
 	 * Return the configured normalized exclusion paths.
 	 *
 	 * @return array
 	 */
 	public static function get_excluded_urls() {
-		$raw = (string) get_option( self::OPTION_NAME, '' );
-		if ( '' === trim( $raw ) ) {
-			return array();
-		}
-
-		$lines = preg_split( '/\r\n|\r|\n/', $raw );
-		if ( ! is_array( $lines ) ) {
-			return array();
-		}
-
-		$urls = array();
-		foreach ( $lines as $line ) {
-			$normalized = self::normalize_url( $line );
-			if ( '' !== $normalized ) {
-				$urls[] = $normalized;
-			}
-		}
-
-		return array_values( array_unique( $urls ) );
+		$parsed = self::parse_input( Mobo_Core_Settings::get( self::OPTION_NAME, '' ) );
+		return isset( $parsed['paths'] ) && is_array( $parsed['paths'] ) ? $parsed['paths'] : array();
 	}
 
 	/**
@@ -151,7 +204,7 @@ final class Mobo_Core_Product_Exclusions {
 			return false;
 		}
 
-		$evidence = get_option( self::GUID_EVIDENCE_OPTION, array() );
+		$evidence = Mobo_Core_Settings::get( self::GUID_EVIDENCE_OPTION, array() );
 		$evidence = is_array( $evidence ) ? $evidence : array();
 		$url      = isset( $evidence[ $product_guid ] ) ? (string) $evidence[ $product_guid ] : '';
 
@@ -161,10 +214,11 @@ final class Mobo_Core_Product_Exclusions {
 	/**
 	 * Whether a local parent/variation belongs to a currently excluded source URL.
 	 *
-	 * @param int $post_id Product or variation ID.
+	 * @param int  $post_id Product or variation ID.
+	 * @param bool $remember Whether to persist GUID/path evidence when a direct URL match exists.
 	 * @return bool
 	 */
-	public static function is_local_product_excluded( $post_id ) {
+	public static function is_local_product_excluded( $post_id, $remember = true ) {
 		$post_id = absint( $post_id );
 		if ( $post_id <= 0 ) {
 			return false;
@@ -182,7 +236,7 @@ final class Mobo_Core_Product_Exclusions {
 		$url = sanitize_text_field( (string) get_post_meta( $post_id, 'mobo_url', true ) );
 		if ( '' !== $url && self::is_url_excluded( $url ) ) {
 			$guid = sanitize_text_field( (string) get_post_meta( $post_id, 'product_guid', true ) );
-			if ( '' !== $guid ) {
+			if ( $remember && '' !== $guid ) {
 				self::remember_guid_url( $guid, $url );
 			}
 			return true;
@@ -206,18 +260,18 @@ final class Mobo_Core_Product_Exclusions {
 			return false;
 		}
 
-		$evidence = get_option( self::GUID_EVIDENCE_OPTION, array() );
+		$evidence = Mobo_Core_Settings::get( self::GUID_EVIDENCE_OPTION, array() );
 		$evidence = is_array( $evidence ) ? $evidence : array();
 		$evidence[ $product_guid ] = $normalized;
 		if ( count( $evidence ) > self::MAX_GUID_EVIDENCE ) {
 			$evidence = array_slice( $evidence, -self::MAX_GUID_EVIDENCE, null, true );
 		}
 
-		if ( ! Mobo_Core_Durable_State_Policy::update_option_verified( self::GUID_EVIDENCE_OPTION, $evidence, false ) ) {
+		if ( ! Mobo_Core_Settings::update( self::GUID_EVIDENCE_OPTION, $evidence, false ) ) {
 			return false;
 		}
 
-		$stored = get_option( self::GUID_EVIDENCE_OPTION, array() );
+		$stored = Mobo_Core_Settings::get( self::GUID_EVIDENCE_OPTION, array() );
 		return is_array( $stored )
 			&& isset( $stored[ $product_guid ] )
 			&& hash_equals( $normalized, (string) $stored[ $product_guid ] );

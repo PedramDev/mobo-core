@@ -47,19 +47,24 @@ final class Mobo_Core_Variation_Lifecycle_Policy {
 		foreach ( self::identity_keys() as $key ) {
 			$snapshot[ $key ] = get_post_meta( $variation_id, $key, false );
 		}
+		/* Validate every value in the captured snapshot. A single-value read hides
+		 * contradictory duplicate rows and can admit ambiguous retirement/pricing. */
 		foreach ( $guid_keys as $key ) {
-			$value = trim( sanitize_text_field( (string) get_post_meta( $variation_id, $key, true ) ) );
-			if ( '' !== $value ) {
-				$guids[ $value ] = true;
+			foreach ( $snapshot[ $key ] as $raw ) {
+				$value = trim( sanitize_text_field( (string) $raw ) );
+				if ( '' !== $value ) {
+					$guids[ $value ] = true;
+				}
 			}
 		}
 		foreach ( $id_keys as $key ) {
-			$raw = get_post_meta( $variation_id, $key, true );
-			if ( is_scalar( $raw ) && '' !== trim( (string) $raw ) ) {
-				if ( ! preg_match( '/^[0-9]+$/', trim( (string) $raw ) ) || absint( $raw ) <= 0 ) {
-					return new WP_Error( 'mobo_core_variation_identity_malformed', 'Variation Portal identity alias is malformed; retirement was blocked.' );
+			foreach ( $snapshot[ $key ] as $raw ) {
+				if ( is_scalar( $raw ) && '' !== trim( (string) $raw ) ) {
+					if ( ! preg_match( '/^[0-9]+$/', trim( (string) $raw ) ) || absint( $raw ) <= 0 ) {
+						return new WP_Error( 'mobo_core_variation_identity_malformed', 'Variation Portal identity alias is malformed; retirement was blocked.' );
+					}
+					$ids[ absint( $raw ) ] = true;
 				}
-				$ids[ absint( $raw ) ] = true;
 			}
 		}
 		if ( count( $guids ) > 1 || count( $ids ) > 1 ) {

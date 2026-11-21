@@ -18,7 +18,10 @@ class Mobo_Core_Upgrade_Coordinator {
 	const BARRIER_LOCK = 'plugin_upgrade_barrier';
 	const STATE_OPTION = 'mobo_core_upgrade_barrier_state';
 	const AUDIT_OPTION = 'mobo_core_last_upgrade_barrier_audit';
+	/** Persistent fail-closed marker when filesystem rollback cannot be verified. */
+	const RECOVERY_HOLD_OPTION = 'mobo_core_upgrade_manual_recovery_hold';
 	const DEFAULT_TTL_SECONDS = 900;
+	const MAX_BARRIER_TTL_SECONDS = 7200; // Long database DDL may need a wider protected boundary.
 	const DEFAULT_DRAIN_TIMEOUT_SECONDS = 120;
 	const DEFAULT_RETRY_AFTER_SECONDS = 60;
 
@@ -35,6 +38,7 @@ class Mobo_Core_Upgrade_Coordinator {
 			$name,
 			array(
 				'remote_plugin_upgrade',
+				'database_unicode_migration_step',
 				self::BARRIER_LOCK,
 			),
 			true
@@ -50,10 +54,17 @@ class Mobo_Core_Upgrade_Coordinator {
 	public static function should_block_lock( $name ) {
 		$name = sanitize_key( (string) $name );
 
+		if ( false !== get_option( self::RECOVERY_HOLD_OPTION, false )
+			&& ! in_array( $name, array( 'remote_plugin_upgrade', self::BARRIER_LOCK ), true ) ) {
+			return true;
+		}
 		if ( '' === $name || self::is_exempt_lock( $name ) ) {
 			return false;
 		}
 
+		/* A failed filesystem rollback is not made safe merely by expiry of the
+		 * temporary upgrade lease. Allow only the existing updater/barrier recovery
+		 * locks; ordinary worker mutation remains blocked until verified recovery. */
 		return self::is_active();
 	}
 
@@ -66,7 +77,7 @@ class Mobo_Core_Upgrade_Coordinator {
 	 */
 	public static function activate( $deployment_id, $ttl_seconds = self::DEFAULT_TTL_SECONDS ) {
 		$deployment_id = sanitize_text_field( (string) $deployment_id );
-		$ttl_seconds    = max( 120, min( 1800, absint( $ttl_seconds ) ) );
+		$ttl_seconds    = max( 120, min( self::MAX_BARRIER_TTL_SECONDS, absint( $ttl_seconds ) ) );
 		$token          = Mobo_Core_Lock::acquire( self::BARRIER_LOCK, $ttl_seconds );
 
 		if ( false === $token ) {
@@ -77,6 +88,7 @@ class Mobo_Core_Upgrade_Coordinator {
 		self::write_state(
 			array(
 				'active'           => true,
+				'barrierTokenHash' => hash( 'sha256', (string) $token ),
 				'status'           => 'draining',
 				'deploymentId'     => $deployment_id,
 				'activatedAt'      => $now,
@@ -111,7 +123,7 @@ class Mobo_Core_Upgrade_Coordinator {
 	 * @return bool
 	 */
 	public static function renew( $token, $ttl_seconds = self::DEFAULT_TTL_SECONDS ) {
-		$ttl_seconds = max( 120, min( 1800, absint( $ttl_seconds ) ) );
+		$ttl_seconds = max( 120, min( self::MAX_BARRIER_TTL_SECONDS, absint( $ttl_seconds ) ) );
 		$renewed     = Mobo_Core_Lock::renew( self::BARRIER_LOCK, $token, $ttl_seconds );
 
 		if ( ! $renewed ) {
@@ -193,7 +205,12 @@ class Mobo_Core_Upgrade_Coordinator {
 				'lastError'        => isset( $details['lastError'] ) ? sanitize_text_field( (string) $details['lastError'] ) : '',
 			);
 			update_option( self::AUDIT_OPTION, $audit, false );
-			delete_option( self::STATE_OPTION );
+			/* Another updater may acquire the barrier immediately after this owner
+			 * releases its lease. Do not blindly delete the new owner's diagnostics.
+			 * The random token hash distinguishes same-second retry deployments. */
+			if ( isset( $state['barrierTokenHash'] ) && hash_equals( (string) $state['barrierTokenHash'], hash( 'sha256', (string) $token ) ) ) {
+				self::delete_state_if_unchanged( $state );
+			}
 		}
 
 		return $released;
@@ -206,10 +223,8 @@ class Mobo_Core_Upgrade_Coordinator {
 	 */
 	public static function is_active() {
 		$active = class_exists( 'Mobo_Core_Lock' ) && Mobo_Core_Lock::is_locked( self::BARRIER_LOCK );
-
-		if ( ! $active ) {
-			delete_option( self::STATE_OPTION );
-		}
+		/* Do not delete stale diagnostics here. A concurrent new owner may acquire
+		 * and write its state between our lock inspection and delete_option(). */
 
 		return $active;
 	}
@@ -310,15 +325,22 @@ class Mobo_Core_Upgrade_Coordinator {
 		$active = self::is_active();
 		$state  = self::read_state();
 		$lock   = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( self::BARRIER_LOCK ) : array();
+		$recovery_hold = false !== get_option( self::RECOVERY_HOLD_OPTION, false );
 
 		$audit = get_option( self::AUDIT_OPTION, array() );
 		if ( ! is_array( $audit ) ) {
 			$audit = array();
 		}
+		/* Historic releases stored raw exception strings in lastAudit. Retain
+		 * the local record but do not relay unreviewed text to REST/Health. */
+		if ( ! empty( $audit['lastError'] ) ) {
+			$audit['lastError'] = 'Upgrade attempt failed; original diagnostics withheld.';
+		}
 
 		return array(
 			'active'           => $active,
-			'status'           => $active ? ( isset( $state['status'] ) ? sanitize_key( (string) $state['status'] ) : 'active' ) : 'inactive',
+			'manualRecoveryHold' => $recovery_hold,
+			'status'           => $active ? ( isset( $state['status'] ) ? sanitize_key( (string) $state['status'] ) : 'active' ) : ( $recovery_hold ? 'manual-recovery-required' : 'inactive' ),
 			'deploymentId'     => isset( $state['deploymentId'] ) ? sanitize_text_field( (string) $state['deploymentId'] ) : '',
 			'activatedAt'      => isset( $state['activatedAt'] ) ? absint( $state['activatedAt'] ) : 0,
 			'lastRenewedAt'    => isset( $state['lastRenewedAt'] ) ? absint( $state['lastRenewedAt'] ) : 0,
@@ -368,5 +390,20 @@ class Mobo_Core_Upgrade_Coordinator {
 	 */
 	private static function write_state( $state ) {
 		update_option( self::STATE_OPTION, is_array( $state ) ? $state : array(), false );
+	}
+
+	/** Compare-and-delete only this exact barrier-state snapshot. */
+	private static function delete_state_if_unchanged( $expected ) {
+		global $wpdb;
+		if ( ! is_array( $expected ) || empty( $expected['barrierTokenHash'] ) ) { return false; }
+		$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", self::STATE_OPTION ) );
+		if ( ! is_string( $raw ) || ! hash_equals( (string) maybe_serialize( $expected ), $raw ) ) { return false; }
+		$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND BINARY option_value = BINARY %s", self::STATE_OPTION, $raw ) );
+		if ( 1 === $deleted ) {
+			wp_cache_delete( self::STATE_OPTION, 'options' );
+			wp_cache_delete( 'notoptions', 'options' );
+			return true;
+		}
+		return false;
 	}
 }

@@ -67,7 +67,11 @@ class Mobo_Core_Sync_Settings_Guard {
 	 * @return array
 	 */
 	public static function get_lock_state() {
-		$state = get_option( 'mobo_core_sync_state', array() );
+		$state = ( class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available() )
+			? Mobo_Core_State_Store::get( 'sync_state', array() )
+			: ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				? get_option( 'mobo_core_sync_state', array() )
+				: array() );
 
 		if ( ! is_array( $state ) ) {
 			$state = array();
@@ -133,12 +137,25 @@ class Mobo_Core_Sync_Settings_Guard {
 		}
 
 		$lock = self::get_lock_state();
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		$connection_label = '';
+		if ( $connection_id > 0 && class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$row = Mobo_Core_Connection_Repository::get_by_id( $connection_id );
+			if ( is_array( $row ) ) {
+				$connection_label = sanitize_text_field( (string) ( $row['display_name'] ?? '' ) );
+			}
+			if ( '' === $connection_label ) {
+				$connection_label = 'اتصال #' . $connection_id;
+			}
+		}
 		set_transient(
 			self::NOTICE_TRANSIENT_PREFIX . $user_id,
 			array(
-				'option'         => sanitize_key( (string) $option_name ),
-				'operationLabel' => isset( $lock['operationLabel'] ) ? sanitize_text_field( (string) $lock['operationLabel'] ) : 'همگام سازی',
-				'createdAt'      => time(),
+				'option'          => sanitize_key( (string) $option_name ),
+				'operationLabel'  => isset( $lock['operationLabel'] ) ? sanitize_text_field( (string) $lock['operationLabel'] ) : 'همگام سازی',
+				'connectionId'    => $connection_id,
+				'connectionLabel' => $connection_label,
+				'createdAt'       => time(),
 			),
 			10 * MINUTE_IN_SECONDS
 		);
@@ -152,7 +169,7 @@ class Mobo_Core_Sync_Settings_Guard {
 	 * @return void
 	 */
 	public function render_admin_notice() {
-		if ( ! function_exists( 'get_current_user_id' ) ) {
+		if ( ! function_exists( 'get_current_user_id' ) || ! current_user_can( 'manage_options' ) ) {
 			return;
 		}
 
@@ -169,9 +186,11 @@ class Mobo_Core_Sync_Settings_Guard {
 
 		delete_transient( $key );
 		$operation = isset( $notice['operationLabel'] ) ? sanitize_text_field( (string) $notice['operationLabel'] ) : 'همگام سازی';
+		$connection = isset( $notice['connectionLabel'] ) ? sanitize_text_field( (string) $notice['connectionLabel'] ) : '';
+		$scope = '' !== $connection ? ' برای «' . $connection . '»' : '';
 		?>
 		<div class="notice notice-warning is-dismissible">
-			<p><?php echo esc_html( 'تنظیمات صف و پردازش در زمان اجرای ' . $operation . ' قفل است. تغییر ذخیره نشد؛ پس از پایان عملیات می توانید این تنظیمات را تغییر دهید.' ); ?></p>
+			<p><?php echo esc_html( 'تنظیمات صف و پردازش' . $scope . ' در زمان اجرای ' . $operation . ' قفل است. تغییر ذخیره نشد؛ پس از پایان عملیات می توانید این تنظیمات را تغییر دهید.' ); ?></p>
 		</div>
 		<?php
 	}

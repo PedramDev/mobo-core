@@ -23,6 +23,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Category_Map {
 
+	/** @return int */
+	private function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
+	/** @return bool */
+	private function is_default_connection() {
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) ) { return false; }
+		$default = Mobo_Core_Connection_Repository::get_default();
+		return is_array( $default ) && absint( $default['id'] ?? 0 ) === $this->connection_id();
+	}
+
 	/** @var bool|null Request-local table existence cache. */
 	private static $table_exists_cache = null;
 
@@ -54,10 +66,11 @@ class Mobo_Core_Category_Map {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			connection_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			remote_guid varchar(191) NOT NULL,
 			manual_term_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			synced_term_id bigint(20) unsigned NOT NULL DEFAULT 0,
@@ -68,10 +81,10 @@ class Mobo_Core_Category_Map {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY remote_guid (remote_guid),
-			KEY manual_term_id (manual_term_id),
-			KEY synced_term_id (synced_term_id),
-			KEY parent_remote_guid (parent_remote_guid)
+			UNIQUE KEY remote_guid (connection_id, remote_guid(180)),
+			KEY manual_term_id (connection_id, manual_term_id),
+			KEY synced_term_id (connection_id, synced_term_id),
+			KEY parent_remote_guid (connection_id, parent_remote_guid(180))
 		) {$charset_collate};";
 
 		dbDelta( $sql );
@@ -218,10 +231,11 @@ class Mobo_Core_Category_Map {
 	 */
 	public function upsert_remote_category_for_mapping( $guid, $name = '', $url = '', $parent_guid = '' ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid = sanitize_text_field( (string) $guid );
 
-		if ( '' === $guid || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || '' === $guid || ! self::table_exists() ) {
 			return array(
 				'success' => false,
 				'created' => false,
@@ -243,18 +257,19 @@ class Mobo_Core_Category_Map {
 		 * Manual/synced term ownership is intentionally untouched on duplicate.
 		 */
 		$query = "INSERT INTO {$table}
-			(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
-			VALUES (%s, 0, 0, %s, %s, %s, %s, %s, %s)
+			(connection_id, remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+			VALUES (%d, %s, 0, 0, %s, %s, %s, %s, %s, %s)
 			ON DUPLICATE KEY UPDATE
-				remote_name = IF(VALUES(remote_name) = '', remote_name, VALUES(remote_name)),
-				remote_slug = IF(VALUES(remote_slug) = '', remote_slug, VALUES(remote_slug)),
-				remote_url = IF(VALUES(remote_url) = '', remote_url, VALUES(remote_url)),
-				parent_remote_guid = IF(VALUES(parent_remote_guid) = '', parent_remote_guid, VALUES(parent_remote_guid)),
-				updated_at = IF(VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
+				remote_name = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_name) = '', remote_name, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_name), remote_name)),
+				remote_slug = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_slug) = '', remote_slug, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_slug), remote_slug)),
+				remote_url = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_url) = '', remote_url, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_url), remote_url)),
+				parent_remote_guid = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(parent_remote_guid) = '', parent_remote_guid, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(parent_remote_guid), parent_remote_guid)),
+				updated_at = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
 
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
+				$connection_id,
 				$guid,
 				$remote_name,
 				$remote_slug,
@@ -310,11 +325,12 @@ class Mobo_Core_Category_Map {
 	 */
 	public function upsert_synced_category( $guid, $synced_term_id, $name = '', $url = '', $parent_guid = '' ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid           = sanitize_text_field( (string) $guid );
 		$synced_term_id = absint( $synced_term_id );
 
-		if ( '' === $guid || $synced_term_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || '' === $guid || $synced_term_id <= 0 || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -332,19 +348,20 @@ class Mobo_Core_Category_Map {
 		 * Manual mapping remains untouched on duplicate.
 		 */
 		$query = "INSERT INTO {$table}
-			(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
-			VALUES (%s, 0, %d, %s, %s, %s, %s, %s, %s)
+			(connection_id, remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+			VALUES (%d, %s, 0, %d, %s, %s, %s, %s, %s, %s)
 			ON DUPLICATE KEY UPDATE
-				synced_term_id = VALUES(synced_term_id),
-				remote_name = IF(VALUES(remote_name) = '', remote_name, VALUES(remote_name)),
-				remote_slug = IF(VALUES(remote_slug) = '', remote_slug, VALUES(remote_slug)),
-				remote_url = IF(VALUES(remote_url) = '', remote_url, VALUES(remote_url)),
-				parent_remote_guid = IF(VALUES(parent_remote_guid) = '', parent_remote_guid, VALUES(parent_remote_guid)),
-				updated_at = IF(VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
+				synced_term_id = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(synced_term_id), synced_term_id),
+				remote_name = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_name) = '', remote_name, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_name), remote_name)),
+				remote_slug = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_slug) = '', remote_slug, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_slug), remote_slug)),
+				remote_url = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(remote_url) = '', remote_url, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(remote_url), remote_url)),
+				parent_remote_guid = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(parent_remote_guid) = '', parent_remote_guid, IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid), VALUES(parent_remote_guid), parent_remote_guid)),
+				updated_at = IF(connection_id=VALUES(connection_id) AND remote_guid=VALUES(remote_guid) AND VALUES(updated_at) > updated_at, VALUES(updated_at), updated_at)";
 
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				$query, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Query structure is static and only values are variable.
+				$connection_id,
 				$guid,
 				$synced_term_id,
 				$remote_name,
@@ -379,7 +396,7 @@ class Mobo_Core_Category_Map {
 
 		$success = $this->verify_mapping_row( $guid, $expected );
 		if ( $success ) {
-			$this->term_lookup_cache[ 'synced_term_id|' . $guid ] = $synced_term_id;
+			$this->term_lookup_cache[ $connection_id . '|synced_term_id|' . $guid ] = $synced_term_id;
 		}
 		return $success;
 	}
@@ -393,11 +410,12 @@ class Mobo_Core_Category_Map {
 	 */
 	public function update_manual_mapping( $guid, $term_id ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid    = sanitize_text_field( (string) $guid );
 		$term_id = absint( $term_id );
 
-		if ( '' === $guid || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || '' === $guid || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -410,7 +428,8 @@ class Mobo_Core_Category_Map {
 
 		$existing_id = $wpdb->get_var(
 			$wpdb->prepare(
-				"SELECT id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				"SELECT id FROM {$table} WHERE connection_id=%d AND remote_guid = %s LIMIT 1",
+				$connection_id,
 				$guid
 			)
 		);
@@ -422,21 +441,22 @@ class Mobo_Core_Category_Map {
 					'manual_term_id' => $term_id,
 					'updated_at'     => $now,
 				),
-				array( 'id' => absint( $existing_id ) ),
+				array( 'connection_id' => $connection_id, 'id' => absint( $existing_id ) ),
 				array( '%d', '%s' ),
-				array( '%d' )
+				array( '%d', '%d' )
 			);
 		} else {
 			$success = false !== $wpdb->insert(
 				$table,
 				array(
+					'connection_id' => $connection_id,
 					'remote_guid'    => $guid,
 					'manual_term_id' => $term_id,
 					'synced_term_id' => 0,
 					'created_at'     => $now,
 					'updated_at'     => $now,
 				),
-				array( '%s', '%d', '%d', '%s', '%s' )
+				array( '%d', '%s', '%d', '%d', '%s', '%s' )
 			);
 		}
 
@@ -449,7 +469,7 @@ class Mobo_Core_Category_Map {
 			);
 		}
 		if ( $success ) {
-			$this->term_lookup_cache[ 'manual_term_id|' . $guid ] = $term_id;
+			$this->term_lookup_cache[ $connection_id . '|manual_term_id|' . $guid ] = $term_id;
 		}
 		return $success;
 	}
@@ -467,9 +487,10 @@ class Mobo_Core_Category_Map {
 	 */
 	private function verify_mapping_row( $guid, $expected ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid = sanitize_text_field( (string) $guid );
-		if ( '' === $guid || ! is_array( $expected ) || empty( $expected ) || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || '' === $guid || ! is_array( $expected ) || empty( $expected ) || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -487,16 +508,17 @@ class Mobo_Core_Category_Map {
 			return false;
 		}
 
-		$select_columns = array_unique( array_merge( array( 'remote_guid' ), $columns ) );
+		$select_columns = array_unique( array_merge( array( 'connection_id', 'remote_guid' ), $columns ) );
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				'SELECT ' . implode( ', ', $select_columns ) . ' FROM ' . self::table_name() . ' WHERE remote_guid = %s LIMIT 1',
+				'SELECT ' . implode( ', ', $select_columns ) . ' FROM ' . self::table_name() . ' WHERE connection_id=%d AND remote_guid = %s LIMIT 1',
+				$connection_id,
 				$guid
 			),
 			ARRAY_A
 		);
 
-		if ( ! is_array( $row ) || ! isset( $row['remote_guid'] ) || $guid !== (string) $row['remote_guid'] ) {
+		if ( ! is_array( $row ) || absint( $row['connection_id'] ?? 0 ) !== $connection_id || ! isset( $row['remote_guid'] ) || $guid !== (string) $row['remote_guid'] ) {
 			return false;
 		}
 
@@ -517,6 +539,83 @@ class Mobo_Core_Category_Map {
 	}
 
 	/**
+	 * Retire synced ownership for remote categories absent from one complete
+	 * authoritative snapshot. Manual mappings are preserved. Local terms are not
+	 * deleted; they are marked retired so historical/customer taxonomy state is
+	 * never destructively removed by snapshot absence alone.
+	 *
+	 * @param array $present_guids Remote GUIDs present in the complete snapshot.
+	 * @return array
+	 */
+	public function retire_absent_remote_categories( $present_guids ) {
+		global $wpdb;
+		$connection_id = $this->connection_id();
+		if ( $connection_id <= 0 || ! self::table_exists() ) { return array( 'retired' => 0, 'failed' => 0 ); }
+		$present = array();
+		foreach ( is_array( $present_guids ) ? $present_guids : array() as $guid ) {
+			$guid = sanitize_text_field( (string) $guid );
+			if ( '' !== $guid ) { $present[ $guid ] = true; }
+		}
+		$table = self::table_name();
+		$wpdb->last_error = '';
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT id, remote_guid, manual_term_id, synced_term_id FROM {$table} WHERE connection_id=%d AND synced_term_id > 0 ORDER BY id ASC", $connection_id ), ARRAY_A );
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			return array( 'retired' => 0, 'failed' => 1, 'readFailed' => true );
+		}
+		$retired = 0; $failed = 0;
+		foreach ( $rows as $row ) {
+			$guid = sanitize_text_field( (string) ( $row['remote_guid'] ?? '' ) );
+			if ( '' === $guid || isset( $present[ $guid ] ) ) { continue; }
+			$term_id = absint( $row['synced_term_id'] ?? 0 );
+			if ( $term_id <= 0 ) { continue; }
+			/* Compare-and-clear: an overlapping ProductUpdated may already have
+			 * re-established a newer synced term for this exact map row. Never erase it
+			 * using an outdated SELECT result. */
+			$updated = $wpdb->update(
+				$table,
+				array( 'synced_term_id' => 0, 'updated_at' => current_time( 'mysql', true ) ),
+				array( 'connection_id' => $connection_id, 'id' => absint( $row['id'] ), 'synced_term_id' => $term_id ),
+				array( '%d', '%s' ),
+				array( '%d', '%d', '%d' )
+			);
+			if ( false === $updated ) { $failed++; continue; }
+			if ( 1 !== absint( $updated ) ) { continue; }
+
+			/* Never mark a term retired when any Connection currently owns it.
+			 * Marking happens AFTER the successful CAS, not before it, to avoid
+			 * retiring a row whose concurrent upsert won the comparison. */
+			if ( $this->term_exists( $term_id ) ) {
+				$wpdb->last_error = '';
+				$live_owner = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE synced_term_id=%d LIMIT 1", $term_id ) );
+				if ( '' !== trim( (string) $wpdb->last_error ) ) { $failed++; continue; }
+				if ( ! $live_owner ) {
+					$current_guid = sanitize_text_field( (string) get_term_meta( $term_id, 'category_guid', true ) );
+					if ( '' !== $current_guid && hash_equals( $guid, $current_guid ) ) {
+						if ( '1' !== (string) get_term_meta( $term_id, 'mobo_category_retired', true ) ) {
+							update_term_meta( $term_id, 'mobo_category_retired', '1' );
+							if ( '1' !== (string) get_term_meta( $term_id, 'mobo_category_retired', true ) ) { $failed++; continue; }
+						}
+						/* Close the marker-vs-reappearance window: if a concurrent
+						 * ProductUpdated reactivated the term after our first owner read,
+						 * the retired marker must not hide its newly committed map row. */
+						$wpdb->last_error = '';
+						$reactivated = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE synced_term_id=%d LIMIT 1", $term_id ) );
+						if ( '' !== trim( (string) $wpdb->last_error ) ) { $failed++; continue; }
+						if ( $reactivated ) {
+							update_term_meta( $term_id, 'mobo_category_retired', '0' );
+							if ( '0' !== (string) get_term_meta( $term_id, 'mobo_category_retired', true ) ) { $failed++; continue; }
+						}
+					}
+				}
+			}
+
+			$this->term_lookup_cache[ $connection_id . '|synced_term_id|' . $guid ] = 0;
+			$retired++;
+		}
+		return array( 'retired' => $retired, 'failed' => $failed );
+	}
+
+	/**
 	 * List mappings for admin UI.
 	 *
 	 * @param int $limit Limit.
@@ -524,6 +623,7 @@ class Mobo_Core_Category_Map {
 	 */
 	public function list_mappings( $limit = 500 ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$limit = max( 1, min( 2000, absint( $limit ) ) );
 
@@ -535,7 +635,8 @@ class Mobo_Core_Category_Map {
 
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT * FROM {$table} ORDER BY remote_name ASC, id ASC LIMIT %d",
+				"SELECT * FROM {$table} WHERE connection_id=%d ORDER BY remote_name ASC, id ASC LIMIT %d",
+				$connection_id,
 				$limit
 			),
 			ARRAY_A
@@ -572,10 +673,11 @@ class Mobo_Core_Category_Map {
 	 */
 	private function seed_legacy_category_if_safe( $guid, $term_id ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid    = sanitize_text_field( (string) $guid );
 		$term_id = absint( $term_id );
-		if ( '' === $guid || $term_id <= 0 || ! self::table_exists() ) {
+		if ( $connection_id <= 0 || ! $this->is_default_connection() || '' === $guid || $term_id <= 0 || ! self::table_exists() ) {
 			return false;
 		}
 
@@ -594,7 +696,8 @@ class Mobo_Core_Category_Map {
 		/* Existing rows are durable/current evidence and are preserved exactly. */
 		$existing = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT id, manual_term_id, synced_term_id FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				"SELECT id, manual_term_id, synced_term_id FROM {$table} WHERE connection_id=%d AND remote_guid = %s LIMIT 1",
+				$connection_id,
 				$guid
 			),
 			ARRAY_A
@@ -631,8 +734,9 @@ class Mobo_Core_Category_Map {
 		$inserted = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT IGNORE INTO {$table}
-				(remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
-				VALUES (%s, 0, %d, %s, %s, %s, %s, %s, %s)",
+				(connection_id, remote_guid, manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid, created_at, updated_at)
+				VALUES (%d, %s, 0, %d, %s, %s, %s, %s, %s, %s)",
+				$connection_id,
 				$guid,
 				$term_id,
 				$remote_name,
@@ -649,7 +753,8 @@ class Mobo_Core_Category_Map {
 
 		$persisted = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid FROM {$table} WHERE remote_guid = %s LIMIT 1",
+				"SELECT manual_term_id, synced_term_id, remote_name, remote_slug, remote_url, parent_remote_guid FROM {$table} WHERE connection_id=%d AND remote_guid = %s LIMIT 1",
+				$connection_id,
 				$guid
 			),
 			ARRAY_A
@@ -683,7 +788,7 @@ class Mobo_Core_Category_Map {
 
 		$limit = max( 50, min( 2000, absint( $limit ) ) );
 
-		if ( ! self::table_exists() ) {
+		if ( ! $this->is_default_connection() || ! self::table_exists() ) {
 			return array( 'categories' => 0 );
 		}
 
@@ -864,6 +969,7 @@ class Mobo_Core_Category_Map {
 	 */
 	private function clear_stale_term_id_if_unchanged( $row_id, $column, $term_id ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$row_id  = absint( $row_id );
 		$column  = sanitize_key( (string) $column );
@@ -875,13 +981,14 @@ class Mobo_Core_Category_Map {
 
 		$table = self::table_name();
 		$sql   = 'manual_term_id' === $column
-			? "UPDATE {$table} SET manual_term_id = 0, updated_at = %s WHERE id = %d AND manual_term_id = %d"
-			: "UPDATE {$table} SET synced_term_id = 0, updated_at = %s WHERE id = %d AND synced_term_id = %d";
+			? "UPDATE {$table} SET manual_term_id = 0, updated_at = %s WHERE connection_id=%d AND id = %d AND manual_term_id = %d"
+			: "UPDATE {$table} SET synced_term_id = 0, updated_at = %s WHERE connection_id=%d AND id = %d AND synced_term_id = %d";
 
 		return $wpdb->query(
 			$wpdb->prepare(
 				$sql, // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
 				current_time( 'mysql', true ),
+				$connection_id,
 				$row_id,
 				$term_id
 			)
@@ -897,6 +1004,7 @@ class Mobo_Core_Category_Map {
 	 */
 	private function read_current_term_id_by_row( $row_id, $column ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$row_id = absint( $row_id );
 		$column = sanitize_key( (string) $column );
@@ -907,12 +1015,12 @@ class Mobo_Core_Category_Map {
 
 		$table = self::table_name();
 		$sql   = 'manual_term_id' === $column
-			? "SELECT manual_term_id FROM {$table} WHERE id = %d LIMIT 1"
-			: "SELECT synced_term_id FROM {$table} WHERE id = %d LIMIT 1";
+			? "SELECT manual_term_id FROM {$table} WHERE connection_id=%d AND id = %d LIMIT 1"
+			: "SELECT synced_term_id FROM {$table} WHERE connection_id=%d AND id = %d LIMIT 1";
 
 		return absint(
 			$wpdb->get_var(
-				$wpdb->prepare( $sql, $row_id ) // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
+				$wpdb->prepare( $sql, $connection_id, $row_id ) // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
 			)
 		);
 	}
@@ -972,6 +1080,7 @@ class Mobo_Core_Category_Map {
 	 */
 	private function get_term_id_by_column( $guid, $column, $clear_stale ) {
 		global $wpdb;
+		$connection_id = $this->connection_id();
 
 		$guid   = sanitize_text_field( (string) $guid );
 		$column = sanitize_key( (string) $column );
@@ -980,17 +1089,17 @@ class Mobo_Core_Category_Map {
 			return 0;
 		}
 
-		$cache_key = $column . '|' . $guid;
+		$cache_key = $connection_id . '|' . $column . '|' . $guid;
 		if ( array_key_exists( $cache_key, $this->term_lookup_cache ) ) {
 			return absint( $this->term_lookup_cache[ $cache_key ] );
 		}
 
 		$table = self::table_name();
 		$sql   = 'manual_term_id' === $column
-			? "SELECT id, manual_term_id AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1"
-			: "SELECT id, synced_term_id AS term_id FROM {$table} WHERE remote_guid = %s LIMIT 1";
+			? "SELECT id, manual_term_id AS term_id FROM {$table} WHERE connection_id=%d AND remote_guid = %s LIMIT 1"
+			: "SELECT id, synced_term_id AS term_id FROM {$table} WHERE connection_id=%d AND remote_guid = %s LIMIT 1";
 		$row   = $wpdb->get_row(
-			$wpdb->prepare( $sql, $guid ), // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
+			$wpdb->prepare( $sql, $connection_id, $guid ), // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- SQL is selected from two fixed internal statements above.
 			ARRAY_A
 		);
 

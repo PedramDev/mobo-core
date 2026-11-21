@@ -33,6 +33,9 @@ final class Mobo_Core_Runtime_Diagnostics {
 
 	/** Register a shutdown flush only after the first metric is recorded. */
 	private static function ensure_shutdown() {
+		// A multi-Connection cron request flushes once per Connection. Any later
+		// metric re-opens the bounded buffer for the next Connection context.
+		self::$flushed = false;
 		if ( self::$shutdown_registered ) {
 			return;
 		}
@@ -220,7 +223,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 	/** Return compact persisted diagnostics, enriched with live queue/environment checks. */
 	public static function get_health_status() {
 		self::flush();
-		$data = get_option( self::OPTION_NAME, array() );
+		$data = Mobo_Core_Settings::get( self::OPTION_NAME, array() );
 		$data = is_array( $data ) ? $data : array();
 		$data['recommendations'] = self::build_recommendations( $data );
 		$data['queueHealth']      = self::get_queue_health();
@@ -236,7 +239,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 		self::$flushed = true;
 
 		$now     = time();
-		$current = get_option( self::OPTION_NAME, array() );
+		$current = Mobo_Core_Settings::get( self::OPTION_NAME, array() );
 		$current = is_array( $current ) ? $current : array();
 		$started = absint( isset( $current['windowStartedAt'] ) ? $current['windowStartedAt'] : 0 );
 		if ( $started <= 0 || ( $now - $started ) >= self::WINDOW_SECONDS ) {
@@ -367,7 +370,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 			$current['schedulerStages'] = $old_scheduler;
 		}
 
-		update_option( self::OPTION_NAME, $current, false );
+		Mobo_Core_Settings::update( self::OPTION_NAME, $current, false );
 		self::$buffer = array();
 	}
 

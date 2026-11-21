@@ -24,7 +24,7 @@
 | `MOBO_CORE_PLUGIN_FILE` | فایل اصلی افزونه |
 | `MOBO_CORE_PLUGIN_DIR` | مسیر filesystem افزونه |
 | `MOBO_CORE_PLUGIN_URL` | URL افزونه |
-| `MOBO_CORE_PURCHASE_URL` | `http://mobo.codeya.ir/` |
+| `MOBO_CORE_PURCHASE_URL` | `the provisioned Backend` |
 | `MOBO_CORE_GITHUB_URL` | `https://github.com/PedramDev/mobo-core` |
 | `MOBO_API_BASE_URL` | آدرس API پیش فرض/قابل override |
 | `MOBO_CORE_DATA_DIR` | `wp-content/uploads/mobo-core/` |
@@ -38,12 +38,14 @@ Base: `/wp-json/mobo-core/v1`
 |---|---|---|---|
 | POST | `/categories/ensure-sync` | `check_security` | `syncId`, `force` |
 | GET/POST | `/cron/run` | `check_cron_security` | `token` |
-| GET | `/cron/status` | `check_security` | `X-SEC` |
+| GET | `/cron/status` | `check_installation_security` | Installation Controller `X-SEC` |
 | GET/POST | `/worker/run` | `check_cron_security` | `token`, `source` |
-| GET | `/worker/status` | `check_security` | `X-SEC` |
-| GET | `/health` | `check_security` | `X-SEC` |
-| POST | `/heartbeat` | `check_security` | `X-SEC`; اجرای bounded shared-engine slice و پاسخ no-cache |
-| GET/POST | `/health/report-now` | `check_security` | `X-SEC` |
+| GET | `/worker/status` | `check_installation_security` | Installation Controller `X-SEC` |
+| GET | `/health` | `check_installation_security` | Installation Controller `X-SEC` |
+| POST | `/heartbeat` | `check_installation_security` | Installation Controller `X-SEC`; اجرای bounded shared-engine slice و پاسخ no-cache |
+| GET/POST | `/health/report-now` | `check_installation_security` | Installation Controller `X-SEC` |
+| GET | `/upgrade/status` | `check_installation_security` | Installation Controller `X-SEC` |
+| POST | `/upgrade/apply` | `check_installation_security` | Installation Controller `X-SEC` + signed deployment payload |
 | POST | `/webhook` | `check_security` | JSON event payload |
 | POST | `/webhook/run` | `check_security` | `X-SEC` |
 | POST | `/sync/start` | `check_security` | JSON: `syncId` اختیاری |
@@ -283,7 +285,7 @@ Hookهای اصلی WordPress/WooCommerce که افزونه به آنها متص
 | `mobo_core_checkout_mobo_cart_validation_enabled` | `'0'` |
 | `mobo_core_checkout_mobo_debug_enabled` | `'0'` |
 | `mobo_core_shipping_diagnostics_enabled` | `'0'` |
-| `mobo_core_checkout_mobo_site_url` | `'https://mobomobo.ir'` |
+| `mobo_core_checkout_mobo_site_url` | `'the provisioned Source'` |
 | `mobo_core_checkout_mobo_username` | `''` |
 | `mobo_core_checkout_mobo_password` | `''` |
 | `mobo_core_checkout_mobo_timeout_seconds` | `8` |
@@ -713,15 +715,17 @@ Public methods: **5** · Internal non-public methods: **11**
 
 Source: [`includes/class-mobo-core-dependencies.php`](includes/class-mobo-core-dependencies.php)  
 کنترل پیش نیازهای اجباری افزونه و توقف امن activation/bootstrap. / Enforces required plugin dependencies and safely blocks activation/bootstrap.  
-Public methods: **6** · Internal non-public methods: **5**
+Public methods: **8** · Internal non-public methods: **5**
 
 | Signature | توضیح فارسی | English summary |
 |---|---|---|
 | `public static function get_missing_dependencies()` | دریافت فهرست WooCommerce یا ووکامرس فارسی نصب نشده/غیرفعال. | Return missing required plugin dependencies. |
-| `public static function requirements_met()` | بررسی کامل بودن همه پیش نیازهای افزونه. | Whether all required dependencies are active. |
+| `public static function requirements_met()` | بررسی کامل بودن پیش نیازهای افزونه و معماری امن PHP. | Whether plugin and platform requirements are satisfied. |
+| `public static function platform_requirements_met()` | الزام معماری 64-bit برای شناسه های پایدار متادیتای terminal WooCommerce. | Whether the PHP runtime provides 64-bit integers required by terminal Woo metadata IDs. |
 | `public static function is_woocommerce_active()` | بررسی فعال بودن WooCommerce. | Whether WooCommerce is active. |
 | `public static function is_persian_woocommerce_active()` | بررسی فعال بودن افزونه رسمی `persian-woocommerce`. | Whether Persian WooCommerce is active. |
 | `public static function enforce_activation_requirements()` | توقف activation و نمایش خطای واضح در وردپرس های قدیمی. | Block activation when a dependency is missing. |
+| `public static function register_platform_notice()` | ثبت اعلان مدیریتی برای معماری PHP پشتیبانی نشده. | Register the unsupported-platform admin notice. |
 | `public static function register_admin_notices($missing = null)` | ثبت اعلان مدیریتی پایدار بعد از غیرفعال شدن dependency. | Register persistent missing-dependency notices. |
 
 ### `Mobo_Core_Logger`

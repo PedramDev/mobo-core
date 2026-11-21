@@ -21,11 +21,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Sync_Event_Store {
 
+	/** Resolve active/default Connection for every queue operation. */
+	private static function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
 	/** @var bool|null Request-local table existence cache. */
 	private static $table_exists_cache = null;
 
-	/** @var array|null Request-local queue summary cache. */
-	private static $summary_cache = null;
+	/** @var array Request-local queue summary cache keyed by Connection. */
+	private static $summary_cache = array();
 
 	/**
 	 * Return table name.
@@ -49,10 +54,11 @@ class Mobo_Core_Sync_Event_Store {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			connection_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			event_uuid varchar(64) NOT NULL,
 			remote_event_id varchar(191) NOT NULL DEFAULT '',
 			event_type varchar(64) NOT NULL,
@@ -73,22 +79,22 @@ class Mobo_Core_Sync_Event_Store {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY event_uuid (event_uuid),
-			KEY remote_event_id (remote_event_id),
-			KEY status_retry (status, next_retry_at),
-			KEY status_retry_id (status, next_retry_at, id),
-			KEY locked_until (locked_until),
-			KEY claim_token (claim_token),
-			KEY status_locked_id (status, locked_until, id),
-			KEY status_updated_id (status, updated_at, id),
-			KEY event_entity_id (event_type, entity_guid(100), id),
-			KEY entity_lookup (entity_type, entity_guid(120)),
-			KEY created_at (created_at)
+			UNIQUE KEY event_uuid (connection_id,event_uuid),
+			KEY connection_status (connection_id,status,next_retry_at,id),
+			KEY remote_event_id (connection_id,remote_event_id(150)),
+			KEY status_retry_id (connection_id,status,next_retry_at,id),
+			KEY locked_until (connection_id,locked_until),
+			KEY claim_token (connection_id,claim_token),
+			KEY status_locked_id (connection_id,status,locked_until,id),
+			KEY status_updated_id (connection_id,status,updated_at,id),
+			KEY event_entity_id (connection_id,event_type,entity_guid(100),id),
+			KEY entity_lookup (connection_id,entity_type,entity_guid(120)),
+			KEY created_at (connection_id,created_at)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
 		self::$table_exists_cache = null;
-		self::$summary_cache      = null;
+		self::$summary_cache      = array();
 	}
 
 	/**
@@ -115,7 +121,7 @@ class Mobo_Core_Sync_Event_Store {
 	 * @return void
 	 */
 	private static function invalidate_summary_cache() {
-		self::$summary_cache = null;
+		self::$summary_cache = array();
 	}
 
 
@@ -125,16 +131,17 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param string $remote_event_id Remote event identity.
 	 * @return string Lock name or empty string.
 	 */
-	private function acquire_remote_event_dedupe_lock( $remote_event_id ) {
+	private function acquire_remote_event_dedupe_lock( $remote_event_id, $connection_id = 0 ) {
 		global $wpdb;
 
 		$remote_event_id = sanitize_text_field( (string) $remote_event_id );
+		$connection_id  = absint( $connection_id );
 		if ( '' === $remote_event_id ) {
 			return '';
 		}
 
 		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
-		$lock_name = 'mobo_evt_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $remote_event_id ), 0, 40 );
+		$lock_name = 'mobo_evt_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $connection_id . '|' . $remote_event_id ), 0, 40 );
 		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 5 ) );
 
 		return '1' === (string) $acquired ? $lock_name : '';
@@ -161,7 +168,7 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param array $raw_payload Raw webhook payload.
 	 * @return int|WP_Error
 	 */
-	public function enqueue( $raw_payload ) {
+	public function enqueue( $raw_payload, $connection_id = 0 ) {
 		global $wpdb;
 
 		if ( ! is_array( $raw_payload ) ) {
@@ -170,6 +177,27 @@ class Mobo_Core_Sync_Event_Store {
 
 		if ( ! self::table_exists() ) {
 			return new WP_Error( 'mobo_core_event_table_missing', 'Sync event table is missing.' );
+		}
+
+		$connection_id = absint( $connection_id );
+		if ( $connection_id <= 0 && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			$connection_id = Mobo_Core_Connection_Context::get_current_connection_id();
+		}
+		if ( $connection_id <= 0 && class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			$default = Mobo_Core_Connection_Repository::get_default();
+			$connection_id = is_array( $default ) ? absint( $default['id'] ?? 0 ) : 0;
+		}
+		if ( $connection_id <= 0 ) {
+			return new WP_Error( 'mobo_core_event_connection_missing', 'Could not resolve webhook connection for event persistence.' );
+		}
+		/* This public store can be called independently of the REST queue. Enforce
+		 * the durable owner here too, before a pending row can be persisted. */
+		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) ) {
+			return new WP_Error( 'mobo_core_event_connection_missing', 'Connection repository is unavailable.' );
+		}
+		$owner = Mobo_Core_Connection_Repository::get_by_id( $connection_id );
+		if ( ! is_array( $owner ) || 1 !== absint( $owner['is_enabled'] ?? 0 ) ) {
+			return new WP_Error( 'mobo_core_event_connection_disabled', 'Webhook Connection is missing or disabled.' );
 		}
 
 		$normalized = $this->normalize_payload( $raw_payload );
@@ -229,10 +257,11 @@ class Mobo_Core_Sync_Event_Store {
 			 * only this tiny database critical section so two identical webhook
 			 * requests cannot both observe a miss and create duplicate queue rows.
 			 */
-			$dedupe_lock_name = $this->acquire_remote_event_dedupe_lock( $remote_event_id );
+			$dedupe_lock_name = $this->acquire_remote_event_dedupe_lock( $remote_event_id, $connection_id );
 			$existing = $wpdb->get_var(
 				$wpdb->prepare(
-					"SELECT id FROM {$table} WHERE remote_event_id = %s AND status IN ('pending', 'processing', 'done') ORDER BY id DESC LIMIT 1",
+					"SELECT id FROM {$table} WHERE connection_id = %d AND remote_event_id = %s AND status IN ('pending', 'processing', 'done') ORDER BY id DESC LIMIT 1",
+					$connection_id,
 					$remote_event_id
 				)
 			);
@@ -257,6 +286,7 @@ class Mobo_Core_Sync_Event_Store {
 		$inserted = $wpdb->insert(
 			$table,
 			array(
+				'connection_id'    => $connection_id,
 				'event_uuid'       => $event_uuid,
 				'remote_event_id'  => $remote_event_id,
 				'event_type'       => $event_type,
@@ -276,7 +306,7 @@ class Mobo_Core_Sync_Event_Store {
 				'created_at'       => $now,
 				'updated_at'       => $now,
 			),
-			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 
 		if ( '' !== $dedupe_lock_name ) {
@@ -298,13 +328,14 @@ class Mobo_Core_Sync_Event_Store {
 		 * from the payload the worker will later process. */
 		$persisted = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version FROM {$table} WHERE id = %d LIMIT 1",
+				"SELECT connection_id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version FROM {$table} WHERE id = %d LIMIT 1",
 				$new_id
 			),
 			ARRAY_A
 		);
 		$expected_version = sanitize_text_field( (string) $normalized['version'] );
 		if ( ! is_array( $persisted )
+			|| $connection_id !== absint( $persisted['connection_id'] ?? 0 )
 			|| $event_uuid !== (string) ( isset( $persisted['event_uuid'] ) ? $persisted['event_uuid'] : '' )
 			|| $remote_event_id !== (string) ( isset( $persisted['remote_event_id'] ) ? $persisted['remote_event_id'] : '' )
 			|| $event_type !== (string) ( isset( $persisted['event_type'] ) ? $persisted['event_type'] : '' )
@@ -324,7 +355,7 @@ class Mobo_Core_Sync_Event_Store {
 		 * multi-variation snapshots: their pages/variants carry independent state.
 		 */
 		if ( $new_id > 0 && $this->is_coalescible_entity_event( $event_type, $entity_type, $entity_guid, $payload ) ) {
-			$this->coalesce_older_pending_entity_events( $new_id, $event_uuid, sanitize_text_field( (string) $normalized['version'] ), $event_type, $entity_type, $entity_guid );
+			$this->coalesce_older_pending_entity_events( $new_id, $event_uuid, sanitize_text_field( (string) $normalized['version'] ), $payload_json, $event_type, $entity_type, $entity_guid, $connection_id );
 		}
 
 		return $new_id;
@@ -381,22 +412,25 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param int    $new_id New event row ID.
 	 * @param string $new_uuid New event UUID.
 	 * @param string $new_version New event/entity version when supplied.
+	 * @param string $new_payload_json Canonical persisted payload JSON for replay/conflict proof.
 	 * @param string $event_type Event type.
 	 * @param string $entity_type Entity type.
 	 * @param string $entity_guid Entity GUID.
 	 * @return int Number coalesced.
 	 */
-	private function coalesce_older_pending_entity_events( $new_id, $new_uuid, $new_version, $event_type, $entity_type, $entity_guid ) {
+	private function coalesce_older_pending_entity_events( $new_id, $new_uuid, $new_version, $new_payload_json, $event_type, $entity_type, $entity_guid, $connection_id = 0 ) {
 		global $wpdb;
 
 		$new_id      = absint( $new_id );
 		$new_uuid    = sanitize_text_field( (string) $new_uuid );
-		$new_version = sanitize_text_field( (string) $new_version );
+		$new_version      = sanitize_text_field( (string) $new_version );
+		$new_payload_json = (string) $new_payload_json;
 		$event_type  = sanitize_text_field( (string) $event_type );
 		$entity_type = sanitize_key( (string) $entity_type );
-		$entity_guid = sanitize_text_field( (string) $entity_guid );
+		$entity_guid   = sanitize_text_field( (string) $entity_guid );
+		$connection_id = absint( $connection_id );
 
-		if ( $new_id <= 0 || '' === $event_type || '' === $entity_type || '' === $entity_guid || ! self::table_exists() ) {
+		if ( $new_id <= 0 || $connection_id <= 0 || '' === $event_type || '' === $entity_type || '' === $entity_guid || ! self::table_exists() ) {
 			return 0;
 		}
 
@@ -410,14 +444,16 @@ class Mobo_Core_Sync_Event_Store {
 		 */
 		$candidates = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, event_uuid, event_version FROM {$table}
+				"SELECT id, event_uuid, event_version, status, payload_json FROM {$table}
 				WHERE id < %d
-					AND status = 'pending'
+					AND connection_id = %d
+					AND status IN ('pending','processing','done','failed')
 					AND event_type = %s
 					AND entity_type = %s
 					AND entity_guid = %s
 				ORDER BY id DESC",
 				$new_id,
+				$connection_id,
 				$event_type,
 				$entity_type,
 				$entity_guid
@@ -433,6 +469,8 @@ class Mobo_Core_Sync_Event_Store {
 		foreach ( $candidates as $candidate ) {
 			$old_id      = absint( isset( $candidate['id'] ) ? $candidate['id'] : 0 );
 			$old_version = sanitize_text_field( (string) ( isset( $candidate['event_version'] ) ? $candidate['event_version'] : '' ) );
+			$old_status       = sanitize_key( (string) ( isset( $candidate['status'] ) ? $candidate['status'] : '' ) );
+			$old_payload_json = (string) ( isset( $candidate['payload_json'] ) ? $candidate['payload_json'] : '' );
 			$comparison  = $this->compare_event_versions( $new_version, $old_version );
 
 			if ( null !== $comparison && $comparison < 0 ) {
@@ -456,15 +494,87 @@ class Mobo_Core_Sync_Event_Store {
 						'progress_json' => false === $progress ? '{"superseded":true}' : $progress,
 						'updated_at'    => $now,
 					),
-					array( 'id' => $new_id, 'status' => 'pending' ),
+					array( 'id' => $new_id, 'connection_id' => $connection_id, 'status' => 'pending' ),
 					array( '%s', '%s', '%s', '%s', '%s', '%s' ),
-					array( '%d', '%s' )
+					array( '%d', '%d', '%s' )
 				);
 				self::invalidate_summary_cache();
 				return 0;
 			}
 
-			if ( $old_id > 0 ) {
+			/* Equal ordering evidence is only a replay when the persisted desired-state
+			 * payload is equivalent. The same revision with a different payload is an
+			 * ordering contract violation and must fail closed before any mutation. */
+			if ( 0 === $comparison ) {
+				$payload_equivalent = $this->event_payloads_equivalent( $new_payload_json, $old_payload_json );
+				if ( ! $payload_equivalent ) {
+					$progress = wp_json_encode(
+						array(
+							'deleteFile'          => false,
+							'orderingConflict'    => true,
+							'conflictsWithEventId'=> sanitize_text_field( (string) ( isset( $candidate['event_uuid'] ) ? $candidate['event_uuid'] : '' ) ),
+							'reason'              => 'equal-version-payload-conflict',
+						),
+						JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+					);
+					$wpdb->update(
+						$table,
+						array(
+							'status'        => 'failed',
+							'locked_until'  => null,
+							'next_retry_at' => null,
+							'last_error'    => 'Equal event version carried a conflicting desired-state payload.',
+							'progress_json' => false === $progress ? '{"orderingConflict":true}' : $progress,
+							'updated_at'    => $now,
+						),
+						array( 'id' => $new_id, 'connection_id' => $connection_id, 'status' => 'pending' )
+					);
+					self::invalidate_summary_cache();
+					return 0;
+				}
+
+				/* A failed equal-version owner may be recovered by the new equivalent row.
+				 * For pending/processing/done owners, keep the existing owner/evidence and
+				 * retire the duplicate arrival without reapplying the same desired state. */
+				if ( 'failed' !== $old_status ) {
+					$progress = wp_json_encode(
+						array(
+							'deleteFile'          => true,
+							'superseded'          => true,
+							'supersededByEventId' => sanitize_text_field( (string) ( isset( $candidate['event_uuid'] ) ? $candidate['event_uuid'] : '' ) ),
+							'reason'              => 'equal-version-replay',
+						),
+						JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+					);
+					$wpdb->update(
+						$table,
+						array(
+							'status'        => 'done',
+							'locked_until'  => null,
+							'next_retry_at' => null,
+							'last_error'    => null,
+							'progress_json' => false === $progress ? '{"superseded":true}' : $progress,
+							'updated_at'    => $now,
+						),
+						array( 'id' => $new_id, 'connection_id' => $connection_id, 'status' => 'pending' )
+					);
+					self::invalidate_summary_cache();
+					return 0;
+				}
+
+				continue;
+			}
+
+			/* Two non-empty but incomparable versions are not ordered by arrival.
+			 * Preserve both rows and let the processor fail closed if durable state
+			 * already carries a different incomparable watermark. */
+			if ( null === $comparison && '' !== $new_version && '' !== $old_version && $new_version !== $old_version ) {
+				continue;
+			}
+
+			/* Only still-pending rows may be physically superseded. Processing, done
+			 * and failed rows remain immutable evidence for recovery/diagnostics. */
+			if ( $old_id > 0 && 'pending' === $old_status ) {
 				$ids_to_supersede[] = $old_id;
 			}
 		}
@@ -486,14 +596,14 @@ class Mobo_Core_Sync_Event_Store {
 
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids_to_supersede ), '%d' ) );
 		$update_args     = array_merge(
-			array( false === $progress ? '{"superseded":true}' : $progress, $now ),
+			array( false === $progress ? '{"superseded":true}' : $progress, $now, $connection_id ),
 			$ids_to_supersede
 		);
 		$updated = $wpdb->query(
 			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains the two fixed %s values followed by dynamic %d ID replacements; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'done', locked_until = NULL, next_retry_at = NULL, last_error = NULL, progress_json = %s, updated_at = %s
-				WHERE status = 'pending' AND id IN ({$id_placeholders})",
+				WHERE connection_id = %d AND status = 'pending' AND id IN ({$id_placeholders})",
 				$update_args
 			)
 		);
@@ -512,6 +622,61 @@ class Mobo_Core_Sync_Event_Store {
 	 * @param string $right Existing version.
 	 * @return int|null -1/0/1, or null when arrival order must be used.
 	 */
+	/**
+	 * Compare two persisted event payloads as desired-state evidence.
+	 * Transport/ordering metadata is removed because it is already represented by
+	 * the row identity/version contract; associative key order is canonicalized.
+	 *
+	 * @param string $left_json Left payload JSON.
+	 * @param string $right_json Right payload JSON.
+	 * @return bool
+	 */
+	private function event_payloads_equivalent( $left_json, $right_json ) {
+		$left  = json_decode( (string) $left_json, true );
+		$right = json_decode( (string) $right_json, true );
+		if ( ! is_array( $left ) || ! is_array( $right ) ) {
+			return hash_equals( (string) $left_json, (string) $right_json );
+		}
+		$left  = $this->canonicalize_event_payload_for_compare( $left );
+		$right = $this->canonicalize_event_payload_for_compare( $right );
+		$left_encoded  = wp_json_encode( $left, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		$right_encoded = wp_json_encode( $right, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		if ( false === $left_encoded || false === $right_encoded ) {
+			return false;
+		}
+		return hash_equals( hash( 'sha256', $left_encoded ), hash( 'sha256', $right_encoded ) );
+	}
+
+	/**
+	 * Canonicalize payload evidence without treating delivery metadata as state.
+	 *
+	 * @param mixed $value Payload value.
+	 * @return mixed
+	 */
+	private function canonicalize_event_payload_for_compare( $value ) {
+		if ( ! is_array( $value ) ) {
+			return $value;
+		}
+		if ( $this->is_list_array( $value ) ) {
+			$out = array();
+			foreach ( $value as $item ) {
+				$out[] = $this->canonicalize_event_payload_for_compare( $item );
+			}
+			return $out;
+		}
+
+		$ignored = array( 'syncid', 'eventid', 'event_id', 'webhookid', 'webhook_id', 'sourcerevision', 'revision', 'eventversion', '_moboeventversion', 'version', 'entityversion' );
+		$out     = array();
+		foreach ( $value as $key => $item ) {
+			if ( in_array( strtolower( (string) $key ), $ignored, true ) ) {
+				continue;
+			}
+			$out[ $key ] = $this->canonicalize_event_payload_for_compare( $item );
+		}
+		ksort( $out, SORT_STRING );
+		return $out;
+	}
+
 	private function compare_event_versions( $left, $right ) {
 	return Mobo_Core_Ordering_Policy::compare_versions( $left, $right );
 }
@@ -535,13 +700,15 @@ class Mobo_Core_Sync_Event_Store {
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$connection_id = self::connection_id();
 
 		$id = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT id FROM {$table}
-				WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				WHERE connection_id = %d AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))
 				LIMIT 1",
+				$connection_id,
 				$now,
 				$now
 			)
@@ -559,60 +726,123 @@ class Mobo_Core_Sync_Event_Store {
 	public function get_summary( $force = false ) {
 		global $wpdb;
 
-		if ( ! $force && is_array( self::$summary_cache ) ) {
-			return self::$summary_cache;
+		$connection_id = self::connection_id();
+		if ( ! $force && isset( self::$summary_cache[ $connection_id ] ) && is_array( self::$summary_cache[ $connection_id ] ) ) {
+			return self::$summary_cache[ $connection_id ];
 		}
 
 		$empty = array(
-			'pendingCount'         => 0,
+			'available'            => false,
+			'readFailed'           => false,
+			'pendingCount'         => 0, // Backward-compatible active count: pending + processing.
+			'queuedPendingCount'   => 0,
+			'processingCount'      => 0,
+			'activeCount'          => 0,
 			'dueCount'             => 0,
 			'failedCount'          => 0,
+			'actionableFailedCount'=> 0,
+			'historicalFailedCount'=> 0,
 			'oldestPendingAt'      => '',
 			'newestPendingUpdateAt'=> '',
 			'nextDeferredAt'       => '',
 		);
 
 		if ( ! self::table_exists() ) {
-			self::$summary_cache = $empty;
+			self::$summary_cache[ $connection_id ] = $empty;
 			return $empty;
 		}
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$wpdb->last_error = '';
 		$row   = $wpdb->get_row(
 			$wpdb->prepare(
 				"SELECT
-					SUM(CASE WHEN status IN ('pending','processing') THEN 1 ELSE 0 END) AS pending_count,
-					SUM(CASE WHEN (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s) THEN 1 ELSE 0 END) AS due_count,
-					SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-					MIN(CASE WHEN status IN ('pending','processing') THEN created_at ELSE NULL END) AS oldest_pending_at,
-					MAX(CASE WHEN status IN ('pending','processing') THEN updated_at ELSE NULL END) AS newest_pending_update_at,
-					MIN(CASE WHEN status = 'pending' AND next_retry_at IS NOT NULL AND next_retry_at > %s THEN next_retry_at ELSE NULL END) AS next_deferred_at
-				FROM {$table}
-				WHERE status IN ('pending','processing','failed')",
+					SUM(CASE WHEN e.status IN ('pending','processing') THEN 1 ELSE 0 END) AS active_count,
+					SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS queued_pending_count,
+					SUM(CASE WHEN e.status = 'processing' THEN 1 ELSE 0 END) AS processing_count,
+					SUM(CASE WHEN (e.status = 'pending' AND (e.next_retry_at IS NULL OR e.next_retry_at <= %s))
+						OR (e.status = 'processing' AND e.locked_until IS NOT NULL AND e.locked_until < %s) THEN 1 ELSE 0 END) AS due_count,
+					SUM(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+					MIN(CASE WHEN e.status IN ('pending','processing') THEN e.created_at ELSE NULL END) AS oldest_pending_at,
+					MAX(CASE WHEN e.status IN ('pending','processing') THEN e.updated_at ELSE NULL END) AS newest_pending_update_at,
+					MIN(CASE WHEN e.status = 'pending' AND e.next_retry_at IS NOT NULL AND e.next_retry_at > %s THEN e.next_retry_at ELSE NULL END) AS next_deferred_at
+				FROM {$table} e
+				WHERE e.connection_id = %d AND e.status IN ('pending','processing','failed')",
 				$now,
 				$now,
-				$now
+				$now,
+				$connection_id,
 			),
 			ARRAY_A
 		);
 
-		if ( ! is_array( $row ) ) {
-			self::$summary_cache = $empty;
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $row ) ) {
+			$empty['readFailed'] = true;
+			self::$summary_cache[ $connection_id ] = $empty;
 			return $empty;
 		}
 
-		self::$summary_cache = array(
-			'pendingCount'          => absint( isset( $row['pending_count'] ) ? $row['pending_count'] : 0 ),
+		$failed_total      = absint( isset( $row['failed_count'] ) ? $row['failed_count'] : 0 );
+		$failed_actionable = 0;
+
+		/*
+		 * Failed-event actionability must use the exact same ordering-aware
+		 * supersession policy as Retry Failed. A newer arrival is not enough:
+		 * a lower version or a different non-empty incomparable version can still
+		 * leave the failed row as the only recoverable desired state.
+		 *
+		 * The additional reads only run when failed rows exist, and the request
+		 * summary cache prevents repeated classification in the same request.
+		 */
+		if ( $failed_total > 0 ) {
+			$wpdb->last_error = '';
+			$failed_rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, event_type, entity_type, entity_guid, event_version
+					 FROM {$table}
+					 WHERE connection_id = %d AND status = 'failed'
+					 ORDER BY id ASC",
+					$connection_id
+				),
+				ARRAY_A
+			);
+
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $failed_rows ) ) {
+				$empty['readFailed'] = true;
+				self::$summary_cache[ $connection_id ] = $empty;
+				return $empty;
+			}
+
+			$classification = $this->classify_failed_rows_for_retry( $failed_rows, $table, $connection_id );
+			if ( ! empty( $classification['readFailed'] ) ) {
+				$empty['readFailed'] = true;
+				self::$summary_cache[ $connection_id ] = $empty;
+				return $empty;
+			}
+
+			$failed_total      = count( $failed_rows );
+			$failed_actionable = count( $classification['retryIds'] );
+		}
+
+		$active_count = absint( isset( $row['active_count'] ) ? $row['active_count'] : 0 );
+		self::$summary_cache[ $connection_id ] = array(
+			'available'             => true,
+			'readFailed'            => false,
+			'pendingCount'          => $active_count, // Backward-compatible alias used by scheduler pressure.
+			'queuedPendingCount'    => absint( isset( $row['queued_pending_count'] ) ? $row['queued_pending_count'] : 0 ),
+			'processingCount'       => absint( isset( $row['processing_count'] ) ? $row['processing_count'] : 0 ),
+			'activeCount'           => $active_count,
 			'dueCount'              => absint( isset( $row['due_count'] ) ? $row['due_count'] : 0 ),
-			'failedCount'           => absint( isset( $row['failed_count'] ) ? $row['failed_count'] : 0 ),
+			'failedCount'           => $failed_total, // Retained terminal history; backward compatibility.
+			'actionableFailedCount'=> $failed_actionable,
+			'historicalFailedCount'=> max( 0, $failed_total - $failed_actionable ),
 			'oldestPendingAt'       => isset( $row['oldest_pending_at'] ) ? (string) $row['oldest_pending_at'] : '',
 			'newestPendingUpdateAt' => isset( $row['newest_pending_update_at'] ) ? (string) $row['newest_pending_update_at'] : '',
 			'nextDeferredAt'        => isset( $row['next_deferred_at'] ) ? (string) $row['next_deferred_at'] : '',
 		);
 
-		return self::$summary_cache;
+		return self::$summary_cache[ $connection_id ];
 	}
 
 	/**
@@ -638,13 +868,15 @@ class Mobo_Core_Sync_Event_Store {
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$connection_id = self::connection_id();
 		$ids   = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT id FROM {$table}
-				WHERE (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
-					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
+				WHERE connection_id = %d AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
+					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$now,
 				$limit
@@ -659,12 +891,12 @@ class Mobo_Core_Sync_Event_Store {
 		$id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 		$locked_until    = gmdate( 'Y-m-d H:i:s', time() + $ttl );
 		$claim_token     = str_replace( '-', '', wp_generate_uuid4() );
-		$update_args     = array_merge( array( $locked_until, $claim_token, $now ), $ids, array( $now, $now ) );
+		$update_args     = array_merge( array( $locked_until, $claim_token, $now, $connection_id ), $ids, array( $now, $now ) );
 		$updated         = $wpdb->query(
 			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- $update_args contains two fixed values, dynamic %d ID replacements, and two trailing fixed values; wpdb::prepare() expands the single array at runtime.
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
-				WHERE id IN ({$id_placeholders})
+				WHERE connection_id = %d AND id IN ({$id_placeholders})
 					AND ((status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s))
 						OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))",
 				$update_args
@@ -677,13 +909,13 @@ class Mobo_Core_Sync_Event_Store {
 
 		self::invalidate_summary_cache();
 
-		$select_args = array_merge( $ids, array( $claim_token ) );
+		$select_args = array_merge( array( $connection_id ), $ids, array( $claim_token ) );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version, claim_token,
+				"SELECT id, connection_id, event_uuid, remote_event_id, event_type, entity_type, entity_guid, sync_id, event_version, claim_token,
 					try_count, expires_at, payload_json, created_at, updated_at
 				FROM {$table}
-				WHERE id IN ({$id_placeholders}) AND status = 'processing' AND claim_token = %s
+				WHERE connection_id = %d AND id IN ({$id_placeholders}) AND status = 'processing' AND claim_token = %s
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC",
 				$select_args
 			),
@@ -721,14 +953,16 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		$table  = self::table_name();
+		$connection_id = self::connection_id();
 		$id_sql = implode( ',', $ids );
 		$now    = current_time( 'mysql', true );
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'pending', locked_until = NULL, claim_token = '', updated_at = %s
-				WHERE status = 'processing' AND claim_token = %s AND id IN ({$id_sql})",
+				WHERE connection_id = %d AND status = 'processing' AND claim_token = %s AND id IN ({$id_sql})",
 				$now,
+				$connection_id,
 				$claim_token
 			)
 		);
@@ -757,11 +991,12 @@ class Mobo_Core_Sync_Event_Store {
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
+		$connection_id = self::connection_id();
 
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT * FROM {$table}
-				WHERE (
+				WHERE connection_id = %d AND ((
 					status = 'pending'
 					AND (next_retry_at IS NULL OR next_retry_at <= %s)
 				)
@@ -769,9 +1004,10 @@ class Mobo_Core_Sync_Event_Store {
 					status = 'processing'
 					AND locked_until IS NOT NULL
 					AND locked_until < %s
-				)
+				))
 				ORDER BY CASE WHEN event_type = 'ProductUpdated' THEN 0 ELSE 1 END, id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$now,
 				$limit
@@ -799,6 +1035,7 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		$table        = self::table_name();
+		$connection_id = self::connection_id();
 		$now          = current_time( 'mysql', true );
 		$locked_until = gmdate( 'Y-m-d H:i:s', time() + max( 30, absint( $ttl ) ) );
 		$claim_token  = str_replace( '-', '', wp_generate_uuid4() );
@@ -807,7 +1044,7 @@ class Mobo_Core_Sync_Event_Store {
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'processing', locked_until = %s, claim_token = %s, updated_at = %s
-				WHERE id = %d
+				WHERE id = %d AND connection_id = %d
 				AND (
 					status = 'pending'
 					OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s)
@@ -816,6 +1053,7 @@ class Mobo_Core_Sync_Event_Store {
 				$claim_token,
 				$now,
 				$id,
+				$connection_id,
 				$now
 			)
 		);
@@ -862,6 +1100,7 @@ class Mobo_Core_Sync_Event_Store {
 		}
 
 		return array(
+			'connectionId'  => isset( $row['connection_id'] ) ? absint( $row['connection_id'] ) : 0,
 			'id'            => isset( $row['event_uuid'] ) ? sanitize_text_field( (string) $row['event_uuid'] ) : '',
 			'eventVersion'  => $event_version,
 			'remoteEventId' => isset( $row['remote_event_id'] ) ? sanitize_text_field( (string) $row['remote_event_id'] ) : '',
@@ -947,14 +1186,19 @@ class Mobo_Core_Sync_Event_Store {
 	public function mark_pending_progress( $id, $payload, $progress = array(), $claim_token = '' ) {
 		$payload_json  = wp_json_encode( is_array( $payload ) ? $payload : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 		$progress_json = wp_json_encode( is_array( $progress ) ? $progress : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		/* Encoding failure must not erase the last durable resume checkpoint or
+		 * release ownership as if the replacement payload had been persisted. */
+		if ( false === $payload_json || false === $progress_json ) {
+			return false;
+		}
 		$defer_seconds = is_array( $progress ) && isset( $progress['deferSeconds'] ) ? absint( $progress['deferSeconds'] ) : 0;
 
 		return $this->update_status(
 			$id,
 			'pending',
 			array(
-				'payload_json'  => false === $payload_json ? '{}' : $payload_json,
-				'progress_json' => false === $progress_json ? '{}' : $progress_json,
+				'payload_json'  => $payload_json,
+				'progress_json' => $progress_json,
 				'locked_until'  => null,
 				'claim_token'   => '',
 				'next_retry_at' => $defer_seconds > 0 ? gmdate( 'Y-m-d H:i:s', time() + $defer_seconds ) : null,
@@ -1071,16 +1315,18 @@ class Mobo_Core_Sync_Event_Store {
 
 		$limit            = max( 1, min( 1000, absint( $limit ) ) );
 		$table            = self::table_name();
+		$connection_id    = self::connection_id();
 		$now              = current_time( 'mysql', true );
 		$stock_error_like = '%' . $wpdb->esc_like( 'stock' ) . '%';
 
 		$ids = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT id FROM {$table}
-				WHERE (status = 'processing' AND (locked_until IS NULL OR locked_until < %s))
-					OR (status = 'pending' AND try_count > 0 AND last_error LIKE %s)
+				WHERE connection_id = %d AND ((status = 'processing' AND (locked_until IS NULL OR locked_until < %s))
+					OR (status = 'pending' AND try_count > 0 AND last_error LIKE %s))
 				ORDER BY id ASC
 				LIMIT %d",
+				$connection_id,
 				$now,
 				$stock_error_like,
 				$limit
@@ -1092,14 +1338,22 @@ class Mobo_Core_Sync_Event_Store {
 			return 0;
 		}
 
+		/* Selection is not ownership: a worker can reclaim or complete a row
+		 * before this UPDATE. Recheck recovery eligibility atomically so a fresh
+		 * claim/terminal result is never reset by a stale maintenance snapshot. */
 		$id_sql  = implode( ',', $ids );
 		$updated = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
 				SET status = 'pending', try_count = 0, next_retry_at = NULL,
 					locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
-				WHERE id IN ({$id_sql})",
-				$now
+				WHERE connection_id = %d AND id IN ({$id_sql})
+					AND ((status = 'processing' AND (locked_until IS NULL OR locked_until < %s))
+						OR (status = 'pending' AND try_count > 0 AND last_error LIKE %s))",
+				$now,
+				$connection_id,
+				$now,
+				$stock_error_like
 			)
 		);
 
@@ -1109,6 +1363,133 @@ class Mobo_Core_Sync_Event_Store {
 
 		return false === $updated ? 0 : absint( $updated );
 	}
+
+	/**
+	 * Classify failed rows with the canonical version-aware supersession policy.
+	 *
+	 * Rows are grouped by queue identity so multiple failed rows for the same
+	 * entity share one bounded later-row read. Reading the newest 100 rows after
+	 * the earliest failed id is equivalent to the former per-failed-row LIMIT 100:
+	 * every later failed id sees either the same newest 100 candidates or a subset.
+	 *
+	 * @param array  $failed_rows Failed event rows.
+	 * @param string $table Event table.
+	 * @param int    $connection_id Connection ID.
+	 * @return array
+	 */
+	private function classify_failed_rows_for_retry( $failed_rows, $table, $connection_id ) {
+		global $wpdb;
+
+		$result = array(
+			'retryIds'      => array(),
+			'supersededIds' => array(),
+			'readFailed'    => false,
+		);
+
+		if ( empty( $failed_rows ) || ! is_array( $failed_rows ) ) {
+			return $result;
+		}
+
+		$groups = array();
+		foreach ( $failed_rows as $failed_row ) {
+			$failed_id   = absint( isset( $failed_row['id'] ) ? $failed_row['id'] : 0 );
+			$event_type  = sanitize_text_field( (string) ( isset( $failed_row['event_type'] ) ? $failed_row['event_type'] : '' ) );
+			$entity_type = sanitize_key( (string) ( isset( $failed_row['entity_type'] ) ? $failed_row['entity_type'] : '' ) );
+			$entity_guid = sanitize_text_field( (string) ( isset( $failed_row['entity_guid'] ) ? $failed_row['entity_guid'] : '' ) );
+
+			if ( $failed_id <= 0 ) {
+				continue;
+			}
+			if ( '' === $entity_guid ) {
+				$result['retryIds'][] = $failed_id;
+				continue;
+			}
+
+			$group_key = wp_json_encode( array( $event_type, $entity_type, $entity_guid ) );
+			if ( false === $group_key ) {
+				$group_key = $event_type . "\x1f" . $entity_type . "\x1f" . $entity_guid;
+			}
+			if ( ! isset( $groups[ $group_key ] ) ) {
+				$groups[ $group_key ] = array(
+					'eventType'  => $event_type,
+					'entityType' => $entity_type,
+					'entityGuid' => $entity_guid,
+					'minId'      => $failed_id,
+					'rows'       => array(),
+				);
+			}
+			$groups[ $group_key ]['minId'] = min( absint( $groups[ $group_key ]['minId'] ), $failed_id );
+			$groups[ $group_key ]['rows'][] = $failed_row;
+		}
+
+		foreach ( $groups as $group ) {
+			$wpdb->last_error = '';
+			$later_rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, event_version, status FROM {$table}
+					 WHERE connection_id = %d AND id > %d
+					   AND event_type = %s AND entity_type = %s AND entity_guid = %s
+					   AND status IN ('pending','processing','done','failed')
+					 ORDER BY id DESC LIMIT 100",
+					$connection_id,
+					absint( $group['minId'] ),
+					(string) $group['eventType'],
+					(string) $group['entityType'],
+					(string) $group['entityGuid']
+				),
+				ARRAY_A
+			);
+
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $later_rows ) ) {
+				$result['readFailed'] = true;
+				return $result;
+			}
+
+			foreach ( $group['rows'] as $failed_row ) {
+				$failed_id      = absint( isset( $failed_row['id'] ) ? $failed_row['id'] : 0 );
+				$failed_version = sanitize_text_field( (string) ( isset( $failed_row['event_version'] ) ? $failed_row['event_version'] : '' ) );
+				$superseded     = false;
+
+				foreach ( $later_rows as $later_row ) {
+					$later_id = absint( isset( $later_row['id'] ) ? $later_row['id'] : 0 );
+					if ( $later_id <= $failed_id ) {
+						continue;
+					}
+
+					$later_version = sanitize_text_field( (string) ( isset( $later_row['event_version'] ) ? $later_row['event_version'] : '' ) );
+					$comparison    = $this->compare_event_versions( $later_version, $failed_version );
+
+					if ( null !== $comparison ) {
+						if ( $comparison >= 0 ) {
+							$superseded = true;
+							break;
+						}
+						continue;
+					}
+
+					/* Legacy rows with no ordering evidence retain arrival-order fallback.
+					 * Two different non-empty incomparable versions do not: suppressing the
+					 * failed row in that case can permanently discard the only recoverable
+					 * newer desired state. */
+					if ( '' === $failed_version || '' === $later_version ) {
+						$superseded = true;
+						break;
+					}
+				}
+
+				if ( $superseded ) {
+					$result['supersededIds'][] = $failed_id;
+				} else {
+					$result['retryIds'][] = $failed_id;
+				}
+			}
+		}
+
+		$result['retryIds'] = array_values( array_unique( array_filter( array_map( 'absint', $result['retryIds'] ) ) ) );
+		$result['supersededIds'] = array_values( array_unique( array_filter( array_map( 'absint', $result['supersededIds'] ) ) ) );
+		return $result;
+	}
+
 
 	/**
 	 * Re-queue failed events for another attempt.
@@ -1123,41 +1504,85 @@ class Mobo_Core_Sync_Event_Store {
 			return 0;
 		}
 
-		$limit = max( 1, min( 1000, absint( $limit ) ) );
-		$table = self::table_name();
-		$now   = current_time( 'mysql', true );
+		$limit         = max( 1, min( 1000, absint( $limit ) ) );
+		$table         = self::table_name();
+		$connection_id = self::connection_id();
+		$now           = current_time( 'mysql', true );
 
-		$ids = $wpdb->get_col(
+		$wpdb->last_error = '';
+		$failed_rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id FROM {$table} WHERE status = 'failed' ORDER BY id ASC LIMIT %d",
+				"SELECT id, event_type, entity_type, entity_guid, event_version
+				 FROM {$table}
+				 WHERE connection_id = %d AND status = 'failed'
+				 ORDER BY id ASC LIMIT %d",
+				$connection_id,
 				$limit
-			)
+			),
+			ARRAY_A
 		);
 
-		if ( empty( $ids ) || ! is_array( $ids ) ) {
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $failed_rows ) ) {
+			return 0;
+		}
+		if ( empty( $failed_rows ) ) {
 			return 0;
 		}
 
-		$ids = array_map( 'absint', $ids );
-		$ids = array_filter( $ids );
+		$classification = $this->classify_failed_rows_for_retry( $failed_rows, $table, $connection_id );
+		if ( ! empty( $classification['readFailed'] ) ) {
+			return 0;
+		}
+
+		$ids            = $classification['retryIds'];
+		$superseded_ids = $classification['supersededIds'];
+
+		/* Superseded failed rows are durable historical evidence, but they are no
+		 * longer retryable work. Retire them so repeated maintenance runs cannot
+		 * starve recoverable failed rows behind the same already-superseded prefix. */
+		$superseded_updated = 0;
+		if ( ! empty( $superseded_ids ) ) {
+			$superseded_progress = wp_json_encode(
+				array(
+					'superseded' => true,
+					'reason'     => 'newer-or-equal-event-version',
+				),
+				JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+			);
+			$superseded_placeholders = implode( ',', array_fill( 0, count( $superseded_ids ), '%d' ) );
+			$superseded_params       = array_merge( array( false === $superseded_progress ? '{"superseded":true}' : $superseded_progress, $now, $connection_id ), $superseded_ids );
+			$superseded_result = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					 SET status = 'done', next_retry_at = NULL, locked_until = NULL, claim_token = '', last_error = NULL, progress_json = %s, updated_at = %s
+					 WHERE connection_id = %d AND status = 'failed' AND id IN ({$superseded_placeholders})",
+					$superseded_params
+				)
+			);
+			$superseded_updated = false === $superseded_result ? 0 : absint( $superseded_result );
+		}
 
 		if ( empty( $ids ) ) {
+			if ( ! empty( $superseded_ids ) ) {
+				self::invalidate_summary_cache();
+			}
 			return 0;
 		}
 
+		/* Another retry/worker may already have advanced a selected failed row.
+		 * Only rows still failed can be re-armed; never clear a newer live claim. */
 		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-		$params       = array_merge( array( $now ), $ids );
-
-		$updated = $wpdb->query(
+		$params       = array_merge( array( $now, $connection_id ), $ids );
+		$updated      = $wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table}
-				SET status = 'pending', try_count = 0, next_retry_at = NULL, locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
-				WHERE id IN ({$placeholders})",
+				 SET status = 'pending', try_count = 0, next_retry_at = NULL, locked_until = NULL, claim_token = '', last_error = NULL, updated_at = %s
+				 WHERE connection_id = %d AND status = 'failed' AND id IN ({$placeholders})",
 				$params
 			)
 		);
 
-		if ( false !== $updated && absint( $updated ) > 0 ) {
+		if ( $superseded_updated > 0 || ( false !== $updated && absint( $updated ) > 0 ) ) {
 			self::invalidate_summary_cache();
 		}
 
@@ -1184,9 +1609,11 @@ class Mobo_Core_Sync_Event_Store {
 
 		$table        = self::table_name();
 		$placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
-		$query        = "SELECT COUNT(*) FROM {$table} WHERE status IN ({$placeholders})";
+		$connection_id = self::connection_id();
+		$query        = "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status IN ({$placeholders})";
+		$args         = array_merge( array( $connection_id ), $statuses );
 
-		return absint( $wpdb->get_var( $wpdb->prepare( $query, $statuses ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
+		return absint( $wpdb->get_var( $wpdb->prepare( $query, $args ) ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name and placeholder list are generated internally; all status values are bound by wpdb::prepare().
 	}
 
 	/**
@@ -1201,6 +1628,7 @@ class Mobo_Core_Sync_Event_Store {
 		global $wpdb;
 
 		$id = absint( $id );
+		$connection_id = self::connection_id();
 
 		if ( $id <= 0 || ! self::table_exists() ) {
 			return false;
@@ -1240,15 +1668,16 @@ class Mobo_Core_Sync_Event_Store {
 				}
 			}
 			$args[] = $id;
+			$args[] = $connection_id;
 			$args[] = $claim_token;
 			$updated = empty( $sets ) ? false : $wpdb->query(
 				$wpdb->prepare(
-					"UPDATE {$table} SET " . implode( ', ', $sets ) . " WHERE id = %d AND status = 'processing' AND claim_token = %s",
+					"UPDATE {$table} SET " . implode( ', ', $sets ) . " WHERE id = %d AND connection_id = %d AND status = 'processing' AND claim_token = %s",
 					$args
 				)
 			);
 		} else {
-			$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id ), $formats, array( '%d' ) );
+			$updated = $wpdb->update( self::table_name(), $data, array( 'id' => $id, 'connection_id' => $connection_id ), $formats, array( '%d', '%d' ) );
 		}
 		if ( false !== $updated ) {
 			self::invalidate_summary_cache();

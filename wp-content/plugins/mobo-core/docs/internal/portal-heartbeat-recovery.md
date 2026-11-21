@@ -4,7 +4,7 @@
 
 `POST /wp-json/mobo-core/v1/heartbeat`
 
-Authentication uses the existing `X-SEC` security code. The response is explicitly marked `no-store` and includes `X-Mobo-Heartbeat: 1`, preventing a normal page/CDN cache from replacing the WordPress/PHP execution.
+Authentication uses the enabled Default Connection's `X-SEC` (the Installation Controller), because Heartbeat runs the shared installation-wide worker. Non-default Source credentials are intentionally rejected. The response is explicitly marked `no-store` and includes `X-Mobo-Heartbeat: 1`, preventing a normal page/CDN cache from replacing the WordPress/PHP execution.
 
 ## Execution model
 

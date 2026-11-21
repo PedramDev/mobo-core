@@ -20,4 +20,4 @@ Release date: 2026-08-01
 
 - No WordPress database migration is required.
 - Shared Media, Image Queue recovery, Webhook Queue, Sync, Repair, Remote Upgrade, and Upgrade Barrier behavior are unchanged.
-- The configured Portal URL remains `http://mobo.codeya.ir`.
+- The configured Portal URL remains `the provisioned Backend`.

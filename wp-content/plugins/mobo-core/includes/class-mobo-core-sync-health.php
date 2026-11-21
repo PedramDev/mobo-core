@@ -15,6 +15,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 final class Mobo_Core_Sync_Health {
 
+	/** Resolve the active/default Connection ownership boundary. */
+	private static function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
 	/** @var bool|null Request-local table existence cache. */
 	private static $table_exists_cache = null;
 
@@ -38,9 +43,10 @@ final class Mobo_Core_Sync_Health {
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
 		$table           = self::table_name();
-		$charset_collate = $wpdb->get_charset_collate();
+		$charset_collate = Mobo_Core_Database_Charset::schema_charset_collate();
 		$sql = "CREATE TABLE {$table} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			connection_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			product_guid varchar(191) NOT NULL,
 			wp_product_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			portal_product_id bigint(20) unsigned NOT NULL DEFAULT 0,
@@ -53,11 +59,11 @@ final class Mobo_Core_Sync_Health {
 			created_at datetime NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY product_guid (product_guid),
-			KEY wp_product_id (wp_product_id),
-			KEY portal_product_id (portal_product_id),
-			KEY sync_status (sync_status),
-			KEY portal_revision (portal_revision)
+			UNIQUE KEY product_guid (connection_id,product_guid(180)),
+			KEY wp_product_id (connection_id,wp_product_id),
+			KEY portal_product_id (connection_id,portal_product_id),
+			KEY sync_status (connection_id,sync_status),
+			KEY portal_revision (connection_id,portal_revision)
 		) {$charset_collate};";
 
 		dbDelta( $sql );
@@ -105,6 +111,169 @@ final class Mobo_Core_Sync_Health {
 	 */
 	public static function mark_failed( $guid, $wp_id = 0, $error = '', $revision = 0, $portal_id = 0, $version = '' ) {
 		return self::upsert_health( $guid, $wp_id, 'failed', $revision, '', $error, $portal_id, false, $version );
+	}
+
+
+	/**
+	 * Persist the specific terminal UpdateVariant evidence that operational Health
+	 * currently reads from the sync-event queue before retention deletes that row.
+	 *
+	 * This intentionally reuses the existing Health ordering fields instead of
+	 * introducing another evidence table. upsert_health() already rejects stale
+	 * revisions/versions, so an old retained event cannot regress newer state.
+	 *
+	 * @param array  $payload Event payload.
+	 * @param string $event_version Durable event ordering watermark.
+	 * @param string $error Stable terminal error.
+	 * @param string $entity_type Durable event entity type fallback.
+	 * @param string $entity_guid Durable event entity GUID fallback.
+	 * @return bool True when the event is either durably preserved or irrelevant.
+	 */
+	public static function preserve_terminal_update_variant_evidence( $payload, $event_version, $error, $entity_type = '', $entity_guid = '' ) {
+		$payload       = is_array( $payload ) ? $payload : array();
+		$event_version = sanitize_text_field( trim( (string) $event_version ) );
+		$error         = sanitize_textarea_field( (string) $error );
+		$entity_type   = sanitize_key( (string) $entity_type );
+		$entity_guid   = sanitize_text_field( (string) $entity_guid );
+
+		if ( 0 !== strpos( $error, 'Incomplete Mobo variant attributes.' ) ) {
+			return true;
+		}
+
+		$guid = self::extract_product_guid_recursive( $payload );
+		if ( '' === $guid && 'product' === $entity_type && preg_match( '/^[0-9a-f-]{32,36}$/i', $entity_guid ) ) {
+			$guid = $entity_guid;
+		}
+		if ( '' === $guid ) {
+			/* Operational Health could not consume this event either; retention may
+			 * remove it without losing a current ownership proof. */
+			return true;
+		}
+
+		$portal_id = self::extract_portal_product_id_recursive( $payload );
+		$revision  = self::extract_revision_recursive( $payload );
+		$version   = '' !== $event_version ? $event_version : self::extract_version_recursive( $payload );
+		if ( '' === $version && $revision > 0 ) {
+			$version = (string) $revision;
+		}
+		$wp_id = self::find_local_product_id( $guid, $portal_id );
+
+		$marked = self::mark_failed( $guid, $wp_id, $error, $revision, $portal_id, $version );
+		if ( ! $marked ) {
+			return false;
+		}
+
+		/* mark_failed() deliberately keeps an equal-version synced Health row sticky
+		 * unless the canonical product is explicitly incomplete. The live event queue
+		 * used to overlay terminal ownership even in that case. Before retention removes
+		 * the row, preserve just the terminal note on that exact Health boundary without
+		 * regressing sync_status. A newer Health boundary makes this old event irrelevant
+		 * and therefore safe to delete. */
+		return self::ensure_terminal_evidence_note( $guid, $error, $revision, $version );
+	}
+
+	/**
+	 * Ensure a current terminal event remains visible after queue retention.
+	 *
+	 * @param string $guid Product GUID.
+	 * @param string $error Stable terminal error.
+	 * @param int    $revision Event revision.
+	 * @param string $version Event version.
+	 * @return bool True when evidence is durable or the event is already stale.
+	 */
+	private static function ensure_terminal_evidence_note( $guid, $error, $revision, $version ) {
+		global $wpdb;
+
+		if ( ! self::table_exists() ) {
+			return false;
+		}
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 ) {
+			return false;
+		}
+		$table = self::table_name();
+		$wpdb->last_error = '';
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT id, portal_revision, portal_version, last_error FROM {$table} WHERE connection_id = %d AND product_guid = %s LIMIT 1",
+				$connection_id,
+				$guid
+			),
+			ARRAY_A
+		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $row ) ) {
+			return false;
+		}
+
+		$current_version = sanitize_text_field( (string) ( isset( $row['portal_version'] ) ? $row['portal_version'] : '' ) );
+		$current_revision = absint( isset( $row['portal_revision'] ) ? $row['portal_revision'] : 0 );
+		$version = sanitize_text_field( trim( (string) $version ) );
+		$revision = absint( $revision );
+
+		if ( '' !== $version && '' !== $current_version ) {
+			$cmp = self::compare_versions( $version, $current_version );
+			if ( -1 === $cmp ) {
+				return true;
+			}
+			if ( 1 === $cmp ) {
+				return false;
+			}
+		} elseif ( $revision > 0 && $current_revision > 0 ) {
+			if ( $revision < $current_revision ) {
+				return true;
+			}
+			if ( $revision > $current_revision ) {
+				return false;
+			}
+		}
+
+		$stored_error = (string) ( isset( $row['last_error'] ) ? $row['last_error'] : '' );
+		if ( 0 === strpos( $stored_error, 'Incomplete Mobo variant attributes.' ) ) {
+			return true;
+		}
+
+		$data = array( 'last_error' => sanitize_textarea_field( (string) $error ) );
+		$formats = array( '%s' );
+		/* An equal-revision sticky row can legitimately predate versioned Health.
+		 * Seed the exact event version only while the current field is still empty. */
+		if ( '' === $current_version && '' !== $version ) {
+			$data['portal_version'] = $version;
+			$formats[] = '%s';
+		}
+		$where = array(
+			'id'              => absint( $row['id'] ),
+			'connection_id'   => $connection_id,
+			'portal_revision' => $current_revision,
+			'portal_version'  => $current_version,
+		);
+		$written = $wpdb->update( $table, $data, $where, $formats, array( '%d', '%d', '%d', '%s' ) );
+		if ( false === $written ) {
+			return false;
+		}
+
+		$verify = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT portal_revision, portal_version, last_error FROM {$table} WHERE connection_id = %d AND product_guid = %s LIMIT 1",
+				$connection_id,
+				$guid
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $verify ) ) {
+			return false;
+		}
+		$verify_error = (string) ( isset( $verify['last_error'] ) ? $verify['last_error'] : '' );
+		$verify_version = sanitize_text_field( (string) ( isset( $verify['portal_version'] ) ? $verify['portal_version'] : '' ) );
+		if ( 0 !== strpos( $verify_error, 'Incomplete Mobo variant attributes.' ) ) {
+			return false;
+		}
+		if ( '' !== $version && '' !== $verify_version ) {
+			$cmp = self::compare_versions( $verify_version, $version );
+			if ( null !== $cmp && $cmp < 0 ) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -224,7 +393,8 @@ final class Mobo_Core_Sync_Health {
 		$counts = array( 'synced' => 0, 'behind' => 0, 'repairing' => 0, 'failed' => 0 );
 		if ( self::table_exists() ) {
 			$table = self::table_name();
-			$rows = $wpdb->get_results( "SELECT sync_status, COUNT(*) AS total FROM {$table} GROUP BY sync_status", ARRAY_A );
+			$connection_id = self::connection_id();
+			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT sync_status, COUNT(*) AS total FROM {$table} WHERE connection_id = %d GROUP BY sync_status", $connection_id ), ARRAY_A );
 			foreach ( is_array( $rows ) ? $rows : array() as $row ) {
 				$key = sanitize_key( (string) $row['sync_status'] );
 				if ( isset( $counts[ $key ] ) ) {
@@ -266,7 +436,7 @@ final class Mobo_Core_Sync_Health {
 	 *                             a full-catalog WooCommerce object walk.
 	 * @return array
 	 */
-	public static function get_operational_dashboard_status( $detail_limit = 15, $deep_structure = true ) {
+	public static function get_operational_dashboard_status( $detail_limit = 15, $deep_structure = true, $ignore_targeted_recovery_owner = false ) {
 		/* MOBO-HEALTH-SYNC-LICENSE-HARDENING-r2: durable operational snapshot. */
 		$mobo_operational_limit = max( 1, absint( $detail_limit ) );
 		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) && ! Mobo_Core_Health_Read_Cache::is_sync_refreshing() ) {
@@ -284,11 +454,15 @@ global $wpdb;
 
 		$operational = array(
 			'currentProducts'          => 0,
+			'monitoredProducts'        => 0,
+			'excludedByPolicy'         => 0,
 			'converged'                => 0,
 			'activeRetryOwner'         => 0,
 			'terminalUpstreamInvalid'  => 0,
 			'unownedConvergenceGap'    => 0,
+			'unverifiedHealthGap'       => 0,
 			'needsAttention'           => 0,
+			'needsVerification'        => 0,
 			'notFullyConverged'        => 0,
 			'historicalHealthResidue'  => 0,
 			'historicalNonLive'        => 0,
@@ -300,11 +474,20 @@ global $wpdb;
 		$result['operational'] = $operational;
 		$result['operationalStatus'] = 'unavailable';
 		$result['unownedRows'] = array();
+		$result['verificationRows'] = array();
 		$result['activeRetryRows'] = array();
 		$result['terminalRows'] = array();
 
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 ) {
+			$result['operationalReason'] = 'connection-unavailable';
+			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
+			return $result;
+		}
+
 		if ( ! class_exists( 'Mobo_Core_Product_Map' ) || ! Mobo_Core_Product_Map::table_exists() ) {
 			$result['operationalReason'] = 'product-map-unavailable';
+			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
 			return $result;
 		}
 
@@ -314,22 +497,32 @@ global $wpdb;
 			? ", h.id AS health_id, h.wp_product_id AS health_wp_product_id, h.portal_revision, h.portal_version, h.portal_hash, h.sync_status, h.last_error, h.updated_at AS health_updated_at"
 			: ", 0 AS health_id, 0 AS health_wp_product_id, 0 AS portal_revision, '' AS portal_version, '' AS portal_hash, '' AS sync_status, NULL AS last_error, NULL AS health_updated_at";
 		$health_join = '' !== $health_table
-			? " LEFT JOIN `{$health_table}` h ON h.product_guid = m.remote_guid"
+			? " LEFT JOIN `{$health_table}` h ON h.connection_id = m.connection_id AND h.product_guid = m.remote_guid"
 			: '';
 
+		$wpdb->last_error = '';
 		$rows = $wpdb->get_results(
-			"SELECT m.remote_guid, m.wp_post_id, m.last_hash AS map_last_hash, m.sync_incomplete AS map_sync_incomplete, m.updated_at AS map_updated_at{$health_select}
-			 FROM `{$map_table}` m
-			 INNER JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
-			 {$health_join}
-			 WHERE m.object_type = 'product'
-			   AND m.wp_post_id > 0
-			   AND p.post_type = 'product'
-			   AND p.post_status NOT IN ('trash','auto-draft')
-			 ORDER BY m.id ASC",
+			$wpdb->prepare(
+				"SELECT m.remote_guid, m.wp_post_id, m.last_hash AS map_last_hash, m.sync_incomplete AS map_sync_incomplete, m.updated_at AS map_updated_at{$health_select}
+				 FROM `{$map_table}` m
+				 INNER JOIN {$wpdb->posts} p ON p.ID = m.wp_post_id
+				 {$health_join}
+				 WHERE m.connection_id = %d
+				   AND m.object_type = 'product'
+				   AND m.wp_post_id > 0
+				   AND p.post_type = 'product'
+				   AND p.post_status NOT IN ('trash','auto-draft')
+				 ORDER BY m.id ASC",
+				$connection_id
+			),
 			ARRAY_A
 		);
-		$rows = is_array( $rows ) ? $rows : array();
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			$result['operationalStatus'] = 'unavailable';
+			$result['operationalReason'] = 'current-product-map-query-failed';
+			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
+			return $result;
+		}
 		$operational['currentProducts'] = count( $rows );
 
 		/* Prime product meta in one query to avoid per-product postmeta reads. */
@@ -345,7 +538,14 @@ global $wpdb;
 		}
 
 		$current_guids = array();
+		$health_scan_total = count( $rows );
+		$health_scan_processed = 0;
 		foreach ( $rows as $row ) {
+			$health_scan_processed++;
+			if ( ( 1 === $health_scan_processed || 0 === $health_scan_processed % 250 || $health_scan_processed === $health_scan_total )
+				&& has_action( 'mobo_core_sync_health_scan_progress' ) ) {
+				do_action( 'mobo_core_sync_health_scan_progress', $health_scan_processed, $health_scan_total, $deep_structure ? 'deep' : 'targeted' );
+			}
 			$guid = sanitize_text_field( (string) ( isset( $row['remote_guid'] ) ? $row['remote_guid'] : '' ) );
 			if ( '' !== $guid ) {
 				$current_guids[ $guid ] = true;
@@ -353,8 +553,34 @@ global $wpdb;
 		}
 
 		$event_ownership = self::load_operational_event_ownership();
+		if ( ! empty( $event_ownership['readFailed'] ) ) {
+			$result['operationalStatus'] = 'unavailable';
+			$result['operationalReason'] = 'sync-event-ownership-query-failed';
+			$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
+			return $result;
+		}
 		$active_events = isset( $event_ownership['active'] ) && is_array( $event_ownership['active'] ) ? $event_ownership['active'] : array();
 		$terminal_events = isset( $event_ownership['terminal'] ) && is_array( $event_ownership['terminal'] ) ? $event_ownership['terminal'] : array();
+		$targeted_recovery_guids = array();
+		$targeted_recovery_owns_unowned = false;
+		/* The worker's final reclassification must be able to observe its own
+		 * post-apply residuals and any newly-actionable rows that appeared while
+		 * the frozen target set was running. Ordinary dashboard callers keep the
+		 * active-owner view; only the targeted worker opts out at its completion
+		 * boundary. */
+		if ( ! $ignore_targeted_recovery_owner && class_exists( 'Mobo_Core_Product_Sync' ) ) {
+			$targeted_sync = new Mobo_Core_Product_Sync();
+			$targeted_state = $targeted_sync->get_manual_sync_state();
+			$targeted_status = sanitize_key( (string) ( $targeted_state['status'] ?? '' ) );
+			if ( ! empty( $targeted_state['targetedConvergenceOnly'] ) && in_array( $targeted_status, array( 'running', 'waiting_for_portal' ), true ) ) {
+				$targeted_recovery_owns_unowned = ! empty( $targeted_state['targetedConvergenceOwnsUnowned'] );
+				foreach ( (array) ( $targeted_state['targetedConvergenceTargets'] ?? array() ) as $target ) {
+					if ( ! is_array( $target ) ) { continue; }
+					$target_guid = sanitize_text_field( (string) ( $target['productGuid'] ?? '' ) );
+					if ( '' !== $target_guid ) { $targeted_recovery_guids[ $target_guid ] = true; }
+				}
+			}
+		}
 		$limit = max( 0, absint( $detail_limit ) );
 
 		foreach ( $rows as $row ) {
@@ -362,6 +588,16 @@ global $wpdb;
 			$product_id = absint( isset( $row['wp_post_id'] ) ? $row['wp_post_id'] : 0 );
 			$health_id = absint( isset( $row['health_id'] ) ? $row['health_id'] : 0 );
 			$health_status = sanitize_key( (string) ( isset( $row['sync_status'] ) ? $row['sync_status'] : '' ) );
+
+			/* A product intentionally excluded from source-driven mutation must not be
+			 * reported as a convergence failure merely because historical Health or
+			 * incomplete markers pre-date the exclusion. Keep it in current-product
+			 * accounting, but outside the active synchronization-health denominator. */
+			if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id, false ) ) {
+				$operational['excludedByPolicy']++;
+				continue;
+			}
+
 			$post_incomplete = '1' === (string) get_post_meta( $product_id, 'mobo_sync_incomplete', true );
 			$map_incomplete = ! empty( $row['map_sync_incomplete'] );
 			/* Target deep structure checks to rows that can affect operational health.
@@ -374,14 +610,29 @@ global $wpdb;
 			$local_sane = $structure_check_required
 				? self::local_product_structure_is_sane( $product_id )
 				: true;
-			$has_active_owner = '' !== $guid && ! empty( $active_events[ $guid ] );
+			$has_active_owner = '' !== $guid && ( ! empty( $active_events[ $guid ] ) || ! empty( $targeted_recovery_guids[ $guid ] ) );
 			$current_incomplete_signal = $post_incomplete
 				|| $map_incomplete
 				|| in_array( $health_status, array( 'behind', 'repairing', 'failed' ), true );
 			$terminal_candidates = '' !== $guid && isset( $terminal_events[ $guid ] ) && is_array( $terminal_events[ $guid ] )
 				? $terminal_events[ $guid ]
 				: array();
-			$terminal_event = ! empty( $terminal_candidates ) ? end( $terminal_candidates ) : array();
+			$durable_terminal_error = 0 === strpos( (string) ( isset( $row['last_error'] ) ? $row['last_error'] : '' ), 'Incomplete Mobo variant attributes.' );
+			$durable_terminal_version = sanitize_text_field( (string) ( isset( $row['portal_version'] ) ? $row['portal_version'] : '' ) );
+			if ( '' === $durable_terminal_version && absint( isset( $row['portal_revision'] ) ? $row['portal_revision'] : 0 ) > 0 ) {
+				$durable_terminal_version = (string) absint( $row['portal_revision'] );
+			}
+			$durable_terminal_event = $durable_terminal_error && '' !== $durable_terminal_version
+				? array(
+					'id'           => 0,
+					'eventVersion' => $durable_terminal_version,
+					'updatedAt'    => sanitize_text_field( (string) ( isset( $row['health_updated_at'] ) ? $row['health_updated_at'] : '' ) ),
+					'lastError'    => sanitize_textarea_field( (string) ( isset( $row['last_error'] ) ? $row['last_error'] : '' ) ),
+				)
+				: array();
+			$durable_terminal_current = ! empty( $durable_terminal_event )
+				&& self::terminal_event_matches_current_boundary( $durable_terminal_event, $row, $product_id );
+			$terminal_event = ! empty( $terminal_candidates ) ? end( $terminal_candidates ) : ( $durable_terminal_current ? $durable_terminal_event : array() );
 			/* current-boundary-terminal-owns-local-structure-gap
 			 * r4: a synced row can still be upstream-blocked when its durable local
 			 * variable structure is malformed. Do not accept any historical terminal
@@ -389,13 +640,19 @@ global $wpdb;
 			 * current product/Health ordering boundary. Existing explicit incomplete/
 			 * failed signals retain the r3 ownership semantics. */
 			$current_terminal_event = self::find_current_terminal_event( $terminal_candidates, $row, $product_id );
-			$terminal_matches_current_boundary = ! empty( $current_terminal_event );
-			if ( $terminal_matches_current_boundary ) {
+			$terminal_matches_current_boundary = ! empty( $current_terminal_event ) || $durable_terminal_current;
+			if ( ! empty( $current_terminal_event ) ) {
 				$terminal_event = $current_terminal_event;
+			} elseif ( $durable_terminal_current ) {
+				$terminal_event = $durable_terminal_event;
 			}
+			/* Terminal ownership is valid only at the current ordering boundary.
+			 * Historical terminal events must not indefinitely shield an incomplete
+			 * product after a newer reconnect/source snapshot supersedes them; such
+			 * rows become actionable again and can be adopted by targeted recovery. */
 			$has_terminal_upstream = ! $has_active_owner
-				&& ! empty( $terminal_candidates )
-				&& ( $current_incomplete_signal || ( ! $local_sane && $terminal_matches_current_boundary ) );
+				&& $terminal_matches_current_boundary
+				&& ( $current_incomplete_signal || ! $local_sane );
 
 			$detail = array(
 				'productGuid' => $guid,
@@ -437,8 +694,31 @@ global $wpdb;
 					continue;
 				}
 
+				/* A raw behind/failed Health row alone is not proof that the current
+				 * product is broken. When local durable markers say complete and the
+				 * targeted structure check is sane, classify it separately as an
+				 * unverified historical/current ambiguity instead of claiming a real
+				 * convergence gap. */
+				if ( ! $post_incomplete && ! $map_incomplete && $local_sane ) {
+					$operational['unverifiedHealthGap']++;
+					if ( count( $result['verificationRows'] ) < $limit ) {
+						$detail['classification'] = 'health-only-unverified';
+						$result['verificationRows'][] = $detail;
+					}
+					continue;
+				}
+
+				if ( $targeted_recovery_owns_unowned ) {
+					$operational['activeRetryOwner']++;
+					if ( count( $result['activeRetryRows'] ) < $limit ) {
+						$detail['classification'] = 'targeted-global-owner';
+						$result['activeRetryRows'][] = $detail;
+					}
+					continue;
+				}
 				$operational['unownedConvergenceGap']++;
 				if ( count( $result['unownedRows'] ) < $limit ) {
+					$detail['classification'] = 'verified-local-gap';
 					$result['unownedRows'][] = $detail;
 				}
 				continue;
@@ -452,6 +732,14 @@ global $wpdb;
 				continue;
 			}
 
+			if ( $targeted_recovery_owns_unowned ) {
+				$operational['activeRetryOwner']++;
+				if ( count( $result['activeRetryRows'] ) < $limit ) {
+					$detail['classification'] = 'targeted-global-owner';
+					$result['activeRetryRows'][] = $detail;
+				}
+				continue;
+			}
 			$operational['unownedConvergenceGap']++;
 			if ( count( $result['unownedRows'] ) < $limit ) {
 				$result['unownedRows'][] = $detail;
@@ -462,11 +750,18 @@ global $wpdb;
 		 * historical/non-live observations. They remain queryable but are excluded
 		 * from operational product-health counts. */
 		if ( '' !== $health_table ) {
+			$wpdb->last_error = '';
 			$incomplete_rows = $wpdb->get_results(
-				"SELECT product_guid FROM `{$health_table}` WHERE sync_status IN ('behind','repairing','failed')",
+				$wpdb->prepare( "SELECT product_guid FROM `{$health_table}` WHERE connection_id = %d AND sync_status IN ('behind','repairing','failed')", $connection_id ),
 				ARRAY_A
 			);
-			foreach ( is_array( $incomplete_rows ) ? $incomplete_rows : array() as $health_row ) {
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $incomplete_rows ) ) {
+				$result['operationalStatus'] = 'unavailable';
+				$result['operationalReason'] = 'sync-health-history-query-failed';
+				$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
+				return $result;
+			}
+			foreach ( $incomplete_rows as $health_row ) {
 				$guid = sanitize_text_field( (string) ( isset( $health_row['product_guid'] ) ? $health_row['product_guid'] : '' ) );
 				if ( '' === $guid || empty( $current_guids[ $guid ] ) ) {
 					$operational['historicalNonLive']++;
@@ -474,16 +769,23 @@ global $wpdb;
 			}
 		}
 
+		/* Only durable current-state evidence belongs in operational attention. A raw
+		 * Health-only discrepancy is audit evidence, not proof that the live product
+		 * needs mutation or Repair. Keep it in a separate verification denominator. */
+		$operational['monitoredProducts'] = max( 0, absint( $operational['currentProducts'] ) - absint( $operational['excludedByPolicy'] ) );
 		$operational['needsAttention'] = absint( $operational['activeRetryOwner'] ) + absint( $operational['unownedConvergenceGap'] );
-		$operational['notFullyConverged'] = absint( $operational['needsAttention'] ) + absint( $operational['terminalUpstreamInvalid'] );
+		$operational['needsVerification'] = absint( $operational['unverifiedHealthGap'] );
+		$operational['notFullyConverged'] = absint( $operational['needsAttention'] ) + absint( $operational['needsVerification'] ) + absint( $operational['terminalUpstreamInvalid'] );
 		$operational['historicalExcluded'] = absint( $operational['historicalHealthResidue'] ) + absint( $operational['historicalNonLive'] );
 
 		/* Keep the current-product accounting closed. Any future classifier branch
 		 * that forgets to account for a mapped live product becomes visible here. */
-		$accounted = absint( $operational['converged'] )
+		$accounted = absint( $operational['excludedByPolicy'] )
+			+ absint( $operational['converged'] )
 			+ absint( $operational['activeRetryOwner'] )
 			+ absint( $operational['terminalUpstreamInvalid'] )
-			+ absint( $operational['unownedConvergenceGap'] );
+			+ absint( $operational['unownedConvergenceGap'] )
+			+ absint( $operational['unverifiedHealthGap'] );
 		$operational['accountingDelta'] = absint( $operational['currentProducts'] ) - $accounted;
 
 		$result['operational'] = $operational;
@@ -491,7 +793,7 @@ global $wpdb;
 		$result['pendingRepair'] = absint( $operational['needsAttention'] ); // Backward-compatible field; no Repair is scheduled.
 		$result['operationalStatus'] = $operational['accountingDelta'] !== 0
 			? 'accounting-error'
-			: ( $operational['unownedConvergenceGap'] > 0 ? 'degraded-unowned' : ( $operational['activeRetryOwner'] > 0 ? 'progressing' : ( $operational['terminalUpstreamInvalid'] > 0 ? 'blocked-upstream' : 'clear' ) ) );
+			: ( $operational['unownedConvergenceGap'] > 0 ? 'degraded-unowned' : ( $operational['unverifiedHealthGap'] > 0 ? 'needs-verification' : ( $operational['activeRetryOwner'] > 0 ? 'progressing' : ( $operational['terminalUpstreamInvalid'] > 0 ? 'blocked-upstream' : 'clear' ) ) ) );
 		$result['operationalReason'] = 'current-product-map';
 		$result['structureAuditMode'] = $deep_structure ? 'deep' : 'targeted';
 
@@ -508,25 +810,32 @@ global $wpdb;
 	 */
 	private static function load_operational_event_ownership() {
 		global $wpdb;
-		$out = array( 'active' => array(), 'terminal' => array() );
+		$out = array( 'active' => array(), 'terminal' => array(), 'readFailed' => false );
 		if ( ! class_exists( 'Mobo_Core_Sync_Event_Store' ) || ! Mobo_Core_Sync_Event_Store::table_exists() ) {
 			return $out;
 		}
 
 		$table = preg_replace( '/[^A-Za-z0-9_]/', '', Mobo_Core_Sync_Event_Store::table_name() );
+		$connection_id = self::connection_id();
+		$wpdb->last_error = '';
 		$rows = $wpdb->get_results(
-			"SELECT id, event_type, entity_type, entity_guid, event_version, status, try_count, payload_json, last_error, updated_at
+			$wpdb->prepare( "SELECT id, event_type, entity_type, entity_guid, event_version, status, try_count, payload_json, last_error, updated_at
 			 FROM `{$table}`
-			 WHERE event_type IN ('ProductUpdated','UpdateVariant')
+			 WHERE connection_id = %d
+			   AND event_type IN ('ProductUpdated','UpdateVariant')
 			   AND (
 				status IN ('pending','processing')
 				OR (event_type='UpdateVariant' AND status='failed' AND try_count>=5 AND last_error LIKE 'Incomplete Mobo variant attributes.%')
 			   )
-			 ORDER BY id ASC",
+			 ORDER BY id ASC", $connection_id ),
 			ARRAY_A
 		);
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			$out['readFailed'] = true;
+			return $out;
+		}
 
-		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+		foreach ( $rows as $row ) {
 			$event_type = sanitize_text_field( (string) ( isset( $row['event_type'] ) ? $row['event_type'] : '' ) );
 			$status = sanitize_key( (string) ( isset( $row['status'] ) ? $row['status'] : '' ) );
 			$payload = json_decode( (string) ( isset( $row['payload_json'] ) ? $row['payload_json'] : '' ), true );
@@ -849,8 +1158,12 @@ global $wpdb;
 		}
 
 		$table = self::table_name();
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 ) {
+			return false;
+		}
 		$now = current_time( 'mysql', true );
-		$existing = $wpdb->get_row( $wpdb->prepare( "SELECT id, wp_product_id, portal_product_id, portal_revision, portal_version, portal_hash, sync_status FROM {$table} WHERE product_guid = %s LIMIT 1", $guid ), ARRAY_A );
+		$existing = $wpdb->get_row( $wpdb->prepare( "SELECT id, wp_product_id, portal_product_id, portal_revision, portal_version, portal_hash, sync_status FROM {$table} WHERE connection_id = %d AND product_guid = %s LIMIT 1", $connection_id, $guid ), ARRAY_A );
 		$row_id = is_array( $existing ) ? absint( $existing['id'] ) : 0;
 		$wp_id = absint( $wp_id );
 		$portal_id = absint( $portal_id );
@@ -887,6 +1200,12 @@ global $wpdb;
 		 * Equal-revision terminal success remains sticky otherwise. */
 		if ( '' !== $existing_version ) {
 			$version_cmp = self::compare_versions( $version, $existing_version );
+			if ( '' !== $version && null === $version_cmp && $version !== $existing_version ) {
+				/* Two different non-empty incomparable watermarks are not safely ordered.
+				 * Keep the durable Health boundary unchanged rather than letting arrival
+				 * order regress or advance state without proof. */
+				return false;
+			}
 			if ( -1 === $version_cmp ) {
 				return true;
 			}
@@ -910,6 +1229,7 @@ global $wpdb;
 		}
 
 		$data = array(
+			'connection_id'    => $connection_id,
 			'product_guid'      => $guid,
 			'wp_product_id'     => $wp_id > 0 ? $wp_id : ( is_array( $existing ) ? absint( $existing['wp_product_id'] ) : 0 ),
 			'portal_product_id' => $portal_id > 0 ? $portal_id : ( is_array( $existing ) ? absint( $existing['portal_product_id'] ) : 0 ),
@@ -924,7 +1244,7 @@ global $wpdb;
 			$data['last_successful_sync_time'] = $now;
 		}
 		if ( $row_id ) {
-			$written = $wpdb->update( $table, $data, array( 'id' => $row_id ) );
+			$written = $wpdb->update( $table, $data, array( 'id' => $row_id, 'connection_id' => $connection_id ) );
 		} else {
 			$data['created_at'] = $now;
 			if ( ! isset( $data['last_successful_sync_time'] ) ) {
@@ -940,7 +1260,8 @@ global $wpdb;
 		 * the canonical table row before mirroring convenience metadata to posts. */
 		$persisted = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT product_guid, wp_product_id, portal_product_id, portal_revision, portal_version, portal_hash, sync_status FROM {$table} WHERE product_guid = %s LIMIT 1",
+				"SELECT product_guid, wp_product_id, portal_product_id, portal_revision, portal_version, portal_hash, sync_status FROM {$table} WHERE connection_id = %d AND product_guid = %s LIMIT 1",
+				$connection_id,
 				$guid
 			),
 			ARRAY_A
@@ -987,10 +1308,11 @@ global $wpdb;
 			return 0;
 		}
 		$table = self::table_name();
+		$connection_id = self::connection_id();
 		if ( '' !== $guid ) {
-			$id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT wp_product_id FROM {$table} WHERE product_guid = %s LIMIT 1", $guid ) ) );
+			$id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT wp_product_id FROM {$table} WHERE connection_id = %d AND product_guid = %s LIMIT 1", $connection_id, $guid ) ) );
 		} elseif ( $portal_id > 0 ) {
-			$id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT wp_product_id FROM {$table} WHERE portal_product_id = %d AND wp_product_id > 0 ORDER BY updated_at DESC, id DESC LIMIT 1", $portal_id ) ) );
+			$id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT wp_product_id FROM {$table} WHERE connection_id = %d AND portal_product_id = %d AND wp_product_id > 0 ORDER BY updated_at DESC, id DESC LIMIT 1", $connection_id, $portal_id ) ) );
 		} else {
 			$id = 0;
 		}

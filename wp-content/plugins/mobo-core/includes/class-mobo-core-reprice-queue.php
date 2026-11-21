@@ -39,6 +39,49 @@ class Mobo_Core_Reprice_Queue {
 	}
 
 	/**
+	 * Fingerprint calculator-affecting global settings for one Reprice generation.
+	 *
+	 * @return string
+	 */
+	private function current_policy_fingerprint() {
+		$policy = array(
+			'autoCompare' => (string) Mobo_Core_Settings::get( 'global_product_auto_compare_price', '0' ),
+			'type'        => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
+			'fixed'       => (string) Mobo_Core_Settings::get( 'global_additional_price', '0' ),
+			'percentage'  => (string) Mobo_Core_Settings::get( 'global_additional_percentage', '0' ),
+			'dynamic'     => (string) Mobo_Core_Settings::get( 'mobo_dynamic_price', '[]' ),
+		);
+
+		/* C75B-P4G: Currency is part of a Reprice generation, not merely a
+		 * rendering preference. Read the RAW option: an unsaved default must
+		 * never look equivalent to an explicit admin opt-in (including 'store').
+		 * These are already-read WP/WC settings, not extra per-item SQL scans. */
+		$currency_preference = class_exists( 'Mobo_Core_Money_Target_Settings' )
+			? get_option( Mobo_Core_Money_Target_Settings::OPTION, null )
+			: null;
+		$policy['currencyPreferenceSaved'] = null !== $currency_preference;
+		$policy['currencyPreference']      = is_string( $currency_preference ) ? $currency_preference : '';
+		$policy['wooCurrency']             = function_exists( 'get_woocommerce_currency' )
+			? (string) get_woocommerce_currency() : '';
+		$policy['wooPriceDecimals']        = function_exists( 'wc_get_price_decimals' )
+			? (int) wc_get_price_decimals() : -1;
+
+		return hash( 'sha256', wp_json_encode( $policy ) );
+	}
+
+	/**
+	 * Whether the stored generation still represents the current global policy.
+	 * Old states without a fingerprint are treated as stale rather than resumable.
+	 *
+	 * @param array $state Reprice state.
+	 * @return bool
+	 */
+	private function generation_matches_current_policy( $state ) {
+		$fingerprint = isset( $state['policyFingerprint'] ) ? trim( (string) $state['policyFingerprint'] ) : '';
+		return '' !== $fingerprint && hash_equals( $fingerprint, $this->current_policy_fingerprint() );
+	}
+
+	/**
 	 * Start a new repricing run.
 	 *
 	 * @param string $source Source label.
@@ -51,6 +94,18 @@ class Mobo_Core_Reprice_Queue {
 		}
 
 		try {
+		/* UX55: Never overwrite a generation that advanced its variation cursor
+		 * while still owing a durable variable-parent recalculation. */
+		$previous = $this->get_state();
+		if ( ! empty( $previous['pendingParentIds'] ) ) {
+			$parents_ready = $this->finalize_pending_parents( $previous );
+			if ( ! $this->persist_state_verified( $previous ) ) {
+				return array( 'success' => false, 'status' => 'checkpoint-failed' );
+			}
+			if ( ! $parents_ready ) {
+				return array( 'success' => false, 'status' => 'parent-finalize-pending', 'message' => $previous['lastMessage'] );
+			}
+		}
 		/* MOBO-4455: a failed COUNT read must not create a false zero-total generation. */
 		$total = $this->count_items();
 		if ( is_wp_error( $total ) ) {
@@ -74,8 +129,10 @@ class Mobo_Core_Reprice_Queue {
 			'startedAt'    => time(),
 			'updatedAt'    => time(),
 			'completedAt'  => 0,
-			'policyType'   => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
-			'failureAttempts' => array(),
+			'policyType'        => (string) Mobo_Core_Settings::get( 'mobo_price_type', 'static-price' ),
+			'policyFingerprint' => $this->current_policy_fingerprint(),
+			'failureAttempts'   => array(),
+			'pendingParentIds' => array(),
 		);
 
 		if ( ! $this->persist_state_verified( $state ) ) {
@@ -145,6 +202,15 @@ class Mobo_Core_Reprice_Queue {
 				return array( 'success' => false, 'status' => $state['status'], 'message' => 'فقط عملیات قیمت‌گذاری متوقف‌شده قابل ادامه است.' );
 			}
 
+			if ( ! $this->generation_matches_current_policy( $state ) ) {
+				$state['status']      = 'invalidated';
+				$state['lastError']   = '';
+				$state['lastMessage'] = 'سیاست قیمت‌گذاری پس از توقف تغییر کرده است؛ ادامه checkpoint قبلی امن نیست و باید اجرای جدید از ابتدا شروع شود.';
+				$state['updatedAt']   = time();
+				$this->persist_state_verified( $state );
+				return array( 'success' => false, 'status' => 'invalidated', 'message' => $state['lastMessage'] );
+			}
+
 			$state['status']       = 'running';
 			$state['completedAt']  = 0;
 			$state['updatedAt']    = time();
@@ -176,9 +242,10 @@ class Mobo_Core_Reprice_Queue {
 		}
 
 		try {
-		delete_option( self::STATE_OPTION );
-		wp_cache_delete( self::STATE_OPTION, 'options' );
-		if ( null !== get_option( self::STATE_OPTION, null ) ) {
+		if ( ! class_exists( 'Mobo_Core_State_Store' ) || ! Mobo_Core_State_Store::is_available() || ! Mobo_Core_State_Store::delete( self::STATE_OPTION ) ) {
+			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'پاک‌سازی وضعیت صف در دیتابیس تأیید نشد.' );
+		}
+		if ( null !== Mobo_Core_State_Store::get( self::STATE_OPTION, null ) ) {
 			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'پاک‌سازی وضعیت صف در دیتابیس تأیید نشد.' );
 		}
 
@@ -231,6 +298,35 @@ class Mobo_Core_Reprice_Queue {
 
 		try {
 			$state = $this->get_state();
+
+			/* Recover a parent pending from an earlier crash before changing generation
+			 * or moving beyond lastPostId. A repeated WC parent sync is idempotent. */
+			if ( ! empty( $state['pendingParentIds'] ) ) {
+				$parents_ready = $this->finalize_pending_parents( $state );
+				$state['updatedAt'] = time();
+				if ( ! $this->persist_state_verified( $state ) ) {
+					return array( 'success' => false, 'status' => 'checkpoint-failed', 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true );
+				}
+				if ( ! $parents_ready ) {
+					return array( 'success' => false, 'status' => 'parent-finalize-pending', 'processed' => 0, 'updated' => 0, 'failed' => 0, 'remaining' => true );
+				}
+			}
+
+			if ( 'running' === $state['status'] && ! $this->generation_matches_current_policy( $state ) ) {
+				$state['status']      = 'invalidated';
+				$state['lastError']   = '';
+				$state['lastMessage'] = 'سیاست قیمت‌گذاری در طول اجرای Reprice تغییر کرد. اجرای قبلی متوقف شد؛ برای جلوگیری از قیمت‌های مخلوط، یک اجرای جدید از ابتدا شروع کنید.';
+				$state['updatedAt']   = time();
+				$this->persist_state_verified( $state );
+				return array(
+					'processed' => 0,
+					'updated'   => 0,
+					'failed'    => 0,
+					'remaining' => false,
+					'status'    => 'invalidated',
+					'message'   => $state['lastMessage'],
+				);
+			}
 
 		if ( 'running' !== $state['status'] ) {
 			return array(
@@ -291,7 +387,7 @@ class Mobo_Core_Reprice_Queue {
 		$processed = 0;
 		$updated   = 0;
 		$failed    = 0;
-		$parents_to_sync = array();
+		$policy_changed_mid_batch = false;
 
 		$paused_for_upgrade = false;
 		$budget_exhausted   = false;
@@ -302,6 +398,12 @@ class Mobo_Core_Reprice_Queue {
 		$checkpoint_seconds = 2.0;
 
 		foreach ( $ids as $post_id ) {
+			/* A settings change after this batch began must not be silently declared
+			 * converged under the old policy generation. */
+			if ( ! $this->generation_matches_current_policy( $state ) ) {
+				$policy_changed_mid_batch = true;
+				break;
+			}
 			if ( class_exists( 'Mobo_Core_Upgrade_Coordinator' ) && Mobo_Core_Upgrade_Coordinator::is_active() ) {
 				$paused_for_upgrade = true;
 				break;
@@ -336,11 +438,12 @@ class Mobo_Core_Reprice_Queue {
 				}
 
 				if ( ! empty( $result['parentId'] ) ) {
-					$parents_to_sync[ absint( $result['parentId'] ) ] = true;
+					$parent_id = absint( $result['parentId'] );
+					$state['pendingParentIds'][ (string) $parent_id ] = $parent_id;
 				}
 			} catch ( Throwable $e ) {
 				$failed++;
-				$state['lastError'] = sanitize_text_field( $e->getMessage() );
+				$state['lastError'] = 'Reprice item ' . $post_id . ' failed (' . sanitize_key( get_class( $e ) ) . ').';
 				$key = (string) $post_id;
 				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
 				$state['failureAttempts'][ $key ] = $attempts;
@@ -379,28 +482,32 @@ class Mobo_Core_Reprice_Queue {
 			}
 		}
 
-		foreach ( array_keys( $parents_to_sync ) as $parent_id ) {
-			if ( function_exists( 'wc_get_product' ) && class_exists( 'WC_Product_Variable' ) ) {
-				try {
-					WC_Product_Variable::sync( absint( $parent_id ) );
-					wc_delete_product_transients( absint( $parent_id ) );
-				} catch ( Throwable $e ) {
-					$failed++;
-					$state['lastError'] = 'خطا در sync محصول متغیر ' . absint( $parent_id ) . ': ' . sanitize_text_field( $e->getMessage() );
-					Mobo_Core_Logger::error( 'Mobo Core reprice parent sync failed for product ' . absint( $parent_id ) . ': ' . $e->getMessage() );
-				}
-			}
+		/* Parent IDs are persisted with the same checkpoint as lastPostId. A crash
+		 * after the cursor save can no longer lose an outstanding derived-price sync. */
+		$parents_ready = $this->finalize_pending_parents( $state );
+		if ( ! $parents_ready ) {
+			$retry_blocked = true;
+		}
+		if ( ! $this->generation_matches_current_policy( $state ) ) {
+			$policy_changed_mid_batch = true;
 		}
 
 		$state['processed']   = absint( $state['processed'] ) + $processed;
 		$state['updated']     = absint( $state['updated'] ) + $updated;
 		$state['failed']      = absint( $state['failed'] ) + $failed;
 		$state['updatedAt']   = time();
-		$state['lastMessage'] = sprintf( 'در این مرحله %d مورد بررسی شد؛ %d مورد به‌روزرسانی شد.', $processed, $updated );
+		if ( $parents_ready ) {
+			$state['lastMessage'] = sprintf( 'در این مرحله %d مورد بررسی شد؛ %d مورد به‌روزرسانی شد.', $processed, $updated );
+		}
 
-		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || $checkpoint_failed || count( $ids ) >= $limit;
+		$remaining = $paused_for_upgrade || $budget_exhausted || $retry_blocked || $checkpoint_failed || count( $ids ) >= $limit || ! empty( $state['pendingParentIds'] );
 
-		if ( ! $remaining ) {
+		if ( $policy_changed_mid_batch && ! $checkpoint_failed && empty( $state['pendingParentIds'] ) ) {
+			$state['status'] = 'invalidated';
+			$state['lastMessage'] = 'The Reprice policy changed during this batch; begin a new generation.';
+			$state['completedAt'] = 0;
+			$remaining = false;
+		} elseif ( ! $remaining ) {
 			$state['status']      = 'done';
 			$state['lastMessage'] = 'اعمال مجدد سیاست قیمت‌گذاری کامل شد.';
 			$state['completedAt'] = time();
@@ -416,7 +523,7 @@ class Mobo_Core_Reprice_Queue {
 			'updated'   => $updated,
 			'failed'    => $failed,
 			'remaining' => $remaining,
-			'status'    => $checkpoint_failed ? 'checkpoint-failed' : ( $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ) ),
+			'status'    => $checkpoint_failed ? 'checkpoint-failed' : ( ! $parents_ready ? 'parent-finalize-pending' : ( $paused_for_upgrade ? 'paused-for-upgrade' : ( $budget_exhausted ? 'budget-exhausted' : $state['status'] ) ) ),
 			'checkpointFailed' => $checkpoint_failed,
 			'budgetExhausted' => $budget_exhausted,
 			'retryBlocked'    => $retry_blocked,
@@ -429,9 +536,68 @@ class Mobo_Core_Reprice_Queue {
 	}
 
 
-	/** Persist queue state and verify the exact value from wp_options. */
+	/**
+	 * Flush parent recalculations recorded alongside a durable Reprice cursor.
+	 * Returns false without clearing a pending parent when its lock, owner,
+	 * WooCommerce sync or cache invalidation fails; retry remains bounded by
+	 * the normal worker budget and cannot be skipped by a later cursor page.
+	 */
+	private function finalize_pending_parents( &$state ) {
+		$pending = isset( $state['pendingParentIds'] ) && is_array( $state['pendingParentIds'] ) ? $state['pendingParentIds'] : array();
+		foreach ( $pending as $key => $pending_id ) {
+			$parent_id = absint( $pending_id );
+			if ( $parent_id <= 0 || ! function_exists( 'wc_get_product' ) || ! is_callable( array( 'WC_Product_Variable', 'sync' ) ) ) {
+				$state['lastError'] = 'Reprice pending parent finalization is unavailable.';
+				$state['lastMessage'] = 'Parent finalization remains pending; an operator must check the parent target.';
+				return false;
+			}
+			/* Never reconcile an object re-owned by another Source. */
+			$post = get_post( $parent_id );
+			if ( ! $post || ! $this->is_owned_by_current_connection( $post ) ) {
+				$state['lastError'] = 'Reprice parent ' . $parent_id . ' no longer belongs to this Connection.';
+				$state['lastMessage'] = 'Parent owner mismatch; pending result was preserved.';
+				return false;
+			}
+			$product_guid = $this->get_product_guid_for_lock( $parent_id );
+			/* A missing GUID/lock service must not downgrade this parent to an
+			 * unprotected WC sync that could race an active product/stock writer. */
+			if ( '' === $product_guid || ! class_exists( 'Mobo_Core_Product_Concurrency' ) ) {
+				$state['lastMessage'] = 'Parent lock identity is unavailable; durable finalization remains pending.';
+				return false;
+			}
+			if ( Mobo_Core_Product_Concurrency::is_manual_sync_busy_for_product( $product_guid ) ) {
+				$state['lastMessage'] = 'Parent finalization deferred for an active product sync.';
+				return false;
+			}
+			$lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 120 );
+			if ( false === $lock ) {
+				$state['lastMessage'] = 'Parent finalization awaits the shared product lock.';
+				return false;
+			}
+			try {
+				WC_Product_Variable::sync( $parent_id );
+				wc_delete_product_transients( $parent_id );
+				unset( $state['pendingParentIds'][ $key ] );
+			} catch ( Throwable $e ) {
+				$state['lastError'] = 'Parent ' . $parent_id . ' finalization failed (' . sanitize_key( get_class( $e ) ) . ').';
+				$state['lastMessage'] = 'A durable parent finalization remains pending.';
+				Mobo_Core_Logger::error( 'Mobo Core reprice parent finalization failed for product ' . $parent_id . ' (' . sanitize_key( get_class( $e ) ) . ').' );
+				return false;
+			} finally {
+				if ( false !== $lock ) {
+					Mobo_Core_Product_Concurrency::release_product_lock( $lock );
+				}
+			}
+		}
+		return true;
+	}
+
+	/** Persist queue state in the current Connection-owned state row. */
 	private function persist_state_verified( $state ) {
-		return is_array( $state ) && Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
+		return is_array( $state )
+			&& class_exists( 'Mobo_Core_State_Store' )
+			&& Mobo_Core_State_Store::is_available()
+			&& Mobo_Core_State_Store::set( self::STATE_OPTION, $state );
 	}
 
 	/**
@@ -442,27 +608,43 @@ class Mobo_Core_Reprice_Queue {
 	public function get_status() {
 		$state = $this->get_state();
 		$total = absint( $state['total'] );
+		$total_available = true;
+		$total_error = '';
 
-		if ( $total <= 0 && in_array( $state['status'], array( 'idle', 'done' ), true ) ) {
-			$total = $this->count_items();
+		if ( $total <= 0 && in_array( $state['status'], array( 'idle', 'done', 'cancelled', 'invalidated' ), true ) ) {
+			$count = $this->count_items();
+			if ( is_wp_error( $count ) ) {
+				$total = 0;
+				$total_available = false;
+				$total_error = sanitize_text_field( $count->get_error_message() );
+			} else {
+				$total = absint( $count );
+			}
 		}
 
 		$processed = absint( $state['processed'] );
-		$percent   = $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
+		$percent   = $total_available && $total > 0 ? min( 100, round( ( $processed / $total ) * 100, 2 ) ) : 0;
+		$policy_changed = in_array( $state['status'], array( 'running', 'cancelled' ), true ) && ! $this->generation_matches_current_policy( $state );
 
 		return array(
-			'status'      => $state['status'],
-			'total'       => $total,
-			'processed'   => $processed,
-			'updated'     => absint( $state['updated'] ),
-			'failed'      => absint( $state['failed'] ),
-			'lastPostId'  => absint( $state['lastPostId'] ),
-			'percent'     => $percent,
-			'lastMessage' => (string) $state['lastMessage'],
-			'lastError'   => (string) $state['lastError'],
-			'updatedAt'   => absint( $state['updatedAt'] ),
-			'policyType'  => (string) $state['policyType'],
-			'shouldContinue' => 'running' === $state['status'],
+			'status'          => $policy_changed ? 'invalidated' : $state['status'],
+			'total'           => $total,
+			'totalAvailable'  => $total_available,
+			'totalError'      => $total_error,
+			'processed'       => $processed,
+			'updated'         => absint( $state['updated'] ),
+			'failed'          => absint( $state['failed'] ),
+			'lastPostId'      => absint( $state['lastPostId'] ),
+			'pendingParents'  => count( is_array( $state['pendingParentIds'] ) ? $state['pendingParentIds'] : array() ),
+			'percent'         => $percent,
+			'lastMessage'     => $policy_changed
+				? 'سیاست قیمت‌گذاری تغییر کرده است؛ checkpoint قبلی قابل ادامه نیست و اجرای جدید باید از ابتدا شروع شود.'
+				: (string) $state['lastMessage'],
+			'lastError'       => (string) $state['lastError'],
+			'updatedAt'       => absint( $state['updatedAt'] ),
+			'policyType'      => (string) $state['policyType'],
+			'policyChanged'   => $policy_changed,
+			'shouldContinue'  => ! $policy_changed && 'running' === $state['status'],
 		);
 	}
 
@@ -564,7 +746,7 @@ class Mobo_Core_Reprice_Queue {
 			if ( $parent->is_type( 'variable' ) && class_exists( 'WC_Product_Variable' ) ) {
 				try { WC_Product_Variable::sync( $product_id ); wc_delete_product_transients( $product_id ); } catch ( Throwable $rollback_parent_error ) { $rollback_errors[] = $rollback_parent_error->getMessage(); }
 			}
-			$message = 'Targeted product repricing failed and was rolled back: ' . sanitize_text_field( $e->getMessage() );
+			$message = 'Targeted product repricing failed and was rolled back (internal exception: ' . sanitize_key( get_class( $e ) ) . ').';
 			if ( ! empty( $rollback_errors ) ) { $message .= ' Rollback warning: ' . implode( ' | ', array_map( 'sanitize_text_field', $rollback_errors ) ); }
 			return new WP_Error( 'mobo_core_family_reprice_failed', $message );
 		}
@@ -949,6 +1131,10 @@ class Mobo_Core_Reprice_Queue {
 			return false;
 		}
 
+		if ( ! $this->is_owned_by_current_connection( $post ) ) {
+			return false;
+		}
+
 		if ( 'product' === $post->post_type ) {
 			if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $post_id ) ) {
 				return false;
@@ -989,25 +1175,93 @@ class Mobo_Core_Reprice_Queue {
 	}
 
 	/**
+	 * Prove that a Woo product/variation belongs to the active Connection.
+	 *
+	 * Woo post IDs are installation-global, but remote identities are not. A
+	 * cursor worker must therefore never accept a post merely because it carries
+	 * historical Mobo meta from another Source.
+	 *
+	 * @param WP_Post $post Product or variation post.
+	 * @return bool
+	 */
+	private function is_owned_by_current_connection( $post ) {
+		if ( ! ( $post instanceof WP_Post ) || ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			return false;
+		}
+
+		if ( 'product' === $post->post_type && class_exists( 'Mobo_Core_Product_State_Repository' ) ) {
+			return is_array( ( new Mobo_Core_Product_State_Repository() )->get_by_woo_product_id( $post->ID ) );
+		}
+		if ( 'product_variation' === $post->post_type && class_exists( 'Mobo_Core_Variant_State_Repository' ) ) {
+			return is_array( ( new Mobo_Core_Variant_State_Repository() )->get_by_woo_variation_id( $post->ID ) );
+		}
+
+		return false;
+	}
+
+	/**
 	 * Count repricable objects.
 	 *
-	 * @return int
+	 * @return int|WP_Error
 	 */
 	private function count_items() {
 		global $wpdb;
 
-		$count = $wpdb->get_var( "
-			SELECT COUNT(DISTINCT p.ID)
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-			LEFT JOIN {$wpdb->posts} parent ON parent.ID = p.post_parent
-			WHERE p.post_type IN ('product', 'product_variation')
-			AND p.post_status = 'publish'
-			AND (p.post_type = 'product' OR (p.post_type = 'product_variation' AND parent.post_type = 'product' AND parent.post_status = 'publish'))
-			AND pm.meta_key = 'mobo_api_price'
-			AND pm.meta_value <> ''
-		" );
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			return new WP_Error( 'mobo_core_reprice_owner_unavailable', 'Unable to prove the active Connection ownership for the Reprice queue.' );
+		}
 
+		$products = Mobo_Core_Storage_Schema::table_name( 'products' );
+		$variants = Mobo_Core_Storage_Schema::table_name( 'variants' );
+		if ( '' === $products || '' === $variants ) {
+			return new WP_Error( 'mobo_core_reprice_owner_unavailable', 'Connection-owned product storage is unavailable for the Reprice queue.' );
+		}
+
+		/* PERF08: ownership is already unique in the custom product/variant tables.
+		 * Count those direct owner rows and use EXISTS for price metadata so duplicate
+		 * meta rows cannot multiply candidates and force COUNT(DISTINCT) over a wide
+		 * posts/meta/owner join. Products and variations have globally unique post IDs. */
+		if ( class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) && Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative() ) {
+			$entity_meta = Mobo_Core_Storage_Entity_Meta_Retirement::table_name();
+			$sql = $wpdb->prepare(
+				"SELECT
+					(SELECT COUNT(*)
+					 FROM {$products} mp
+					 INNER JOIN {$wpdb->posts} p ON p.ID=mp.woo_product_id AND p.post_type='product' AND p.post_status='publish'
+					 WHERE mp.connection_id=%d
+					 AND EXISTS (SELECT 1 FROM {$entity_meta} em WHERE em.woo_object_id=p.ID AND em.meta_key='mobo_api_price' AND COALESCE(em.meta_value,'')<>'' LIMIT 1))
+					+
+					(SELECT COUNT(*)
+					 FROM {$variants} mv
+					 INNER JOIN {$wpdb->posts} p ON p.ID=mv.woo_variation_id AND p.post_type='product_variation' AND p.post_status='publish'
+					 INNER JOIN {$wpdb->posts} parent ON parent.ID=p.post_parent AND parent.post_type='product' AND parent.post_status='publish'
+					 WHERE mv.connection_id=%d
+					 AND EXISTS (SELECT 1 FROM {$entity_meta} em WHERE em.woo_object_id=p.ID AND em.meta_key='mobo_api_price' AND COALESCE(em.meta_value,'')<>'' LIMIT 1)) AS total",
+				$connection_id,
+				$connection_id
+			);
+		} else {
+			$sql = $wpdb->prepare(
+				"SELECT
+					(SELECT COUNT(*)
+					 FROM {$products} mp
+					 INNER JOIN {$wpdb->posts} p ON p.ID=mp.woo_product_id AND p.post_type='product' AND p.post_status='publish'
+					 WHERE mp.connection_id=%d
+					 AND EXISTS (SELECT 1 FROM {$wpdb->postmeta} pm WHERE pm.post_id=p.ID AND pm.meta_key='mobo_api_price' AND pm.meta_value<>'' LIMIT 1))
+					+
+					(SELECT COUNT(*)
+					 FROM {$variants} mv
+					 INNER JOIN {$wpdb->posts} p ON p.ID=mv.woo_variation_id AND p.post_type='product_variation' AND p.post_status='publish'
+					 INNER JOIN {$wpdb->posts} parent ON parent.ID=p.post_parent AND parent.post_type='product' AND parent.post_status='publish'
+					 WHERE mv.connection_id=%d
+					 AND EXISTS (SELECT 1 FROM {$wpdb->postmeta} pm WHERE pm.post_id=p.ID AND pm.meta_key='mobo_api_price' AND pm.meta_value<>'' LIMIT 1)) AS total",
+				$connection_id,
+				$connection_id
+			);
+		}
+
+		$count = $wpdb->get_var( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared above with Connection ownership placeholders.
 		if ( '' !== trim( (string) $wpdb->last_error ) || null === $count ) {
 			return new WP_Error(
 				'mobo_core_reprice_count_read_failed',
@@ -1030,28 +1284,67 @@ class Mobo_Core_Reprice_Queue {
 
 		$last_id = absint( $last_id );
 		$limit   = max( 1, absint( $limit ) );
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			return new WP_Error( 'mobo_core_reprice_owner_unavailable', 'Unable to prove the active Connection ownership for the Reprice queue.' );
+		}
 
-		$sql = $wpdb->prepare(
-			"
-			SELECT DISTINCT p.ID
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-			LEFT JOIN {$wpdb->posts} parent ON parent.ID = p.post_parent
-			WHERE p.post_type IN ('product', 'product_variation')
-			AND p.post_status = 'publish'
-			AND (p.post_type = 'product' OR (p.post_type = 'product_variation' AND parent.post_type = 'product' AND parent.post_status = 'publish'))
-			AND pm.meta_key = 'mobo_api_price'
-			AND pm.meta_value <> ''
-			AND p.ID > %d
-			ORDER BY p.ID ASC
-			LIMIT %d
-			",
-			$last_id,
-			$limit
-		);
+		$products = Mobo_Core_Storage_Schema::table_name( 'products' );
+		$variants = Mobo_Core_Storage_Schema::table_name( 'variants' );
+		if ( '' === $products || '' === $variants ) {
+			return new WP_Error( 'mobo_core_reprice_owner_unavailable', 'Connection-owned product storage is unavailable for the Reprice queue.' );
+		}
 
-		$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared immediately above with bounded integer placeholders.
+		/* PERF08: two ownership-native branches avoid LEFT JOIN + DISTINCT row
+		 * multiplication. UNION ALL is safe because WordPress post IDs are globally
+		 * unique and each custom storage table has a unique Woo object ID. The outer
+		 * ORDER/LIMIT preserves the exact stable post-ID cursor contract. */
+		if ( class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) && Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative() ) {
+			$entity_meta = Mobo_Core_Storage_Entity_Meta_Retirement::table_name();
+			$sql = $wpdb->prepare(
+				"(SELECT p.ID AS ID
+				  FROM {$products} mp
+				  INNER JOIN {$wpdb->posts} p ON p.ID=mp.woo_product_id AND p.post_type='product' AND p.post_status='publish'
+				  WHERE mp.connection_id=%d AND p.ID>%d
+				  AND EXISTS (SELECT 1 FROM {$entity_meta} em WHERE em.woo_object_id=p.ID AND em.meta_key='mobo_api_price' AND COALESCE(em.meta_value,'')<>'' LIMIT 1))
+				 UNION ALL
+				 (SELECT p.ID AS ID
+				  FROM {$variants} mv
+				  INNER JOIN {$wpdb->posts} p ON p.ID=mv.woo_variation_id AND p.post_type='product_variation' AND p.post_status='publish'
+				  INNER JOIN {$wpdb->posts} parent ON parent.ID=p.post_parent AND parent.post_type='product' AND parent.post_status='publish'
+				  WHERE mv.connection_id=%d AND p.ID>%d
+				  AND EXISTS (SELECT 1 FROM {$entity_meta} em WHERE em.woo_object_id=p.ID AND em.meta_key='mobo_api_price' AND COALESCE(em.meta_value,'')<>'' LIMIT 1))
+				 ORDER BY ID ASC LIMIT %d",
+				$connection_id,
+				$last_id,
+				$connection_id,
+				$last_id,
+				$limit
+			);
+		} else {
+			$sql = $wpdb->prepare(
+				"(SELECT p.ID AS ID
+				  FROM {$products} mp
+				  INNER JOIN {$wpdb->posts} p ON p.ID=mp.woo_product_id AND p.post_type='product' AND p.post_status='publish'
+				  WHERE mp.connection_id=%d AND p.ID>%d
+				  AND EXISTS (SELECT 1 FROM {$wpdb->postmeta} pm WHERE pm.post_id=p.ID AND pm.meta_key='mobo_api_price' AND pm.meta_value<>'' LIMIT 1))
+				 UNION ALL
+				 (SELECT p.ID AS ID
+				  FROM {$variants} mv
+				  INNER JOIN {$wpdb->posts} p ON p.ID=mv.woo_variation_id AND p.post_type='product_variation' AND p.post_status='publish'
+				  INNER JOIN {$wpdb->posts} parent ON parent.ID=p.post_parent AND parent.post_type='product' AND parent.post_status='publish'
+				  WHERE mv.connection_id=%d AND p.ID>%d
+				  AND EXISTS (SELECT 1 FROM {$wpdb->postmeta} pm WHERE pm.post_id=p.ID AND pm.meta_key='mobo_api_price' AND pm.meta_value<>'' LIMIT 1))
+				 ORDER BY ID ASC LIMIT %d",
+				$connection_id,
+				$last_id,
+				$connection_id,
+				$last_id,
+				$limit
+			);
+		}
 
+		$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared immediately above with bounded placeholders.
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
 			return new WP_Error(
 				'mobo_core_reprice_candidate_read_failed',
@@ -1068,7 +1361,9 @@ class Mobo_Core_Reprice_Queue {
 	 * @return array
 	 */
 	private function get_state() {
-		$state = get_option( self::STATE_OPTION, array() );
+		$state = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+			? Mobo_Core_State_Store::get( self::STATE_OPTION, array() )
+			: array();
 
 		if ( ! is_array( $state ) ) {
 			$state = array();
@@ -1087,8 +1382,10 @@ class Mobo_Core_Reprice_Queue {
 			'startedAt'   => 0,
 			'updatedAt'   => 0,
 			'completedAt' => 0,
-			'policyType'  => '',
-			'failureAttempts' => array(),
+			'policyType'        => '',
+			'policyFingerprint' => '',
+			'failureAttempts'   => array(),
+			'pendingParentIds' => array(),
 		);
 
 		return array_merge( $defaults, $state );

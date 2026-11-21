@@ -52,17 +52,50 @@ class Mobo_Core_Health_Reporter {
 		$schema_last_error      = sanitize_text_field( (string) get_option( 'mobo_core_schema_last_error', '' ) );
 		$schema_last_error_at   = absint( get_option( 'mobo_core_schema_last_error_at', 0 ) );
 		$current_plugin_version = defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '';
+		$database_unicode = class_exists( 'Mobo_Core_Database_Charset' )
+			? Mobo_Core_Database_Charset::get_status( false )
+			: array( 'ready' => false, 'message' => 'Database Unicode checker is unavailable.' );
+		$database_unicode_migration = class_exists( 'Mobo_Core_Database_Unicode_Migration' )
+			? Mobo_Core_Database_Unicode_Migration::get_status()
+			: array( 'status' => 'unavailable', 'active' => false, 'needsContinuation' => false );
 		$database_schema_ready  = '' !== $current_plugin_version
 			&& $plugin_db_version === $current_plugin_version
 			&& $schema_version === $current_plugin_version
-			&& '' === $schema_last_error;
+			&& '' === $schema_last_error
+			&& ! empty( $database_unicode['ready'] );
+		$custom_storage = array(
+			'requestedMode' => class_exists( 'Mobo_Core_Storage_Mode' ) ? Mobo_Core_Storage_Mode::requested() : 'legacy',
+			'effectiveMode' => class_exists( 'Mobo_Core_Storage_Mode' ) ? Mobo_Core_Storage_Mode::effective() : 'legacy',
+			'rolloutPhase'  => class_exists( 'Mobo_Core_Storage_Mode' ) ? Mobo_Core_Storage_Mode::rollout_phase() : 'legacy',
+			'schemaReady'   => class_exists( 'Mobo_Core_Storage_Schema' ) ? Mobo_Core_Storage_Schema::is_ready() : false,
+			'schemaVersion' => sanitize_text_field( (string) get_option( 'mobo_core_storage_schema_version', '' ) ),
+			'backfill'      => class_exists( 'Mobo_Core_Storage_Backfill' ) ? Mobo_Core_Storage_Backfill::get_status() : array( 'status' => 'unavailable' ),
+			'parity'        => class_exists( 'Mobo_Core_Storage_Parity' ) ? Mobo_Core_Storage_Parity::get_status() : array( 'enabled' => false ),
+			'stateParity'   => class_exists( 'Mobo_Core_Storage_State_Parity' ) ? Mobo_Core_Storage_State_Parity::get_status() : array( 'enabled' => false ),
+			'primaryRead'   => class_exists( 'Mobo_Core_Storage_Primary_Read' ) ? Mobo_Core_Storage_Primary_Read::get_status() : array( 'enabled' => false, 'totalFallbacks' => 0 ),
+			'metaCommitBridge'=> class_exists( 'Mobo_Core_Storage_Meta_Commit_Bridge' ) ? Mobo_Core_Storage_Meta_Commit_Bridge::get_status() : array( 'enabled' => false, 'pendingEntities' => 0, 'maxPendingEntities' => 100 ),
+			'reconciliation'=> class_exists( 'Mobo_Core_Storage_Reconciler' ) ? Mobo_Core_Storage_Reconciler::get_status() : array( 'status' => 'unavailable' ),
+			'promotionGate' => class_exists( 'Mobo_Core_Storage_Promotion_Gate' ) ? Mobo_Core_Storage_Promotion_Gate::get_status() : array( 'eligible' => false, 'status' => 'unavailable' ),
+			'primaryUsage'  => class_exists( 'Mobo_Core_Storage_Primary_Usage' ) ? Mobo_Core_Storage_Primary_Usage::get_status() : array( 'identityHits' => 0, 'stateHits' => 0 ),
+			'customOnlyGate'=> class_exists( 'Mobo_Core_Storage_Custom_Only_Gate' ) ? Mobo_Core_Storage_Custom_Only_Gate::get_status() : array( 'eligible' => false, 'status' => 'unavailable' ),
+			'legacyDependency'=> class_exists( 'Mobo_Core_Storage_Legacy_Dependency' ) ? Mobo_Core_Storage_Legacy_Dependency::get_status() : array( 'readDependencyCount'=>0, 'legacyWriteCount'=>0 ),
+			'legacyRetirementGate'=> class_exists( 'Mobo_Core_Storage_Legacy_Retirement_Gate' ) ? Mobo_Core_Storage_Legacy_Retirement_Gate::get_status() : array( 'eligible'=>false, 'status'=>'unavailable' ),
+			'legacyWriteSuppression'=> class_exists( 'Mobo_Core_Storage_Legacy_Write_Suppression' ) ? Mobo_Core_Storage_Legacy_Write_Suppression::get_status() : array( 'requested'=>'off', 'effective'=>'off', 'suppressedProductMapWrites'=>0, 'emergencyFallbacks'=>0 ),
+			'postmetaSuppressionReadiness'=> class_exists( 'Mobo_Core_Storage_Postmeta_Suppression_Readiness' ) ? Mobo_Core_Storage_Postmeta_Suppression_Readiness::get_status() : array( 'eligible'=>false, 'allEligible'=>false, 'status'=>'unavailable', 'eligibleKeys'=>array() ),
+			'postmetaWriteSuppression'=> class_exists( 'Mobo_Core_Storage_Postmeta_Write_Suppression' ) ? Mobo_Core_Storage_Postmeta_Write_Suppression::get_status() : array( 'safeKeys'=>array(), 'requestedKeys'=>array(), 'request'=>array(), 'metrics'=>array() ),
+			'operationalMetaRetirement'=> class_exists( 'Mobo_Core_Storage_Operational_Meta_Retirement' ) ? Mobo_Core_Storage_Operational_Meta_Retirement::get_status() : array( 'fenced'=>false, 'complete'=>false, 'status'=>'unavailable', 'physicalResidue'=>null ),
+			'identityMetaRetirement'=> class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) ? Mobo_Core_Storage_Identity_Meta_Retirement::get_status() : array( 'fenced'=>false, 'complete'=>false, 'status'=>'unavailable', 'physicalResidue'=>null, 'managedKeys'=>array() ),
+			'entityMetaRetirement'=> class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) ? Mobo_Core_Storage_Entity_Meta_Retirement::get_status() : array( 'fenced'=>false, 'complete'=>false, 'status'=>'unavailable', 'physicalResidue'=>null ),
+			'retirementFinalizer'=> class_exists( 'Mobo_Core_Storage_Retirement_Finalizer' ) ? Mobo_Core_Storage_Retirement_Finalizer::get_status() : array( 'logicalRetirementComplete'=>false, 'status'=>'unavailable', 'physicalDeletionAllowed'=>false ),
+		);
 
 		return array(
 			'siteUrl'               => home_url( '/' ),
-			'licenseToken'          => (string) get_option( 'mobo_core_token', '' ),
+			'licenseToken'          => class_exists( 'Mobo_Core_Connection_Repository' ) ? (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', get_option( 'mobo_core_token', '' ) ) : (string) get_option( 'mobo_core_token', '' ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'pluginBuildFingerprint'=> class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'webhookCredential'      => $webhook_auth,
+			'moneyContract'          => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::compatibility_status( 0, true ) : array( 'compatible' => false, 'code' => 'money_policy_unavailable', 'requiresReprovision' => true ),
 			'licenseInstallation'   => class_exists( 'Mobo_Core_Portal_Request_Signer' ) ? Mobo_Core_Portal_Request_Signer::get_status() : array( 'identityReady' => false, 'opensslAvailable' => function_exists( 'openssl_sign' ) ),
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,
@@ -75,6 +108,9 @@ class Mobo_Core_Health_Reporter {
 			'databaseSchemaReady'   => $database_schema_ready,
 			'databaseSchemaLastError' => $schema_last_error,
 			'databaseSchemaLastErrorAt' => $this->format_timestamp( $schema_last_error_at ),
+			'databaseUnicode'       => $database_unicode,
+			'databaseUnicodeMigration' => $database_unicode_migration,
+			'customStorage'         => $custom_storage,
 			'activeTheme'           => $environment['active_theme'],
 			'activePluginsCount'    => $environment['active_plugins_count'],
 			'opCacheEnabled'        => $environment['opcache_enabled'],
@@ -138,13 +174,14 @@ class Mobo_Core_Health_Reporter {
 
 			'cronMode'              => $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ),
 			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
+			'networkDependencies'  => class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::get_status() : array(),
 			'portalHeartbeat'       => array(
-				'lastAttemptAt'       => absint( get_option( 'mobo_core_portal_heartbeat_last_attempt_at', 0 ) ),
-				'lastSuccessAt'       => absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ),
-				'secondsSinceSuccess' => absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) > 0
-					? max( 0, time() - absint( get_option( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) )
+				'lastAttemptAt'       => absint( Mobo_Core_Settings::get( 'mobo_core_portal_heartbeat_last_attempt_at', 0 ) ),
+				'lastSuccessAt'       => absint( Mobo_Core_Settings::get( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ),
+				'secondsSinceSuccess' => absint( Mobo_Core_Settings::get( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) > 0
+					? max( 0, time() - absint( Mobo_Core_Settings::get( 'mobo_core_portal_heartbeat_last_success_at', 0 ) ) )
 					: 0,
-				'lastResult'          => get_option( 'mobo_core_portal_heartbeat_last_result', array() ),
+				'lastResult'          => Mobo_Core_Settings::get( 'mobo_core_portal_heartbeat_last_result', array() ),
 			),
 			'syncHealth'            => class_exists( 'Mobo_Core_Sync_Health' ) ? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ? Mobo_Core_Sync_Health::get_operational_dashboard_status( 15, ! $non_blocking ) : Mobo_Core_Sync_Health::get_dashboard_status() ) : array(),
 			'syncStatus'            => $sync_status,
@@ -216,7 +253,7 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	public function get_last_report_status() {
-		$last_result = get_option( 'mobo_core_health_last_report_result', array() );
+		$last_result = Mobo_Core_Settings::get( 'mobo_core_health_last_report_result', array() );
 
 		if ( ! is_array( $last_result ) ) {
 			$last_result = array();
@@ -226,8 +263,8 @@ class Mobo_Core_Health_Reporter {
 			'enabled'       => false,
 			'deliveryMode'  => 'portal-pull',
 			'reportUrl'     => '',
-			'lastAttemptAt' => absint( get_option( 'mobo_core_health_last_report_attempt_at', 0 ) ),
-			'lastSuccessAt' => absint( get_option( 'mobo_core_health_last_report_success_at', 0 ) ),
+			'lastAttemptAt' => absint( Mobo_Core_Settings::get( 'mobo_core_health_last_report_attempt_at', 0 ) ),
+			'lastSuccessAt' => absint( Mobo_Core_Settings::get( 'mobo_core_health_last_report_success_at', 0 ) ),
 			'lastResult'    => array(),
 			'message'       => 'Portal گزارش سلامت را مستقیماً از endpoint افزونه دریافت می‌کند.',
 		);
@@ -241,10 +278,10 @@ class Mobo_Core_Health_Reporter {
 	 */
 	private function save_result( $result ) {
 		$result['updatedAt'] = time();
-		update_option( 'mobo_core_health_last_report_result', $result, false );
+		Mobo_Core_Settings::update( 'mobo_core_health_last_report_result', $result, false );
 
 		if ( ! empty( $result['success'] ) && 'sent' === ( isset( $result['status'] ) ? $result['status'] : '' ) ) {
-			update_option( 'mobo_core_health_last_report_success_at', time(), false );
+			Mobo_Core_Settings::update( 'mobo_core_health_last_report_success_at', time(), false );
 		}
 
 		return $result;
@@ -256,7 +293,10 @@ class Mobo_Core_Health_Reporter {
 	 * @return string
 	 */
 	private function get_report_url() {
-		$base_url = apply_filters( 'mobo_core_api_base_url', '' );
+		$base_url = class_exists( 'Mobo_Core_Connection_Repository' ) ? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( '' ) : '';
+		if ( '' === trim( (string) $base_url ) ) {
+			$base_url = apply_filters( 'mobo_core_api_base_url', '' );
+		}
 
 		if ( '' === trim( (string) $base_url ) ) {
 			$base_url = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
@@ -368,7 +408,7 @@ class Mobo_Core_Health_Reporter {
 			return absint( $sync_status['completedAt'] );
 		}
 
-		return absint( get_option( 'mobo_core_last_sync_success_at', 0 ) );
+		return absint( Mobo_Core_Settings::get( 'mobo_core_last_sync_success_at', 0 ) );
 	}
 
 	/**
@@ -380,19 +420,41 @@ class Mobo_Core_Health_Reporter {
 			return 0;
 		}
 
-		$result = $cron_status['lastResult'];
+		return $this->extract_webhook_success_timestamp_from_runner_result( $cron_status['lastResult'] );
+	}
 
-		if ( empty( $result['success'] ) || empty( $result['webhookQueue'] ) || ! is_array( $result['webhookQueue'] ) ) {
+	/**
+	 * Resolve webhook-success evidence from single- or multi-Connection runner results.
+	 *
+	 * @param array $result Runner result.
+	 * @return int
+	 */
+	private function extract_webhook_success_timestamp_from_runner_result( $result ) {
+		if ( ! is_array( $result ) ) {
 			return 0;
 		}
 
-		$status = isset( $result['webhookQueue']['status'] ) ? sanitize_key( (string) $result['webhookQueue']['status'] ) : '';
-
-		if ( in_array( $status, array( 'processed', 'empty' ), true ) ) {
-			return isset( $result['executedAt'] ) ? absint( $result['executedAt'] ) : 0;
+		$latest = 0;
+		if ( ! empty( $result['success'] ) && ! empty( $result['webhookQueue'] ) && is_array( $result['webhookQueue'] ) ) {
+			$status = isset( $result['webhookQueue']['status'] ) ? sanitize_key( (string) $result['webhookQueue']['status'] ) : '';
+			if ( in_array( $status, array( 'processed', 'empty' ), true ) ) {
+				$latest = isset( $result['executedAt'] ) ? absint( $result['executedAt'] ) : 0;
+			}
 		}
 
-		return 0;
+		if ( isset( $result['connections'] ) && is_array( $result['connections'] ) ) {
+			foreach ( $result['connections'] as $connection_result ) {
+				if ( ! is_array( $connection_result ) || empty( $connection_result['result'] ) || ! is_array( $connection_result['result'] ) ) {
+					continue;
+				}
+				$latest = max(
+					$latest,
+					$this->extract_webhook_success_timestamp_from_runner_result( $connection_result['result'] )
+				);
+			}
+		}
+
+		return $latest;
 	}
 
 	/**
@@ -405,20 +467,55 @@ class Mobo_Core_Health_Reporter {
 	 * @return array
 	 */
 	private function get_image_queue_stats() {
+		$empty = array( 'pending' => 0, 'attaching' => 0, 'failed' => 0, 'due' => 0, 'nextRetryAt' => '', 'oldestPendingAt' => '' );
 		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
-			return array( 'pending' => 0, 'attaching' => 0, 'failed' => 0, 'due' => 0, 'nextRetryAt' => '', 'oldestPendingAt' => '' );
+			return $empty;
 		}
 
-		$queue   = new Mobo_Core_Image_Queue();
-		$summary = $queue->get_summary();
-		return array(
-			'pending'         => absint( isset( $summary['pending'] ) ? $summary['pending'] : 0 ),
-			'attaching'       => absint( isset( $summary['attaching'] ) ? $summary['attaching'] : 0 ),
-			'failed'          => absint( isset( $summary['failed'] ) ? $summary['failed'] : 0 ),
-			'due'             => absint( isset( $summary['due'] ) ? $summary['due'] : 0 ),
-			'nextRetryAt'     => isset( $summary['nextRetryAt'] ) ? (string) $summary['nextRetryAt'] : '',
-			'oldestPendingAt' => isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '',
-		);
+		$summaries = array();
+		if ( class_exists( 'Mobo_Core_Connection_Repository' ) && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+			foreach ( Mobo_Core_Connection_Repository::list_enabled() as $connection ) {
+				$connection_id = is_array( $connection ) ? absint( $connection['id'] ?? 0 ) : 0;
+				if ( $connection_id <= 0 ) {
+					continue;
+				}
+				$summaries[] = Mobo_Core_Connection_Context::run(
+					$connection_id,
+					static function () {
+						$queue = new Mobo_Core_Image_Queue();
+						return $queue->get_summary();
+					}
+				);
+			}
+		}
+
+		if ( empty( $summaries ) ) {
+			$queue = new Mobo_Core_Image_Queue();
+			$summaries[] = $queue->get_summary();
+		}
+
+		$result = $empty;
+		foreach ( $summaries as $summary ) {
+			if ( ! is_array( $summary ) ) {
+				continue;
+			}
+			$result['pending']   += absint( isset( $summary['pending'] ) ? $summary['pending'] : 0 );
+			$result['attaching'] += absint( isset( $summary['attaching'] ) ? $summary['attaching'] : 0 );
+			$result['failed']    += absint( isset( $summary['failed'] ) ? $summary['failed'] : 0 );
+			$result['due']       += absint( isset( $summary['due'] ) ? $summary['due'] : 0 );
+
+			$oldest = isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '';
+			if ( '' !== $oldest && ( '' === $result['oldestPendingAt'] || strcmp( $oldest, $result['oldestPendingAt'] ) < 0 ) ) {
+				$result['oldestPendingAt'] = $oldest;
+			}
+
+			$retry = isset( $summary['nextRetryAt'] ) ? (string) $summary['nextRetryAt'] : '';
+			if ( '' !== $retry && ( '' === $result['nextRetryAt'] || strcmp( $retry, $result['nextRetryAt'] ) < 0 ) ) {
+				$result['nextRetryAt'] = $retry;
+			}
+		}
+
+		return $result;
 	}
 
 	private function get_webhook_queue_stats() {
@@ -427,12 +524,43 @@ class Mobo_Core_Health_Reporter {
 		$oldest_at = '';
 
 		if ( class_exists( 'Mobo_Core_Sync_Event_Store' ) && Mobo_Core_Sync_Event_Store::table_exists() ) {
-			$event_store = new Mobo_Core_Sync_Event_Store();
-			$summary     = $event_store->get_summary();
-			$pending    += absint( isset( $summary['pendingCount'] ) ? $summary['pendingCount'] : 0 );
-			$failed     += absint( isset( $summary['failedCount'] ) ? $summary['failedCount'] : 0 );
-			$oldest_at   = isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '';
+			$summaries = array();
+
+			if ( class_exists( 'Mobo_Core_Connection_Repository' ) && class_exists( 'Mobo_Core_Connection_Context' ) ) {
+				foreach ( Mobo_Core_Connection_Repository::list_enabled() as $connection ) {
+					$connection_id = is_array( $connection ) ? absint( $connection['id'] ?? 0 ) : 0;
+					if ( $connection_id <= 0 ) {
+						continue;
+					}
+					$summaries[] = Mobo_Core_Connection_Context::run(
+						$connection_id,
+						static function () {
+							$event_store = new Mobo_Core_Sync_Event_Store();
+							return $event_store->get_summary();
+						}
+					);
+				}
+			}
+
+			if ( empty( $summaries ) ) {
+				$event_store = new Mobo_Core_Sync_Event_Store();
+				$summaries[] = $event_store->get_summary();
+			}
+
+			foreach ( $summaries as $summary ) {
+				if ( ! is_array( $summary ) ) {
+					continue;
+				}
+				$pending += absint( isset( $summary['pendingCount'] ) ? $summary['pendingCount'] : 0 );
+				$failed  += absint( isset( $summary['actionableFailedCount'] ) ? $summary['actionableFailedCount'] : ( isset( $summary['failedCount'] ) ? $summary['failedCount'] : 0 ) );
+
+				$candidate = isset( $summary['oldestPendingAt'] ) ? (string) $summary['oldestPendingAt'] : '';
+				if ( '' !== $candidate && ( '' === $oldest_at || strcmp( $candidate, $oldest_at ) < 0 ) ) {
+					$oldest_at = $candidate;
+				}
+			}
 		}
+
 		/* MOBO-HEALTH-SYNC-LICENSE-HARDENING-r1: legacy file counts are collected in background. */
 		if ( class_exists( 'Mobo_Core_Health_Read_Cache' ) ) {
 			$mobo_legacy_webhook = Mobo_Core_Health_Read_Cache::get_legacy_webhook_file_stats();
@@ -798,7 +926,7 @@ class Mobo_Core_Health_Reporter {
 				$result = array(
 					'available' => false,
 					'source'    => 'cpanel_uapi',
-					'error'     => 'اتصال به cPanel UAPI ناموفق بود: ' . $response->get_error_message(),
+					'error'     => 'اتصال به cPanel UAPI ناموفق بود. (' . sanitize_key( (string) $response->get_error_code() ) . ')',
 				);
 				set_transient( $cache_key, $result, 5 * MINUTE_IN_SECONDS );
 				return $result;
@@ -1174,7 +1302,7 @@ class Mobo_Core_Health_Reporter {
 			$actions = as_get_scheduled_actions( $args, 'ids' );
 		} catch ( Exception $exception ) {
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-				Mobo_Core_Logger::error( 'Mobo Core health Action Scheduler count failed: ' . $exception->getMessage() );
+				Mobo_Core_Logger::error( 'Mobo Core health Action Scheduler count failed with an internal exception.' );
 			}
 
 			return null;
@@ -1219,7 +1347,7 @@ class Mobo_Core_Health_Reporter {
 			}
 		}
 
-		$health_result = get_option( 'mobo_core_health_last_report_result', array() );
+		$health_result = Mobo_Core_Settings::get( 'mobo_core_health_last_report_result', array() );
 		if ( is_array( $health_result ) && empty( $health_result['success'] ) && ! empty( $health_result['message'] ) ) {
 			return sanitize_text_field( (string) $health_result['message'] );
 		}

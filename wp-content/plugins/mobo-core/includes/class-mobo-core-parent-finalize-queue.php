@@ -19,7 +19,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class Mobo_Core_Parent_Finalize_Queue {
 
-	const OPTION_QUEUE = 'mobo_core_parent_finalize_queue';
+	const OPTION_QUEUE = 'mobo_core_parent_finalize_queue'; // legacy migration source only
+	const QUEUE_TYPE   = 'parent_finalize';
 	const LOCK_NAME    = 'parent_finalize_queue';
 	const MAX_ITEMS    = 5000;
 
@@ -41,6 +42,9 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		if ( $product_id <= 0 ) {
 			return array( 'success' => false, 'status' => 'invalid-product' );
 		}
+		if ( ! self::product_belongs_to_current_connection( $product_id ) ) {
+			return array( 'success' => false, 'status' => 'connection-owner-mismatch' );
+		}
 
 		$lock = self::acquire_lock();
 		if ( false === $lock ) {
@@ -48,22 +52,72 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		}
 
 		try {
-			$queue = self::read_queue();
-			$key   = (string) $product_id;
-			$now   = time();
-			$old   = isset( $queue[ $key ] ) && is_array( $queue[ $key ] ) ? $queue[ $key ] : array();
+			$key        = (string) $product_id;
+			$now        = time();
+			$queue      = null;
+			$old        = array();
+			$row_mode   = class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available();
 
-			$queue[ $key ] = array(
-				'productId'    => $product_id,
-				'productGuid'  => '' !== $product_guid ? $product_guid : ( isset( $old['productGuid'] ) ? sanitize_text_field( (string) $old['productGuid'] ) : '' ),
-				'reason'       => '' !== $reason ? $reason : 'variant-delta',
-				'queuedAt'     => isset( $old['queuedAt'] ) ? absint( $old['queuedAt'] ) : $now,
-				'updatedAt'    => $now,
-				'attempts'     => 0,
-				'nextAttemptAt'=> $now,
-				'lastError'    => '',
+			if ( $row_mode ) {
+				/* Preserve the additive Default-only legacy cutover before any direct row write.
+				 * An incomplete/failed import must not be treated as an empty destination. */
+				if ( ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+					&& ! Mobo_Core_Work_Queue_Store::migrate_option_map( self::OPTION_QUEUE, self::QUEUE_TYPE ) ) {
+					return array( 'success' => false, 'status' => 'checkpoint-failed' );
+				}
+				$previous = Mobo_Core_Work_Queue_Store::read_one_checked( self::QUEUE_TYPE, $key );
+				if ( 'error' === $previous['status'] ) {
+					return array( 'success' => false, 'status' => 'checkpoint-failed' );
+				}
+				if ( 'ok' === $previous['status'] ) {
+					$old = $previous['row']['payload'];
+				}
+				/* An existing row does not grow the queue, so don't count it before
+				 * every burst re-enqueue. Admission count is needed only for a new key. */
+				if ( 'missing' === $previous['status'] ) {
+					$pending = Mobo_Core_Work_Queue_Store::count_strict( self::QUEUE_TYPE );
+					if ( $pending < 0 ) {
+						return array( 'success' => false, 'status' => 'checkpoint-failed' );
+					}
+					/* Keep historical MAX_ITEMS eviction by payload updatedAt (stable ties),
+					 * not by SQL updated_at. Only this capacity edge loads the full map. */
+					if ( $pending >= self::MAX_ITEMS ) {
+						$row_mode = false;
+					}
+				}
+			}
+			if ( ! $row_mode ) {
+				$queue = self::read_queue();
+				$old   = isset( $queue[ $key ] ) && is_array( $queue[ $key ] ) ? $queue[ $key ] : array();
+			}
+
+			$item = array(
+				'productId'     => $product_id,
+				'productGuid'   => '' !== $product_guid ? $product_guid : ( isset( $old['productGuid'] ) ? sanitize_text_field( (string) $old['productGuid'] ) : '' ),
+				'reason'        => '' !== $reason ? $reason : 'variant-delta',
+				'queuedAt'      => isset( $old['queuedAt'] ) ? absint( $old['queuedAt'] ) : $now,
+				'updatedAt'     => $now,
+				'attempts'      => 0,
+				'nextAttemptAt' => $now,
+				'lastError'     => '',
 			);
 
+			if ( $row_mode ) {
+				/* PERF02: one exact row upsert/readback; the same scoped queue mutex
+				 * serializes ordinary producers. This re-enqueue invalidates an old claim. */
+				if ( ! Mobo_Core_Work_Queue_Store::put( self::QUEUE_TYPE, $key, $item ) ) {
+					return array( 'success' => false, 'status' => 'checkpoint-failed' );
+				}
+				$pending = Mobo_Core_Work_Queue_Store::count_strict( self::QUEUE_TYPE );
+				if ( $pending < 0 ) {
+					return array( 'success' => false, 'status' => 'checkpoint-failed' );
+				}
+				update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+				return array( 'success' => true, 'status' => 'queued', 'pendingCount' => $pending );
+			}
+
+			/* Fallback: unavailable pre-cutover row store or MAX_ITEMS eviction edge. */
+			$queue[ $key ] = $item;
 			if ( count( $queue ) > self::MAX_ITEMS ) {
 				uasort(
 					$queue,
@@ -73,17 +127,12 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				);
 				$queue = array_slice( $queue, 0, self::MAX_ITEMS, true );
 			}
-
 			if ( ! self::write_queue( $queue ) ) {
 				return array( 'success' => false, 'status' => 'checkpoint-failed' );
 			}
 			update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+			return array( 'success' => true, 'status' => 'queued', 'pendingCount' => count( $queue ) );
 
-			return array(
-				'success'      => true,
-				'status'       => 'queued',
-				'pendingCount' => count( $queue ),
-			);
 		} finally {
 			self::release_lock( $lock );
 		}
@@ -122,56 +171,123 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		}
 
 		try {
+			$row_mode = class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available();
+			if ( $row_mode && ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() )
+				&& ! Mobo_Core_Work_Queue_Store::migrate_option_map( self::OPTION_QUEUE, self::QUEUE_TYPE ) ) {
+				$result['success'] = false;
+				$result['status'] = 'checkpoint-failed';
+				$result['remaining'] = true;
+				return $result;
+			}
+			/* PERF11: mirror legacy payload queuedAt into indexed row metadata in
+			 * bounded CAS-safe slices. Until this Connection is completely backfilled,
+			 * retain the authoritative historical full-map ordering path. */
+			$ordering_backfill = $row_mode ? Mobo_Core_Work_Queue_Store::backfill_queued_at_us( self::QUEUE_TYPE, 250 ) : array( 'status' => 'legacy' );
+			if ( $row_mode && ( ! is_array( $ordering_backfill ) || 'error' === $ordering_backfill['status'] ) ) {
+				$result['success'] = false;
+				$result['status'] = 'checkpoint-failed';
+				$result['remaining'] = true;
+				return $result;
+			}
+			$indexed_order = $row_mode && 'complete' === $ordering_backfill['status'];
+			$queue = ( $row_mode && ! $indexed_order ) ? self::read_queue() : array();
+			if ( $row_mode && ! $indexed_order && Mobo_Core_Work_Queue_Store::map_read_failed( self::QUEUE_TYPE ) ) {
+				$result['success'] = false;
+				$result['status'] = 'checkpoint-failed';
+				$result['remaining'] = true;
+				return $result;
+			}
+			/* PERF12: once migration is complete, the due-at-start snapshot is bounded
+			 * and ordered directly by indexed queued_at_us. A newer enqueue during Woo
+			 * side effects is still excluded from this immutable pass. */
+			$due_snapshot = null;
+			if ( $indexed_order ) {
+				$indexed_due = Mobo_Core_Work_Queue_Store::oldest_due_rows_checked( self::QUEUE_TYPE, $limit );
+				if ( ! is_array( $indexed_due ) || 'ok' !== $indexed_due['status'] ) {
+					$result['success'] = false;
+					$result['status'] = 'checkpoint-failed';
+					$result['remaining'] = true;
+					return $result;
+				}
+				$due_snapshot = array();
+				foreach ( $indexed_due['rows'] as $indexed_key => $indexed_row ) {
+					$due_snapshot[ $indexed_key ] = $indexed_row['payload'];
+				}
+			}
 			while ( $result['processed'] < $limit && microtime( true ) < ( $deadline - 0.1 ) ) {
-				$queue = self::read_queue();
-				if ( empty( $queue ) ) {
-					break;
-				}
+				if ( ! $row_mode ) { $queue = self::read_queue(); }
+				if ( ( ! $row_mode || ! $indexed_order ) && empty( $queue ) ) { break; }
 
-				/* Oldest due parent first; live claims are not due. */
-				$due = array();
-				$now = time();
-				foreach ( $queue as $key => $item ) {
-					if ( self::item_is_due( $item, $now ) ) {
-						$due[ $key ] = $item;
+				if ( ! $row_mode || ( ! $indexed_order && null === $due_snapshot ) ) {
+					/* Migration fallback: oldest due parent by PAYLOAD queuedAt. */
+					$due = array();
+					$now = time();
+					foreach ( $queue as $candidate_key => $candidate_item ) {
+						if ( self::item_is_due( $candidate_item, $now ) ) { $due[ $candidate_key ] = $candidate_item; }
 					}
+					uasort(
+						$due,
+						static function ( $a, $b ) {
+							return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
+						}
+					);
+					if ( $row_mode ) { $due_snapshot = $due; }
 				}
-				if ( empty( $due ) ) {
-					break;
+				if ( $row_mode ) {
+					if ( empty( $due_snapshot ) ) { break; }
+					$key = (string) array_key_first( $due_snapshot );
+					$item = $due_snapshot[ $key ];
+					unset( $due_snapshot[ $key ] );
+				} else {
+					if ( empty( $due ) ) { break; }
+					$key = (string) array_key_first( $due );
+					$item = $due[ $key ];
 				}
-
-				uasort(
-					$due,
-					static function ( $a, $b ) {
-						return absint( isset( $a['queuedAt'] ) ? $a['queuedAt'] : 0 ) <=> absint( isset( $b['queuedAt'] ) ? $b['queuedAt'] : 0 );
-					}
-				);
-
-				$key        = (string) array_key_first( $due );
-				$item       = $due[ $key ];
 				$product_id = absint( isset( $item['productId'] ) ? $item['productId'] : 0 );
 
 				if ( $product_id <= 0 || 'product' !== get_post_type( $product_id ) ) {
-					unset( $queue[ $key ] );
-					if ( ! self::write_queue( $queue ) ) {
+					$deleted = $row_mode
+						? Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::QUEUE_TYPE, $key, hash( 'sha256', maybe_serialize( $item ) ) )
+						: self::write_queue( array_diff_key( $queue, array( $key => true ) ) );
+					if ( ! $deleted ) {
 						$result['success'] = false;
 						$result['status'] = 'checkpoint-failed';
 						$result['remaining'] = true;
 						return $result;
 					}
+					unset( $queue[ $key ] );
+					$result['processed']++;
+					$result['dropped']++;
+					continue;
+				}
+
+				if ( ! self::product_belongs_to_current_connection( $product_id ) ) {
+					$deleted = $row_mode
+						? Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::QUEUE_TYPE, $key, hash( 'sha256', maybe_serialize( $item ) ) )
+						: self::write_queue( array_diff_key( $queue, array( $key => true ) ) );
+					if ( ! $deleted ) {
+						$result['success'] = false;
+						$result['status'] = 'checkpoint-failed';
+						$result['remaining'] = true;
+						return $result;
+					}
+					unset( $queue[ $key ] );
 					$result['processed']++;
 					$result['dropped']++;
 					continue;
 				}
 
 				if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $product_id ) ) {
-					unset( $queue[ $key ] );
-					if ( ! self::write_queue( $queue ) ) {
+					$deleted = $row_mode
+						? Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::QUEUE_TYPE, $key, hash( 'sha256', maybe_serialize( $item ) ) )
+						: self::write_queue( array_diff_key( $queue, array( $key => true ) ) );
+					if ( ! $deleted ) {
 						$result['success'] = false;
 						$result['status'] = 'checkpoint-failed';
 						$result['remaining'] = true;
 						return $result;
 					}
+					unset( $queue[ $key ] );
 					delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
 					$result['processed']++;
 					$result['dropped']++;
@@ -179,15 +295,21 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				}
 
 				$claim_token = wp_generate_uuid4();
-				$queue[ $key ]['processingToken'] = $claim_token;
-				$queue[ $key ]['processingUntil'] = time() + 120;
-				$queue[ $key ]['updatedAt']       = time();
-				if ( ! self::write_queue( $queue ) ) {
+				$claimed = $item;
+				$claimed['processingToken'] = $claim_token;
+				$claimed['processingUntil'] = time() + 120;
+				$claimed['updatedAt']       = time();
+				$claimed_hash = hash( 'sha256', maybe_serialize( $claimed ) );
+				$claim_saved = $row_mode
+					? Mobo_Core_Work_Queue_Store::replace_key_if_hash( self::QUEUE_TYPE, $key, hash( 'sha256', maybe_serialize( $item ) ), $claimed )
+					: self::write_queue( array_replace( $queue, array( $key => $claimed ) ) );
+				if ( ! $claim_saved ) {
 					$result['success'] = false;
 					$result['status'] = 'checkpoint-failed';
 					$result['remaining'] = true;
 					return $result;
 				}
+				$queue[ $key ] = $claimed;
 
 				/*
 				 * Do the potentially expensive WC variable sync with the queue mutex
@@ -238,26 +360,46 @@ final class Mobo_Core_Parent_Finalize_Queue {
 					return $result;
 				}
 
-				$queue   = self::read_queue();
-				$current = isset( $queue[ $key ] ) && is_array( $queue[ $key ] ) ? $queue[ $key ] : array();
+				$commit_read = $row_mode ? Mobo_Core_Work_Queue_Store::read_one_checked( self::QUEUE_TYPE, $key ) : null;
+				if ( $row_mode && 'error' === $commit_read['status'] ) {
+					update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+					$result['success'] = false;
+					$result['status'] = 'commit-failed';
+					$result['remaining'] = true;
+					return $result;
+				}
+				if ( ! $row_mode ) { $queue = self::read_queue(); }
+				$current = $row_mode
+					? ( 'ok' === $commit_read['status'] ? $commit_read['row']['payload'] : array() )
+					: ( isset( $queue[ $key ] ) && is_array( $queue[ $key ] ) ? $queue[ $key ] : array() );
 				$current_token = isset( $current['processingToken'] ) ? (string) $current['processingToken'] : '';
+				if ( $row_mode && 'ok' === $commit_read['status'] && ! hash_equals( (string) $claim_token, (string) $commit_read['row']['claim_token'] ) ) {
+					$current_token = '';
+				}
 
 				if ( '' === $current_token || ! hash_equals( $claim_token, $current_token ) ) {
 					/* A newer enqueue superseded this finalization; preserve its pending marker. */
 					update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
+					if ( $row_mode ) {
+						if ( 'ok' === $commit_read['status'] ) { $queue[ $key ] = $current; }
+						else { unset( $queue[ $key ] ); }
+					}
 					$result['deferred']++;
 					continue;
 				}
 
 				if ( null === $failure ) {
-					unset( $queue[ $key ] );
-					if ( ! self::write_queue( $queue ) ) {
+					$commit_saved = $row_mode
+						? Mobo_Core_Work_Queue_Store::finish_claim( self::QUEUE_TYPE, $key, $claimed_hash, $claim_token )
+						: self::write_queue( array_diff_key( $queue, array( $key => true ) ) );
+					if ( ! $commit_saved ) {
 						update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
 						$result['success'] = false;
 						$result['status'] = 'commit-failed';
 						$result['remaining'] = true;
 						return $result;
 					}
+					unset( $queue[ $key ] );
 					delete_post_meta( $product_id, '_mobo_parent_sync_pending' );
 					$result['finalized']++;
 					continue;
@@ -266,24 +408,45 @@ final class Mobo_Core_Parent_Finalize_Queue {
 				$result['failed']++;
 				$attempts = 1 + absint( isset( $current['attempts'] ) ? $current['attempts'] : 0 );
 				$delay    = min( 600, 30 * (int) pow( 2, min( 4, $attempts - 1 ) ) );
-				$queue[ $key ]['attempts']      = $attempts;
-				$queue[ $key ]['nextAttemptAt'] = time() + $delay;
-				$queue[ $key ]['updatedAt']     = time();
-				$queue[ $key ]['lastError']     = substr( sanitize_text_field( $failure->getMessage() ), 0, 500 );
-				unset( $queue[ $key ]['processingToken'], $queue[ $key ]['processingUntil'] );
+				$replacement = $current;
+				$replacement['attempts']      = $attempts;
+				$replacement['nextAttemptAt'] = time() + $delay;
+				$replacement['updatedAt']     = time();
+				$replacement['lastError']     = 'Variable-parent finalization failed with an internal exception (' . sanitize_key( get_class( $failure ) ) . ').';
+				unset( $replacement['processingToken'], $replacement['processingUntil'] );
 				update_post_meta( $product_id, '_mobo_parent_sync_pending', '1' );
-				if ( ! self::write_queue( $queue ) ) {
+				$commit_saved = $row_mode
+					? Mobo_Core_Work_Queue_Store::finish_claim( self::QUEUE_TYPE, $key, $claimed_hash, $claim_token, $replacement )
+					: self::write_queue( array_replace( $queue, array( $key => $replacement ) ) );
+				if ( ! $commit_saved ) {
 					$result['success'] = false;
 					$result['status'] = 'commit-failed';
 					$result['remaining'] = true;
 					return $result;
 				}
+				$queue[ $key ] = $replacement;
 			}
 
-			$queue = self::read_queue();
-			$result['pendingCount'] = count( $queue );
-			$result['remaining']    = ! empty( $queue );
-			$result['remainingDue'] = self::queue_has_due_items( $queue );
+			if ( $row_mode ) {
+				/* PERF07: do not materialize every payload again just to report the
+				 * final pending/due flags. available_at and claim_expires_at are the
+				 * row-store mirrors of nextAttemptAt/processingUntil. */
+				$counts = Mobo_Core_Work_Queue_Store::pending_due_counts_strict( self::QUEUE_TYPE );
+				if ( false === $counts ) {
+					$result['success'] = false;
+					$result['status'] = 'checkpoint-failed';
+					$result['remaining'] = true;
+					return $result;
+				}
+				$result['pendingCount'] = absint( $counts['pending'] );
+				$result['remaining']    = $result['pendingCount'] > 0;
+				$result['remainingDue'] = absint( $counts['due'] ) > 0;
+			} else {
+				$queue = self::read_queue();
+				$result['pendingCount'] = count( $queue );
+				$result['remaining']    = ! empty( $queue );
+				$result['remainingDue'] = self::queue_has_due_items( $queue );
+			}
 			$result['status']       = $result['failed'] > 0
 				? ( $result['finalized'] > 0 ? 'partial' : 'failed' )
 				: ( $result['finalized'] > 0 ? 'success' : ( $result['remaining'] ? 'waiting' : 'empty' ) );
@@ -301,6 +464,10 @@ final class Mobo_Core_Parent_Finalize_Queue {
 	 * @return bool
 	 */
 	public static function has_due_work() {
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			$counts = Mobo_Core_Work_Queue_Store::pending_due_counts_strict( self::QUEUE_TYPE );
+			return is_array( $counts ) && absint( $counts['due'] ) > 0;
+		}
 		return self::queue_has_due_items( self::read_queue() );
 	}
 
@@ -382,26 +549,36 @@ final class Mobo_Core_Parent_Finalize_Queue {
 		return absint( isset( $item['nextAttemptAt'] ) ? $item['nextAttemptAt'] : 0 ) <= absint( $now );
 	}
 
+	/** Prove one installation-global Woo Product ID belongs to this Connection. */
+	private static function product_belongs_to_current_connection( $product_id ) {
+		$product_id = absint( $product_id );
+		if ( $product_id <= 0 || ! class_exists( 'Mobo_Core_Product_State_Repository' ) || ! class_exists( 'Mobo_Core_Storage_Schema' ) || ! Mobo_Core_Storage_Schema::is_ready() ) {
+			return false;
+		}
+		return is_array( ( new Mobo_Core_Product_State_Repository() )->get_by_woo_product_id( $product_id ) );
+	}
+
 	private static function read_queue() {
-		$queue = get_option( self::OPTION_QUEUE, array() );
-		return is_array( $queue ) ? $queue : array();
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			if ( ! class_exists( 'Mobo_Core_Large_Runtime_Storage' ) || Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { Mobo_Core_Work_Queue_Store::migrate_option_map( self::OPTION_QUEUE, self::QUEUE_TYPE ); }
+			return Mobo_Core_Work_Queue_Store::load_map( self::QUEUE_TYPE );
+		}
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return array(); }
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) { return array(); }
+		$legacy = get_option( self::OPTION_QUEUE, array() );
+		return is_array( $legacy ) ? $legacy : array();
 	}
 
 	private static function write_queue( $queue ) {
 		$queue = is_array( $queue ) ? $queue : array();
-		if ( empty( $queue ) ) {
-			delete_option( self::OPTION_QUEUE );
-			wp_cache_delete( self::OPTION_QUEUE, 'options' );
-			return null === get_option( self::OPTION_QUEUE, null );
+		if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
+			return Mobo_Core_Work_Queue_Store::replace_map( self::QUEUE_TYPE, $queue );
 		}
-		if ( false === get_option( self::OPTION_QUEUE, false ) ) {
-			add_option( self::OPTION_QUEUE, $queue, '', false );
-		} else {
-			update_option( self::OPTION_QUEUE, $queue, false );
-		}
-		wp_cache_delete( self::OPTION_QUEUE, 'options' );
-		$stored = get_option( self::OPTION_QUEUE, null );
-		return is_array( $stored ) && maybe_serialize( $stored ) === maybe_serialize( $queue );
+		if ( class_exists( 'Mobo_Core_Large_Runtime_Storage' ) && ! Mobo_Core_Large_Runtime_Storage::legacy_fallback_allowed() ) { return false; }
+		if ( class_exists( 'Mobo_Core_Connection_Context' ) && method_exists( 'Mobo_Core_Connection_Context', 'legacy_default_owner_allowed' ) && ! Mobo_Core_Connection_Context::legacy_default_owner_allowed() ) { return false; }
+		return class_exists( 'Mobo_Core_Durable_State_Policy' )
+			? Mobo_Core_Durable_State_Policy::update_option_verified( self::OPTION_QUEUE, $queue, false )
+			: update_option( self::OPTION_QUEUE, $queue, false );
 	}
 
 	private static function acquire_lock() {

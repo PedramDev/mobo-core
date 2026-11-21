@@ -19,6 +19,67 @@ class Mobo_Core_Category_Sync {
 	/** @var array Request-local product ID => sorted product_cat term IDs. */
 	private $product_category_ids_cache = array();
 
+	/** UX59: Snapshot apply lock token; only populated by authoritative HTTP lanes. */
+	private $snapshot_lease_name = '';
+	private $snapshot_lease_token = '';
+
+	/**
+	 * Apply one external category snapshot after fencing its HTTP request-start time.
+	 * State and lock are Connection-owned. A newer already-committed snapshot wins,
+	 * even if its response happened to arrive before an older in-flight GET.
+	 * Direct legacy/payload callers without a start time retain their old contract.
+	 */
+	private function apply_fenced_snapshot( $payload, $started_us, $mapping_only ) {
+		$started_us = absint( $started_us );
+		if ( $started_us <= 0 ) {
+			return $mapping_only ? $this->load_categories_for_mapping_payload_locked( $payload ) : $this->sync_categories_payload_locked( $payload );
+		}
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 || ! class_exists( 'Mobo_Core_Lock' ) || ! class_exists( 'Mobo_Core_State_Store' ) || ! Mobo_Core_State_Store::is_available() ) {
+			return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot owner or durable state is unavailable.' );
+		}
+		/* An authoritative empty array is valid only while its destination table
+		 * is actually available; do not commit a generation to a missing map. */
+		if ( ! $this->category_map instanceof Mobo_Core_Category_Map || ! Mobo_Core_Category_Map::table_exists() ) {
+			return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category mapping table is unavailable.' );
+		}
+		$lock_name = 'category_snapshot_c' . $connection_id;
+		$token = Mobo_Core_Lock::acquire( $lock_name, 900 );
+		if ( false === $token ) {
+			return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot mutation is busy; retry with a fresh fetch.' );
+		}
+		try {
+			$committed_us = absint( Mobo_Core_State_Store::get( 'category_snapshot_committed_us', 0 ) );
+			if ( $committed_us >= $started_us ) {
+				return array( 'complete' => false, 'skipped' => 1, 'stale' => true, 'error' => 'Category HTTP snapshot predates the committed snapshot.' );
+			}
+			$this->snapshot_lease_name = $lock_name;
+			$this->snapshot_lease_token = $token;
+			$result = $mapping_only ? $this->load_categories_for_mapping_payload_locked( $payload ) : $this->sync_categories_payload_locked( $payload );
+			if ( ! empty( $result['complete'] ) && empty( $result['skipped'] ) ) {
+				if ( ! Mobo_Core_Lock::renew( $lock_name, $token, 900 )
+					|| ! Mobo_Core_State_Store::set( 'category_snapshot_committed_us', $started_us ) ) {
+					$result['complete'] = false;
+					$result['skipped'] = 1;
+					$result['error'] = 'Category snapshot watermark could not be durably committed.';
+				}
+			}
+			return $result;
+		} finally {
+			$this->snapshot_lease_name = '';
+			$this->snapshot_lease_token = '';
+			Mobo_Core_Lock::release( $lock_name, $token );
+		}
+	}
+
+	/** @return bool */
+	private function category_snapshot_lease_valid() {
+		return '' === $this->snapshot_lease_name || (
+			'' !== $this->snapshot_lease_token
+			&& Mobo_Core_Lock::renew( $this->snapshot_lease_name, $this->snapshot_lease_token, 900 )
+		);
+	}
+
 	public function __construct() {
 		$this->category_map = class_exists( 'Mobo_Core_Category_Map' ) ? new Mobo_Core_Category_Map() : null;
 	}
@@ -33,7 +94,12 @@ class Mobo_Core_Category_Sync {
 	 * @param mixed $payload API payload.
 	 * @return array
 	 */
-	public function load_categories_for_mapping_payload( $payload ) {
+	public function load_categories_for_mapping_payload( $payload, $snapshot_started_us = 0 ) {
+		return $this->apply_fenced_snapshot( $payload, $snapshot_started_us, true );
+	}
+
+	/** Source payload application; caller holds the optional HTTP-snapshot lease. */
+	private function load_categories_for_mapping_payload_locked( $payload ) {
 		$categories = $payload;
 
 		if ( is_array( $payload ) && isset( $payload['data'] ) && is_array( $payload['data'] ) ) {
@@ -51,8 +117,12 @@ class Mobo_Core_Category_Sync {
 		$created = 0;
 		$updated = 0;
 		$skipped = 0;
+		$present_guids = array();
 
 		foreach ( $categories as $category_data ) {
+			if ( ! $this->category_snapshot_lease_valid() ) {
+				return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot lease was lost.' );
+			}
 			if ( ! is_array( $category_data ) ) {
 				$skipped++;
 				continue;
@@ -68,6 +138,7 @@ class Mobo_Core_Category_Sync {
 				continue;
 			}
 
+			$present_guids[ $category_guid ] = true;
 			$result = $this->category_map->upsert_remote_category_for_mapping( $category_guid, $title, $url, $parent_guid );
 
 			if ( empty( $result['success'] ) ) {
@@ -84,15 +155,28 @@ class Mobo_Core_Category_Sync {
 			}
 		}
 
+		$complete = 0 === $skipped;
+		if ( $complete && class_exists( 'Mobo_Core_Settings' ) ) {
+			$active_guids = array_values( array_keys( $present_guids ) );
+			Mobo_Core_Settings::update( 'mobo_core_category_mapping_active_guids', $active_guids, false );
+			Mobo_Core_Settings::update( 'mobo_core_category_mapping_active_snapshot_at', time(), false );
+		}
+
 		return array(
 			'created'  => $created,
 			'updated'  => $updated,
 			'skipped'  => $skipped,
-			'complete' => 0 === $skipped,
+			'complete' => $complete,
+			'active'   => count( $present_guids ),
 		);
 	}
 
-	public function sync_categories_payload( $payload ) {
+	public function sync_categories_payload( $payload, $snapshot_started_us = 0 ) {
+		return $this->apply_fenced_snapshot( $payload, $snapshot_started_us, false );
+	}
+
+	/** Source payload application; caller holds the optional HTTP-snapshot lease. */
+	private function sync_categories_payload_locked( $payload ) {
 		$categories = $payload;
 
 		if ( is_array( $payload ) && isset( $payload['data'] ) && is_array( $payload['data'] ) ) {
@@ -111,13 +195,20 @@ class Mobo_Core_Category_Sync {
 		$updated = 0;
 		$skipped = 0;
 		$pending = array();
+		$present_guids = array();
+		$unresolved = array();
 
 		foreach ( $categories as $category_data ) {
+			if ( ! $this->category_snapshot_lease_valid() ) {
+				return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot lease was lost.' );
+			}
 			if ( ! is_array( $category_data ) ) {
 				$skipped++;
 				continue;
 			}
 			$pending[] = $category_data;
+			$guid = $this->get_category_guid( $category_data );
+			if ( '' !== $guid ) { $present_guids[ $guid ] = true; }
 		}
 
 		/*
@@ -128,6 +219,9 @@ class Mobo_Core_Category_Sync {
 		 */
 		$max_passes = max( 1, count( $pending ) );
 		for ( $pass = 0; $pass < $max_passes && ! empty( $pending ); $pass++ ) {
+			if ( ! $this->category_snapshot_lease_valid() ) {
+				return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot lease was lost before applying the next pass.' );
+			}
 			$next_pending = array();
 			$progress     = 0;
 
@@ -158,17 +252,35 @@ class Mobo_Core_Category_Sync {
 
 			if ( 0 === $progress ) {
 				$skipped += count( $next_pending );
+				foreach ( $next_pending as $stalled_category ) {
+					$unresolved[] = array( 'guid' => $this->get_category_guid( $stalled_category ), 'parentGuid' => $this->get_parent_category_guid( $stalled_category ) );
+				}
 				break;
 			}
 
 			$pending = $next_pending;
 		}
 
+		$retirement = array( 'retired' => 0, 'failed' => 0 );
+		/* A stale/expired writer must never retire rows by absence. */
+		if ( ! $this->category_snapshot_lease_valid() ) {
+			return array( 'complete' => false, 'skipped' => 1, 'error' => 'Category snapshot lease was lost before retirement.' );
+		}
+		if ( 0 === $skipped && $this->category_map instanceof Mobo_Core_Category_Map && method_exists( $this->category_map, 'retire_absent_remote_categories' ) ) {
+			$retirement = $this->category_map->retire_absent_remote_categories( array_keys( $present_guids ) );
+			if ( ! empty( $retirement['failed'] ) ) { $skipped += absint( $retirement['failed'] ); }
+		}
+		if ( 0 === $skipped && class_exists( 'Mobo_Core_Settings' ) ) {
+			Mobo_Core_Settings::update( 'mobo_core_category_mapping_active_guids', array_values( array_keys( $present_guids ) ), false );
+			Mobo_Core_Settings::update( 'mobo_core_category_mapping_active_snapshot_at', time(), false );
+		}
 		return array(
 			'created'  => $created,
 			'updated'  => $updated,
 			'skipped'  => $skipped,
 			'complete' => 0 === $skipped,
+			'retired'  => absint( $retirement['retired'] ?? 0 ),
+			'unresolved' => $unresolved,
 		);
 	}
 
@@ -534,7 +646,7 @@ class Mobo_Core_Category_Sync {
 			);
 		}
 
-		$term_id        = $this->find_term_id_by_guid( $category_guid );
+		$term_id        = $this->find_term_id_by_guid( $category_guid, true );
 		$parent_term_id = 0;
 
 		if ( '' !== $parent_guid ) {
@@ -646,6 +758,12 @@ class Mobo_Core_Category_Sync {
 				$hierarchy_repaired = ! is_wp_error( $updated_parent );
 			}
 
+			/* A source category that reappears after authoritative retirement is
+			 * resurrected in place; do not leave the local term marked retired. */
+			if ( ! $this->set_term_meta_verified( $term_id, 'mobo_category_retired', '0' ) ) {
+				return array( 'term_id' => $term_id, 'created' => false, 'incomplete' => true, 'error' => 'Category retirement marker could not be cleared.' );
+			}
+
 			if ( ! $this->upsert_category_map( $category_guid, $term_id, $title, $url, $parent_guid ) ) {
 				return array(
 					'term_id'    => $term_id,
@@ -653,6 +771,11 @@ class Mobo_Core_Category_Sync {
 					'incomplete' => true,
 					'error'      => 'WooCommerce category exists but its Mobo category map could not be persisted.',
 				);
+			}
+			/* Retirement can interleave with the two persistence layers. After the
+			 * durable map points at this term, reassert that it is not retired. */
+			if ( ! $this->set_term_meta_verified( $term_id, 'mobo_category_retired', '0' ) ) {
+				return array( 'term_id' => $term_id, 'created' => false, 'incomplete' => true, 'error' => 'Reactivated category retirement marker was not verified.' );
 			}
 			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 
@@ -779,14 +902,14 @@ class Mobo_Core_Category_Sync {
 		);
 	}
 
-	public function find_term_id_by_guid( $category_guid ) {
+	public function find_term_id_by_guid( $category_guid, $include_retired = false ) {
 		$category_guid = sanitize_text_field( (string) $category_guid );
 
 		if ( '' === $category_guid ) {
 			return 0;
 		}
 
-		if ( array_key_exists( $category_guid, $this->term_id_by_guid_cache ) ) {
+		if ( ! $include_retired && array_key_exists( $category_guid, $this->term_id_by_guid_cache ) ) {
 			return absint( $this->term_id_by_guid_cache[ $category_guid ] );
 		}
 
@@ -794,7 +917,11 @@ class Mobo_Core_Category_Sync {
 			$term_id = $this->category_map->get_synced_term_id( $category_guid );
 
 			if ( $term_id > 0 ) {
-				$this->term_id_by_guid_cache[ $category_guid ] = absint( $term_id );
+				if ( ! $include_retired && '1' === (string) get_term_meta( $term_id, 'mobo_category_retired', true ) ) {
+					$this->term_id_by_guid_cache[ $category_guid ] = 0;
+					return 0;
+				}
+				if ( ! $include_retired ) { $this->term_id_by_guid_cache[ $category_guid ] = absint( $term_id ); }
 				return absint( $term_id );
 			}
 		}
@@ -820,8 +947,12 @@ class Mobo_Core_Category_Sync {
 		}
 
 		$term_id = absint( $terms[0]->term_id );
+		if ( $term_id > 0 && ! $include_retired && '1' === (string) get_term_meta( $term_id, 'mobo_category_retired', true ) ) {
+			$this->term_id_by_guid_cache[ $category_guid ] = 0;
+			return 0;
+		}
 
-		if ( $term_id > 0 ) {
+		if ( $term_id > 0 && ! $include_retired ) {
 			$this->term_id_by_guid_cache[ $category_guid ] = $term_id;
 			$this->upsert_category_map( $category_guid, $term_id, '', '', '' );
 		}
@@ -1127,7 +1258,8 @@ class Mobo_Core_Category_Sync {
 
 		return $this->set_term_meta_verified( $term_id, 'category_guid', sanitize_text_field( (string) $category_guid ) )
 			&& $this->set_term_meta_verified( $term_id, 'mobo_category_url', sanitize_text_field( (string) $url ) )
-			&& $this->set_term_meta_verified( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) );
+			&& $this->set_term_meta_verified( $term_id, 'mobo_parent_category_guid', sanitize_text_field( (string) $parent_guid ) )
+			&& $this->set_term_meta_verified( $term_id, 'mobo_category_retired', '0' );
 	}
 
 	/**

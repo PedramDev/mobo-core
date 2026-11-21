@@ -16,6 +16,36 @@ class Mobo_Core_Remote_Control {
 	const LAST_OPERATION_OPTION = 'mobo_core_portal_last_operation';
 
 	/**
+	 * Return the Connection-scoped last-operation option key.
+	 *
+	 * Portal control endpoints are Source-scoped. Their auxiliary state must not
+	 * remain installation-global, otherwise one authenticated Source can observe
+	 * another Source's request id/status metadata.
+	 *
+	 * @return string
+	 */
+	private static function last_operation_option_name() {
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' )
+			? absint( Mobo_Core_Connection_Context::get_current_connection_id() )
+			: 0;
+
+		return $connection_id > 0
+			? self::LAST_OPERATION_OPTION . '_c' . $connection_id
+			: self::LAST_OPERATION_OPTION;
+	}
+
+	/** @return array */
+	private static function read_last_operation() {
+		$record = get_option( self::last_operation_option_name(), array() );
+		return is_array( $record ) ? $record : array();
+	}
+
+	/** @param array $record Record. @return bool */
+	private static function write_last_operation( $record ) {
+		return update_option( self::last_operation_option_name(), is_array( $record ) ? $record : array(), false );
+	}
+
+	/**
 	 * Start a normal Sync or full Repair.
 	 *
 	 * @param string $operation Operation name: sync|repair.
@@ -75,7 +105,7 @@ class Mobo_Core_Remote_Control {
 				'status'      => 'running',
 				'message'     => isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '',
 			);
-			update_option( self::LAST_OPERATION_OPTION, $record, false );
+			self::write_last_operation( $record );
 		} else {
 			/*
 			 * Never let a rejected concurrent request replace the identity/status of
@@ -93,7 +123,7 @@ class Mobo_Core_Remote_Control {
 					'status'      => 'rejected',
 					'message'     => isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '',
 				);
-				update_option( self::LAST_OPERATION_OPTION, $record, false );
+				self::write_last_operation( $record );
 			}
 		}
 
@@ -117,14 +147,11 @@ class Mobo_Core_Remote_Control {
 	public static function cancel_operation() {
 		$sync = new Mobo_Core_Product_Sync();
 		$result = $sync->cancel_manual_sync();
-		$record = get_option( self::LAST_OPERATION_OPTION, array() );
-		if ( ! is_array( $record ) ) {
-			$record = array();
-		}
+		$record = self::read_last_operation();
 		$record['status'] = ! empty( $result['success'] ) ? 'cancelled' : 'cancel-failed';
 		$record['finishedAt'] = time();
 		$record['message'] = isset( $result['message'] ) ? sanitize_text_field( (string) $result['message'] ) : '';
-		update_option( self::LAST_OPERATION_OPTION, $record, false );
+		self::write_last_operation( $record );
 
 		return array(
 			'success' => ! empty( $result['success'] ),
@@ -144,10 +171,7 @@ class Mobo_Core_Remote_Control {
 		$manual = $sync->get_manual_sync_status();
 		$reconciliation = class_exists( 'Mobo_Core_Sync_Health' ) ? ( method_exists( 'Mobo_Core_Sync_Health', 'get_operational_dashboard_status' ) ? Mobo_Core_Sync_Health::get_operational_dashboard_status() : Mobo_Core_Sync_Health::get_dashboard_status() ) : array();
 		$upgrade = class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array();
-		$last = get_option( self::LAST_OPERATION_OPTION, array() );
-		if ( ! is_array( $last ) ) {
-			$last = array();
-		}
+		$last = self::read_last_operation();
 
 		$is_running = ! empty( $manual['isRunning'] ) || ! empty( $manual['isWaitingForPortal'] );
 		$operation = ! empty( $manual['repairMode'] ) ? 'repair' : ( $is_running ? 'sync' : '' );
@@ -173,7 +197,7 @@ class Mobo_Core_Remote_Control {
 			$last['status'] = $status;
 			if ( in_array( $status, array( 'done', 'cancelled', 'failed' ), true ) && empty( $last['finishedAt'] ) ) {
 				$last['finishedAt'] = ! empty( $manual['completedAt'] ) ? absint( $manual['completedAt'] ) : time();
-				update_option( self::LAST_OPERATION_OPTION, $last, false );
+				self::write_last_operation( $last );
 			}
 		}
 

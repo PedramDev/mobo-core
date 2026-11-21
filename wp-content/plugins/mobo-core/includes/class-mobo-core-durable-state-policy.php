@@ -36,6 +36,25 @@ final class Mobo_Core_Durable_State_Policy {
 	}
 
 	/**
+	 * Write a plugin-owned large state row outside wp_options and verify exact read-back.
+	 *
+	 * @param string $key State key.
+	 * @param mixed  $value Desired value.
+	 * @return bool
+	 */
+	public static function update_state_verified( $key, $value ) {
+		if ( ! class_exists( 'Mobo_Core_State_Store' ) || ! Mobo_Core_State_Store::is_available() ) {
+			return false;
+		}
+		if ( ! Mobo_Core_State_Store::set( $key, $value ) ) {
+			return false;
+		}
+		$stored = Mobo_Core_State_Store::get( $key, null );
+		return maybe_serialize( $stored ) === maybe_serialize( $value );
+	}
+
+
+	/**
 	 * Canonicalize scalar metadata exactly as WordPress stores it in metadata tables.
 	 * Numeric/bool/null scalars are read back as strings, while arrays/objects retain
 	 * their serialized structure. Verified persistence must compare DB semantics, not
@@ -73,6 +92,54 @@ final class Mobo_Core_Durable_State_Policy {
 		wp_cache_delete( $post_id, 'post_meta' );
 		$stored = self::canonical_meta_value( get_post_meta( $post_id, $key, true ) );
 		return maybe_serialize( $stored ) === maybe_serialize( $expected );
+	}
+
+	/**
+	 * PERF03: Verify one contiguous group of bookkeeping metadata with a single
+	 * explicit post-meta cache refresh. This is ONLY for fields that have no
+	 * externally observable side effect or crash/ack fence between individual
+	 * writes. Ordering watermarks, in-flight markers and payment metadata must
+	 * continue to use the individual verified-write boundary.
+	 *
+	 * Every field is checked AFTER the final cache invalidation. An ambiguous
+	 * update_post_meta() return value never becomes proof of persistence. In
+	 * particular, neither the pre-write metadata cache nor a successful UPDATE
+	 * is accepted as the final postcondition.
+	 *
+	 * @param int   $post_id Post or variation ID.
+	 * @param array $updates Associative key => desired value, in write order.
+	 * @return bool Whether the entire group matches verified persisted state.
+	 */
+	public static function update_post_meta_verified_batch( $post_id, $updates ) {
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || ! is_array( $updates ) || empty( $updates ) ) {
+			return false;
+		}
+		$expected = array();
+		foreach ( $updates as $raw_key => $value ) {
+			$key = sanitize_key( (string) $raw_key );
+			if ( '' === $key || isset( $expected[ $key ] ) ) {
+				return false;
+			}
+			$expected[ $key ] = self::canonical_meta_value( $value );
+		}
+
+		foreach ( $expected as $key => $value ) {
+			$current = self::canonical_meta_value( get_post_meta( $post_id, $key, true ) );
+			if ( maybe_serialize( $current ) !== maybe_serialize( $value ) ) {
+				update_post_meta( $post_id, $key, $value );
+			}
+		}
+		/* WordPress update_post_meta() may have invalidated the cache while writing.
+		 * Make one final explicit refresh even when every field looked like a no-op. */
+		wp_cache_delete( $post_id, 'post_meta' );
+		foreach ( $expected as $key => $value ) {
+			$stored = self::canonical_meta_value( get_post_meta( $post_id, $key, true ) );
+			if ( maybe_serialize( $stored ) !== maybe_serialize( $value ) ) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/** Persist term metadata and verify WordPress-normalized read-back. */

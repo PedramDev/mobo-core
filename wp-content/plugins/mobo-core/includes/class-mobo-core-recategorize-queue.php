@@ -125,9 +125,10 @@ class Mobo_Core_Recategorize_Queue {
 		}
 
 		try {
-		delete_option( self::STATE_OPTION );
-		wp_cache_delete( self::STATE_OPTION, 'options' );
-		if ( null !== get_option( self::STATE_OPTION, null ) ) {
+		if ( ! class_exists( 'Mobo_Core_State_Store' ) || ! Mobo_Core_State_Store::is_available() || ! Mobo_Core_State_Store::delete( self::STATE_OPTION ) ) {
+			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'پاک‌سازی وضعیت صف در دیتابیس تأیید نشد.' );
+		}
+		if ( null !== Mobo_Core_State_Store::get( self::STATE_OPTION, null ) ) {
 			return array( 'success' => false, 'status' => 'checkpoint-failed', 'message' => 'پاک‌سازی وضعیت صف در دیتابیس تأیید نشد.' );
 		}
 
@@ -272,8 +273,8 @@ class Mobo_Core_Recategorize_Queue {
 				}
 			} catch ( Throwable $e ) {
 				$failed++;
-				$state['lastError'] = sanitize_text_field( $e->getMessage() );
-				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': ' . $e->getMessage() );
+				$state['lastError'] = 'Recategorize internal exception (' . sanitize_key( get_class( $e ) ) . ').';
+				Mobo_Core_Logger::error( 'Mobo Core recategorize failed for product ' . $post_id . ': internal exception (' . sanitize_key( get_class( $e ) ) . ').' );
 				$key = (string) $post_id;
 				$attempts = isset( $state['failureAttempts'][ $key ] ) ? absint( $state['failureAttempts'][ $key ] ) + 1 : 1;
 				$state['failureAttempts'][ $key ] = $attempts;
@@ -346,9 +347,12 @@ class Mobo_Core_Recategorize_Queue {
 	}
 
 
-	/** Persist queue state and verify the exact value from wp_options. */
+	/** Persist queue state in the current Connection-owned state row. */
 	private function persist_state_verified( $state ) {
-		return is_array( $state ) && Mobo_Core_Durable_State_Policy::update_option_verified( self::STATE_OPTION, $state, false );
+		return is_array( $state )
+			&& class_exists( 'Mobo_Core_State_Store' )
+			&& Mobo_Core_State_Store::is_available()
+			&& Mobo_Core_State_Store::set( self::STATE_OPTION, $state );
 	}
 
 	/**
@@ -659,6 +663,8 @@ class Mobo_Core_Recategorize_Queue {
 		}
 
 		$table = Mobo_Core_Sync_Event_Store::table_name();
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 ) { return array(); }
 
 		/*
 		 * Fast path: current ProductUpdated rows carry entity_guid and are covered by
@@ -668,10 +674,12 @@ class Mobo_Core_Recategorize_Queue {
 		$rows = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT payload_json FROM {$table}
-				WHERE event_type = 'ProductUpdated'
+				WHERE connection_id = %d
+					AND event_type = 'ProductUpdated'
 					AND entity_guid = %s
 				ORDER BY id DESC
 				LIMIT 10",
+				$connection_id,
 				$product_guid
 			)
 		);
@@ -685,11 +693,13 @@ class Mobo_Core_Recategorize_Queue {
 		$rows = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT payload_json FROM {$table}
-				WHERE event_type = 'ProductUpdated'
+				WHERE connection_id = %d
+					AND event_type = 'ProductUpdated'
 					AND entity_guid = ''
 					AND payload_json LIKE %s
 				ORDER BY id DESC
 				LIMIT 10",
+				$connection_id,
 				$like
 			)
 		);
@@ -982,15 +992,27 @@ class Mobo_Core_Recategorize_Queue {
 	private function count_items() {
 		global $wpdb;
 
-		return absint( $wpdb->get_var( "
-			SELECT COUNT(DISTINCT p.ID)
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pg ON pg.post_id = p.ID
-			WHERE p.post_type = 'product'
-			AND p.post_status = 'publish'
-			AND pg.meta_key = 'product_guid'
-			AND pg.meta_value <> ''
-		" ) );
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id <= 0 ) { return 0; }
+			return absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND p.post_status='publish' AND c.product_guid<>''", $connection_id ) ) );
+		}
+
+		$table = class_exists( 'Mobo_Core_Storage_Schema' ) ? Mobo_Core_Storage_Schema::table_name( 'products' ) : '';
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 || '' === $table ) { return 0; }
+		return absint( $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(DISTINCT p.ID)
+			 FROM {$wpdb->posts} p
+			 INNER JOIN {$wpdb->postmeta} pg ON pg.post_id = p.ID
+			 INNER JOIN {$table} c ON c.connection_id = %d AND c.woo_product_id = p.ID
+			 WHERE p.post_type = 'product'
+			 AND p.post_status = 'publish'
+			 AND pg.meta_key = 'product_guid'
+			 AND pg.meta_value <> ''",
+			$connection_id
+		) ) );
 	}
 
 	/**
@@ -1006,22 +1028,35 @@ class Mobo_Core_Recategorize_Queue {
 		$last_id = absint( $last_id );
 		$limit   = max( 1, absint( $limit ) );
 
-		$sql = $wpdb->prepare(
-			"
-			SELECT DISTINCT p.ID
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pg ON pg.post_id = p.ID
-			WHERE p.post_type = 'product'
-			AND p.post_status = 'publish'
-			AND pg.meta_key = 'product_guid'
-			AND pg.meta_value <> ''
-			AND p.ID > %d
-			ORDER BY p.ID ASC
-			LIMIT %d
-			",
-			$last_id,
-			$limit
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced() ) {
+			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id <= 0 ) { return array(); }
+			$sql = $wpdb->prepare(
+				"SELECT DISTINCT p.ID FROM {$wpdb->posts} p INNER JOIN {$table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND p.post_status='publish' AND c.product_guid<>'' AND p.ID>%d ORDER BY p.ID ASC LIMIT %d",
+				$connection_id, $last_id, $limit
+			);
+		} else {
+			$table = class_exists( 'Mobo_Core_Storage_Schema' ) ? Mobo_Core_Storage_Schema::table_name( 'products' ) : '';
+			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id <= 0 || '' === $table ) { return array(); }
+			$sql = $wpdb->prepare(
+				"SELECT DISTINCT p.ID
+				 FROM {$wpdb->posts} p
+				 INNER JOIN {$wpdb->postmeta} pg ON pg.post_id = p.ID
+				 INNER JOIN {$table} c ON c.connection_id = %d AND c.woo_product_id = p.ID
+				 WHERE p.post_type = 'product'
+				 AND p.post_status = 'publish'
+				 AND pg.meta_key = 'product_guid'
+				 AND pg.meta_value <> ''
+				 AND p.ID > %d
+				 ORDER BY p.ID ASC
+				 LIMIT %d",
+				$connection_id,
+				$last_id,
+				$limit
+			);
+		}
 
 		$ids = $wpdb->get_col( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Prepared immediately above with bounded integer placeholders.
 
@@ -1034,7 +1069,9 @@ class Mobo_Core_Recategorize_Queue {
 	 * @return array
 	 */
 	private function get_state() {
-		$state = get_option( self::STATE_OPTION, array() );
+		$state = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+			? Mobo_Core_State_Store::get( self::STATE_OPTION, array() )
+			: array();
 
 		if ( ! is_array( $state ) ) {
 			$state = array();

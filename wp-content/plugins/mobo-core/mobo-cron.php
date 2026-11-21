@@ -150,6 +150,8 @@ function mobo_core_cron_run() {
 		mobo_core_cron_emit_json( array( 'success' => false, 'status' => 'plugin-not-loaded', 'message' => 'Mobo Core is inactive or unavailable.' ), 1, '', $base_ob_level, 503 );
 	}
 
+	Mobo_Core_Cron_Runner::record_real_cron_hit();
+
 	$dispatch_claim = class_exists( 'Mobo_Core_Self_Runner' )
 		? Mobo_Core_Self_Runner::claim_worker_request( '' )
 		: array( 'success' => true, 'token' => '' );
@@ -171,7 +173,7 @@ function mobo_core_cron_run() {
 	$dispatch_token = isset( $dispatch_claim['token'] ) ? (string) $dispatch_claim['token'] : '';
 	$runner = new Mobo_Core_Cron_Runner();
 	try {
-		$result = $runner->run( 'cpanel-local-php-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $dispatch_token ) );
+		$result = $runner->run( 'cpanel-local-php-cron', false, array( 'suppressContinuationKick' => true, 'dispatcherToken' => $dispatch_token, 'schedulerHitRecorded' => true ) );
 	} finally {
 		if ( '' !== $dispatch_token && class_exists( 'Mobo_Core_Self_Runner' ) ) {
 			Mobo_Core_Self_Runner::release_worker_request( $dispatch_token );

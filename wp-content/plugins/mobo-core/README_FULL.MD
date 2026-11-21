@@ -1,4 +1,56 @@
+> **REL32-VARIATION-SINGLETON-DISCOVERY / 10.34.77:** completes release-hygiene singleton media discovery across both WooCommerce products and product variations. Ownership now unions canonical Product State, canonical Variant State, Product Map product/variation compatibility rows, and live legacy Mobo identity rows exactly as the release integrity gate does. Hygiene revision 4 re-arms the same-version pass once.\n\n> **REL31-LEGACY-IDENTITY-THUMBNAIL-DISCOVERY / 10.34.77:** completes the one-time singleton thumbnail repair ownership universe so it matches release-gate discovery: canonical Custom Storage, Product Map compatibility rows, and live products that still carry historical Mobo identity postmeta. Legacy rows are discovery-only and are not restored as runtime identity authority. Hygiene revision 3 re-arms the same-version release pass once.\n\n> **REL30-CANONICAL-RESIDUE-DISCOVERY / 10.34.77:** widens release-hygiene candidate discovery to canonical Custom Storage product ownership and postmeta-only pre-HPOS Revenue Ledger residue. Revenue ownership enrichment updates WooCommerce CRUD authority and the existing legacy ledger shadow without recalculating any financial field; a hygiene revision marker re-arms the corrected pass on same-version replacement.
+
+> **REL29-RELEASE-HYGIENE-DEFERRED-WIRING / 10.34.77:** fixes the one-time 10.34.77 release-hygiene bootstrap so deferred repairs can arm themselves on the first normal request, including same-version candidate replacement. The durable Revenue Ledger ownership pending flag now also keeps the deferred repair hook alive until convergence; completed sites do not keep loading the hook because `mobo_core_103477_release_hygiene_scheduled_at` is persisted.
+
+> **REL28-RELEASE-HYGIENE-LEGACY-OWNERSHIP / 10.34.77:** one-time web-safe release hygiene re-arms proven-safe `_thumbnail_id` singleton dedupe and backfills missing Revenue Ledger Connection ownership only from unambiguous durable evidence (or a sole-Connection historical installation). Financial ledger values are never recalculated; ambiguous history remains fail-closed. Stable tag aligned to 10.34.77.
+
+> **REL27-QUEUE-FAILED-SUPERSESSION-CONSISTENCY / 10.34.77:** Queue Summary and `Retry Failed` now share one ordering-aware failed-event supersession classifier. A newer arrival with a lower version, or a different non-empty incomparable version, remains actionable instead of being hidden from Health/UI metrics; legacy rows without ordering evidence retain arrival-order fallback. Classification DB read errors fail closed instead of producing a false zero actionable-failure count.
+
+> **REL26-FINAL-HARDENING / 10.34.77:** Final pre-publish cumulative candidate. This build includes same-site Self Runner TLS policy, runtime `MOBO_API_BASE_URL` precedence, HTTP-authoritative server-provisioned Backend URLs, endpoint-scoped network circuits, retry/backoff coordination without fake retry consumption, Exact Convergence retry reset after a valid response, bounded rolling targeted-convergence windows with global ownership, and the deferred post-upgrade recovery lifecycle proven through clean completion/no-rebirth. `mobo-core-manifest.json` is regenerated from the packaged bytes for exact-build verification.
+
+> **REL23-HTTP-BACKEND-POLICY / 10.34.77:** `api_base_url` is scheme-authoritative. HTTP endpoints are valid when server-provisioned (including `http://mobo.codeya.ir`); the plugin must not auto-upgrade, reject, or rewrite them to HTTPS. The admin UI now reports HTTP factually without treating HTTPS as a production requirement. Local `MOBO_API_BASE_URL` override precedence and endpoint-scoped network circuits remain unchanged.
+
+> **REL20-NETWORK-BACKOFF-COORDINATION / 10.34.77:** Product Sync now treats durable Portal/MoboCore circuit backoff as a deferral rather than a new transport attempt: retry budget is consumed only by real requests, `waiting_for_portal` honors the network retry boundary, and a backoff resume preserves the count of prior real attempts. Exact targeted convergence recovery also advances with a durable cursor and counts only finalized targets, preventing a temporary Backend outage from repeatedly rescanning the entire frozen target set. TLS verification and external request authentication are unchanged.
+
+> **REL19-SAME-SITE-LOOPBACK-TLS / 10.34.77:** Self Runner wake-ups now follow WordPress core's `https_local_ssl_verify` policy for the same-site `/worker/run` loopback, while `mobo_core_http_sslverify` remains the final override. This prevents private/local certificate chains from stranding a durable post-upgrade convergence owner. External MoboCore, Provider, image, updater, checkout and other outbound HTTPS requests retain their existing verified-TLS defaults. Backend remains unchanged.
+> **REL18-DEFERRED-POST-UPGRADE-CONVERGENCE-HOOK / 10.34.77:** The durable `mobo_core_103473_post_upgrade_convergence_pending` intent now participates in the lightweight deferred-repair bootstrap pre-check, so a request after signed provisioning actually registers `Mobo_Core_Migration::run_deferred_repairs()` on `init`. Upgrades crossing 10.34.77 re-arm the intent, preserving the provisioning-boundary guard while ensuring provisioned installations create the targeted convergence owner instead of leaving pending intent dormant. Backend remains unchanged.
+
+> **REL16-CURRENT-BOUNDARY-TERMINAL-OWNERSHIP / 10.34.76:** Operational convergence now accepts terminal upstream ownership only when terminal evidence matches the current product/source ordering boundary. Historical terminal events whose evidence has been superseded are reclassified as actionable convergence gaps so post-upgrade targeted recovery can adopt and heal them instead of leaving stale terminal ownership behind.
+
+> **REL15-DYNAMIC-POST-UPGRADE-CONVERGENCE-RECLASSIFICATION / 10.34.76:** Targeted post-upgrade convergence recovery now reclassifies Operational Health before releasing its owner. Newly-actionable gaps that appear while the frozen generation is running (for example terminal evidence superseded by a newer reconnect/source boundary) are adopted into the same durable generation. Completion is based on fresh post-apply unowned state with the generation owner ignored, so attempted-but-still-broken products are reported as unresolved instead of false-PASS.
+
+> **REL12-CANONICAL-RAW-VARIATION-META-CONVERGENCE / 10.34.71:** Exact Variant storefront convergence now reads durable `attribute_*` rows directly from postmeta, canonicalizes legacy equivalent meta-key spellings, removes duplicate/stale attribute rows, and re-verifies the raw byte values after every successful Variant mutation. Woo object hydration remains useful for storefront objects but is no longer accepted as exact persistence evidence.
+
+> **REL11-RAW-VARIATION-ATTRIBUTE-VALUE-CONVERGENCE / 10.34.70:** Exact storefront convergence now reads and verifies durable WooCommerce `attribute_*` postmeta instead of trusting the hydrated Variation object, which can canonicalize parent option case and hide legacy raw drift. Case-only mismatches are rewritten and verified after the normal Woo save while slug-normalized identity matching remains unchanged.
+
+> **REL03-CUSTOM-STATE-RESIDUE-FINALIZER / 10.34.62:** Release-residue self-heal now proves convergence from Product Map + canonical Custom Storage Product/Variant state; Sync Health is observational output only. Re-arms the bounded finalizer for 10.34.61 upgrades. Backend remains unchanged.
+
+> **HARDEN14-OBSERVABILITY-ADMIN-HEALTH / 10.34.61:** Admin Health now exposes durable monetary compatibility, precise network failure classes, backlog/stalled state and last successful sync without executing probes during rendering. HARDEN03 Backend remains unchanged.
+
+> **HARDEN10-CHECKOUT-SCOPE-PREFLIGHT / 10.34.60:** Automatic Mobo order submission now rejects mixed, multi-Connection and ownership-ambiguous checkouts before payment, while leaving optional remote/cart validation independent. Phases 8/9/11/12/13 retain the existing production mechanisms and are covered by the HARDEN13 Test Suite checkpoint.
+
+> **HARDEN06-REPLAY-OUT-OF-ORDER / 10.34.59:** Version-aware queue supersession and failed-event recovery prevent a late stale delivery from suppressing a failed newer desired state. Different non-empty incomparable watermarks fail closed instead of using arrival order, equal-version completed rows are replay-deduped, and equal-version ProductUpdated payloads with conflicting durable source hashes are blocked.
+
+> **HARDEN04-AMBIGUOUS-PURCHASE-IDEMPOTENCY / 10.34.58:** Provider purchase ambiguity is fail-closed with durable attempt/remote-order checkpoints and positive-only reconciliation. A known remote order can only heal local uncertainty when provider details positively prove the exact expected order and `paid=true`; missing/false/incomplete evidence never authorizes another Checkout/Wallet POST. Reconciliation owns the same per-order and shared Provider-session leases, and stale queue/admin paths cannot replay a known remote purchase or post-success listeners.
+> **HARDEN02-MONEY-CONTRACT / 10.34.56:** Connection provisioning now carries explicit Source monetary semantics (`money_unit`, fraction digits, representation and monotonic contract version). MoboMobo is provisioned as IRT/Toman with zero fraction digits. IRT and IRR are distinct; Product Sync, Reprice, Shipping and Order Submission fail closed on mismatch and no implicit x10 conversion remains. Backend reconciliation refreshes existing customers without requiring a license re-save.
+
+> **REL10-EXACT-VARIATION-ATTRIBUTE-VALUE-CONVERGENCE / 10.34.69:** Variation identity continues to use slug-normalized signatures for duplicate-safe matching, while storefront convergence now compares exact sanitized option values. Case-only historical drift such as `Airpods 3` vs `airpods 3` is rewritten in place instead of being incorrectly accepted as a no-op.
+> **REL09-ONLYINSTOCK-EXACT-CONVERGENCE-RECOVERY / 10.34.68:** Repair now exact-fetches existing local products that Operational Health classifies as unowned after the catalogue pass. This closes OnlyInStock policy omissions without importing new out-of-stock products: terminal/active-owned rows are excluded, existing Woo identity is required, and the exact snapshot is fed through the normal Parent/Variant lock and webhook-ordering pipeline.
+
+> **REL08-VARIANT-CHECKPOINT-ORDER-RESIDUE-PROOF / 10.34.67:** The historical residue finalizer now removes the last legacy parent-level Variant watermark equality assumption. When the optional parent Variant checkpoint pair exists, both values must be present and preserve monotonic ordering (`seen<=applied`); exact Custom Variant State remains authoritative for child convergence after retirement.
+> **REL06-VARIANT-APPLIED-STATE-RESIDUE-PROOF / 10.34.66:** The historical residue finalizer now follows the canonical Variant State repository applied-state contract. A migrated Variant may legitimately have applied revision ahead of seen revision; exact Custom Variant coverage is proven by applied status, no dirty/claim state, desired<=applied, complete child identity coverage, and non-conflicting hashes. Hashed child-map fallback is retained only when no Custom Variant state exists.
+
+> **REL02-DURABLE-RESIDUE-FINALIZER / 10.34.55:** Pre-release Plugin Gate proved that 10.34.54's bounded residue scan still depended on retained historical done-event rows. 10.34.55 re-arms the scan and promotes current durable state to the proof boundary: exact applied Product/Variant revision+version, matching source hash, completed authoritative desired-state, complete child mappings, sane local topology, and no active event owner. Historical event rows are no longer required. `_thumbnail_id` duplicate normalization now preserves the oldest row only when WordPress' public singleton read resolves to that exact value, allowing conflicting later rows to be removed without changing the effective thumbnail. Portal/.NET is unchanged.
+
+> **REL01-CONVERGENCE-RESIDUE / 10.34.54:** Pre-release Plugin Gate exposed historical incomplete-marker residue that the original one-page 10.33.53 self-heal could not exhaust. The proof itself remains strict; only scan ownership/lifetime is corrected. The repair now resumes by Product Map id, includes synced/behind candidates, remains pending until the bounded scan is exhausted, and is advanced by real Cron. A second bounded repair normalizes duplicate `_thumbnail_id` rows on current Mobo products without changing the effective thumbnail value.
+
+> **MIGOPT09-BACKFILL-CACHE / 10.34.53:** The clean 10.34.52 full benchmark reduced DB queries to 959,936 and CPU to ~82.5s, but accelerated Backfill retained WordPress postmeta caches from multiple completed 100-row units until request shutdown, peaking near 150 MiB. 10.34.53 bulk-primes only the current bounded Backfill unit and releases its postmeta cache in `finally`; no batch/grace/cursor/fence safety is weakened.
+> **MIGOPT08-PREFENCE-READS / 10.34.52:** The clean 10.34.51 full benchmark completed with zero residue/parity and sharply lower request/memory pressure, but Backfill and Operational proof still paid repeated pre-fence state checks inside each Legacy snapshot. 10.34.52 introduces a trusted migration-only pre-fence Legacy-read scope for those two workers; it is exception/return-safe via `finally` and never changes normal runtime/write-path fence behavior. No batch or grace enlargement.
+> **MIGOPT07-OPBACKFILL / 10.34.51:** A clean 10.34.50 `test1` benchmark completed with exact zero residue/parity, but 132 backfill requests plus Operational proof dominated runtime/query pressure and peak PHP memory reached ~272 MiB. 10.34.51 lets a genuinely running backfill consume multiple small durable units in the existing bounded Cron slice, makes Operational proof bulk-prefetched verify-first/no-op, and bounds proof cache retention without increasing destructive unit size.
 # Mobo Core — Full Documentation / مستندات کامل
+> **MIGOPT06-SLICELOOP / 10.34.50:** `test1` fixture telemetry showed that 10.34.49 reduced the Identity hot path dramatically, but every real-cron request still reported one migration iteration. The accelerated waiting detector was matching the JSON field name `lastError` even when empty. 10.34.50 inspects only actual status/error values, allowing multiple durable worker batches per bounded Cron slice while preserving immediate stop on grace/waiting/error states.
+> **MIGOPT05-IDENTITY-NOOP / 10.34.49:** Fixture telemetry on test1 showed ~62.5k DB queries per Identity proof slice despite set-based prefetch. The cause was unconditional replay of the heavyweight Product/Variation Legacy bridge for every proof object and Variation parent. 10.34.49 verifies the prefetched Custom snapshot first and executes the original mirror + fresh verification only on real mismatch/missing state; crash/replay and terminal proof semantics are unchanged.
+
 
 <div align="center">
 
@@ -9,6 +61,15 @@
 </div>
 
 ---
+
+> **MIGOPT05-IDENTITY-NOOP / 10.34.49:** Retains the 10.34.47 crash/replay contract and optimizes remaining migration query paths: set-based Identity proof and Operational reconcile reads, durable cleanup/reconcile cursors, existence-first boolean blockers, and byte-bounded Entity bulk statements. Sensitive ownership creation revalidates fresh identity under lock, and exact terminal proof remains authoritative. Adaptive row-batch growth remains disabled pending fixture telemetry. See `docs/releases/RELEASE_10.34.49.md` and the customer-host chaos contract.
+
+> **MIGOPT03-SAFE / 10.34.47:** Customer-host migration is hardened for arbitrary PHP/host termination, transient DB failure/reconnect, overlapping Cron/web requests, stale/lost locks, partial batches, and late Legacy writes. The bounded Cron slice is retained; checkpoints publish through exact-state CAS, Entity cleanup is durably journaled and lineage-safe with `legacy_origin_meta_id`, and terminal migrations are physically re-probed so residue can re-enter recovery after the DB version is already current. No WP-CLI dependency is introduced. Portal/.NET is unchanged. See `docs/releases/RELEASE_10.34.47.md` and `docs/internal/migration-customer-hosting-chaos-contract.md`.
+
+> **Current cumulative candidate — 10.34.53 / PERF01–PERF12 + REL01 + MIGOPT09-BACKFILL-CACHE:** Custom Storage schema v14 retains immutable Entity lineage and crash-safe cleanup journaling; migration hot paths use bounded set-based reads and the real Cron accelerator can now execute multiple durable batches within its existing 12-second budget. This remains a WordPress-only benchmark/chaos candidate; Portal/.NET is unchanged. See `docs/releases/RELEASE_10.34.53.md`.
+
+> **REL01 / 10.34.44:** failed sync-event retention no longer destroys the only evidence that an incomplete product is blocked by a terminal upstream-invalid `UpdateVariant`. Before a qualifying event row is deleted, its current ordering/error evidence is durably mirrored into Sync Health; operational classification consumes that durable evidence after retention. Portal/.NET is unchanged.
+
 
 <a id="fa"></a>
 
@@ -23,7 +84,7 @@ Mobo Core لایه اتصال بین فروشگاه WooCommerce و سرویس Mo
 1. **MoboCore Portal v25**: API، لایسنس، داده محصول، payload رویدادها، Health و نگاشت های مرکزی.
 2. **Mobo Core 10.33.16.18**: افزونه وردپرس، صف محلی، Sync، نگاشت، تصاویر، Checkout و عملیات مشتری.
 3. **WooCommerce**: منبع نهایی محصول، تنوع، دسته بندی، رسانه، سبد و سفارش در سایت مشتری.
-4. **mobomobo.ir**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
+4. **the provisioned Source**: جریان اختصاصی بررسی سبد و ثبت سفارش که فقط در صورت فعال سازی تنظیمات Checkout استفاده می شود.
 
 نمودارهای کامل در [`DIAGRAMS.MD`](DIAGRAMS.MD#fa) قرار دارند.
 
@@ -42,7 +103,7 @@ Runner از آمار سبک ۲۴ساعته `runtimeDiagnostics` برای محا�
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
 | WooCommerce | `8.2+`، تست شده تا `10.9` |
-| ووکامرس فارسی | اجباری؛ نصب و فعال با slug برابر `persian-woocommerce` |
+| ووکامرس فارسی | اختیاری؛ برای MoboCore الزامی نیست |
 | HPOS | اعلام سازگاری شده است |
 | Cursor sync | محصول و تنوع پشتیبانی می شوند |
 | Lightweight webhook pull | پشتیبانی می شود |
@@ -54,7 +115,7 @@ Runner از آمار سبک ۲۴ساعته `runtimeDiagnostics` برای محا�
 ### نصب جدید
 
 1. از دیتابیس و فایل های سایت backup بگیرید.
-2. WooCommerce و افزونه «ووکامرس فارسی» (`persian-woocommerce`) را نصب و فعال کنید.
+2. WooCommerce را نصب و فعال کنید؛ ووکامرس فارسی اختیاری است.
 3. ZIP افزونه را از **افزونه ها > افزودن افزونه > بارگذاری** نصب کنید.
 4. افزونه را فعال کنید؛ Migration داخلی optionهای پیش فرض و جدول های محلی را ایجاد می کند.
 5. از **موبو > اتصال** ارتباط را تنظیم کنید.
@@ -92,13 +153,13 @@ Repair برای بازسازی map داخلی، متادیتای GUID، hashها
 نمونه در `wp-config.php`:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'the provisioned Backend' );
 ```
 
 تست پایه:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'the provisioned BackendLicenseInfo'
 ```
 
 Token و کد امنیتی باید با اطلاعات Webhook/License در پرتال یکسان باشند.
@@ -173,17 +234,19 @@ Content-Type: application/json
 
 ## 8. Cron واقعی و Self Runner
 
-Mobo Core برای عملیات حیاتی به WP-Cron وابسته نیست. Endpoint کران واقعی:
+Mobo Core برای عملیات حیاتی به WP-Cron وابسته نیست. روش اصلی پیشنهادی برای Cron هاست، اجرای مستقیم فایل `mobo-cron.php` با PHP CLI است. Endpoint HTTP فقط fallback است:
 
 ```text
-/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+/wp-json/mobo-core/v1/cron/run
 ```
 
-نمونه cPanel/cron:
+نمونه HTTP fallback با Header امن‌تر:
 
 ```cron
-* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
+* * * * * curl -fsS --max-time 55 -H 'X-SEC: REPLACE_WITH_CRON_TOKEN' 'https://example.com/wp-json/mobo-core/v1/cron/run' >/dev/null 2>&1
 ```
+
+احراز هویت قدیمی `?token=` برای سازگاری حفظ شده، اما برای تنظیم جدید توصیه نمی‌شود چون Secret می‌تواند وارد history یا access log شود.
 
 از نسخه `10.31.75` هر slice در چند دور منصفانه اجرا می شود. در هر دور، صف های Webhook، تصویر معمولی، نوسازی تصاویر، Sync محصول، Reprice، Recategorize و سفارش queued سهم محدود خود را می گیرند. تا وقتی زمان امن باقی مانده، کار قابل اجرای فوری وجود دارد و پیشرفت واقعی اتفاق می افتد، دور بعدی در همان Process شروع می شود. توقف فقط در پایان بودجه امن، خالی شدن صف قابل اجرا، نبود پیشرفت، رسیدن به سقف دورها، خطای غیرقابل ادامه یا از دست رفتن lease انجام می شود. Health و maintenance نیز در همان slice به شکل کنترل شده اجرا می شوند.
 
@@ -212,7 +275,7 @@ Self Runner با loopback request غیرمسدودکننده، بعد از در�
 - قواعد legacy/global
 - نوع قیمت گذاری
 - درصد یا مقدار افزایش قیمت
-- فیلد اختصاصی `mobo_additional_price` در هر variation
+- فیلد اختصاصی `mobo_additional_price` فقط روی variation موبویی با مالکیت معتبر؛ مقدار مثبت آن بالاترین اولویت قیمت‌گذاری است، خالی/۰ یعنی fallback به override محصول یا policy عمومی، و ذخیره فیلد به‌تنهایی قیمت فعلی را فوراً بازمحاسبه نمی‌کند.
 - filter توسعه دهنده `mobo_core_calculated_price_pair`
 
 Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync کامل یا درخواست مجدد تمام payloadها نباشد.
@@ -225,19 +288,20 @@ Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync 
 
 ### روند امن نوسازی WebP
 
-بخش «نوسازی تصاویر» در پنل مدیر یک راهنمای مرحله ای فارسی، دکمه های شماره گذاری شده و کادر «پیشنهاد مرحله بعد» دارد. این کادر بر اساس وضعیت واقعی صف، پیمایش ها، خطاها و گزینه های ایمنی، اقدام بعدی را به مدیر اعلام می کند. ترتیب توصیه شده:
+بخش «نوسازی تصاویر» یک Workflow یک‌کلیکی و خودکار است، اما **Product Repair را خودکار شروع یا Retry نمی‌کند**. قبل از شروع چرخه باید یک Repair کامل و موفق محصولات ثبت شده باشد. Repair تصمیم مستقلی در «نمای کلی» است؛ پس از تکمیل آن، Image Refresh فقط مراحل مربوط به رسانه را اجرا می‌کند.
 
-1. از دیتابیس و `wp-content/uploads` پشتیبان کامل بگیرید.
-2. ترمیم محصولات را یک بار کامل کنید؛ تا قبل از آن این بخش قفل است.
-3. در اولین اجرای آزمایشی حذف پیوست قدیمی را خاموش نگه دارید و ساخت برش های WebP را روشن کنید. پس از تکمیل مرحله ۶، اگر گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» را فعال کردید، این انتخاب از نسخه 10.33.13 دائمی است و افزونه در چرخه های بعدی آن را خودکار خاموش نمی کند.
-4. «۱) بررسی تصاویر قدیمی» و «۲) ساخت صف نوسازی» را تا پایان یک دوره کامل اجرا کنید.
-5. «۳) پردازش مرحله ای صف» را تا صفر شدن ردیف های در انتظار، آماده پردازش و ناموفق ادامه دهید.
-6. «۴) اسکن سلامت برش های WebP» را تا پایان یک دوره کامل اجرا کنید.
-7. در صورت وجود نقص، «۵) بازسازی برش های ناقص WebP» را تا پایان دوره اجرا و دوباره مرحله ۴ را تکرار کنید.
-8. پس از سلامت صف و برش ها، مرحله ۶ را تا پایان اسکن اجرا کنید. اگر پیوست آماده حذف وجود داشت، گزینه «حذف پیوست قدیمی بعد از جایگزینی امن» را یک بار فعال کنید. از آن پس مرحله ۷ در همین چرخه و چرخه های بعدی بدون تایید مجدد، با انتقال مرجع و کنترل نهایی، حذف امن را ادامه می دهد تا زمانی که خود مدیر این گزینه را خاموش کند.
-9. در پایان، مرحله ۸ را با پاک سازی خاموش تا پایان اسکن خانواده های فیزیکی اجرا کنید. اگر خانواده آماده حذف وجود داشت، پاک سازی فایل های بدون پیوست را فعال کنید و مرحله ۹ را محدود و مرحله ای انجام دهید.
+قبل از شروع از دیتابیس و `wp-content/uploads` پشتیبان قابل بازیابی بگیرید. با شروع چرخه، MoboCore به‌صورت bounded و از طریق Cron/Self Runner این مراحل را ادامه می‌دهد:
 
-ساخت صف، پردازش را همان لحظه شروع نمی کند. پردازش فقط با مرحله ۳ یا اجرای زمان بندی شده انجام می شود. اگر اجرای آزمایشی با حذف خاموش انجام شود، پیوست های قدیمی ثبت شده گم نمی شوند؛ متادیتای جایگزینی روی آن ها ذخیره می شود و مرحله های ۶ و ۷ دقیقا برای اسکن و حذف امن همین پیوست ها هستند.
+1. پاک‌سازی اولیه collision/orphanهای اثبات‌شده و بررسی پیش‌نیازها؛
+2. اسکن تصاویر Mobo و ساخت صف نوسازی؛
+3. دریافت دوباره منبع و جایگزینی WebP، حتی وقتی URL منبع نسبت به چرخه قبل تغییر نکرده است؛
+4. کنترل و در صورت امکان بازسازی برش‌های WebP؛
+5. Safety Audit پیوست‌های قدیمی، انتقال مراجع و حذف فقط مواردی که بی‌خطر بودن حذف آن‌ها اثبات شده است؛
+6. اسکن و پاک‌سازی کنترل‌شده خانواده‌های orphan که بلافاصله قبل از حذف دوباره اعتبارسنجی می‌شوند.
+
+Retry و backoff خودکار است. خطای یک تصویر مانع ادامه تصاویر مستقل نمی‌شود؛ مواردی که پس از بودجه Retry قابل اصلاح نیستند برای همان چرخه قرنطینه و بدون حذف ناامن حفظ می‌شوند. رسیدن Workflow به `completed` می‌تواند به معنی «نقطه پایدار با موارد حفظ‌شده» باشد؛ UI فعلی بین تکمیل کاملاً سالم و تکمیل با quarantine/Safety-block/error تفاوت می‌گذارد.
+
+پاک‌سازی destructive تصمیم دستی مرحله‌ای ندارد، اما Safety Audit حذف نشده است: فعال بودن Workflow به‌تنهایی مجوز حذف هیچ Attachment یا خانواده فایل نیست. Shared Media نیز مالکیت و fallback policy خودش را حفظ می‌کند و Image Refresh در زمان اختلال mount، ownership را با fallback خصوصی ناامن دور نمی‌زند.
 
 ### کنترل و بازسازی برش ها
 
@@ -266,43 +330,45 @@ Reprice به صورت cursor/batch اجرا می شود تا نیاز به Sync 
 
 - بررسی موجودی محلی
 - بررسی کامل بودن GUID و Sync
-- اعتبارسنجی سبد در mobomobo.ir
+- اعتبارسنجی سبد در the provisioned Source
 - اعتبارسنجی خارجی سفارشی
 - نگاشت کشور، استان و شهر
 - انتخاب روش ارسال موبو بر اساس rate ووکامرس، استان و بازه زمانی
 - ثبت خودکار سفارش موبو
 
-ثبت سفارش خودکار زمانی queue می شود که سفارش واجد محصول موبو وارد وضعیت `processing` شود. سفارش های غیرموبو از این جریان خارج می مانند. در سفارش ترکیبی فقط اقلام موبو به موبو ارسال می شوند و سفارش WooCommerce برای انجام اقلام غیرموبو در وضعیت `processing` باقی می ماند. گزینه تکمیل خودکار فقط برای سفارش هایی اعمال می شود که تمام اقلام آنها موبو باشند.
+ثبت سفارش خودکار فقط زمانی queue می‌شود که سفارش `processing`، تماماً موبو باشد و مالکیت تمام اقلام آن به یک Connection مشخص برسد. سفارش غیرموبو، ترکیبی یا Multi-Connection به‌صورت Fail-Closed از این جریان خارج می‌شود و هیچ بخش جزئی از آن به موبو ارسال نمی‌شود. گزینه تکمیل خودکار فقط پس از ثبت موفق همین سفارش‌های واجد شرایط اعمال می‌شود.
 
 
 ### قفل تنظیمات صف هنگام Sync و Repair
 
 در زمان اجرای Sync کامل یا Repair، تنظیمات تب «صف و پردازش» قفل می شوند. تغییر `products_per_page` یا `variants_per_page` در اجرای page-based می تواند مرز صفحه را جابه جا کند و باعث رد شدن یا پردازش دوباره رکوردها شود؛ تغییر cursor mode نیز strategy ادامه را عوض می کند. قفل هم در UI و هم در مسیر ذخیره سمت سرور اعمال می شود و direct `update_option()` نیز تا پایان یا لغو عملیات مقدار قبلی را حفظ می کند. وضعیت `waiting_for_portal` هم بخشی از اجرای فعال محسوب می شود.
 
-### تنظیمات ووکامرس فارسی برای ثبت خودکار
+### آدرس Checkout و Location Resolver
 
-برای عملکرد صحیح ثبت سفارش خودکار، گزینه «فعالسازی شهرهای ایران» باید در تنظیمات افزونه ووکامرس فارسی فعال باشد. Mobo Core فقط این الزام را در پنل یادآوری می‌کند و این تنظیم را نمی‌خواند یا تغییر نمی‌دهد.
+Mobo Core همچنان وابستگی عمومی پروژه به ووکامرس فارسی را حفظ می‌کند، اما ثبت سفارش خودکار به گزینه «فعالسازی شهرهای ایران» یا مالکیت فیلدهای آدرس توسط آن افزونه وابسته نیست. فیلدهای country/state/city در اختیار WooCommerce و افزونه‌های آدرس فروشگاه باقی می‌مانند. هنگام Submit Order، Mobo Core مقادیر native ذخیره‌شده روی سفارش را به Location Resolver مرکزی MoboCore می‌فرستد و Provider در Backend شناسه‌های مقصد را resolve می‌کند.
 
-در نسخه `10.31.56` نگاشت دستی شهر حذف شده است. افزونه ابتدا کشورها، استان ها و شهرهای موبو را از MoboCore دریافت می کند، سپس در مسیر uploads دو فایل `iran_cities.js` و `iran_cities.min.js` می سازد. این فایل ها همان تابع سازگار `Persian_Woo_iranCities()` را ارائه می کنند، اما مقدار هر گزینه شهر شناسه واقعی `city_id` موبو است. Mobo Core از فیلتر `persian_woo_iran_cities` استفاده می کند و در مرحله نهایی فقط URL و version همان handle موجود `pw-iran-cities` را تغییر می دهد؛ handle حذف و دوباره ثبت نمی شود تا dependency، inline data و ترتیب اجرای ووکامرس فارسی حفظ شود. نگاشت کشور و استان همچنان باقی می ماند، چون WooCommerce استان را با کد محلی مانند `THR` نگه می دارد و موبو از `state_id` استفاده می کند. فایل قدیمی شهرها فقط برای تشخیص alias استان و سازگاری سفارش های قبلی استفاده می شود و منبع شهرهای Checkout نیست.
+در Build آزمایشی C75B، تولید فایل‌های `iran_cities.js` و جایگزینی انتخابگر شهر غیرفعال و پیاده‌سازی آن حذف شده است. فیلدهای آدرس متعلق به WooCommerce هستند و شناسه‌های Provider فقط هنگام ثبت خودکار سفارش از Resolver مرکزی Backend دریافت می‌شوند. داده‌های Cache قدیمی در دیتابیس عمداً پاک نمی‌شوند.
 
 قبل از فعال سازی production:
 
 1. ورود حساب موبو را تست کنید.
-2. نگاشت آدرس را sync و بررسی کنید.
-3. روش ارسال WooCommerce را به ID موبو نگاشت کنید.
+2. country/state/city واقعی یک سفارش را با Resolver مرکزی بررسی کنید.
+3. تمام روش‌های ارسال فعال WooCommerce را به shipping_id فعلی موبو نگاشت کنید.
 4. یک سفارش آزمایشی با یک variation واقعی ثبت کنید.
 5. log و order meta box موبو را بررسی کنید.
 6. رفتار retry و duplicate submission را آزمایش کنید.
 
-## 13. پیامک سفارش
+## 13. پیامک سفارش و هشدار کیف پول
 
-ارسال مستقیم gateway داخل Mobo Core پیاده سازی نشده است. افزونه از `PWSMS()->send_sms()` متعلق به «پیامک حرفه ای ووکامرس» استفاده می کند.
+Mobo Core درگاه پیامک مستقل پیاده‌سازی نمی‌کند و ارسال را به `PWSMS()->send_sms()` متعلق به «پیامک حرفه‌ای ووکامرس» واگذار می‌کند. در دسترس بودن API محلی یا پذیرفته‌شدن درخواست توسط درگاه، به‌تنهایی تحویل نهایی SMS به گوشی را اثبات نمی‌کند.
 
-سناریوها:
+تنظیمات پیامک سفارش **سراسری فروشگاه** هستند و با تغییر Connection عوض نمی‌شوند. سناریوها:
 
 - `non_mobo`: سفارش بدون محصول موبو
 - `mobo_only`: فقط محصولات موبو
 - `mixed`: ترکیب محصول موبو و عادی
+
+این پیامک‌ها در hook ساخته‌شدن سفارش Checkout ارسال می‌شوند و منتظر پرداخت موفق نمی‌مانند. هر سفارش/سناریو دارای lock و replay fence پایدار است؛ قبل از تماس با درگاه fence ذخیره می‌شود و اگر نتیجه remote یا commit نهایی مبهم باشد، Mobo Core ارسال را خودکار replay نمی‌کند. خطای ارسال در Order Note ثبت می‌شود و صف Retry مستقل برای SMS سفارش وجود ندارد.
 
 Placeholderهای اختصاصی:
 
@@ -314,7 +380,9 @@ Placeholderهای اختصاصی:
 {customer_mobile}
 ```
 
-هر سناریو فقط یک بار برای سفارش ارسال می شود و نتیجه در order meta ثبت می شود.
+هشدار کمبود موجودی کیف پول **Connection-scoped** است و مستقل از master پیامک سفارش عمل می‌کند. فقط Providerی که endpoint موجودی دارد می‌تواند آن را اجرا کند و بررسی موجودی پس از موفقیت durable ثبت خودکار سفارش موبو انجام می‌شود. مقدار threshold برابر `0` معتبر است. هشدار one-shot است؛ افزایش موجودی یا تغییر threshold آن را خودکار re-arm نمی‌کند و مدیر باید صریحاً دوباره فعالش کند. پیش از remote send یک replay fence پایدار ثبت می‌شود؛ نتیجه نامطمئن یا شکست commit، ارسال بعدی را تا re-arm صریح مسدود می‌کند.
+
+SMS آزمایشی کیف پول state جدا از هشدار زنده دارد، موجودی Provider را fetch نمی‌کند و one-shot واقعی را مصرف/پاک نمی‌کند.
 
 ## 14. Health Report
 
@@ -322,10 +390,10 @@ Endpoint محلی برای Probe پرتال:
 
 ```http
 GET /wp-json/mobo-core/v1/health
-X-SEC: <security-code>
+X-SEC: <default-connection-security-code>
 ```
 
-Portal گزارش را مستقیماً از endpoint بالا Pull می‌کند. افزونه گزارش دوره‌ای به Portal Push نمی‌کند. در صورت قدیمی بودن Cron، Portal می‌تواند endpoint جداگانه `/heartbeat` را برای Recovery فراخوانی کند؛ نتیجه Heartbeat مستقل از دسترسی Health ثبت می‌شود.
+این endpoint سطح نصب است و فقط Connection پیش‌فرضِ فعال (Installation Controller) مجاز به Pull آن است. Portal گزارش را مستقیماً از endpoint بالا Pull می‌کند. افزونه گزارش دوره‌ای به Portal Push نمی‌کند. در صورت قدیمی بودن Cron، Portal می‌تواند endpoint جداگانه `/heartbeat` را برای Recovery فراخوانی کند؛ نتیجه Heartbeat مستقل از دسترسی Health ثبت می‌شود.
 
 گزارش می‌تواند نسخه WordPress/PHP/WooCommerce، وضعیت Debug، memory، disk، cron، Sync، صف وب‌هوک و Action Scheduler را شامل شود.
 
@@ -341,11 +409,11 @@ Portal گزارش را مستقیماً از endpoint بالا Pull می‌کن�
 |---|---|---|---|
 | POST | `/categories/ensure-sync` | `X-SEC` | Sync دسته ها در صورت نیاز |
 | GET/POST | `/cron/run` | Cron Token یا `X-SEC` | اجرای یک slice |
-| GET | `/cron/status` | `X-SEC` | وضعیت Cron |
+| GET | `/cron/status` | Installation Controller `X-SEC` | وضعیت Cron |
 | GET/POST | `/worker/run` | Cron Token یا `X-SEC` | اجرای Self Worker |
-| GET | `/worker/status` | `X-SEC` | وضعیت Self Runner |
-| GET | `/health` | `X-SEC` | سلامت محلی |
-| GET/POST | `/health/report-now` | `X-SEC` | ارسال فوری Health |
+| GET | `/worker/status` | Installation Controller `X-SEC` | وضعیت Self Runner |
+| GET | `/health` | Installation Controller `X-SEC` | سلامت محلی |
+| GET/POST | `/health/report-now` | Installation Controller `X-SEC` | snapshot سازگاری Health |
 | POST | `/webhook` | `X-SEC` | پذیرش رویداد |
 | POST | `/webhook/run` | `X-SEC` | پردازش صف وب هوک |
 | POST | `/sync/start` | `X-SEC` | شروع Sync |
@@ -415,8 +483,8 @@ Portal گزارش را مستقیماً از endpoint بالا Pull می‌کن�
 
 ### سفارش موبو ثبت نمی شود
 
-- سفارش باید حداقل یک محصول موبو و وضعیت `processing` داشته باشد.
-- login test، address mapping و shipping mapping را بررسی کنید.
+- سفارش باید `processing`، تماماً موبو و متعلق به دقیقاً یک Connection باشد؛ Mixed/Multi-Connection عمداً ارسال نمی‌شود.
+- Connection، login test، sender fields، Location Resolver و shipping mapping را بررسی کنید.
 - order meta box و WooCommerce logs را بخوانید.
 - Cron واقعی باید queue سفارش را پردازش کند.
 
@@ -429,7 +497,7 @@ Portal گزارش را مستقیماً از endpoint بالا Pull می‌کن�
 - [ ] یک Sync کامل یا Repair موفق انجام شده است.
 - [ ] دسته بندی و variation نمونه کنترل شده اند.
 - [ ] صف وب هوک backlog غیرعادی ندارد.
-- [ ] نگاشت آدرس و روش ارسال تست شده است.
+- [ ] Location Resolver و نگاشت تمام روش‌های ارسال فعال WooCommerce تست شده است.
 - [ ] ثبت سفارش خودکار قبل از production با سفارش آزمایشی تست شده است.
 - [ ] Health reporting در صورت نیاز فعال و endpoint آن بررسی شده است.
 - [ ] logها و backupها secret خام ندارند.
@@ -449,7 +517,7 @@ Portal گزارش را مستقیماً از endpoint بالا Pull می‌کن�
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#fa)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#fa)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](http://mobo.codeya.ir/)
+- [MoboCore service](the provisioned Backend)
 - فروش: `+989124508218`
 - فنی: `+989367362228`
 
@@ -487,7 +555,7 @@ Primary components:
 1. **MoboCore Portal v25**: API, licensing, product data, event payloads, health, and central mappings.
 2. **Mobo Core 10.33.16.18**: WordPress integration, local queues, sync, mapping, images, checkout, and customer-side operations.
 3. **WooCommerce**: the final product, variation, category, media, cart, and order store on the customer site.
-4. **mobomobo.ir**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
+4. **the provisioned Source**: the dedicated cart-check and order-submission workflow, used only when checkout features are enabled.
 
 See [`DIAGRAMS.MD`](DIAGRAMS.MD#en) for the complete diagrams.
 
@@ -505,7 +573,7 @@ The runner uses the lightweight 24-hour `runtimeDiagnostics` history to calculat
 | WordPress | `5.8+` |
 | PHP | `7.4+` |
 | WooCommerce | `8.2+`, tested through `10.9` |
-| Persian WooCommerce | Required; installed and active with slug `persian-woocommerce` |
+| Persian WooCommerce | Optional; not required by MoboCore |
 | HPOS | compatibility declared |
 | Cursor sync | supported for products and variations |
 | Lightweight webhook pull | supported |
@@ -517,7 +585,7 @@ Legacy page-number requests remain supported. New installations prefer cursor pa
 ### New installation
 
 1. Back up the database and site files.
-2. Install and activate WooCommerce and Persian WooCommerce (`persian-woocommerce`).
+2. Install and activate WooCommerce; Persian WooCommerce is optional.
 3. Upload the plugin ZIP through **Plugins > Add New > Upload Plugin**.
 4. Activate Mobo Core; its migration creates defaults and local tables.
 5. Configure the connection under **Mobo > Connection**.
@@ -555,13 +623,13 @@ API base URL priority:
 Example:
 
 ```php
-define( 'MOBO_API_BASE_URL', 'http://mobo.codeya.ir/' );
+define( 'MOBO_API_BASE_URL', 'the provisioned Backend' );
 ```
 
 Basic test:
 
 ```bash
-curl -H 'Token: YOUR_TOKEN'   'http://mobo.codeya.ir/LicenseInfo'
+curl -H 'Token: YOUR_TOKEN'   'the provisioned BackendLicenseInfo'
 ```
 
 The Token and security code must match the customer license and webhook record in Portal.
@@ -621,17 +689,19 @@ In lightweight mode, Portal sends metadata and a `changesUrl`. The plugin retrie
 
 ## 8. Real cron and self-runner
 
-Production endpoint:
+The preferred production host-Cron setup is direct PHP CLI execution of `mobo-cron.php`. The HTTP endpoint is a fallback:
 
 ```text
-/wp-json/mobo-core/v1/cron/run?token=<cron-token>
+/wp-json/mobo-core/v1/cron/run
 ```
 
-Example:
+HTTP fallback example using the header-based secret:
 
 ```cron
-* * * * * curl -fsS --max-time 55 'https://example.com/wp-json/mobo-core/v1/cron/run?token=REPLACE_WITH_TOKEN' >/dev/null 2>&1
+* * * * * curl -fsS --max-time 55 -H 'X-SEC: REPLACE_WITH_CRON_TOKEN' 'https://example.com/wp-json/mobo-core/v1/cron/run' >/dev/null 2>&1
 ```
+
+Legacy `?token=` authentication remains supported for compatibility, but new setups should use `X-SEC` so the secret is not placed in the URL/history/access log.
 
 Since `10.31.75`, each invocation runs repeated fair rounds rather than stopping after one fixed batch for most queues. Every round gives webhook, normal-image, image-refresh, product-sync, reprice, recategorize, and queued-order work a bounded share. The same process continues until the safe PHP deadline is near, no immediately runnable work remains, no progress is possible, the configured round cap is reached, or lease ownership is lost. Health and maintenance remain bounded within the same slice.
 
@@ -663,7 +733,7 @@ The original raster and all WordPress derivatives such as `150x150`, `scaled`, `
 
 Sensitive checkout features are disabled by default. When all validation and submission options are disabled, Mobo Core stays out of the customer checkout runtime.
 
-Optional features include local stock checks, remote cart validation, external validation, address mapping, shipping mapping, and automatic Mobo order submission. An eligible order is queued when it contains at least one Mobo item and enters `processing`. Non-Mobo orders are excluded. Successful submissions may move the WooCommerce order to `completed` when auto-complete is enabled.
+Optional features include local stock checks, remote cart validation, external validation, optional city-cache compatibility, shipping mapping, and automatic Mobo order submission. An eligible order is queued only when it is entirely Mobo-owned, all Mobo items belong to one Connection, and it enters `processing`. Non-Mobo, mixed, and multi-Connection orders fail closed and no partial Mobo submission is attempted. Successful eligible submissions may move the WooCommerce order to `completed` when auto-complete is enabled.
 
 
 ### Queue settings lock during Sync and Repair
@@ -672,13 +742,15 @@ While a full Sync or Repair run is active, the Queue and Processing tab is immut
 
 ### Persian WooCommerce settings for automatic submission
 
-When automatic Mobo order submission is enabled, the Persian WooCommerce options “Enable Iran cities” and “Swap state and city fields” must be enabled. Mobo Core now displays guidance only: it does not read, modify, block, or periodically inspect these settings, and it does not stop checkout or order submission based on their values.
+Automatic Mobo order submission does **not** require the Persian WooCommerce options “Enable Iran cities” or “Swap state and city fields”. Mobo Core does not read, modify, block, or periodically inspect those settings. Native WooCommerce order country/state/city values are resolved by the Backend Location Resolver only during automatic remote-order submission. Legacy city assets are retired in C75B.
 
-Version `10.31.56` removes manual city-to-city mapping. The plugin first downloads countries, states, and cities from MoboCore, then generates `iran_cities.js` and `iran_cities.min.js` under the WordPress uploads directory. Both files expose the Persian WooCommerce-compatible `Persian_Woo_iranCities()` function, while every city option value is the authoritative Mobo `city_id`. Mobo Core replaces the source through the `persian_woo_iran_cities` filter and, as a final safeguard, mutates only the existing `pw-iran-cities` source/version without deregistering the handle, preserving dependencies, inline data, and execution order. Country and state mapping remain because WooCommerce stores province codes such as `THR`, while Mobo uses numeric `state_id` values. The legacy bundled city source is retained only for province aliases and old-order compatibility, not as the current checkout city source.
+Prior releases used generated Persian WooCommerce city assets, but C75B retires this mechanism. Native WooCommerce fields are used for checkout. The old numeric city decoder is retained temporarily for historical order compatibility until the isolated retry and shipping tests are complete. No global order-city migration is performed.
 
-## 13. Order SMS
+## 13. Order SMS and wallet alert
 
-Mobo Core delegates SMS delivery to Persian WooCommerce SMS through `PWSMS()->send_sms()`. Scenarios are `non_mobo`, `mobo_only`, and `mixed`. Mobo-specific placeholders include order type labels and Mobo/non-Mobo item counts.
+Mobo Core delegates SMS transport to Persian WooCommerce SMS through `PWSMS()->send_sms()`; local API availability or gateway acceptance is not proof of final handset delivery. Order-SMS settings are store-wide. Scenarios are `non_mobo`, `mobo_only`, and `mixed`, with Mobo-specific placeholders for order type and Mobo/non-Mobo item counts. These notifications run when Checkout creates/processes the WooCommerce order, not after payment success. A durable per-order/scenario replay fence is stored before the gateway call, so an ambiguous gateway/final-commit outcome is not automatically replayed. Failed/uncertain sends are recorded in Order Notes and there is no independent Order-SMS retry queue.
+
+The low-wallet alert is Connection-scoped and independent from the Order-SMS master switch. It is evaluated only after durable successful automatic Mobo purchase for Providers that expose a wallet-balance endpoint. Threshold `0` is valid. The alert is one-shot and never auto-rearms after balance recovery or threshold changes; explicit administrator re-arm is required. A durable pre-send fence suppresses automatic resend after an ambiguous transport or post-send commit. Wallet transport tests use separate history, do not fetch Provider balance, and do not consume/re-arm the live one-shot state.
 
 ## 14. Health reporting
 
@@ -752,7 +824,7 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 - [`FUNCTIONS.MD`](FUNCTIONS.MD#en)
 - [`DIAGRAMS.MD`](DIAGRAMS.MD#en)
 - [Repository](https://github.com/PedramDev/mobo-core)
-- [MoboCore service](http://mobo.codeya.ir/)
+- [MoboCore service](the provisioned Backend)
 - Sales: `+989124508218`
 - Technical support: `+989367362228`
 
@@ -763,3 +835,16 @@ A WooCommerce simple product still has one purchasable Mobo Variant. The plugin 
 [Persian](#fa) · [English](#en) · [Full documentation](README_FULL.MD) · [Function reference](FUNCTIONS.MD) · [Diagrams](DIAGRAMS.MD)
 
 </div>
+
+### Current WooCommerce shipping-method policy
+
+Mobo Core is **mapping-only** for checkout shipping. It maps merchant-owned WooCommerce shipping rates to the Source `shipping_id`; it does not register, create, or publish a customer-facing `mobo_core_shipping` rate. Any `mobo_core_shipping` zone instance is legacy residue and is kept disabled/retired.
+
+- Network resilience for Portal API is endpoint-scoped: a circuit opened against one effective scheme/host/port is not inherited after an environment/runtime API-base override switches to another endpoint.
+
+
+### REL24 exact-recovery retry reset
+A valid Exact Convergence API response now clears transient retry state before candidate finalization, so a recovered dependency does not carry stale real-attempt budget into later failures. Network circuit scope remains endpoint-aware and production `mobo.codeya.ir` remains HTTP-only.
+
+### REL25 targeted convergence window hardening
+Post-upgrade exact convergence uses a bounded 1000-target worker window but the active generation now overlays ownership on all actionable unowned convergence gaps. Once a window is exhausted, a fresh owner-ignored Health view selects the next bounded window and resets the durable cursor. Successful old rows are pruned from the attempted ledger; unresolved rows are retained only to a bounded safety limit. This prevents >1000-gap catalogues from getting stuck on the first window or exposing the later windows as unowned while recovery is active.

@@ -1,0 +1,638 @@
+/* Connection & License page. Every rule is isolated to the MoboCore root. */
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-status-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 16px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile {
+  min-width: 0;
+  padding: 14px 13px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: var(--mobo-admin-shadow-soft);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile__label {
+  color: #35455d;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile .dashicons {
+  color: #73839b;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile__value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile__value::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--success {
+  background: linear-gradient(180deg, #f6fffa 0%, #edfbf4 100%);
+  border-color: #ccebd9;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--success .mobo-admin-status-tile__value {
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--danger {
+  background: linear-gradient(180deg, #fff9f9 0%, #fff0f0 100%);
+  border-color: #f1cccc;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--danger .mobo-admin-status-tile__value {
+  color: var(--mobo-admin-danger);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--warning {
+  background: linear-gradient(180deg, #fffdf8 0%, #fff8e9 100%);
+  border-color: #efdfb8;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--warning .mobo-admin-status-tile__value {
+  color: var(--mobo-admin-warning);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--info {
+  background: linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%);
+  border-color: #d2e2fa;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile--info .mobo-admin-status-tile__value {
+  color: var(--mobo-admin-info);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-card,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-card,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-card {
+  margin-bottom: 16px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-card-heading p {
+  margin: 5px 0 0;
+  color: var(--mobo-admin-muted);
+  font-size: 12px;
+  line-height: 1.85;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 7px 10px;
+  border: 1px solid #e9eef5;
+  border-radius: 11px;
+  background: var(--mobo-admin-surface-soft);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row__label {
+  color: #4c5e76;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row__value {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--mobo-admin-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row__value code,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row__value span[data-mobo-copy-value] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-panel {
+  padding: 15px;
+  border: 1px solid #e5ebf3;
+  border-radius: 13px;
+  background: var(--mobo-admin-surface-soft);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-panel h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 6px;
+  color: var(--mobo-admin-text);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-panel > p {
+  min-height: 40px;
+  margin: 0 0 11px;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-settings-card .mobo-save-row {
+  display: flex;
+  justify-content: flex-start;
+  margin: 14px 0 0;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, .75fr) minmax(0, 1.25fr);
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-facts {
+  display: grid;
+  gap: 8px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-fact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 40px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--mobo-admin-surface-soft);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-fact span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-fact strong {
+  color: var(--mobo-admin-text);
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 150px;
+  padding: 16px;
+  border: 1px solid #dfe7f0;
+  border-radius: 13px;
+  background: #fff;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--danger {
+  border-color: #efc2c2;
+  background: var(--mobo-admin-danger-bg);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--success {
+  border-color: #c8ead7;
+  background: var(--mobo-admin-success-bg);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state p {
+  margin: 0;
+  color: #5f6e83;
+  font-size: 11px;
+  line-height: 1.9;
+  overflow-wrap: anywhere;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-help-accordion {
+  margin: 16px 0;
+  border: 1px solid #d9e5f7;
+  border-radius: 14px;
+  background: #f5f9ff;
+  overflow: hidden;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-help-accordion > summary {
+  cursor: pointer;
+  padding: 15px 17px;
+  color: #2157a4;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-help-accordion__body {
+  padding: 0 14px 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-help-accordion .mobo-guide-box,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-help-accordion .mobo-recommendation-box {
+  margin-top: 10px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-row .mobo-field {
+  width: 100%;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-row .mobo-save-row {
+  width: 100%;
+  margin: 0;
+  justify-content: flex-end;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-row .mobo-save-row button {
+  min-height: 42px;
+  min-width: 150px;
+}
+
+@media (max-width: 1050px) {
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-connection-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-connection-status-grid,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-connection-meta,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-settings-grid,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-license-grid,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-create-row {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-card-heading {
+    flex-direction: column;
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-meta-row {
+    grid-template-columns: 95px minmax(0, 1fr);
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-create-row .mobo-save-row button {
+    width: 100%;
+  }
+}
+
+
+/* Phase 1.1 polish based on the first real wp-admin rendering. */
+#mobo-core-admin.mobo-admin--connection .mobo-hero {
+  min-height: 104px;
+  margin: 14px 0 10px;
+  padding: 20px 24px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-hero h1 {
+  font-size: clamp(23px, 2vw, 28px);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-hero p {
+  max-width: 620px;
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile {
+  padding: 13px 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-status-tile__label {
+  font-size: 13px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 7px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--mobo-admin-border);
+  border-radius: 11px;
+  background: #fff;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item > span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item > strong {
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item > small {
+  min-width: 0;
+  color: var(--mobo-admin-muted);
+  font-size: 10px;
+  line-height: 1.65;
+  text-align: end;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--success {
+  border-color: #ccebd9;
+  background: #f5fcf8;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--success > strong {
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--danger {
+  border-color: #f1cccc;
+  background: #fff7f7;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--danger > strong {
+  color: var(--mobo-admin-danger);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--warning {
+  border-color: #efdfb8;
+  background: #fffaf0;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--warning > strong {
+  color: var(--mobo-admin-warning);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--info {
+  border-color: #d2e2fa;
+  background: #f6f9ff;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item--info > strong {
+  color: var(--mobo-admin-info);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state {
+  min-height: 132px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state p {
+  font-size: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-technical-error {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #ead4d4;
+  border-radius: 9px;
+  background: #fff;
+  color: #7c3434;
+  font-size: 11px;
+  line-height: 1.75;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  text-align: left;
+}
+
+@media (max-width: 782px) {
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item {
+    grid-template-columns: auto auto;
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-security-summary__item > small {
+    grid-column: 1 / -1;
+    text-align: start;
+  }
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-grid.is-error-only {
+  grid-template-columns: 1fr;
+}
+
+/* Connection lifecycle and pending-flow refinements. */
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-setup {
+  display: grid;
+  gap: 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-setup__intro {
+  display: grid;
+  gap: 5px;
+  padding: 14px;
+  border: 1px solid #d8e6fb;
+  border-radius: 12px;
+  background: #f5f9ff;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-setup__intro strong {
+  color: #173a6f;
+  font-size: 13px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-setup__intro span {
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.85;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps li,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow li {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e2e9f3;
+  border-radius: 11px;
+  background: var(--mobo-admin-surface-soft);
+  color: #52647d;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps li strong,
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow li strong {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  border-radius: 8px;
+  background: #e8f1ff;
+  color: #2157a4;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps li.is-done {
+  border-color: #c8ead7;
+  background: var(--mobo-admin-success-bg);
+  color: var(--mobo-admin-success);
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps li.is-current {
+  border-color: #f0d693;
+  background: #fff9e9;
+  color: #8a5a00;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-pending-actions form {
+  margin: 0;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-btn-danger {
+  border-color: #efc2c2;
+  background: #fff3f3;
+  color: #9f1f1f;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-btn-danger:hover {
+  border-color: #e79b9b;
+  background: #ffe8e8;
+  color: #851818;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-http-warning {
+  margin-top: 12px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow {
+  margin-bottom: 14px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--warning {
+  border-color: #f0d693;
+  background: #fff9e9;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--info {
+  border-color: #d2e2fa;
+  background: #f5f9ff;
+}
+
+@media (max-width: 900px) {
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-connection-steps,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-create-flow {
+    grid-template-columns: 1fr;
+  }
+
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-pending-actions,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-pending-actions form,
+  #mobo-core-admin.mobo-admin--connection .mobo-admin-pending-actions .mobo-btn {
+    width: 100%;
+  }
+}
+
+/* UX9 content clarity: actionable service guidance and calmer pending/help text. */
+#mobo-core-admin.mobo-admin--connection .mobo-admin-service-guidance {
+  margin: -4px 0 16px;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-pending-note {
+  margin: 10px 0 0;
+  color: var(--mobo-admin-muted);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--warning {
+  border-color: #efdfb8;
+  background: #fffaf0;
+}
+
+#mobo-core-admin.mobo-admin--connection .mobo-admin-license-state--info {
+  border-color: #d2e2fa;
+  background: #f6f9ff;
+}

@@ -14,23 +14,33 @@ final class Mobo_Core_Product_Identity_Policy {
 	}
 
 	/** @return array */
+	public static function external_product_id_meta_keys() {
+		return array( '_mobo_external_product_id' );
+	}
+
+	/** @return array */
 	public static function portal_product_id_meta_keys() {
-		return array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id' );
+		return array( 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'PortalProductId' );
+	}
+
+	/** @return array */
+	public static function external_variant_id_meta_keys() {
+		return array( '_mobo_external_variant_id' );
 	}
 
 	/** @return array */
 	public static function portal_variant_id_meta_keys() {
-		return array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' );
+		return array( 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id', 'PortalVariantId' );
 	}
 
 	/** @return array */
 	public static function product_identity_meta_keys() {
-		return array_values( array_unique( array_merge( self::product_guid_meta_keys(), self::portal_product_id_meta_keys() ) ) );
+		return array_values( array_unique( array_merge( self::product_guid_meta_keys(), self::external_product_id_meta_keys(), self::portal_product_id_meta_keys() ) ) );
 	}
 
 	/** @return array */
 	public static function variation_identity_meta_keys() {
-		return array_values( array_unique( array_merge( self::variant_guid_meta_keys(), self::portal_variant_id_meta_keys() ) ) );
+		return array_values( array_unique( array_merge( self::variant_guid_meta_keys(), self::external_variant_id_meta_keys(), self::portal_variant_id_meta_keys() ) ) );
 	}
 
 	/**

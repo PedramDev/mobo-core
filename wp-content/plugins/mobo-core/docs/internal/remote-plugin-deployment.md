@@ -13,7 +13,7 @@ Remote deployment endpoints exist from Mobo Core `10.31.82`. The safe global Upg
 - `GET /wp-json/mobo-core/v1/upgrade/status`
 - `POST /wp-json/mobo-core/v1/upgrade/apply`
 
-Both endpoints require the site's existing `X-SEC` security code. The apply request also requires an HMAC-SHA256 deployment signature created by Portal.
+Both endpoints are installation-global and require the enabled Default Connection's `X-SEC` (the Installation Controller). A non-default Source credential cannot inspect or mutate plugin-wide upgrade state. The apply request also requires an HMAC-SHA256 deployment signature created by Portal.
 
 ## Safe upgrade sequence
 
@@ -56,7 +56,7 @@ Before changing the active plugin directory, Mobo Core verifies:
 1. deployment timestamp and HMAC signature;
 2. expected currently installed version;
 3. target version is newer;
-4. HTTPS Portal package URL policy;
+4. HTTPS Portal package URL policy (`http://` is accepted only in explicit `WP_DEBUG` development mode);
 5. short-lived package token;
 6. complete ZIP SHA-256;
 7. plugin header version;
@@ -71,3 +71,13 @@ The current plugin directory is copied to:
 `wp-content/uploads/mobo-core/upgrade-backups/latest/mobo-core`
 
 If installation fails or the installed header does not report the requested version, Mobo Core attempts to restore this backup before returning failure.
+
+## UX47-UX49 integrity/recovery hardening
+
+Current release artifacts add three additional deployment guarantees:
+
+- Build identity is verified from the actual installed files, not only from hashes declared by `mobo-core-manifest.json`. A same-version package is considered already current only when the live tree itself verifies.
+- The rollback snapshot is first created in pending storage and verified against both the release manifest and a deterministic whole-tree digest. The old trusted snapshot is not rotated until the new snapshot is complete. Restore verifies the backup before deleting the live directory and verifies the restored bytes again afterward.
+- A request that dies during a transient upgrade stage is detectable after its lease/barrier expires. If the target version is already fully installed and byte-verified, status can report `completed-recovered`; otherwise it reports an interrupted recovery mode. A damaged active tree cannot overwrite an existing verified same-version rollback snapshot during retry.
+
+Because PHP constants are loaded before filesystem replacement, post-install verification always uses the signed/requested target version explicitly; it never compares a newly installed manifest against the old in-memory plugin version constant.

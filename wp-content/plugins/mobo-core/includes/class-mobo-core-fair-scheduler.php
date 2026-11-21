@@ -25,7 +25,7 @@ final class Mobo_Core_Fair_Scheduler {
 		$circuit_profile = is_array( $circuit_profile ) ? $circuit_profile : array();
 		$webhook_pressure = (bool) $webhook_pressure;
 
-		$diagnostics = get_option( 'mobo_core_runtime_diagnostics', array() );
+		$diagnostics = Mobo_Core_Settings::get( 'mobo_core_runtime_diagnostics', array() );
 		$diagnostics = is_array( $diagnostics ) ? $diagnostics : array();
 		$scheduler_stats = isset( $diagnostics['schedulerStages'] ) && is_array( $diagnostics['schedulerStages'] ) ? $diagnostics['schedulerStages'] : array();
 		$weights = isset( $budget_profile['weights'] ) && is_array( $budget_profile['weights'] ) ? $budget_profile['weights'] : array();
@@ -51,7 +51,9 @@ final class Mobo_Core_Fair_Scheduler {
 			 */
 			if ( $last <= 0 && in_array( $stage, array( 'repriceQueue', 'recategorizeQueue' ), true ) ) {
 				$state_option = 'repriceQueue' === $stage ? 'mobo_core_reprice_state' : 'mobo_core_recategorize_state';
-				$admin_state  = get_option( $state_option, array() );
+				$admin_state  = class_exists( 'Mobo_Core_State_Store' ) && Mobo_Core_State_Store::is_available()
+					? Mobo_Core_State_Store::get( $state_option, array() )
+					: array();
 				if ( is_array( $admin_state ) && 'running' === sanitize_key( (string) ( isset( $admin_state['status'] ) ? $admin_state['status'] : '' ) ) ) {
 					$last = absint( isset( $admin_state['startedAt'] ) ? $admin_state['startedAt'] : 0 );
 				}

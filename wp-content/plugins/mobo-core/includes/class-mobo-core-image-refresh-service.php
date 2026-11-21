@@ -35,6 +35,8 @@ class Mobo_Core_Image_Refresh_Service {
 
 	/** Cached authoritative image identities from the local image queue. @var array|null */
 	private $current_image_identity_map = null;
+	/** @var int Connection owning the cached identity map. */
+	private $current_image_identity_map_connection_id = 0;
 
 	/**
 	 * Whether this workflow must fetch the canonical source again even when the
@@ -43,8 +45,8 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return bool
 	 */
 	public static function force_source_reimport_enabled() {
-		return '1' === (string) get_option( self::FORCE_SOURCE_REIMPORT_OPTION, '1' )
-			&& '' !== sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		return '1' === (string) Mobo_Core_Settings::get( self::FORCE_SOURCE_REIMPORT_OPTION, '1' )
+			&& '' !== sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) );
 	}
 
 	/**
@@ -104,16 +106,16 @@ class Mobo_Core_Image_Refresh_Service {
 					'legacyRaster'    => 0,
 					'queueable'       => 0,
 					'totalLegacyBytes'=> 0,
-					'cursorStart'     => absint( get_option( self::SCAN_CURSOR_OPTION, 0 ) ),
-					'cursorEnd'       => absint( get_option( self::SCAN_CURSOR_OPTION, 0 ) ),
+					'cursorStart'     => absint( Mobo_Core_Settings::get( self::SCAN_CURSOR_OPTION, 0 ) ),
+					'cursorEnd'       => absint( Mobo_Core_Settings::get( self::SCAN_CURSOR_OPTION, 0 ) ),
 					'cycleComplete'   => false,
 				)
 			);
-			update_option( 'mobo_core_image_refresh_last_scan', $result, false );
+			Mobo_Core_Settings::update( 'mobo_core_image_refresh_last_scan', $result, false );
 			return $result;
 		}
 
-		$previous     = get_option( 'mobo_core_image_refresh_last_scan', array() );
+		$previous     = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_scan', array() );
 		$previous     = is_array( $previous ) ? $previous : array();
 		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
 		$batch = $legacy_already_complete
@@ -122,7 +124,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
-		$missing_cursor_start = absint( get_option( self::MISSING_SCAN_CURSOR_OPTION, 0 ) );
+		$missing_cursor_start = absint( Mobo_Core_Settings::get( self::MISSING_SCAN_CURSOR_OPTION, 0 ) );
 		$missing_batch = $recovery instanceof Mobo_Core_Missing_Image_Recovery && $recovery->is_enabled()
 			? $recovery->get_candidate_batch( $limit, $missing_cursor_start )
 			: array( 'rows' => array(), 'scanned' => 0, 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => 0 );
@@ -242,12 +244,12 @@ class Mobo_Core_Image_Refresh_Service {
 		$result['missingImageProducts'] += count( $missing_rows );
 
 		if ( ! empty( $missing_batch['cycleComplete'] ) ) {
-			update_option( self::MISSING_SCAN_CURSOR_OPTION, 0, false );
+			Mobo_Core_Settings::update( self::MISSING_SCAN_CURSOR_OPTION, 0, false );
 		} else {
-			update_option( self::MISSING_SCAN_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_start ), false );
+			Mobo_Core_Settings::update( self::MISSING_SCAN_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_start ), false );
 		}
 
-		update_option( 'mobo_core_image_refresh_last_scan', $result, false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_last_scan', $result, false );
 
 		return $result;
 	}
@@ -267,17 +269,17 @@ class Mobo_Core_Image_Refresh_Service {
 					'enqueued'        => 0,
 					'withoutProduct'  => 0,
 					'withoutSourceUrl'=> 0,
-					'cursorStart'     => absint( get_option( self::ENQUEUE_CURSOR_OPTION, 0 ) ),
-					'cursorEnd'       => absint( get_option( self::ENQUEUE_CURSOR_OPTION, 0 ) ),
+					'cursorStart'     => absint( Mobo_Core_Settings::get( self::ENQUEUE_CURSOR_OPTION, 0 ) ),
+					'cursorEnd'       => absint( Mobo_Core_Settings::get( self::ENQUEUE_CURSOR_OPTION, 0 ) ),
 					'cycleComplete'   => false,
 				)
 			);
-			update_option( 'mobo_core_image_refresh_last_enqueue', $result, false );
+			Mobo_Core_Settings::update( 'mobo_core_image_refresh_last_enqueue', $result, false );
 			return $result;
 		}
 
 		$queue       = new Mobo_Core_Image_Refresh_Queue();
-		$previous     = get_option( 'mobo_core_image_refresh_last_enqueue', array() );
+		$previous     = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_enqueue', array() );
 		$previous     = is_array( $previous ) ? $previous : array();
 		$legacy_already_complete = ! empty( $previous['legacyComplete'] ) && empty( $previous['cycleComplete'] );
 		$batch = $legacy_already_complete
@@ -286,13 +288,13 @@ class Mobo_Core_Image_Refresh_Service {
 		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
 		$recovery     = class_exists( 'Mobo_Core_Missing_Image_Recovery' ) ? new Mobo_Core_Missing_Image_Recovery() : null;
-		$missing_cursor_start = absint( get_option( self::MISSING_ENQUEUE_CURSOR_OPTION, 0 ) );
+		$missing_cursor_start = absint( Mobo_Core_Settings::get( self::MISSING_ENQUEUE_CURSOR_OPTION, 0 ) );
 		$missing_batch = $recovery instanceof Mobo_Core_Missing_Image_Recovery && $recovery->is_enabled()
 			? $recovery->get_candidate_batch( $limit, $missing_cursor_start )
 			: array( 'rows' => array(), 'scanned' => 0, 'cursorStart' => 0, 'cursorEnd' => 0, 'cycleComplete' => true, 'estimatedTotal' => 0 );
 		$missing_rows = isset( $missing_batch['rows'] ) && is_array( $missing_batch['rows'] ) ? $missing_batch['rows'] : array();
 		$continue_cycle = ( $legacy_already_complete || $cursor_start > 0 || $missing_cursor_start > 0 ) && ! empty( $previous ) && empty( $previous['cycleComplete'] );
-		$source_scan   = get_option( 'mobo_core_image_refresh_last_scan', array() );
+		$source_scan   = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_scan', array() );
 		$source_scan   = is_array( $source_scan ) ? $source_scan : array();
 		$source_scan_cycle_id = ! empty( $source_scan['cycleId'] )
 			? sanitize_text_field( (string) $source_scan['cycleId'] )
@@ -439,7 +441,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 			if ( is_wp_error( $recover ) ) {
 				$result['missingImageFailed']++;
-				$result['lastError'] = sanitize_text_field( $recover->get_error_message() );
+				$result['lastError'] = 'Image recovery failed [' . substr( sanitize_key( (string) $recover->get_error_code() ), 0, 64 ) . '].';
 				$missing_error = true;
 				break;
 			}
@@ -455,14 +457,14 @@ class Mobo_Core_Image_Refresh_Service {
 
 		if ( $missing_error ) {
 			$result['cycleComplete'] = false;
-			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, $missing_cursor_end, false );
+			Mobo_Core_Settings::update( self::MISSING_ENQUEUE_CURSOR_OPTION, $missing_cursor_end, false );
 		} elseif ( ! empty( $missing_batch['cycleComplete'] ) ) {
-			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, 0, false );
+			Mobo_Core_Settings::update( self::MISSING_ENQUEUE_CURSOR_OPTION, 0, false );
 		} else {
-			update_option( self::MISSING_ENQUEUE_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_end ), false );
+			Mobo_Core_Settings::update( self::MISSING_ENQUEUE_CURSOR_OPTION, absint( isset( $missing_batch['cursorEnd'] ) ? $missing_batch['cursorEnd'] : $missing_cursor_end ), false );
 		}
 
-		update_option( 'mobo_core_image_refresh_last_enqueue', $result, false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_last_enqueue', $result, false );
 
 		/* Queue construction normally only builds the replacement queue. Missing
 		 * product images are intentionally handed to the separate safe image queue,
@@ -514,8 +516,8 @@ class Mobo_Core_Image_Refresh_Service {
 			return $this->save_last_result( $this->locked_result() );
 		}
 
-		$last_scan    = get_option( 'mobo_core_image_refresh_last_scan', array() );
-		$last_enqueue = get_option( 'mobo_core_image_refresh_last_enqueue', array() );
+		$last_scan    = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_scan', array() );
+		$last_enqueue = Mobo_Core_Settings::get( 'mobo_core_image_refresh_last_enqueue', array() );
 		$scan_time    = is_array( $last_scan ) ? absint( isset( $last_scan['checkedAt'] ) ? $last_scan['checkedAt'] : 0 ) : 0;
 		$enqueue_time = is_array( $last_enqueue ) ? absint( isset( $last_enqueue['checkedAt'] ) ? $last_enqueue['checkedAt'] : 0 ) : 0;
 		$scan_cycle_id = is_array( $last_scan ) && ! empty( $last_scan['cycleId'] )
@@ -821,7 +823,7 @@ class Mobo_Core_Image_Refresh_Service {
 					$image_guid,
 					$active_old_attachment_id,
 					$force_source_reimport,
-					sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) )
+					sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) )
 				)
 			);
 		}
@@ -984,7 +986,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	private function mark_refresh_completed( $product_id, $old_attachment_id, $new_attachment_id, $image_guid, $new_source_url ) {
 		$now = time();
-		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$generation_id = sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) );
 
 		update_post_meta( $product_id, 'mobo_image_refresh_last_completed_at', $now );
 		update_post_meta( $product_id, 'mobo_image_refresh_last_old_attachment_id', absint( $old_attachment_id ) );
@@ -1020,7 +1022,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	private function find_generation_replacement( $old_attachment_id, $image_guid, $source_url ) {
 		$old_attachment_id = absint( $old_attachment_id );
-		$generation_id     = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$generation_id     = sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) );
 		$image_guid        = sanitize_text_field( (string) $image_guid );
 		$source_url        = esc_url_raw( (string) $source_url );
 		if ( $old_attachment_id <= 0 || '' === $generation_id ) {
@@ -1057,7 +1059,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return void
 	 */
 	private function register_generation_candidate( $old_attachment_id, $new_attachment_id ) {
-		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$generation_id = sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) );
 		$old_attachment_id = absint( $old_attachment_id );
 		$new_attachment_id = absint( $new_attachment_id );
 		if ( '' === $generation_id || $old_attachment_id <= 0 || $new_attachment_id <= 0 ) {
@@ -1077,12 +1079,12 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return void
 	 */
 	private function record_generation_stats( $old_bytes, $new_bytes, $reused ) {
-		$generation_id = sanitize_text_field( (string) get_option( self::GENERATION_ID_OPTION, '' ) );
+		$generation_id = sanitize_text_field( (string) Mobo_Core_Settings::get( self::GENERATION_ID_OPTION, '' ) );
 		if ( '' === $generation_id ) {
 			return;
 		}
 
-		$stats = get_option( self::GENERATION_STATS_OPTION, array() );
+		$stats = Mobo_Core_Settings::get( self::GENERATION_STATS_OPTION, array() );
 		$stats = is_array( $stats ) ? $stats : array();
 		if ( $generation_id !== sanitize_text_field( (string) ( isset( $stats['generationId'] ) ? $stats['generationId'] : '' ) ) ) {
 			$stats = array( 'generationId' => $generation_id );
@@ -1096,7 +1098,7 @@ class Mobo_Core_Image_Refresh_Service {
 			$stats['bytesAfter']      = absint( isset( $stats['bytesAfter'] ) ? $stats['bytesAfter'] : 0 ) + absint( $new_bytes );
 		}
 		$stats['updatedAt'] = time();
-		update_option( self::GENERATION_STATS_OPTION, $stats, false );
+		Mobo_Core_Settings::update( self::GENERATION_STATS_OPTION, $stats, false );
 	}
 
 	/**
@@ -1240,13 +1242,16 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		if ( '' !== $image_guid && class_exists( 'Mobo_Core_Image_Queue' ) && Mobo_Core_Image_Queue::table_exists() ) {
+			$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+			if ( $connection_id <= 0 ) { return ''; }
 			$table = Mobo_Core_Image_Queue::table_name();
 			$rows  = $wpdb->get_col(
 				$wpdb->prepare(
 					"SELECT source_url FROM {$table}
-					WHERE image_guid = %s AND product_id = %d AND source_url IS NOT NULL AND source_url <> ''
+					WHERE connection_id = %d AND image_guid = %s AND product_id = %d AND source_url IS NOT NULL AND source_url <> ''
 					ORDER BY updated_at DESC, id DESC
 					LIMIT 5",
+					$connection_id,
 					$image_guid,
 					$product_id
 				)
@@ -1262,9 +1267,10 @@ class Mobo_Core_Image_Refresh_Service {
 			$rows = $wpdb->get_col(
 				$wpdb->prepare(
 					"SELECT source_url FROM {$table}
-					WHERE image_guid = %s AND source_url IS NOT NULL AND source_url <> ''
+					WHERE connection_id = %d AND image_guid = %s AND source_url IS NOT NULL AND source_url <> ''
 					ORDER BY updated_at DESC, id DESC
 					LIMIT 5",
+					$connection_id,
 					$image_guid
 				)
 			);
@@ -1540,9 +1546,12 @@ class Mobo_Core_Image_Refresh_Service {
 	/** @return array */
 	private function get_current_image_identity_map() {
 		global $wpdb;
-		if ( is_array( $this->current_image_identity_map ) ) {
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 ) { return array( 'byBasename' => array() ); }
+		if ( is_array( $this->current_image_identity_map ) && $this->current_image_identity_map_connection_id === $connection_id ) {
 			return $this->current_image_identity_map;
 		}
+		$this->current_image_identity_map_connection_id = $connection_id;
 		$this->current_image_identity_map = array( 'byBasename' => array() );
 		if ( ! class_exists( 'Mobo_Core_Image_Queue' ) || ! Mobo_Core_Image_Queue::table_exists() ) {
 			return $this->current_image_identity_map;
@@ -1553,9 +1562,10 @@ class Mobo_Core_Image_Refresh_Service {
 			$wpdb->prepare(
 				"SELECT image_guid, source_url, attachment_id, product_id, position_index, status
 				FROM {$table}
-				WHERE image_guid <> '' AND source_url <> ''
+				WHERE connection_id = %d AND image_guid <> '' AND source_url <> ''
 				ORDER BY updated_at DESC, id DESC
 				LIMIT %d",
+				$connection_id,
 				50000
 			),
 			ARRAY_A
@@ -1715,7 +1725,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$limit         = max( 1, min( 5000, absint( $limit ) ) );
 		$cursor_option = sanitize_key( (string) $cursor_option );
-		$cursor_start  = absint( get_option( $cursor_option, 0 ) );
+		$cursor_start  = absint( Mobo_Core_Settings::get( $cursor_option, 0 ) );
 		$fetch_limit   = $limit + 1;
 
 		$estimated_total = absint(
@@ -1753,7 +1763,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
 		$cycle_complete = ! $has_more;
 
-		update_option( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
+		Mobo_Core_Settings::update( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
 
 		return array(
 			'ids'            => $ids,
@@ -1779,7 +1789,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$limit         = max( 1, min( 5000, absint( $limit ) ) );
 		$cursor_option = sanitize_key( (string) $cursor_option );
-		$cursor_start  = absint( get_option( $cursor_option, 0 ) );
+		$cursor_start  = absint( Mobo_Core_Settings::get( $cursor_option, 0 ) );
 		$fetch_limit   = $limit + 1;
 		$jpg_like      = '%.jpg';
 		$jpeg_like     = '%.jpeg';
@@ -1834,7 +1844,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$cursor_end     = ! empty( $ids ) ? absint( end( $ids ) ) : $cursor_start;
 		$cycle_complete = ! $has_more;
 
-		update_option( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
+		Mobo_Core_Settings::update( $cursor_option, $cycle_complete ? 0 : $cursor_end, false );
 
 		return array(
 			'ids'            => $ids,
@@ -1858,7 +1868,7 @@ class Mobo_Core_Image_Refresh_Service {
 
 		$limit         = max( 1, min( 5000, absint( $limit ) ) );
 		$cursor_option = sanitize_key( (string) $cursor_option );
-		$cursor_start  = absint( get_option( $cursor_option, 0 ) );
+		$cursor_start  = absint( Mobo_Core_Settings::get( $cursor_option, 0 ) );
 		$fetch_limit   = $limit + 1;
 
 		$estimated_total = absint(
@@ -1941,19 +1951,19 @@ class Mobo_Core_Image_Refresh_Service {
 					'sharedChecked'    => 0,
 					'failed'        => 0,
 					'issues'        => array(),
-					'cursorStart'   => absint( get_option( $cursor_option, 0 ) ),
-					'cursorEnd'     => absint( get_option( $cursor_option, 0 ) ),
+					'cursorStart'   => absint( Mobo_Core_Settings::get( $cursor_option, 0 ) ),
+					'cursorEnd'     => absint( Mobo_Core_Settings::get( $cursor_option, 0 ) ),
 					'cycleComplete' => false,
 				)
 			);
-			update_option( $option_name, $result, false );
+			Mobo_Core_Settings::update( $option_name, $result, false );
 			return $result;
 		}
 
 		$batch       = $this->get_mobo_attachment_batch( $limit, $cursor_option );
 		$attachments = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
-		$previous     = get_option( $option_name, array() );
+		$previous     = Mobo_Core_Settings::get( $option_name, array() );
 		$previous     = is_array( $previous ) ? $previous : array();
 		$continue_cycle = $cursor_start > 0
 			&& ! empty( $previous )
@@ -2096,7 +2106,7 @@ class Mobo_Core_Image_Refresh_Service {
 			}
 		}
 
-		update_option( $option_name, $result, false );
+		Mobo_Core_Settings::update( $option_name, $result, false );
 		return $result;
 	}
 
@@ -2139,15 +2149,15 @@ class Mobo_Core_Image_Refresh_Service {
 			'invalidReplacement'       => 0,
 			'invalidSubsizes'          => 0,
 			'issues'                   => array(),
-			'cursorStart'              => absint( get_option( $cursor_option, 0 ) ),
-			'cursorEnd'                => absint( get_option( $cursor_option, 0 ) ),
+			'cursorStart'              => absint( Mobo_Core_Settings::get( $cursor_option, 0 ) ),
+			'cursorEnd'                => absint( Mobo_Core_Settings::get( $cursor_option, 0 ) ),
 			'cycleComplete'            => false,
 			'checkedAt'                => time(),
 		);
 
 		if ( ! $this->is_unlocked() ) {
 			$result = $this->locked_result( $empty_result );
-			update_option( $option_name, $result, false );
+			Mobo_Core_Settings::update( $option_name, $result, false );
 			return $result;
 		}
 
@@ -2155,14 +2165,14 @@ class Mobo_Core_Image_Refresh_Service {
 			$result            = $empty_result;
 			$result['status']  = 'disabled';
 			$result['message'] = 'ابتدا گزینه حذف پیوست قدیمی بعد از جایگزینی امن را فعال و تنظیمات را ذخیره کنید.';
-			update_option( $option_name, $result, false );
+			Mobo_Core_Settings::update( $option_name, $result, false );
 			return $result;
 		}
 
 		$batch          = $this->get_replaced_attachment_batch( $limit, $cursor_option );
 		$attachment_ids = isset( $batch['ids'] ) && is_array( $batch['ids'] ) ? $batch['ids'] : array();
 		$cursor_start   = isset( $batch['cursorStart'] ) ? absint( $batch['cursorStart'] ) : 0;
-		$previous       = get_option( $option_name, array() );
+		$previous       = Mobo_Core_Settings::get( $option_name, array() );
 		$previous       = is_array( $previous ) ? $previous : array();
 		$continue_cycle = $cursor_start > 0
 			&& ! empty( $previous )
@@ -2186,7 +2196,7 @@ class Mobo_Core_Image_Refresh_Service {
 		}
 
 		/* Expose a running heartbeat before expensive work starts. */
-		update_option( $option_name, $result, false );
+		Mobo_Core_Settings::update( $option_name, $result, false );
 
 		if ( empty( $attachment_ids ) ) {
 			$result['status']           = 'processed';
@@ -2195,8 +2205,8 @@ class Mobo_Core_Image_Refresh_Service {
 			$result['stableComplete']   = $delete;
 			$result['needsAnotherPass'] = false;
 			$result['checkedAt']        = time();
-			update_option( $cursor_option, 0, false );
-			update_option( $option_name, $result, false );
+			Mobo_Core_Settings::update( $cursor_option, 0, false );
+			Mobo_Core_Settings::update( $option_name, $result, false );
 			return $result;
 		}
 
@@ -2274,8 +2284,8 @@ class Mobo_Core_Image_Refresh_Service {
 			/* Advance only after this attachment completed. */
 			$result['cursorEnd'] = $old_attachment_id;
 			$result['checkedAt'] = time();
-			update_option( $cursor_option, $old_attachment_id, false );
-			update_option( $option_name, $result, false );
+			Mobo_Core_Settings::update( $cursor_option, $old_attachment_id, false );
+			Mobo_Core_Settings::update( $option_name, $result, false );
 
 			if ( ( microtime( true ) - $batch_started ) >= $time_budget ) {
 				break;
@@ -2289,9 +2299,9 @@ class Mobo_Core_Image_Refresh_Service {
 		$result['checkedAt']     = time();
 
 		if ( $result['cycleComplete'] ) {
-			update_option( $cursor_option, 0, false );
+			Mobo_Core_Settings::update( $cursor_option, 0, false );
 		} elseif ( $processed_in_batch <= 0 ) {
-			update_option( $cursor_option, $cursor_start, false );
+			Mobo_Core_Settings::update( $cursor_option, $cursor_start, false );
 		}
 
 		/* A Stage 7 pass is final only when a full pass makes no new progress.
@@ -2308,7 +2318,7 @@ class Mobo_Core_Image_Refresh_Service {
 			&& ! empty( $result['cycleComplete'] )
 			&& absint( $result['passProgress'] ) > 0;
 
-		update_option( $option_name, $result, false );
+		Mobo_Core_Settings::update( $option_name, $result, false );
 		return $result;
 	}
 
@@ -2504,16 +2514,16 @@ class Mobo_Core_Image_Refresh_Service {
 			$message = 'تمام برش های لازم موجود هستند، مسیر و ابعاد متادیتا با فایل واقعی تطبیق دارد و موتور تصویر سرور نیز WebP را پشتیبانی می‌کند.';
 		} elseif ( $healthy ) {
 			$code    = 'healthy_editor_unavailable';
-			$message = 'برش های فعلی کامل هستند، اما موتور تصویر سرور امکان بازسازی WebP را ندارد: ' . $editor->get_error_message();
+			$message = 'برش های فعلی کامل هستند، اما موتور تصویر سرور امکان بازسازی WebP را ندارد.';
 		} elseif ( ! $original_format_ok ) {
 			$code    = 'wrong_original_storage_format';
 			$message = 'فایل اصلی از نظر محتوای تصویر WebP است، اما پسوند فایل یا MIME پیوست با image/webp سازگار نیست؛ برای جلوگیری از Content-Type اشتباه باید Attachment تمیز دوباره import شود.';
 		} elseif ( ! $metadata_valid && ! $editor_supported ) {
 			$code    = 'unsupported_editor';
-			$message = 'مسیر/ابعاد متادیتای تصویر با فایل اصلی سازگار نیست و موتور تصویر سرور نیز قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
+			$message = 'مسیر/ابعاد متادیتای تصویر با فایل اصلی سازگار نیست و موتور تصویر سرور نیز قادر به بازسازی WebP نیست.';
 		} elseif ( ! $editor_supported ) {
 			$code    = 'unsupported_editor';
-			$message = 'یک یا چند برش ناقص یا ناسازگار است و موتور تصویر سرور قادر به بازسازی WebP نیست: ' . $editor->get_error_message();
+			$message = 'یک یا چند برش ناقص یا ناسازگار است و موتور تصویر سرور قادر به بازسازی WebP نیست.';
 		} elseif ( ! $metadata_valid ) {
 			$code    = 'stale_metadata';
 			$message = 'مسیر یا ابعاد متادیتای اصلی تصویر با فایل واقعی تطبیق ندارد و باید بازسازی شود.';
@@ -2677,23 +2687,23 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	public function reset_workflow_state( $keep_legacy_scan = true ) {
 		if ( ! $keep_legacy_scan ) {
-			delete_option( self::SCAN_CURSOR_OPTION );
-			delete_option( self::MISSING_SCAN_CURSOR_OPTION );
-			delete_option( 'mobo_core_image_refresh_last_scan' );
+			Mobo_Core_Settings::delete( self::SCAN_CURSOR_OPTION );
+			Mobo_Core_Settings::delete( self::MISSING_SCAN_CURSOR_OPTION );
+			Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_scan' );
 		}
 
-		delete_option( self::ENQUEUE_CURSOR_OPTION );
-		delete_option( self::MISSING_ENQUEUE_CURSOR_OPTION );
-		delete_option( self::SUBSIZE_SCAN_CURSOR_OPTION );
-		delete_option( self::SUBSIZE_REPAIR_CURSOR_OPTION );
-		delete_option( self::REPLACED_SCAN_CURSOR_OPTION );
-		delete_option( self::REPLACED_DELETE_CURSOR_OPTION );
-		delete_option( 'mobo_core_image_refresh_last_enqueue' );
-		delete_option( 'mobo_core_image_refresh_last_result' );
-		delete_option( 'mobo_core_image_refresh_last_subsize_scan' );
-		delete_option( 'mobo_core_image_refresh_last_subsize_repair' );
-		delete_option( 'mobo_core_image_refresh_last_replaced_scan' );
-		delete_option( 'mobo_core_image_refresh_last_replaced_delete' );
+		Mobo_Core_Settings::delete( self::ENQUEUE_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::MISSING_ENQUEUE_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::SUBSIZE_SCAN_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::SUBSIZE_REPAIR_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::REPLACED_SCAN_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::REPLACED_DELETE_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_enqueue' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_result' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_subsize_scan' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_subsize_repair' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_replaced_scan' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_replaced_delete' );
 	}
 
 	/**
@@ -2704,14 +2714,14 @@ class Mobo_Core_Image_Refresh_Service {
 	 * @return void
 	 */
 	public function invalidate_post_queue_verification_state() {
-		delete_option( self::SUBSIZE_SCAN_CURSOR_OPTION );
-		delete_option( self::SUBSIZE_REPAIR_CURSOR_OPTION );
-		delete_option( self::REPLACED_SCAN_CURSOR_OPTION );
-		delete_option( self::REPLACED_DELETE_CURSOR_OPTION );
-		delete_option( 'mobo_core_image_refresh_last_subsize_scan' );
-		delete_option( 'mobo_core_image_refresh_last_subsize_repair' );
-		delete_option( 'mobo_core_image_refresh_last_replaced_scan' );
-		delete_option( 'mobo_core_image_refresh_last_replaced_delete' );
+		Mobo_Core_Settings::delete( self::SUBSIZE_SCAN_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::SUBSIZE_REPAIR_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::REPLACED_SCAN_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( self::REPLACED_DELETE_CURSOR_OPTION );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_subsize_scan' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_subsize_repair' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_replaced_scan' );
+		Mobo_Core_Settings::delete( 'mobo_core_image_refresh_last_replaced_delete' );
 
 		/* Keep the administrator's persistent old-attachment deletion preference. */
 		update_option( 'mobo_core_orphan_image_cleanup_enabled', '0', false );
@@ -2828,14 +2838,14 @@ class Mobo_Core_Image_Refresh_Service {
 					'success'    => false,
 					'generated'  => 0,
 					'registered' => 0,
-					'message'    => 'ساخت برش‌ها به دلیل آماده نبودن فضای ذخیره‌سازی متوقف شد: ' . sanitize_text_field( isset( $storage['message'] ) ? (string) $storage['message'] : 'فضای کافی وجود ندارد.' ),
+					'message'    => 'ساخت برش‌ها به دلیل آماده نبودن فضای ذخیره‌سازی متوقف شد.',
 				);
 			}
 		}
 
 		$editor = wp_get_image_editor( $file );
 		if ( is_wp_error( $editor ) ) {
-			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'کتابخانه پردازش تصویر سرور قادر به باز کردن یا ساخت WebP نیست: ' . $editor->get_error_message() );
+			return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'کتابخانه پردازش تصویر سرور قادر به باز کردن یا ساخت WebP نیست.' );
 		}
 
 		/*
@@ -2853,7 +2863,7 @@ class Mobo_Core_Image_Refresh_Service {
 		if ( ! is_array( $metadata ) ) {
 			$generated_metadata = wp_generate_attachment_metadata( $attachment_id, $file );
 			if ( is_wp_error( $generated_metadata ) || ! is_array( $generated_metadata ) ) {
-				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => is_wp_error( $generated_metadata ) ? 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند. جزئیات فنی: ' . sanitize_text_field( $generated_metadata->get_error_message() ) : 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند.' );
+				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => is_wp_error( $generated_metadata ) ? 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند.' : 'وردپرس نتوانست متادیتای گمشده تصویر را بازسازی کند.' );
 			}
 			wp_update_attachment_metadata( $attachment_id, $generated_metadata );
 			$metadata = $generated_metadata;
@@ -2953,12 +2963,12 @@ class Mobo_Core_Image_Refresh_Service {
 		if ( function_exists( 'wp_update_image_subsizes' ) ) {
 			$updated = wp_update_image_subsizes( $attachment_id );
 			if ( is_wp_error( $updated ) ) {
-				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'وردپرس نتوانست برش های تصویر را بازسازی کند. جزئیات فنی: ' . sanitize_text_field( $updated->get_error_message() ) );
+				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => 'وردپرس نتوانست برش های تصویر را بازسازی کند.' );
 			}
 		} else {
 			$generated_metadata = wp_generate_attachment_metadata( $attachment_id, $file );
 			if ( is_wp_error( $generated_metadata ) || ! is_array( $generated_metadata ) ) {
-				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => is_wp_error( $generated_metadata ) ? 'وردپرس نتوانست متادیتا و برش های تصویر را تولید کند. جزئیات فنی: ' . sanitize_text_field( $generated_metadata->get_error_message() ) : 'وردپرس نتوانست متادیتای تصویر را تولید کند.' );
+				return array( 'success' => false, 'generated' => 0, 'registered' => 0, 'message' => is_wp_error( $generated_metadata ) ? 'وردپرس نتوانست متادیتا و برش های تصویر را تولید کند.' : 'وردپرس نتوانست متادیتای تصویر را تولید کند.' );
 			}
 			wp_update_attachment_metadata( $attachment_id, $generated_metadata );
 		}
@@ -3452,11 +3462,42 @@ class Mobo_Core_Image_Refresh_Service {
 			return false;
 		}
 
-		if ( 'product_variation' === get_post_type( $product_id ) ) {
-			$parent_id = wp_get_post_parent_id( $product_id );
-			if ( $parent_id > 0 && $this->is_mobo_product( $parent_id ) ) {
-				return true;
+		$connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+		if ( $connection_id <= 0 ) {
+			return false;
+		}
+
+		$type = get_post_type( $product_id );
+		if ( 'product_variation' === $type ) {
+			if ( class_exists( 'Mobo_Core_Variant_State_Repository' ) ) {
+				$owner = ( new Mobo_Core_Variant_State_Repository() )->get_owner_by_woo_variation_id( $product_id );
+				if ( is_array( $owner ) ) {
+					return absint( $owner['connection_id'] ?? 0 ) === $connection_id;
+				}
 			}
+			$parent_id = wp_get_post_parent_id( $product_id );
+			if ( $parent_id > 0 ) {
+				return $this->is_mobo_product( $parent_id );
+			}
+			return false;
+		}
+
+		if ( 'product' !== $type ) {
+			return false;
+		}
+
+		if ( class_exists( 'Mobo_Core_Product_State_Repository' ) ) {
+			$owner = ( new Mobo_Core_Product_State_Repository() )->get_owner_by_woo_product_id( $product_id );
+			if ( is_array( $owner ) ) {
+				return absint( $owner['connection_id'] ?? 0 ) === $connection_id;
+			}
+		}
+
+		/* Legacy product postmeta has no Source identity. It is therefore valid only
+		 * for the Default Connection during one-way bootstrap/migration. */
+		$default = class_exists( 'Mobo_Core_Connection_Repository' ) ? Mobo_Core_Connection_Repository::get_default() : null;
+		if ( ! is_array( $default ) || absint( $default['id'] ?? 0 ) !== $connection_id ) {
+			return false;
 		}
 
 		return '' !== sanitize_text_field( (string) get_post_meta( $product_id, 'product_guid', true ) )
@@ -4415,6 +4456,14 @@ class Mobo_Core_Image_Refresh_Service {
 			array( 'termmeta', $wpdb->termmeta, 'term_id', 'meta_key', '1=1', array() ),
 			array( 'usermeta', $wpdb->usermeta, 'user_id', 'meta_key', '1=1', array() ),
 		);
+		/* Generic Mobo Product/Variation metadata leaves wp_postmeta after the v6
+		 * terminal cutover. Keep image-reference safety aware of that storage too. */
+		if ( class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) && Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative() ) {
+			$entity_meta_table = Mobo_Core_Storage_Entity_Meta_Retirement::table_name();
+			if ( '' !== $entity_meta_table ) {
+				$meta_sets[] = array( 'mobo_entity_meta', $entity_meta_table, 'woo_object_id', 'meta_key', "meta_key NOT LIKE %s AND meta_key NOT IN ('mobo_refreshed_from_attachment_id','mobo_replaces_attachment_id')", array( $wpdb->esc_like( 'mobo_image_refresh_' ) . '%' ) );
+			}
+		}
 		foreach ( $meta_sets as $set ) {
 			$params = array();
 			$where  = $this->build_attachment_reference_sql( 'meta_value', $attachment_id, $tokens, $params );
@@ -4472,7 +4521,7 @@ class Mobo_Core_Image_Refresh_Service {
 	 */
 	private function save_last_result( $result ) {
 		$result['executedAt'] = time();
-		update_option( 'mobo_core_image_refresh_last_result', $result, false );
+		Mobo_Core_Settings::update( 'mobo_core_image_refresh_last_result', $result, false );
 
 		return $result;
 	}

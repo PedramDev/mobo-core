@@ -37,7 +37,9 @@ class Mobo_Core_Webhook_Auth_Status {
 			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 		);
 
-		update_option( self::OPTION_KEY, $data, false );
+		if ( class_exists( 'Mobo_Core_Settings' ) ) {
+			Mobo_Core_Settings::update( self::OPTION_KEY, $data, false );
+		}
 		return $data;
 	}
 
@@ -47,7 +49,9 @@ class Mobo_Core_Webhook_Auth_Status {
 	 * @return array
 	 */
 	public static function get_status() {
-		$data = get_option( self::OPTION_KEY, array() );
+		$data = class_exists( 'Mobo_Core_Settings' )
+			? Mobo_Core_Settings::get( self::OPTION_KEY, array() )
+			: array();
 		if ( ! is_array( $data ) ) {
 			$data = array();
 		}

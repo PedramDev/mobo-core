@@ -23,7 +23,7 @@ flowchart LR
     P["MoboCore Portal v25<br/>.NET 10 + PostgreSQL"]
     W["Mobo Core 10.31.76<br/>WordPress Plugin"]
     WC["WooCommerce<br/>Products / Variations / Orders"]
-    M["mobomobo.ir<br/>Cart & Order Workflow"]
+    M["the provisioned Source<br/>Cart & Order Workflow"]
     C["Server Cron / cPanel"]
     H["Portal Health Worker"]
 
@@ -99,10 +99,12 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    CR["GET/POST /cron/run?token=..
-کران سرور یا Self Runner"] --> SEC{"Cron token / X-SEC معتبر است؟"}
+    CLI["Cron اصلی هاست<br/>PHP mobo-cron.php"] --> CLAIM{"Dispatcher مشترک آزاد است؟"}
+    HTTP["HTTP fallback<br/>GET/POST /cron/run + X-SEC"] --> SEC{"Cron/Worker token معتبر است؟"}
     SEC -- No --> E401["401 Unauthorized"]
-    SEC -- Yes --> LOCK{"Lease اتمیک Runner دریافت شد؟"}
+    SEC -- Yes --> CLAIM
+    CLAIM -- No --> BUSY0["Scheduler hit ثبت می‌شود؛ Worker دیگر در حال اجراست"]
+    CLAIM -- Yes --> LOCK{"Lease اتمیک Runner دریافت شد؟"}
     LOCK -- No --> BUSY["locked؛ اجرای همزمان بدون ورود به صف خارج می‌شود"]
     LOCK -- Yes --> CFG["محاسبه بودجه امن، سقف دورها و TTL موثر محدود"]
     CFG --> HB["تمدید heartbeat با token مالک"]
@@ -204,7 +206,7 @@ sequenceDiagram
     participant U as Customer
     participant WC as WooCommerce
     participant MC as Mobo Core
-    participant MM as mobomobo.ir
+    participant MM as the provisioned Source
     participant Q as Order Queue
 
     U->>WC: Submit checkout
@@ -254,11 +256,11 @@ sequenceDiagram
     participant HW as Portal Health Worker
 
     loop Health interval
-        HW->>WP: GET /health + X-SEC
+        HW->>WP: GET /health + Default Connection X-SEC
         WP-->>HW: Local health snapshot
         HW->>P: Store reachable/warning/critical state
         opt Cron is stale and recovery is enabled
-            HW->>WP: POST /heartbeat + X-SEC
+            HW->>WP: POST /heartbeat + Default Connection X-SEC
             WP-->>HW: Recovery status (does not decide reachability)
         end
     end

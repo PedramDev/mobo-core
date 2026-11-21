@@ -42,6 +42,11 @@ class Mobo_Core_Repair_Integrity {
 			: null;
 	}
 
+	/** Active Source owner for every terminal custom-storage proof. */
+	private function connection_id() {
+		return class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+	}
+
 	/**
 	 * Run one bounded repair slice and mutate the manual-sync state by reference.
 	 *
@@ -105,6 +110,8 @@ class Mobo_Core_Repair_Integrity {
 			'priceMetaObjectsRepaired' => 0,
 			'priceMetaRowsRemoved' => 0,
 			'priceMetaObjectsExcluded' => 0,
+			'productLockQuarantined' => 0,
+			'samples' => array(),
 			'staleShippingMappingsRemoved' => 0,
 			'legacyShippingMethodsDisabled' => 0,
 			'legacyShippingFallbacksDisabled' => 0,
@@ -116,29 +123,142 @@ class Mobo_Core_Repair_Integrity {
 		);
 	}
 
+	/**
+	 * Whether identity postmeta has crossed the irreversible terminal fence.
+	 * Direct SQL/meta_query consumers must use Custom Storage after this point;
+	 * WordPress metadata filters cannot virtualize those query shapes.
+	 *
+	 * @return bool
+	 */
+	private function identity_terminal_active() {
+		return class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' )
+			&& Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads()
+			&& class_exists( 'Mobo_Core_Storage_Schema' )
+			&& Mobo_Core_Storage_Schema::is_ready();
+	}
+
+	/** @return array|WP_Error|null */
+	private function next_trashed_product_identity( $cursor ) {
+		global $wpdb;
+		$cursor = absint( $cursor );
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$products_table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$row = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT p.ID,c.product_guid FROM {$wpdb->posts} p INNER JOIN {$products_table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.ID>%d AND p.post_type='product' AND p.post_status='trash' AND c.product_guid<>'' ORDER BY p.ID ASC LIMIT 1",
+					$this->connection_id(),
+					$cursor
+				),
+				ARRAY_A
+			);
+		} else {
+			$row = $wpdb->get_row(
+				$wpdb->prepare(
+					"SELECT p.ID, MAX(pm.meta_value) AS product_guid
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+					WHERE p.ID > %d
+					AND p.post_type = 'product'
+					AND p.post_status = 'trash'
+					AND pm.meta_key = 'product_guid'
+					AND pm.meta_value <> ''
+					GROUP BY p.ID
+					ORDER BY p.ID ASC
+					LIMIT 1",
+					$cursor
+				),
+				ARRAY_A
+			);
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) ) {
+			return new WP_Error( 'mobo_core_repair_trashed_product_read_failed', 'Unable to read trashed Mobo products; Repair phase and cursor were preserved for retry.' );
+		}
+		return is_array( $row ) ? $row : null;
+	}
+
+	/** @return int|WP_Error */
+	private function count_product_guid_status( $product_guid, $trash_only ) {
+		global $wpdb;
+		$product_guid = sanitize_text_field( (string) $product_guid );
+		if ( '' === $product_guid ) { return 0; }
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$products_table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$status_clause = $trash_only ? "p.post_status='trash'" : "p.post_status<>'trash'";
+			$count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p INNER JOIN {$products_table} c ON c.woo_product_id=p.ID WHERE c.connection_id=%d AND p.post_type='product' AND {$status_clause} AND c.product_guid=%s",
+					$this->connection_id(),
+					$product_guid
+				)
+			);
+		} else {
+			$status_clause = $trash_only ? "p.post_status='trash'" : "p.post_status<>'trash'";
+			$count = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID WHERE p.post_type='product' AND {$status_clause} AND pm.meta_key='product_guid' AND pm.meta_value=%s",
+					$product_guid
+				)
+			);
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) ) {
+			return new WP_Error( 'mobo_core_repair_product_identity_count_failed', 'Unable to verify local Product identity cardinality.' );
+		}
+		return absint( $count );
+	}
+
 	private function run_portal_variant_duplicate_slice( &$state ) {
 		global $wpdb;
 
 		$cursor = absint( isset( $state['repairIntegrityCursor'] ) ? $state['repairIntegrityCursor'] : 0 );
 		$limit  = 25;
-		$portal_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::portal_variant_id_meta_keys() : array( '_mobo_portal_variant_id', 'mobo_portal_variant_id', 'portal_variant_id' );
-		$portal_keys = array_values( array_filter( array_map( 'sanitize_key', $portal_keys ) ) );
-		$placeholders = implode( ',', array_fill( 0, count( $portal_keys ), '%s' ) );
-		$sql = "SELECT CAST(pm.meta_value AS UNSIGNED) AS portal_variant_id, COUNT(DISTINCT p.ID) AS object_count
-			FROM {$wpdb->postmeta} pm
-			INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-			WHERE pm.meta_key IN ({$placeholders})
-			AND pm.meta_value REGEXP '^[0-9]+$'
-			AND CAST(pm.meta_value AS UNSIGNED) > %d
-			AND p.post_type = 'product_variation'
-			AND p.post_status IN ('publish','private','draft','pending')
-			GROUP BY CAST(pm.meta_value AS UNSIGNED)
-			HAVING COUNT(DISTINCT p.ID) > 1
-			ORDER BY CAST(pm.meta_value AS UNSIGNED) ASC
-			LIMIT %d";
-		$args = array_merge( $portal_keys, array( $cursor, $limit ) );
-		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
-		$rows = $wpdb->get_results( $prepared, ARRAY_A );
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT c.portal_variant_id, COUNT(DISTINCT p.ID) AS object_count
+					FROM {$variants_table} c
+					INNER JOIN {$wpdb->posts} p ON p.ID=c.woo_variation_id
+					WHERE c.connection_id = %d
+					AND c.portal_variant_id IS NOT NULL
+					AND c.portal_variant_id > %d
+					AND p.post_type='product_variation'
+					AND p.post_status IN ('publish','private','draft','pending')
+					GROUP BY c.portal_variant_id
+					HAVING COUNT(DISTINCT p.ID) > 1
+					ORDER BY c.portal_variant_id ASC
+					LIMIT %d",
+					$this->connection_id(),
+					$cursor,
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$portal_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::portal_variant_id_meta_keys() : array( '_mobo_portal_variant_id', 'mobo_portal_variant_id', 'portal_variant_id' );
+			$portal_keys = array_values( array_filter( array_map( 'sanitize_key', $portal_keys ) ) );
+			$placeholders = implode( ',', array_fill( 0, count( $portal_keys ), '%s' ) );
+			$sql = "SELECT CAST(pm.meta_value AS UNSIGNED) AS portal_variant_id, COUNT(DISTINCT p.ID) AS object_count
+				FROM {$wpdb->postmeta} pm
+				INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				WHERE pm.meta_key IN ({$placeholders})
+				AND pm.meta_value REGEXP '^[0-9]+$'
+				AND CAST(pm.meta_value AS UNSIGNED) > %d
+				AND p.post_type = 'product_variation'
+				AND p.post_status IN ('publish','private','draft','pending')
+				GROUP BY CAST(pm.meta_value AS UNSIGNED)
+				HAVING COUNT(DISTINCT p.ID) > 1
+				ORDER BY CAST(pm.meta_value AS UNSIGNED) ASC
+				LIMIT %d";
+			$args = array_merge( $portal_keys, array( $cursor, $limit ) );
+			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
+			$rows = $wpdb->get_results( $prepared, ARRAY_A );
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			return new WP_Error( 'mobo_core_repair_portal_variant_read_failed', 'Unable to read Portal-variant duplicate groups; Repair phase and cursor were preserved for retry.' );
+		}
 
 		if ( empty( $rows ) ) {
 			$state['repairIntegrityPhase']  = self::PHASE_TRASHED_PRODUCTS;
@@ -155,6 +275,10 @@ class Mobo_Core_Repair_Integrity {
 
 			$result = $this->repair_portal_variant_group( $portal_variant_id );
 			if ( is_wp_error( $result ) ) {
+				if ( 'mobo_core_repair_product_lock_busy' === $result->get_error_code() ) {
+					$state['repairIntegrityStats']['productLockBusySkipped'] = absint( $state['repairIntegrityStats']['productLockBusySkipped'] ?? 0 ) + 1;
+					return $this->bounded_lock_contention( $state, 'portal-variant-duplicate', (string) $portal_variant_id, 'repairIntegrityCursor', $portal_variant_id, $state['repairIntegrityStats'] );
+				}
 				$state['repairIntegrityStats']['errors']++;
 				$this->append_sample( $state['repairIntegrityStats']['ambiguousSamples'], array( 'portalVariantId' => $portal_variant_id, 'reason' => $result->get_error_message() ) );
 				/* Keep the cursor before this identity. A failed quarantine transition is
@@ -191,22 +315,37 @@ class Mobo_Core_Repair_Integrity {
 	private function repair_portal_variant_group( $portal_variant_id, $product_lock_token = false, $locked_product_guid = '' ) {
 		global $wpdb;
 
-		$portal_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::portal_variant_id_meta_keys() : array( '_mobo_portal_variant_id', 'mobo_portal_variant_id', 'portal_variant_id' );
-		$portal_keys = array_values( array_filter( array_map( 'sanitize_key', $portal_keys ) ) );
-		$placeholders = implode( ',', array_fill( 0, count( $portal_keys ), '%s' ) );
-		$sql = "SELECT DISTINCT p.ID
-			FROM {$wpdb->posts} p
-			INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-			WHERE p.post_type = 'product_variation'
-			AND p.post_status IN ('publish','private','draft','pending')
-			AND pm.meta_key IN ({$placeholders})
-			AND pm.meta_value REGEXP '^[0-9]+$'
-			AND CAST(pm.meta_value AS UNSIGNED) = %d
-			ORDER BY p.ID ASC";
-		$args = array_merge( $portal_keys, array( absint( $portal_variant_id ) ) );
-		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
-		$ids = $wpdb->get_col( $prepared );
-		$ids = array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID FROM {$variants_table} c INNER JOIN {$wpdb->posts} p ON p.ID=c.woo_variation_id WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','pending') AND c.portal_variant_id=%d ORDER BY p.ID ASC",
+					$this->connection_id(),
+					absint( $portal_variant_id )
+				)
+			);
+		} else {
+			$portal_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::portal_variant_id_meta_keys() : array( '_mobo_portal_variant_id', 'mobo_portal_variant_id', 'portal_variant_id' );
+			$portal_keys = array_values( array_filter( array_map( 'sanitize_key', $portal_keys ) ) );
+			$placeholders = implode( ',', array_fill( 0, count( $portal_keys ), '%s' ) );
+			$sql = "SELECT DISTINCT p.ID
+				FROM {$wpdb->posts} p
+				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+				WHERE p.post_type = 'product_variation'
+				AND p.post_status IN ('publish','private','draft','pending')
+				AND pm.meta_key IN ({$placeholders})
+				AND pm.meta_value REGEXP '^[0-9]+$'
+				AND CAST(pm.meta_value AS UNSIGNED) = %d
+				ORDER BY p.ID ASC";
+			$args = array_merge( $portal_keys, array( absint( $portal_variant_id ) ) );
+			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
+			$ids = $wpdb->get_col( $prepared );
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			return new WP_Error( 'mobo_core_repair_portal_variant_members_read_failed', 'Unable to read members of a Portal-variant duplicate group; Repair preserved the group for retry.' );
+		}
+		$ids = array_values( array_filter( array_unique( array_map( 'absint', $ids ) ) ) );
 		if ( count( $ids ) <= 1 ) {
 			return array( 'repaired' => false, 'ambiguous' => false, 'portalVariantId' => absint( $portal_variant_id ) );
 		}
@@ -313,9 +452,11 @@ class Mobo_Core_Repair_Integrity {
 			);
 		}
 
-		$this->replace_meta_single( $canonical_id, '_mobo_portal_variant_id', (string) absint( $portal_variant_id ) );
-		$this->replace_meta_single( $canonical_id, 'mobo_portal_variant_id', (string) absint( $portal_variant_id ) );
-		$this->replace_meta_single( $canonical_id, 'portal_variant_id', (string) absint( $portal_variant_id ) );
+		if ( ! $this->replace_meta_single( $canonical_id, '_mobo_portal_variant_id', (string) absint( $portal_variant_id ) )
+			|| ! $this->replace_meta_single( $canonical_id, 'mobo_portal_variant_id', (string) absint( $portal_variant_id ) )
+			|| ! $this->replace_meta_single( $canonical_id, 'portal_variant_id', (string) absint( $portal_variant_id ) ) ) {
+			return new WP_Error( 'mobo_core_repair_portal_variant_meta_persist_failed', 'Could not durably normalize Portal variation identity metadata; Repair preserved the duplicate group for retry.' );
+		}
 
 		if ( ! $this->product_map->upsert_variation( $canonical_guid, $canonical_id, $product_guid, $source_hash, false ) ) {
 			return new WP_Error( 'mobo_core_repair_variation_map_persist_failed', 'Could not durably persist the canonical duplicate Variation Map row.' );
@@ -516,23 +657,10 @@ class Mobo_Core_Repair_Integrity {
 		global $wpdb;
 
 		$cursor = absint( isset( $state['repairIntegrityCursor'] ) ? $state['repairIntegrityCursor'] : 0 );
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT p.ID, MAX(pm.meta_value) AS product_guid
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-				WHERE p.ID > %d
-				AND p.post_type = 'product'
-				AND p.post_status = 'trash'
-				AND pm.meta_key = 'product_guid'
-				AND pm.meta_value <> ''
-				GROUP BY p.ID
-				ORDER BY p.ID ASC
-				LIMIT 1",
-				$cursor
-			),
-			ARRAY_A
-		);
+		$row = $this->next_trashed_product_identity( $cursor );
+		if ( is_wp_error( $row ) ) {
+			return $row;
+		}
 
 		if ( empty( $row ) ) {
 			$state['repairIntegrityPhase']  = self::PHASE_SIGNATURE_REPORT;
@@ -552,34 +680,14 @@ class Mobo_Core_Repair_Integrity {
 
 		/* If the GUID already has another active local parent, this Trash row is a
 		 * local duplicate/history record and must never be auto-restored. */
-		$active_count = absint(
-			$wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(DISTINCT p.ID)
-					FROM {$wpdb->posts} p
-					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-					WHERE p.post_type = 'product'
-					AND p.post_status <> 'trash'
-					AND pm.meta_key = 'product_guid'
-					AND pm.meta_value = %s",
-					$product_guid
-				)
-			)
-		);
-		$trash_count = absint(
-			$wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT COUNT(DISTINCT p.ID)
-					FROM {$wpdb->posts} p
-					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-					WHERE p.post_type = 'product'
-					AND p.post_status = 'trash'
-					AND pm.meta_key = 'product_guid'
-					AND pm.meta_value = %s",
-					$product_guid
-				)
-			)
-		);
+		$active_count = $this->count_product_guid_status( $product_guid, false );
+		if ( is_wp_error( $active_count ) ) {
+			return new WP_Error( 'mobo_core_repair_trashed_active_count_failed', 'Unable to verify active product identity before Trash recovery; no mutation was attempted.' );
+		}
+		$trash_count = $this->count_product_guid_status( $product_guid, true );
+		if ( is_wp_error( $trash_count ) ) {
+			return new WP_Error( 'mobo_core_repair_trashed_count_failed', 'Unable to verify trashed product identity before recovery; no mutation was attempted.' );
+		}
 		if ( $active_count > 0 || 1 !== $trash_count ) {
 			$state['repairIntegrityCursor'] = $post_id;
 			$state['repairIntegrityStats']['trashedProductsAmbiguous']++;
@@ -652,7 +760,8 @@ class Mobo_Core_Repair_Integrity {
 
 		$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 180 );
 		if ( false === $product_lock || is_wp_error( $product_lock ) ) {
-			return new WP_Error( 'mobo_core_repair_product_lock_busy', 'Another Mobo product or variation operation currently owns this product lock; retry Repair after it completes.' );
+			$state['repairIntegrityStats']['productLockBusySkipped'] = absint( $state['repairIntegrityStats']['productLockBusySkipped'] ?? 0 ) + 1;
+			return $this->bounded_lock_contention( $state, 'trashed-product', (string) $post_id, 'repairIntegrityCursor', $post_id, $state['repairIntegrityStats'] );
 		}
 
 		try {
@@ -662,34 +771,14 @@ class Mobo_Core_Repair_Integrity {
 				return new WP_Error( 'mobo_core_repair_trash_identity_changed', 'Trashed-product identity changed while Repair was waiting for the shared product lock; retry Repair.' );
 			}
 
-			$active_count_locked = absint(
-				$wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(DISTINCT p.ID)
-						FROM {$wpdb->posts} p
-						INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-						WHERE p.post_type = 'product'
-						AND p.post_status <> 'trash'
-						AND pm.meta_key = 'product_guid'
-						AND pm.meta_value = %s",
-						$product_guid
-					)
-				)
-			);
-			$trash_count_locked = absint(
-				$wpdb->get_var(
-					$wpdb->prepare(
-						"SELECT COUNT(DISTINCT p.ID)
-						FROM {$wpdb->posts} p
-						INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-						WHERE p.post_type = 'product'
-						AND p.post_status = 'trash'
-						AND pm.meta_key = 'product_guid'
-						AND pm.meta_value = %s",
-						$product_guid
-					)
-				)
-			);
+			$active_count_locked = $this->count_product_guid_status( $product_guid, false );
+			if ( is_wp_error( $active_count_locked ) ) {
+				return new WP_Error( 'mobo_core_repair_trashed_locked_active_count_failed', 'Unable to revalidate active product identity under the product lock; no mutation was attempted.' );
+			}
+			$trash_count_locked = $this->count_product_guid_status( $product_guid, true );
+			if ( is_wp_error( $trash_count_locked ) ) {
+				return new WP_Error( 'mobo_core_repair_trashed_locked_count_failed', 'Unable to revalidate trashed product identity under the product lock; no mutation was attempted.' );
+			}
 
 			if ( $active_count_locked > 0 || 1 !== $trash_count_locked ) {
 				$state['repairIntegrityCursor'] = $post_id;
@@ -705,14 +794,22 @@ class Mobo_Core_Repair_Integrity {
 			}
 
 			if ( $this->product_map instanceof Mobo_Core_Product_Map && Mobo_Core_Product_Map::table_exists() ) {
-				$map_owner_id = absint(
-					$wpdb->get_var(
-						$wpdb->prepare(
-							"SELECT wp_post_id FROM " . Mobo_Core_Product_Map::table_name() . " WHERE remote_guid = %s AND object_type = 'product' LIMIT 1",
-							$product_guid
-						)
+				$wpdb->last_error = '';
+				$repair_connection_id = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
+				if ( $repair_connection_id <= 0 ) {
+					return new WP_Error( 'mobo_core_repair_connection_context_missing', 'Repair Source context is unavailable.' );
+				}
+				$map_owner_raw = $wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT wp_post_id FROM " . Mobo_Core_Product_Map::table_name() . " WHERE connection_id=%d AND remote_guid = %s AND object_type = 'product' LIMIT 1",
+						$repair_connection_id,
+						$product_guid
 					)
 				);
+				if ( '' !== trim( (string) $wpdb->last_error ) ) {
+					return new WP_Error( 'mobo_core_repair_trashed_map_owner_read_failed', 'Unable to verify Product Map ownership under the product lock; no recovery mutation was attempted.' );
+				}
+				$map_owner_id = absint( $map_owner_raw );
 				if ( $map_owner_id > 0 && $map_owner_id !== $post_id ) {
 					$state['repairIntegrityCursor'] = $post_id;
 					$state['repairIntegrityStats']['trashedProductsAmbiguous']++;
@@ -746,20 +843,35 @@ class Mobo_Core_Repair_Integrity {
 		global $wpdb;
 
 		$cursor = absint( isset( $state['repairIntegrityCursor'] ) ? $state['repairIntegrityCursor'] : 0 );
-		$parents = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.post_parent
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
-				WHERE p.post_type = 'product_variation'
-				AND p.post_status IN ('publish','private','draft','pending')
-				AND p.post_parent > %d
-				ORDER BY p.post_parent ASC
-				LIMIT 25",
-				$cursor
-			)
-		);
-		$parents = array_values( array_filter( array_unique( array_map( 'absint', is_array( $parents ) ? $parents : array() ) ) ) );
+		$wpdb->last_error = '';
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$parents = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.post_parent FROM {$wpdb->posts} p INNER JOIN {$variants_table} c ON c.woo_variation_id=p.ID WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','pending') AND p.post_parent>%d ORDER BY p.post_parent ASC LIMIT 25",
+					$this->connection_id(),
+					$cursor
+				)
+			);
+		} else {
+			$parents = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.post_parent
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'product_guid'
+					WHERE p.post_type = 'product_variation'
+					AND p.post_status IN ('publish','private','draft','pending')
+					AND p.post_parent > %d
+					ORDER BY p.post_parent ASC
+					LIMIT 25",
+					$cursor
+				)
+			);
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $parents ) ) {
+			return new WP_Error( 'mobo_core_repair_signature_parent_read_failed', 'Unable to read variation-signature parent candidates; Repair phase and cursor were preserved for retry.' );
+		}
+		$parents = array_values( array_filter( array_unique( array_map( 'absint', $parents ) ) ) );
 		if ( empty( $parents ) ) {
 			$state['repairIntegrityPhase']  = self::PHASE_PRICE_META;
 			$state['repairIntegrityCursor'] = 0;
@@ -869,6 +981,7 @@ class Mobo_Core_Repair_Integrity {
 			'ambiguousDuplicateGroups' => 0,
 			'staleFenceSkipped' => 0,
 			'productLockBusySkipped' => 0,
+			'productLockQuarantined' => 0,
 			'priceMetaObjectsScanned' => 0,
 			'priceMetaObjectsRepaired' => 0,
 			'priceMetaRowsRemoved' => 0,
@@ -882,23 +995,45 @@ class Mobo_Core_Repair_Integrity {
 		global $wpdb;
 		$cursor = absint( $state['postSyncIntegrityCursor'] ?? 0 );
 		$marker_key = class_exists( 'Mobo_Core_Product_Sync' ) ? Mobo_Core_Product_Sync::REPAIR_SYNC_ID_META : '_mobo_last_repair_sync_id';
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} marker ON marker.post_id=p.ID AND marker.meta_key=%s AND marker.meta_value=%s
-				INNER JOIN {$wpdb->postmeta} complete ON complete.post_id=p.ID AND complete.meta_key='mobo_sync_incomplete' AND complete.meta_value='0'
-				WHERE p.ID > %d
-				AND p.post_type='product'
-				AND p.post_status NOT IN ('trash','auto-draft')
-				ORDER BY p.ID ASC
-				LIMIT 20",
-				$marker_key,
-				$sync_id,
-				$cursor
-			)
-		);
-		$ids = array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		$wpdb->last_error = '';
+		if ( class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) && Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative() ) {
+			$entity_table = Mobo_Core_Storage_Entity_Meta_Retirement::table_name();
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$entity_table} marker ON marker.woo_object_id=p.ID AND marker.meta_key=%s AND marker.meta_value=%s
+					WHERE p.ID > %d
+					AND p.post_type='product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+					ORDER BY p.ID ASC
+					LIMIT 20",
+					$marker_key,
+					maybe_serialize( $sync_id ),
+					$cursor
+				)
+			);
+		} else {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} marker ON marker.post_id=p.ID AND marker.meta_key=%s AND marker.meta_value=%s
+					WHERE p.ID > %d
+					AND p.post_type='product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+					ORDER BY p.ID ASC
+					LIMIT 20",
+					$marker_key,
+					$sync_id,
+					$cursor
+				)
+			);
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			return new WP_Error( 'mobo_core_repair_post_sync_parent_read_failed', 'Unable to read post-sync Repair parent candidates; Repair phase and cursor were preserved for retry.' );
+		}
+		$ids = array_values( array_filter( array_unique( array_map( 'absint', $ids ) ) ) );
 		if ( empty( $ids ) ) {
 			$state['postSyncIntegrityPhase'] = 'legacy-simple-topology';
 			$state['postSyncIntegrityCursor'] = 0;
@@ -906,6 +1041,17 @@ class Mobo_Core_Repair_Integrity {
 		}
 
 		foreach ( $ids as $parent_id ) {
+			/*
+			 * Do not SQL-join mobo_sync_incomplete from wp_postmeta here. In
+			 * Custom-Only mode the exact operational marker may be Custom-first
+			 * and its retained Legacy row may intentionally be stale. Resolve the
+			 * marker through the normal metadata API so the storage rollout filter
+			 * selects the authoritative source for the active mode.
+			 */
+			if ( '0' !== (string) get_post_meta( $parent_id, 'mobo_sync_incomplete', true ) ) {
+				$state['postSyncIntegrityCursor'] = max( absint( $state['postSyncIntegrityCursor'] ), $parent_id );
+				continue;
+			}
 			$state['postSyncIntegrityStats']['parentsScanned']++;
 			if ( class_exists( 'Mobo_Core_Product_Exclusions' ) && Mobo_Core_Product_Exclusions::is_local_product_excluded( $parent_id ) ) {
 				$state['postSyncIntegrityCursor'] = max( absint( $state['postSyncIntegrityCursor'] ), $parent_id );
@@ -948,15 +1094,7 @@ class Mobo_Core_Repair_Integrity {
 			$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 180 );
 			if ( false === $product_lock ) {
 				$state['postSyncIntegrityStats']['productLockBusySkipped']++;
-				/*
-				 * Do not advance the cursor. Lock contention is transient, so the same
-				 * parent must be retried rather than silently skipped.
-				 */
-				return array(
-					'success' => true,
-					'done'    => false,
-					'message' => sprintf( 'Repair نهایی منتظر آزاد شدن lock محصول %d است؛ parent در اجرای بعد دوباره بررسی می‌شود.', $parent_id ),
-				);
+				return $this->bounded_lock_contention( $state, 'post-sync-topology', (string) $parent_id, 'postSyncIntegrityCursor', $parent_id, $state['postSyncIntegrityStats'] );
 			}
 
 			try {
@@ -1139,56 +1277,68 @@ class Mobo_Core_Repair_Integrity {
 	 *
 	 * @param int $cursor Parent product ID cursor.
 	 * @param int $limit Maximum parents.
-	 * @return array
+	 * @return array|WP_Error
 	 */
 	private function find_legacy_simple_parent_ids( $cursor, $limit ) {
 		global $wpdb;
 
 		$cursor = absint( $cursor );
 		$limit  = max( 1, min( 100, absint( $limit ) ) );
-		$identity_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' )
-			? Mobo_Core_Product_Identity_Policy::variation_identity_meta_keys()
-			: array( 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid', 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' );
-		$identity_keys = array_values( array_filter( array_map( 'sanitize_key', $identity_keys ) ) );
-		if ( empty( $identity_keys ) ) {
-			return array();
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT parent.ID
+					FROM {$wpdb->posts} child
+					INNER JOIN {$wpdb->posts} parent ON parent.ID=child.post_parent
+					INNER JOIN {$variants_table} own ON own.woo_variation_id=child.ID
+					WHERE own.connection_id=%d
+					AND parent.ID>%d
+					AND parent.post_type='product'
+					AND parent.post_status NOT IN ('trash','auto-draft')
+					AND child.post_type='product_variation'
+					AND child.post_status IN ('publish','private','draft','pending')
+					ORDER BY parent.ID ASC
+					LIMIT %d",
+					$this->connection_id(),
+					$cursor,
+					$limit
+				)
+			);
+		} else {
+			$identity_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' )
+				? Mobo_Core_Product_Identity_Policy::variation_identity_meta_keys()
+				: array( 'variant_guid', 'mobo_variant_guid', '_mobo_variant_guid', 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' );
+			$identity_keys = array_values( array_filter( array_map( 'sanitize_key', $identity_keys ) ) );
+			if ( empty( $identity_keys ) ) { return array(); }
+			$placeholders = implode( ',', array_fill( 0, count( $identity_keys ), '%s' ) );
+			$sql = "SELECT DISTINCT parent.ID
+				FROM {$wpdb->posts} child
+				INNER JOIN {$wpdb->posts} parent ON parent.ID=child.post_parent
+				INNER JOIN {$wpdb->postmeta} own ON own.post_id=child.ID
+				WHERE parent.ID > %d
+				AND parent.post_type='product'
+				AND parent.post_status NOT IN ('trash','auto-draft')
+				AND child.post_type='product_variation'
+				AND child.post_status IN ('publish','private','draft','pending')
+				AND own.meta_key IN ({$placeholders})
+				AND own.meta_value <> ''
+				ORDER BY parent.ID ASC
+				LIMIT %d";
+			$args = array_merge( array( $cursor ), $identity_keys, array( $limit ) );
+			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
+			$ids = $wpdb->get_col( $prepared );
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			return new WP_Error( 'mobo_core_repair_legacy_parent_read_failed', 'Unable to read legacy simple-parent candidates; Repair phase and cursor were preserved for retry.' );
 		}
 
-		$placeholders = implode( ',', array_fill( 0, count( $identity_keys ), '%s' ) );
-		$sql = "SELECT DISTINCT parent.ID
-			FROM {$wpdb->posts} child
-			INNER JOIN {$wpdb->posts} parent ON parent.ID=child.post_parent
-			INNER JOIN {$wpdb->postmeta} own ON own.post_id=child.ID
-			INNER JOIN {$wpdb->postmeta} complete ON complete.post_id=parent.ID AND complete.meta_key='mobo_sync_incomplete' AND complete.meta_value='0'
-			WHERE parent.ID > %d
-			AND parent.post_type='product'
-			AND parent.post_status NOT IN ('trash','auto-draft')
-			AND child.post_type='product_variation'
-			AND child.post_status IN ('publish','private','draft','pending')
-			AND own.meta_key IN ({$placeholders})
-			AND own.meta_value <> ''
-			ORDER BY parent.ID ASC
-			LIMIT %d";
-		$args = array_merge( array( $cursor ), $identity_keys, array( $limit ) );
-		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
-		$ids = $wpdb->get_col( $prepared );
-
-		return array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		/* Do not filter completion in SQL; the canonical proof resolves operational
+		 * state through its terminal-aware metadata bridge. */
+		return array_values( array_filter( array_unique( array_map( 'absint', $ids ) ) ) );
 	}
 
-	/**
-	 * Prove that a legacy local product is the unique canonical Mobo object for
-	 * its product_guid and is currently a complete non-Variable product.
-	 *
-	 * This is local-topology evidence, not source-generation evidence. It does
-	 * not authorize field overwrite; it only authorizes retirement of live
-	 * Mobo-owned variation children that are impossible beneath the current
-	 * non-Variable parent.
-	 *
-	 * @param int    $parent_id Parent product ID.
-	 * @param string $reason Failure/skip reason by reference.
-	 * @return array|false Array contains guid/product on success.
-	 */
 	private function prove_legacy_simple_parent_canonical( $parent_id, &$reason ) {
 		global $wpdb;
 
@@ -1242,18 +1392,29 @@ class Mobo_Core_Repair_Integrity {
 		/* Product Map + resolver agreement is strong, but also require exactly one
 		 * active local product carrying the canonical product_guid. This prevents a
 		 * duplicate/collision family from being mutated by local topology cleanup. */
-		$matching_ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID AND pm.meta_key='product_guid' AND pm.meta_value=%s
-				WHERE p.post_type='product'
-				AND p.post_status NOT IN ('trash','auto-draft')
-				ORDER BY p.ID ASC
-				LIMIT 2",
-				$product_guid
-			)
-		);
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' ) && Mobo_Core_Storage_Identity_Meta_Retirement::must_use_custom_reads() && class_exists( 'Mobo_Core_Storage_Schema' ) && Mobo_Core_Storage_Schema::is_ready() ) {
+			$products_table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$matching_ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID FROM {$wpdb->posts} p INNER JOIN {$products_table} c ON c.woo_product_id=p.ID AND c.connection_id=%d AND c.product_guid=%s WHERE p.post_type='product' AND p.post_status NOT IN ('trash','auto-draft') ORDER BY p.ID ASC LIMIT 2",
+					$this->connection_id(),
+					$product_guid
+				)
+			);
+		} else {
+			$matching_ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID AND pm.meta_key='product_guid' AND pm.meta_value=%s
+					WHERE p.post_type='product'
+					AND p.post_status NOT IN ('trash','auto-draft')
+					ORDER BY p.ID ASC
+					LIMIT 2",
+					$product_guid
+				)
+			);
+		}
 		$matching_ids = array_values( array_filter( array_unique( array_map( 'absint', is_array( $matching_ids ) ? $matching_ids : array() ) ) ) );
 		if ( 1 !== count( $matching_ids ) || $matching_ids[0] !== $parent_id ) {
 			$reason = 'product-guid-not-unique';
@@ -1298,12 +1459,7 @@ class Mobo_Core_Repair_Integrity {
 		$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 180 );
 		if ( false === $product_lock ) {
 			$state['postSyncIntegrityStats']['productLockBusySkipped']++;
-			return array(
-				'success' => true,
-				'done'    => false,
-				'retry'   => true,
-				'message' => sprintf( 'Repair legacy topology منتظر آزاد شدن lock محصول %d است؛ parent در اجرای بعد دوباره بررسی می‌شود.', $parent_id ),
-			);
+			return $this->bounded_lock_contention( $state, 'legacy-topology', (string) $parent_id, '', 0, $state['postSyncIntegrityStats'] );
 		}
 
 		try {
@@ -1393,6 +1549,10 @@ class Mobo_Core_Repair_Integrity {
 	private function run_post_sync_legacy_simple_slice( &$state, $sync_id ) {
 		$cursor = absint( $state['postSyncIntegrityCursor'] ?? 0 );
 		$ids    = $this->find_legacy_simple_parent_ids( $cursor, 20 );
+		if ( is_wp_error( $ids ) ) {
+			$state['postSyncIntegrityStats']['errors'] = absint( $state['postSyncIntegrityStats']['errors'] ?? 0 ) + 1;
+			return $ids;
+		}
 
 		if ( empty( $ids ) ) {
 			$state['postSyncIntegrityPhase'] = 'map-backed-duplicate-variants';
@@ -1437,41 +1597,59 @@ class Mobo_Core_Repair_Integrity {
 	 *
 	 * @param int $cursor Cursor.
 	 * @param int $limit Limit.
-	 * @return array
+	 * @return array|WP_Error
 	 */
 	private function find_map_backed_duplicate_variant_groups( $cursor, $limit ) {
 		global $wpdb;
 		$cursor = absint( $cursor );
 		$limit  = max( 1, min( 100, absint( $limit ) ) );
-
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT pm.meta_value AS variant_guid,
-				        MIN(p.ID) AS cursor_id
-				FROM {$wpdb->postmeta} pm
-				INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id
-				WHERE pm.meta_key='variant_guid'
-				AND pm.meta_value <> ''
-				AND p.post_type='product_variation'
-				AND p.post_status IN ('publish','private','draft','pending')
-				GROUP BY pm.meta_value
-				HAVING COUNT(DISTINCT p.ID) > 1
-				   AND MIN(p.ID) > %d
-				ORDER BY MIN(p.ID) ASC
-				LIMIT %d",
-				$cursor,
-				$limit
-			),
-			ARRAY_A
-		);
-
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT c.variant_guid, MIN(p.ID) AS cursor_id
+					FROM {$variants_table} c
+					INNER JOIN {$wpdb->posts} p ON p.ID=c.woo_variation_id
+					WHERE c.connection_id=%d
+					AND c.variant_guid<>''
+					AND p.post_type='product_variation'
+					AND p.post_status IN ('publish','private','draft','pending')
+					GROUP BY c.variant_guid
+					HAVING COUNT(DISTINCT p.ID)>1 AND MIN(p.ID)>%d
+					ORDER BY MIN(p.ID) ASC LIMIT %d",
+					$this->connection_id(),
+					$cursor,
+					$limit
+				),
+				ARRAY_A
+			);
+		} else {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT pm.meta_value AS variant_guid, MIN(p.ID) AS cursor_id
+					FROM {$wpdb->postmeta} pm
+					INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id
+					WHERE pm.meta_key='variant_guid' AND pm.meta_value<>''
+					AND p.post_type='product_variation'
+					AND p.post_status IN ('publish','private','draft','pending')
+					GROUP BY pm.meta_value
+					HAVING COUNT(DISTINCT p.ID)>1 AND MIN(p.ID)>%d
+					ORDER BY MIN(p.ID) ASC LIMIT %d",
+					$cursor,
+					$limit
+				),
+				ARRAY_A
+			);
+		}
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			return new WP_Error( 'mobo_core_repair_map_duplicate_read_failed', 'Unable to read map-backed duplicate variation groups; Repair phase and cursor were preserved for retry.' );
+		}
 		$out = array();
-		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+		foreach ( $rows as $row ) {
 			$guid = sanitize_text_field( (string) ( $row['variant_guid'] ?? '' ) );
-			$cid  = absint( $row['cursor_id'] ?? 0 );
-			if ( '' !== $guid && $cid > 0 ) {
-				$out[] = array( 'variantGuid' => $guid, 'cursorId' => $cid );
-			}
+			$cid = absint( $row['cursor_id'] ?? 0 );
+			if ( '' !== $guid && $cid > 0 ) { $out[] = array( 'variantGuid'=>$guid, 'cursorId'=>$cid ); }
 		}
 		return $out;
 	}
@@ -1479,34 +1657,31 @@ class Mobo_Core_Repair_Integrity {
 	private function live_variation_ids_by_guid( $variant_guid ) {
 		global $wpdb;
 		$variant_guid = sanitize_text_field( (string) $variant_guid );
-		if ( '' === $variant_guid ) {
-			return array();
+		if ( '' === $variant_guid ) { return array(); }
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID FROM {$variants_table} c INNER JOIN {$wpdb->posts} p ON p.ID=c.woo_variation_id WHERE c.connection_id=%d AND p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','pending') AND c.variant_guid=%s ORDER BY p.ID ASC",
+					$this->connection_id(),
+					$variant_guid
+				)
+			);
+		} else {
+			$ids = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID WHERE p.post_type='product_variation' AND p.post_status IN ('publish','private','draft','pending') AND pm.meta_key='variant_guid' AND pm.meta_value=%s ORDER BY p.ID ASC",
+					$variant_guid
+				)
+			);
 		}
-
-		$ids = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT DISTINCT p.ID
-				FROM {$wpdb->posts} p
-				INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID
-				WHERE p.post_type='product_variation'
-				AND p.post_status IN ('publish','private','draft','pending')
-				AND pm.meta_key='variant_guid'
-				AND pm.meta_value=%s
-				ORDER BY p.ID ASC",
-				$variant_guid
-			)
-		);
-
-		return array_values( array_filter( array_unique( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) ) );
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
+			return new WP_Error( 'mobo_core_repair_live_variation_read_failed', 'Unable to read live variations for duplicate identity proof; Repair preserved the group for retry.' );
+		}
+		return array_values( array_filter( array_unique( array_map( 'absint', $ids ) ) ) );
 	}
 
-	/**
-	 * Product Map can break a duplicate identity tie only when map, parent
-	 * product identity, Portal identity and storefront signature all agree.
-	 *
-	 * @param string $variant_guid Variant GUID.
-	 * @return array
-	 */
 	private function prove_map_backed_duplicate_group( $variant_guid ) {
 		$variant_guid = sanitize_text_field( (string) $variant_guid );
 		if ( '' === $variant_guid
@@ -1517,6 +1692,9 @@ class Mobo_Core_Repair_Integrity {
 		}
 
 		$ids = $this->live_variation_ids_by_guid( $variant_guid );
+		if ( is_wp_error( $ids ) ) {
+			return array( 'safe' => false, 'readError' => $ids, 'reason' => $ids->get_error_message() );
+		}
 		if ( count( $ids ) <= 1 ) {
 			return array( 'safe' => false, 'resolved' => true, 'ids' => $ids, 'reason' => 'duplicate no longer exists' );
 		}
@@ -1680,6 +1858,10 @@ class Mobo_Core_Repair_Integrity {
 		$state['postSyncIntegrityStats']['mapBackedDuplicateGroupsScanned']++;
 
 		$proof = $this->prove_map_backed_duplicate_group( $variant_guid );
+		if ( isset( $proof['readError'] ) && is_wp_error( $proof['readError'] ) ) {
+			$state['postSyncIntegrityStats']['errors'] = absint( $state['postSyncIntegrityStats']['errors'] ?? 0 ) + 1;
+			return $proof['readError'];
+		}
 		if ( empty( $proof['safe'] ) ) {
 			if ( ! empty( $proof['resolved'] ) ) {
 				return array( 'success' => true, 'done' => false );
@@ -1701,7 +1883,7 @@ class Mobo_Core_Repair_Integrity {
 		$product_lock = Mobo_Core_Product_Concurrency::acquire_product_lock( $product_guid, 0, 180 );
 		if ( false === $product_lock ) {
 			$state['postSyncIntegrityStats']['productLockBusySkipped']++;
-			return array( 'success' => true, 'done' => false, 'retry' => true, 'message' => 'Map-backed duplicate cleanup is waiting for the normal product lock.' );
+			return $this->bounded_lock_contention( $state, 'map-backed-duplicate', sanitize_text_field( (string) $variant_guid ), '', 0, $state['postSyncIntegrityStats'] );
 		}
 
 		try {
@@ -1758,6 +1940,10 @@ class Mobo_Core_Repair_Integrity {
 	private function run_post_sync_map_backed_duplicate_slice( &$state, $sync_id ) {
 		$cursor = absint( $state['postSyncIntegrityCursor'] ?? 0 );
 		$groups = $this->find_map_backed_duplicate_variant_groups( $cursor, 20 );
+		if ( is_wp_error( $groups ) ) {
+			$state['postSyncIntegrityStats']['errors'] = absint( $state['postSyncIntegrityStats']['errors'] ?? 0 ) + 1;
+			return $groups;
+		}
 
 		if ( empty( $groups ) ) {
 			$state['postSyncIntegrityPhase'] = 'price-meta';
@@ -1814,7 +2000,7 @@ class Mobo_Core_Repair_Integrity {
 			if ( is_wp_error( $cleanup_result ) ) {
 				if ( 'mobo_core_repair_product_lock_busy' === $cleanup_result->get_error_code() ) {
 					$state['postSyncIntegrityStats']['productLockBusySkipped'] = absint( $state['postSyncIntegrityStats']['productLockBusySkipped'] ?? 0 ) + 1;
-					return array( 'success' => true, 'done' => false, 'retry' => true, 'message' => sprintf( 'Post-sync price metadata cleanup is waiting for the shared product lock for object %d.', $post_id ) );
+					return $this->bounded_lock_contention( $state, 'post-sync-price-meta', (string) $post_id, 'postSyncIntegrityCursor', $post_id, $state['postSyncIntegrityStats'] );
 				}
 				$state['postSyncIntegrityStats']['errors'] = absint( $state['postSyncIntegrityStats']['errors'] ?? 0 ) + 1;
 			}
@@ -1830,6 +2016,35 @@ class Mobo_Core_Repair_Integrity {
 				absint( $state['postSyncIntegrityStats']['priceMetaRowsRemoved'] )
 			),
 		);
+	}
+
+	/**
+	 * Bound repeated contention on the exact same Repair object. After five
+	 * consecutive misses the object is quarantined diagnostically and the phase is
+	 * allowed to advance instead of keeping the entire site in Repair forever.
+	 */
+	private function bounded_lock_contention( &$state, $scope, $object_key, $cursor_key, $cursor_value, &$stats ) {
+		$scope = sanitize_key( (string) $scope );
+		$object_key = sanitize_text_field( (string) $object_key );
+		$key = $scope . '|' . $object_key;
+		$previous = sanitize_text_field( (string) ( $state['repairLivenessLockKey'] ?? '' ) );
+		$count = $previous === $key ? absint( $state['repairLivenessLockCount'] ?? 0 ) + 1 : 1;
+		$state['repairLivenessLockKey'] = $key;
+		$state['repairLivenessLockCount'] = $count;
+		if ( $count < 5 ) {
+			return array( 'success' => true, 'done' => false, 'retry' => true, 'message' => sprintf( 'Repair منتظر lock است (%d/5): %s.', $count, $key ) );
+		}
+		$stats['productLockQuarantined'] = absint( $stats['productLockQuarantined'] ?? 0 ) + 1;
+		if ( ! isset( $stats['samples'] ) || ! is_array( $stats['samples'] ) ) {
+			$stats['samples'] = array();
+		}
+		$this->append_sample( $stats['samples'], array( 'reason' => 'persistent product lock contention quarantined for Repair liveness', 'scope' => $scope, 'object' => $object_key ) );
+		if ( '' !== $cursor_key && array_key_exists( $cursor_key, $state ) ) {
+			$state[ $cursor_key ] = max( absint( $state[ $cursor_key ] ), absint( $cursor_value ) );
+		}
+		$state['repairLivenessLockKey'] = '';
+		$state['repairLivenessLockCount'] = 0;
+		return array( 'success' => true, 'done' => false, 'quarantined' => true, 'message' => sprintf( 'Repair lock پایدار را برای %s quarantine کرد و ادامه می‌دهد.', $key ) );
 	}
 
 	private function post_sync_completion_message( $stats ) {
@@ -1954,7 +2169,7 @@ class Mobo_Core_Repair_Integrity {
 			if ( is_wp_error( $cleanup_result ) ) {
 				if ( 'mobo_core_repair_product_lock_busy' === $cleanup_result->get_error_code() ) {
 					$state['repairIntegrityStats']['productLockBusySkipped'] = absint( $state['repairIntegrityStats']['productLockBusySkipped'] ?? 0 ) + 1;
-					return array( 'success' => true, 'done' => false, 'retry' => true, 'message' => sprintf( 'Price metadata cleanup is waiting for the shared product lock for object %d.', $post_id ) );
+					return $this->bounded_lock_contention( $state, 'repair-price-meta', (string) $post_id, 'repairIntegrityCursor', $post_id, $state['repairIntegrityStats'] );
 				}
 				$state['repairIntegrityStats']['errors'] = absint( $state['repairIntegrityStats']['errors'] ?? 0 ) + 1;
 			}
@@ -1976,37 +2191,52 @@ class Mobo_Core_Repair_Integrity {
 		global $wpdb;
 		$cursor = absint( $cursor );
 		$limit  = max( 1, min( 200, absint( $limit ) ) );
-		$identity_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::identity_meta_keys() : array( 'product_guid', 'variant_guid', 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' );
-		$identity_keys = array_values( array_filter( array_map( 'sanitize_key', $identity_keys ) ) );
-		if ( empty( $identity_keys ) ) {
-			return array();
+		$wpdb->last_error = '';
+		if ( $this->identity_terminal_active() ) {
+			$products_table = Mobo_Core_Storage_Schema::table_name( 'products' );
+			$variants_table = Mobo_Core_Storage_Schema::table_name( 'variants' );
+			$sql = "SELECT pm.post_id
+				FROM {$wpdb->postmeta} pm
+				INNER JOIN {$wpdb->posts} p ON p.ID=pm.post_id
+				LEFT JOIN {$products_table} cp ON p.post_type='product' AND cp.woo_product_id=p.ID AND cp.connection_id=%d
+				LEFT JOIN {$variants_table} cv ON p.post_type='product_variation' AND cv.woo_variation_id=p.ID AND cv.connection_id=%d
+				WHERE pm.post_id>%d
+				AND p.post_type IN ('product','product_variation')
+				AND p.post_status NOT IN ('trash','auto-draft')
+				AND pm.meta_key IN ('_price','_regular_price','_sale_price')
+				AND (cp.id IS NOT NULL OR cv.id IS NOT NULL)
+				GROUP BY pm.post_id
+				HAVING COUNT(*)>COUNT(DISTINCT pm.meta_key)
+				ORDER BY pm.post_id ASC LIMIT %d";
+			$ids = $wpdb->get_col( $wpdb->prepare( $sql, $this->connection_id(), $this->connection_id(), $cursor, $limit ) );
+		} else {
+			$identity_keys = class_exists( 'Mobo_Core_Product_Identity_Policy' ) ? Mobo_Core_Product_Identity_Policy::identity_meta_keys() : array( 'product_guid', 'variant_guid', 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'portal_variant_id', 'mobo_portal_variant_id', '_mobo_portal_variant_id' );
+			$identity_keys = array_values( array_filter( array_map( 'sanitize_key', $identity_keys ) ) );
+			if ( empty( $identity_keys ) ) { return array(); }
+			$placeholders = implode( ',', array_fill( 0, count( $identity_keys ), '%s' ) );
+			$sql = "SELECT pm.post_id
+				FROM {$wpdb->postmeta} pm
+				INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				WHERE pm.post_id > %d
+				AND p.post_type IN ('product','product_variation')
+				AND p.post_status NOT IN ('trash','auto-draft')
+				AND pm.meta_key IN ('_price','_regular_price','_sale_price')
+				AND EXISTS (
+					SELECT 1 FROM {$wpdb->postmeta} own
+					WHERE own.post_id = pm.post_id
+					AND own.meta_key IN ({$placeholders})
+					AND own.meta_value <> ''
+				)
+				GROUP BY pm.post_id
+				HAVING COUNT(*) > COUNT(DISTINCT pm.meta_key)
+				ORDER BY pm.post_id ASC
+				LIMIT %d";
+			$args = array_merge( array( $cursor ), $identity_keys, array( $limit ) );
+			$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
+			$ids = $wpdb->get_col( $prepared );
 		}
-		$placeholders = implode( ',', array_fill( 0, count( $identity_keys ), '%s' ) );
-		$sql = "SELECT pm.post_id
-			FROM {$wpdb->postmeta} pm
-			INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-			WHERE pm.post_id > %d
-			AND p.post_type IN ('product','product_variation')
-			AND p.post_status NOT IN ('trash','auto-draft')
-			AND pm.meta_key IN ('_price','_regular_price','_sale_price')
-			AND EXISTS (
-				SELECT 1 FROM {$wpdb->postmeta} own
-				WHERE own.post_id = pm.post_id
-				AND own.meta_key IN ({$placeholders})
-				AND own.meta_value <> ''
-			)
-			GROUP BY pm.post_id
-			HAVING COUNT(*) > COUNT(DISTINCT pm.meta_key)
-			ORDER BY pm.post_id ASC
-			LIMIT %d";
-		$args = array_merge( array( $cursor ), $identity_keys, array( $limit ) );
-		$prepared = call_user_func_array( array( $wpdb, 'prepare' ), array_merge( array( $sql ), $args ) );
-		$ids = $wpdb->get_col( $prepared );
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
-			return new WP_Error(
-				'mobo_core_repair_price_meta_read_failed',
-				'Unable to read duplicate WooCommerce price metadata from the database; Repair phase and cursor were preserved for retry.'
-			);
+			return new WP_Error( 'mobo_core_repair_price_meta_read_failed', 'Unable to read duplicate WooCommerce price metadata from the database; Repair phase and cursor were preserved for retry.' );
 		}
 		return array_values( array_filter( array_unique( array_map( 'absint', $ids ) ) ) );
 	}
@@ -2140,8 +2370,13 @@ class Mobo_Core_Repair_Integrity {
 	private function run_shipping_cleanup_slice( &$state ) {
 		global $wpdb;
 
+		$wpdb->last_error = '';
 		$existing_instances = $wpdb->get_col( "SELECT instance_id FROM {$wpdb->prefix}woocommerce_shipping_zone_methods" );
-		$existing = array_fill_keys( array_map( 'absint', is_array( $existing_instances ) ? $existing_instances : array() ), true );
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $existing_instances ) ) {
+			return new WP_Error( 'mobo_core_repair_shipping_instances_read_failed', 'Unable to read WooCommerce shipping instances; no shipping cleanup mutation was attempted.' );
+		}
+		$existing = array_fill_keys( array_map( 'absint', $existing_instances ), true );
+		$wpdb->last_error = '';
 		$options = $wpdb->get_results(
 			"SELECT option_name FROM {$wpdb->options}
 			WHERE option_name LIKE 'mobo_core_wc_shipping_method_map_zone_%'
@@ -2149,7 +2384,10 @@ class Mobo_Core_Repair_Integrity {
 			OR option_name LIKE 'mobo_core_wc_shipping_method_map_mixed_zone_%'",
 			ARRAY_A
 		);
-		foreach ( is_array( $options ) ? $options : array() as $row ) {
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $options ) ) {
+			return new WP_Error( 'mobo_core_repair_shipping_mapping_read_failed', 'Unable to read plugin-owned shipping mapping options; no shipping cleanup mutation was attempted.' );
+		}
+		foreach ( $options as $row ) {
 			$name = isset( $row['option_name'] ) ? sanitize_key( (string) $row['option_name'] ) : '';
 			if ( '' === $name ) {
 				continue;
@@ -2306,6 +2544,24 @@ class Mobo_Core_Repair_Integrity {
 		if ( $post_id <= 0 || '' === $key ) {
 			return false;
 		}
+		/* After 10.33.95 identity cutover, raw wp_postmeta repair would resurrect
+		 * retired aliases. Route those keys through the terminal metadata API. */
+		if ( class_exists( 'Mobo_Core_Storage_Identity_Meta_Retirement' )
+			&& Mobo_Core_Storage_Identity_Meta_Retirement::is_fenced()
+			&& isset( Mobo_Core_Storage_Identity_Meta_Retirement::managed_keys()[ $key ] ) ) {
+			$expected = class_exists( 'Mobo_Core_Durable_State_Policy' ) ? Mobo_Core_Durable_State_Policy::canonical_meta_value( $value ) : $value;
+			$updated  = update_post_meta( $post_id, $key, $expected );
+			if ( false === $updated && ! metadata_exists( 'post', $post_id, $key ) ) {
+				return false;
+			}
+			$stored = get_post_meta( $post_id, $key, false );
+			if ( ! is_array( $stored ) || 1 !== count( $stored ) ) {
+				return false;
+			}
+			$actual = class_exists( 'Mobo_Core_Durable_State_Policy' ) ? Mobo_Core_Durable_State_Policy::canonical_meta_value( $stored[0] ) : $stored[0];
+			return maybe_serialize( $actual ) === maybe_serialize( $expected );
+		}
+		$wpdb->last_error = '';
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s ORDER BY meta_id ASC",
@@ -2314,7 +2570,9 @@ class Mobo_Core_Repair_Integrity {
 			),
 			ARRAY_A
 		);
-		$rows = is_array( $rows ) ? $rows : array();
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+			return false;
+		}
 		$expected = class_exists( 'Mobo_Core_Durable_State_Policy' ) ? Mobo_Core_Durable_State_Policy::canonical_meta_value( $value ) : $value;
 		if ( empty( $rows ) ) {
 			if ( false === add_post_meta( $post_id, $key, $expected, true ) ) {
