@@ -102,8 +102,10 @@ final class Mobo_Core_Sync_Health {
 	/**
 	 * Mark a product as fully converged.
 	 */
-	public static function mark_synced( $guid, $wp_id = 0, $revision = 0, $hash = '', $portal_id = 0, $version = '' ) {
-		return self::upsert_health( $guid, $wp_id, 'synced', $revision, $hash, '', $portal_id, true, $version );
+	public static function mark_synced( $guid, $wp_id = 0, $revision = 0, $hash = '', $portal_id = 0, $version = '', $record_sync_time = true ) {
+		/* $record_sync_time=false: local proof says converged (migration self-heal) but
+		 * no sync with the Source happened now, so "last successful sync" stays as is. */
+		return self::upsert_health( $guid, $wp_id, 'synced', $revision, $hash, '', $portal_id, true, $version, (bool) $record_sync_time );
 	}
 
 	/**
@@ -898,6 +900,61 @@ global $wpdb;
 	/** A partial scan older than this restarts from the beginning. */
 	const SCAN_STATE_MAX_AGE = 3600;
 
+	/** Persist the scan cursor at least this often while classifying (seconds). */
+	const SCAN_PERSIST_SECONDS = 2.0;
+
+	/** Requests that died at the same cursor (with a 1-row chunk) before that product is skipped. */
+	const SCAN_STALL_SKIP_AFTER = 3;
+
+	/**
+	 * Pure decision (unit tested) at the start of a scan slice: did the previous
+	 * slice die inside the scan (its in-flight marker is still stored), how large
+	 * may the next chunk be, and must the stuck product be skipped?
+	 *
+	 * @param array $state     Stored scan state.
+	 * @param int   $cursor    Current durable cursor.
+	 * @param int   $page_size Maximum chunk.
+	 * @return array{died:bool,stalls:int,chunk:int,skip:bool}
+	 */
+	public static function scan_chunk_decision( $state, $cursor, $page_size ) {
+		$page_size = max( 1, absint( $page_size ) );
+		$chunk     = absint( is_array( $state ) ? ( $state['chunk'] ?? 0 ) : 0 );
+		$chunk     = $chunk > 0 ? min( $page_size, $chunk ) : $page_size;
+		$stalls    = absint( is_array( $state ) ? ( $state['stalls'] ?? 0 ) : 0 );
+		$inflight  = is_array( $state ) && isset( $state['inflight'] ) && is_array( $state['inflight'] ) ? $state['inflight'] : null;
+		$died      = null !== $inflight;
+		if ( $died ) {
+			/* Any death shrinks the chunk; only a death without any cursor progress counts as a stall. */
+			$stalls = absint( $inflight['startCursor'] ?? -1 ) === absint( $cursor ) ? $stalls + 1 : 0;
+			$chunk  = max( 1, (int) floor( $chunk / 4 ) );
+		}
+		$skip = $died && 1 === $chunk && $stalls >= self::SCAN_STALL_SKIP_AFTER;
+		return array( 'died' => $died, 'stalls' => $stalls, 'chunk' => $chunk, 'skip' => $skip );
+	}
+
+	/**
+	 * Pure adaptive chunk size (unit tested): shrink to what fitted when the deadline
+	 * cut a chunk short, grow (x2) after a full chunk that took under 2 s.
+	 *
+	 * @param int   $chunk     Current chunk.
+	 * @param int   $done      Rows classified from this chunk.
+	 * @param int   $fetched   Rows fetched for this chunk.
+	 * @param float $elapsed   Seconds spent on this chunk.
+	 * @param int   $page_size Maximum chunk.
+	 * @return int
+	 */
+	public static function next_scan_chunk( $chunk, $done, $fetched, $elapsed, $page_size ) {
+		$chunk     = max( 1, absint( $chunk ) );
+		$page_size = max( 1, absint( $page_size ) );
+		if ( absint( $done ) < absint( $fetched ) ) {
+			return max( 1, min( $chunk, absint( $done ) ) );
+		}
+		if ( absint( $fetched ) >= $chunk && (float) $elapsed < 2.0 ) {
+			return min( $page_size, $chunk * 2 );
+		}
+		return $chunk;
+	}
+
 	/**
 	 * Pure decision (unit tested): may a stored partial scan be resumed?
 	 *
@@ -984,10 +1041,25 @@ global $wpdb;
 		$operational = $state['operational'];
 		$lists       = $state['lists'];
 		$cursor      = absint( $state['cursor'] );
-		$finished    = false;
-		while ( microtime( true ) < $deadline - 1.0 ) {
+		$finished    = 'finalize' === (string) ( $state['phase'] ?? '' );
+
+		/* Runtime-30s: a request that died inside this scan left its in-flight
+		 * marker behind. Shrink the chunk after every such death; after
+		 * SCAN_STALL_SKIP_AFTER deaths at the same cursor with a 1-row chunk the
+		 * offending product is skipped and reported for verification instead of
+		 * being retried forever (no livelock). */
+		$decision = self::scan_chunk_decision( $state, $cursor, $page_size );
+		$chunk    = $decision['chunk'];
+		$state['chunk']  = $chunk;
+		$state['stalls'] = $decision['stalls'];
+		$state['deaths'] = absint( $state['deaths'] ?? 0 ) + ( $decision['died'] ? 1 : 0 );
+		$state['inflight'] = array( 'startCursor' => $cursor, 'at' => $now );
+		update_option( $option, $state, false );
+		$last_persist = microtime( true );
+
+		$sql_page = static function ( $after, $size ) use ( $wpdb, $map_table, $health_select, $health_join, $connection_id ) {
 			$wpdb->last_error = '';
-			$rows = $wpdb->get_results(
+			return $wpdb->get_results(
 				$wpdb->prepare(
 					"SELECT m.id AS map_id, m.remote_guid, m.wp_post_id, m.last_hash AS map_last_hash, m.sync_incomplete AS map_sync_incomplete, m.updated_at AS map_updated_at{$health_select}
 					 FROM `{$map_table}` m
@@ -1002,11 +1074,46 @@ global $wpdb;
 					 ORDER BY m.id ASC
 					 LIMIT %d",
 					$connection_id,
-					$cursor,
-					$page_size
+					$after,
+					$size
 				),
 				ARRAY_A
 			);
+		};
+
+		if ( ! $finished && $decision['skip'] ) {
+			$rows = $sql_page( $cursor, 1 );
+			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
+				$out['status'] = 'current-product-map-query-failed';
+				return $out;
+			}
+			if ( ! empty( $rows ) ) {
+				$row = $rows[0];
+				$operational['currentProducts']++;
+				$operational['unverifiedHealthGap']++;
+				if ( count( $lists['verificationRows'] ) < $limit ) {
+					$lists['verificationRows'][] = array(
+						'productGuid'    => sanitize_text_field( (string) ( $row['remote_guid'] ?? '' ) ),
+						'wpProductId'    => absint( $row['wp_post_id'] ?? 0 ),
+						'healthStatus'   => sanitize_key( (string) ( $row['sync_status'] ?? '' ) ),
+						'classification' => 'scan-skipped-timeout',
+					);
+				}
+				$cursor = max( $cursor, absint( $row['map_id'] ?? 0 ) );
+				$state['skipped'] = absint( $state['skipped'] ?? 0 ) + 1;
+				$state['stalls']  = 0;
+				$out['skipped']   = 1;
+			}
+		}
+
+		$deadline_hit = false;
+		while ( ! $finished ) {
+			if ( microtime( true ) >= $deadline - 1.0 ) {
+				$deadline_hit = true;
+				break;
+			}
+			$requested = $chunk;
+			$rows = $sql_page( $cursor, $requested );
 			if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $rows ) ) {
 				$out['status'] = 'current-product-map-query-failed';
 				return $out;
@@ -1020,16 +1127,40 @@ global $wpdb;
 				$product_id = absint( $row['wp_post_id'] ?? 0 );
 				if ( $product_id > 0 ) { $product_ids[] = $product_id; }
 			}
+			$product_ids = array_values( array_unique( $product_ids ) );
 			if ( ! empty( $product_ids ) && function_exists( 'update_meta_cache' ) ) {
-				update_meta_cache( 'post', array_values( array_unique( $product_ids ) ) );
+				update_meta_cache( 'post', $product_ids );
 			}
-			$operational['currentProducts'] += count( $rows );
-			self::classify_operational_rows( $rows, $context, false, $limit, $operational, $lists );
+			$chunk_started = microtime( true );
+			$done_in_chunk = 0;
 			foreach ( $rows as $row ) {
+				/* Per-product deadline: one product with many variations must not
+				 * carry the request past its limit. */
+				if ( $done_in_chunk > 0 && microtime( true ) >= $deadline - 1.0 ) {
+					$deadline_hit = true;
+					break;
+				}
+				$operational['currentProducts']++;
+				self::classify_operational_rows( array( $row ), $context, false, $limit, $operational, $lists );
 				$cursor = max( $cursor, absint( $row['map_id'] ?? 0 ) );
+				$out['processed']++;
+				$done_in_chunk++;
+				if ( microtime( true ) - $last_persist >= self::SCAN_PERSIST_SECONDS ) {
+					/* Incremental durable cursor: a hard kill loses at most a few seconds. */
+					$state['cursor'] = $cursor; $state['operational'] = $operational; $state['lists'] = $lists;
+					$state['inflight'] = array( 'startCursor' => $cursor, 'at' => time() );
+					update_option( $option, $state, false );
+					$last_persist = microtime( true );
+				}
 			}
-			$out['processed'] += count( $rows );
-			if ( count( $rows ) < $page_size ) {
+			if ( function_exists( 'wp_cache_delete' ) ) {
+				foreach ( $product_ids as $evict_id ) { wp_cache_delete( $evict_id, 'post_meta' ); }
+			}
+			$chunk = self::next_scan_chunk( $chunk, $done_in_chunk, count( $rows ), microtime( true ) - $chunk_started, $page_size );
+			if ( $deadline_hit ) {
+				break;
+			}
+			if ( count( $rows ) < $requested ) {
 				$finished = true;
 				break;
 			}
@@ -1040,12 +1171,22 @@ global $wpdb;
 		}
 
 		$out['cursor'] = $cursor;
-		if ( ! $finished ) {
+		$state['chunk'] = $chunk;
+		/* The closing history query needs a little time of its own; resume it next request. */
+		if ( $finished && microtime( true ) >= $deadline - 2.0 ) {
+			$state['phase'] = 'finalize';
+			$finished_now   = false;
+		} else {
+			$finished_now = $finished;
+		}
+		if ( ! $finished_now ) {
 			$state['cursor']      = $cursor;
 			$state['operational'] = $operational;
 			$state['lists']       = $lists;
+			unset( $state['inflight'] );
 			update_option( $option, $state, false );
 			$out['status'] = 'in-progress';
+			$out['chunk']  = $chunk;
 			return $out;
 		}
 
@@ -1430,7 +1571,7 @@ global $wpdb;
 	}
 
 	/** Persist one canonical health row. */
-	private static function upsert_health( $guid, $wp_id, $status, $revision, $hash, $error, $portal_id, $successful, $version = '' ) {
+	private static function upsert_health( $guid, $wp_id, $status, $revision, $hash, $error, $portal_id, $successful, $version = '', $stamp_sync_time = true ) {
 		global $wpdb;
 		$guid = sanitize_text_field( (string) $guid );
 		if ( '' === $guid ) {
@@ -1530,7 +1671,7 @@ global $wpdb;
 			'last_error'        => '' !== (string) $error ? sanitize_textarea_field( (string) $error ) : null,
 			'updated_at'        => $now,
 		);
-		if ( $successful ) {
+		if ( $successful && $stamp_sync_time ) {
 			$data['last_successful_sync_time'] = $now;
 		}
 		if ( $row_id ) {
@@ -1573,7 +1714,7 @@ global $wpdb;
 			update_post_meta( $stored_wp_id, '_mobo_portal_version', sanitize_text_field( (string) $data['portal_version'] ) );
 			update_post_meta( $stored_wp_id, '_mobo_sync_status', $status );
 			update_post_meta( $stored_wp_id, '_mobo_sync_last_error', sanitize_textarea_field( (string) $error ) );
-			if ( $successful ) {
+			if ( $successful && $stamp_sync_time ) {
 				update_post_meta( $stored_wp_id, '_mobo_last_successful_sync_time', gmdate( 'c' ) );
 			}
 		}

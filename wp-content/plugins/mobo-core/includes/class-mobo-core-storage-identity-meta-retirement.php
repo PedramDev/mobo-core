@@ -26,6 +26,15 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 	/** @var bool|null */
 	private static $fenced = null;
 
+	/** Negative fence reads are reused this long per request (see is_fenced()). */
+	const NEGATIVE_FENCE_TTL = 5;
+
+	/** @var float microtime of the last negative (unfenced) state read; 0 = none. */
+	private static $negative_fence_at = 0.0;
+
+	/** @var float microtime of the last "fenced but not complete" read (is_physically_retired()); 0 = none. */
+	private static $incomplete_at = 0.0;
+
 	/** @var bool Request-local cache: terminal zero-residue was already proven. */
 	private static $zero_residue_verified = false;
 
@@ -112,11 +121,22 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 			self::$fenced = true;
 			return false !== apply_filters( 'mobo_core_identity_meta_terminal_fence_active', true );
 		}
+		/* Runtime-30s: before the fence every meta read asked this and re-read the
+		 * runtime row (the most frequent query in the 30 s timeouts). Reuse a negative
+		 * answer for NEGATIVE_FENCE_TTL seconds; persist_state()/reset_request_cache()
+		 * invalidate it and read errors are never cached. */
+		$negative_now = microtime( true );
+		if ( self::negative_fence_fresh( self::$negative_fence_at, $negative_now ) ) {
+			return false;
+		}
 		$state = self::load_state();
 		$active = ! empty( $state['fenceActive'] ) && self::FENCE_VERSION === absint( isset( $state['fenceVersion'] ) ? $state['fenceVersion'] : 0 );
 		if ( $active ) {
 			self::$fenced = true;
 			update_option( self::FENCE_OPTION, self::FENCE_VERSION, false );
+		}
+		if ( ! $active && empty( $state['__stateLoadError'] ) ) {
+			self::$negative_fence_at = $negative_now;
 		}
 		return $active && false !== apply_filters( 'mobo_core_identity_meta_terminal_fence_active', true );
 	}
@@ -159,7 +179,20 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 	}
 
 	/** @return void */
-	public static function reset_request_cache() { self::$fenced = null; self::$zero_residue_verified = false; self::$legacy_read_bypass_depth = array(); self::reset_proof_batch_cache(); }
+	/**
+	 * Pure (unit tested): may a negative fence read from $cached_at be reused at $now?
+	 *
+	 * @param float $cached_at microtime of the negative read (0 = none).
+	 * @param float $now       microtime.
+	 * @return bool
+	 */
+	public static function negative_fence_fresh( $cached_at, $now ) {
+		$cached_at = (float) $cached_at;
+		$age       = (float) $now - $cached_at;
+		return $cached_at > 0 && $age >= 0 && $age < self::NEGATIVE_FENCE_TTL;
+	}
+
+	public static function reset_request_cache() { self::$negative_fence_at = 0.0; self::$incomplete_at = 0.0; self::$fenced = null; self::$zero_residue_verified = false; self::$legacy_read_bypass_depth = array(); self::reset_proof_batch_cache(); }
 
 
 	/** @return int */
@@ -821,7 +854,7 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 
 	/** Durable terminal prerequisite with request-local zero-residue caching. @return bool */
 	public static function is_physically_retired() {
-		if(!self::is_fenced()){return false;}$state=self::load_state();if(empty($state['complete'])){return false;}if(self::$zero_residue_verified){return true;}$has=self::has_physical_residue();if(null===$has||$has){return false;}self::$zero_residue_verified=true;return true;
+		if(!self::is_fenced()){return false;}$incomplete_now=microtime(true);if(self::negative_fence_fresh(self::$incomplete_at,$incomplete_now)){return false;}$state=self::load_state();if(empty($state['complete'])){if(empty($state['__stateLoadError'])){self::$incomplete_at=$incomplete_now;}return false;}if(self::$zero_residue_verified){return true;}$has=self::has_physical_residue();if(null===$has||$has){return false;}self::$zero_residue_verified=true;return true;
 	}
 
 	/** @return int|null */
@@ -892,6 +925,8 @@ final class Mobo_Core_Storage_Identity_Meta_Retirement {
 	}
 	/** CAS-persist worker state so stale lock owners cannot overwrite newer progress. @return bool */
 	private static function persist_state( $state, $finished = false ) {
+		self::$negative_fence_at = 0.0;
+		self::$incomplete_at = 0.0;
 		if ( class_exists( 'Mobo_Core_Migration' ) && ! Mobo_Core_Migration::accelerated_slice_lock_is_valid() ) { return false; }
 		if ( ! empty( $state['__stateLoadError'] ) ) { return false; }
 		global $wpdb;if(!class_exists('Mobo_Core_Storage_Schema')||!Mobo_Core_Storage_Schema::is_ready()){return false;}
