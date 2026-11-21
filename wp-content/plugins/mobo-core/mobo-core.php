@@ -779,6 +779,15 @@ add_action(
 				MOBO_CORE_PLUGIN_FILE,
 				true
 			);
+			/* M9: Checkout Block / Store API pre-payment validation runs on the place
+			 * order POST only (woocommerce_store_api_checkout_update_order_from_request,
+			 * with an order_processed fallback), validates the submitted address and
+			 * stops checkout with a Store API RouteException (HTTP 400, Persian message). */
+			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+				'cart_checkout_blocks',
+				MOBO_CORE_PLUGIN_FILE,
+				true
+			);
 		}
 	}
 );

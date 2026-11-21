@@ -97,6 +97,8 @@ class Mobo_Core_Checkout_Validator {
 	private $active_order_route_connection_id = 0;
 	/** PERF04: a bounded recovery read must never be interpreted as an empty queue on SQL/corruption failure. */
 	private $order_recovery_read_failed = false;
+	/** @var array<int,bool> M9: Store API orders already validated in this request (order id => true). */
+	private $store_api_validated_order_ids = array();
 
 	/**
 	 * Register validation hooks.
@@ -319,7 +321,16 @@ class Mobo_Core_Checkout_Validator {
 	public function init() {
 		add_action( 'woocommerce_check_cart_items', array( $this, 'validate_cart_notices' ), 20 );
 		add_action( 'woocommerce_after_checkout_validation', array( $this, 'validate_checkout_errors' ), 20, 2 );
-		add_action( 'woocommerce_store_api_checkout_update_order_meta', array( $this, 'validate_store_api_checkout_order' ), 20, 1 );
+		/* M9: Checkout Block / Store API. update_order_meta also fires on GET (checkout
+		 * page load with a draft order) and on PUT/PATCH draft updates, so it only freezes
+		 * line-item identity. The blocking pre-payment validation runs once on the place
+		 * order POST, against the address submitted in that request, and throws a Store
+		 * API RouteException (HTTP 400 + Persian message) instead of a plain Exception
+		 * (HTTP 500). order_processed is a fallback for builds that skipped the request
+		 * hook. */
+		add_action( 'woocommerce_store_api_checkout_update_order_meta', array( $this, 'snapshot_store_api_draft_order' ), 20, 1 );
+		add_action( 'woocommerce_store_api_checkout_update_order_from_request', array( $this, 'validate_store_api_checkout_request' ), 30, 2 );
+		add_action( 'woocommerce_store_api_checkout_order_processed', array( $this, 'validate_store_api_checkout_order' ), 3, 1 );
 		add_action( 'woocommerce_order_status_changed', array( $this, 'handle_order_status_changed' ), 20, 4 );
 		add_action( 'woocommerce_checkout_create_order_line_item', array( $this, 'capture_checkout_line_item_identity' ), 5, 4 );
 		add_action( 'woocommerce_checkout_order_processed', array( $this, 'capture_processed_order_identity' ), 5, 3 );
@@ -668,26 +679,78 @@ class Mobo_Core_Checkout_Validator {
 
 
 	/**
-	 * Checkout Block / Store API equivalent of classic checkout validation.
-	 * WooCommerce explicitly supports throwing here to stop payment safely.
+	 * Store API draft-order hook (GET checkout load, PUT/PATCH draft updates and the
+	 * POST itself). Never validates or throws: it only freezes line-item ownership
+	 * before any payment can run, even when validation toggles are off.
 	 *
 	 * @param WC_Order $order Draft checkout order.
 	 * @return void
-	 * @throws Exception When Mobo pre-purchase validation fails.
+	 */
+	public function snapshot_store_api_draft_order( $order ) {
+		$this->snapshot_order_line_item_identities( $order );
+	}
+
+	/**
+	 * Place-order POST: validate the order using the address submitted in THIS
+	 * request (not a stale session/customer address).
+	 *
+	 * @param WC_Order        $order Draft checkout order.
+	 * @param WP_REST_Request $request Store API request.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
+	 */
+	public function validate_store_api_checkout_request( $order, $request = null ) {
+		if ( ! $order instanceof WC_Order ) {
+			return;
+		}
+		$method = is_object( $request ) && method_exists( $request, 'get_method' ) ? strtoupper( (string) $request->get_method() ) : '';
+		if ( 'POST' !== $method ) {
+			return; /* Draft updates (PUT/PATCH) never block; only placing the order does. */
+		}
+		$this->snapshot_order_line_item_identities( $order );
+		$this->store_api_validated_order_ids[ absint( $order->get_id() ) ] = true;
+		$this->run_store_api_pre_payment_validation( $order, $this->store_api_submitted_destination( $request ) );
+	}
+
+	/**
+	 * Checkout Block / Store API fallback (woocommerce_store_api_checkout_order_processed,
+	 * POST only, after WooCommerce applied the submitted addresses). Skipped when the
+	 * request hook already validated this order.
+	 *
+	 * @param WC_Order $order Order.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
 	 */
 	public function validate_store_api_checkout_order( $order ) {
-		/* Checkout Blocks already has a persisted order at this hook. Freeze line-item
-		 * ownership before any payment can run, even when validation toggles are off. */
+		if ( ! $order instanceof WC_Order ) {
+			return;
+		}
 		$this->snapshot_order_line_item_identities( $order );
+		$order_id = absint( $order->get_id() );
+		if ( isset( $this->store_api_validated_order_ids[ $order_id ] ) ) {
+			return;
+		}
+		$this->store_api_validated_order_ids[ $order_id ] = true;
+		$this->run_store_api_pre_payment_validation( $order, null );
+	}
 
+	/**
+	 * Shared Store API pre-payment validation.
+	 *
+	 * @param WC_Order   $order Order.
+	 * @param array|null $destination Submitted country/state/city, or null to use the order.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
+	 */
+	private function run_store_api_pre_payment_validation( $order, $destination ) {
 		$scope_error = $this->validate_auto_order_order_scope_pre_payment( $order );
 		if ( is_wp_error( $scope_error ) ) {
-			throw new Exception( sanitize_text_field( (string) $scope_error->get_error_message() ) );
+			$this->throw_store_api_checkout_error( 'mobo_core_checkout_order_scope', $scope_error->get_error_message() );
 		}
 
-		$destination_error = $this->validate_auto_order_destination_pre_payment( array(), $order );
+		$destination_error = $this->validate_auto_order_destination_pre_payment( array(), $order, $destination );
 		if ( is_wp_error( $destination_error ) ) {
-			throw new Exception( sanitize_text_field( (string) $destination_error->get_error_message() ) );
+			$this->throw_store_api_checkout_error( 'mobo_core_checkout_destination', $destination_error->get_error_message() );
 		}
 
 		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
@@ -701,8 +764,65 @@ class Mobo_Core_Checkout_Validator {
 
 		$messages = isset( $result['errors'] ) && is_array( $result['errors'] ) ? $result['errors'] : array();
 		$messages = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $messages ) ) ) );
-		$message  = ! empty( $messages ) ? implode( ' | ', $messages ) : 'اعتبارسنجی خرید موبو ناموفق بود. لطفاً سبد خرید را بررسی و دوباره تلاش کنید.';
-		throw new Exception( $message );
+		$this->throw_store_api_checkout_error( 'mobo_core_checkout_validation', implode( ' | ', $messages ) );
+	}
+
+	/**
+	 * Destination (country/state/city) the order will be submitted with, read from
+	 * the Store API request body. Mirrors get_order_address_group_for_mobo(): the
+	 * shipping address when complete, otherwise billing.
+	 *
+	 * @param WP_REST_Request|null $request Request.
+	 * @return array|null Null when the request carries no usable address.
+	 */
+	private function store_api_submitted_destination( $request ) {
+		if ( ! is_object( $request ) ) {
+			return null;
+		}
+		$params = method_exists( $request, 'get_json_params' ) ? $request->get_json_params() : null;
+		if ( ! is_array( $params ) || ( ! isset( $params['shipping_address'] ) && ! isset( $params['billing_address'] ) ) ) {
+			$params = method_exists( $request, 'get_params' ) ? $request->get_params() : array();
+		}
+		$params = is_array( $params ) ? $params : array();
+		$read   = static function ( $group ) use ( $params ) {
+			$raw = isset( $params[ $group ] ) && is_array( $params[ $group ] ) ? $params[ $group ] : array();
+			$out = array();
+			foreach ( array( 'country', 'state', 'city', 'address_1' ) as $key ) {
+				$out[ $key ] = isset( $raw[ $key ] ) && is_scalar( $raw[ $key ] ) ? sanitize_text_field( (string) $raw[ $key ] ) : '';
+			}
+			return $out;
+		};
+		$shipping = $read( 'shipping_address' );
+		$billing  = $read( 'billing_address' );
+		if ( '' !== $shipping['country'] && '' !== $shipping['state'] && '' !== $shipping['city'] && '' !== $shipping['address_1'] ) {
+			$group = $shipping;
+		} elseif ( '' !== $billing['country'] || '' !== $billing['state'] || '' !== $billing['city'] ) {
+			$group = $billing;
+		} else {
+			return null;
+		}
+		return array( 'country' => $group['country'], 'state' => $group['state'], 'city' => $group['city'] );
+	}
+
+	/**
+	 * Stop a Store API checkout with HTTP 400 and a shopper-facing Persian message.
+	 * A plain Exception would become HTTP 500 "woocommerce_rest_unknown_server_error".
+	 *
+	 * @param string $code Error code.
+	 * @param string $message Message.
+	 * @return void
+	 * @throws Exception Always.
+	 */
+	private function throw_store_api_checkout_error( $code, $message ) {
+		$message = sanitize_text_field( (string) $message );
+		if ( '' === $message ) {
+			$message = 'اعتبارسنجی خرید موبو ناموفق بود. لطفاً سبد خرید را بررسی و دوباره تلاش کنید.';
+		}
+		$route_exception = 'Automattic\\WooCommerce\\StoreApi\\Exceptions\\RouteException';
+		if ( class_exists( $route_exception ) ) {
+			throw new $route_exception( sanitize_key( (string) $code ), $message, 400 );
+		}
+		throw new Exception( $message, 400 );
 	}
 
 	/**
@@ -1103,7 +1223,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @param WC_Order|null $order Store API draft order, null for classic checkout.
 	 * @return true|WP_Error
 	 */
-	private function validate_auto_order_destination_pre_payment( $data, $order ) {
+	private function validate_auto_order_destination_pre_payment( $data, $order, $submitted_destination = null ) {
 		if ( ! class_exists( 'Mobo_Core_Checkout_Preflight' ) ) {
 			return true;
 		}
@@ -1113,7 +1233,11 @@ class Mobo_Core_Checkout_Validator {
 			if ( 'all_mobo' !== ( $scope['status'] ?? '' ) || $connection_id <= 0 || ! $this->auto_order_enabled_for_connection_ids( array( $connection_id ) ) ) {
 				return true;
 			}
-			$run = function () use ( $data, $order ) {
+			$run = function () use ( $data, $order, $submitted_destination ) {
+				if ( $order instanceof WC_Order && is_array( $submitted_destination ) && method_exists( 'Mobo_Core_Checkout_Preflight', 'validate_order_destination_values' ) ) {
+					/* M9: the address submitted with the place-order request. */
+					return Mobo_Core_Checkout_Preflight::validate_order_destination_values( $order, $submitted_destination );
+				}
 				return $order instanceof WC_Order
 					? Mobo_Core_Checkout_Preflight::validate_order( $order, $this->get_order_address_group_for_mobo( $order ) )
 					: Mobo_Core_Checkout_Preflight::validate_checkout_data( $data );
