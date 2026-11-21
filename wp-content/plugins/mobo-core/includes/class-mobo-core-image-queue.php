@@ -870,6 +870,101 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * M5: storage recovered. Must only be called while the storage probe passes.
+	 *
+	 * 1. Pending rows that were deferred only because uploads storage/quota was
+	 *    not ready get their long backoff cleared so they retry now instead of
+	 *    up to six hours later.
+	 * 2. Terminal readiness rows ("Permanent: image readiness failed
+	 *    repeatedly") are revived per Mobo_Core_Image_Reimport_Ledger::
+	 *    revival_action(): rows made terminal by a storage failure get a fresh
+	 *    ledger entry; rows terminal for REVIVE_AFTER_SECONDS are re-checked
+	 *    with the fresh-reimport counter kept (no extra attachment possible).
+	 *
+	 * Nothing is deleted. Returns the number of rows changed.
+	 *
+	 * @param int $limit Max rows per call.
+	 * @return int
+	 */
+	public function revive_storage_blocked( $limit = 100 ) {
+		global $wpdb;
+		$connection_id = self::connection_id();
+		$limit         = max( 1, min( 500, absint( $limit ) ) );
+		if ( $connection_id <= 0 || ! self::table_exists() || ! class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+			return 0;
+		}
+
+		$table   = self::table_name();
+		$now     = current_time( 'mysql', true );
+		$changed = 0;
+		$like    = $wpdb->esc_like( Mobo_Core_Image_Reimport_Ledger::STORAGE_NOT_READY_PREFIX ) . '%';
+		$expedited = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET next_retry_at = NULL, updated_at = %s
+				WHERE connection_id = %d AND status = 'pending'
+					AND next_retry_at IS NOT NULL AND next_retry_at > %s
+					AND last_error LIKE %s
+				LIMIT %d",
+				$now,
+				$connection_id,
+				$now,
+				$like,
+				$limit
+			)
+		);
+		$changed += false === $expedited ? 0 : absint( $expedited );
+
+		$marker = '%' . $wpdb->esc_like( Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER ) . '%';
+		$rows   = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, image_guid, source_url, last_error, updated_at
+				FROM {$table}
+				WHERE connection_id = %d AND status = 'failed' AND last_error LIKE %s
+				ORDER BY updated_at ASC, id ASC
+				LIMIT %d",
+				$connection_id,
+				$marker,
+				$limit
+			),
+			ARRAY_A
+		);
+		$now_ts = time();
+		foreach ( is_array( $rows ) ? $rows : array() as $row ) {
+			$updated_ts = strtotime( (string) $row['updated_at'] . ' UTC' );
+			$action     = Mobo_Core_Image_Reimport_Ledger::revival_action( (string) $row['last_error'], false === $updated_ts ? 0 : $updated_ts, $now_ts, true );
+			if ( 'keep' === $action ) {
+				continue;
+			}
+			$revived = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$table}
+					SET status = 'pending', try_count = 0, next_retry_at = NULL, locked_until = NULL, last_error = NULL, attachment_id = 0, updated_at = %s
+					WHERE connection_id = %d AND id = %d AND status = 'failed'",
+					$now,
+					$connection_id,
+					absint( $row['id'] )
+				)
+			);
+			if ( false === $revived || absint( $revived ) < 1 ) {
+				continue; /* Write failed or a concurrent writer moved the row: ledger untouched. */
+			}
+			$key = Mobo_Core_Image_Reimport_Ledger::key( $connection_id, (string) $row['image_guid'], (string) $row['source_url'] );
+			if ( 'forget' === $action ) {
+				Mobo_Core_Image_Reimport_Ledger::forget( $key );
+			} else {
+				Mobo_Core_Image_Reimport_Ledger::reset_failures( $key );
+			}
+			$changed++;
+		}
+
+		if ( $changed > 0 ) {
+			self::invalidate_summary_cache();
+		}
+		return $changed;
+	}
+
+	/**
 	 * Bulk-claim due image rows for the dedicated image worker.
 	 *
 	 * @param int $limit Limit.
