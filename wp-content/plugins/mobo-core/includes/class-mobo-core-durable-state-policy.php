@@ -32,7 +32,27 @@ final class Mobo_Core_Durable_State_Policy {
 		wp_cache_delete( $option, 'options' );
 		$stored = get_option( $option, null );
 
-		return maybe_serialize( $stored ) === maybe_serialize( $value );
+		return self::option_read_back_matches( $stored, $value );
+	}
+
+	/**
+	 * wp_options returns scalars as their stored string form (int 8 reads back as "8",
+	 * true as "1"), so scalars compare by string form; arrays/objects stay exact.
+	 *
+	 * @param mixed $stored Read-back value.
+	 * @param mixed $expected Written value.
+	 * @return bool
+	 */
+	public static function option_read_back_matches( $stored, $expected ) {
+		if ( null === $stored || null === $expected ) {
+			return $stored === $expected;
+		}
+		if ( is_scalar( $stored ) && is_scalar( $expected ) ) {
+			$stored   = is_bool( $stored ) ? ( $stored ? '1' : '' ) : (string) $stored;
+			$expected = is_bool( $expected ) ? ( $expected ? '1' : '' ) : (string) $expected;
+			return $stored === $expected;
+		}
+		return maybe_serialize( $stored ) === maybe_serialize( $expected );
 	}
 
 	/**
