@@ -358,7 +358,7 @@ class Mobo_Core_Legacy_Image_Audit {
 			$state['lastSliceSeconds']  = round( $elapsed, 3 );
 			$state['maxSliceSeconds']   = round( max( (float) $state['maxSliceSeconds'], $elapsed ), 3 );
 			$state['lastSliceSteps']    = $steps;
-			$state['peakMemory']        = max( absint( $state['peakMemory'] ), (int) memory_get_peak_usage( true ) );
+			$state['peakMemory']        = max( absint( $state['peakMemory'] ), (int) ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::memory_peak( true ) : ( function_exists( 'memory_get_peak_usage' ) ? memory_get_peak_usage( true ) : 0 ) ) );
 			$state['lastRunAt']         = time();
 			update_option( self::STATE_OPTION, $state, false );
 			return $state;
