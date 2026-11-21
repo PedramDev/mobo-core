@@ -545,7 +545,14 @@ class Mobo_Core_Rest_Controller {
 		$params = $request->get_json_params();
 		$params = is_array( $params ) ? $params : array();
 		$token = Mobo_Core_Settings::normalize_opaque_secret( $params['token'] ?? '', 191 );
-		$result = Mobo_Core_Connection_Repository::provision_by_token( $token, $params );
+		/* Optional X-SEC proof: required only to move an already-provisioned
+		 * Connection to another Backend host. Today's Backend client does not send
+		 * it and is unaffected while its configured Backend host is unchanged. */
+		$result = Mobo_Core_Connection_Repository::provision_by_token(
+			$token,
+			$params,
+			array( 'security_code' => (string) $request->get_header( 'X-SEC' ) )
+		);
 		if ( is_wp_error( $result ) ) { return $result; }
 		$money_status = class_exists( 'Mobo_Core_Money_Policy' )
 			? Mobo_Core_Money_Policy::compatibility_status_for_row( $result )
@@ -886,7 +893,24 @@ class Mobo_Core_Rest_Controller {
 	public function get_health( $request ) {
 		$reporter = new Mobo_Core_Health_Reporter();
 
-		return rest_ensure_response( $reporter->get_local_status() );
+		$response = rest_ensure_response( $reporter->get_local_status( $this->health_may_include_license_token() ) );
+		if ( $response instanceof WP_REST_Response ) {
+			$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+		}
+		return $response;
+	}
+
+	/**
+	 * The full License Token is returned only on a response whose request passed
+	 * the X-SEC installation check in this request (check_security() sets the
+	 * authenticated Connection context). Portal's health/heartbeat ingestion uses
+	 * it for license/domain diagnostics. Every other path gets a last-4 mask.
+	 *
+	 * @return bool
+	 */
+	private function health_may_include_license_token() {
+		return class_exists( 'Mobo_Core_Connection_Context' )
+			&& absint( Mobo_Core_Connection_Context::get_current_connection_id() ) > 0;
 	}
 
 
@@ -904,6 +928,8 @@ class Mobo_Core_Rest_Controller {
 	public function run_heartbeat( $request ) {
 		$started_at = microtime( true );
 		$attempt_at = time();
+		/* Capture X-SEC authentication before workers may switch Connection context. */
+		$include_license_token = $this->health_may_include_license_token();
 
 		Mobo_Core_Settings::update( 'mobo_core_portal_heartbeat_last_attempt_at', $attempt_at, false );
 
@@ -979,7 +1005,7 @@ class Mobo_Core_Rest_Controller {
 		}
 
 		$reporter = new Mobo_Core_Health_Reporter();
-		$health   = $reporter->get_local_status();
+		$health   = $reporter->get_local_status( $include_license_token );
 		$duration = max( 0, (int) round( ( microtime( true ) - $started_at ) * 1000 ) );
 		$status   = ! empty( $work['success'] ) ? 'online' : 'online-worker-warning';
 
@@ -1106,7 +1132,7 @@ class Mobo_Core_Rest_Controller {
 				'success' => true,
 				'status'  => 'portal-pull-only',
 				'message' => 'Portal گزارش سلامت را مستقیماً از endpoint افزونه دریافت می‌کند.',
-				'data'    => $reporter->build_report(),
+				'data'    => $reporter->build_report( false, $this->health_may_include_license_token() ),
 			)
 		);
 	}

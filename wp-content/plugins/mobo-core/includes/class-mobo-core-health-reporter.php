@@ -20,9 +20,13 @@ class Mobo_Core_Health_Reporter {
 	 *
 	 * @param bool $non_blocking Avoid optional network probes and full-catalog
 	 *                           structure scans for wp-admin/Portal health pulls.
+	 * @param bool $include_license_token Return the full License Token. Only
+	 *                           X-SEC-authenticated Backend responses pass true
+	 *                           (Portal uses it for license/domain diagnostics);
+	 *                           every other consumer gets a last-4 mask.
 	 * @return array
 	 */
-	public function build_report( $non_blocking = false ) {
+	public function build_report( $non_blocking = false, $include_license_token = false ) {
 		$started_at  = microtime( true );
 		$sync_status = $this->get_sync_status();
 		$queue_stats = $this->get_webhook_queue_stats();
@@ -46,6 +50,11 @@ class Mobo_Core_Health_Reporter {
 		$last_cron_hit     = isset( $cron_status['lastHitAt'] ) ? absint( $cron_status['lastHitAt'] ) : 0;
 		$last_sync_success = $this->get_last_sync_success_timestamp( $sync_status );
 		$last_error        = $this->resolve_last_error( $sync_status, $cron_status );
+
+		$license_token = class_exists( 'Mobo_Core_Connection_Repository' )
+			? (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', get_option( 'mobo_core_token', '' ) )
+			: (string) get_option( 'mobo_core_token', '' );
+		$license_token = trim( $license_token );
 
 		$plugin_db_version      = sanitize_text_field( (string) get_option( 'mobo_core_db_version', '' ) );
 		$schema_version         = sanitize_text_field( (string) get_option( 'mobo_core_schema_version', '' ) );
@@ -91,7 +100,8 @@ class Mobo_Core_Health_Reporter {
 
 		return array(
 			'siteUrl'               => home_url( '/' ),
-			'licenseToken'          => class_exists( 'Mobo_Core_Connection_Repository' ) ? (string) Mobo_Core_Connection_Repository::get_runtime_value( 'license_token', get_option( 'mobo_core_token', '' ) ) : (string) get_option( 'mobo_core_token', '' ),
+			'licenseToken'          => $include_license_token ? $license_token : self::mask_secret( $license_token ),
+			'licenseTokenLast4'     => self::mask_secret( $license_token ),
 			'pluginVersion'         => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'pluginBuildFingerprint'=> class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'webhookCredential'      => $webhook_auth,
@@ -231,18 +241,31 @@ class Mobo_Core_Health_Reporter {
 	}
 
 	/**
+	 * Mask a secret to its last four characters ("****abcd"); '' stays ''.
+	 *
+	 * @param string $value Secret.
+	 * @return string
+	 */
+	public static function mask_secret( $value ) {
+		$value = trim( (string) $value );
+		if ( '' === $value ) { return ''; }
+		return strlen( $value ) <= 4 ? '****' : '****' . substr( $value, -4 );
+	}
+
+	/**
 	 * Return current local health status for REST /health.
 	 *
+	 * @param bool $include_license_token See build_report().
 	 * @return array
 	 */
-	public function get_local_status() {
+	public function get_local_status( $include_license_token = false ) {
 		return array(
 			'success'       => true,
 			'status'        => 'ok',
 			'pluginVersion' => defined( 'MOBO_CORE_VERSION' ) ? MOBO_CORE_VERSION : '',
 			'pluginBuildFingerprint' => class_exists( 'Mobo_Core_Remote_Updater' ) ? Mobo_Core_Remote_Updater::get_build_fingerprint() : '',
 			'siteTime'      => gmdate( 'c' ),
-			'data'          => $this->build_report( true ),
+			'data'          => $this->build_report( true, (bool) $include_license_token ),
 			'lastReport'    => $this->get_last_report_status(),
 		);
 	}

@@ -18,6 +18,23 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 final class Mobo_Core_Connection_Repository {
 	const DEFAULT_NAME = 'Default Connection';
 
+	/**
+	 * Backend URL that 10.33.x defined as the MOBO_API_BASE_URL default.
+	 *
+	 * Effective Backend URL precedence (see resolve_api_base_url()):
+	 * 1. MOBO_API_BASE_URL constant (wp-config / environment override, never persisted).
+	 * 2. The Connection row's api_base_url (server-provisioned, or adopted below).
+	 * 3./4. Only while adopting the legacy single connection as the Default
+	 *    Connection during a pre-10.34.12 upgrade: the legacy
+	 *    mobo_core_api_base_url option, else this legacy default. These are
+	 *    written once into the Default row so upgraded sites keep their Backend
+	 *    without waiting for provisioning. New/extra Connections never inherit them.
+	 */
+	const LEGACY_DEFAULT_API_BASE_URL = 'http://mobo.codeya.ir/';
+
+	/** First release whose migration adopts the legacy single connection. */
+	const LEGACY_ADOPTION_BEFORE_VERSION = '10.34.12';
+
 	/** @var array<int,array>|null */
 	private static $row_cache = array();
 	/** @var bool|null Request-local positive table-existence cache. */
@@ -85,6 +102,7 @@ final class Mobo_Core_Connection_Repository {
 			$id = absint( $row['id'] );
 			if ( ! self::ensure_default_source_key( $id, $row ) ) { return 0; }
 			self::sync_default_from_legacy_options( $id, false );
+			self::adopt_legacy_api_base_url( $id, $row );
 			return $id;
 		}
 
@@ -97,7 +115,9 @@ final class Mobo_Core_Connection_Repository {
 				'provider_key'   => '',
 				'display_name'   => self::DEFAULT_NAME,
 				'webhook_id'     => null,
-				'api_base_url'   => '',
+				/* Upgraded 10.33.x sites keep their legacy Backend immediately;
+				 * fresh installs stay empty until server provisioning. */
+				'api_base_url'   => self::legacy_adoption_api_base_url(),
 				'source_site_url'=> '',
 				'license_token'  => trim( (string) get_option( 'mobo_core_token', '' ) ),
 				'security_code'  => self::legacy_security_code(),
@@ -435,9 +455,22 @@ final class Mobo_Core_Connection_Repository {
 	 * selected by Token. Ordinary provisioning can refresh URLs/name/status but
 	 * cannot silently rebind an existing Connection to another Source or Provider.
 	 *
+	 * api_base_url policy (plain http stays allowed by owner decision):
+	 * - private/loopback/link-local/reserved IP literals, local-only hostnames
+	 *   and hostnames resolving to such addresses are rejected unless local
+	 *   development is enabled (WP_DEBUG, MOBO_CORE_ALLOW_LOCAL_BACKEND or a
+	 *   local/development environment type);
+	 * - an already-provisioned Connection may change scheme/port/path freely but
+	 *   may move to a different host only when the request additionally proves
+	 *   the Connection's X-SEC (options['security_code']). The Token HMAC alone
+	 *   is not enough because the Token is a customer-visible value.
+	 *
+	 * @param string $license_token License Token.
+	 * @param array  $payload       Provisioning payload.
+	 * @param array  $options       Optional: security_code (X-SEC header value).
 	 * @return array|WP_Error Updated row.
 	 */
-	public static function provision_by_token( $license_token, $payload ) {
+	public static function provision_by_token( $license_token, $payload, $options = array() ) {
 		global $wpdb;
 		/* Provisioning is a durable routing mutation; do not admit new work
 		 * while an upgrade/Unicode operation is draining the installation. */
@@ -478,6 +511,23 @@ final class Mobo_Core_Connection_Repository {
 
 		if ( '' === $source_key || '' === $provider_key || '' === $api_base_url || '' === $source_site_url ) {
 			return new WP_Error( 'mobo_core_provision_payload_invalid', 'Provisioning payload is incomplete.', array( 'status' => 400 ) );
+		}
+		$url_check = self::validate_backend_base_url( $api_base_url );
+		if ( is_wp_error( $url_check ) ) {
+			return new WP_Error( $url_check->get_error_code(), $url_check->get_error_message(), array( 'status' => 422 ) );
+		}
+		$api_base_url = $url_check;
+		if ( self::is_provisioned( $row )
+			&& ! self::same_url_host( (string) ( $row['api_base_url'] ?? '' ), $api_base_url ) ) {
+			$options = is_array( $options ) ? $options : array();
+			$proof = isset( $options['security_code'] ) ? (string) $options['security_code'] : '';
+			if ( ! self::security_matches( self::security_code_for_row( $row ), $proof ) ) {
+				return new WP_Error(
+					'mobo_core_provision_api_host_change_forbidden',
+					'A provisioned Connection cannot move to another Backend host without its X-SEC.',
+					array( 'status' => 409 )
+				);
+			}
 		}
 		if ( ! class_exists( 'Mobo_Core_Provider_Registry' ) || ! Mobo_Core_Provider_Registry::exists( $provider_key ) ) {
 			return new WP_Error( 'mobo_core_provision_provider_unknown', 'Provider is not supported by this plugin build.', array( 'status' => 422 ) );
@@ -1013,8 +1063,200 @@ final class Mobo_Core_Connection_Repository {
 		return Mobo_Core_Settings::normalize_security_code( get_option( 'mobo_core_security_code', '' ) );
 	}
 
-	private static function legacy_api_base_url() {
-		$url = trim( (string) get_option( 'mobo_core_api_base_url', '' ) );
-		return '' !== $url ? esc_url_raw( $url ) : '';
+	/**
+	 * Whether the running migration is adopting a pre-10.34.12 single-connection
+	 * install. The previous release stays in mobo_core_db_version until the whole
+	 * migration pipeline finalizes, so this is true exactly while upgrading from
+	 * 10.33.x and false for fresh installs (empty version) and finished upgrades.
+	 *
+	 * @return bool
+	 */
+	public static function is_legacy_adoption_context() {
+		$previous = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+		return '' !== $previous && version_compare( $previous, self::LEGACY_ADOPTION_BEFORE_VERSION, '<' );
+	}
+
+	/**
+	 * Backend URL to persist on the legacy Default Connection while adopting a
+	 * 10.33.x install: legacy option when it is a valid Backend URL, else the old
+	 * built-in default. MOBO_API_BASE_URL is deliberately not persisted; it keeps
+	 * winning at runtime through resolve_api_base_url().
+	 *
+	 * @param bool|null $legacy_context Override for tests; null detects.
+	 * @return string Normalized URL, or '' outside the legacy adoption context.
+	 */
+	public static function legacy_adoption_api_base_url( $legacy_context = null ) {
+		$legacy_context = null === $legacy_context ? self::is_legacy_adoption_context() : (bool) $legacy_context;
+		if ( ! $legacy_context ) { return ''; }
+		$option = trim( (string) get_option( 'mobo_core_api_base_url', '' ) );
+		if ( '' !== $option ) {
+			/* No DNS during migration; literal/local-name checks still apply. */
+			$valid = self::validate_backend_base_url( $option, null, false );
+			if ( ! is_wp_error( $valid ) ) { return $valid; }
+		}
+		return self::LEGACY_DEFAULT_API_BASE_URL;
+	}
+
+	/**
+	 * Backfill a Default row that a previous (interrupted) 10.34.x migration
+	 * created with an empty URL. Only unprovisioned, URL-less rows are touched,
+	 * and only while still upgrading from 10.33.x; a CAS keeps provisioning
+	 * that wins a race intact.
+	 *
+	 * @param int   $connection_id Default Connection id.
+	 * @param array $row           Row as read by the caller.
+	 * @return void
+	 */
+	private static function adopt_legacy_api_base_url( $connection_id, $row ) {
+		global $wpdb;
+		$id = absint( $connection_id );
+		if ( $id <= 0 || ! is_array( $row ) || empty( $row['is_default'] ) ) { return; }
+		if ( '' !== trim( (string) ( $row['api_base_url'] ?? '' ) ) || '' !== trim( (string) ( $row['source_key'] ?? '' ) ) ) { return; }
+		$url = self::legacy_adoption_api_base_url();
+		if ( '' === $url ) { return; }
+		$updated = $wpdb->query( $wpdb->prepare(
+			'UPDATE ' . self::table_name() . " SET api_base_url = %s, updated_at = %s WHERE id = %d AND is_default = 1 AND api_base_url = '' AND source_key = ''",
+			$url,
+			current_time( 'mysql', true ),
+			$id
+		) );
+		if ( false !== $updated ) { self::invalidate_request_cache( $id ); }
+	}
+
+	/**
+	 * Local Backend targets are allowed only on explicit development installs.
+	 *
+	 * @return bool
+	 */
+	public static function local_backend_urls_allowed() {
+		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) { return true; }
+		if ( defined( 'MOBO_CORE_ALLOW_LOCAL_BACKEND' ) && MOBO_CORE_ALLOW_LOCAL_BACKEND ) { return true; }
+		return function_exists( 'wp_get_environment_type' ) && in_array( wp_get_environment_type(), array( 'local', 'development' ), true );
+	}
+
+	/**
+	 * Validate a Backend base URL (http or https; plain http is intentionally allowed).
+	 *
+	 * @param string        $url         Candidate URL.
+	 * @param bool|null     $allow_local Null = local_backend_urls_allowed().
+	 * @param bool|callable $resolve     True = gethostbynamel(); false = skip DNS;
+	 *                                   callable(host): string[]|false for tests.
+	 * @return string|WP_Error Normalized URL with trailing slash.
+	 */
+	public static function validate_backend_base_url( $url, $allow_local = null, $resolve = true ) {
+		$url = trim( (string) $url );
+		$invalid = new WP_Error( 'mobo_core_backend_url_invalid', 'Backend URL must be an absolute http(s) URL without credentials, query or fragment.' );
+		if ( '' === $url || strlen( $url ) > 2048 || preg_match( '/[\s\x00-\x1f\x7f]/', $url ) ) { return $invalid; }
+		$parts = wp_parse_url( $url );
+		if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] )
+			|| isset( $parts['user'] ) || isset( $parts['pass'] ) || isset( $parts['query'] ) || isset( $parts['fragment'] ) ) {
+			return $invalid;
+		}
+		$scheme = strtolower( (string) $parts['scheme'] );
+		if ( 'http' !== $scheme && 'https' !== $scheme ) { return $invalid; }
+		if ( isset( $parts['port'] ) && ( absint( $parts['port'] ) < 1 || absint( $parts['port'] ) > 65535 ) ) { return $invalid; }
+
+		$host = self::normalize_url_host( (string) $parts['host'] );
+		if ( '' === $host ) { return $invalid; }
+		$allow_local = null === $allow_local ? self::local_backend_urls_allowed() : (bool) $allow_local;
+		if ( ! $allow_local ) {
+			$local = new WP_Error( 'mobo_core_backend_url_local', 'Backend URL must not target a private, loopback, link-local or reserved address.' );
+			if ( false !== filter_var( $host, FILTER_VALIDATE_IP ) ) {
+				if ( self::is_non_public_ip( $host ) ) { return $local; }
+			} else {
+				if ( ! preg_match( '/^[a-z0-9](?:[a-z0-9-]{0,62})(?:\.[a-z0-9](?:[a-z0-9-]{0,62}))*$/', $host ) ) { return $invalid; }
+				if ( 'localhost' === $host || false === strpos( $host, '.' )
+					|| preg_match( '/\.(localhost|local|localdomain|internal|lan|home|arpa)$/', $host ) ) {
+					return $local;
+				}
+				if ( false !== $resolve ) {
+					$ips = is_callable( $resolve ) ? call_user_func( $resolve, $host ) : self::resolve_host_addresses( $host );
+					if ( ! is_array( $ips ) || empty( $ips ) ) {
+						return new WP_Error( 'mobo_core_backend_url_unresolvable', 'Backend URL host could not be resolved.' );
+					}
+					foreach ( $ips as $ip ) {
+						if ( false === filter_var( (string) $ip, FILTER_VALIDATE_IP ) || self::is_non_public_ip( (string) $ip ) ) { return $local; }
+					}
+				}
+			}
+		}
+
+		$normalized = trailingslashit( esc_url_raw( $url, array( 'http', 'https' ) ) );
+		return '/' !== $normalized ? $normalized : $invalid;
+	}
+
+	/**
+	 * Whether two URLs name the same host (scheme, port and path may differ).
+	 *
+	 * @return bool
+	 */
+	public static function same_url_host( $a, $b ) {
+		$ha = self::normalize_url_host( (string) wp_parse_url( (string) $a, PHP_URL_HOST ) );
+		$hb = self::normalize_url_host( (string) wp_parse_url( (string) $b, PHP_URL_HOST ) );
+		return '' !== $ha && $ha === $hb;
+	}
+
+	/**
+	 * Resolve A records, plus AAAA when available. Runtime only; tests inject a resolver.
+	 *
+	 * @param string $host Hostname.
+	 * @return string[]
+	 */
+	private static function resolve_host_addresses( $host ) {
+		$ips = @gethostbynamel( $host ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- failure handled by caller.
+		$ips = is_array( $ips ) ? $ips : array();
+		if ( function_exists( 'dns_get_record' ) && defined( 'DNS_AAAA' ) ) {
+			$records = @dns_get_record( $host, DNS_AAAA ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			if ( is_array( $records ) ) {
+				foreach ( $records as $record ) {
+					if ( is_array( $record ) && ! empty( $record['ipv6'] ) ) { $ips[] = (string) $record['ipv6']; }
+				}
+			}
+		}
+		return $ips;
+	}
+
+	private static function normalize_url_host( $host ) {
+		$host = strtolower( rtrim( trim( (string) $host ), '.' ) );
+		if ( '' !== $host && '[' === $host[0] && ']' === substr( $host, -1 ) ) { $host = substr( $host, 1, -1 ); }
+		return $host;
+	}
+
+	/**
+	 * Version-independent private/reserved check (PHP's filter flags changed
+	 * between 7.4 and 8.x). IPv4-mapped/compatible IPv6 is checked as IPv4.
+	 *
+	 * @param string $ip IP literal.
+	 * @return bool True when the address is not a public unicast address.
+	 */
+	public static function is_non_public_ip( $ip ) {
+		$packed = @inet_pton( (string) $ip ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		if ( false === $packed ) { return true; }
+		if ( 16 === strlen( $packed ) ) {
+			$prefix = substr( $packed, 0, 12 );
+			$nat64 = "\x00\x64\xff\x9b" . str_repeat( "\0", 8 );
+			if ( str_repeat( "\0", 10 ) . "\xff\xff" === $prefix || $nat64 === $prefix
+				|| ( str_repeat( "\0", 12 ) === $prefix && "\0\0\0\0" !== substr( $packed, 12 ) && "\0\0\0\1" !== substr( $packed, 12 ) ) ) {
+				$packed = substr( $packed, 12 );
+			}
+		}
+		$ranges = 4 === strlen( $packed )
+			? array( '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4' )
+			: array( '::/127', '64:ff9b:1::/48', '100::/64', '2001:db8::/32', 'fc00::/7', 'fe80::/10', 'fec0::/10', 'ff00::/8' );
+		foreach ( $ranges as $cidr ) {
+			list( $net, $bits ) = explode( '/', $cidr );
+			$net = inet_pton( $net );
+			if ( false === $net || strlen( $net ) !== strlen( $packed ) ) { continue; }
+			$bits = (int) $bits;
+			$bytes = intdiv( $bits, 8 );
+			if ( $bytes > 0 && substr( $packed, 0, $bytes ) !== substr( $net, 0, $bytes ) ) { continue; }
+			$rem = $bits % 8;
+			if ( $rem > 0 ) {
+				$mask = ( 0xff << ( 8 - $rem ) ) & 0xff;
+				if ( ( ord( $packed[ $bytes ] ) & $mask ) !== ( ord( $net[ $bytes ] ) & $mask ) ) { continue; }
+			}
+			return true;
+		}
+		return false;
 	}
 }

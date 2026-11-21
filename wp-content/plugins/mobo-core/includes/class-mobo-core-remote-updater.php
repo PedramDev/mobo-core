@@ -43,6 +43,7 @@ class Mobo_Core_Remote_Updater {
 		$recovery_mode = '';
 		$recovery_hold = class_exists( 'Mobo_Core_Upgrade_Coordinator' )
 			&& false !== get_option( Mobo_Core_Upgrade_Coordinator::RECOVERY_HOLD_OPTION, false );
+		$migration_gate = self::get_migration_gate_status();
 
 		$transient_stages = array( 'downloading', 'validating', 'draining', 'backing-up', 'installing', 'verifying' );
 		if ( in_array( $stored_status, $transient_stages, true ) && empty( $upgrade_lock['active'] ) && empty( $barrier_status['active'] ) ) {
@@ -67,6 +68,10 @@ class Mobo_Core_Remote_Updater {
 			'interrupted'    => $interrupted,
 			'recoveryMode'   => $recovery_mode,
 			'currentVersion' => $current_version,
+			/* Backend push gate: upgrade only when migration.upgradeAllowed. */
+			'dbVersion'      => $migration_gate['dbVersion'],
+			'migrationInProgress' => ! empty( $migration_gate['inProgress'] ),
+			'migration'      => $migration_gate,
 			'buildFingerprint' => ! empty( $build_integrity['ready'] ) ? (string) $build_integrity['fingerprint'] : '',
 			'buildIntegrity' => $build_integrity,
 			'deploymentId'   => isset( $status['deploymentId'] ) ? sanitize_text_field( (string) $status['deploymentId'] ) : '',
@@ -175,6 +180,28 @@ class Mobo_Core_Remote_Updater {
 					'queuesResumable'  => true,
 				);
 			}
+		}
+
+		/* Never replace plugin files while the database migration for the
+		 * installed build is unfinished or its mutex is held. 423 + retryAfter is
+		 * what the Backend classifies as busy/retryable (409 is treated as a
+		 * permanent block by the current Portal worker). allowPendingMigration
+		 * lets the Backend push a fix-forward build for a stalled (not running)
+		 * migration; it never bypasses a held migration lock. */
+		$migration_gate = self::get_migration_gate_status();
+		$allow_pending  = ! empty( $params['allowPendingMigration'] ) && true === filter_var( $params['allowPendingMigration'], FILTER_VALIDATE_BOOLEAN );
+		if ( ! empty( $migration_gate['lockHeld'] ) || ( empty( $migration_gate['dbVersionMatches'] ) && ! $allow_pending ) ) {
+			return new WP_Error(
+				'mobo_core_upgrade_migration_in_progress',
+				'Database migration for the installed version is not finished; retry the upgrade later.',
+				array(
+					'status'         => 423,
+					'retryAfter'     => absint( $migration_gate['retryAfter'] ) > 0 ? absint( $migration_gate['retryAfter'] ) : 120,
+					'reason'         => 'migration_in_progress',
+					'currentVersion' => $current_version,
+					'migration'      => $migration_gate,
+				)
+			);
 		}
 
 		$lock = Mobo_Core_Lock::acquire( 'remote_plugin_upgrade', 900 );
@@ -1325,12 +1352,22 @@ class Mobo_Core_Remote_Updater {
 			return false;
 		}
 		$scheme = strtolower( (string) $parts['scheme'] );
-		$debug_http_allowed = defined( 'WP_DEBUG' ) && WP_DEBUG && 'http' === $scheme;
-		if ( 'https' !== $scheme && ! $debug_http_allowed ) {
+		if ( 'https' !== $scheme && 'http' !== $scheme ) {
 			return false;
 		}
+		$debug_http_allowed = defined( 'WP_DEBUG' ) && WP_DEBUG && 'http' === $scheme;
 		if ( false === strpos( (string) $parts['path'], '/api/plugin-packages/' ) ) {
 			return false;
+		}
+
+		/* The Backend intentionally stays on plain http (owner decision), so the
+		 * update after this one must be deliverable over http. Plain-http packages
+		 * are trusted ONLY from the exact origin (scheme, host, effective port) of
+		 * the authenticated Connection's Backend. The administrator host allowlist
+		 * never widens http; package bytes stay bound by the X-SEC-signed sha256. */
+		if ( 'http' === $scheme && ! $debug_http_allowed ) {
+			$api_base = self::trusted_backend_base_url();
+			return '' !== trim( $api_base ) && self::same_url_origin( $api_base, $url );
 		}
 
 		$configured_hosts = get_option( 'mobo_core_remote_update_allowed_hosts', '' );
@@ -1339,15 +1376,7 @@ class Mobo_Core_Remote_Updater {
 		$allowed = array_values( array_unique( array_filter( array_map( 'strtolower', is_array( $allowed ) ? $allowed : array() ) ) ) );
 
 		if ( empty( $allowed ) ) {
-			$api_base = class_exists( 'Mobo_Core_Connection_Repository' )
-				? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( '' )
-				: '';
-			if ( '' === trim( (string) $api_base ) ) {
-				$api_base = apply_filters( 'mobo_core_api_base_url', '' );
-			}
-			if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
-				$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
-			}
+			$api_base = self::trusted_backend_base_url();
 
 			/* License/package credentials are sent to this URL. With no explicit
 			 * administrator allowlist, require the exact Portal origin, including
@@ -1356,6 +1385,80 @@ class Mobo_Core_Remote_Updater {
 		}
 
 		return in_array( strtolower( (string) $parts['host'] ), $allowed, true );
+	}
+
+	/**
+	 * Effective Backend base URL of the authenticated Connection (constant
+	 * override > Connection api_base_url; legacy fallbacks only pre-table).
+	 *
+	 * @return string
+	 */
+	private static function trusted_backend_base_url() {
+		$api_base = class_exists( 'Mobo_Core_Connection_Repository' )
+			? (string) Mobo_Core_Connection_Repository::get_runtime_base_url( '' )
+			: '';
+		if ( '' === trim( (string) $api_base ) ) {
+			$api_base = apply_filters( 'mobo_core_api_base_url', '' );
+		}
+		if ( ! is_string( $api_base ) || '' === trim( $api_base ) ) {
+			$api_base = (string) Mobo_Core_Settings::get( 'mobo_core_api_base_url', '' );
+		}
+		return is_string( $api_base ) ? $api_base : '';
+	}
+
+	/**
+	 * Read-only migration gate for /upgrade/apply and /upgrade/status.
+	 *
+	 * Never acquires or refreshes the migration mutex. Mirrors the two lock
+	 * forms used by Mobo_Core_Migration: the connection-scoped GET_LOCK name and
+	 * the fallback option lease (MIGRATION_LOCK_OPTION, JSON {owner, expiresAt}).
+	 *
+	 * @return array{dbVersion:string,codeVersion:string,dbVersionMatches:bool,lockHeld:bool,lockKind:string,inProgress:bool,state:string,upgradeAllowed:bool,retryAfter:int}
+	 */
+	public static function get_migration_gate_status() {
+		global $wpdb;
+		$db_version   = trim( (string) get_option( 'mobo_core_db_version', '' ) );
+		$code_version = defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '';
+		$matches      = '' !== $code_version && $db_version === $code_version;
+
+		$lock_kind = '';
+		if ( isset( $wpdb ) && is_object( $wpdb ) ) {
+			$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
+			$lock_name = 'mobo_mig_' . substr( sha1( $db_name . '|' . (string) $wpdb->prefix ), 0, 40 );
+			$wpdb->last_error = '';
+			$holder = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', $lock_name ) );
+			if ( '' === trim( (string) $wpdb->last_error ) && null !== $holder && '' !== (string) $holder && '0' !== (string) $holder ) {
+				$lock_kind = 'mysql';
+			}
+			if ( '' === $lock_kind ) {
+				$option_name = ( class_exists( 'Mobo_Core_Migration' ) && defined( 'Mobo_Core_Migration::MIGRATION_LOCK_OPTION' ) )
+					? (string) Mobo_Core_Migration::MIGRATION_LOCK_OPTION
+					: 'mobo_core_migration_request_lock_v1';
+				$wpdb->last_error = '';
+				$raw = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $option_name ) );
+				if ( '' === trim( (string) $wpdb->last_error ) && is_string( $raw ) && '' !== $raw ) {
+					$decoded = json_decode( $raw, true );
+					/* An undecodable lease is treated as held: fail closed, retry later. */
+					if ( ! is_array( $decoded ) || absint( $decoded['expiresAt'] ?? 0 ) >= time() ) {
+						$lock_kind = 'option';
+					}
+				}
+			}
+		}
+		$lock_held = '' !== $lock_kind;
+		$state = $lock_held ? 'running' : ( $matches ? 'complete' : 'pending' );
+
+		return array(
+			'dbVersion'        => sanitize_text_field( $db_version ),
+			'codeVersion'      => $code_version,
+			'dbVersionMatches' => $matches,
+			'lockHeld'         => $lock_held,
+			'lockKind'         => $lock_kind,
+			'inProgress'       => 'complete' !== $state,
+			'state'            => $state,
+			'upgradeAllowed'   => 'complete' === $state,
+			'retryAfter'       => 'complete' === $state ? 0 : 120,
+		);
 	}
 
 	private static function read_disk_plugin_version() {
