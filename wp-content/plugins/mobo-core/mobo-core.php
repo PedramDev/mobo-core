@@ -539,6 +539,25 @@ add_action( 'update_option_woocommerce_currency', array( 'Mobo_Core_Store_Curren
 add_action( 'admin_notices', array( 'Mobo_Core_Store_Currency_Guard', 'render_notice' ) );
 add_action( 'admin_post_mobo_core_dismiss_currency_change', array( 'Mobo_Core_Store_Currency_Guard', 'handle_dismiss' ) );
 
+/* M8: quarantined non-canonical duplicate copies must not sell with a frozen price.
+ * The hot hooks stay tiny; the guard class loads only on a real quarantine change
+ * or a product trash/draft transition. */
+function mobo_core_quarantine_sale_guard_option_changed( $option ) {
+	if ( 0 === strpos( (string) $option, 'mobo_core_migration_quarantine_v1' ) ) {
+		Mobo_Core_Quarantine_Sale_Guard::schedule_reconcile();
+	}
+}
+add_action( 'added_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+add_action( 'updated_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+add_action( 'deleted_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+function mobo_core_quarantine_sale_guard_transition( $new_status, $old_status, $post ) {
+	if ( $new_status === $old_status || ( 'trash' !== $new_status && 'draft' !== $new_status ) || ! is_object( $post ) || 'product' !== ( $post->post_type ?? '' ) ) {
+		return;
+	}
+	Mobo_Core_Quarantine_Sale_Guard::handle_transition( $new_status, $old_status, $post );
+}
+add_action( 'transition_post_status', 'mobo_core_quarantine_sale_guard_transition', 10, 3 );
+
 /* S1: clone/staging copy guard notice (Source purchases and wallet payments blocked). Lazy-loaded. */
 add_action( 'admin_notices', array( 'Mobo_Core_Clone_Guard', 'render_admin_notice' ) );
 
