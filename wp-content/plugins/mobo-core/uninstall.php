@@ -199,17 +199,19 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_legacy_image_audit_state' );
 	delete_option( 'mobo_core_legacy_image_audit_stop' );
 	delete_option( 'mobo_core_legacy_image_audit_content_refs' );
+	delete_option( 'mobo_core_legacy_image_audit_hits' );
 	delete_option( 'mobo_core_legacy_image_cleanup_deleted_total' );
 	delete_option( 'mobo_core_image_reimport_ledger' );
 
 	/*
-	 * Remove temporary seen-variant options.
+	 * Remove temporary seen-variant options and legacy image scan candidate chunks.
 	 */
 	$prefix          = $wpdb->esc_like( 'mobo_seen_variants_' ) . '%';
 	$option_names = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
-			$prefix
+			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+			$prefix,
+			$wpdb->esc_like( 'mobo_core_legacy_image_audit_cand_' ) . '%'
 		)
 	);
 

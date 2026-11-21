@@ -2,16 +2,35 @@
 /**
  * READ-ONLY scanner for legacy Mobo JPG/PNG attachments.
  *
- * Walks image attachments in primary-key order inside a per-request time
- * budget, classifies every JPG/PNG attachment with Mobo_Core_Legacy_Image_Policy
- * and stores counts, estimated disk usage and a bounded sample list in one
- * option. It never changes posts, metadata, files or plugin queues: the only
- * write is its own state option (cursor + counters) and the Stop flag.
+ * Three resumable phases, each run in bounded steps inside the admin request's
+ * time budget (clamped to Mobo_Core_Request_Deadline):
  *
- * Crash safety: one batch is computed in memory and committed together with
- * the cursor in a single update_option(). If PHP or the database dies mid-batch
- * the batch is simply recomputed on the next run; counters are never added
- * twice and the cursor never moves past unclassified attachments.
+ * 1. attachments: primary-key batches of JPG/PNG attachments. Ownership
+ *    (strong proof only, see Mobo_Core_Legacy_Image_Policy), shared files,
+ *    image/refresh queues, featured/gallery/variation use, WPML translations,
+ *    termmeta/site options are checked with grouped queries. Attachments that
+ *    would be candidates are NOT counted yet: they go into the candidate index
+ *    (option chunks of CHUNK_SIZE entries holding their family file paths).
+ * 2. refs: one keyset-paged pass (byte budget per page, no per-attachment LIKE
+ *    queries) over post content/excerpt (all types and statuses incl.
+ *    revisions, Elementor templates), ALL postmeta, termmeta, term
+ *    descriptions (incl. Polylang groups), usermeta, options (Elementor kit,
+ *    theme mods, widgets, ACF options), slider/plugin tables that exist
+ *    (Revolution Slider, Smart Slider, LayerSlider, Basalam media) and the
+ *    Elementor CSS files. Every candidate whose ID or any family basename (or a
+ *    size/-scaled/thumb variant of it) is found gets a hit bit per source.
+ * 3. finalize: candidate chunks are classified (hit => protected_referenced,
+ *    incomplete index => uncertain, else unused/replace) and counted.
+ *
+ * It never changes posts, metadata, files or plugin queues: the only writes are
+ * its own options (state, candidate chunks, hit map, Stop flag).
+ *
+ * Crash safety: every step is computed in memory and committed with its cursor
+ * in one update_option(). Candidate chunks are keyed by attachment ID and the
+ * hit map is a bitwise union, so re-running a step after a crash/timeout never
+ * loses or double counts anything. A row larger than ROW_MAX_BYTES (or an
+ * unreadable CSS file) is skipped and marks the whole index incomplete, which
+ * turns every remaining candidate into "unsure" instead of "unused".
  *
  * PHP 7.4 compatible.
  */
@@ -21,16 +40,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /*
- * Bounded read-only SELECTs over core and Mobo tables. Identifier lists are
- * absint()-sanitized integers; every string value is prepared.
+ * Bounded read-only SELECTs over core, Mobo and known plugin tables. Identifier
+ * lists are absint()-sanitized integers, table/column names come from
+ * $wpdb/SHOW TABLES and are validated; every string value is prepared.
  */
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
 class Mobo_Core_Legacy_Image_Audit {
 
+	const STATE_VERSION  = 2;
 	const STATE_OPTION   = 'mobo_core_legacy_image_audit_state';
+	/* v1 leftover (content reference set); deleted when a new cycle starts. */
 	const CONTENT_OPTION = 'mobo_core_legacy_image_audit_content_refs';
-	const CONTENT_SPAN   = 2000;
-	const CONTENT_MAX    = 60000;
+	const HITS_OPTION    = 'mobo_core_legacy_image_audit_hits';
+	const CAND_PREFIX    = 'mobo_core_legacy_image_audit_cand_';
 	const STOP_OPTION    = 'mobo_core_legacy_image_audit_stop';
 	const DELETED_OPTION = 'mobo_core_legacy_image_cleanup_deleted_total';
 	const LOCK_NAME      = 'legacy_image_audit';
@@ -38,14 +60,67 @@ class Mobo_Core_Legacy_Image_Audit {
 	const BATCH_DEFAULT  = 40;
 	const BATCH_MAX      = 100;
 
+	/** Candidates per index chunk option. */
+	const CHUNK_SIZE = 500;
+	/** Candidate index capacity; beyond it attachments are "unsure". */
+	const PENDING_MAX = 15000;
+	/** Reference pass: rows planned per page and value bytes fetched per page. */
+	const PAGE_ROWS  = 2000;
+	const PAGE_BYTES = 2097152;
+	/** A single value larger than this is skipped and marks the index incomplete. */
+	const ROW_MAX_BYTES = 4194304;
+	/** Elementor CSS files. */
+	const CSS_DIR            = 'elementor/css';
+	const CSS_MAX_FILE_BYTES = 2097152;
+	const CSS_FILES_PER_PAGE = 200;
+	const CSS_MAX_FILES      = 50000;
+	/** ACF field definitions read per cycle. */
+	const ACF_MAX_FIELDS = 5000;
+	/** Stored incomplete-index details (reason keys). */
+	const INCOMPLETE_MAX = 20;
+	/** Seconds of the request deadline left to the caller after a slice. */
+	const DEADLINE_RESERVE = 1.5;
+
 	/** Product identity keys used by legacy (pre custom storage) Mobo products. */
 	const PRODUCT_IDENTITY_KEYS = array( 'product_guid', 'portal_product_id', 'mobo_portal_product_id', '_mobo_portal_product_id', 'PortalProductId', 'mobo_url' );
 
 	/** Popular variation-gallery plugin keys; any hit is treated as a foreign reference. */
 	const EXTRA_GALLERY_KEYS = array( 'woo_variation_gallery_images', '_wc_additional_variation_images', 'rtwpvg_images', '_product_image_gallery_variation' );
 
-	/** @var array<int,bool> Request cache: product id => is Mobo product. */
+	/**
+	 * Postmeta keys the reference pass ignores: Woo featured/gallery are checked
+	 * precisely (with Mobo/merchant ownership) in the attachment pass; the rest
+	 * are Mobo provenance/identity markers that link old and new attachments
+	 * but are not a use of the image.
+	 */
+	const SKIP_META_KEYS = array( '_thumbnail_id', '_product_image_gallery', 'image_guid', 'img_guid', 'mobo_source_url', 'mobo_refreshed_from_attachment_id', 'mobo_replaces_attachment_id', 'mobo_image_format', 'mobo_sync_incomplete', 'mobo_image_content_token', 'mobo_shared_media', '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_old_date' );
+	const SKIP_META_PREFIXES = array( 'mobo_image_refresh_', '_mobo_quarantined_' );
+	/** Attachment file keys: compared by full relative path (same physical file), never by basename. */
+	const ATTACHMENT_FILE_KEYS = array( '_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_backup_sizes' );
+	/** Options never scanned: caches (regenerated from scanned data), WP internals, our own image job state. */
+	const SKIP_OPTION_PREFIXES = array( '_transient_', '_site_transient_', 'mobo_core_legacy_image_', 'mobo_core_image_', 'mobo_core_orphan_image_' );
+	const SKIP_OPTIONS         = array( 'rewrite_rules', 'cron', 'rs-library', 'rs-templates', 'rs-templates-new' );
+	/** Remote catalogue caches (Elementor / Slider Revolution template libraries): item "id"s are not attachments. */
+	const SKIP_OPTION_REMOTE_PREFIXES = array( 'elementor_remote_info_', 'rtl_elementor_remote_info_' );
+	/** Plugin tables scanned when present: table-name prefix (after $wpdb->prefix) => report source. */
+	const PLUGIN_TABLE_PATTERNS = array(
+		'revslider_'                  => 'slider',
+		'nextend2_smartslider3_'      => 'slider',
+		'layerslider'                 => 'slider',
+		'sync_basalam_uploaded_media' => 'plugin',
+	);
+
+	/** @var array<int,bool|null> Request cache: product id => is Mobo product. */
 	private $mobo_product_cache = array();
+
+	/** @var array|null Request cache of the candidate index. */
+	private $index = null;
+
+	/** @var string Key of the cached index. */
+	private $index_key = '';
+
+	/** @var bool|null Request cache: WPML translations table present. */
+	private $wpml_table = null;
 
 	/**
 	 * Default/empty state.
@@ -57,31 +132,52 @@ class Mobo_Core_Legacy_Image_Audit {
 		foreach ( Mobo_Core_Legacy_Image_Policy::classes() as $class ) {
 			$classes[ $class ] = array( 'count' => 0, 'bytes' => 0, 'metaBytes' => 0, 'files' => 0, 'missingFiles' => 0 );
 		}
+		$sources = array();
+		foreach ( array_keys( Mobo_Core_Legacy_Image_Policy::reference_sources() ) as $source ) {
+			$sources[ $source ] = 0;
+		}
 		return array(
-			'version'        => 1,
-			'status'         => 'idle',
-			'phase'          => 'content',
-			'contentCursor'  => 0,
-			'contentMaxId'   => 0,
-			'contentRefs'    => 0,
-			'contentOverflow'=> false,
-			'cycleId'        => '',
-			'cursor'         => 0,
-			'scanned'        => 0,
-			'estimatedTotal' => 0,
-			'batches'        => 0,
-			'startedAt'      => 0,
-			'updatedAt'      => 0,
-			'completedAt'    => 0,
-			'lastRunAt'      => 0,
-			'lastError'      => '',
-			'classes'        => $classes,
-			'samples'        => array(),
+			'version'            => self::STATE_VERSION,
+			'status'             => 'idle',
+			'phase'              => 'attachments',
+			'cycleId'            => '',
+			'cursor'             => 0,
+			'scanned'            => 0,
+			'estimatedTotal'     => 0,
+			'batches'            => 0,
+			'startedAt'          => 0,
+			'updatedAt'          => 0,
+			'completedAt'        => 0,
+			'lastRunAt'          => 0,
+			'lastError'          => '',
+			'classes'            => $classes,
+			'samples'            => array(),
+			'pending'            => 0,
+			'pendingOverflow'    => false,
+			'sourcesReady'       => false,
+			'sources'            => array(),
+			'sourceIndex'        => 0,
+			'sourceCursor'       => 0,
+			'sourceMax'          => 0,
+			'refRows'            => 0,
+			'refBytes'           => 0,
+			'refPages'           => 0,
+			'incomplete'         => false,
+			'incompleteReasons'  => array(),
+			'acfNames'           => array(),
+			'finalizeChunk'      => 0,
+			'referencedBySource' => $sources,
+			'slices'             => 0,
+			'lastSliceSeconds'   => 0,
+			'maxSliceSeconds'    => 0,
+			'lastSliceSteps'     => 0,
+			'peakMemory'         => 0,
 		);
 	}
 
 	/**
-	 * Current normalized state.
+	 * Current normalized state. A state written by an older scanner version is
+	 * discarded (its "unused" figures used weaker rules).
 	 *
 	 * @return array
 	 */
@@ -89,9 +185,16 @@ class Mobo_Core_Legacy_Image_Audit {
 		$state = get_option( self::STATE_OPTION, array() );
 		$state = is_array( $state ) ? $state : array();
 		$base  = self::empty_state();
+		if ( ! isset( $state['version'] ) || self::STATE_VERSION !== (int) $state['version'] ) {
+			return $base;
+		}
 		$state = array_merge( $base, $state );
-		$state['classes'] = array_merge( $base['classes'], is_array( $state['classes'] ) ? $state['classes'] : array() );
-		$state['samples'] = is_array( $state['samples'] ) ? array_slice( $state['samples'], 0, self::SAMPLE_LIMIT ) : array();
+		$state['classes']            = array_merge( $base['classes'], is_array( $state['classes'] ) ? $state['classes'] : array() );
+		$state['referencedBySource'] = array_merge( $base['referencedBySource'], is_array( $state['referencedBySource'] ) ? $state['referencedBySource'] : array() );
+		$state['samples']            = is_array( $state['samples'] ) ? array_slice( $state['samples'], 0, self::SAMPLE_LIMIT ) : array();
+		$state['sources']            = is_array( $state['sources'] ) ? $state['sources'] : array();
+		$state['incompleteReasons']  = is_array( $state['incompleteReasons'] ) ? $state['incompleteReasons'] : array();
+		$state['acfNames']           = is_array( $state['acfNames'] ) ? $state['acfNames'] : array();
 		return $state;
 	}
 
@@ -118,27 +221,45 @@ class Mobo_Core_Legacy_Image_Audit {
 				$protected += $count;
 			}
 		}
+		$get   = static function ( $class ) use ( $by_class ) {
+			return absint( isset( $by_class[ $class ] ) ? $by_class[ $class ] : 0 );
+		};
+		$unused = isset( $state['classes'][ Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE ] ) ? $state['classes'][ Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE ] : array();
 		return array(
-			'scanStatus'       => sanitize_key( (string) $state['status'] ),
-			'scanComplete'     => 'complete' === $state['status'],
-			'scanned'          => absint( $state['scanned'] ),
-			'estimatedTotal'   => absint( $state['estimatedTotal'] ),
-			'candidates'       => $candidates,
-			'replaceThenDelete'=> absint( isset( $by_class[ Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE ] ) ? $by_class[ Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE ] : 0 ),
-			'deleteCandidates' => absint( isset( $by_class[ Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE ] ) ? $by_class[ Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE ] : 0 ),
-			'protected'        => $protected,
-			'bytes'            => $bytes,
-			'metadataBytes'    => $meta_bytes,
-			'deleted'          => absint( get_option( self::DELETED_OPTION, 0 ) ),
-			'deletionEnabled'  => false,
-			'lastRunAt'        => absint( $state['lastRunAt'] ),
-			'completedAt'      => absint( $state['completedAt'] ),
-			'classes'          => $by_class,
+			'scanStatus'         => sanitize_key( (string) $state['status'] ),
+			'scanComplete'       => 'complete' === $state['status'],
+			'phase'              => sanitize_key( (string) $state['phase'] ),
+			'scanned'            => absint( $state['scanned'] ),
+			'estimatedTotal'     => absint( $state['estimatedTotal'] ),
+			'candidates'         => $candidates,
+			'replaceThenDelete'  => $get( Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE ),
+			'deleteCandidates'   => $get( Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE ),
+			'unusedBytes'        => absint( isset( $unused['bytes'] ) ? $unused['bytes'] : 0 ),
+			'unusedMetadataBytes'=> absint( isset( $unused['metaBytes'] ) ? $unused['metaBytes'] : 0 ),
+			'protected'          => $protected,
+			'referenced'         => $get( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_REFERENCED ),
+			'referencedBySource' => array_map( 'absint', $state['referencedBySource'] ),
+			'unsureWeakOwnership'=> $get( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_WEAK_OWNERSHIP ),
+			'unsure'             => $get( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN ),
+			'merchant'           => $get( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_NOT_MOBO ),
+			'merchantProductUse' => $get( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_FOREIGN_USE ),
+			'pendingCandidates'  => 'complete' === $state['status'] ? 0 : absint( $state['pending'] ),
+			'referenceIndexComplete' => empty( $state['incomplete'] ) && empty( $state['pendingOverflow'] ),
+			'incompleteReasons'  => array_slice( array_map( 'sanitize_text_field', array_keys( $state['incompleteReasons'] ) ), 0, 5 ),
+			'referenceRows'      => absint( $state['refRows'] ),
+			'maxSliceSeconds'    => round( (float) $state['maxSliceSeconds'], 2 ),
+			'bytes'              => $bytes,
+			'metadataBytes'      => $meta_bytes,
+			'deleted'            => absint( get_option( self::DELETED_OPTION, 0 ) ),
+			'deletionEnabled'    => false,
+			'lastRunAt'          => absint( $state['lastRunAt'] ),
+			'completedAt'        => absint( $state['completedAt'] ),
+			'classes'            => $by_class,
 		);
 	}
 
 	/**
-	 * Request a cooperative stop. The running slice stops before its next batch.
+	 * Request a cooperative stop. The running slice stops before its next step.
 	 *
 	 * @return array
 	 */
@@ -159,8 +280,9 @@ class Mobo_Core_Legacy_Image_Audit {
 	 * @return array
 	 */
 	public function reset() {
+		$state = self::get_state();
 		delete_option( self::STOP_OPTION );
-		delete_option( self::CONTENT_OPTION );
+		$this->clear_index( absint( $state['pending'] ) );
 		update_option( self::STATE_OPTION, self::empty_state(), false );
 		return self::get_state();
 	}
@@ -168,14 +290,22 @@ class Mobo_Core_Legacy_Image_Audit {
 	/**
 	 * Start a new scan cycle or continue the current one for a bounded time.
 	 *
-	 * @param float $time_budget Seconds.
+	 * @param float $time_budget Seconds (clamped to the request deadline).
 	 * @param int   $batch_size Attachments per batch.
 	 * @return array State after the slice.
 	 */
 	public function run( $time_budget = 8.0, $batch_size = self::BATCH_DEFAULT ) {
 		global $wpdb;
-		$time_budget = max( 1.0, min( 25.0, (float) $time_budget ) );
-		$batch_size  = max( 5, min( self::BATCH_MAX, absint( $batch_size ) ) );
+		$time_budget = max( 0.5, min( 25.0, (float) $time_budget ) );
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) ) {
+			$time_budget = min( $time_budget, Mobo_Core_Request_Deadline::clamp_seconds( $time_budget, self::DEADLINE_RESERVE ) );
+		}
+		$batch_size = max( 5, min( self::BATCH_MAX, absint( $batch_size ) ) );
+		if ( $time_budget < 0.5 ) {
+			$state              = self::get_state();
+			$state['lastError'] = 'زمان کافی در این درخواست باقی نمانده است؛ دوباره ادامه دهید.';
+			return $state;
+		}
 
 		$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( self::LOCK_NAME, (int) ceil( $time_budget ) + 60 ) : '__no_lock__';
 		if ( false === $lock ) {
@@ -189,68 +319,47 @@ class Mobo_Core_Legacy_Image_Audit {
 			delete_option( self::STOP_OPTION );
 			$state = self::get_state();
 			if ( in_array( $state['status'], array( 'idle', 'complete' ), true ) ) {
-				$state              = self::empty_state();
-				$state['status']    = 'running';
-				$state['cycleId']   = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : uniqid( 'legacy', true );
-				$state['startedAt'] = time();
+				$this->clear_index( absint( $state['pending'] ) );
+				delete_option( self::CONTENT_OPTION );
+				$state                   = self::empty_state();
+				$state['status']         = 'running';
+				$state['cycleId']        = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : uniqid( 'legacy', true );
+				$state['startedAt']      = time();
 				$state['estimatedTotal'] = absint( $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_mime_type IN ('image/jpeg','image/png')" ) );
-				$state['contentMaxId']   = absint( $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ) );
-				update_option( self::CONTENT_OPTION, array( 'b' => array(), 'i' => array() ), false );
 			}
 			$state['status']    = 'running';
 			$state['lastError'] = '';
 
-			$deadline = microtime( true ) + $time_budget;
-			$guard    = 0;
-			while ( microtime( true ) < $deadline && $guard < 500 ) {
-				$guard++;
+			$started  = microtime( true );
+			$deadline = $started + $time_budget;
+			$steps    = 0;
+			while ( microtime( true ) < $deadline && $steps < 2000 ) {
 				if ( $this->stop_requested() ) {
 					$state['status'] = 'stopped';
 					break;
 				}
-				if ( 'content' === $state['phase'] ) {
-					/* Phase 1: one bounded pass over post content collecting every
-					 * referenced upload basename / attachment id into a compact set. */
-					$refs = get_option( self::CONTENT_OPTION, array() );
-					$refs = is_array( $refs ) ? $refs : array();
-					$page = $this->content_page( absint( $state['contentCursor'] ), absint( $state['contentMaxId'] ), $refs );
-					if ( ! empty( $page['error'] ) ) {
-						$state['lastError'] = sanitize_text_field( (string) $page['error'] );
-						break;
-					}
-					/* Union semantics: re-processing a page after a crash is harmless. */
-					update_option( self::CONTENT_OPTION, $page['refs'], false );
-					$state['contentCursor']   = absint( $page['cursorEnd'] );
-					$state['contentRefs']     = count( $page['refs']['b'] ) + count( $page['refs']['i'] );
-					$state['contentOverflow'] = ! empty( $state['contentOverflow'] ) || ! empty( $page['overflow'] );
-					if ( ! empty( $page['done'] ) ) {
-						$state['phase'] = 'attachments';
-					}
-					$state['updatedAt'] = time();
-					update_option( self::STATE_OPTION, $state, false );
-					continue;
-				}
-				$content_refs = get_option( self::CONTENT_OPTION, array() );
-				$batch = $this->scan_batch( absint( $state['cursor'] ), $batch_size, is_array( $content_refs ) ? $content_refs : array(), ! empty( $state['contentOverflow'] ) );
-				if ( ! empty( $batch['error'] ) ) {
-					/* Uncertain database state: do not advance; keep the cycle resumable. */
-					$state['lastError'] = sanitize_text_field( (string) $batch['error'] );
+				$steps++;
+				$result = $this->step( $state, $batch_size );
+				if ( '' !== (string) $result['error'] ) {
+					/* Uncertain database state: nothing of this step is committed. */
+					$state['lastError'] = sanitize_text_field( (string) $result['error'] );
 					break;
 				}
-				$state = $this->merge_batch( $state, $batch );
+				$state              = $result['state'];
 				$state['updatedAt'] = time();
-				$state['lastRunAt'] = time();
-				if ( ! empty( $batch['done'] ) ) {
-					$state['status']      = 'complete';
-					$state['completedAt'] = time();
-				}
-				/* Commit cursor + counters atomically after every batch. */
+				/* Commit cursor + counters atomically after every step. */
 				update_option( self::STATE_OPTION, $state, false );
 				if ( 'complete' === $state['status'] ) {
 					break;
 				}
 			}
-			$state['lastRunAt'] = time();
+			$elapsed                    = microtime( true ) - $started;
+			$state['slices']            = absint( $state['slices'] ) + 1;
+			$state['lastSliceSeconds']  = round( $elapsed, 3 );
+			$state['maxSliceSeconds']   = round( max( (float) $state['maxSliceSeconds'], $elapsed ), 3 );
+			$state['lastSliceSteps']    = $steps;
+			$state['peakMemory']        = max( absint( $state['peakMemory'] ), (int) memory_get_peak_usage( true ) );
+			$state['lastRunAt']         = time();
 			update_option( self::STATE_OPTION, $state, false );
 			return $state;
 		} finally {
@@ -261,19 +370,54 @@ class Mobo_Core_Legacy_Image_Audit {
 	}
 
 	/**
-	 * Add one computed batch to the state (pure).
+	 * One bounded unit of work for the current phase (pure w.r.t. the state
+	 * option: the caller commits the returned state).
+	 *
+	 * @param array $state State.
+	 * @param int   $batch_size Attachment batch size.
+	 * @return array{state:array,error:string}
+	 */
+	public function step( array $state, $batch_size = self::BATCH_DEFAULT ) {
+		$phase = (string) $state['phase'];
+		if ( 'attachments' === $phase ) {
+			$batch = $this->scan_batch( absint( $state['cursor'] ), $batch_size );
+			if ( ! empty( $batch['error'] ) ) {
+				return array( 'state' => $state, 'error' => (string) $batch['error'] );
+			}
+			$state = $this->commit_attachment_batch( $state, $batch );
+			$state['lastRunAt'] = time();
+			if ( ! empty( $batch['done'] ) ) {
+				$state['phase'] = absint( $state['pending'] ) > 0 ? 'refs' : 'finalize';
+			}
+			return array( 'state' => $state, 'error' => '' );
+		}
+		if ( 'refs' === $phase ) {
+			return $this->ref_step( $state );
+		}
+		if ( 'finalize' === $phase ) {
+			return $this->finalize_step( $state );
+		}
+		$state['phase'] = 'attachments';
+		return array( 'state' => $state, 'error' => '' );
+	}
+
+	/**
+	 * Add one computed batch to the state (pure). Items flagged `pending` are
+	 * never counted here: they are counted once, in the finalize phase.
 	 *
 	 * @param array $state State.
 	 * @param array $batch Batch result.
 	 * @return array
 	 */
 	public function merge_batch( array $state, array $batch ) {
-		$state['cursor']   = max( absint( $state['cursor'] ), absint( isset( $batch['cursorEnd'] ) ? $batch['cursorEnd'] : 0 ) );
-		$state['scanned']  = absint( $state['scanned'] ) + absint( isset( $batch['scanned'] ) ? $batch['scanned'] : 0 );
-		$state['batches']  = absint( $state['batches'] ) + 1;
+		if ( isset( $batch['cursorEnd'] ) ) {
+			$state['cursor'] = max( absint( $state['cursor'] ), absint( $batch['cursorEnd'] ) );
+		}
+		$state['scanned'] = absint( $state['scanned'] ) + absint( isset( $batch['scanned'] ) ? $batch['scanned'] : 0 );
+		$state['batches'] = absint( $state['batches'] ) + 1;
 		foreach ( isset( $batch['items'] ) && is_array( $batch['items'] ) ? $batch['items'] : array() as $item ) {
 			$class = isset( $item['class'] ) ? (string) $item['class'] : '';
-			if ( ! isset( $state['classes'][ $class ] ) ) {
+			if ( ! isset( $state['classes'][ $class ] ) || ! empty( $item['pending'] ) ) {
 				continue;
 			}
 			$state['classes'][ $class ]['count']++;
@@ -281,7 +425,21 @@ class Mobo_Core_Legacy_Image_Audit {
 			$state['classes'][ $class ]['metaBytes']    += absint( isset( $item['metaBytes'] ) ? $item['metaBytes'] : 0 );
 			$state['classes'][ $class ]['files']        += absint( isset( $item['files'] ) ? $item['files'] : 0 );
 			$state['classes'][ $class ]['missingFiles'] += absint( isset( $item['missing'] ) ? $item['missing'] : 0 );
-			$sampleable = Mobo_Core_Legacy_Image_Policy::is_candidate_class( $class ) || Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN === $class;
+			foreach ( isset( $item['sources'] ) && is_array( $item['sources'] ) ? $item['sources'] : array() as $source ) {
+				if ( isset( $state['referencedBySource'][ $source ] ) ) {
+					$state['referencedBySource'][ $source ]++;
+				}
+			}
+			$candidate  = Mobo_Core_Legacy_Image_Policy::is_candidate_class( $class );
+			$sampleable = $candidate || in_array( $class, array( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN, Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_WEAK_OWNERSHIP ), true );
+			if ( $sampleable && ! $candidate ) {
+				/* Unsure samples (attachment pass) keep room for candidate samples (finalize). */
+				$unsure_samples = 0;
+				foreach ( $state['samples'] as $sample ) {
+					$unsure_samples += Mobo_Core_Legacy_Image_Policy::is_candidate_class( isset( $sample['class'] ) ? $sample['class'] : '' ) ? 0 : 1;
+				}
+				$sampleable = $unsure_samples < (int) floor( self::SAMPLE_LIMIT / 3 );
+			}
 			if ( $sampleable && count( $state['samples'] ) < self::SAMPLE_LIMIT ) {
 				$state['samples'][] = array(
 					'id'        => absint( isset( $item['id'] ) ? $item['id'] : 0 ),
@@ -299,6 +457,109 @@ class Mobo_Core_Legacy_Image_Audit {
 	}
 
 	/**
+	 * Store a batch's candidates in the index chunks, then count the rest.
+	 *
+	 * Idempotent: entries are keyed by attachment ID at a position derived from
+	 * the committed state, and entries a previous uncommitted attempt left for
+	 * the same ID range are dropped first.
+	 *
+	 * @param array $state State.
+	 * @param array $batch scan_batch() result.
+	 * @return array New state.
+	 */
+	public function commit_attachment_batch( array $state, array $batch ) {
+		$pending = array();
+		$items   = array();
+		$room    = max( 0, self::PENDING_MAX - absint( $state['pending'] ) );
+		foreach ( isset( $batch['items'] ) && is_array( $batch['items'] ) ? $batch['items'] : array() as $item ) {
+			if ( ! empty( $item['pending'] ) ) {
+				if ( count( $pending ) < $room ) {
+					$pending[] = $item;
+					continue;
+				}
+				$state['pendingOverflow'] = true;
+				$item['pending'] = false;
+				$item['class']   = Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN;
+				$item['reason']  = 'candidate-index-full';
+			}
+			$items[] = $item;
+		}
+		$low  = absint( $state['cursor'] );
+		$high = absint( isset( $batch['cursorEnd'] ) ? $batch['cursorEnd'] : $low );
+		$this->write_chunks( absint( $state['pending'] ), $pending, $low, $high );
+		$batch['items']   = $items;
+		$state            = $this->merge_batch( $state, $batch );
+		$state['pending'] = absint( $state['pending'] ) + count( $pending );
+		return $state;
+	}
+
+	/**
+	 * Write candidate entries into their chunk options.
+	 *
+	 * @param int   $start Committed pending count (position of the first entry).
+	 * @param array $items Pending items.
+	 * @param int   $low Batch ID range start (exclusive).
+	 * @param int   $high Batch ID range end (inclusive).
+	 * @return void
+	 */
+	private function write_chunks( $start, array $items, $low, $high ) {
+		$by_chunk = array();
+		foreach ( array_values( $items ) as $i => $item ) {
+			$chunk = intdiv( $start + $i, self::CHUNK_SIZE );
+			$by_chunk[ $chunk ][ absint( $item['id'] ) ] = array(
+				'c'  => (string) $item['class'],
+				'r'  => (string) $item['reason'],
+				'f'  => (string) $item['file'],
+				'b'  => absint( $item['bytes'] ),
+				'mb' => absint( $item['metaBytes'] ),
+				'n'  => absint( $item['files'] ),
+				'm'  => absint( $item['missing'] ),
+				'p'  => array_values( array_map( 'strval', isset( $item['paths'] ) && is_array( $item['paths'] ) ? $item['paths'] : array() ) ),
+			);
+		}
+		$first = intdiv( $start, self::CHUNK_SIZE );
+		$touch = array_unique( array_merge( array( $first, $first + 1 ), array_keys( $by_chunk ) ) );
+		foreach ( $touch as $chunk ) {
+			$existing = get_option( self::CAND_PREFIX . $chunk, array() );
+			$existing = is_array( $existing ) ? $existing : array();
+			$before   = $existing;
+			foreach ( array_keys( $existing ) as $id ) {
+				if ( $id > $low && $id <= $high ) {
+					unset( $existing[ $id ] );
+				}
+			}
+			if ( isset( $by_chunk[ $chunk ] ) ) {
+				$existing = $by_chunk[ $chunk ] + $existing;
+				ksort( $existing );
+			}
+			if ( $existing === $before ) {
+				continue;
+			}
+			if ( empty( $existing ) ) {
+				delete_option( self::CAND_PREFIX . $chunk );
+			} else {
+				update_option( self::CAND_PREFIX . $chunk, $existing, false );
+			}
+		}
+		$this->index = null;
+	}
+
+	/**
+	 * Delete candidate chunks and the hit map.
+	 *
+	 * @param int $pending Pending count of the cycle being cleared.
+	 * @return void
+	 */
+	private function clear_index( $pending ) {
+		$chunks = (int) ceil( absint( $pending ) / self::CHUNK_SIZE ) + 2;
+		for ( $i = 0; $i < $chunks || ( $i < $chunks + 1000 && false !== get_option( self::CAND_PREFIX . $i, false ) ); $i++ ) {
+			delete_option( self::CAND_PREFIX . $i );
+		}
+		delete_option( self::HITS_OPTION );
+		$this->index = null;
+	}
+
+	/**
 	 * Fresh read of the Stop flag (bypasses the request-local option cache).
 	 *
 	 * @return bool
@@ -311,6 +572,10 @@ class Mobo_Core_Legacy_Image_Audit {
 		return '1' === (string) get_option( self::STOP_OPTION, '0' );
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* Phase 1: attachments                                               */
+	/* ------------------------------------------------------------------ */
+
 	/**
 	 * Classify one primary-key batch of JPG/PNG attachments (read-only).
 	 *
@@ -318,12 +583,12 @@ class Mobo_Core_Legacy_Image_Audit {
 	 * @param int $limit Batch size.
 	 * @return array{items:array,scanned:int,cursorEnd:int,done:bool,error:string}
 	 */
-	public function scan_batch( $cursor, $limit, array $content_refs = array(), $content_overflow = false ) {
+	public function scan_batch( $cursor, $limit ) {
 		global $wpdb;
 		$out  = array( 'items' => array(), 'scanned' => 0, 'cursorEnd' => absint( $cursor ), 'done' => false, 'error' => '' );
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT ID, post_mime_type, post_parent FROM {$wpdb->posts}
+				"SELECT ID, post_mime_type, post_parent, post_title, LENGTH(post_content) + LENGTH(post_excerpt) AS text_len FROM {$wpdb->posts}
 				WHERE post_type = 'attachment' AND ID > %d AND post_mime_type IN ('image/jpeg','image/png')
 				ORDER BY ID ASC LIMIT %d",
 				absint( $cursor ),
@@ -341,21 +606,24 @@ class Mobo_Core_Legacy_Image_Audit {
 		}
 
 		$ids    = array();
-		$mime   = array();
-		$parent = array();
+		$posts  = array();
 		foreach ( $rows as $row ) {
 			$id = absint( $row['ID'] );
 			if ( $id > 0 ) {
-				$ids[]       = $id;
-				$mime[ $id ]   = (string) $row['post_mime_type'];
-				$parent[ $id ] = absint( $row['post_parent'] );
+				$ids[]        = $id;
+				$posts[ $id ] = array(
+					'mime'     => (string) $row['post_mime_type'],
+					'parent'   => absint( $row['post_parent'] ),
+					'title'    => (string) $row['post_title'],
+					'text_len' => absint( $row['text_len'] ),
+				);
 			}
 		}
 		$out['scanned']   = count( $ids );
 		$out['cursorEnd'] = max( $ids );
 		$out['done']      = count( $rows ) < absint( $limit );
 
-		$meta = $this->fetch_meta( $ids, array( 'image_guid', 'img_guid', 'mobo_source_url', '_wp_attached_file', '_wp_attachment_metadata', 'mobo_image_refresh_replaced_by_attachment_id', 'mobo_shared_media' ) );
+		$meta = $this->fetch_meta( $ids, array( 'image_guid', 'img_guid', 'mobo_source_url', '_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_backup_sizes', 'mobo_image_refresh_replaced_by_attachment_id', 'mobo_image_refresh_identity_source', 'mobo_shared_media' ) );
 		if ( null === $meta ) {
 			$out['error'] = 'meta-query-failed';
 			return $out;
@@ -367,7 +635,7 @@ class Mobo_Core_Legacy_Image_Audit {
 			if ( '' !== trim( (string) ( isset( $m['image_guid'] ) ? $m['image_guid'] : '' ) ) || '' !== trim( (string) ( isset( $m['img_guid'] ) ? $m['img_guid'] : '' ) ) ) {
 				$marked[] = $id;
 			} else {
-				/* (c) merchant upload: counted only, never inspected further. */
+				/* (c) merchant upload or earliest unmarked plugin version: counted only, never inspected further. */
 				$out['items'][] = array( 'id' => $id, 'class' => Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_NOT_MOBO, 'reason' => 'no-plugin-ownership-marker' );
 			}
 		}
@@ -375,7 +643,11 @@ class Mobo_Core_Legacy_Image_Audit {
 			return $out;
 		}
 
-		$context = $this->gather_context( $marked, $meta, $content_refs, $parent );
+		$parents = array();
+		foreach ( $marked as $id ) {
+			$parents[ $id ] = $posts[ $id ]['parent'];
+		}
+		$context = $this->gather_context( $marked, $meta, $parents );
 		if ( ! empty( $context['error'] ) ) {
 			$out['error'] = (string) $context['error'];
 			return $out;
@@ -394,9 +666,9 @@ class Mobo_Core_Legacy_Image_Audit {
 		foreach ( $marked as $id ) {
 			$m        = isset( $meta[ $id ] ) ? $meta[ $id ] : array();
 			$file     = (string) ( isset( $m['_wp_attached_file'] ) ? $m['_wp_attached_file'] : '' );
-			$metadata = isset( $m['_wp_attachment_metadata'] ) ? maybe_unserialize( $m['_wp_attachment_metadata'] ) : array();
+			$metadata = isset( $m['_wp_attachment_metadata'] ) ? self::safe_unserialize( $m['_wp_attachment_metadata'] ) : array();
 			$facts    = array(
-				'mime'                 => $mime[ $id ],
+				'mime'                 => $posts[ $id ]['mime'],
 				'file'                 => $file,
 				'image_guid'           => (string) ( isset( $m['image_guid'] ) ? $m['image_guid'] : '' ),
 				'img_guid'             => (string) ( isset( $m['img_guid'] ) ? $m['img_guid'] : '' ),
@@ -406,20 +678,29 @@ class Mobo_Core_Legacy_Image_Audit {
 				'active_refresh'       => isset( $context['activeRefresh'][ $id ] ),
 				'guid_pending_raster'  => false,
 				'webp_available'       => false,
-				'refs_complete'        => ! $content_overflow && ! isset( $context['parentUnknown'][ $id ] ),
+				'refs_complete'        => ! isset( $context['parentUnknown'][ $id ] ),
 				'parent_non_mobo'      => isset( $context['parentNonMobo'][ $id ] ),
 				'refs'                 => isset( $context['refs'][ $id ] ) ? $context['refs'][ $id ] : array(),
 				'replaced_by_valid'    => isset( $context['validReplacement'][ $id ] ),
+				'linkage'              => array(),
+				'filename_pattern'     => Mobo_Core_Legacy_Image_Policy::filename_pattern( $posts[ $id ]['title'], $posts[ $id ]['text_len'], $file, $metadata, (string) ( isset( $m['mobo_source_url'] ) ? $m['mobo_source_url'] : '' ) ),
 			);
 			$identity = Mobo_Core_Legacy_Image_Policy::identity( $facts['image_guid'], $facts['img_guid'] );
 			$guid     = $identity['canonical'];
+			if ( isset( $context['parentMobo'][ $id ] ) ) {
+				$facts['linkage'][] = 'parent-mobo-product';
+			}
+			if ( absint( isset( $m['mobo_image_refresh_replaced_by_attachment_id'] ) ? $m['mobo_image_refresh_replaced_by_attachment_id'] : 0 ) > 0 || '' !== trim( (string) ( isset( $m['mobo_image_refresh_identity_source'] ) ? $m['mobo_image_refresh_identity_source'] : '' ) ) ) {
+				$facts['linkage'][] = 'refresh-marker';
+			}
 			if ( '' !== $guid && isset( $context['guid'][ $guid ] ) ) {
+				$facts['linkage'][]           = 'image-queue-guid';
 				$facts['guid_pending_raster'] = ! empty( $context['guid'][ $guid ]['pendingRaster'] );
 				$facts['webp_available']      = ! empty( $context['guid'][ $guid ]['webp'] );
 			}
 			$verdict  = Mobo_Core_Legacy_Image_Policy::classify( $facts );
 			$estimate = Mobo_Core_Legacy_Image_Policy::estimate_family( $file, $metadata, $probe );
-			$out['items'][] = array(
+			$item     = array(
 				'id'        => $id,
 				'class'     => $verdict['class'],
 				'reason'    => $verdict['reason'],
@@ -429,9 +710,60 @@ class Mobo_Core_Legacy_Image_Audit {
 				'files'     => $estimate['files'],
 				'missing'   => $estimate['missing'],
 			);
+			if ( Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_REFERENCED === $verdict['class'] ) {
+				$item['sources'] = array( substr( (string) $verdict['reason'], strlen( 'referenced-by-' ) ) );
+			}
+			if ( Mobo_Core_Legacy_Image_Policy::is_candidate_class( $verdict['class'] ) ) {
+				/* Waits for the site-wide reference index (phase 2). */
+				$item['pending'] = true;
+				$item['paths']   = self::candidate_paths( $file, $metadata, isset( $m['_wp_attachment_backup_sizes'] ) ? self::safe_unserialize( $m['_wp_attachment_backup_sizes'] ) : array() );
+			}
+			$out['items'][] = $item;
 		}
 
 		return $out;
+	}
+
+	/**
+	 * Every relative path of an attachment family incl. edited-image backups.
+	 *
+	 * @param string $file _wp_attached_file.
+	 * @param mixed  $metadata Unserialized metadata.
+	 * @param mixed  $backup_sizes Unserialized _wp_attachment_backup_sizes.
+	 * @return string[]
+	 */
+	public static function candidate_paths( $file, $metadata, $backup_sizes ) {
+		$paths = array_keys( Mobo_Core_Legacy_Image_Policy::family_files( $file, $metadata ) );
+		$file  = ltrim( str_replace( '\\', '/', (string) $file ), '/' );
+		$dir   = dirname( $file );
+		$pre   = ( '.' === $dir || '' === $dir ) ? '' : $dir . '/';
+		foreach ( is_array( $backup_sizes ) ? $backup_sizes : array() as $size ) {
+			if ( is_array( $size ) && ! empty( $size['file'] ) && is_string( $size['file'] ) ) {
+				$path = $pre . Mobo_Core_Legacy_Image_Policy::base_name( str_replace( '\\', '/', $size['file'] ) );
+				if ( Mobo_Core_Legacy_Image_Policy::is_safe_relative_path( $path ) ) {
+					$paths[] = $path;
+				}
+			}
+		}
+		return array_values( array_unique( $paths ) );
+	}
+
+	/**
+	 * unserialize() without objects (read-only parse of WordPress metadata).
+	 *
+	 * @param mixed $value Raw value.
+	 * @return mixed
+	 */
+	private static function safe_unserialize( $value ) {
+		if ( ! is_string( $value ) ) {
+			return $value;
+		}
+		$trimmed = trim( $value );
+		if ( 1 !== preg_match( '/^(?:a|s|i|b|d|N):/', $trimmed ) ) {
+			return $value;
+		}
+		$data = @unserialize( $trimmed, array( 'allowed_classes' => false ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize -- classes disabled.
+		return ( false === $data && 'b:0;' !== $trimmed ) ? $value : $data;
 	}
 
 	/**
@@ -465,15 +797,16 @@ class Mobo_Core_Legacy_Image_Audit {
 	}
 
 	/**
-	 * Gather every reference/ownership fact for a batch of marked attachments.
+	 * Gather ownership linkage and precise reference facts for a batch of marked attachments.
 	 *
 	 * @param int[] $ids Marked attachment IDs.
 	 * @param array $meta Bulk meta of the batch.
+	 * @param array $parents Attachment ID => post_parent.
 	 * @return array
 	 */
-	private function gather_context( array $ids, array $meta, array $content_refs = array(), array $parents = array() ) {
+	private function gather_context( array $ids, array $meta, array $parents = array() ) {
 		global $wpdb;
-		$ctx = array( 'parentNonMobo' => array(), 'parentUnknown' => array(), 'refs' => array(), 'sharedFile' => array(), 'liveQueue' => array(), 'activeRefresh' => array(), 'validReplacement' => array(), 'guid' => array(), 'error' => '' );
+		$ctx = array( 'parentNonMobo' => array(), 'parentMobo' => array(), 'parentUnknown' => array(), 'refs' => array(), 'sharedFile' => array(), 'liveQueue' => array(), 'activeRefresh' => array(), 'validReplacement' => array(), 'guid' => array(), 'error' => '' );
 		$id_list   = implode( ',', array_map( 'absint', $ids ) );
 		$id_values = array_map( 'strval', array_map( 'absint', $ids ) );
 		$in_values = implode( ',', array_fill( 0, count( $id_values ), '%s' ) );
@@ -481,10 +814,10 @@ class Mobo_Core_Legacy_Image_Audit {
 			return '' !== (string) $wpdb->last_error;
 		};
 
-		/* 0. Attached to a post that is not a Mobo product. Legacy Mobo downloads
-		 * were inserted without a parent; "duplicate product" plugins copy
-		 * attachments together with their img_guid meta and attach the copy to the
-		 * merchant's product, so such a copy is merchant-owned. */
+		/* 0. Parent. Legacy Mobo downloads were inserted without a parent;
+		 * "duplicate product" plugins copy attachments together with their
+		 * img_guid meta and attach the copy to the merchant's product, so such a
+		 * copy is merchant-owned. A Mobo product parent is ownership linkage. */
 		$parent_ids = array();
 		foreach ( $ids as $id ) {
 			if ( ! empty( $parents[ $id ] ) ) {
@@ -511,6 +844,8 @@ class Mobo_Core_Legacy_Image_Audit {
 					$ctx['parentNonMobo'][ $id ] = true;
 				} elseif ( null === $mobo ) {
 					$ctx['parentUnknown'][ $id ] = true;
+				} else {
+					$ctx['parentMobo'][ $id ] = true;
 				}
 			}
 		}
@@ -668,7 +1003,7 @@ class Mobo_Core_Legacy_Image_Audit {
 		$wanted = array_flip( array_map( 'absint', $ids ) );
 		foreach ( (array) $rows as $row ) {
 			if ( '_product_image_gallery' === $row['meta_key'] ) {
-				$hits = Mobo_Core_Legacy_Image_Policy::parse_gallery( (string) $row['meta_value'] );
+				$hits  = Mobo_Core_Legacy_Image_Policy::parse_gallery( (string) $row['meta_value'] );
 				$owner = 'product_variation' === $row['post_type'] ? absint( $row['post_parent'] ) : absint( $row['post_id'] );
 				foreach ( $hits as $aid ) {
 					if ( isset( $wanted[ $aid ] ) ) {
@@ -685,7 +1020,7 @@ class Mobo_Core_Legacy_Image_Audit {
 			}
 		}
 
-		/* 7. Term meta (category thumbnails etc.) and a few site options. */
+		/* 7. Term meta equal to the ID (category thumbnails etc.) and core site options. */
 		if ( ! empty( $wpdb->termmeta ) ) {
 			$rows = $wpdb->get_col( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->termmeta} WHERE meta_value IN ({$in_values})", $id_values ) );
 			if ( $fail() ) {
@@ -693,7 +1028,7 @@ class Mobo_Core_Legacy_Image_Audit {
 				return $ctx;
 			}
 			foreach ( (array) $rows as $value ) {
-				$ctx['refs'][ absint( $value ) ][] = array( 'kind' => 'term', 'mobo' => null );
+				$ctx['refs'][ absint( $value ) ][] = array( 'kind' => 'termmeta', 'mobo' => null );
 			}
 		}
 		$option_ids = array( absint( get_option( 'site_icon', 0 ) ), absint( get_option( 'woocommerce_placeholder_image', 0 ) ) );
@@ -702,24 +1037,21 @@ class Mobo_Core_Legacy_Image_Audit {
 		}
 		foreach ( $option_ids as $oid ) {
 			if ( $oid > 0 && isset( $wanted[ $oid ] ) ) {
-				$ctx['refs'][ $oid ][] = array( 'kind' => 'option', 'mobo' => null );
+				$ctx['refs'][ $oid ][] = array( 'kind' => 'options', 'mobo' => null );
 			}
 		}
 
-		/* 8. Post content / excerpt: compare with the set built in phase 1. */
-		$content_basenames = isset( $content_refs['b'] ) && is_array( $content_refs['b'] ) ? $content_refs['b'] : array();
-		$content_ids       = isset( $content_refs['i'] ) && is_array( $content_refs['i'] ) ? $content_refs['i'] : array();
-		foreach ( $ids as $id ) {
-			if ( isset( $content_ids[ $id ] ) ) {
-				$ctx['refs'][ $id ][] = array( 'kind' => 'content', 'mobo' => null );
-				continue;
+		/* 8. WPML: an attachment with translations is linked to them. */
+		if ( $this->wpml_table_exists() ) {
+			$table = $wpdb->prefix . 'icl_translations';
+			$rows  = $wpdb->get_results( "SELECT t.element_id, (SELECT COUNT(*) FROM {$table} t2 WHERE t2.trid = t.trid) AS members FROM {$table} t WHERE t.element_type = 'post_attachment' AND t.element_id IN ({$id_list})", ARRAY_A );
+			if ( $fail() ) {
+				$ctx['error'] = 'wpml-query-failed';
+				return $ctx;
 			}
-			$file     = isset( $meta[ $id ]['_wp_attached_file'] ) ? (string) $meta[ $id ]['_wp_attached_file'] : '';
-			$metadata = isset( $meta[ $id ]['_wp_attachment_metadata'] ) ? maybe_unserialize( $meta[ $id ]['_wp_attachment_metadata'] ) : array();
-			foreach ( array_keys( Mobo_Core_Legacy_Image_Policy::family_files( $file, $metadata ) ) as $relative ) {
-				if ( isset( $content_basenames[ strtolower( basename( $relative ) ) ] ) ) {
-					$ctx['refs'][ $id ][] = array( 'kind' => 'content', 'mobo' => null );
-					break;
+			foreach ( (array) $rows as $row ) {
+				if ( absint( $row['members'] ) > 1 ) {
+					$ctx['refs'][ absint( $row['element_id'] ) ][] = array( 'kind' => 'translation', 'mobo' => null );
 				}
 			}
 		}
@@ -728,65 +1060,720 @@ class Mobo_Core_Legacy_Image_Audit {
 	}
 
 	/**
-	 * Phase 1 page: collect references from post_content/post_excerpt of every
-	 * non-attachment post (any status, revisions included) in one primary-key
-	 * range. Read-only.
+	 * Whether the WPML translations table exists (cached per request).
 	 *
-	 * @param int   $cursor Last processed post ID.
-	 * @param int   $max_id Highest post ID at cycle start.
-	 * @param array $refs Accumulated set array{b: basename=>1, i: id=>1}.
-	 * @return array{refs:array,cursorEnd:int,done:bool,overflow:bool,error:string}
+	 * @return bool
 	 */
-	public function content_page( $cursor, $max_id, array $refs ) {
+	private function wpml_table_exists() {
 		global $wpdb;
-		$refs = array(
-			'b' => isset( $refs['b'] ) && is_array( $refs['b'] ) ? $refs['b'] : array(),
-			'i' => isset( $refs['i'] ) && is_array( $refs['i'] ) ? $refs['i'] : array(),
+		if ( null === $this->wpml_table ) {
+			$table            = $wpdb->prefix . 'icl_translations';
+			$found            = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
+			$this->wpml_table = is_string( $found ) && strtolower( $found ) === strtolower( $table );
+		}
+		return $this->wpml_table;
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Phase 2: site-wide reference index                                 */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Describe every reference source of this site (core tables, plugin tables
+	 * that exist, Elementor CSS directory) and read ACF media field names.
+	 *
+	 * @param array $state State.
+	 * @return array{state:array,error:string}
+	 */
+	public function init_sources( array $state ) {
+		global $wpdb;
+		$sources   = array();
+		$sources[] = array( 'id' => 'posts', 'kind' => 'posts', 'table' => $wpdb->posts, 'pk' => 'ID', 'owner' => 'ID', 'type' => 'post_type', 'cols' => array( 'post_content', 'post_excerpt' ), 'source' => 'content' );
+		$sources[] = array( 'id' => 'postmeta', 'kind' => 'meta', 'table' => $wpdb->postmeta, 'pk' => 'meta_id', 'owner' => 'post_id', 'key' => 'meta_key', 'cols' => array( 'meta_value' ), 'source' => 'postmeta', 'self' => true );
+		if ( ! empty( $wpdb->termmeta ) ) {
+			$sources[] = array( 'id' => 'termmeta', 'kind' => 'meta', 'table' => $wpdb->termmeta, 'pk' => 'meta_id', 'owner' => 'term_id', 'key' => 'meta_key', 'cols' => array( 'meta_value' ), 'source' => 'termmeta' );
+		}
+		if ( ! empty( $wpdb->term_taxonomy ) ) {
+			$sources[] = array( 'id' => 'term_taxonomy', 'kind' => 'termtax', 'table' => $wpdb->term_taxonomy, 'pk' => 'term_taxonomy_id', 'key' => 'taxonomy', 'cols' => array( 'description' ), 'source' => 'termmeta' );
+		}
+		if ( ! empty( $wpdb->usermeta ) ) {
+			$sources[] = array( 'id' => 'usermeta', 'kind' => 'meta', 'table' => $wpdb->usermeta, 'pk' => 'umeta_id', 'owner' => 'user_id', 'key' => 'meta_key', 'cols' => array( 'meta_value' ), 'source' => 'usermeta' );
+		}
+		$sources[] = array( 'id' => 'options', 'kind' => 'options', 'table' => $wpdb->options, 'pk' => 'option_id', 'key' => 'option_name', 'cols' => array( 'option_value' ), 'source' => 'options' );
+
+		foreach ( self::PLUGIN_TABLE_PATTERNS as $pattern => $source ) {
+			$tables = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix . $pattern ) . '%' ) );
+			if ( '' !== (string) $wpdb->last_error ) {
+				return array( 'state' => $state, 'error' => 'plugin-table-detection-failed' );
+			}
+			foreach ( (array) $tables as $table ) {
+				$table = (string) $table;
+				if ( ! self::is_identifier( $table ) ) {
+					continue;
+				}
+				$columns = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
+				if ( '' !== (string) $wpdb->last_error ) {
+					return array( 'state' => $state, 'error' => 'plugin-table-columns-failed' );
+				}
+				$pk   = '';
+				$text = array();
+				foreach ( (array) $columns as $column ) {
+					$name = isset( $column['Field'] ) ? (string) $column['Field'] : '';
+					$type = strtolower( isset( $column['Type'] ) ? (string) $column['Type'] : '' );
+					if ( ! self::is_identifier( $name ) ) {
+						continue;
+					}
+					if ( '' === $pk && 'PRI' === ( isset( $column['Key'] ) ? (string) $column['Key'] : '' ) && 1 === preg_match( '/int/', $type ) ) {
+						$pk = $name;
+					} elseif ( 1 === preg_match( '/text|blob|json|^varchar\((?:[3-9]\d|\d{3,})\)/', $type ) ) {
+						$text[] = $name;
+					}
+				}
+				if ( '' !== $pk && ! empty( $text ) ) {
+					$sources[] = array( 'id' => $table, 'kind' => 'plain', 'table' => $table, 'pk' => $pk, 'cols' => array_slice( $text, 0, 8 ), 'source' => $source );
+				}
+			}
+		}
+
+		$uploads = function_exists( 'wp_get_upload_dir' ) ? wp_get_upload_dir() : array();
+		$basedir = isset( $uploads['basedir'] ) ? rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' ) : '';
+		if ( '' !== $basedir && is_dir( $basedir . '/' . self::CSS_DIR ) ) {
+			$sources[] = array( 'id' => 'elementor-css', 'kind' => 'css', 'source' => 'css' );
+		}
+
+		/* ACF image/gallery/file field names (field definitions stored in the DB). */
+		$names = array();
+		$rows  = $wpdb->get_results( $wpdb->prepare( "SELECT post_excerpt, post_content FROM {$wpdb->posts} WHERE post_type = 'acf-field' ORDER BY ID ASC LIMIT %d", self::ACF_MAX_FIELDS + 1 ), ARRAY_A );
+		if ( '' !== (string) $wpdb->last_error ) {
+			return array( 'state' => $state, 'error' => 'acf-field-query-failed' );
+		}
+		foreach ( array_slice( (array) $rows, 0, self::ACF_MAX_FIELDS ) as $row ) {
+			$settings = self::safe_unserialize( (string) $row['post_content'] );
+			$type     = is_array( $settings ) && isset( $settings['type'] ) ? (string) $settings['type'] : '';
+			$name     = trim( (string) $row['post_excerpt'] );
+			if ( '' !== $name && in_array( $type, array( 'image', 'gallery', 'file', 'image_aspect_ratio_crop', 'photo_gallery' ), true ) ) {
+				$names[ $name ] = 1;
+			}
+		}
+		if ( count( (array) $rows ) > self::ACF_MAX_FIELDS ) {
+			$state = self::mark_incomplete( $state, 'acf-field-limit' );
+		}
+
+		$state['sources']      = $sources;
+		$state['acfNames']     = $names;
+		$state['sourcesReady'] = true;
+		$state['sourceIndex']  = 0;
+		$state['sourceCursor'] = 0;
+		$state['sourceMax']    = 0;
+		return array( 'state' => $state, 'error' => '' );
+	}
+
+	/**
+	 * One reference-pass page of the current source.
+	 *
+	 * @param array $state State.
+	 * @return array{state:array,error:string}
+	 */
+	public function ref_step( array $state ) {
+		if ( empty( $state['sourcesReady'] ) ) {
+			return $this->init_sources( $state );
+		}
+		$index = absint( $state['sourceIndex'] );
+		if ( $index >= count( $state['sources'] ) ) {
+			$state['phase'] = 'finalize';
+			return array( 'state' => $state, 'error' => '' );
+		}
+		$source = $state['sources'][ $index ];
+		$lookup = $this->load_index( $state );
+		if ( 'css' === $source['kind'] ) {
+			$page = $this->css_page( (string) $state['sourceCursor'], $lookup );
+		} else {
+			$page = $this->rows_page( $source, absint( $state['sourceCursor'] ), absint( $state['sourceMax'] ), $lookup, is_array( $state['acfNames'] ) ? $state['acfNames'] : array() );
+		}
+		if ( '' !== (string) $page['error'] ) {
+			return array( 'state' => $state, 'error' => (string) $page['error'] );
+		}
+		/* Hits first (bitwise union: replaying a page after a crash is harmless), then the cursor. */
+		if ( ! empty( $page['hits'] ) ) {
+			$hits    = get_option( self::HITS_OPTION, array() );
+			$hits    = is_array( $hits ) ? $hits : array();
+			$changed = false;
+			foreach ( $page['hits'] as $id => $mask ) {
+				$old = isset( $hits[ $id ] ) ? (int) $hits[ $id ] : 0;
+				if ( ( $old | (int) $mask ) !== $old ) {
+					$hits[ $id ] = $old | (int) $mask;
+					$changed     = true;
+				}
+			}
+			if ( $changed ) {
+				update_option( self::HITS_OPTION, $hits, false );
+			}
+		}
+		foreach ( $page['incomplete'] as $reason ) {
+			$state = self::mark_incomplete( $state, $reason );
+		}
+		$state['refRows']  = absint( $state['refRows'] ) + absint( $page['rows'] );
+		$state['refBytes'] = absint( $state['refBytes'] ) + absint( $page['bytes'] );
+		$state['refPages'] = absint( $state['refPages'] ) + 1;
+		if ( ! empty( $page['done'] ) ) {
+			$state['sourceIndex']  = $index + 1;
+			$state['sourceCursor'] = 0;
+			$state['sourceMax']    = 0;
+			if ( $state['sourceIndex'] >= count( $state['sources'] ) ) {
+				$state['phase'] = 'finalize';
+			}
+		} else {
+			$state['sourceCursor'] = $page['cursorEnd'];
+			$state['sourceMax']    = absint( $page['max'] );
+		}
+		return array( 'state' => $state, 'error' => '' );
+	}
+
+	/**
+	 * Record an incomplete-index reason (idempotent, bounded).
+	 *
+	 * @param array  $state State.
+	 * @param string $reason Reason key (e.g. "oversized:wp_postmeta#123:5000000").
+	 * @return array
+	 */
+	public static function mark_incomplete( array $state, $reason ) {
+		$state['incomplete'] = true;
+		$reasons             = is_array( $state['incompleteReasons'] ) ? $state['incompleteReasons'] : array();
+		$reason              = substr( (string) $reason, 0, 120 );
+		if ( ! isset( $reasons[ $reason ] ) && count( $reasons ) < self::INCOMPLETE_MAX ) {
+			$reasons[ $reason ] = 1;
+		}
+		$state['incompleteReasons'] = $reasons;
+		return $state;
+	}
+
+	/**
+	 * Candidate lookup structures from the index chunks (cached per request).
+	 *
+	 * @param array $state State.
+	 * @return array{ids:array,base:array,root:array,paths:array}
+	 */
+	public function load_index( array $state ) {
+		$key = (string) $state['cycleId'] . ':' . absint( $state['pending'] );
+		if ( null !== $this->index && $key === $this->index_key ) {
+			return $this->index;
+		}
+		$index  = array( 'ids' => array(), 'base' => array(), 'root' => array(), 'paths' => array() );
+		$chunks = (int) ceil( absint( $state['pending'] ) / self::CHUNK_SIZE );
+		for ( $c = 0; $c < $chunks; $c++ ) {
+			$entries = get_option( self::CAND_PREFIX . $c, array() );
+			foreach ( is_array( $entries ) ? $entries : array() as $id => $entry ) {
+				$id                  = absint( $id );
+				$index['ids'][ $id ] = true;
+				foreach ( isset( $entry['p'] ) && is_array( $entry['p'] ) ? $entry['p'] : array() as $path ) {
+					$path = Mobo_Core_Legacy_Image_Policy::lower( str_replace( '\\', '/', (string) $path ) );
+					$base = Mobo_Core_Legacy_Image_Policy::base_name( $path );
+					$index['paths'][ $id ][ $path ]                                      = true;
+					$index['base'][ $base ][ $id ]                                       = true;
+					$index['root'][ Mobo_Core_Legacy_Image_Policy::basename_root( $base ) ][ $id ] = true;
+				}
+			}
+		}
+		$this->index     = $index;
+		$this->index_key = $key;
+		return $index;
+	}
+
+	/**
+	 * Candidate IDs a set of referenced basenames points at.
+	 *
+	 * @param string[] $basenames Lower-cased basenames.
+	 * @param array    $index Index.
+	 * @return array<int,bool>
+	 */
+	public static function match_basenames( array $basenames, array $index ) {
+		$out = array();
+		foreach ( $basenames as $basename ) {
+			$basename = Mobo_Core_Legacy_Image_Policy::lower( (string) $basename );
+			if ( isset( $index['base'][ $basename ] ) ) {
+				$out += $index['base'][ $basename ];
+			}
+			$root = Mobo_Core_Legacy_Image_Policy::basename_root( $basename );
+			if ( isset( $index['root'][ $root ] ) ) {
+				$out += $index['root'][ $root ];
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Read one byte-budgeted keyset page of a table source and match it.
+	 *
+	 * @param array $source Source descriptor.
+	 * @param int   $cursor Last processed primary key.
+	 * @param int   $max Highest primary key of this source for the cycle (0 = not yet read).
+	 * @param array $index Candidate index.
+	 * @param array $acf ACF media field names.
+	 * @return array{hits:array,cursorEnd:int,max:int,done:bool,rows:int,bytes:int,incomplete:array,error:string}
+	 */
+	public function rows_page( array $source, $cursor, $max, array $index, array $acf = array() ) {
+		global $wpdb;
+		$out = array( 'hits' => array(), 'cursorEnd' => absint( $cursor ), 'max' => absint( $max ), 'done' => false, 'rows' => 0, 'bytes' => 0, 'incomplete' => array(), 'error' => '' );
+		$table = (string) $source['table'];
+		$pk    = (string) $source['pk'];
+		$cols  = isset( $source['cols'] ) && is_array( $source['cols'] ) ? array_values( $source['cols'] ) : array();
+		foreach ( array_merge( array( $table, $pk ), $cols ) as $identifier ) {
+			if ( ! self::is_identifier( $identifier ) ) {
+				$out['error'] = 'invalid-source';
+				return $out;
+			}
+		}
+		if ( empty( $cols ) ) {
+			$out['done'] = true;
+			return $out;
+		}
+		if ( $out['max'] <= 0 ) {
+			$out['max'] = absint( $wpdb->get_var( "SELECT MAX(`{$pk}`) FROM `{$table}`" ) );
+			if ( '' !== (string) $wpdb->last_error ) {
+				$out['error'] = 'source-max-failed';
+				return $out;
+			}
+			if ( $out['max'] <= 0 ) {
+				$out['done'] = true;
+				return $out;
+			}
+		}
+		$len_parts = array();
+		foreach ( $cols as $col ) {
+			$len_parts[] = "COALESCE(LENGTH(`{$col}`),0)";
+		}
+		$len   = implode( ' + ', $len_parts );
+		$extra = '';
+		if ( 'options' === $source['kind'] ) {
+			/* Skipped server-side too, so a huge cache can never mark the index incomplete. */
+			$likes = array();
+			foreach ( array_merge( self::SKIP_OPTION_PREFIXES, self::SKIP_OPTION_REMOTE_PREFIXES ) as $prefix ) {
+				$likes[] = $wpdb->esc_like( $prefix ) . '%';
+			}
+			$extra = $wpdb->prepare(
+				str_repeat( ' AND `option_name` NOT LIKE %s', count( $likes ) ) . ' AND `option_name` NOT IN (' . implode( ',', array_fill( 0, count( self::SKIP_OPTIONS ), '%s' ) ) . ')',
+				array_merge( $likes, self::SKIP_OPTIONS )
+			);
+		}
+		$plan = $wpdb->get_results(
+			$wpdb->prepare( "SELECT `{$pk}` AS pk, ({$len}) AS len FROM `{$table}` WHERE `{$pk}` > %d AND `{$pk}` <= %d{$extra} ORDER BY `{$pk}` ASC LIMIT %d", absint( $cursor ), $out['max'], self::PAGE_ROWS ),
+			ARRAY_A
 		);
-		$cursor = absint( $cursor );
-		$end    = $cursor + self::CONTENT_SPAN;
-		$out    = array( 'refs' => $refs, 'cursorEnd' => $cursor, 'done' => false, 'overflow' => false, 'error' => '' );
-		$rows   = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT post_content, post_excerpt FROM {$wpdb->posts}
-				WHERE ID > %d AND ID <= %d AND post_type <> 'attachment'
-				AND ( post_content LIKE %s OR post_content LIKE %s OR post_content LIKE %s OR post_content LIKE %s OR post_content LIKE %s
-					OR post_excerpt LIKE %s OR post_excerpt LIKE %s OR post_excerpt LIKE %s )",
-				$cursor,
-				$end,
-				'%.jp%',
-				'%.png%',
-				'%wp-image-%',
-				'%ids=%',
-				'%"id":%',
-				'%.jp%',
-				'%.png%',
-				'%wp-image-%'
-			),
+		if ( ! is_array( $plan ) || '' !== (string) $wpdb->last_error ) {
+			$out['error'] = 'source-plan-failed';
+			return $out;
+		}
+		if ( empty( $plan ) ) {
+			$out['done'] = true;
+			return $out;
+		}
+		$end   = absint( $cursor );
+		$bytes = 0;
+		$taken = 0;
+		foreach ( $plan as $row ) {
+			$row_len = absint( $row['len'] );
+			if ( $row_len > self::ROW_MAX_BYTES ) {
+				/* Never loaded: the index is incomplete, every candidate becomes "unsure". */
+				$out['incomplete'][] = 'oversized:' . $table . '#' . absint( $row['pk'] ) . ':' . $row_len;
+				$end                 = absint( $row['pk'] );
+				$taken++;
+				continue;
+			}
+			if ( $bytes > 0 && $bytes + $row_len > self::PAGE_BYTES ) {
+				break;
+			}
+			$bytes += $row_len;
+			$end    = absint( $row['pk'] );
+			$taken++;
+		}
+		$out['done']      = $taken === count( $plan ) && count( $plan ) < self::PAGE_ROWS;
+		$out['cursorEnd'] = $end;
+		$out['bytes']     = $bytes;
+
+		$select = array( "`{$pk}` AS pk" );
+		foreach ( array( 'owner' => 'owner_id', 'key' => 'k', 'type' => 't' ) as $field => $alias ) {
+			if ( ! empty( $source[ $field ] ) ) {
+				if ( ! self::is_identifier( (string) $source[ $field ] ) ) {
+					$out['error'] = 'invalid-source';
+					return $out;
+				}
+				$select[] = '`' . $source[ $field ] . "` AS {$alias}";
+			}
+		}
+		foreach ( $cols as $i => $col ) {
+			$select[] = "`{$col}` AS c{$i}";
+		}
+		$rows = $wpdb->get_results(
+			$wpdb->prepare( 'SELECT ' . implode( ', ', $select ) . " FROM `{$table}` WHERE `{$pk}` > %d AND `{$pk}` <= %d AND ({$len}) <= %d{$extra} ORDER BY `{$pk}` ASC", absint( $cursor ), $end, self::ROW_MAX_BYTES ),
 			ARRAY_A
 		);
 		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
-			$out['error'] = 'content-query-failed';
+			$out['error'] = 'source-fetch-failed';
 			return $out;
 		}
+		$out['rows'] = count( $rows );
+		$maybe       = array();
 		foreach ( $rows as $row ) {
-			$found = Mobo_Core_Legacy_Image_Policy::extract_content_references( (string) $row['post_content'] . "\n" . (string) $row['post_excerpt'] );
-			foreach ( $found['basenames'] as $basename ) {
-				$out['refs']['b'][ $basename ] = 1;
-			}
-			foreach ( $found['ids'] as $id ) {
-				$out['refs']['i'][ $id ] = 1;
+			foreach ( $this->match_row( $source, $row, $index, $acf, $maybe ) as $id => $mask ) {
+				$out['hits'][ $id ] = ( isset( $out['hits'][ $id ] ) ? $out['hits'][ $id ] : 0 ) | $mask;
 			}
 		}
-		if ( count( $out['refs']['b'] ) + count( $out['refs']['i'] ) > self::CONTENT_MAX ) {
-			/* Too many references to hold safely: every marked attachment becomes
-			 * "uncertain" instead of risking a false "unreferenced". */
-			$out['overflow'] = true;
-			$out['refs']     = array( 'b' => array(), 'i' => array() );
+		if ( ! empty( $maybe ) ) {
+			$probe = $this->acf_probe( $source, $maybe );
+			if ( null === $probe ) {
+				$out['error'] = 'acf-probe-failed';
+				return $out;
+			}
+			foreach ( $probe as $id => $mask ) {
+				$out['hits'][ $id ] = ( isset( $out['hits'][ $id ] ) ? $out['hits'][ $id ] : 0 ) | $mask;
+			}
 		}
-		$out['cursorEnd'] = $end;
-		$out['done']      = $end >= absint( $max_id );
 		return $out;
+	}
+
+	/**
+	 * Match one row of a reference source against the candidate index.
+	 *
+	 * @param array $source Source descriptor.
+	 * @param array $row Row (pk, owner_id, k, t, c0..cN).
+	 * @param array $index Candidate index.
+	 * @param array $acf ACF media field names.
+	 * @param array $maybe Out: numeric values equal to a candidate ID under a non-media key (ACF probe).
+	 * @return array<int,int> Candidate ID => hit mask.
+	 */
+	public function match_row( array $source, array $row, array $index, array $acf, array &$maybe ) {
+		$P     = 'Mobo_Core_Legacy_Image_Policy';
+		$kind  = (string) $source['kind'];
+		$owner = isset( $row['owner_id'] ) ? absint( $row['owner_id'] ) : 0;
+		$self  = ( 'posts' === $kind || ! empty( $source['self'] ) ) ? $owner : 0;
+		$key   = isset( $row['k'] ) ? (string) $row['k'] : '';
+		$texts = array();
+		foreach ( $row as $field => $value ) {
+			if ( 1 === preg_match( '/^c\d+$/', (string) $field ) && null !== $value && '' !== (string) $value ) {
+				$texts[] = (string) $value;
+			}
+		}
+		if ( empty( $texts ) || empty( $index['ids'] ) ) {
+			return array();
+		}
+		$name = (string) $source['source'];
+		$acf_key = false;
+		if ( 'posts' === $kind ) {
+			$type = isset( $row['t'] ) ? (string) $row['t'] : '';
+			$name = 'revision' === $type ? 'revision' : ( in_array( $type, array( 'elementor_library', 'e-landing-page', 'elementor_snippet' ), true ) ? 'elementor' : 'content' );
+		} elseif ( 'meta' === $kind ) {
+			if ( in_array( $key, self::SKIP_META_KEYS, true ) || self::has_prefix( $key, self::SKIP_META_PREFIXES ) ) {
+				return array();
+			}
+			if ( 'postmeta' === $source['id'] && in_array( $key, self::ATTACHMENT_FILE_KEYS, true ) ) {
+				return $this->match_attachment_file_row( $key, $texts[0], $owner, $index );
+			}
+			$acf_key = $P::is_acf_media_key( $key, $acf );
+			$name    = 0 === strpos( $key, '_elementor' ) ? 'elementor' : ( $acf_key ? 'acf' : $name );
+		} elseif ( 'options' === $kind ) {
+			if ( in_array( $key, self::SKIP_OPTIONS, true ) || self::has_prefix( $key, self::SKIP_OPTION_PREFIXES ) || self::has_prefix( $key, self::SKIP_OPTION_REMOTE_PREFIXES ) ) {
+				return array();
+			}
+			$acf_key = $P::is_acf_media_key( $key, $acf );
+			$name    = false !== stripos( $key, 'elementor' ) ? 'elementor' : ( $acf_key ? 'acf' : 'options' );
+		} elseif ( 'termtax' === $kind && 'post_translations' === $key ) {
+			/* Polylang: serialized lang => post_id group. A translated attachment is linked. */
+			$group = $P::extract_value_ids( 'ids', $texts[0], true );
+			$hits  = array();
+			if ( count( $group ) > 1 ) {
+				foreach ( $group as $id ) {
+					if ( isset( $index['ids'][ $id ] ) ) {
+						$hits[ $id ] = $P::source_bit( 'translation' );
+					}
+				}
+			}
+			return $hits;
+		}
+		$bit = $P::source_bit( $name );
+		$ids = array();
+		$bases = array();
+		foreach ( $texts as $text ) {
+			$found = $P::extract_content_references( $text );
+			foreach ( $found['ids'] as $id ) {
+				$ids[ $id ] = true;
+			}
+			foreach ( $found['basenames'] as $basename ) {
+				$bases[ $basename ] = true;
+			}
+		}
+		if ( '' !== $key && in_array( $kind, array( 'meta', 'options' ), true ) ) {
+			foreach ( $P::extract_value_ids( $key, $texts[0], $acf_key ) as $id ) {
+				$ids[ $id ] = true;
+			}
+			$plain = trim( $texts[0] );
+			if ( ! $acf_key && ! $P::is_media_key( $key ) && 1 === preg_match( '/^\d{1,19}$/', $plain ) && isset( $index['ids'][ (int) $plain ] ) && (int) $plain !== $self ) {
+				/* Numeric value equal to a candidate under an unknown key: a reference only
+				 * when ACF declares the key (`_key` => field_xxx), checked in one query per page. */
+				$maybe[] = array( 'owner' => $owner, 'key' => $key, 'id' => (int) $plain );
+			}
+		}
+		$hits = array();
+		foreach ( array_keys( $ids ) as $id ) {
+			if ( isset( $index['ids'][ $id ] ) && $id !== $self ) {
+				$hits[ $id ] = $bit;
+			}
+		}
+		foreach ( array_keys( self::match_basenames( array_keys( $bases ), $index ) ) as $id ) {
+			if ( $id !== $self ) {
+				$hits[ $id ] = $bit;
+			}
+		}
+		return $hits;
+	}
+
+	/**
+	 * Another attachment's file meta: a hit only when it names the exact same
+	 * relative path as a candidate's family file (same physical file).
+	 *
+	 * @param string $key Meta key.
+	 * @param string $value Raw value.
+	 * @param int    $owner Owning attachment ID.
+	 * @param array  $index Candidate index.
+	 * @return array<int,int>
+	 */
+	private function match_attachment_file_row( $key, $value, $owner, array $index ) {
+		$paths = array();
+		if ( '_wp_attached_file' === $key ) {
+			$paths[] = (string) $value;
+		} elseif ( '_wp_attachment_metadata' === $key ) {
+			$data = self::safe_unserialize( $value );
+			if ( is_array( $data ) && ! empty( $data['file'] ) ) {
+				$paths = array_keys( Mobo_Core_Legacy_Image_Policy::family_files( (string) $data['file'], $data ) );
+			}
+		} else {
+			/* Backup sizes hold basenames only: same basename in a candidate's family protects it. */
+			$data = self::safe_unserialize( $value );
+			$bases = array();
+			foreach ( is_array( $data ) ? $data : array() as $size ) {
+				if ( is_array( $size ) && ! empty( $size['file'] ) && is_string( $size['file'] ) ) {
+					$bases[] = Mobo_Core_Legacy_Image_Policy::lower( Mobo_Core_Legacy_Image_Policy::base_name( $size['file'] ) );
+				}
+			}
+			$hits = array();
+			foreach ( $bases as $base ) {
+				foreach ( isset( $index['base'][ $base ] ) ? array_keys( $index['base'][ $base ] ) : array() as $id ) {
+					if ( $id !== $owner ) {
+						$hits[ $id ] = Mobo_Core_Legacy_Image_Policy::source_bit( 'sharedfile' );
+					}
+				}
+			}
+			return $hits;
+		}
+		$hits = array();
+		foreach ( $paths as $path ) {
+			$path = Mobo_Core_Legacy_Image_Policy::lower( ltrim( str_replace( '\\', '/', (string) $path ), '/' ) );
+			$base = Mobo_Core_Legacy_Image_Policy::base_name( $path );
+			foreach ( isset( $index['base'][ $base ] ) ? array_keys( $index['base'][ $base ] ) : array() as $id ) {
+				if ( $id !== $owner && isset( $index['paths'][ $id ][ $path ] ) ) {
+					$hits[ $id ] = Mobo_Core_Legacy_Image_Policy::source_bit( 'sharedfile' );
+				}
+			}
+		}
+		return $hits;
+	}
+
+	/**
+	 * Resolve numeric values under unknown keys: an ACF value row `key` has a
+	 * sibling `_key` whose value is an ACF field key (`field_...`).
+	 *
+	 * @param array $source Source descriptor.
+	 * @param array $maybe Items {owner, key, id}.
+	 * @return array<int,int>|null Hits; null on DB error.
+	 */
+	private function acf_probe( array $source, array $maybe ) {
+		global $wpdb;
+		$maybe = array_slice( $maybe, 0, 500 );
+		$keys  = array();
+		foreach ( $maybe as $item ) {
+			$keys[ '_' . $item['key'] ] = true;
+		}
+		$keys = array_keys( $keys );
+		$ph   = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+		$bit  = Mobo_Core_Legacy_Image_Policy::source_bit( 'acf' );
+		$hits = array();
+		if ( 'options' === $source['kind'] ) {
+			$rows = $wpdb->get_col( $wpdb->prepare( "SELECT option_name FROM {$wpdb->options} WHERE option_name IN ({$ph}) AND option_value LIKE %s", array_merge( $keys, array( 'field\_%' ) ) ) );
+			if ( '' !== (string) $wpdb->last_error ) {
+				return null;
+			}
+			$found = array_flip( array_map( 'strval', (array) $rows ) );
+			foreach ( $maybe as $item ) {
+				if ( isset( $found[ '_' . $item['key'] ] ) ) {
+					$hits[ $item['id'] ] = $bit;
+				}
+			}
+			return $hits;
+		}
+		$table = (string) $source['table'];
+		$owner = (string) $source['owner'];
+		if ( ! self::is_identifier( $table ) || ! self::is_identifier( $owner ) ) {
+			return null;
+		}
+		$owners = array_values( array_unique( array_map( 'absint', array_column( $maybe, 'owner' ) ) ) );
+		$rows   = $wpdb->get_results( $wpdb->prepare( "SELECT `{$owner}` AS owner_id, meta_key FROM `{$table}` WHERE `{$owner}` IN (" . implode( ',', $owners ) . ") AND meta_key IN ({$ph}) AND meta_value LIKE %s", array_merge( $keys, array( 'field\_%' ) ) ), ARRAY_A );
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
+			return null;
+		}
+		$found = array();
+		foreach ( $rows as $row ) {
+			$found[ absint( $row['owner_id'] ) . '|' . (string) $row['meta_key'] ] = true;
+		}
+		foreach ( $maybe as $item ) {
+			if ( isset( $found[ absint( $item['owner'] ) . '|_' . $item['key'] ] ) ) {
+				$hits[ $item['id'] ] = $bit;
+			}
+		}
+		return $hits;
+	}
+
+	/**
+	 * One page of Elementor generated CSS files (uploads/elementor/css/*.css),
+	 * cursor = last processed file name. Oversized/unreadable files mark the
+	 * index incomplete.
+	 *
+	 * @param string $cursor Last processed file name ('' / '0' = start).
+	 * @param array  $index Candidate index.
+	 * @return array{hits:array,cursorEnd:string,max:int,done:bool,rows:int,bytes:int,incomplete:array,error:string}
+	 */
+	public function css_page( $cursor, array $index ) {
+		$out     = array( 'hits' => array(), 'cursorEnd' => (string) $cursor, 'max' => 0, 'done' => true, 'rows' => 0, 'bytes' => 0, 'incomplete' => array(), 'error' => '' );
+		$cursor  = '0' === (string) $cursor ? '' : (string) $cursor;
+		$uploads = function_exists( 'wp_get_upload_dir' ) ? wp_get_upload_dir() : array();
+		$basedir = isset( $uploads['basedir'] ) ? rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' ) : '';
+		$dir     = $basedir . '/' . self::CSS_DIR;
+		if ( '' === $basedir || ! is_dir( $dir ) ) {
+			return $out;
+		}
+		$files = glob( $dir . '/*.css', GLOB_NOSORT );
+		if ( false === $files ) {
+			$out['incomplete'][] = 'css-directory-unreadable';
+			return $out;
+		}
+		$names = array();
+		foreach ( $files as $file ) {
+			$names[] = Mobo_Core_Legacy_Image_Policy::base_name( $file );
+		}
+		sort( $names, SORT_STRING );
+		if ( count( $names ) > self::CSS_MAX_FILES ) {
+			$out['incomplete'][] = 'css-file-limit';
+			$names               = array_slice( $names, 0, self::CSS_MAX_FILES );
+		}
+		$bit   = Mobo_Core_Legacy_Image_Policy::source_bit( 'css' );
+		$count = 0;
+		foreach ( $names as $i => $name ) {
+			if ( '' !== $cursor && strcmp( $name, $cursor ) <= 0 ) {
+				continue;
+			}
+			if ( $count >= self::CSS_FILES_PER_PAGE || ( $out['bytes'] > 0 && $out['bytes'] >= self::PAGE_BYTES ) ) {
+				$out['done'] = false;
+				break;
+			}
+			$count++;
+			$out['cursorEnd'] = $name;
+			$path             = $dir . '/' . $name;
+			$size             = @filesize( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- read-only probe.
+			if ( false === $size ) {
+				$out['incomplete'][] = 'css-unreadable:' . $name;
+				continue;
+			}
+			if ( $size > self::CSS_MAX_FILE_BYTES ) {
+				$out['incomplete'][] = 'css-oversized:' . $name;
+				continue;
+			}
+			$text = @file_get_contents( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- bounded local read.
+			if ( false === $text ) {
+				$out['incomplete'][] = 'css-unreadable:' . $name;
+				continue;
+			}
+			$out['rows']++;
+			$out['bytes'] += strlen( $text );
+			$found         = Mobo_Core_Legacy_Image_Policy::extract_content_references( $text );
+			foreach ( array_keys( self::match_basenames( $found['basenames'], $index ) ) as $id ) {
+				$out['hits'][ $id ] = $bit;
+			}
+		}
+		return $out;
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Phase 3: finalize                                                  */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Classify and count one candidate chunk.
+	 *
+	 * @param array $state State.
+	 * @return array{state:array,error:string}
+	 */
+	public function finalize_step( array $state ) {
+		$chunks = (int) ceil( absint( $state['pending'] ) / self::CHUNK_SIZE );
+		$chunk  = absint( $state['finalizeChunk'] );
+		if ( $chunk >= $chunks ) {
+			$state['status']      = 'complete';
+			$state['completedAt'] = time();
+			return array( 'state' => $state, 'error' => '' );
+		}
+		$entries    = get_option( self::CAND_PREFIX . $chunk, array() );
+		$hits       = get_option( self::HITS_OPTION, array() );
+		$hits       = is_array( $hits ) ? $hits : array();
+		$incomplete = ! empty( $state['incomplete'] );
+		$items      = array();
+		foreach ( is_array( $entries ) ? $entries : array() as $id => $entry ) {
+			$verdict = Mobo_Core_Legacy_Image_Policy::finalize_candidate( (string) $entry['c'], isset( $hits[ $id ] ) ? (int) $hits[ $id ] : 0, $incomplete );
+			$items[] = array(
+				'id'        => absint( $id ),
+				'class'     => $verdict['class'],
+				'reason'    => '' !== $verdict['reason'] ? $verdict['reason'] : (string) $entry['r'],
+				'file'      => (string) $entry['f'],
+				'bytes'     => absint( $entry['b'] ),
+				'metaBytes' => absint( $entry['mb'] ),
+				'files'     => absint( $entry['n'] ),
+				'missing'   => absint( $entry['m'] ),
+				'sources'   => $verdict['sources'],
+			);
+		}
+		$state                  = $this->merge_batch( $state, array( 'items' => $items, 'scanned' => 0 ) );
+		$state['finalizeChunk'] = $chunk + 1;
+		if ( $state['finalizeChunk'] >= $chunks ) {
+			$state['status']      = 'complete';
+			$state['completedAt'] = time();
+		}
+		return array( 'state' => $state, 'error' => '' );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Helpers                                                            */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Whether a key starts with one of the prefixes.
+	 *
+	 * @param string   $key Key.
+	 * @param string[] $prefixes Prefixes.
+	 * @return bool
+	 */
+	private static function has_prefix( $key, array $prefixes ) {
+		foreach ( $prefixes as $prefix ) {
+			if ( 0 === strpos( (string) $key, $prefix ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Safe SQL identifier (table/column name).
+	 *
+	 * @param string $name Name.
+	 * @return bool
+	 */
+	private static function is_identifier( $name ) {
+		return 1 === preg_match( '/^[A-Za-z0-9_$]{1,64}$/', (string) $name );
 	}
 
 	/**

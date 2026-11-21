@@ -6027,40 +6027,73 @@ https://source.example/products/test-product/
 		$status  = sanitize_key( (string) $state['status'] );
 		$running = 'running' === $status;
 		$labels  = array(
-			Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE       => 'بدون استفاده (قابل حذف پس از اثبات نهایی)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE    => 'در استفاده محصول Mobo؛ WebP موجود (اول جایگزینی)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_IN_USE_NO_REPLACEMENT  => 'در استفاده؛ WebP جایگزین شناخته نشده (نگه داشته می‌شود)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_FOREIGN_USE  => 'استفاده خارج از محصولات Mobo (محافظت‌شده)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_LIVE         => 'تصویر فعلی صف تصاویر/نوسازی فعال (محافظت‌شده)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_FILE  => 'فایل مشترک با پیوست دیگر (محافظت‌شده)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_MEDIA => 'Shared Media (محافظت‌شده)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN    => 'نامطمئن (محافظت‌شده)',
-			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_NOT_MOBO     => 'آپلود فروشگاه / غیر Mobo (هرگز لمس نمی‌شود)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_DELETE_CANDIDATE          => 'بدون استفاده با اثبات قوی مالکیت Mobo (قابل حذف پس از اثبات نهایی)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_REPLACE_THEN_DELETE       => 'فقط در محصول Mobo؛ WebP موجود (اول جایگزینی)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_IN_USE_NO_REPLACEMENT     => 'در استفاده؛ WebP جایگزین شناخته نشده (نگه داشته می‌شود)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_REFERENCED      => 'مرجع در محتوا/Elementor/ACF/تنظیمات/اسلایدر/CSS (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_FOREIGN_USE     => 'در محصول فروشگاه یا پیوست به نوشته غیر Mobo (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_LIVE            => 'تصویر فعلی صف تصاویر/نوسازی فعال (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_FILE     => 'فایل مشترک با پیوست دیگر (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_SHARED_MEDIA    => 'Shared Media (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_WEAK_OWNERSHIP  => 'نامطمئن: فقط نشانگر، بدون اثبات قوی مالکیت (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_UNCERTAIN       => 'نامطمئن (محافظت‌شده)',
+			Mobo_Core_Legacy_Image_Policy::CLASS_PROTECTED_NOT_MOBO        => 'آپلود فروشگاه / غیر Mobo (هرگز لمس نمی‌شود)',
 		);
+		$source_labels = array(
+			'content'     => 'محتوای نوشته/برگه',
+			'revision'    => 'فقط در بازنگری‌ها (revision)',
+			'elementor'   => 'Elementor (داده/قالب/کیت)',
+			'acf'         => 'فیلدهای ACF',
+			'postmeta'    => 'سایر متاهای نوشته',
+			'termmeta'    => 'دسته‌ها و برچسب‌ها',
+			'options'     => 'تنظیمات سایت/پوسته/ابزارک‌ها',
+			'usermeta'    => 'متای کاربران',
+			'css'         => 'فایل‌های CSS المنتور',
+			'slider'      => 'اسلایدرها (Revolution/Smart/Layer)',
+			'translation' => 'ترجمه‌های پیوست (WPML/Polylang)',
+			'sharedfile'  => 'فایل/برش مشترک در متادیتای پیوست دیگر',
+			'plugin'      => 'جداول افزونه‌های دیگر (مثلاً همگام‌سازی باسلام)',
+		);
+		$phase_labels = array(
+			'attachments' => 'مرحله ۱ از ۳: مالکیت و استفاده مستقیم پیوست‌ها',
+			'refs'        => 'مرحله ۲ از ۳: جست‌وجوی مراجع در کل سایت',
+			'finalize'    => 'مرحله ۳ از ۳: نتیجه‌گیری',
+		);
+		$phase      = sanitize_key( (string) $state['phase'] );
 		$total      = absint( $state['estimatedTotal'] );
 		$scanned    = absint( $state['scanned'] );
-		$percent    = 'content' === $state['phase'] ? 0 : ( $total > 0 ? min( 100, round( ( $scanned / $total ) * 100, 1 ) ) : 0 );
+		$sources    = is_array( $state['sources'] ) ? $state['sources'] : array();
+		if ( 'attachments' === $phase ) {
+			$percent = $total > 0 ? min( 100, round( ( $scanned / $total ) * 100, 1 ) ) : 0;
+		} elseif ( 'refs' === $phase ) {
+			$percent = count( $sources ) > 0 ? min( 100, round( ( absint( $state['sourceIndex'] ) / count( $sources ) ) * 100, 1 ) ) : 0;
+		} else {
+			$percent = 100;
+		}
 		$last_label = absint( $state['lastRunAt'] ) > 0 ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $state['lastRunAt'] ) ) : 'هنوز اجرا نشده';
 		?>
 		<div class="mobo-card mobo-card-wide mobo-legacy-image-audit-card" id="mobo-legacy-image-audit">
 			<div class="mobo-admin-card-heading">
 				<div>
 					<h2 class="mobo-admin-section-title">پاک‌سازی تصاویر قدیمی — بررسی (فقط خواندنی)</h2>
-					<p>پیوست‌های JPG/PNG که نسخه‌های قدیمی افزونه از فروشگاه منبع دانلود کرده‌اند شناسایی، دسته‌بندی و حجمشان برآورد می‌شود. این بخش هیچ فایل، پیوست یا محصولی را تغییر نمی‌دهد. آپلودهای خود فروشگاه (بدون نشانگر img_guid/image_guid) هرگز کاندید نمی‌شوند.</p>
+					<p>پیوست‌های JPG/PNG که نسخه‌های قدیمی افزونه از فروشگاه منبع دانلود کرده‌اند شناسایی، دسته‌بندی و حجمشان برآورد می‌شود. این بخش هیچ فایل، پیوست یا محصولی را تغییر نمی‌دهد. فقط پیوستی کاندید است که هم نشانگر Mobo دارد و هم اثبات قوی (اتصال به محصول Mobo یا نام فایلی که کد Mobo ساخته)، و در هیچ جای سایت (محتوا، Elementor، ACF، تنظیمات، دسته‌ها، اسلایدرها، CSS) به آن ارجاع نشده است. آپلودهای خود فروشگاه هرگز کاندید نمی‌شوند.</p>
 				</div>
 				<span class="mobo-admin-badge mobo-admin-badge--<?php echo esc_attr( 'complete' === $status ? 'success' : ( $running ? 'info' : 'warning' ) ); ?>"><?php echo esc_html( array( 'idle' => 'اجرا نشده', 'running' => 'در حال بررسی', 'stopped' => 'متوقف‌شده', 'complete' => 'کامل' )[ $status ] ?? $status ); ?></span>
 			</div>
 			<div class="mobo-status-grid">
-				<?php $this->status_box( 'کاندید پاک‌سازی (a+b)', number_format_i18n( absint( $summary['candidates'] ) ) ); ?>
-				<?php $this->status_box( 'حجم قابل آزادسازی (فایل‌های موجود)', size_format( absint( $summary['bytes'] ), 1 ) ); ?>
-				<?php $this->status_box( 'حجم طبق متادیتای وردپرس', size_format( absint( $summary['metadataBytes'] ), 1 ) ); ?>
+				<?php $this->status_box( 'بدون استفاده (اثبات قوی)', number_format_i18n( absint( $summary['deleteCandidates'] ) ) ); ?>
+				<?php $this->status_box( 'حجم بدون استفاده (فایل‌های موجود / متادیتا)', size_format( absint( $summary['unusedBytes'] ), 1 ) . ' / ' . size_format( absint( $summary['unusedMetadataBytes'] ), 1 ) ); ?>
+				<?php $this->status_box( 'محافظت‌شده چون مرجع دارد', number_format_i18n( absint( $summary['referenced'] ) ) ); ?>
+				<?php $this->status_box( 'نامطمئن (مالکیت ضعیف / سایر)', number_format_i18n( absint( $summary['unsureWeakOwnership'] ) ) . ' / ' . number_format_i18n( absint( $summary['unsure'] ) ) ); ?>
+				<?php $this->status_box( 'متعلق به فروشگاه (غیر Mobo)', number_format_i18n( absint( $summary['merchant'] ) ) ); ?>
 				<?php $this->status_box( 'پیوست JPG/PNG بررسی‌شده', number_format_i18n( $scanned ) . ' / ' . number_format_i18n( $total ) ); ?>
 				<?php $this->status_box( 'آخرین اجرا', $last_label ); ?>
 			</div>
 			<?php if ( $running || 'stopped' === $status ) : ?>
-				<div class="mobo-progress-wrap"><div class="mobo-progress-meta"><span><?php echo esc_html( 'content' === $state['phase'] ? 'مرحله ۱: جمع‌آوری مراجع محتوای نوشته‌ها' : 'مرحله ۲: دسته‌بندی پیوست‌ها' ); ?></span><strong><?php echo esc_html( number_format_i18n( $percent, 1 ) . '٪' ); ?></strong></div><div class="mobo-progress"><div style="width: <?php echo esc_attr( $percent ); ?>%;"></div></div></div>
+				<div class="mobo-progress-wrap"><div class="mobo-progress-meta"><span><?php echo esc_html( isset( $phase_labels[ $phase ] ) ? $phase_labels[ $phase ] : $phase ); ?><?php if ( 'refs' === $phase && isset( $sources[ absint( $state['sourceIndex'] ) ]['id'] ) ) : ?> — <code dir="ltr"><?php echo esc_html( (string) $sources[ absint( $state['sourceIndex'] ) ]['id'] ); ?></code><?php endif; ?></span><strong><?php echo esc_html( number_format_i18n( $percent, 1 ) . '٪' ); ?></strong></div><div class="mobo-progress"><div style="width: <?php echo esc_attr( $percent ); ?>%;"></div></div></div>
 			<?php endif; ?>
 			<?php if ( '' !== (string) $state['lastError'] ) : ?><div class="mobo-alert mobo-alert-warning"><?php echo esc_html( (string) $state['lastError'] ); ?></div><?php endif; ?>
+			<?php if ( empty( $summary['referenceIndexComplete'] ) ) : ?><div class="mobo-alert mobo-alert-warning">جست‌وجوی مراجع کامل نبود (ردیف/فایل بسیار بزرگ یا ظرفیت). هیچ پیوستی «بدون استفاده» اعلام نمی‌شود و همه کاندیدها «نامطمئن» می‌مانند.<?php if ( ! empty( $summary['incompleteReasons'] ) ) : ?> <code dir="ltr"><?php echo esc_html( implode( ' | ', $summary['incompleteReasons'] ) ); ?></code><?php endif; ?></div><?php endif; ?>
 			<table class="widefat striped" style="margin:12px 0;">
 				<thead><tr><th>دسته</th><th>تعداد</th><th>حجم موجود</th><th>حجم متادیتا</th><th>فایل‌ها (مفقود)</th></tr></thead>
 				<tbody>
@@ -6069,6 +6102,17 @@ https://source.example/products/test-product/
 				<?php endforeach; ?>
 				</tbody>
 			</table>
+			<?php if ( absint( $summary['referenced'] ) > 0 ) : ?>
+				<table class="widefat striped" style="margin:0 0 12px;">
+					<thead><tr><th>محافظت‌شده چون مرجع دارد — منبع مرجع</th><th>تعداد پیوست</th></tr></thead>
+					<tbody>
+					<?php foreach ( $source_labels as $source => $label ) : $count = absint( isset( $summary['referencedBySource'][ $source ] ) ? $summary['referencedBySource'][ $source ] : 0 ); if ( $count <= 0 ) { continue; } ?>
+						<tr><td><?php echo esc_html( $label ); ?></td><td><?php echo esc_html( number_format_i18n( $count ) ); ?></td></tr>
+					<?php endforeach; ?>
+					</tbody>
+				</table>
+				<p class="description">یک پیوست ممکن است در چند منبع مرجع داشته باشد.</p>
+			<?php endif; ?>
 			<?php if ( ! empty( $state['samples'] ) ) : ?>
 				<details><summary>نمونه موارد (حداکثر <?php echo esc_html( number_format_i18n( Mobo_Core_Legacy_Image_Audit::SAMPLE_LIMIT ) ); ?>)</summary>
 					<table class="widefat striped"><thead><tr><th>شناسه پیوست</th><th>فایل</th><th>دسته / دلیل</th><th>حجم</th></tr></thead><tbody>
@@ -6099,7 +6143,7 @@ https://source.example/products/test-product/
 					</form>
 				<?php endif; ?>
 			</div>
-			<div class="mobo-note">حذف در این نسخه فعال نیست. «بدون استفاده» یعنی در تصویر شاخص/گالری محصولات و متغیرها، متادیتای دسته‌ها، تنظیمات سایت و محتوای نوشته‌ها مرجعی پیدا نشد؛ پیش از هر حذف آینده یک اثبات کامل دیگر روی همه جداول لازم است.</div>
+			<div class="mobo-note">حذف در این نسخه فعال نیست. «بدون استفاده» یعنی شناسه پیوست و نام هیچ‌کدام از فایل‌ها/برش‌هایش در محتوای همه نوشته‌ها (همه وضعیت‌ها و بازنگری‌ها)، همه متاهای نوشته (Elementor، ACF، ووکامرس)، دسته‌ها، کاربران، تنظیمات سایت، جداول اسلایدر و فایل‌های CSS المنتور پیدا نشد. بررسی در چند بخش کوتاه و قابل ادامه اجرا می‌شود؛ تغییراتی که پس از اسکن در سایت داده شود دیده نمی‌شود، پس پیش از هر حذف آینده اثبات دوباره لازم است.</div>
 			<?php if ( $running ) : ?>
 				<script>
 				(function () {

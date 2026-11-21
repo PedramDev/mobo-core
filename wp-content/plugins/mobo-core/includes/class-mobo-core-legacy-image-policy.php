@@ -10,11 +10,23 @@
  * the database or the filesystem itself (filesystem probes are injected), so
  * it is fully unit-testable.
  *
- * Ownership proof is GUID-first and identical to Mobo_Core_Image_Prune_Queue:
- * a valid `image_guid`/`img_guid` (agreeing when both exist) proves the plugin
- * created the attachment. `mobo_source_url` alone, a file name, an upload date
- * or a matching product never prove ownership. Anything not provably created
- * by the plugin is a merchant upload and is always protected.
+ * Ownership needs STRONG proof (customers run Elementor & co. and own many
+ * images unrelated to the plugin):
+ *   1. a valid ownership marker written by our code (`image_guid`/`img_guid`,
+ *      agreeing when both exist), AND
+ *   2. either a linkage to a Mobo-owned product (post_parent is a Mobo product,
+ *      Mobo product featured/gallery reference, the GUID is in our image queue,
+ *      or our refresh code recorded a replacement), or a file name our download
+ *      code produced (see filename_pattern()).
+ * A marker alone (e.g. `img_guid` copied by a "duplicate" plugin) is only weak
+ * proof: such attachments are reported as "unsure" and protected. Attachments
+ * without any marker (merchant uploads and the earliest unmarked plugin
+ * version) are never candidates. `mobo_source_url` alone, a file name alone, an
+ * upload date or a matching product never prove ownership.
+ *
+ * Reference rules (what counts as USED) are implemented as pure extractors
+ * here and applied by the scanner to post content, all postmeta, termmeta,
+ * usermeta, options, slider/plugin tables and Elementor CSS files.
  *
  * PHP 7.4 compatible.
  */
@@ -37,8 +49,12 @@ final class Mobo_Core_Legacy_Image_Policy {
 	const CLASS_PROTECTED_SHARED_FILE = 'protected_shared_file';
 	/* Still the current desired-state attachment of the image queue, or in an active refresh. */
 	const CLASS_PROTECTED_LIVE = 'protected_live';
-	/* Used outside Mobo products (merchant product, term, option, post content, ...). */
+	/* Used by a merchant product (featured/gallery/variation) or attached to a non-Mobo post. */
 	const CLASS_PROTECTED_FOREIGN_USE = 'protected_foreign_use';
+	/* Referenced from content, page builders, ACF, options, terms, sliders, CSS, translations, ... */
+	const CLASS_PROTECTED_REFERENCED = 'protected_referenced';
+	/* Ownership marker present but no linkage/filename proof: unsure, protected. */
+	const CLASS_PROTECTED_WEAK_OWNERSHIP = 'protected_weak_ownership';
 	/* (a) Used only by Mobo products and a WebP replacement exists or can be fetched. */
 	const CLASS_REPLACE_THEN_DELETE = 'replace_then_delete';
 	/* Used only by Mobo products but no WebP replacement is known: keep. */
@@ -56,13 +72,161 @@ final class Mobo_Core_Legacy_Image_Policy {
 			self::CLASS_DELETE_CANDIDATE,
 			self::CLASS_REPLACE_THEN_DELETE,
 			self::CLASS_IN_USE_NO_REPLACEMENT,
+			self::CLASS_PROTECTED_REFERENCED,
 			self::CLASS_PROTECTED_FOREIGN_USE,
 			self::CLASS_PROTECTED_LIVE,
 			self::CLASS_PROTECTED_SHARED_FILE,
 			self::CLASS_PROTECTED_SHARED_MEDIA,
+			self::CLASS_PROTECTED_WEAK_OWNERSHIP,
 			self::CLASS_PROTECTED_UNCERTAIN,
 			self::CLASS_PROTECTED_NOT_MOBO,
 		);
+	}
+
+	/**
+	 * Reference sources (report buckets) and their bit in a hit mask.
+	 *
+	 * @return array<string,int>
+	 */
+	public static function reference_sources() {
+		return array(
+			'content'     => 1,
+			'revision'    => 2,
+			'elementor'   => 4,
+			'acf'         => 8,
+			'postmeta'    => 16,
+			'termmeta'    => 32,
+			'options'     => 64,
+			'usermeta'    => 128,
+			'css'         => 256,
+			'slider'      => 512,
+			'translation' => 1024,
+			'sharedfile'  => 2048,
+			'plugin'      => 4096,
+		);
+	}
+
+	/**
+	 * Bit of one reference source (0 = unknown).
+	 *
+	 * @param string $source Source name.
+	 * @return int
+	 */
+	public static function source_bit( $source ) {
+		$all = self::reference_sources();
+		return isset( $all[ (string) $source ] ) ? (int) $all[ (string) $source ] : 0;
+	}
+
+	/**
+	 * Source names contained in a hit mask, in report order.
+	 *
+	 * @param int $mask Hit mask.
+	 * @return string[]
+	 */
+	public static function sources_from_mask( $mask ) {
+		$mask = (int) $mask;
+		$out  = array();
+		foreach ( self::reference_sources() as $name => $bit ) {
+			if ( $mask & $bit ) {
+				$out[] = $name;
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Final class of a candidate that waited for the site-wide reference index.
+	 *
+	 * A hit always protects. Without a hit, an incomplete index (oversized row,
+	 * unreadable file, capacity) makes the candidate "unsure", never "unused".
+	 *
+	 * @param string $class Class from the attachment pass (a candidate class).
+	 * @param int    $mask Reference hit mask.
+	 * @param bool   $index_incomplete Whether any reference source was skipped.
+	 * @return array{class:string,reason:string,sources:string[]}
+	 */
+	public static function finalize_candidate( $class, $mask, $index_incomplete ) {
+		$sources = self::sources_from_mask( (int) $mask );
+		if ( ! empty( $sources ) ) {
+			return array( 'class' => self::CLASS_PROTECTED_REFERENCED, 'reason' => 'referenced-by-' . $sources[0], 'sources' => $sources );
+		}
+		if ( $index_incomplete ) {
+			return array( 'class' => self::CLASS_PROTECTED_UNCERTAIN, 'reason' => 'reference-index-incomplete', 'sources' => array() );
+		}
+		return array( 'class' => (string) $class, 'reason' => '', 'sources' => array() );
+	}
+
+	/**
+	 * Whether a file name is one our historical download code produced.
+	 *
+	 * Old versions saved `basename(source URL)` into uploads and inserted the
+	 * attachment with an empty caption/description and no parent:
+	 * - db8c5c9..b1bce7d: post_title = sanitize_file_name(basename) WITH extension
+	 *   (WordPress' own uploader never keeps the extension in the title);
+	 * - Mobo Source file names are short hex tokens (e.g. `5897fb.jpeg`), kept
+	 *   by every version, plus WordPress' `-N`/`-scaled`/`-rotated` suffixes;
+	 * - newer image sync records `mobo_source_url`; the stored file is that
+	 *   URL's basename (plus `-N`/`-scaled`).
+	 * A non-empty caption/description means a person edited the attachment, so
+	 * it is never treated as produced by our code.
+	 *
+	 * @param string $title Attachment post_title.
+	 * @param int    $text_length Length of post_content + post_excerpt.
+	 * @param string $attached_file _wp_attached_file.
+	 * @param mixed  $metadata Unserialized _wp_attachment_metadata.
+	 * @param string $source_url mobo_source_url meta (optional).
+	 * @return string Pattern name, '' when none matched.
+	 */
+	public static function filename_pattern( $title, $text_length, $attached_file, $metadata, $source_url = '' ) {
+		if ( absint( $text_length ) > 0 ) {
+			return '';
+		}
+		$file_base = self::base_name( str_replace( '\\', '/', (string) $attached_file ) );
+		if ( '' === $file_base || ! self::is_legacy_raster( '', $file_base ) ) {
+			return '';
+		}
+		$metadata = is_array( $metadata ) ? $metadata : array();
+		$original = ! empty( $metadata['original_image'] ) && is_string( $metadata['original_image'] ) ? self::base_name( $metadata['original_image'] ) : preg_replace( '/-(?:scaled|rotated)(\.[a-z0-9]+)$/i', '$1', $file_base );
+		$title    = trim( (string) $title );
+
+		if ( '' !== $title && 1 === preg_match( '/\.(?:jpe?g|jpe|png)$/i', $title ) && ( $title === $original || self::lower( $title ) === self::lower( $original ) || self::lower( $title ) === self::lower( $file_base ) ) ) {
+			return 'title-equals-filename';
+		}
+		if ( 1 === preg_match( '/^[0-9a-f]{6,32}(?:-(?:\d{1,4}|scaled|rotated))*\.(?:jpe?g|jpe|png)$/i', $file_base ) ) {
+			return 'source-hex-filename';
+		}
+		$source_url = trim( (string) $source_url );
+		if ( '' !== $source_url ) {
+			$source_path = (string) parse_url( $source_url, PHP_URL_PATH ); // phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- pure parsing.
+			$source_base = self::lower( rawurldecode( self::base_name( $source_path ) ) );
+			$normalized  = self::lower( preg_replace( '/(?:-(?:\d{1,4}|scaled|rotated))+(\.[a-z0-9]+)$/i', '$1', $file_base ) );
+			if ( '' !== $source_base && ( $source_base === self::lower( $file_base ) || $source_base === $normalized ) ) {
+				return 'source-url-filename';
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Ownership strength from an identity, linkage facts and a filename pattern.
+	 *
+	 * @param array  $identity identity() result.
+	 * @param array  $linkage Linkage names (parent-mobo-product, mobo-product-ref, image-queue-guid, refresh-marker).
+	 * @param string $filename_pattern filename_pattern() result.
+	 * @return array{strong:bool,proof:string}
+	 */
+	public static function ownership_strength( array $identity, array $linkage, $filename_pattern ) {
+		if ( empty( $identity['marked'] ) || ! empty( $identity['conflict'] ) || ! empty( $identity['invalid'] ) || '' === (string) ( isset( $identity['canonical'] ) ? $identity['canonical'] : '' ) ) {
+			return array( 'strong' => false, 'proof' => '' );
+		}
+		$linkage = array_values( array_filter( array_map( 'strval', $linkage ) ) );
+		if ( ! empty( $linkage ) ) {
+			return array( 'strong' => true, 'proof' => 'marker+' . $linkage[0] );
+		}
+		if ( '' !== (string) $filename_pattern ) {
+			return array( 'strong' => true, 'proof' => 'marker+' . (string) $filename_pattern );
+		}
+		return array( 'strong' => false, 'proof' => 'marker-only' );
 	}
 
 	/**
@@ -177,7 +341,10 @@ final class Mobo_Core_Legacy_Image_Policy {
 	 *   non-WebP source and might reuse this JPG/PNG
 	 * - refs_complete (bool) every reference check of the scanner ran
 	 * - refs (array of array{kind:string, mobo:bool|null})
-	 *   kind: featured|gallery|variation|term|option|content|other
+	 *   kind: featured|gallery|variation|other (product context) or a
+	 *   reference_sources() name (termmeta, options, translation, ...)
+	 * - linkage (string[]) parent-mobo-product|image-queue-guid|refresh-marker
+	 * - filename_pattern (string) filename_pattern() result
 	 * - replaced_by_valid (bool) a recorded, valid WebP replacement exists
 	 * - webp_available (bool) a current WebP attachment/source exists for the GUID
 	 *
@@ -233,14 +400,32 @@ final class Mobo_Core_Legacy_Image_Policy {
 
 		$refs = $get( 'refs', array() );
 		$refs = is_array( $refs ) ? $refs : array();
-		if ( ! empty( $refs ) ) {
-			foreach ( $refs as $ref ) {
-				$kind = is_array( $ref ) && isset( $ref['kind'] ) ? (string) $ref['kind'] : 'other';
-				$mobo = is_array( $ref ) && array_key_exists( 'mobo', $ref ) ? $ref['mobo'] : null;
-				if ( ! in_array( $kind, array( 'featured', 'gallery', 'variation' ), true ) || true !== $mobo ) {
-					return self::result( self::CLASS_PROTECTED_FOREIGN_USE, 'referenced-by-' . preg_replace( '/[^a-z_]/', '', $kind ) . ( true === $mobo ? '' : '-non-mobo' ), $guid );
-				}
+		$mobo_product_ref = false;
+		foreach ( $refs as $ref ) {
+			$kind = is_array( $ref ) && isset( $ref['kind'] ) ? (string) $ref['kind'] : 'other';
+			$mobo = is_array( $ref ) && array_key_exists( 'mobo', $ref ) ? $ref['mobo'] : null;
+			if ( in_array( $kind, array( 'featured', 'gallery', 'variation' ), true ) && true === $mobo ) {
+				$mobo_product_ref = true;
+				continue;
 			}
+			$kind = preg_replace( '/[^a-z_]/', '', $kind );
+			if ( 0 !== self::source_bit( $kind ) ) {
+				return self::result( self::CLASS_PROTECTED_REFERENCED, 'referenced-by-' . $kind, $guid );
+			}
+			return self::result( self::CLASS_PROTECTED_FOREIGN_USE, 'referenced-by-' . $kind . ( true === $mobo ? '' : '-non-mobo' ), $guid );
+		}
+
+		$linkage = $get( 'linkage', array() );
+		$linkage = is_array( $linkage ) ? $linkage : array();
+		if ( $mobo_product_ref ) {
+			$linkage[] = 'mobo-product-ref';
+		}
+		$ownership = self::ownership_strength( $identity, $linkage, (string) $get( 'filename_pattern', '' ) );
+		if ( ! $ownership['strong'] ) {
+			return self::result( self::CLASS_PROTECTED_WEAK_OWNERSHIP, 'weak-ownership-marker-only', $guid );
+		}
+
+		if ( ! empty( $refs ) ) {
 			if ( true === $get( 'replaced_by_valid', false ) || true === $get( 'webp_available', false ) ) {
 				return self::result( self::CLASS_REPLACE_THEN_DELETE, true === $get( 'replaced_by_valid', false ) ? 'replacement-recorded-still-referenced' : 'webp-replacement-available', $guid );
 			}
@@ -271,7 +456,7 @@ final class Mobo_Core_Legacy_Image_Policy {
 		$files[ $relative_file ] = isset( $metadata['filesize'] ) ? absint( $metadata['filesize'] ) : 0;
 
 		if ( ! empty( $metadata['original_image'] ) && is_string( $metadata['original_image'] ) ) {
-			$original = $prefix . basename( str_replace( '\\', '/', $metadata['original_image'] ) );
+			$original = $prefix . self::base_name( $metadata['original_image'] );
 			if ( self::is_safe_relative_path( $original ) && ! isset( $files[ $original ] ) ) {
 				$files[ $original ] = 0;
 			}
@@ -282,7 +467,7 @@ final class Mobo_Core_Legacy_Image_Policy {
 			if ( ! is_array( $size ) || empty( $size['file'] ) || ! is_string( $size['file'] ) ) {
 				continue;
 			}
-			$path = $prefix . basename( str_replace( '\\', '/', $size['file'] ) );
+			$path = $prefix . self::base_name( $size['file'] );
 			if ( ! self::is_safe_relative_path( $path ) ) {
 				continue;
 			}
@@ -362,36 +547,312 @@ final class Mobo_Core_Legacy_Image_Policy {
 		}
 		$basenames = array();
 		$ids       = array();
-		$variants  = array( $text, str_replace( '\\/', '/', $text ), rawurldecode( $text ) );
-		foreach ( array_unique( $variants ) as $variant ) {
-			if ( preg_match_all( '#([^\s"\'<>()\[\]{},=/\\\\|]+\.(?:jpe?g|jpe|png))(?![a-z0-9])#i', $variant, $m ) ) {
-				foreach ( $m[1] as $basename ) {
-					$basenames[ strtolower( $basename ) ] = true;
+		$add_ids   = static function ( $list ) use ( &$ids ) {
+			foreach ( self::parse_gallery( preg_replace( '/[\s"\'\\\\]+/', '', (string) $list ) ) as $id ) {
+				$ids[ $id ] = true;
+			}
+		};
+
+		/* Basenames: only texts that can hold a raster file name are scanned. */
+		if ( false !== stripos( $text, 'jp' ) || false !== stripos( $text, 'png' ) ) {
+			$variants = array( $text );
+			if ( false !== strpos( $text, '\\/' ) ) {
+				$variants[] = str_replace( '\\/', '/', $text );
+			}
+			if ( false !== strpos( $text, '%' ) ) {
+				$variants[] = rawurldecode( str_replace( '\\/', '/', $text ) );
+			}
+			if ( false !== stripos( $text, '\\u' ) ) {
+				$variants[] = self::unescape_unicode( str_replace( '\\/', '/', $text ) );
+			}
+			if ( false !== strpos( $text, '&#' ) || false !== strpos( $text, '&amp;' ) ) {
+				$variants[] = html_entity_decode( $text, ENT_QUOTES, 'UTF-8' );
+			}
+			foreach ( array_unique( $variants ) as $variant ) {
+				if ( preg_match_all( '#([^\s"\'<>()\[\]{},=/\\\\|;:*?]+\.(?:jpe?g|jpe|png))(?![a-z0-9])#i', $variant, $m ) ) {
+					foreach ( $m[1] as $basename ) {
+						$basenames[ self::lower( $basename ) ] = true;
+					}
 				}
 			}
 		}
+
+		/* Gutenberg/classic editor classes. */
 		if ( preg_match_all( '/wp-image-(\d+)/', $text, $m ) ) {
 			foreach ( $m[1] as $id ) {
 				$ids[ (int) $id ] = true;
 			}
 		}
-		if ( preg_match_all( '/(?:ids|include)\s*=\s*\\\\?["\']([^"\'\\\\]*)/i', $text, $m ) ) {
-			foreach ( $m[1] as $list ) {
-				foreach ( self::parse_gallery( $list ) as $id ) {
-					$ids[ $id ] = true;
+		/* data-id / data-attachment-id / data-image-id attributes (galleries, sliders). */
+		if ( preg_match_all( '/data-(?:id|attachment-id|image-id|media-id)\s*=\s*\\\\?["\']?(\d+)/i', $text, $m ) ) {
+			foreach ( $m[1] as $id ) {
+				$ids[ (int) $id ] = true;
+			}
+		}
+		/* Shortcode / HTML attributes: [gallery ids=".."], [vc_single_image image="12"],
+		 * [vc_gallery images="1,2"], bg_image="5", id="7", include="1,2" ... */
+		if ( preg_match_all( '/([A-Za-z][A-Za-z0-9_\-]*)\s*=\s*\\\\?["\']?\s*(\d+(?:\s*,\s*\d+)*)(?![A-Za-z0-9_\-.])/', $text, $m, PREG_SET_ORDER ) ) {
+			foreach ( $m as $match ) {
+				if ( self::is_media_key( $match[1] ) || in_array( strtolower( $match[1] ), array( 'include', 'images', 'img' ), true ) ) {
+					$add_ids( $match[2] );
 				}
 			}
 		}
-		if ( preg_match_all( '/"(?:id|ids|mediaId|attachmentId|attachment_id|imageId|image_id)"\s*:\s*\[?\s*"?(\d+(?:\s*,\s*\d+)*)/', $text, $m ) ) {
-			foreach ( $m[1] as $list ) {
-				foreach ( self::parse_gallery( $list ) as $id ) {
-					$ids[ $id ] = true;
+		/* JSON (Elementor, blocks, sliders): "id":12, "ids":[1,2], "mediaId":"5", "image_id":7 ... */
+		if ( preg_match_all( '/"([A-Za-z][A-Za-z0-9_\-]*)"\s*:\s*\[?\s*"?(\d+(?:\s*"?\s*,\s*"?\s*\d+)*)(?![A-Za-z0-9_\-.])/', $text, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
+			foreach ( $m as $match ) {
+				if ( self::is_media_key( $match[1][0] ) && self::bare_id_in_media_context( $text, $match[1][0], $match[0][1] ) ) {
+					$add_ids( $match[2][0] );
 				}
 			}
 		}
+		/* Escaped JSON inside strings: \"id\":12 */
+		if ( false !== strpos( $text, '\\"' ) && preg_match_all( '/\\\\"([A-Za-z][A-Za-z0-9_\-]*)\\\\"\s*:\s*\[?\s*(?:\\\\")?(\d+)(?![A-Za-z0-9_\-.])/', $text, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
+			foreach ( $m as $match ) {
+				if ( self::is_media_key( $match[1][0] ) && self::bare_id_in_media_context( $text, $match[1][0], $match[0][1] ) ) {
+					$ids[ (int) $match[2][0] ] = true;
+				}
+			}
+		}
+		/* PHP-serialized arrays (options, ACF, theme mods, widgets, kits):
+		 * s:2:"id";i:12;  s:8:"image_id";s:2:"12";  s:7:"gallery";a:2:{i:0;i:5;i:1;s:1:"6";} */
+		if ( false !== strpos( $text, ':"' ) && preg_match_all( '/s:\d+:"([A-Za-z0-9_\-]+)";(?:i:(\d+);|s:\d+:"(\d+(?:,\d+)*)";|a:\d+:\{((?:i:\d+;(?:i:\d+;|s:\d+:"\d+";))+)\})/', $text, $m, PREG_SET_ORDER | PREG_OFFSET_CAPTURE ) ) {
+			foreach ( $m as $match ) {
+				$offset = $match[0][1];
+				foreach ( $match as $group => $capture ) {
+					$match[ $group ] = is_array( $capture ) ? $capture[0] : $capture;
+				}
+				if ( ! self::is_media_key( $match[1] ) || ! self::bare_id_in_media_context( $text, $match[1], $offset ) ) {
+					continue;
+				}
+				if ( isset( $match[2] ) && '' !== $match[2] ) {
+					$ids[ (int) $match[2] ] = true;
+				} elseif ( isset( $match[3] ) && '' !== $match[3] ) {
+					$add_ids( $match[3] );
+				} elseif ( isset( $match[4] ) && preg_match_all( '/i:\d+;(?:i:(\d+);|s:\d+:"(\d+)";)/', $match[4], $mm, PREG_SET_ORDER ) ) {
+					foreach ( $mm as $item ) {
+						$ids[ (int) ( '' !== $item[1] ? $item[1] : $item[2] ) ] = true;
+					}
+				}
+			}
+		}
+		/* Other plugins' attachment handles, e.g. "attachment:55859". */
+		if ( preg_match_all( '/\battachment[:#](\d+)\b/i', $text, $m ) ) {
+			foreach ( $m[1] as $id ) {
+				$ids[ (int) $id ] = true;
+			}
+		}
+		unset( $ids[0] );
 		$out['basenames'] = array_keys( $basenames );
-		$out['ids']       = array_keys( $ids );
+		$out['ids']       = array_map( 'intval', array_keys( $ids ) );
 		return $out;
+	}
+
+	/**
+	 * A bare `id` key is only an attachment reference in a media context: a
+	 * Gutenberg block comment, or an object that also carries an image/uploads `url` (the
+	 * Elementor/kit media control shape {"url":"..","id":12}). Other plugins'
+	 * caches use `"id"` for template/remote/item numbers (e.g. Elementor's remote
+	 * template library), which must not protect an unrelated attachment.
+	 * Specific keys (image_id, mediaId, ids, ...) are always accepted.
+	 *
+	 * @param string $text Whole text.
+	 * @param string $key Matched key.
+	 * @param int    $offset Byte offset of the match.
+	 * @return bool
+	 */
+	public static function bare_id_in_media_context( $text, $key, $offset ) {
+		if ( 'id' !== strtolower( (string) $key ) ) {
+			return true;
+		}
+		if ( false !== strpos( (string) $text, '<!-- wp:' ) ) {
+			return true;
+		}
+		$start  = max( 0, (int) $offset - 300 );
+		$window = substr( (string) $text, $start, 600 );
+		/* The url must point at an image / uploads file, not a page or remote item. */
+		return 1 === preg_match( '#(?:\\\\?"url\\\\?"\s*:\s*\\\\?"|s:3:"url";s:\d+:")[^"]*?(?:\.(?:jpe?g|jpe|png|gif|webp|avif|svg)|/uploads/)#i', $window );
+	}
+	/**
+	 * Byte-safe basename (PHP's basename() is locale dependent for multibyte names).
+	 *
+	 * @param string $path Path or URL path.
+	 * @return string
+	 */
+	public static function base_name( $path ) {
+		$path = rtrim( str_replace( '\\', '/', (string) $path ), '/' );
+		$pos  = strrpos( $path, '/' );
+		return false === $pos ? $path : substr( $path, $pos + 1 );
+	}
+	/**
+	 * ASCII-only lower-case. strtolower() on PHP < 8.2 follows the process
+	 * locale and can rewrite UTF-8 bytes of Persian/Arabic file names.
+	 *
+	 * @param string $value Value.
+	 * @return string
+	 */
+	public static function lower( $value ) {
+		return strtr( (string) $value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz' );
+	}
+	/**
+	 * Decode JSON \uXXXX escapes (Elementor stores Persian file names that way).
+	 *
+	 * @param string $text Text.
+	 * @return string
+	 */
+	public static function unescape_unicode( $text ) {
+		return (string) preg_replace_callback(
+			'/\\\\u([dD][89abAB][0-9a-fA-F]{2})\\\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\\\u([0-9a-fA-F]{4})/',
+			static function ( $m ) {
+				if ( isset( $m[3] ) && '' !== $m[3] ) {
+					$code = hexdec( $m[3] );
+				} else {
+					$code = 0x10000 + ( ( hexdec( $m[1] ) - 0xD800 ) << 10 ) + ( hexdec( $m[2] ) - 0xDC00 );
+				}
+				if ( $code < 0x80 ) {
+					return chr( $code );
+				}
+				if ( $code < 0x800 ) {
+					return chr( 0xC0 | ( $code >> 6 ) ) . chr( 0x80 | ( $code & 0x3F ) );
+				}
+				if ( $code < 0x10000 ) {
+					return chr( 0xE0 | ( $code >> 12 ) ) . chr( 0x80 | ( ( $code >> 6 ) & 0x3F ) ) . chr( 0x80 | ( $code & 0x3F ) );
+				}
+				return chr( 0xF0 | ( $code >> 18 ) ) . chr( 0x80 | ( ( $code >> 12 ) & 0x3F ) ) . chr( 0x80 | ( ( $code >> 6 ) & 0x3F ) ) . chr( 0x80 | ( $code & 0x3F ) );
+			},
+			(string) $text
+		);
+	}
+
+	/**
+	 * Whether a meta key / option name / JSON or serialized array key / shortcode
+	 * attribute names a media reference. Deliberately broad (a false hit only
+	 * protects): `id`, `*_id(s)`, camelCase `*Id(s)`, and names ending in
+	 * image/thumbnail/logo/gallery/banner/icon/bg/background/photo/media/
+	 * attachment/avatar/cover/poster/slide/hero (singular or plural).
+	 *
+	 * @param string $key Key.
+	 * @return bool
+	 */
+	public static function is_media_key( $key ) {
+		$key = (string) $key;
+		if ( '' === $key ) {
+			return false;
+		}
+		if ( 1 === preg_match( '/(?:^|[_\-])ids?$/i', $key ) || 1 === preg_match( '/[a-z0-9]Ids?$/', $key ) ) {
+			return true;
+		}
+		return 1 === preg_match( '/(?:image|img|thumbnail|thumb|logo|gallery|galleries|banner|icon|bg|background|photo|picture|poster|media|attachment|avatar|cover|slide|hero)s?$/i', $key );
+	}
+
+	/**
+	 * Whether a meta key / option name belongs to an ACF image/gallery/file
+	 * field: exact field name, a repeater/flexible sub-field (`rep_0_name`) or an
+	 * options-page value (`options_name`).
+	 *
+	 * @param string $key Meta key.
+	 * @param array  $acf_names Field name => true (image/gallery/file fields).
+	 * @return bool
+	 */
+	public static function is_acf_media_key( $key, array $acf_names ) {
+		$key = (string) $key;
+		if ( '' === $key || empty( $acf_names ) ) {
+			return false;
+		}
+		if ( isset( $acf_names[ $key ] ) ) {
+			return true;
+		}
+		$pos = strrpos( $key, '_' );
+		while ( false !== $pos && $pos > 0 ) {
+			if ( isset( $acf_names[ substr( $key, $pos + 1 ) ] ) ) {
+				return true;
+			}
+			$pos = strrpos( substr( $key, 0, $pos ), '_' );
+		}
+		return false;
+	}
+
+	/**
+	 * Attachment IDs a key/value pair holds as a plain value: a numeric value,
+	 * a CSV list, a serialized or JSON array of IDs. Only applied to media keys
+	 * (is_media_key()) or ACF media fields; an unrelated numeric value (stock,
+	 * price, counter) under another key is never read as an attachment ID.
+	 *
+	 * @param string $key Key.
+	 * @param string $value Raw value.
+	 * @param bool   $force Treat as media key (ACF field).
+	 * @return int[]
+	 */
+	public static function extract_value_ids( $key, $value, $force = false ) {
+		if ( ! $force && ! self::is_media_key( $key ) ) {
+			return array();
+		}
+		$value = trim( (string) $value );
+		if ( '' === $value ) {
+			return array();
+		}
+		if ( 1 === preg_match( '/^\d+(?:\s*,\s*\d+)*$/', $value ) ) {
+			return self::parse_gallery( $value );
+		}
+		$ids = array();
+		if ( 1 === preg_match( '/^a:\d+:\{/', $value ) && strlen( $value ) <= 1048576 ) {
+			$data = @unserialize( $value, array( 'allowed_classes' => false ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize -- classes disabled; read-only parse.
+			self::collect_numeric_leaves( $data, $ids, 0 );
+		} elseif ( '[' === $value[0] && strlen( $value ) <= 1048576 ) {
+			self::collect_numeric_leaves( json_decode( $value, true ), $ids, 0 );
+		}
+		unset( $ids[0] );
+		return array_map( 'intval', array_keys( $ids ) );
+	}
+
+	/**
+	 * Collect integer-like leaves of a decoded array (bounded depth/size).
+	 *
+	 * @param mixed $data Data.
+	 * @param array $ids Accumulator id => true.
+	 * @param int   $depth Depth.
+	 * @return void
+	 */
+	private static function collect_numeric_leaves( $data, array &$ids, $depth ) {
+		if ( $depth > 8 || count( $ids ) > 10000 ) {
+			return;
+		}
+		if ( is_array( $data ) ) {
+			foreach ( $data as $item ) {
+				self::collect_numeric_leaves( $item, $ids, $depth + 1 );
+			}
+			return;
+		}
+		if ( is_int( $data ) || ( is_string( $data ) && 1 === preg_match( '/^\d{1,19}$/', $data ) ) ) {
+			$ids[ (int) $data ] = true;
+		}
+	}
+
+	/**
+	 * Root of an image basename: WordPress size (`-300x300`), `-scaled`,
+	 * `-rotated`, edit (`-e1700000000000`) and Elementor thumb hash suffixes are
+	 * stripped, so a reference to any generated variant protects the original.
+	 * The `-N` uniqueness suffix is kept (it names a different upload).
+	 *
+	 * @param string $basename Lower-cased basename.
+	 * @return string
+	 */
+	public static function basename_root( $basename ) {
+		$basename = self::lower( (string) $basename );
+		$dot      = strrpos( $basename, '.' );
+		if ( false === $dot ) {
+			return $basename;
+		}
+		$stem = substr( $basename, 0, $dot );
+		$ext  = substr( $basename, $dot );
+		for ( $i = 0; $i < 4; $i++ ) {
+			$next = preg_replace( '/-(?:\d{1,5}x\d{1,5}|scaled|rotated|e\d{10,}|[a-z0-9]{24,})$/', '', $stem );
+			if ( $next === $stem || '' === $next ) {
+				break;
+			}
+			$stem = $next;
+		}
+		return $stem . $ext;
 	}
 
 	/**
