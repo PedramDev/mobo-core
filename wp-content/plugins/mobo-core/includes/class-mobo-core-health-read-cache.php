@@ -193,6 +193,14 @@ final class Mobo_Core_Health_Read_Cache {
 			return $dispatch_result;
 		}
 
+		/* S1: a database copy (clone/staging/backup restore) carries the original
+		 * site's last-good snapshot. Never answer with another site's identity or
+		 * with a clone verdict that no longer matches the live guard: compute live. */
+		if ( ! self::snapshot_matches_current_site( $snapshot ) ) {
+			self::schedule_near_refresh();
+			return $dispatch_result;
+		}
+
 		$age = max( 0, time() - absint( $snapshot['generatedAt'] ) );
 
 		if ( $age <= 120 ) {
@@ -208,6 +216,36 @@ final class Mobo_Core_Health_Read_Cache {
 		self::schedule_near_refresh();
 		$response = self::snapshot_to_response( $snapshot, true );
 		return $response instanceof WP_REST_Response ? $response : $dispatch_result;
+	}
+
+	/**
+	 * Whether a cached Health body was generated for THIS site address and the
+	 * current clone-guard verdict. Snapshots without the fields (older releases)
+	 * are accepted unchanged.
+	 *
+	 * @param array $snapshot Stored snapshot.
+	 * @return bool
+	 */
+	public static function snapshot_matches_current_site( $snapshot ) {
+		$body = is_array( $snapshot ) && isset( $snapshot['body'] ) && is_array( $snapshot['body'] ) ? $snapshot['body'] : array();
+		$data = isset( $body['data'] ) && is_array( $body['data'] ) ? $body['data'] : $body;
+		if ( ! class_exists( 'Mobo_Core_Clone_Guard' ) ) {
+			return true;
+		}
+		if ( isset( $data['siteUrl'] ) && is_scalar( $data['siteUrl'] ) && '' !== (string) $data['siteUrl'] ) {
+			/* Same source the Health body uses (home_url), so filtered/multilingual
+			 * home URLs compare like for like. */
+			$current = function_exists( 'home_url' ) ? (string) home_url( '/' ) : '';
+			if ( '' !== $current && Mobo_Core_Clone_Guard::site_key( (string) $data['siteUrl'] ) !== Mobo_Core_Clone_Guard::site_key( $current ) ) {
+				return false;
+			}
+		}
+		if ( array_key_exists( 'cloneSuspected', $data ) ) {
+			if ( (bool) $data['cloneSuspected'] !== (bool) Mobo_Core_Clone_Guard::is_clone_suspected() ) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private static function store_health_response( $response ) {

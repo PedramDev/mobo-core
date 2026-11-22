@@ -7095,7 +7095,18 @@ class Mobo_Core_Product_Sync {
 	}
 
 	private function product_attributes_match_payload( $product, $attributes ) {
-		return $this->current_product_attributes_for_hash( $product ) === $this->normalize_product_attributes_for_hash( $attributes );
+		$current = $this->current_product_attributes_for_hash( $product );
+		$desired = $this->normalize_product_attributes_for_hash( $attributes );
+		/* utf8mb3 sites: the Unicode guard stores four-byte characters as numeric
+		 * entities (&#x1f600;), but WooCommerce's reader html-decodes custom
+		 * attribute values (wc_get_text_attributes). Compare both sides in the
+		 * guard's canonical form, otherwise every emoji value fails post-write
+		 * verification and the variable product can never be built. */
+		if ( class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+			$current = Mobo_Core_Unicode_Guard::canonical( $current );
+			$desired = Mobo_Core_Unicode_Guard::canonical( $desired );
+		}
+		return $current === $desired;
 	}
 
 	private function normalize_category_guids_for_hash( $refs ) {
@@ -9863,7 +9874,17 @@ class Mobo_Core_Product_Sync {
 			if ( '' === $key || '' === $value ) {
 				return new WP_Error( 'mobo_core_variant_attribute_empty', 'Mobo variant contains an empty attribute selection.' );
 			}
-			if ( isset( $expected[ $key ] ) && ! empty( $expected[ $key ] ) && ! in_array( $value, $expected[ $key ], true ) ) {
+			/* Canonical comparison: on utf8mb3 the stored selection carries the
+			 * guard's numeric entities while WooCommerce html-decodes the parent's
+			 * custom attribute options (see product_attributes_match_payload()). */
+			$allowed = isset( $expected[ $key ] ) ? $expected[ $key ] : array();
+			if ( class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+				$allowed     = Mobo_Core_Unicode_Guard::canonical( $allowed );
+				$value_canon = Mobo_Core_Unicode_Guard::canonical( $value );
+			} else {
+				$value_canon = $value;
+			}
+			if ( ! empty( $allowed ) && ! in_array( $value_canon, $allowed, true ) ) {
 				return new WP_Error( 'mobo_core_variant_attribute_value_invalid', 'Mobo variant attribute value is not allowed by the parent attribute: ' . $key . '=' . $value );
 			}
 			$actual_keys[] = $key;

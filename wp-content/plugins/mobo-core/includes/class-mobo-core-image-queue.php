@@ -1928,6 +1928,11 @@ class Mobo_Core_Image_Queue {
 			return array( 'status' => 'missing-table', 'scheduled' => 0 );
 		}
 
+		/* Binary FIND_IN_SET: wp_postmeta often keeps an older collation
+		 * (utf8mb4_unicode_ci from a MariaDB/MySQL 5.7 import) while CAST(... AS CHAR)
+		 * takes the connection collation WordPress picks on MySQL 8/9
+		 * (utf8mb4_unicode_520_ci): "Illegal mix of collations" made this repair
+		 * query fail on every run. Digits and commas compare identically in binary. */
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
 		$rows  = $wpdb->get_results(
@@ -1954,9 +1959,9 @@ class Mobo_Core_Image_Queue {
 							thumb.meta_value IS NULL
 							OR thumb.meta_value = ''
 							OR CAST(thumb.meta_value AS UNSIGNED) <> q.attachment_id
-							OR FIND_IN_SET(CAST(q.attachment_id AS CHAR), COALESCE(gallery.meta_value, '')) > 0
+							OR FIND_IN_SET(CAST(q.attachment_id AS BINARY), CAST(COALESCE(gallery.meta_value, '') AS BINARY)) > 0
 						) )
-						OR ( q.position_index > 0 AND FIND_IN_SET(CAST(q.attachment_id AS CHAR), COALESCE(gallery.meta_value, '')) = 0 )
+						OR ( q.position_index > 0 AND FIND_IN_SET(CAST(q.attachment_id AS BINARY), CAST(COALESCE(gallery.meta_value, '') AS BINARY)) = 0 )
 					)
 				ORDER BY q.updated_at ASC, q.id ASC
 				LIMIT %d",
