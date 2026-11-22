@@ -55,6 +55,7 @@ function get_post_type( $id ) { return 'product'; }
 
 /* Fake $wpdb: prepare() keeps SQL and args structured so the fake can answer. */
 class Fake_WPDB {
+	public $postmeta = 'wp_postmeta';
 	public $options = 'wp_options';
 	public $posts = 'wp_posts';
 	public $prefix = 'wp_';
