@@ -4,13 +4,17 @@
  */
 import { test, expect } from '../lib/fixtures';
 import { actionForm, clickAndReadNotice, gotoTab, note, requireRendered, reveal, toAsciiDigits } from '../lib/admin';
-import { columnExists, count, defaultConnectionId, getOption, lit, serializedField, t, tableExists } from '../lib/db';
+import { columnExists, count, defaultConnectionId, getOption, lit, scalar, serializedField, t, tableExists } from '../lib/db';
 
 
-function failedWebhooks(): number {
+function failedWebhooks(untouchedSince: string | null = null): number {
   if (!tableExists('mobo_sync_events')) return 0;
   const scope = columnExists('mobo_sync_events', 'connection_id') ? `connection_id = ${lit(defaultConnectionId())} AND ` : '';
-  return count(`SELECT COUNT(*) FROM ${t('mobo_sync_events')} WHERE ${scope}status = 'failed'`);
+  /* untouchedSince (UTC, DB clock): only failed rows not written since then. The site's real cron keeps running
+   * during the test and may claim a re-armed row and fail it again (e.g. "Webhook event expired") before the
+   * re-count; such a row was re-armed by the button and must not be counted as "never left failed". */
+  const since = untouchedSince ? ` AND updated_at < ${lit(untouchedSince)}` : '';
+  return count(`SELECT COUNT(*) FROM ${t('mobo_sync_events')} WHERE ${scope}status = 'failed'${since}`);
 }
 
 /**
@@ -30,6 +34,7 @@ test.describe('Site health tab', () => {
     await gotoTab(page, 'health');
     const before = failedWebhooks();
     const supersededBefore = supersededWebhooks();
+    const clickedAt = scalar('SELECT UTC_TIMESTAMP()');
     const btn = actionForm(page, 'mobo_core_retry_failed_webhooks').locator('button[type="submit"]');
     await expect(btn).toHaveText('برگرداندن وب‌هوک‌های ناموفق به صف');
     const n = await clickAndReadNotice(page, btn);
@@ -43,9 +48,9 @@ test.describe('Site health tab', () => {
     expect(requeued, 'never more than the failed rows considered').toBeLessThanOrEqual(considered);
     expect(requeued).toBeGreaterThanOrEqual(0);
     expect(n.type).toBe(requeued > 0 ? 'success' : 'warning');
-    const after = failedWebhooks();
+    const after = failedWebhooks(clickedAt);
     const retired = before - requeued - after;
-    note(testInfo, `failed before=${before}, re-armed=${requeued}, retired as superseded=${retired}, failed after=${after}`);
+    note(testInfo, `failed before=${before}, re-armed=${requeued}, retired as superseded=${retired}, failed after (untouched)=${after}, failed after (all, incl. re-failed by live cron)=${failedWebhooks()}`);
     expect(after, 're-armed rows left the failed state').toBeLessThanOrEqual(before - requeued);
     expect(requeued + retired, 'only considered rows changed').toBeLessThanOrEqual(considered);
     if (supersededBefore >= 0) {

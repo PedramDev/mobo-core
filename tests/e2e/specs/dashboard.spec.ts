@@ -10,7 +10,7 @@ import { Page } from '@playwright/test';
 import { test, expect } from '../lib/fixtures';
 import { actionForm, cardAjax, clickAndReadNotice, gotoTab, note, postAjax, requireRendered } from '../lib/admin';
 import { getOption, getSetting, getState, serializedField } from '../lib/db';
-import { mockCursor, mockRequestsSince, waitForMockRequests } from '../lib/services';
+import { mockCursor, waitForMockRequests } from '../lib/services';
 
 
 function syncState(): { status: string | null; syncId: string | null; repair: string | null } {
@@ -146,7 +146,11 @@ test.describe('Dashboard: product sync controls', () => {
   test('"به‌روزرسانی دسته‌بندی‌ها برای نگاشت" loads Source categories', { tag: '@backend' }, async ({ page }) => {
     await ensureNotRunning(page);
     const before = Number(getSetting('mobo_core_categories_mapping_loaded_at') || 0);
-    const baseline = await mockCursor();
+    /* T1: the plugin refreshes categories from the Backend's GET /get-categories, which the Backend answers from
+     * its own DB; the Source is only polled by the Backend fetcher on its own schedule, so a Source request in this
+     * window is not evidence. Proof of a fresh, fully applied snapshot instead: the microsecond commit watermark
+     * (written only after every row was applied, Mobo_Core_Category_Sync::apply_fenced_snapshot) strictly advances. */
+    const watermarkBefore = Number(getState('category_snapshot_committed_us') || 0);
     const btn = actionForm(page, 'mobo_core_sync_categories').locator('button[type="submit"]').first();
     await requireRendered(btn, 'category preload control');
     const n = await clickAndReadNotice(page, btn);
@@ -155,7 +159,7 @@ test.describe('Dashboard: product sync controls', () => {
     const after = Number(getSetting('mobo_core_categories_mapping_loaded_at') || getSetting('mobo_core_categories_last_sync_at') || 0);
     expect(after, 'category snapshot timestamp advanced').toBeGreaterThanOrEqual(before);
     expect(after).toBeGreaterThan(0);
-    if (baseline) expect((await mockRequestsSince(baseline))?.count ?? 0, 'mock Source was queried').toBeGreaterThan(0);
+    expect(Number(getState('category_snapshot_committed_us') || 0), 'a new category snapshot was committed').toBeGreaterThan(watermarkBefore);
   });
 
   test('"حفظ محصول اصلی و کنار گذاشتن نسخه‌های تکراری" quarantines duplicates', async ({ page }) => {

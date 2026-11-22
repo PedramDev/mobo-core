@@ -7,7 +7,6 @@ import { Page } from '@playwright/test';
 import { test, expect } from '../lib/fixtures';
 import { actionForm, boolValue, cardAjax, clickAndReadNotice, gotoTab, postAjax, requireRendered, reveal, setBool, submitForm } from '../lib/admin';
 import { defaultConnectionId, getSetting, getState, lit, scalar, t, tableExists } from '../lib/db';
-import { mockCursor, mockRequestsSince } from '../lib/services';
 
 
 const policyForm = (page: Page) => page.locator('form[data-mobo-category-policy-form="1"]');
@@ -92,11 +91,16 @@ test.describe('Categories tab', () => {
 
   test('"دریافت تازه‌ترین فهرست دسته‌ها" fetches Source categories', { tag: '@backend' }, async ({ page }) => {
     await gotoTab(page, 'categories');
-    const baseline = await mockCursor();
+    /* T1: the plugin refreshes categories from the Backend's GET /get-categories, which the Backend answers from
+     * its own DB; the Source is only polled by the Backend fetcher on its own schedule, so a Source request in this
+     * window is not evidence. Proof of a fresh, fully applied snapshot instead: the microsecond commit watermark
+     * (written only after every row was applied, Mobo_Core_Category_Sync::apply_fenced_snapshot) strictly advances. */
+    const watermarkBefore = Number(getState('category_snapshot_committed_us') || 0);
     const n = await clickAndReadNotice(page, actionForm(page, 'mobo_core_sync_categories').locator('button[type="submit"]').first());
     expect(n.type, n.message).toBe('success');
     expect(Number(getSetting('mobo_core_categories_mapping_loaded_at') || getSetting('mobo_core_categories_last_sync_at') || 0)).toBeGreaterThan(0);
-    if (baseline) expect((await mockRequestsSince(baseline))?.count ?? 0, 'mock Source was queried').toBeGreaterThan(0);
+    expect(Number(getState('category_snapshot_committed_us') || 0), 'a new category snapshot was committed').toBeGreaterThan(watermarkBefore);
+    expect(Number(getSetting('mobo_core_category_mapping_active_snapshot_at') || 0), 'active category snapshot recorded').toBeGreaterThan(0);
   });
 
   test('ajax mobo_core_get_recategorize_status returns queue status', async ({ page }) => {
