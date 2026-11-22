@@ -325,6 +325,8 @@ $suites = array(
 	'image-storage-resilience-test.php' => array(),
 	'sync-event-retry-test.php'         => array(),
 	'environment-gaps-test.php'         => array( 'exec' ), // the harness spawns the mobo-cron.php child with exec().
+	/* Data health scanner/repairs: deadline/memory guards, random ids, file probes. */
+	'data-health-test.php'              => array(),
 );
 foreach ( $suites as $suite => $except ) {
 	list( $code, $output ) = run_php( disabled_flag( $except ), __DIR__ . '/' . $suite );

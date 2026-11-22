@@ -923,6 +923,9 @@ add_action(
 		 * checkout, REST). Filters only read already-loaded product meta. */
 		Mobo_Core_Source_Visibility::init();
 
+		/* Data health scanner/repair jobs run in short WP-Cron slices (class loads only when the tick fires). */
+		add_action( 'mobo_core_data_health_tick', array( 'Mobo_Core_Data_Health', 'cron_tick' ) );
+
 		/* Private shared media is loaded only on servers that explicitly enable it. */
 		if ( mobo_core_shared_media_configured() ) {
 			Mobo_Core_Shared_Media::init();

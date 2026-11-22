@@ -250,6 +250,8 @@ class Mobo_Core_Health_Reporter {
 			'imageProcessing'        => $this->get_image_processing_stats( ! $non_blocking ),
 			/* Read-only legacy JPG/PNG cleanup estimate (option read only, no scan). */
 			'legacyImages'           => class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ? Mobo_Core_Legacy_Image_Audit::health_summary() : null,
+			/* Corrupted-data scanner: counts per corruption class only (option read, no scan, no IDs). */
+			'dataHealth'             => class_exists( 'Mobo_Core_Data_Health' ) ? Mobo_Core_Data_Health::health_summary() : null,
 			'phpInfoSummary'         => $this->get_php_info_summary(),
 
 			'lastError'             => $last_error,
