@@ -44,6 +44,24 @@ const REPRICE_NOT_ACTIVE = 'عملیات قیمت‌گذاری فعال نیست
 /** Fail-safe answer while a Cron worker still finishes the batch that was just cancelled. */
 const REPRICE_BATCH_BUSY = 'هنوز batch جاری را تمام نکرده است';
 
+/**
+ * Click a reprice control and, while the plugin refuses with the "worker is still finishing the current batch"
+ * fail-safe (a real cron/self-runner is mid-batch), re-open the tab and retry for up to ~60 s. Returns the last
+ * notice; null when the control disappeared meanwhile (the run changed state on its own).
+ */
+async function clickRepriceControlWhenIdle(page: Page, control: () => Locator): Promise<{ type: string; message: string } | null> {
+  const deadline = Date.now() + 60_000;
+  let n = await clickAndReadNotice(page, control());
+  while (n.message.includes(REPRICE_BATCH_BUSY) && Date.now() < deadline) {
+    await page.waitForTimeout(5_000);
+    await gotoTab(page, 'pricing');
+    if ((await control().count()) === 0) return null;
+    n = await clickAndReadNotice(page, control());
+  }
+  expect(n.message, 'worker batch still busy after ~60 s').not.toContain(REPRICE_BATCH_BUSY);
+  return n;
+}
+
 test.describe('Pricing tab', () => {
   test('"ذخیره سیاست قیمت" persists price type and percentage', async ({ page }) => {
     await gotoTab(page, 'pricing');
@@ -93,9 +111,11 @@ test.describe('Pricing tab', () => {
   test('"توقف اعمال قیمت" cancels the running reprice', async ({ page }) => {
     await freezeRepricePoll(page);
     await gotoTab(page, 'pricing');
-    const cancel = actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
-    await requireRendered(cancel, 'reprice is not running (small catalogs finish within the first batch)');
-    const n = await clickAndReadNotice(page, cancel);
+    const cancel = () => actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
+    await requireRendered(cancel(), 'reprice is not running (small catalogs finish within the first batch)');
+    // The real cron may be mid-batch; the plugin then refuses the cancel (fail-safe) until the batch ends.
+    const clicked = await clickRepriceControlWhenIdle(page, cancel);
+    const n = clicked ?? { type: 'success', message: REPRICE_NOT_ACTIVE };
     expect(n.type, n.message).toBe('success');
     if (n.message.includes(REPRICE_NOT_ACTIVE)) {
       // A Cron/Self-Runner worker finished the run between render and click: the
@@ -116,24 +136,20 @@ test.describe('Pricing tab', () => {
     try {
       // The real cron may still be finishing the batch the cancel test just stopped;
       // the plugin then refuses the resume (fail-safe). Retry for up to ~60 s.
-      const deadline = Date.now() + 60_000;
-      let n = await clickAndReadNotice(page, resumeButton());
-      while (n.message.includes(REPRICE_BATCH_BUSY) && Date.now() < deadline) {
-        await page.waitForTimeout(5_000);
-        await gotoTab(page, 'pricing');
-        if ((await resumeButton().count()) === 0) break;
-        n = await clickAndReadNotice(page, resumeButton());
-      }
-      expect(n.message, 'worker batch still busy after ~60 s').not.toContain(REPRICE_BATCH_BUSY);
-      expect(n.type, n.message).toBe('success');
+      const n = await clickRepriceControlWhenIdle(page, resumeButton);
+      expect(n, 'resume control disappeared before it could be used').not.toBeNull();
+      expect(n!.type, n!.message).toBe('success');
       resumed = true;
       expect(['running', 'done', 'completed']).toContain(String(repriceDbStatus()));
     } finally {
       // Leave it stopped for the reset test.
       if (resumed) {
         await gotoTab(page, 'pricing');
-        const cancel = actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
-        if ((await cancel.count()) > 0) expect((await clickAndReadNotice(page, cancel)).type).toBe('success');
+        const cancel = () => actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
+        if ((await cancel().count()) > 0) {
+          const c = await clickRepriceControlWhenIdle(page, cancel);
+          if (c) expect(c.type, c.message).toBe('success');
+        }
       }
     }
   });
