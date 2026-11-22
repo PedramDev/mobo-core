@@ -205,6 +205,14 @@ function mobo_core_uninstall_runtime_state() {
 	delete_option( 'mobo_core_legacy_image_audit_hits' );
 	delete_option( 'mobo_core_legacy_image_cleanup_deleted_total' );
 	delete_option( 'mobo_core_image_reimport_ledger' );
+	/* Data health scanner state (its findings/backup tables are kept, like other Mobo tables). */
+	foreach ( array( 'mobo_core_data_health_state', 'mobo_core_data_health_job', 'mobo_core_data_health_batches', 'mobo_core_data_health_stop', 'mobo_core_data_health_auto_repair', 'mobo_core_data_health_daily_scan', 'mobo_core_data_health_schema' ) as $mobo_dh_option ) {
+		delete_option( $mobo_dh_option );
+	}
+	if ( function_exists( 'wp_clear_scheduled_hook' ) ) {
+		wp_clear_scheduled_hook( 'mobo_core_data_health_tick' );
+		wp_clear_scheduled_hook( 'mobo_core_data_health_tick', array( 'continue' ) );
+	}
 
 	/*
 	 * Remove temporary seen-variant options and legacy image scan candidate chunks.

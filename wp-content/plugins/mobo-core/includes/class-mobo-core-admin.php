@@ -38,6 +38,8 @@ class Mobo_Core_Admin {
 		add_action( 'admin_notices', array( $this, 'render_db_charset_notice' ) );
 		/* Support access: "پشتیبانی" tab handlers, request/Source notices, expiry. */
 		Mobo_Core_Support_Admin::register_hooks();
+		/* Data health: "سلامت داده" tab handlers, AJAX slices, hourly tick schedule. */
+		Mobo_Core_Data_Health_Admin::register_hooks();
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_bar_menu', array( $this, 'register_admin_bar_menu' ), 80 );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
@@ -325,6 +327,7 @@ class Mobo_Core_Admin {
 			'pricing'     => 'قیمت‌گذاری',
 			'sync-health' => 'سلامت همگام‌سازی',
 			'health'      => 'سلامت سایت',
+			'data-health' => 'سلامت داده',
 			'support'     => 'پشتیبانی',
 		);
 
@@ -916,7 +919,7 @@ class Mobo_Core_Admin {
 			);
 		}
 
-		$remaining_tabs = array( 'categories', 'pricing', 'filters', 'queue', 'sync-health', 'image-refresh', 'cron', 'checkout', 'sms', 'health', 'support' );
+		$remaining_tabs = array( 'categories', 'pricing', 'filters', 'queue', 'sync-health', 'image-refresh', 'cron', 'checkout', 'sms', 'health', 'data-health', 'support' );
 		if ( in_array( $active_tab, $remaining_tabs, true ) ) {
 			$remaining_style = 'assets/admin/css/pages/remaining.css';
 			wp_enqueue_style(
@@ -980,6 +983,7 @@ class Mobo_Core_Admin {
 			'checkout',
 			'sms',
 			'health',
+			'data-health',
 			'support',
 		);
 
@@ -1005,6 +1009,7 @@ class Mobo_Core_Admin {
 			'checkout'    => array( 'سفارش موبو', 'کنترل ثبت خودکار، اعتبارسنجی، آدرس و روش ارسال سفارش موبویی.' ),
 			'sms'         => array( 'پیامک', 'مدیریت پیامک سفارش و هشدار موجودی کیف پول.' ),
 			'health'      => array( 'سلامت سایت', 'بررسی پیش‌نیازهای فنی اثرگذار بر اجرای MoboCore.' ),
+			'data-health' => array( 'سلامت داده', 'یافتن و ترمیم امن داده‌های خراب‌شده محصولات، با پیش‌نمایش، پشتیبان و امکان بازگردانی.' ),
 			'support'     => array( 'پشتیبانی', 'دسترسی امن پشتیبانی موبو بدون رد و بدل کردن رمز عبور، و بررسی مواردی که باید قبل از پشتیبانی اصلاح شوند.' ),
 		);
 		$page_heading = isset( $page_titles[ $active_tab ] ) ? $page_titles[ $active_tab ] : $page_titles['dashboard'];
@@ -1076,6 +1081,8 @@ class Mobo_Core_Admin {
 					<?php $this->render_sms_tab(); ?>
 				<?php elseif ( 'health' === $active_tab ) : ?>
 					<?php $this->render_health_tab(); ?>
+				<?php elseif ( 'data-health' === $active_tab ) : ?>
+					<?php Mobo_Core_Data_Health_Admin::render_tab(); ?>
 				<?php elseif ( 'support' === $active_tab ) : ?>
 					<?php Mobo_Core_Support_Admin::render_tab(); ?>
 				<?php endif; ?>
