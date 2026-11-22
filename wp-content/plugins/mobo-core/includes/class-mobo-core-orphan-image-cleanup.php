@@ -112,6 +112,9 @@ class Mobo_Core_Orphan_Image_Cleanup {
 		global $wpdb;
 
 		$table = self::table_name();
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			return Mobo_Core_Table_Cache::exists( $table );
+		}
 
 		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
 	}

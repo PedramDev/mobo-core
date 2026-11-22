@@ -64,6 +64,9 @@ final class Mobo_Core_Migration_Quarantine {
 	/** A successful background run within this window means sync really continues. */
 	const RUNTIME_HEALTHY_WINDOW = 600;
 
+	/** A real-cron hit this recent means cron is running (used to tell "timing out" from "not running"). */
+	const RUNTIME_HIT_WINDOW = 300;
+
 	/** Consecutive mirror/verify failures on one object before it is marked instead of retried. */
 	const FAILURE_THRESHOLD = 3;
 
@@ -707,28 +710,39 @@ final class Mobo_Core_Migration_Quarantine {
 	 * @param int   $last_success Latest successful runner/self-runner run (unix).
 	 * @param array $lease        Dispatcher lease status (Mobo_Core_Lock::get_status()).
 	 * @param int   $now          Unix time.
+	 * @param int   $last_hit     Latest real-cron hit (unix; 0 = unknown). A recent hit
+	 *                            without a completed slice means cron runs but its
+	 *                            requests die (time/memory limit): 'timing-out'.
 	 * @return array{state:string,lockRemaining:int}
 	 */
-	public static function classify_runtime_activity( $last_success, $lease, $now ) {
+	public static function classify_runtime_activity( $last_success, $lease, $now, $last_hit = 0 ) {
 		$last_success = absint( $last_success );
 		$now          = absint( $now );
+		$last_hit     = absint( $last_hit );
 		if ( $last_success > 0 && $last_success <= $now + 60 && ( $now - $last_success ) <= self::RUNTIME_HEALTHY_WINDOW ) {
 			return array( 'state' => 'healthy', 'lockRemaining' => 0 );
 		}
 		if ( is_array( $lease ) && ! empty( $lease['active'] ) ) {
 			return array( 'state' => 'locked', 'lockRemaining' => absint( $lease['remainingSeconds'] ?? 0 ) );
 		}
+		if ( $last_hit > 0 && $last_hit <= $now + 60 && ( $now - $last_hit ) <= self::RUNTIME_HIT_WINDOW ) {
+			return array( 'state' => 'timing-out', 'lockRemaining' => 0 );
+		}
 		return array( 'state' => 'idle', 'lockRemaining' => 0 );
 	}
 
 	/** @return array{state:string,lockRemaining:int} Live background activity. */
 	public static function runtime_activity_state() {
+		/* A completed migration-only slice is a successful background run too
+		 * (mobo_core_real_cron_last_slice_ok_at); without it the notice claimed "no
+		 * successful run" right after migration-only mode ended. */
 		$last_success = max(
 			absint( get_option( 'mobo_core_real_cron_last_success_at', 0 ) ),
+			absint( get_option( 'mobo_core_real_cron_last_slice_ok_at', 0 ) ),
 			absint( get_option( 'mobo_core_self_runner_last_run_success_at', 0 ) )
 		);
 		$lease = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::get_status( 'worker_dispatcher' ) : array();
-		return self::classify_runtime_activity( $last_success, $lease, time() );
+		return self::classify_runtime_activity( $last_success, $lease, time(), absint( get_option( 'mobo_core_real_cron_last_hit_at', 0 ) ) );
 	}
 
 	/**
@@ -774,6 +788,9 @@ final class Mobo_Core_Migration_Quarantine {
 				} elseif ( 'locked' === $activity['state'] ) {
 					$class = 'notice-warning';
 					$lines[] = sprintf( 'موبوکور: انتقال داده‌ها در پس‌زمینه در حال انجام است، اما در چند دقیقه اخیر هیچ اجرای موفق پس‌زمینه ثبت نشده و قفل اجرای کار (worker) هنوز فعال است (حداکثر %d ثانیه دیگر آزاد می‌شود). همگام‌سازی، وب‌هوک‌ها و سفارش‌ها پس از آزاد شدن قفل ادامه می‌یابند.', absint( $activity['lockRemaining'] ) );
+				} elseif ( 'timing-out' === $activity['state'] ) {
+					$class = 'notice-warning';
+					$lines[] = 'موبوکور: Cron سایت اجرا می‌شود، اما اجراهای پس‌زمینه پیش از پایان قطع می‌شوند (محدودیت زمان اجرا یا حافظهٔ هاست). انتقال داده‌ها و همگام‌سازی با بخش‌های کوچک‌تر ادامه پیدا می‌کند؛ اگر این پیام بیش از چند ساعت باقی ماند، مقدار max_execution_time و memory_limit هاست را بررسی کنید.';
 				} else {
 					$class = 'notice-warning';
 					$lines[] = 'موبوکور: انتقال داده‌ها به ساختار جدید در انتظار اجرای پس‌زمینه است؛ در چند دقیقه اخیر هیچ اجرای موفق Cron ثبت نشده است. همگام‌سازی، وب‌هوک‌ها و سفارش‌ها تا اجرای بعدی Cron منتظر می‌مانند. تنظیم Cron سایت را بررسی کنید.';

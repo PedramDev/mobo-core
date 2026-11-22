@@ -209,6 +209,15 @@ function mobo_core_cron_run() {
 		}
 	}
 
+	/* Runner lease still held by another (or a just-killed) request: answer like the
+	 * dispatcher (423 + Retry-After, exit 0) instead of a generic 500 failure. */
+	if ( is_array( $result ) && 'locked' === (string) ( $result['status'] ?? '' ) ) {
+		$retry = absint( $result['retryAfter'] ?? 0 );
+		if ( $retry > 0 && ! headers_sent() ) {
+			header( 'Retry-After: ' . $retry );
+		}
+		mobo_core_cron_emit_json( $result, 0, '', $base_ob_level, 423 );
+	}
 	mobo_core_cron_emit_json( $result, empty( $result['success'] ) ? 1 : 0, '', $base_ob_level );
 }
 

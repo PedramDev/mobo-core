@@ -159,6 +159,10 @@ Mobo_Core_Autoloader::register();
  * REST route), so ordinary storefront requests stay lean.
  */
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-environment.php';
+/* Lease guard first: it must run before WooCommerce's shutdown logger, which can
+ * fatal again after a memory-limit fatal and stop all later shutdown callbacks. */
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shutdown-guard.php';
+Mobo_Core_Shutdown_Guard::register();
 Mobo_Core_Environment::on_shutdown( 'mobo_core_diagnostics_shutdown' );
 add_filter( 'rest_request_after_callbacks', 'mobo_core_diagnostics_rest_observer', 999, 3 );
 

@@ -518,6 +518,10 @@ class Mobo_Core_Self_Runner {
 		 * so this is a no-op after the normal release or once another request owns
 		 * the lease. If the host SIGKILLs the process, the short TTL bounds the gap. */
 		Mobo_Core_Environment::on_shutdown( array( __CLASS__, 'release_worker_request' ), $token );
+		if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+			/* Runs before WooCommerce's shutdown logger (released even after a memory fatal). */
+			Mobo_Core_Shutdown_Guard::track_lock( self::DISPATCH_LOCK_NAME, $token );
+		}
 
 		update_option( self::OPTION_WORKER_STARTED_AT, time(), false );
 		delete_option( self::OPTION_DISPATCH_PENDING );
@@ -606,6 +610,12 @@ class Mobo_Core_Self_Runner {
 
 	/** Release the worker dispatcher only when the caller still owns it. */
 	public static function release_worker_request( $token ) {
+		if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+			$tracked = Mobo_Core_Shutdown_Guard::tracked();
+			if ( isset( $tracked[ self::DISPATCH_LOCK_NAME ] ) && $tracked[ self::DISPATCH_LOCK_NAME ] === (string) $token ) {
+				Mobo_Core_Shutdown_Guard::untrack_lock( self::DISPATCH_LOCK_NAME );
+			}
+		}
 		return Mobo_Core_Lock::release( self::DISPATCH_LOCK_NAME, sanitize_text_field( (string) $token ) );
 	}
 
