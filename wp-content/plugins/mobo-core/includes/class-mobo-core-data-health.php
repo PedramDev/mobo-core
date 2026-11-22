@@ -397,9 +397,50 @@ final class Mobo_Core_Data_Health {
 		return '1' === (string) get_option( self::STOP_OPTION, '0' );
 	}
 
-	/** @return bool */
+	/**
+	 * Stop before the next step/item? Uses the shared runtime guard (release the
+	 * request caches at 60 % of memory_limit, stop at 75 %) plus an absolute
+	 * headroom floor for small limits. Unknown usage/limit never stops work.
+	 *
+	 * @return bool
+	 */
 	private static function memory_low() {
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) && method_exists( 'Mobo_Core_Request_Deadline', 'memory_guard' ) && Mobo_Core_Request_Deadline::memory_guard( 0.6, 0.75 ) ) {
+			return true;
+		}
 		return class_exists( 'Mobo_Core_Environment' ) && Mobo_Core_Environment::memory_headroom_bytes() < self::MIN_HEADROOM;
+	}
+
+	/**
+	 * Per-item stop check inside repair chunks: own slice deadline, the request
+	 * deadline (shared helper) and memory.
+	 *
+	 * @param float $deadline Absolute microtime of this slice.
+	 * @return bool
+	 */
+	private static function must_yield( $deadline ) {
+		if ( microtime( true ) >= $deadline ) {
+			return true;
+		}
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) && ! Mobo_Core_Request_Deadline::has_time( self::DEADLINE_RESERVE ) ) {
+			return true;
+		}
+		return self::memory_low();
+	}
+
+	/**
+	 * Fatal during a slice (memory/time limit): leave a visible trace; the lease
+	 * itself is released by Mobo_Core_Shutdown_Guard and the cursor of the last
+	 * committed step is intact.
+	 *
+	 * @param array $error error_get_last().
+	 * @return void
+	 */
+	public static function record_fatal( $error ) {
+		$state = self::get_state();
+		$state['fatalStops'] = absint( isset( $state['fatalStops'] ) ? $state['fatalStops'] : 0 ) + 1;
+		$state['lastError']  = 'درخواست قبلی با خطای مهلک PHP قطع شد (حافظه یا زمان)؛ از آخرین مرحله ذخیره‌شده ادامه می‌یابد.';
+		update_option( self::STATE_OPTION, $state, false );
 	}
 
 	/**
@@ -422,9 +463,16 @@ final class Mobo_Core_Data_Health {
 		if ( '' === $work ) {
 			return $out;
 		}
-		$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( self::LOCK_NAME, (int) ceil( $budget ) + 60 ) : '__no_lock__';
+		$ttl  = class_exists( 'Mobo_Core_Request_Deadline' ) && method_exists( 'Mobo_Core_Request_Deadline', 'runner_lock_ttl' ) ? Mobo_Core_Request_Deadline::runner_lock_ttl( (int) ceil( $budget ) ) : (int) ceil( $budget ) + 60;
+		$lock = class_exists( 'Mobo_Core_Lock' ) ? Mobo_Core_Lock::acquire( self::LOCK_NAME, $ttl ) : '__no_lock__';
 		if ( false === $lock ) {
 			return $out;
+		}
+		$guarded = class_exists( 'Mobo_Core_Shutdown_Guard' ) && '__no_lock__' !== $lock;
+		if ( $guarded ) {
+			/* A fatal (memory/time) must not keep the lease for its full TTL. */
+			Mobo_Core_Shutdown_Guard::track_lock( self::LOCK_NAME, (string) $lock );
+			Mobo_Core_Shutdown_Guard::on_fatal( 'data_health', array( __CLASS__, 'record_fatal' ) );
 		}
 		$started = microtime( true );
 		try {
@@ -441,6 +489,10 @@ final class Mobo_Core_Data_Health {
 		} finally {
 			if ( class_exists( 'Mobo_Core_Lock' ) && '__no_lock__' !== $lock ) {
 				Mobo_Core_Lock::release( self::LOCK_NAME, $lock );
+			}
+			if ( $guarded ) {
+				Mobo_Core_Shutdown_Guard::untrack_lock( self::LOCK_NAME );
+				Mobo_Core_Shutdown_Guard::forget_on_fatal( 'data_health' );
 			}
 		}
 		$out['state'] = self::get_state();
@@ -655,7 +707,7 @@ final class Mobo_Core_Data_Health {
 				break;
 			}
 			$steps++;
-			$job = 'undo' === $job['type'] ? self::undo_step( $job ) : self::apply_step( $job );
+			$job = 'undo' === $job['type'] ? self::undo_step( $job, $deadline ) : self::apply_step( $job, $deadline );
 			self::save_job( $job );
 		}
 		if ( in_array( $job['status'], array( 'complete', 'failed' ), true ) ) {
@@ -676,7 +728,7 @@ final class Mobo_Core_Data_Health {
 	}
 
 	/** @return array */
-	private static function apply_step( array $job ) {
+	private static function apply_step( array $job, $deadline = INF ) {
 		$index = absint( $job['index'] );
 		if ( ! isset( $job['detectors'][ $index ] ) ) {
 			$job['status']     = 'complete';
@@ -694,7 +746,14 @@ final class Mobo_Core_Data_Health {
 			$job['cursor'] = 0;
 			return $job;
 		}
+		$handled = 0;
 		foreach ( $rows as $row ) {
+			/* Per-item yield (at least one item per call so work always advances);
+			 * the cursor only moves past items really handled. */
+			if ( $handled > 0 && self::must_yield( $deadline ) ) {
+				break;
+			}
+			$handled++;
 			$job['cursor'] = absint( $row['id'] );
 			if ( ! in_array( (string) $row['repair_class'], $job['classes'], true ) || '' === (string) $row['action'] ) {
 				continue;
@@ -719,7 +778,7 @@ final class Mobo_Core_Data_Health {
 	}
 
 	/** @return array */
-	private static function undo_step( array $job ) {
+	private static function undo_step( array $job, $deadline = INF ) {
 		$rows = Mobo_Core_Data_Health_Store::backup_page_desc( $job['batchId'], absint( $job['cursor'] ), self::JOB_CHUNK );
 		if ( false === $rows ) {
 			$job['lastError'] = 'خواندن پشتیبان ناموفق بود؛ دوباره تلاش می‌شود.';
@@ -730,7 +789,14 @@ final class Mobo_Core_Data_Health {
 			$job['finishedAt'] = time();
 			return $job;
 		}
+		$handled = 0;
 		foreach ( $rows as $row ) {
+			/* Per-item yield (at least one item per call so work always advances);
+			 * the cursor only moves past items really handled. */
+			if ( $handled > 0 && self::must_yield( $deadline ) ) {
+				break;
+			}
+			$handled++;
 			$job['cursor'] = absint( $row['id'] );
 			if ( ! in_array( (string) $row['status'], array( 'applied', 'pending' ), true ) ) {
 				continue;

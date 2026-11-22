@@ -165,6 +165,10 @@ final class Mobo_Core_Data_Health_Store {
 	 */
 	public static function table_exists( $table ) {
 		global $wpdb;
+		/* Shared positive-result cache (no SHOW TABLES on every request). */
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			return Mobo_Core_Table_Cache::exists( (string) $table );
+		}
 		$like  = method_exists( $wpdb, 'esc_like' ) ? $wpdb->esc_like( $table ) : $table;
 		$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $like ) );
 		return is_string( $found ) && strtolower( $found ) === strtolower( $table );

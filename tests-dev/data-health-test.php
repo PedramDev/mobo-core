@@ -120,6 +120,8 @@ final class Mobo_Core_Product_Map {
 $inc = MOBO_CORE_PLUGIN_DIR . 'includes/';
 require $inc . 'class-mobo-core-environment.php';
 require $inc . 'class-mobo-core-request-deadline.php';
+require $inc . 'class-mobo-core-table-cache.php';
+require $inc . 'class-mobo-core-shutdown-guard.php';
 require $inc . 'class-mobo-core-product-identity-policy.php';
 require $inc . 'class-mobo-core-variation-identity-policy.php';
 require $inc . 'class-mobo-core-data-health-store.php';
@@ -163,6 +165,8 @@ function fresh_db( $with_map = true ) {
 	$GLOBALS['t_dbdelta_broken'] = false;
 	Mobo_Core_Data_Health_Store::reset_request_cache();
 	Mobo_Core_Data_Health_Detectors::reset_request_cache();
+	Mobo_Core_Table_Cache::reset();
+	Mobo_Core_Shutdown_Guard::reset();
 	Mobo_Core_Request_Deadline::reset();
 	$pdo = $GLOBALS['wpdb']->pdo;
 	$pdo->exec( 'DROP TABLE wp_posts' );
@@ -499,6 +503,39 @@ if ( Mobo_Core_Environment::can( 'ini_set' ) && Mobo_Core_Environment::can( 'ini
 } else {
 	t_ok( true, 'memory guard: memory functions disabled on this host (headroom unknown -> unlimited)' );
 }
+
+/* ================================================================== */
+echo "\n[9b] Shared runtime helpers: table cache, shutdown guard, per-item yield\n";
+fresh_db();
+seed_catalog();
+update_option( Mobo_Core_Data_Health::AUTO_OPTION, '0' );
+Mobo_Core_Data_Health::start_scan( 'test' );
+run_until_idle();
+$probes = Mobo_Core_Table_Cache::$probes;
+Mobo_Core_Data_Health_Detectors::reset_request_cache();
+Mobo_Core_Data_Health_Store::reset_request_cache();
+Mobo_Core_Table_Cache::reset();
+Mobo_Core_Data_Health::start_scan( 'test' );
+run_until_idle();
+$absent = 0;
+foreach ( array( 'custom_products', 'custom_variants', 'migrations', 'sync_health' ) as $k ) { $absent += (int) ( 0 === (int) v( "SELECT COUNT(*) FROM sqlite_master WHERE name='" . Mobo_Core_Data_Health_Detectors::table( $k ) . "'" ) ); }
+t_same( $absent, Mobo_Core_Table_Cache::$probes, 'second request: existing tables come from Mobo_Core_Table_Cache; only absent tables are re-probed (negatives are never cached)' );
+t_ok( $probes > 0, '  first request probed and persisted positive results' );
+t_same( array(), Mobo_Core_Shutdown_Guard::tracked(), 'data_health lease untracked after a normal slice' );
+Mobo_Core_Data_Health::record_fatal( array( 'type' => E_ERROR, 'message' => 'Allowed memory size exhausted' ) );
+$st = Mobo_Core_Data_Health::get_state();
+t_same( 1, (int) $st['fatalStops'], 'fatal during a slice is recorded for support' );
+/* Per-item yield: a job step whose slice deadline already passed still handles exactly one item. */
+Mobo_Core_Data_Health::start_apply( array( 'orphan_term_relationship' ), array( 'a' ), 'auto' );
+fresh_deadline();
+$m = new ReflectionMethod( 'Mobo_Core_Data_Health', 'apply_step' );
+$m->setAccessible( true );
+$after = $m->invoke( null, Mobo_Core_Data_Health::get_job(), microtime( true ) - 1 );
+t_same( 1, (int) $after['applied'], 'per-item deadline: one item handled, the rest yields to the next slice' );
+t_same( true, has_rel( 7777, 6 ) xor has_rel( 7777, 3 ), '  exactly one of the two orphan rows changed' );
+update_option( Mobo_Core_Data_Health::JOB_OPTION, $after );
+run_until_idle();
+t_ok( ! has_rel( 7777, 6 ) && ! has_rel( 7777, 3 ), '  the next slice resumes from the cursor and finishes' );
 
 /* ================================================================== */
 echo "\n[10] Hosts that refuse CREATE TABLE\n";
