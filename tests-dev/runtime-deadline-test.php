@@ -21,6 +21,8 @@ define( 'ARRAY_A', 'ARRAY_A' );
 define( 'MOBO_CORE_VERSION', '10.34.77' );
 
 $GLOBALS['__child_mode'] = isset( $argv[1] ) && '--child-claim-then-fatal' === $argv[1];
+$GLOBALS['__child_oom']  = isset( $argv[1] ) && '--child-runner-lock-then-oom' === $argv[1];
+if ( $GLOBALS['__child_oom'] ) { $GLOBALS['__child_mode'] = true; }
 $GLOBALS['__store_file'] = $GLOBALS['__child_mode'] ? (string) $argv[2] : '';
 $GLOBALS['__store']      = array( 'raw' => array(), 'opt' => array() );
 if ( '' !== $GLOBALS['__store_file'] && is_file( $GLOBALS['__store_file'] ) ) {
@@ -42,12 +44,17 @@ function sanitize_key( $v ) { return preg_replace( '/[^a-z0-9_\-]/', '', strtolo
 function sanitize_text_field( $v ) { return trim( preg_replace( '/[\r\n\t]+/', ' ', strip_tags( (string) $v ) ) ); }
 function wp_json_encode( $v, $flags = 0 ) { return json_encode( $v, $flags ); }
 function wp_generate_uuid4() { return sprintf( '%04x%04x-%04x-4%03x-a%03x-%012x', mt_rand( 0, 0xffff ), mt_rand( 0, 0xffff ), mt_rand( 0, 0xffff ), mt_rand( 0, 0xfff ), mt_rand( 0, 0xfff ), mt_rand( 0, 0xffffffffffff ) ); }
-function wp_cache_get( $k, $g = '' ) { return false; }
-function wp_cache_set( $k, $v, $g = '' ) { return true; }
-function wp_cache_delete( $k, $g = '' ) { return true; }
+$GLOBALS['__wp_cache'] = array();
+function wp_cache_get( $k, $g = '' ) { return isset( $GLOBALS['__wp_cache'][ $g ][ $k ] ) ? $GLOBALS['__wp_cache'][ $g ][ $k ] : false; }
+function wp_cache_set( $k, $v, $g = '' ) { $GLOBALS['__wp_cache'][ $g ][ $k ] = $v; return true; }
+function wp_cache_delete( $k, $g = '' ) { unset( $GLOBALS['__wp_cache'][ $g ][ $k ] ); return true; }
 function delete_transient( $k ) { return true; }
 function apply_filters( $tag, $value ) { return $value; }
-function get_post_meta( $id, $key = '', $single = false ) { return ''; }
+$GLOBALS['__slow_meta'] = array(); // product id => seconds a meta read takes (deadline-per-item tests)
+function get_post_meta( $id, $key = '', $single = false ) {
+	if ( isset( $GLOBALS['__slow_meta'][ $id ] ) ) { $until = microtime( true ) + $GLOBALS['__slow_meta'][ $id ]; while ( microtime( true ) < $until ) { /* busy wait: usleep may be disabled */ } }
+	return '';
+}
 function update_meta_cache( $type, $ids ) { return true; }
 function has_action( $tag ) { return false; }
 function sanitize_textarea_field( $v ) { return (string) $v; }
@@ -160,6 +167,22 @@ require $plugin . 'class-mobo-core-environment.php';
 require $plugin . 'class-mobo-core-request-deadline.php';
 require $plugin . 'class-mobo-core-lock.php';
 require $plugin . 'class-mobo-core-self-runner.php';
+
+/* ---------------- child: runner lock tracked by the early guard, then OOM ---------------- */
+if ( $GLOBALS['__child_oom'] ) {
+	require $plugin . 'class-mobo-core-shutdown-guard.php';
+	Mobo_Core_Shutdown_Guard::register();               // like mobo-core.php: registered first
+	register_shutdown_function( static function () {     // like WooCommerce's logger: re-fatals on OOM
+		$again = array();
+		while ( true ) { $again[] = str_repeat( 'y', 65536 ); }
+	} );
+	ini_set( 'memory_limit', '24M' );
+	$token = Mobo_Core_Lock::acquire( 'real_cron_runner', 150 );
+	update_option( 'child_locked', false !== $token ? 1 : 0 );
+	Mobo_Core_Shutdown_Guard::track_lock( 'real_cron_runner', (string) $token );
+	$hog = array();
+	while ( true ) { $hog[] = str_repeat( 'x', 65536 ); } // Fatal: Allowed memory size exhausted.
+}
 
 /* ---------------- child: claim, then die by max_execution_time ---------------- */
 if ( $GLOBALS['__child_mode'] ) {
@@ -345,6 +368,187 @@ check( 'read 1 s ago -> reuse (no extra query per meta read)', true === $E::nega
 check( 'older than the TTL -> re-read (a flip by another process is seen)', false === $E::negative_state_cache_fresh( 100.0 - $E::NEGATIVE_STATE_TTL, 100.0 ) );
 check( 'TTL far inside the 120 s transition grace', $E::NEGATIVE_STATE_TTL > 0 && $E::NEGATIVE_STATE_TTL * 10 <= $E::GRACE_SECONDS );
 check( 'clock going backwards -> re-read', false === $E::negative_state_cache_fresh( 100.0, 90.0 ) );
+
+
+/* ======================= runtime-30s (Run 3) additions ======================= */
+
+function scan_rows( $n, $first_product = 1000 ) {
+	$rows = array();
+	for ( $i = 1; $i <= $n; $i++ ) {
+		$rows[] = array( 'map_id' => $i * 2, 'remote_guid' => 'g-' . $i, 'wp_post_id' => $first_product + $i, 'map_last_hash' => '', 'map_sync_incomplete' => 0, 'map_updated_at' => '', 'health_id' => 0, 'health_wp_product_id' => 0, 'portal_revision' => 0, 'portal_version' => '', 'portal_hash' => '', 'sync_status' => '', 'last_error' => null, 'health_updated_at' => null );
+	}
+	return $rows;
+}
+/* classify_operational_rows() reads `mobo_sync_incomplete` once per product, so a
+ * slow meta read stands in for a product with a huge variation structure. */
+
+echo "\n[9] Sync Health scan: deadline checked per product, cursor persisted, chunk shrinks\n";
+$GLOBALS['__store'] = array( 'raw' => array(), 'opt' => array() );
+$GLOBALS['wpdb']->map_rows = scan_rows( 300 );
+$GLOBALS['__slow_meta'] = array();
+for ( $i = 1; $i <= 300; $i++ ) { $GLOBALS['__slow_meta'][ 1000 + $i ] = 0.05; } // 50 ms per product
+$t0 = microtime( true );
+$p  = $H::run_operational_scan_page( 20, microtime( true ) + 2.6, 200 );
+$el = microtime( true ) - $t0;
+$st = get_option( $H::SCAN_STATE_OPTION_PREFIX . '1' );
+check( 'stops before the deadline inside a 200-row page (no overrun)', $el < 2.0 && $p['processed'] > 0 && $p['processed'] < 200 && 'in-progress' === $p['status'] );
+check( '  cursor persisted at the last classified product', absint( $st['cursor'] ?? 0 ) === 2 * $p['processed'] && absint( $st['operational']['currentProducts'] ?? 0 ) === $p['processed'] );
+check( '  next chunk shrinks to what fitted', absint( $st['chunk'] ?? 0 ) === $p['processed'] && absint( $p['chunk'] ?? 0 ) === $p['processed'] );
+check( '  clean exit leaves no in-flight marker (no false stall)', ! isset( $st['inflight'] ) );
+$before = $p['processed'];
+$GLOBALS['__slow_meta'] = array();
+$p2 = $H::run_operational_scan_page( 20, microtime( true ) + 30, 200 );
+check( 'next slice resumes after the cursor and finishes (300 counted once)', true === $p2['complete'] && $before + $p2['processed'] === 300 && 300 === $p2['result']['operational']['currentProducts'] && 0 === $p2['result']['operational']['accountingDelta'] );
+
+echo "\n[10] Sync Health scan: requests killed inside the scan never loop forever\n";
+$dec = $H::scan_chunk_decision( array( 'chunk' => 200 ), 10, 200 );
+check( 'clean previous slice -> chunk kept, no stall', false === $dec['died'] && 200 === $dec['chunk'] && 0 === $dec['stalls'] && false === $dec['skip'] );
+$dec = $H::scan_chunk_decision( array( 'chunk' => 200, 'inflight' => array( 'startCursor' => 10 ) ), 10, 200 );
+check( 'died without progress -> stall 1, chunk /4', true === $dec['died'] && 1 === $dec['stalls'] && 50 === $dec['chunk'] && false === $dec['skip'] );
+$dec = $H::scan_chunk_decision( array( 'chunk' => 200, 'stalls' => 2, 'inflight' => array( 'startCursor' => 4 ) ), 10, 200 );
+check( 'died after some progress -> stalls reset, chunk still shrinks', 0 === $dec['stalls'] && 50 === $dec['chunk'] );
+$dec = $H::scan_chunk_decision( array( 'chunk' => 1, 'stalls' => 2, 'inflight' => array( 'startCursor' => 10 ) ), 10, 200 );
+check( '3rd death at the same cursor with a 1-row chunk -> skip-and-mark', true === $dec['skip'] && 3 === $dec['stalls'] && 1 === $dec['chunk'] );
+check( 'next_scan_chunk: deadline cut 200 after 37 -> 37', 37 === $H::next_scan_chunk( 200, 37, 200, 9.0, 200 ) );
+check( 'next_scan_chunk: fast full chunk grows x2 up to the page size', 100 === $H::next_scan_chunk( 50, 50, 50, 0.5, 200 ) && 200 === $H::next_scan_chunk( 150, 150, 150, 0.5, 200 ) );
+check( 'next_scan_chunk: slow full chunk keeps size; never below 1', 50 === $H::next_scan_chunk( 50, 50, 50, 5.0, 200 ) && 1 === $H::next_scan_chunk( 1, 0, 1, 9.0, 200 ) );
+/* End to end: product #4 is a "poison" product that alone exceeds any request. */
+$GLOBALS['__store'] = array( 'raw' => array(), 'opt' => array() );
+$GLOBALS['wpdb']->map_rows = scan_rows( 10 );
+$GLOBALS['__slow_meta'] = array();
+update_option( $H::SCAN_STATE_OPTION_PREFIX . '1', array( 'connectionId' => 1, 'limit' => 20, 'startedAt' => time(), 'cursor' => 6, 'chunk' => 1, 'stalls' => 2, 'inflight' => array( 'startCursor' => 6, 'at' => time() - 40 ),
+	'operational' => array( 'currentProducts' => 3, 'monitoredProducts' => 0, 'excludedByPolicy' => 0, 'converged' => 3, 'activeRetryOwner' => 0, 'terminalUpstreamInvalid' => 0, 'unownedConvergenceGap' => 0, 'unverifiedHealthGap' => 0, 'needsAttention' => 0, 'needsVerification' => 0, 'notFullyConverged' => 0, 'historicalHealthResidue' => 0, 'historicalNonLive' => 0, 'historicalExcluded' => 0 ),
+	'lists' => array( 'unownedRows' => array(), 'verificationRows' => array(), 'activeRetryRows' => array(), 'terminalRows' => array() ) ) );
+$p3 = $H::run_operational_scan_page( 20, microtime( true ) + 30, 200 );
+check( 'poison product (3 deaths at its cursor) is skipped, the scan completes', true === $p3['complete'] && 1 === absint( $p3['skipped'] ?? 0 ) );
+check( '  skipped product reported for verification, accounting still closed', 10 === $p3['result']['operational']['currentProducts'] && 1 === $p3['result']['operational']['unverifiedHealthGap'] && 0 === $p3['result']['operational']['accountingDelta']
+	&& 'scan-skipped-timeout' === ( $p3['result']['verificationRows'][0]['classification'] ?? '' ) && 1004 === ( $p3['result']['verificationRows'][0]['wpProductId'] ?? 0 ) );
+$GLOBALS['__slow_meta'] = array();
+
+echo "\n[11] runner lock TTL follows the PHP limit; 'locked' answers carry Retry-After\n";
+check( '30 s host -> 45 s runner lock (was 150 s from the option)', 45 === $D::runner_lock_ttl( 24, '30' ) );
+check( 'never shorter than budget + 15 s', 55 === $D::runner_lock_ttl( 40, '30' ) );
+check( '300 s host -> capped at 90 s', 90 === $D::runner_lock_ttl( 25, '300' ) && 90 === $D::runner_lock_ttl( 200, '300' ) );
+require_once $plugin . 'class-mobo-core-cron-runner.php';
+$C = 'Mobo_Core_Cron_Runner';
+check( 'Retry-After = remaining lease, 1..90', 37 === $C::locked_retry_after( array( 'active' => true, 'remainingSeconds' => 37 ) ) && 1 === $C::locked_retry_after( array( 'active' => false ) ) && 90 === $C::locked_retry_after( array( 'active' => true, 'remainingSeconds' => 400 ) ) );
+check( 'degradation: 0-1 deaths normal, 2-3 level 1, 4+ level 2', 0 === $C::degrade_level( 1 ) && 1 === $C::degrade_level( 2 ) && 1 === $C::degrade_level( 3 ) && 2 === $C::degrade_level( 4 ) );
+check( 'level 1 skips only the stage the last dead slice was in', true === $C::degraded_skip( 'health-snapshot', 1, 'health-snapshot' ) && false === $C::degraded_skip( 'cache-warmup', 1, 'health-snapshot' ) && false === $C::degraded_skip( 'health-snapshot', 0, 'health-snapshot' ) );
+check( 'level 2 skips every optional heavy stage, never critical work', true === $C::degraded_skip( 'health-snapshot', 2, '' ) && true === $C::degraded_skip( 'cache-warmup', 2, '' ) && false === $C::degraded_skip( 'webhook-queue', 2, 'webhook-queue' ) );
+
+echo "\n[12] runner lock released by the EARLY guard after a memory fatal, even when a later shutdown handler re-fatals\n";
+$file = tempnam( sys_get_temp_dir(), 'mobo-oom-' );
+file_put_contents( $file, json_encode( array( 'raw' => array(), 'opt' => array() ) ) );
+$cmd = escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( __FILE__ ) . ' --child-runner-lock-then-oom ' . escapeshellarg( $file ) . ' 2>&1';
+$child_output = (string) shell_exec( $cmd );
+$after = json_decode( (string) file_get_contents( $file ), true );
+@unlink( $file );
+check( 'child acquired the runner lock', 1 === (int) ( $after['opt']['child_locked'] ?? 0 ) );
+check( 'child died by the memory limit', false !== stripos( $child_output, 'Allowed memory size' ) );
+check( 'runner lock row is gone (no 150 s "locked" cron)', ! isset( $after['raw']['mobo_core_runtime_lock_real_cron_runner'] ) );
+
+echo "\n[13] memory pressure helper (disabled-function safe)\n";
+check( '200 MB of 256M >= 75 % -> pressure', true === $D::memory_pressure( 0.75, 200 * 1048576, '256M' ) );
+check( '150 MB of 256M -> no pressure', false === $D::memory_pressure( 0.75, 150 * 1048576, '256M' ) );
+check( 'unlimited (-1) or unknown usage (0) never stops work', false === $D::memory_pressure( 0.75, 999 * 1048576, '-1' ) && false === $D::memory_pressure( 0.75, 0, '256M' ) );
+check( 'parse_bytes: G/M/K/plain/garbage', 1073741824 === $D::parse_bytes( '1G' ) && 268435456 === $D::parse_bytes( '256M' ) && 2048 === $D::parse_bytes( '2k' ) && 512 === $D::parse_bytes( '512' ) && 0 === $D::parse_bytes( 'lots' ) );
+Mobo_Core_Environment::simulate_disabled( array( 'memory_get_usage' ) );
+check( 'memory_get_usage disabled -> never pressure (no fatal)', false === $D::memory_pressure( 0.75, null, '1M' ) );
+Mobo_Core_Environment::simulate_disabled( array() );
+
+echo "\n[14] migration notice: cron running vs timing out vs not running\n";
+require_once $plugin . 'class-mobo-core-migration-quarantine.php';
+$Q = 'Mobo_Core_Migration_Quarantine';
+$now = 1800000000;
+check( 'completed migration-only slice 40 s ago -> healthy (no false "no successful run")', 'healthy' === $Q::classify_runtime_activity( $now - 40, array( 'active' => true, 'remainingSeconds' => 41 ), $now, $now - 40 )['state'] );
+check( 'no completed slice for 15 min but cron hit 30 s ago -> timing-out', 'timing-out' === $Q::classify_runtime_activity( $now - 900, array(), $now, $now - 30 )['state'] );
+check( 'no completed slice and no hit -> idle ("check Cron setup")', 'idle' === $Q::classify_runtime_activity( $now - 900, array(), $now, $now - 3600 )['state'] && 'idle' === $Q::classify_runtime_activity( 0, array(), $now )['state'] );
+check( 'lease held and no success -> locked', 'locked' === $Q::classify_runtime_activity( 0, array( 'active' => true, 'remainingSeconds' => 20 ), $now, $now - 5 )['state'] );
+
+echo "\n[15] identity/operational fence: negative state reads cached briefly per request\n";
+require_once $plugin . 'class-mobo-core-storage-identity-meta-retirement.php';
+require_once $plugin . 'class-mobo-core-storage-operational-meta-retirement.php';
+foreach ( array( 'Mobo_Core_Storage_Identity_Meta_Retirement', 'Mobo_Core_Storage_Operational_Meta_Retirement' ) as $W ) {
+	check( $W . ': read 1 s ago -> reuse', true === $W::negative_fence_fresh( 99.0, 100.0 ) );
+	check( $W . ': never read / older than TTL / clock backwards -> re-read', false === $W::negative_fence_fresh( 0, 100.0 ) && false === $W::negative_fence_fresh( 100.0 - $W::NEGATIVE_FENCE_TTL, 100.0 ) && false === $W::negative_fence_fresh( 100.0, 90.0 ) );
+}
+
+echo "\n[16] table existence: one probe, then memo + persisted (no SHOW TABLES per call)\n";
+require_once $plugin . 'class-mobo-core-table-cache.php';
+class Probe_WPDB extends Fake_WPDB {
+	public $tables = array( 'wp_mobo_connection_settings' );
+	public function get_var( $q ) {
+		$d = json_decode( substr( $q, 2 ), true );
+		if ( 0 === strpos( $d['sql'], 'SHOW TABLES LIKE' ) ) { return in_array( $d['args'][0], $this->tables, true ) ? $d['args'][0] : null; }
+		return parent::get_var( $q );
+	}
+}
+$saved_wpdb = $GLOBALS['wpdb'];
+$GLOBALS['wpdb'] = new Probe_WPDB();
+$GLOBALS['__store'] = array( 'raw' => array(), 'opt' => array() );
+$T = 'Mobo_Core_Table_Cache';
+$T::reset();
+$a = $T::exists( 'wp_mobo_connection_settings' ); $b = $T::exists( 'wp_mobo_connection_settings' ); $c = $T::exists( 'wp_mobo_connection_settings' );
+check( 'first call probes once, repeated calls are memoized', $a && $b && $c && 1 === $T::$probes );
+$T::reset();
+check( 'a later request reuses the persisted positive result (0 probes)', $T::exists( 'wp_mobo_connection_settings' ) && 0 === $T::$probes );
+check( 'missing table: not cached (may be created later in the same request)', false === $T::exists( 'wp_mobo_missing' ) && false === $T::exists( 'wp_mobo_missing' ) && 2 === $T::$probes );
+update_option( 'mobo_core_db_version', '10.34.78' );
+$T::reset();
+$T::exists( 'wp_mobo_connection_settings' );
+check( 'DB version change invalidates the persisted map', 1 === $T::$probes );
+$T::flush();
+check( 'flush() (schema install) forgets everything', ! is_array( get_option( $T::OPTION, null ) ) && $T::exists( 'wp_mobo_connection_settings' ) && 2 === $T::$probes );
+$GLOBALS['wpdb'] = $saved_wpdb;
+
+
+echo "\n[17] terminal Custom reads: one cached row per object instead of one SELECT per meta key\n";
+if ( ! class_exists( 'Mobo_Core_Storage_Schema', false ) ) {
+	class Mobo_Core_Storage_Schema { public static function table_name( $k ) { return 'wp_mobo_' . $k; } }
+}
+require_once $plugin . 'class-mobo-core-storage-row-cache.php';
+require_once $plugin . 'class-mobo-core-storage-postmeta-write-suppression.php';
+class Row_WPDB extends Fake_WPDB {
+	public $rows = 0;
+	public function get_row( $q, $output = null ) {
+		$d = json_decode( substr( $q, 2 ), true );
+		if ( false !== strpos( $d['sql'], 'FROM wp_mobo_products WHERE connection_id=%d AND woo_product_id=%d' ) ) {
+			$this->rows++;
+			return array( 'product_seen_revision' => 7, 'product_seen_revision_present' => 1, 'product_applied_revision' => 5, 'product_applied_revision_present' => 1,
+				'variant_seen_revision' => 0, 'variant_seen_revision_present' => 0, 'variant_applied_revision' => 0, 'variant_applied_revision_present' => 0,
+				'product_source_hash' => 'h1', 'product_source_hash_present' => 1, 'sync_incomplete_meta' => 1, 'sync_incomplete_meta_present' => 1 );
+		}
+		return null;
+	}
+}
+$saved_wpdb = $GLOBALS['wpdb'];
+$GLOBALS['wpdb'] = new Row_WPDB();
+Mobo_Core_Storage_Row_Cache::reset();
+$W = 'Mobo_Core_Storage_Postmeta_Write_Suppression';
+$r1 = $W::terminal_current( 42, '_mobo_product_seen_revision' );
+$r2 = $W::terminal_current( 42, '_mobo_product_source_hash' );
+$r3 = $W::terminal_current( 42, 'mobo_sync_incomplete' );
+check( 'values are the same as the per-key reads returned', 7 === $r1['value'] && true === $r1['present'] && 'h1' === $r2['value'] && '1' === $r3['value'] );
+check( '3 keys of one product -> 1 SELECT', 1 === $GLOBALS['wpdb']->rows );
+Mobo_Core_Storage_Row_Cache::observe_query( "UPDATE wp_mobo_products SET product_source_hash='h2' WHERE id=1" );
+$W::terminal_current( 42, '_mobo_product_source_hash' );
+check( 'a write to the table invalidates the cached row (fresh read after write)', 2 === $GLOBALS['wpdb']->rows );
+$GLOBALS['wpdb'] = $saved_wpdb;
+Mobo_Core_Storage_Row_Cache::reset();
+
+
+echo "\n[18] memory guard used by the scan / migration loops\n";
+$old_limit = Mobo_Core_Environment::ini( 'memory_limit', '256M' );
+$usage     = Mobo_Core_Environment::memory_usage( true );
+if ( $usage > 0 ) {
+	ini_set( 'memory_limit', (string) (int) ceil( $usage * 1.1 ) );
+	check( 'usage ~90 % of the limit -> guard says stop (after releasing caches)', true === $D::memory_guard( 0.6, 0.75 ) );
+	ini_set( 'memory_limit', (string) (int) ceil( $usage * 4 ) );
+	check( 'usage 25 % of the limit -> guard lets the loop continue', false === $D::memory_guard( 0.6, 0.75 ) );
+	ini_set( 'memory_limit', $old_limit );
+}
+check( 'unlimited memory_limit -> never stops', ( ini_set( 'memory_limit', '-1' ) || true ) && false === $D::memory_guard( 0.6, 0.75 ) );
+ini_set( 'memory_limit', $old_limit );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed (PHP " . PHP_VERSION . ")\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );

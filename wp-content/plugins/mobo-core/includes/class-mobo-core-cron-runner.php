@@ -5,7 +5,7 @@
  * This class is intentionally independent from WP-Cron. It is triggered by a
  * server/cPanel cron that executes mobo-cron.php directly, by the authenticated
  * HTTP fallback (/wp-json/mobo-core/v1/cron/run with the Cron/Worker token in
- * X-SEC), or by WP-CLI/custom integrations. Query-token HTTP authentication is
+ * the X-Mobo-Cron-Token or X-SEC header), or by WP-CLI/custom integrations. Query-token HTTP authentication is
  * retained only for backward compatibility and is not the preferred setup.
  *
  * PHP 7.4 compatible.
@@ -106,6 +106,10 @@ class Mobo_Core_Cron_Runner {
 					'runtimeBlockedReason' => $runtime_blocked_reason,
 					'databaseMigration' => $migration,
 				);
+				if ( ! empty( $migration['success'] ) && self::is_real_scheduler_source( $source ) ) {
+					/* A completed migration-only slice is a successful background run (notice R5). */
+					update_option( 'mobo_core_real_cron_last_slice_ok_at', time(), false );
+				}
 				$this->save_last_result( $result );
 				return $result;
 			}
@@ -169,17 +173,28 @@ class Mobo_Core_Cron_Runner {
 		}
 
 		if ( false === $lock ) {
+			$lock_status = Mobo_Core_Lock::get_status( 'real_cron_runner' );
 			$result = array(
-				'success' => false,
-				'status'  => 'locked',
-				'source'  => $source,
-				'message' => 'Cron runner is already running.',
-				'lock'    => Mobo_Core_Lock::get_status( 'real_cron_runner' ),
+				'success'    => false,
+				'status'     => 'locked',
+				'source'     => $source,
+				'message'    => 'Cron runner is already running.',
+				'lock'       => $lock_status,
+				/* Callers get a 423 + Retry-After (REST controller / mobo-cron.php), so
+				 * a busy runner is never reported as a successful "200 OK" slice. */
+				'httpStatus' => 423,
+				'retryAfter' => self::locked_retry_after( $lock_status ),
 			);
 
 			$this->save_last_result( $result );
 			return $result;
 		}
+
+		if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+			/* Released by the early shutdown guard even after a memory-limit fatal. */
+			Mobo_Core_Shutdown_Guard::track_lock( 'real_cron_runner', $lock );
+		}
+		$degrade = self::begin_inflight( $source );
 
 		/*
 		 * A fatal error or explicit exit normally still runs shutdown callbacks.
@@ -214,10 +229,16 @@ class Mobo_Core_Cron_Runner {
 			/* Shared mode: advance migration first with a bounded share of the slice,
 			 * serialized with ordinary work by the runner lease held here, then hand the
 			 * remaining budget to the normal dispatcher. */
+			if ( ! empty( $degrade['level'] ) ) {
+				/* Previous requests died inside the runner: keep more headroom. */
+				$config['effectiveTimeBudgetSeconds'] = max( 1, (int) floor( $config['effectiveTimeBudgetSeconds'] * ( 1 === (int) $degrade['level'] ? 0.7 : 0.5 ) ) );
+				$config['degradeLevel'] = (int) $degrade['level'];
+			}
 			if ( 'shared' === $migration_mode ) {
 				$migration_share = class_exists( 'Mobo_Core_Migration_Quarantine' )
 					? Mobo_Core_Migration_Quarantine::shared_migration_budget( $config['effectiveTimeBudgetSeconds'] )
 					: 4;
+				self::set_stage( 'shared-migration' );
 				$migration_started = microtime( true );
 				try {
 					$shared_migration = Mobo_Core_Migration::run_budgeted_slice( $source, $migration_share, 200 );
@@ -254,6 +275,13 @@ class Mobo_Core_Cron_Runner {
 				Mobo_Core_API_Client::clear_runtime_deadline();
 			}
 			$result['lockReleased'] = Mobo_Core_Lock::release( 'real_cron_runner', $lock );
+			if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+				Mobo_Core_Shutdown_Guard::untrack_lock( 'real_cron_runner' );
+			}
+			self::end_inflight();
+		}
+		if ( ! empty( $degrade['level'] ) && is_array( $result ) ) {
+			$result['runnerDegraded'] = $degrade;
 		}
 
 		if ( null !== $shared_migration && is_array( $result ) ) {
@@ -401,57 +429,61 @@ class Mobo_Core_Cron_Runner {
 	 * @param int    $last_driver_run Any driver last run.
 	 * @param string $driver_source Source of that run.
 	 * @param int    $now Unix time.
+	 * @param bool   $self_runner_enabled Whether the self-runner is currently enabled.
 	 * @return string self_runner|real_cron|portal_heartbeat|other_driver|not_detected
 	 */
-	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now ) {
-		$now             = absint( $now );
-		$last_self_run   = absint( $last_self_run );
-		$last_cron_hit   = absint( $last_cron_hit );
-		$last_driver_run = absint( $last_driver_run );
-		$heartbeat       = 'portal-heartbeat' === sanitize_key( (string) $driver_source );
-		$recent          = static function ( $at ) use ( $now ) {
-			return $at > 0 && ( $now - $at ) < HOUR_IN_SECONDS;
-		};
-		/* envA T14: the label must describe the driver that runs the site NOW. A
-		 * self-runner run months ago (loopback since blocked) used to pin the label
-		 * to self_runner forever while the real cron / Backend heartbeat drove the
-		 * runner, and real_cron was never reported once a continuation had run. */
-		if ( $recent( $last_cron_hit ) ) {
-			return 'real_cron';
-		}
-		if ( $heartbeat && $recent( $last_driver_run ) ) {
-			return 'portal_heartbeat';
-		}
-		if ( $recent( $last_self_run ) ) {
-			return 'self_runner';
-		}
-		if ( $recent( $last_driver_run ) ) {
-			return 'other_driver';
-		}
-		/* Nothing ran within the hour: keep the historical label so the Backend can
-		 * report a stale runner (it judges staleness from lastCronHitAt). */
-		if ( $last_self_run > 0 ) {
-			return 'self_runner';
-		}
-		if ( $last_cron_hit > 0 ) {
-			return 'real_cron';
-		}
-		return 'not_detected';
+	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled = true ) {
+		$activity = self::resolve_cron_activity( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled );
+		return $activity['mode'];
 	}
 
 	/**
-	 * Pure: the most recent runner activity of any driver (health lastCronHitAt).
-	 * Preferring the self-runner timestamp whenever it was ever non-zero froze
-	 * lastCronHitAt at an old self-run on sites whose loopback is now blocked, so
-	 * the Backend flagged "runner-stale" although real cron / heartbeat ran.
+	 * Pure: most recent runner driver for health (B2). The newest of real cron,
+	 * self-runner and any other driver (Backend heartbeat, worker/run) wins, so a
+	 * stale self-runner timestamp left behind after switching to real cron never
+	 * masks a recent real cron hit. The self-runner counts only while enabled.
+	 * A driver run older than an hour gives no mode of its own (it still dates
+	 * lastAt when nothing newer exists). Ties prefer real cron.
 	 *
-	 * @param int $last_self_run   Self-runner last run.
-	 * @param int $last_cron_hit   Real cron last hit.
-	 * @param int $last_driver_run Any driver last run.
-	 * @return int Unix time, 0 when nothing ever ran.
+	 * @param int    $last_self_run Self-runner last run.
+	 * @param int    $last_cron_hit Real cron last hit.
+	 * @param int    $last_driver_run Any driver last run.
+	 * @param string $driver_source Source of that run.
+	 * @param int    $now Unix time.
+	 * @param bool   $self_runner_enabled Whether the self-runner is currently enabled.
+	 * @return array{mode:string,lastAt:int}
 	 */
-	public static function latest_runner_activity_at( $last_self_run, $last_cron_hit, $last_driver_run ) {
-		return max( 0, absint( $last_self_run ), absint( $last_cron_hit ), absint( $last_driver_run ) );
+	public static function resolve_cron_activity( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled = true ) {
+		$cron   = absint( $last_cron_hit );
+		$self   = $self_runner_enabled ? absint( $last_self_run ) : 0;
+		$driver = absint( $last_driver_run );
+		$source = sanitize_key( (string) $driver_source );
+
+		$mode = 'not_detected';
+		$at   = 0;
+		if ( $cron > 0 ) {
+			$mode = 'real_cron';
+			$at   = $cron;
+		}
+		if ( $self > $at ) {
+			$mode = 'self_runner';
+			$at   = $self;
+		}
+		if ( $driver > $at && ( absint( $now ) - $driver ) < HOUR_IN_SECONDS ) {
+			if ( self::is_real_scheduler_source( $source ) ) {
+				$mode = 'real_cron';
+			} elseif ( 'self-runner' === $source && $self_runner_enabled ) {
+				$mode = 'self_runner';
+			} else {
+				$mode = 'portal-heartbeat' === $source ? 'portal_heartbeat' : 'other_driver';
+			}
+			$at = $driver;
+		}
+
+		return array(
+			'mode'   => $mode,
+			'lastAt' => max( $at, $driver ),
+		);
 	}
 
 	/**
@@ -711,6 +743,12 @@ class Mobo_Core_Cron_Runner {
 		$http_timeout_cap = max( 5, $effective_budget );
 		$blocking_timeout = max( 15, min( $blocking_timeout, $http_timeout_cap ) );
 		$lock_ttl = min( 600, max( $configured_ttl, $effective_budget + 30, $blocking_timeout + 30 ) );
+		if ( class_exists( 'Mobo_Core_Request_Deadline' ) ) {
+			/* Runtime-30s: the request cannot outlive its PHP limit, so neither may the
+			 * lease: limit + 15 s within [45, 90] (heartbeat-renewed while the slice
+			 * runs). A killed request therefore blocks cron for <= 90 s, not 150 s. */
+			$lock_ttl = Mobo_Core_Request_Deadline::runner_lock_ttl( $effective_budget );
+		}
 
 		return array(
 			'httpTimeoutCapSeconds'       => $http_timeout_cap,
@@ -1056,12 +1094,16 @@ class Mobo_Core_Cron_Runner {
 		 */
 		if ( ! $lock_lost && ! $upgrade_paused && class_exists( 'Mobo_Core_Health_Read_Cache' )
 			&& method_exists( 'Mobo_Core_Health_Read_Cache', 'refresh_due_from_real_cron' ) ) {
-			if ( $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+			if ( self::skip_stage_when_degraded( 'health-snapshot', $config ) ) {
+				$aggregate['healthSnapshots'] = array( 'success' => true, 'status' => 'skipped-degraded' );
+			} elseif ( $this->renew_runner_lock( $lock_token, $config['lockTtlSeconds'], $lock_renewals ) ) {
+				self::set_stage( 'health-snapshot' );
 				try {
 					$aggregate['healthSnapshots'] = Mobo_Core_Health_Read_Cache::refresh_due_from_real_cron( $deadline );
 				} catch ( Throwable $e ) {
 					$aggregate['healthSnapshots'] = $this->exception_result( 'health-snapshot-refresh-exception', $e );
 				}
+				self::set_stage( 'runner-tail' );
 			} else {
 				$lock_lost   = true;
 				$stop_reason = 'lock-lost';
@@ -1436,6 +1478,9 @@ class Mobo_Core_Cron_Runner {
 						$prune_result = $prune->process_due( max( 1, min( 3, $image_limit ) ), max( 1, min( 4, $image_budget ) ) );
 						$result['prune']     = $prune_result;
 						$result['processed'] = absint( isset( $result['processed'] ) ? $result['processed'] : 0 ) + absint( isset( $prune_result['processed'] ) ? $prune_result['processed'] : 0 );
+						if ( array_key_exists( 'circuitFailed', $result ) ) {
+							$result['circuitFailed'] = absint( $result['circuitFailed'] ) + absint( isset( $prune_result['failed'] ) ? $prune_result['failed'] : 0 );
+						}
 						$result['failed']    = absint( isset( $result['failed'] ) ? $result['failed'] : 0 ) + absint( isset( $prune_result['failed'] ) ? $prune_result['failed'] : 0 );
 						$result['remaining'] = ! empty( $result['remaining'] ) || ! empty( $prune_result['remaining'] );
 						if ( 'empty' === sanitize_key( (string) ( isset( $result['status'] ) ? $result['status'] : '' ) ) && 'empty' !== sanitize_key( (string) ( isset( $prune_result['status'] ) ? $prune_result['status'] : '' ) ) ) {
@@ -1694,7 +1739,7 @@ class Mobo_Core_Cron_Runner {
 			$round['imageQueue'] = $this->merge_queue_counters(
 				$round['imageQueue'],
 				$late_image,
-				array( 'processed', 'failed' ),
+				array( 'processed', 'failed', 'circuitFailed', 'itemFailed', 'hostDeferred' ),
 				array( 'remaining' )
 			);
 			$round['imageQueue']['latePass'] = $late_image;
@@ -2316,6 +2361,9 @@ class Mobo_Core_Cron_Runner {
 	 * @return bool
 	 */
 	private function cache_warmup_host_pressure( $config, $deadline ) {
+		if ( self::skip_stage_when_degraded( 'cache-warmup', $config ) ) {
+			return true;
+		}
 		try {
 			$tuning_mode = isset( $config['adaptiveTuning']['mode'] ) ? (string) $config['adaptiveTuning']['mode'] : '';
 			if ( in_array( $tuning_mode, array( 'conservative', 'cautious' ), true ) ) {
@@ -2719,6 +2767,147 @@ class Mobo_Core_Cron_Runner {
 	 * @param float $deadline Stage deadline (microtime).
 	 * @return float
 	 */
+	/* ---------------- runtime-30s: in-flight marker and graceful degradation ---------------- */
+
+	/** Option present while a runner slice is in flight; left behind when the request dies. */
+	const INFLIGHT_OPTION = 'mobo_core_runner_inflight_v1';
+
+	/** Consecutive runner deaths (+ last stage/error) for degradation and diagnostics. */
+	const DEATHS_OPTION = 'mobo_core_runner_deaths_v1';
+
+	/** @var string Stage currently running (recorded by the shutdown guard on a fatal). */
+	private static $stage = '';
+
+	/** @var bool */
+	private static $inflight_active = false;
+
+	/** @var array Degradation decided for this slice. */
+	private static $degrade = array( 'level' => 0, 'deaths' => 0, 'lastStage' => '' );
+
+	/**
+	 * Pure (unit tested): degradation level after N consecutive runner deaths.
+	 * 0 = normal, 1 = 70 % budget and skip the stage the last dead slice was in,
+	 * 2 = 50 % budget and skip every optional heavy stage (health snapshot, warm-up).
+	 *
+	 * @param int $deaths Consecutive deaths.
+	 * @return int
+	 */
+	public static function degrade_level( $deaths ) {
+		$deaths = absint( $deaths );
+		return $deaths >= 4 ? 2 : ( $deaths >= 2 ? 1 : 0 );
+	}
+
+	/**
+	 * Pure (unit tested): must an optional stage be skipped under this degradation?
+	 *
+	 * @param string $stage     Stage key.
+	 * @param int    $level     degrade_level().
+	 * @param string $last_dead Stage the last dead slice was in.
+	 * @return bool
+	 */
+	public static function degraded_skip( $stage, $level, $last_dead ) {
+		$level = absint( $level );
+		if ( $level >= 2 ) {
+			return in_array( (string) $stage, array( 'health-snapshot', 'cache-warmup' ), true );
+		}
+		return 1 === $level && '' !== (string) $last_dead && (string) $stage === (string) $last_dead;
+	}
+
+	/** @return bool */
+	private static function skip_stage_when_degraded( $stage, $config ) {
+		$level = absint( isset( $config['degradeLevel'] ) ? $config['degradeLevel'] : self::$degrade['level'] );
+		return self::degraded_skip( $stage, $level, (string) self::$degrade['lastStage'] );
+	}
+
+	/** @param string $stage Stage key. @return void */
+	public static function set_stage( $stage ) {
+		self::$stage = self::stage_key( $stage );
+	}
+
+	/** @return string */
+	private static function stage_key( $stage ) {
+		return (string) preg_replace( '/[^a-z0-9_-]/', '', strtolower( (string) $stage ) );
+	}
+
+	/**
+	 * Start of a locked runner slice: detect a previous death, persist the marker.
+	 *
+	 * @param string $source Source.
+	 * @return array Degradation for this slice.
+	 */
+	private static function begin_inflight( $source ) {
+		$deaths = get_option( self::DEATHS_OPTION, array() );
+		$deaths = is_array( $deaths ) ? $deaths : array();
+		$count  = absint( isset( $deaths['count'] ) ? $deaths['count'] : 0 );
+		$prev   = get_option( self::INFLIGHT_OPTION, null );
+		if ( is_array( $prev ) ) {
+			$count++;
+			$deaths['count']     = $count;
+			$deaths['lastStage'] = self::stage_key( isset( $prev['stage'] ) ? $prev['stage'] : '' );
+			$deaths['lastError'] = substr( (string) ( isset( $prev['error'] ) ? $prev['error'] : '' ), 0, 40 );
+			$deaths['lastAt']    = absint( isset( $prev['at'] ) ? $prev['at'] : 0 );
+			$deaths['total']     = absint( isset( $deaths['total'] ) ? $deaths['total'] : 0 ) + 1;
+			update_option( self::DEATHS_OPTION, $deaths, false );
+		}
+		update_option( self::INFLIGHT_OPTION, array( 'at' => time(), 'source' => self::stage_key( $source ), 'stage' => 'start' ), false );
+		self::$inflight_active = true;
+		self::$stage           = 'start';
+		if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+			Mobo_Core_Shutdown_Guard::on_fatal( 'runner-inflight', array( __CLASS__, 'record_fatal' ) );
+		}
+		self::$degrade = array(
+			'level'     => self::degrade_level( $count ),
+			'deaths'    => $count,
+			'lastStage' => (string) ( isset( $deaths['lastStage'] ) ? $deaths['lastStage'] : '' ),
+		);
+		return self::$degrade;
+	}
+
+	/**
+	 * Fatal-only shutdown callback: remember where the slice died.
+	 *
+	 * @param array $error error_get_last().
+	 * @return void
+	 */
+	public static function record_fatal( $error ) {
+		if ( ! self::$inflight_active ) {
+			return;
+		}
+		$message = is_array( $error ) && isset( $error['message'] ) ? (string) $error['message'] : '';
+		$kind    = false !== stripos( $message, 'Maximum execution time' ) ? 'time-limit' : ( false !== stripos( $message, 'Allowed memory size' ) ? 'memory-limit' : 'fatal' );
+		update_option( self::INFLIGHT_OPTION, array( 'at' => time(), 'stage' => self::$stage, 'error' => $kind ), false );
+	}
+
+	/** Clean end of a slice. @return void */
+	private static function end_inflight() {
+		if ( ! self::$inflight_active ) {
+			return;
+		}
+		self::$inflight_active = false;
+		delete_option( self::INFLIGHT_OPTION );
+		update_option( 'mobo_core_real_cron_last_slice_ok_at', time(), false );
+		if ( self::$degrade['deaths'] > 0 ) {
+			$deaths          = get_option( self::DEATHS_OPTION, array() );
+			$deaths          = is_array( $deaths ) ? $deaths : array();
+			$deaths['count'] = 0;
+			update_option( self::DEATHS_OPTION, $deaths, false );
+		}
+		if ( class_exists( 'Mobo_Core_Shutdown_Guard', false ) ) {
+			Mobo_Core_Shutdown_Guard::forget_on_fatal( 'runner-inflight' );
+		}
+	}
+
+	/**
+	 * Retry-After for a "locked" runner answer: what is left of the lease, 1..90 s.
+	 *
+	 * @param array $lock_status Mobo_Core_Lock::get_status().
+	 * @return int
+	 */
+	public static function locked_retry_after( $lock_status ) {
+		$remaining = is_array( $lock_status ) && ! empty( $lock_status['active'] ) ? absint( isset( $lock_status['remainingSeconds'] ) ? $lock_status['remainingSeconds'] : 0 ) : 0;
+		return (int) max( 1, min( 90, $remaining ) );
+	}
+
 	private static function clamp_to_request_deadline( $deadline ) {
 		if ( ! class_exists( 'Mobo_Core_Request_Deadline' ) ) {
 			return (float) $deadline;

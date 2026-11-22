@@ -41,6 +41,8 @@ async function freezeRepricePoll(page: Page): Promise<void> {
 }
 
 const REPRICE_NOT_ACTIVE = 'عملیات قیمت‌گذاری فعال نیست';
+/** Fail-safe answer while a Cron worker still finishes the batch that was just cancelled. */
+const REPRICE_BATCH_BUSY = 'هنوز batch جاری را تمام نکرده است';
 
 test.describe('Pricing tab', () => {
   test('"ذخیره سیاست قیمت" persists price type and percentage', async ({ page }) => {
@@ -105,17 +107,35 @@ test.describe('Pricing tab', () => {
   });
 
   test('"ادامه از checkpoint" resumes a cancelled reprice', async ({ page }) => {
+    test.setTimeout(240_000);
     await freezeRepricePoll(page);
     await gotoTab(page, 'pricing');
-    const resume = actionForm(page, 'mobo_core_resume_reprice').locator('button[type="submit"]');
-    await requireRendered(resume, 'resume is only offered for a cancelled reprice run');
-    const n = await clickAndReadNotice(page, resume);
-    expect(n.type, n.message).toBe('success');
-    expect(['running', 'done', 'completed']).toContain(String(repriceDbStatus()));
-    // Leave it stopped for the reset test.
-    await gotoTab(page, 'pricing');
-    const cancel = actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
-    if ((await cancel.count()) > 0) expect((await clickAndReadNotice(page, cancel)).type).toBe('success');
+    const resumeButton = () => actionForm(page, 'mobo_core_resume_reprice').locator('button[type="submit"]');
+    await requireRendered(resumeButton(), 'resume is only offered for a cancelled reprice run');
+    let resumed = false;
+    try {
+      // The real cron may still be finishing the batch the cancel test just stopped;
+      // the plugin then refuses the resume (fail-safe). Retry for up to ~60 s.
+      const deadline = Date.now() + 60_000;
+      let n = await clickAndReadNotice(page, resumeButton());
+      while (n.message.includes(REPRICE_BATCH_BUSY) && Date.now() < deadline) {
+        await page.waitForTimeout(5_000);
+        await gotoTab(page, 'pricing');
+        if ((await resumeButton().count()) === 0) break;
+        n = await clickAndReadNotice(page, resumeButton());
+      }
+      expect(n.message, 'worker batch still busy after ~60 s').not.toContain(REPRICE_BATCH_BUSY);
+      expect(n.type, n.message).toBe('success');
+      resumed = true;
+      expect(['running', 'done', 'completed']).toContain(String(repriceDbStatus()));
+    } finally {
+      // Leave it stopped for the reset test.
+      if (resumed) {
+        await gotoTab(page, 'pricing');
+        const cancel = actionForm(page, 'mobo_core_cancel_reprice').locator('button[type="submit"]');
+        if ((await cancel.count()) > 0) expect((await clickAndReadNotice(page, cancel)).type).toBe('success');
+      }
+    }
   });
 
   test('"پاک کردن گزارش قبلی" resets the reprice report', async ({ page }) => {

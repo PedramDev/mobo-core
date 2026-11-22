@@ -56,7 +56,8 @@ final class Mobo_Core_Durable_State_Policy {
 	}
 
 	/**
-	 * Write a plugin-owned large state row outside wp_options and verify exact read-back.
+	 * Write a plugin-owned large state row outside wp_options and verify the read-back
+	 * (scalars by canonical string form, arrays/objects exact).
 	 *
 	 * @param string $key State key.
 	 * @param mixed  $value Desired value.
@@ -70,7 +71,8 @@ final class Mobo_Core_Durable_State_Policy {
 			return false;
 		}
 		$stored = Mobo_Core_State_Store::get( $key, null );
-		return maybe_serialize( $stored ) === maybe_serialize( $value );
+		/* B3: the state table returns scalars as strings; compare like wp_options. */
+		return self::option_read_back_matches( $stored, $value );
 	}
 
 

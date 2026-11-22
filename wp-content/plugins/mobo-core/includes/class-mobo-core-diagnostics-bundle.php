@@ -192,6 +192,7 @@ final class Mobo_Core_Diagnostics_Bundle {
 			'version'   => defined( 'MOBO_CORE_VERSION' ) ? (string) MOBO_CORE_VERSION : '',
 			'dbVersion' => (string) get_option( 'mobo_core_db_version', '' ),
 			'migration' => class_exists( 'Mobo_Core_Migration_Quarantine' ) ? Mobo_Core_Migration_Quarantine::health_payload() : array( 'status' => 'unavailable' ),
+			'dataHealth' => class_exists( 'Mobo_Core_Data_Health' ) ? Mobo_Core_Data_Health::health_summary() : array( 'status' => 'unavailable' ),
 		);
 	}
 
