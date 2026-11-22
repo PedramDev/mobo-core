@@ -266,5 +266,10 @@ $mig_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-cor
 check( 'loop checks the request memory guard before each further iteration and stops the slice', 1 === preg_match( '/if \( \$iterations > 0 && class_exists\( \'Mobo_Core_Request_Deadline\' \) && Mobo_Core_Request_Deadline::memory_guard\( [0-9.]+, [0-9.]+ \) \) \{\s*\$memory_stopped = true;\s*break;/', $mig_src ) );
 check( 'exactly one memory guard in the slice loop (no duplicate envB helper left after the merge)', false === strpos( $mig_src, 'slice_memory_pressure' ) && 1 === substr_count( $mig_src, "\$telemetry['memoryStopped'] = \$memory_stopped;" ) );
 
+echo "\n[F9] Image linkage-repair query is collation independent (mixed utf8mb4_unicode_ci / _520_ci)\n";
+$iq_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-image-queue.php' );
+check( 'no FIND_IN_SET on CAST(... AS CHAR) against a WordPress column remains', false === strpos( $iq_src, 'FIND_IN_SET(CAST(q.attachment_id AS CHAR)' ) );
+check( 'both FIND_IN_SET calls compare binary strings', 2 === substr_count( $iq_src, "FIND_IN_SET(CAST(q.attachment_id AS BINARY), CAST(COALESCE(gallery.meta_value, '') AS BINARY))" ) );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
