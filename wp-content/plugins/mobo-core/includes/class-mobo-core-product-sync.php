@@ -3851,6 +3851,7 @@ class Mobo_Core_Product_Sync {
 			if ( ! $this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '0' ) ) {
 				return $this->result( false, 'Simple-product completion marker could not be persisted; event will retry.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 			}
+			$this->release_awaiting_variants( $product_id );
 
 			if ( ! empty( $payload['_moboWebhookForegroundContext'] ) && ! $this->mark_webhook_product_applied( $product_id ) ) {
 				$this->persist_post_meta_verified( $product_id, 'mobo_sync_incomplete', '1' );
@@ -4178,6 +4179,7 @@ class Mobo_Core_Product_Sync {
 				$this->upsert_product_map( $product_guid, $product_id, true );
 				return $this->result( false, 'ثبت نهایی completion marker پس از Variant Sync ناموفق بود.', array( 'deleteFile' => false, 'productGuid' => $product_guid, 'retryable' => true ) );
 			}
+			$this->release_awaiting_variants( $product_id );
 		}
 
 		$message = sprintf(
@@ -5567,6 +5569,24 @@ class Mobo_Core_Product_Sync {
 			}
 		} else {
 			$product = new WC_Product_Simple();
+		}
+
+		/*
+		 * R1: ProductUpdated carries no Variants (they arrive in separate UpdateVariant
+		 * pages), but its product-level price is the lowest Variant price and its stock
+		 * the sum. A new product whose payload proves variation attributes is therefore
+		 * created blocked (persisted out of stock, not purchasable) until its Variant
+		 * topology is applied; it must never sell as this temporary Simple parent.
+		 * Existing products are never flagged.
+		 */
+		if ( class_exists( 'Mobo_Core_Source_Visibility' )
+			&& Mobo_Core_Source_Visibility::should_await_variants(
+				$is_new_product,
+				$product instanceof WC_Product_Simple && ! $product instanceof WC_Product_Variable,
+				$this->product_payload_can_have_variants( $data, 0 )
+			)
+		) {
+			Mobo_Core_Source_Visibility::mark_awaiting_variants( $product );
 		}
 
 		/*
@@ -7993,6 +8013,19 @@ class Mobo_Core_Product_Sync {
 	 * @param array  $snapshot Validated snapshot.
 	 * @return array|WP_Error
 	 */
+	/**
+	 * R1: Variant topology of the product has been applied; lift the creation-time
+	 * "awaiting Variants" sale block (no-op for every product that never had it).
+	 *
+	 * @param int $product_id Product ID.
+	 * @return void
+	 */
+	private function release_awaiting_variants( $product_id ) {
+		if ( class_exists( 'Mobo_Core_Source_Visibility' ) && method_exists( 'Mobo_Core_Source_Visibility', 'release_awaiting_variants' ) ) {
+			Mobo_Core_Source_Visibility::release_awaiting_variants( $product_id );
+		}
+	}
+
 	private function apply_simple_product_variant_snapshot( $product_id, $product_guid, $snapshot ) {
 		$product_id   = absint( $product_id );
 		$product_guid = sanitize_text_field( (string) $product_guid );
@@ -8010,6 +8043,8 @@ class Mobo_Core_Product_Sync {
 				return $result;
 			}
 
+			$this->release_awaiting_variants( $product_id );
+
 			return array(
 				'success'         => true,
 				'productId'       => $product_id,
@@ -8024,6 +8059,7 @@ class Mobo_Core_Product_Sync {
 			if ( is_wp_error( $empty_state ) ) {
 				return $empty_state;
 			}
+			$this->release_awaiting_variants( $product_id );
 
 			return array(
 				'success'              => true,
