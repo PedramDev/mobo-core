@@ -105,6 +105,7 @@ final class Pricing_Fake_WPDB {
 	public $last_error = '';
 	public $rows = array();
 	public $pending_meta_ids = array();
+	public $entity_pending_ids = array();
 	public function prepare( $query, ...$args ) {
 		if ( 1 === count( $args ) && is_array( $args[0] ) ) { $args = $args[0]; }
 		return array( 'q' => $query, 'a' => $args );
@@ -132,6 +133,7 @@ final class Pricing_Fake_WPDB {
 	public function get_col( $p ) {
 		$q = is_array( $p ) ? $p['q'] : (string) $p;
 		if ( false !== strpos( $q, 'FROM wp_postmeta' ) ) { return $this->pending_meta_ids; }
+		if ( false !== strpos( $q, 'FROM wp_mobo_entity_meta' ) ) { return $this->entity_pending_ids; }
 		return array();
 	}
 	public function get_results() { return array(); }
