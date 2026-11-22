@@ -110,9 +110,21 @@ class Mobo_Core_Lock {
 	public static function is_locked( $name ) { return false; }
 }
 
+/* Extra WP stubs for the Clone Guard / Health read cache (F2). */
+function wp_parse_url( $url, $component = -1 ) { return parse_url( $url, $component ); }
+function esc_url_raw( $u ) { return (string) $u; }
+function home_url( $path = '' ) { return rtrim( (string) get_option( 'home', '' ), '/' ) . $path; }
+function wp_get_environment_type() { return 'production'; }
+function add_action() { return true; }
+function add_filter() { return true; }
+function wp_next_scheduled() { return 1; }
+function wp_schedule_event() { return true; }
+
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-migration-quarantine.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-storage-schema.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-migration.php';
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-clone-guard.php';
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-health-read-cache.php';
 
 $GLOBALS['__pass'] = 0; $GLOBALS['__fail'] = 0;
 function check( $label, $cond ) {
@@ -141,6 +153,26 @@ check( 'upgrade from < 10.31.71: one cleanup, not one per pass', 1 === Mobo_Core
 $GLOBALS['__options'] = array();
 $lock_recovery->invoke( null, '10.33.67' );
 check( 'upgrade from 10.33.67 never force-releases locks', 1 === Mobo_Core_Lock::$force_release_all_calls && false === get_option( 'mobo_core_103171_lock_cleanup_at', false ) );
+
+echo "\n[F2] Health snapshot copied with the database is never served for another site address\n";
+$GLOBALS['__options'] = array();
+$snap = function ( $site, $clone ) {
+	return array( 'generatedAt' => time(), 'status' => 200, 'body' => array( 'success' => true, 'data' => array( 'siteUrl' => $site, 'cloneSuspected' => $clone ) ) );
+};
+update_option( 'home', 'https://shop.example' );
+update_option( 'siteurl', 'https://shop.example' );
+update_option( Mobo_Core_Clone_Guard::OPTION_BINDING, array( 'v' => 1, 'home' => 'shop.example', 'site' => 'shop.example', 'homeUrl' => 'https://shop.example', 'db' => Mobo_Core_Clone_Guard::database_fingerprint(), 'boundAt' => 1, 'source' => 'provision' ) );
+Mobo_Core_Clone_Guard::reset_cache();
+check( 'original site: its own snapshot is served (cache kept)', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://shop.example/', false ) ) );
+check( 'original site: www / http variant of the same host still matches', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'http://www.shop.example/', false ) ) );
+update_option( 'home', 'https://staging.shop.example' );
+update_option( 'siteurl', 'https://staging.shop.example' );
+Mobo_Core_Clone_Guard::reset_cache();
+check( 'clone: guard reports cloneSuspected', true === Mobo_Core_Clone_Guard::is_clone_suspected() );
+check( 'clone: the copied original snapshot (other siteUrl, cloneSuspected=false) is refused', false === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://shop.example/', false ) ) );
+check( 'clone: right URL but stale clone verdict is refused', false === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://staging.shop.example/', false ) ) );
+check( 'clone: its own fresh snapshot is served', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://staging.shop.example/', true ) ) );
+check( 'legacy snapshot without siteUrl/cloneSuspected fields is accepted unchanged', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( array( 'generatedAt' => time(), 'body' => array( 'data' => array( 'x' => 1 ) ) ) ) );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
