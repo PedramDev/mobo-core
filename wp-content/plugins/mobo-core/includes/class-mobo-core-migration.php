@@ -2436,6 +2436,17 @@ class Mobo_Core_Migration {
 			return;
 		}
 
+		/* One-shot per installation. The budgeted migration re-runs every step on
+		 * each cron slice until finalize_database_version() stamps the new version,
+		 * so on a fresh install ('' previous version) or a pre-10.31.71 upgrade this
+		 * step used to call force_release_all() on EVERY slice. That deleted the live
+		 * real_cron_runner + dispatcher lease of the very request running the
+		 * migration (cron/run answered "lock-lost", mobo-cron.php HTTP 500) and the
+		 * leases of concurrent workers, so a second driver could start in parallel. */
+		if ( false !== get_option( 'mobo_core_103171_lock_cleanup_at', false ) ) {
+			return;
+		}
+
 		$lock_result = array(
 			'deleted' => 0,
 			'found'   => 0,
