@@ -248,5 +248,18 @@ check( '  and registers harden_rest_response_cache on rest_post_dispatch', 1 ===
 $ctl_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-rest-controller.php' );
 check( 'the filter is still a public static callable', false !== strpos( $ctl_src, 'public static function filter_rest_authentication_errors( $result )' ) );
 
+echo "\n[F7] utf8mb3: guard-encoded attribute values compare equal to WooCommerce's html-decoded read-back\n";
+if ( ! class_exists( 'Mobo_Core_Unicode_Guard' ) ) {
+	require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-unicode-guard.php';
+}
+$enc = array( array( 'name' => 'color', 'options' => array( 'v0 &#x1f600;&#x1f680;', 'v1 &#x1f600;&#x1f680;' ) ) );
+$dec = array( array( 'name' => 'color', 'options' => array( "v0 \u{1F600}\u{1F680}", "v1 \u{1F600}\u{1F680}" ) ) );
+check( 'canonical(encoded desired) === canonical(decoded stored)', Mobo_Core_Unicode_Guard::canonical( $enc ) === Mobo_Core_Unicode_Guard::canonical( $dec ) );
+check( 'BMP numeric entities (e.g. &#1575;) are left untouched', '&#1575;' === Mobo_Core_Unicode_Guard::canonical( '&#1575;' ) );
+check( 'a genuinely different option still differs', Mobo_Core_Unicode_Guard::canonical( 'v2 &#x1f600;' ) !== Mobo_Core_Unicode_Guard::canonical( "v0 \u{1F600}" ) );
+$ps_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-product-sync.php' );
+check( 'parent attribute verification compares canonical forms', 1 === preg_match( '/function product_attributes_match_payload.{0,900}Mobo_Core_Unicode_Guard::canonical\( \$current \)/s', $ps_src ) );
+check( 'variation selection validation compares canonical forms', false !== strpos( $ps_src, '$value_canon = Mobo_Core_Unicode_Guard::canonical( $value );' ) );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
