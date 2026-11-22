@@ -75,7 +75,28 @@ final class Mobo_Core_State_Store {
 		if ( false === $result ) { return false; }
 		$stored = self::get( $key, null );
 		if ( '' !== trim( (string) $wpdb->last_error ) ) { return false; }
-		return maybe_serialize( $stored ) === $serialized;
+		return self::read_back_matches( $stored, $value );
+	}
+
+	/**
+	 * B3: the state_value column returns scalars as strings (int 123 reads back as
+	 * "123", true as "1"), so scalars compare by canonical string form; arrays and
+	 * objects stay exact. Same rule as Mobo_Core_Durable_State_Policy::option_read_back_matches().
+	 *
+	 * @param mixed $stored Read-back value.
+	 * @param mixed $expected Written value.
+	 * @return bool
+	 */
+	public static function read_back_matches( $stored, $expected ) {
+		if ( null === $stored || null === $expected ) {
+			return $stored === $expected;
+		}
+		if ( is_scalar( $stored ) && is_scalar( $expected ) ) {
+			$stored   = is_bool( $stored ) ? ( $stored ? '1' : '' ) : (string) $stored;
+			$expected = is_bool( $expected ) ? ( $expected ? '1' : '' ) : (string) $expected;
+			return $stored === $expected;
+		}
+		return maybe_serialize( $stored ) === maybe_serialize( $expected );
 	}
 
 	public static function delete( $key ) {
@@ -135,7 +156,7 @@ final class Mobo_Core_State_Store {
 		if ( ! self::set( $state_key, $legacy ) ) { return false; }
 		$stored = self::get( $state_key, null );
 		global $wpdb;
-		if ( '' !== trim( (string) $wpdb->last_error ) || maybe_serialize( $stored ) !== maybe_serialize( $legacy ) ) { return false; }
+		if ( '' !== trim( (string) $wpdb->last_error ) || ! self::read_back_matches( $stored, $legacy ) ) { return false; }
 		delete_option( $option_name );
 		wp_cache_delete( $option_name, 'options' );
 		return $sentinel === get_option( $option_name, $sentinel );

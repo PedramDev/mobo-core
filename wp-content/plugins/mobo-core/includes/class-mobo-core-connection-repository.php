@@ -59,6 +59,11 @@ final class Mobo_Core_Connection_Repository {
 		if ( true === self::$table_exists_cache ) { return true; }
 		$table = self::table_name();
 		if ( '' === $table ) { return false; }
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			$exists = Mobo_Core_Table_Cache::exists( $table );
+			if ( $exists ) { self::$table_exists_cache = true; }
+			return $exists;
+		}
 		$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
 		$exists = (string) $found === (string) $table;
 		/* Cache only a positive result. A table may be created later in the same

@@ -48,6 +48,15 @@ class Mobo_Core_Health_Reporter {
 
 		$last_self_run     = isset( $self_status['lastRunAt'] ) ? absint( $self_status['lastRunAt'] ) : 0;
 		$last_cron_hit     = isset( $cron_status['lastHitAt'] ) ? absint( $cron_status['lastHitAt'] ) : 0;
+		/* B2: the most recent driver wins; a stale (or disabled) self-runner timestamp
+		 * must never mask a recent real cron hit (Backend Warning => webhook throttling). */
+		$self_enabled      = ! empty( $self_status['enabled'] );
+		$cron_activity     = method_exists( 'Mobo_Core_Cron_Runner', 'resolve_cron_activity' )
+			? Mobo_Core_Cron_Runner::resolve_cron_activity( $last_self_run, $last_cron_hit, absint( $cron_status['lastDriverRunAt'] ?? 0 ), (string) ( $cron_status['lastDriverSource'] ?? '' ), time(), $self_enabled )
+			: array(
+				'mode'   => $last_cron_hit > 0 ? 'real_cron' : 'not_detected',
+				'lastAt' => max( $last_cron_hit, absint( $cron_status['lastDriverRunAt'] ?? 0 ) ),
+			);
 		$last_sync_success = $this->get_last_sync_success_timestamp( $sync_status );
 		$last_error        = $this->resolve_last_error( $sync_status, $cron_status );
 
@@ -202,9 +211,7 @@ class Mobo_Core_Health_Reporter {
 			'storageWriteProbeCheckedAt' => isset( $disk['write_probe']['checked_at'] ) ? $this->format_timestamp( absint( $disk['write_probe']['checked_at'] ) ) : null,
 			'storageWriteProbeBytes'     => isset( $disk['write_probe']['bytes'] ) ? absint( $disk['write_probe']['bytes'] ) : 0,
 
-			'cronMode'              => class_exists( 'Mobo_Core_Cron_Runner' ) && method_exists( 'Mobo_Core_Cron_Runner', 'classify_cron_mode' )
-				? Mobo_Core_Cron_Runner::classify_cron_mode( $last_self_run, $last_cron_hit, absint( $cron_status['lastDriverRunAt'] ?? 0 ), (string) ( $cron_status['lastDriverSource'] ?? '' ), time() )
-				: ( $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ) ),
+			'cronMode'              => (string) $cron_activity['mode'],
 			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
 			'networkDependencies'  => class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::get_status() : array(),
 			'portalHeartbeat'       => array(
@@ -227,9 +234,9 @@ class Mobo_Core_Health_Reporter {
 			'storeCurrencyChange'    => class_exists( 'Mobo_Core_Store_Currency_Guard' ) ? Mobo_Core_Store_Currency_Guard::health_payload() : array( 'pending' => false ),
 			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
-			/* Heartbeat-only sites (no server cron, no self-runner) still run the
-			 * worker: report the latest driver run instead of "never". */
-			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : ( $last_cron_hit > 0 ? $last_cron_hit : absint( $cron_status['lastDriverRunAt'] ?? 0 ) ) ),
+			/* Most recent driver run (real cron, enabled self-runner, Backend heartbeat
+			 * or another driver); heartbeat-only sites are not reported as "never". */
+			'lastCronHitAt'         => $this->format_timestamp( absint( $cron_activity['lastAt'] ) ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),
 			'lastWebhookSuccessAt'  => $this->format_timestamp( $this->get_last_webhook_success_timestamp( $cron_status ) ),
 
@@ -250,6 +257,8 @@ class Mobo_Core_Health_Reporter {
 			'imageProcessing'        => $this->get_image_processing_stats( ! $non_blocking ),
 			/* Read-only legacy JPG/PNG cleanup estimate (option read only, no scan). */
 			'legacyImages'           => class_exists( 'Mobo_Core_Legacy_Image_Audit' ) ? Mobo_Core_Legacy_Image_Audit::health_summary() : null,
+			/* Corrupted-data scanner: counts per corruption class only (option read, no scan, no IDs). */
+			'dataHealth'             => class_exists( 'Mobo_Core_Data_Health' ) ? Mobo_Core_Data_Health::health_summary() : null,
 			'phpInfoSummary'         => $this->get_php_info_summary(),
 
 			'lastError'             => $last_error,

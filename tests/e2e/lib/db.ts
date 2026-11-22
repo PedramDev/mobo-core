@@ -145,7 +145,23 @@ export function latestOrderNote(orderId: number): string | null {
   return scalar(`SELECT comment_content FROM ${t('comments')} WHERE comment_post_ID = ${lit(orderId)} AND comment_type = 'order_note' ORDER BY comment_ID DESC LIMIT 1`);
 }
 
+/**
+ * Single post/product meta value. Since the 10.34.77 storage migration MoboCore
+ * keeps its product meta (e.g. _mobo_pricing_override_*) in wp_mobo_entity_meta,
+ * read the same way the plugin does (sort_order, id); fall back to wp_postmeta
+ * for keys/installs that are not migrated. A Mobo-managed key (_mobo_*, mobo_*)
+ * of an object that already lives in the custom storage never falls back, so a
+ * deleted override is not shadowed by a retired wp_postmeta leftover.
+ */
 export function postMeta(postId: number, key: string): string | null {
+  if (tableExists('mobo_entity_meta')) {
+    const rows = query(
+      `SELECT meta_value FROM ${t('mobo_entity_meta')} WHERE woo_object_id = ${lit(postId)} AND meta_key = ${lit(key)} ORDER BY sort_order ASC, id ASC LIMIT 1`,
+    );
+    if (rows.length > 0) return rows[0].meta_value;
+    const managed = key.startsWith('_mobo_') || key.startsWith('mobo_');
+    if (managed && count(`SELECT COUNT(*) FROM ${t('mobo_entity_meta')} WHERE woo_object_id = ${lit(postId)}`) > 0) return null;
+  }
   return scalar(`SELECT meta_value FROM ${t('postmeta')} WHERE post_id = ${lit(postId)} AND meta_key = ${lit(key)} ORDER BY meta_id DESC LIMIT 1`);
 }
 

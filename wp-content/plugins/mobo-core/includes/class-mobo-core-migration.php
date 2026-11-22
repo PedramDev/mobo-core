@@ -534,41 +534,6 @@ class Mobo_Core_Migration {
 	 * @param int    $max_iterations Hard safety cap even on a very fast database.
 	 * @return array
 	 */
-	/**
-	 * Free WordPress' in-request object cache between accelerated migration
-	 * iterations. Only the runtime layer is released (wp_cache_flush_runtime);
-	 * a persistent backend that cannot do that is left untouched.
-	 *
-	 * @return void
-	 */
-	private static function release_slice_runtime_cache() {
-		if ( ! function_exists( 'wp_cache_flush_runtime' ) ) {
-			return;
-		}
-		if ( function_exists( 'wp_cache_supports' ) && ! wp_cache_supports( 'flush_runtime' ) ) {
-			return;
-		}
-		wp_cache_flush_runtime();
-	}
-
-	/**
-	 * Pure-ish: is this request too close to memory_limit to start another
-	 * migration iteration? Reserve: the larger of 24 MiB and 15 % of the limit.
-	 *
-	 * @param int|null $usage Override (tests); null = memory_get_usage().
-	 * @param int|null $limit Override (tests); null = this host's memory_limit.
-	 * @return bool
-	 */
-	public static function slice_memory_pressure( $usage = null, $limit = null ) {
-		$limit = null === $limit ? ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::memory_limit_bytes() : 0 ) : (int) $limit;
-		if ( $limit <= 0 ) {
-			return false;
-		}
-		$usage   = null === $usage ? ( function_exists( 'memory_get_usage' ) ? memory_get_usage() : 0 ) : (int) $usage;
-		$reserve = max( 25165824, (int) floor( $limit * 0.15 ) );
-		return $usage > ( $limit - $reserve );
-	}
-
 	public static function run_budgeted_slice( $source = 'real-cron', $time_budget_seconds = 12, $max_iterations = 200 ) {
 		/* One correlation id per slice so errors and events of this slice can be
 		 * followed in the remote diagnostics bundle. */
@@ -623,8 +588,8 @@ class Mobo_Core_Migration {
 			);
 		}
 		$iterations          = 0;
-		$progressed          = 0;
 		$memory_stopped      = false;
+		$progressed          = 0;
 		$pipeline_passes     = 0;
 		$pipeline_elapsed_ms = 0;
 		$db_queries_started  = isset( $wpdb->num_queries ) ? absint( $wpdb->num_queries ) : 0;
@@ -679,18 +644,12 @@ class Mobo_Core_Migration {
 				if ( ! self::refresh_migration_request_lock( $lock_token ) ) {
 					break;
 				}
-				/* Low-memory hosts (128M): every terminal-retirement batch leaves its
-				 * posts/meta in WordPress' in-request object cache, and one slice runs
-				 * dozens of batches. Release that cache between iterations and stop
-				 * the slice (the next Cron pass resumes from the durable cursor)
-				 * before the memory_limit fatal that otherwise repeats on every pass
-				 * and leaves the site in migration-only mode for good. */
-				if ( $iterations > 0 ) {
-					self::release_slice_runtime_cache();
-					if ( self::slice_memory_pressure() ) {
-						$memory_stopped = true;
-						break;
-					}
+				/* Runtime-30s: never start another unit at >= 75 % of memory_limit (two
+				 * 256 MB fatals on griffinstore). Drop request-local caches once and stop
+				 * if that does not help; the durable cursors resume next request. */
+				if ( $iterations > 0 && class_exists( 'Mobo_Core_Request_Deadline' ) && Mobo_Core_Request_Deadline::memory_guard( 0.6, 0.75 ) ) {
+					$memory_stopped = true;
+					break;
 				}
 				$iterations++;
 				if ( 1 === $iterations ) {
@@ -750,8 +709,8 @@ class Mobo_Core_Migration {
 		$telemetry['pipelineElapsedMs'] = $pipeline_elapsed_ms;
 		$telemetry['dbQueries'] = max( 0, ( isset( $wpdb->num_queries ) ? absint( $wpdb->num_queries ) : 0 ) - $db_queries_started );
 		$telemetry['memoryStartBytes'] = absint( $memory_started );
-		$telemetry['memoryPeakBytes'] = function_exists( 'memory_get_peak_usage' ) ? absint( memory_get_peak_usage( true ) ) : 0;
 		$telemetry['memoryStopped'] = $memory_stopped;
+		$telemetry['memoryPeakBytes'] = function_exists( 'memory_get_peak_usage' ) ? absint( memory_get_peak_usage( true ) ) : 0;
 		$workers = self::migration_worker_statuses();
 		self::save_migration_status_snapshot( $workers );
 		return array(
@@ -5146,7 +5105,7 @@ class Mobo_Core_Migration {
 			 * write failure must not make Health authoritative by rolling durable state
 			 * backwards. Record the refresh failure for diagnostics and allow the normal
 			 * Health/dashboard residue classifier to treat any stale row separately. */
-			if ( ! Mobo_Core_Sync_Health::mark_synced( $guid, $product_id, $portal_revision, $source_hash, $portal_id, $portal_version ) ) {
+			if ( ! Mobo_Core_Sync_Health::mark_synced( $guid, $product_id, $portal_revision, $source_hash, $portal_id, $portal_version, false ) ) {
 				$health_refresh_failed++;
 				if ( count( $health_refresh_failed_guids ) < 100 ) {
 					$health_refresh_failed_guids[] = $guid;

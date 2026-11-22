@@ -40,6 +40,10 @@ final class Mobo_Core_Connection_Settings {
 	public static function table_exists() {
 		global $wpdb;
 		$table = self::table_name();
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			/* Was an uncached SHOW TABLES on every call (hottest query of a cron slice). */
+			return Mobo_Core_Table_Cache::exists( $table );
+		}
 		$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
 		return (string) $found === (string) $table;
 	}

@@ -68,6 +68,33 @@ class Mobo_Core_Rest_Controller {
 		'/mobo-core/v1/support/request-access'           => 'xsec',
 	);
 
+	/** Request header carrying the Cron/Worker token (recommended over ?token=). */
+	const CRON_TOKEN_HEADER = 'X-Mobo-Cron-Token';
+
+	/**
+	 * Pure: whether any provided Cron/Worker credential (X-Mobo-Cron-Token header,
+	 * X-SEC header, legacy ?token= query) equals the configured token. Each
+	 * candidate is compared in constant time; an empty token never matches.
+	 *
+	 * @param string $expected Configured cron token.
+	 * @param array  $candidates Provided values.
+	 * @return bool
+	 */
+	public static function cron_token_matches( $expected, $candidates ) {
+		$expected = (string) $expected;
+		if ( '' === trim( $expected ) ) {
+			return false;
+		}
+		$matched = false;
+		foreach ( (array) $candidates as $candidate ) {
+			$candidate = trim( is_scalar( $candidate ) ? (string) $candidate : '' );
+			if ( '' !== $candidate && hash_equals( $expected, $candidate ) ) {
+				$matched = true;
+			}
+		}
+		return $matched;
+	}
+
 	/**
 	 * Pure: credential kind of a Backend route ('' = not a Backend route).
 	 *
@@ -138,13 +165,12 @@ class Mobo_Core_Rest_Controller {
 	 */
 	private static function backend_credential_valid( $kind ) {
 		if ( 'cron' === $kind ) {
-			$expected = (string) get_option( 'mobo_core_cron_token', '' );
 			// phpcs:ignore WordPress.Security.NonceVerification -- machine token, compared in constant time.
-			$provided = isset( $_REQUEST['token'] ) ? trim( (string) wp_unslash( $_REQUEST['token'] ) ) : '';
-			if ( '' === $provided ) {
-				$provided = self::request_header( 'X-SEC' );
-			}
-			return '' !== trim( $expected ) && '' !== $provided && hash_equals( $expected, $provided );
+			$query = isset( $_REQUEST['token'] ) ? trim( (string) wp_unslash( $_REQUEST['token'] ) ) : '';
+			return self::cron_token_matches(
+				(string) get_option( 'mobo_core_cron_token', '' ),
+				array( self::request_header( self::CRON_TOKEN_HEADER ), self::request_header( 'X-SEC' ), $query )
+			);
 		}
 		if ( 'xsec' === $kind ) {
 			$provided = self::request_header( 'X-SEC' );
@@ -970,17 +996,15 @@ class Mobo_Core_Rest_Controller {
 			);
 		}
 
-		$provided = (string) $request->get_param( 'token' );
+		/* O3: the token header keeps the secret out of web-server access logs; the
+		 * legacy ?token= query form stays accepted for existing cPanel cron lines. */
+		$candidates = array(
+			(string) $request->get_header( self::CRON_TOKEN_HEADER ),
+			(string) $request->get_header( 'X-SEC' ),
+			(string) $request->get_param( 'token' ),
+		);
 
-		if ( '' === $provided ) {
-			$provided = (string) $request->get_header( 'X-SEC' );
-		}
-
-		if ( '' === $provided ) {
-			$provided = (string) $request->get_header( 'x-sec' );
-		}
-
-		if ( '' === $provided || ! hash_equals( $expected, $provided ) ) {
+		if ( ! self::cron_token_matches( $expected, $candidates ) ) {
 			return new WP_Error(
 				'mobo_core_cron_unauthorized',
 				'Unauthorized cron request.',
@@ -1170,6 +1194,26 @@ class Mobo_Core_Rest_Controller {
 			}
 		}
 
+		return self::locked_aware_response( $result );
+	}
+
+	/**
+	 * A runner that found its lease held ("locked") answers 423 + Retry-After like
+	 * the dispatcher, never "200 OK" for a slice that did nothing. The JSON body is
+	 * unchanged (success=false, status=locked), so existing callers keep working.
+	 *
+	 * @param mixed $result Runner result.
+	 * @return WP_REST_Response
+	 */
+	private static function locked_aware_response( $result ) {
+		if ( is_array( $result ) && 'locked' === (string) ( $result['status'] ?? '' ) ) {
+			$retry    = absint( $result['retryAfter'] ?? 0 );
+			$response = new WP_REST_Response( $result, 423 );
+			if ( $retry > 0 ) {
+				$response->header( 'Retry-After', (string) $retry );
+			}
+			return $response;
+		}
 		return rest_ensure_response( $result );
 	}
 

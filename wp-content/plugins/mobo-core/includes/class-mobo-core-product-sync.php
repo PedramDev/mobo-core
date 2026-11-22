@@ -2535,6 +2535,25 @@ class Mobo_Core_Product_Sync {
 	}
 
 	/**
+	 * Whether a variable parent keeps its own (parent-level) stock. While the Source
+	 * block overlay is persisted the WooCommerce props read "unmanaged", so the
+	 * remembered natural state decides.
+	 *
+	 * @param WC_Product $product Variable product.
+	 * @return bool
+	 */
+	private function variable_parent_has_parent_stock( $product ) {
+		if ( ! $product instanceof WC_Product ) {
+			return false;
+		}
+		$natural = Mobo_Core_Source_Visibility::stored_natural_stock( $product );
+		if ( is_array( $natural ) ) {
+			return ! empty( $natural['manage'] );
+		}
+		return (bool) $product->get_manage_stock( 'edit' );
+	}
+
+	/**
 	 * Delta application under the product lock. Phase 1 validates and stages every
 	 * change in memory; phase 2 saves. A failure in phase 1 applies nothing; a
 	 * failure in phase 2 marks the product incomplete and asks for a full snapshot.
@@ -2608,6 +2627,14 @@ class Mobo_Core_Product_Sync {
 				if ( array_key_exists( 'purchasable', $fields ) ) {
 					$flag_updates[ $product_id ] = Mobo_Core_Source_Visibility::payload_variant_purchasable( array( 'purchasable' => $fields['purchasable'] ) );
 				}
+			} elseif ( array_key_exists( 'stock', $fields ) && $this->variable_parent_has_parent_stock( $product ) ) {
+				/* B1: a variable parent with parent-level stock (_manage_stock=yes) gets
+				 * the product-level stock exactly like the full snapshot path
+				 * (apply_api_stock: quantity, stock status, Source-block overlay; the
+				 * save below updates the lookup table and the outofstock visibility
+				 * term). Variant-derived prices are never staged on the parent. A
+				 * parent whose stock is derived from its variations stays unmanaged. */
+				$product_staged = $this->stage_delta_commerce_fields( $product, array( 'stock' => $fields['stock'] ), 'product', 'product' ) || $product_staged;
 			}
 			if ( array_key_exists( 'publishedAt', $fields ) && '' !== sanitize_text_field( (string) $fields['publishedAt'] ) ) {
 				$this->apply_product_dates( $product, $fields );

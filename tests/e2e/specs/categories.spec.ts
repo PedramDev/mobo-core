@@ -7,7 +7,7 @@ import { Page } from '@playwright/test';
 import { test, expect } from '../lib/fixtures';
 import { actionForm, boolValue, cardAjax, clickAndReadNotice, gotoTab, postAjax, requireRendered, reveal, setBool, submitForm } from '../lib/admin';
 import { defaultConnectionId, getSetting, getState, lit, scalar, t, tableExists } from '../lib/db';
-import { mockLog } from '../lib/services';
+import { mockCursor, mockRequestsSince } from '../lib/services';
 
 
 const policyForm = (page: Page) => page.locator('form[data-mobo-category-policy-form="1"]');
@@ -92,11 +92,11 @@ test.describe('Categories tab', () => {
 
   test('"دریافت تازه‌ترین فهرست دسته‌ها" fetches Source categories', { tag: '@backend' }, async ({ page }) => {
     await gotoTab(page, 'categories');
-    const baseline = await mockLog();
+    const baseline = await mockCursor();
     const n = await clickAndReadNotice(page, actionForm(page, 'mobo_core_sync_categories').locator('button[type="submit"]').first());
     expect(n.type, n.message).toBe('success');
     expect(Number(getSetting('mobo_core_categories_mapping_loaded_at') || getSetting('mobo_core_categories_last_sync_at') || 0)).toBeGreaterThan(0);
-    if (baseline) expect((await mockLog())!.length, 'mock Source was queried').toBeGreaterThan(baseline.length);
+    if (baseline) expect((await mockRequestsSince(baseline))?.count ?? 0, 'mock Source was queried').toBeGreaterThan(0);
   });
 
   test('ajax mobo_core_get_recategorize_status returns queue status', async ({ page }) => {

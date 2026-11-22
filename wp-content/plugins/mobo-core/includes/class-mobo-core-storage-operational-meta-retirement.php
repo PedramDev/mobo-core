@@ -30,6 +30,15 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 	/** @var bool|null Request-local positive fence cache. False is intentionally not cached. */
 	private static $fenced = null;
 
+	/** Negative fence reads are reused this long per request (see is_fenced()). */
+	const NEGATIVE_FENCE_TTL = 5;
+
+	/** @var float microtime of the last negative (unfenced) state read; 0 = none. */
+	private static $negative_fence_at = 0.0;
+
+	/** @var float microtime of the last "fenced but not complete" read (is_physically_retired()); 0 = none. */
+	private static $incomplete_at = 0.0;
+
 	/** @var bool Request-local cache: terminal zero-residue was already proven. */
 	private static $zero_residue_verified = false;
 	/** @var bool Reconciliation reads fail closed on any storage query error. */
@@ -121,6 +130,14 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 			return false !== apply_filters( 'mobo_core_operational_meta_terminal_fence_active', true );
 		}
 
+		/* Runtime-30s: before the fence every meta read asked this and re-read the
+		 * runtime row (the most frequent query in the 30 s timeouts). Reuse a negative
+		 * answer for NEGATIVE_FENCE_TTL seconds; persist_state()/reset_request_cache()
+		 * invalidate it and read errors are never cached. */
+		$negative_now = microtime( true );
+		if ( self::negative_fence_fresh( self::$negative_fence_at, $negative_now ) ) {
+			return false;
+		}
 		$state = self::load_state();
 		$active = ! empty( $state['fenceActive'] ) && self::FENCE_VERSION === absint( isset( $state['fenceVersion'] ) ? $state['fenceVersion'] : 0 );
 		if ( $active ) {
@@ -128,11 +145,27 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 			/* Self-heal the redundant marker; false can also mean it already existed. */
 			update_option( self::FENCE_OPTION, self::FENCE_VERSION, false );
 		}
+		if ( ! $active && empty( $state['__stateLoadError'] ) ) {
+			self::$negative_fence_at = $negative_now;
+		}
 		return $active && false !== apply_filters( 'mobo_core_operational_meta_terminal_fence_active', true );
 	}
 
 	/** @return void */
-	public static function reset_request_cache() { self::$fenced = null; self::$zero_residue_verified = false; self::reset_reconcile_batch_cache(); self::reset_proof_batch_cache(); }
+	/**
+	 * Pure (unit tested): may a negative fence read from $cached_at be reused at $now?
+	 *
+	 * @param float $cached_at microtime of the negative read (0 = none).
+	 * @param float $now       microtime.
+	 * @return bool
+	 */
+	public static function negative_fence_fresh( $cached_at, $now ) {
+		$cached_at = (float) $cached_at;
+		$age       = (float) $now - $cached_at;
+		return $cached_at > 0 && $age >= 0 && $age < self::NEGATIVE_FENCE_TTL;
+	}
+
+	public static function reset_request_cache() { self::$negative_fence_at = 0.0; self::$incomplete_at = 0.0; self::$fenced = null; self::$zero_residue_verified = false; self::reset_reconcile_batch_cache(); self::reset_proof_batch_cache(); }
 
 
 	/** @return int */
@@ -425,6 +458,10 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 		try {
 		foreach ( $rows as $row ) {
 			$row_id=absint($row['id']??0);$post_id=absint($row['wp_post_id']??0);$object_type=sanitize_key((string)($row['object_type']??''));$guid=sanitize_text_field((string)($row['remote_guid']??''));
+			/* Runtime-30s: stop the page early under memory pressure; the cursor below
+			 * keeps every object proven so far and the next slice resumes after it. */
+			if ( class_exists( 'Mobo_Core_Request_Deadline' ) && Mobo_Core_Request_Deadline::memory_pressure( 0.75 ) ) { $state['memoryStops']=absint($state['memoryStops']??0)+1; break; }
+			if ( $post_id > 0 ) { self::prime_proof_meta_chunk( $post_ids, $post_id ); }
 			$expected = Mobo_Core_Product_Map::TYPE_VARIATION === $object_type ? 'product_variation' : 'product';
 			if ( $post_id <= 0 || get_post_type( $post_id ) !== $expected ) { $cursor=$row_id; continue; }
 			/* Marked objects keep their legacy rows and are skipped by every worker. */
@@ -519,7 +556,11 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 	/** Set-based Custom-state snapshot for one bounded Operational proof page. @return bool */
 	private static function prime_proof_batch_cache( $post_ids ) {
 		global $wpdb;self::reset_proof_batch_cache();$post_ids=array_values(array_unique(array_filter(array_map('absint',(array)$post_ids))));if(empty($post_ids)){return true;}
-		if(function_exists('_prime_post_caches')){_prime_post_caches($post_ids,false,false);}update_meta_cache('post',$post_ids);
+		if(function_exists('_prime_post_caches')){_prime_post_caches($post_ids,false,false);}
+		/* Runtime-30s: postmeta is primed in small chunks inside the proof loop
+		 * (prime_proof_meta_chunk()); one update_meta_cache() for a 500-object page
+		 * exhausted 256 MB on griffinstore. */
+		self::$proof_meta_primed=array();
 		foreach($post_ids as $id){self::$proof_product_scope[$id]=true;self::$proof_variant_scope[$id]=true;}
 		$connection_id=class_exists('Mobo_Core_Connection_Context')?absint(Mobo_Core_Connection_Context::get_effective_connection_id()):0;if($connection_id<=0){return false;}
 		$idph=implode(',',array_fill(0,count($post_ids),'%d'));
@@ -538,8 +579,39 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 	private static function invalidate_proof_variant_state( $post_id ) {$post_id=absint($post_id);unset(self::$proof_variant_scope[$post_id],self::$proof_variant_rows[$post_id]);}
 
 	/** Release only the heavy postmeta cache retained by this proof page. @return void */
+	/** @var array<int,bool> Post ids whose postmeta is currently primed by the proof. */
+	private static $proof_meta_primed = array();
+
+	/** Postmeta rows primed per chunk inside the proof loop. */
+	const PROOF_META_CHUNK = 50;
+
+	/**
+	 * Prime postmeta for the chunk of the page that starts at $post_id and evict
+	 * the previously primed chunk (bounded memory, still one query per chunk).
+	 *
+	 * @param int[] $post_ids Page post ids (ordered).
+	 * @param int   $post_id  Object about to be proven.
+	 * @return void
+	 */
+	private static function prime_proof_meta_chunk( $post_ids, $post_id ) {
+		if ( isset( self::$proof_meta_primed[ $post_id ] ) || ! function_exists( 'update_meta_cache' ) ) {
+			return;
+		}
+		foreach ( array_keys( self::$proof_meta_primed ) as $old ) {
+			wp_cache_delete( $old, 'post_meta' );
+		}
+		self::$proof_meta_primed = array();
+		$pos   = array_search( $post_id, $post_ids, true );
+		$chunk = false === $pos ? array( $post_id ) : array_slice( $post_ids, (int) $pos, self::PROOF_META_CHUNK );
+		update_meta_cache( 'post', $chunk );
+		foreach ( $chunk as $id ) {
+			self::$proof_meta_primed[ $id ] = true;
+		}
+	}
+
 	private static function release_proof_batch_cache( $post_ids ) {
-		foreach((array)$post_ids as $post_id){$post_id=absint($post_id);if($post_id>0){wp_cache_delete($post_id,'post_meta');}}
+		foreach((array)$post_ids as $post_id){$post_id=absint($post_id);if($post_id>0){wp_cache_delete($post_id,'post_meta');wp_cache_delete($post_id,'posts');}}
+		self::$proof_meta_primed=array();
 		self::reset_proof_batch_cache();
 	}
 
@@ -871,7 +943,7 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 
 	/** Durable terminal prerequisite with request-local zero-residue caching. @return bool */
 	public static function is_physically_retired() {
-		if(!self::is_fenced()){return false;}$state=self::load_state();if(empty($state['complete'])){return false;}if(self::$zero_residue_verified){return true;}$has=self::has_physical_residue();if(null===$has||$has){return false;}self::$zero_residue_verified=true;return true;
+		if(!self::is_fenced()){return false;}$incomplete_now=microtime(true);if(self::negative_fence_fresh(self::$incomplete_at,$incomplete_now)){return false;}$state=self::load_state();if(empty($state['complete'])){if(empty($state['__stateLoadError'])){self::$incomplete_at=$incomplete_now;}return false;}if(self::$zero_residue_verified){return true;}$has=self::has_physical_residue();if(null===$has||$has){return false;}self::$zero_residue_verified=true;return true;
 	}
 
 	/** @return int|null */
@@ -937,6 +1009,8 @@ final class Mobo_Core_Storage_Operational_Meta_Retirement {
 
 	/** CAS-persist worker state so an expired/lost lock owner cannot overwrite newer progress. @return bool */
 	private static function persist_state( $state, $finished = false ) {
+		self::$negative_fence_at = 0.0;
+		self::$incomplete_at = 0.0;
 		if ( class_exists( 'Mobo_Core_Migration' ) && ! Mobo_Core_Migration::accelerated_slice_lock_is_valid() ) { return false; }
 		if ( ! empty( $state['__stateLoadError'] ) ) { return false; }
 		global $wpdb;if(!class_exists('Mobo_Core_Storage_Schema')||!Mobo_Core_Storage_Schema::is_ready()){return false;}

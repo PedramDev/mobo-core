@@ -1050,6 +1050,45 @@ class Mobo_Core_Image_Queue {
 	}
 
 	/**
+	 * Return one claimed row to pending until a given time without recording an
+	 * attempt: try count, last error and the per-item backoff ledger stay as they
+	 * were. Used while the row's image host is isolated by its per-host breaker.
+	 *
+	 * @param int    $id Row ID.
+	 * @param int    $until Unix time of the next eligible attempt.
+	 * @param string $claim_token Exact persisted claim token.
+	 * @return bool
+	 */
+	public function defer_claimed_until( $id, $until, $claim_token ) {
+		global $wpdb;
+		$connection_id = self::connection_id();
+		$id            = absint( $id );
+		$until         = max( time() + 1, absint( $until ) );
+		$claim_token   = sanitize_text_field( (string) $claim_token );
+		if ( $connection_id <= 0 || $id <= 0 || '' === $claim_token || ! self::table_exists() ) {
+			return false;
+		}
+		$table   = self::table_name();
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', next_retry_at = %s, locked_until = NULL, updated_at = %s
+				WHERE connection_id = %d AND id = %d AND status = 'processing' AND locked_until = %s",
+				gmdate( 'Y-m-d H:i:s', $until ),
+				current_time( 'mysql', true ),
+				$connection_id,
+				$id,
+				$claim_token
+			)
+		);
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+		return false;
+	}
+
+	/**
 	 * Release rows that were bulk-claimed but not handled before a safe stop.
 	 *
 	 * @param array  $ids Row IDs.
