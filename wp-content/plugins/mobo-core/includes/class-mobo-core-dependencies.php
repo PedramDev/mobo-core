@@ -263,4 +263,92 @@ class Mobo_Core_Dependencies {
 			require_once $plugin_api;
 		}
 	}
+
+	/**
+	 * Backend (machine) REST routes that must still answer while a requirement is
+	 * missing. envA T13: with WooCommerce inactive (FTP rename, failed update,
+	 * dependency auto-deactivation) the bootstrap returned before any route was
+	 * registered, so cron/run, heartbeat, health and webhook answered 404
+	 * rest_no_route. A cPanel cron / the Backend then saw "endpoint missing"
+	 * (webhook deliveries may be treated as permanent failures) instead of the
+	 * retryable "dependency missing" that mobo-cron.php already reports.
+	 *
+	 * SECURITY: /health and /health/report-now are deliberately NOT registered
+	 * here. Mobo_Core_Health_Read_Cache::serve_health_snapshot() answers any
+	 * handler of GET /mobo-core/v1/health from the cached report on
+	 * rest_dispatch_request (it relies on the route's permission_callback), so an
+	 * open placeholder route would hand out the full Health report (license token
+	 * included) without X-SEC. These routes need no credential because they only
+	 * ever return the constant 503 below.
+	 *
+	 * @return string[] Routes relative to the mobo-core/v1 namespace.
+	 */
+	public static function dependency_missing_routes() {
+		return array(
+			'/cron/run', '/cron/status', '/worker/run', '/worker/status', '/heartbeat',
+			'/webhook', '/webhook/run', '/sync/start', '/sync/run', '/sync/status', '/sync/cancel',
+			'/upgrade/status', '/upgrade/apply', '/connection/provision',
+		);
+	}
+
+	/**
+	 * 503 body for a Backend route while requirements are missing. No secrets,
+	 * no side effects; Retry-After tells callers to back off.
+	 *
+	 * @param string[] $missing Missing requirement labels.
+	 * @return array{status:int,body:array,headers:array}
+	 */
+	public static function dependency_missing_rest_payload( $missing = array() ) {
+		$missing = is_array( $missing ) ? array_values( array_filter( array_map( 'strval', $missing ) ) ) : array();
+		return array(
+			'status'  => 503,
+			'body'    => array(
+				'success' => false,
+				'status'  => 'dependency-missing',
+				'code'    => 'mobo_core_dependency_missing',
+				'message' => 'WooCommerce (or another Mobo Core requirement) is not active; the request was not processed.',
+				'missing' => $missing,
+			),
+			'headers' => array( 'Retry-After' => '300', 'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0' ),
+		);
+	}
+
+	/**
+	 * Register the 503 dependency-missing answers (called only from the bootstrap
+	 * branch that skips the normal plugin runtime).
+	 *
+	 * @param string[] $missing Missing requirement labels.
+	 * @return void
+	 */
+	public static function register_dependency_missing_routes( $missing = array() ) {
+		if ( ! function_exists( 'add_action' ) ) {
+			return;
+		}
+		add_action(
+			'rest_api_init',
+			static function () use ( $missing ) {
+				if ( ! function_exists( 'register_rest_route' ) ) {
+					return;
+				}
+				$payload = self::dependency_missing_rest_payload( $missing );
+				foreach ( self::dependency_missing_routes() as $route ) {
+					register_rest_route(
+						'mobo-core/v1',
+						$route,
+						array(
+							'methods'             => array( 'GET', 'POST' ),
+							'callback'            => static function () use ( $payload ) {
+								$response = new WP_REST_Response( $payload['body'], $payload['status'] );
+								foreach ( $payload['headers'] as $name => $value ) {
+									$response->header( $name, $value );
+								}
+								return $response;
+							},
+							'permission_callback' => '__return_true',
+						)
+					);
+				}
+			}
+		);
+	}
 }

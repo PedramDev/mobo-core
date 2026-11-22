@@ -234,5 +234,22 @@ $item = $store->row_to_item( array( 'payload_json' => '{}', 'expires_at' => '202
 t_same( 1767225600, $item['expiresAt'], 'row_to_item() expiry is UTC' );
 date_default_timezone_set( $tz );
 
+echo "\n[envA T15] same-revision re-delivery vs a processed (enriched) row\n";
+$eq = new ReflectionMethod( 'Mobo_Core_Sync_Event_Store', 'event_payloads_equivalent' );
+$eq->setAccessible( true );
+$sent      = array( 'event' => 'ProductUpdated', 'sourceRevision' => 7, 'eventId' => 'a', 'data' => array( 'syncId' => 's1', 'data' => array( array( 'productId' => 'g1', 'price' => 100 ) ) ) );
+$processed = $sent;
+$processed['_moboEventVersion'] = '7';
+$processed['_moboWebhookForegroundContext'] = '1';
+$processed['_moboQueueEventUuid'] = 'u-1';
+$processed['entityGuid'] = 'g1';
+$redelivery = $sent;
+$redelivery['eventId'] = 'b';
+$redelivery['data']['syncId'] = 's2';
+t_check( true === $eq->invoke( $store, wp_json_encode( $redelivery ), wp_json_encode( $processed ) ), 'identical re-delivery (new eventId/syncId) == processed row with plugin-internal keys (replay, not conflict)' );
+$changed = $redelivery;
+$changed['data']['data'][0]['price'] = 101;
+t_check( false === $eq->invoke( $store, wp_json_encode( $changed ), wp_json_encode( $processed ) ), 'same revision with a different price is still an ordering conflict' );
+
 echo "\n" . $GLOBALS['t_checks'] . ' checks, ' . $GLOBALS['t_failures'] . ' failure(s) on PHP ' . PHP_VERSION . "\n";
 exit( $GLOBALS['t_failures'] > 0 ? 1 : 0 );

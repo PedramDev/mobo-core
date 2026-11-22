@@ -143,6 +143,18 @@ if ( Mobo_Core_Environment::can( 'exec' ) ) {
 }
 $cron_src = (string) file_get_contents( $plugin_dir . 'mobo-cron.php' );
 t_check( false !== strpos( $cron_src, "function_exists( 'wc_get_product' )" ) && false !== strpos( $cron_src, "'dependency-missing'" ), 'cron entry checks WooCommerce functions before running the worker' );
+/* envA T13: REST cron/heartbeat/health/webhook answered 404 rest_no_route while WC was inactive. */
+if ( ! class_exists( 'Mobo_Core_Dependencies' ) ) {
+	require $inc . 'class-mobo-core-dependencies.php';
+}
+$D = 'Mobo_Core_Dependencies';
+$routes = $D::dependency_missing_routes();
+t_check( ! array_diff( array( '/cron/run', '/worker/run', '/heartbeat', '/webhook' ), $routes ), 'WC inactive: Backend/cron REST routes stay registered' );
+t_check( ! in_array( '/health', $routes, true ) && ! in_array( '/health/report-now', $routes, true ), '  SECURITY: no open /health placeholder (Health_Read_Cache would serve the cached report without X-SEC)' );
+$dp = $D::dependency_missing_rest_payload( array( 'WooCommerce' ) );
+t_check( 503 === $dp['status'] && 'dependency-missing' === $dp['body']['status'] && isset( $dp['headers']['Retry-After'] ) && false === $dp['body']['success'], '  ...answering retryable 503 dependency-missing (not 404)' );
+$main_src = (string) file_get_contents( $plugin_dir . 'mobo-core.php' );
+t_check( false !== strpos( $main_src, 'register_dependency_missing_routes(' ), '  bootstrap registers them in the missing-dependency branch' );
 
 /* ====================================================================== */
 echo "\n[2] REST blocked by security plugins: narrow bypass\n";
@@ -264,6 +276,14 @@ $GLOBALS['t_hpos'] = false;
 t_same( '', $RL::hpos_meta_table(), 'HPOS off => legacy wp_postmeta discovery only' );
 $sql = $RL::backfill_candidate_sql( 'hpos', 'wp_wc_orders_meta; DROP TABLE x' );
 t_check( false === strpos( $sql['select'], ';' ), 'HPOS table name is sanitized in SQL' );
+/* envA T12 (HPOS off): the CPT order store drops a nested meta_query (and logs
+ * _doing_it_wrong), so the summary must use the meta_key/meta_value shortcut that
+ * both stores honour, otherwise every shop_order is loaded in one REST request. */
+$qa = $RL::summary_query_args( 200, 3 );
+t_check( ! isset( $qa['meta_query'] ), 'revenue summary query has no nested meta_query (ignored by the CPT store)' );
+t_same( $RL::META_LEDGER_VERSION, $qa['meta_key'] ?? null, '  filters on the ledger version meta key' );
+t_same( (string) $RL::LEDGER_VERSION, $qa['meta_value'] ?? null, '  ...and value' );
+t_same( array( 200, 3, 'ids', 'shop_order' ), array( $qa['limit'], $qa['page'], $qa['return'], $qa['type'] ), '  paged, ids only, orders only' );
 
 /* ====================================================================== */
 echo "\n[4] cron health on heartbeat-only sites\n";
@@ -294,6 +314,11 @@ $health_src = (string) file_get_contents( $inc . 'class-mobo-core-health-reporte
 t_check( false !== strpos( $health_src, "Mobo_Core_Cron_Runner::resolve_cron_activity( \$last_self_run, \$last_cron_hit, absint( \$cron_status['lastDriverRunAt'] ?? 0 ), (string) ( \$cron_status['lastDriverSource'] ?? '' ), time(), \$self_enabled )" ), 'health report resolves the most recent driver with the self-runner enabled flag' );
 t_check( false !== strpos( $health_src, "'cronMode'              => (string) \$cron_activity['mode']" ) && false !== strpos( $health_src, "'lastCronHitAt'         => \$this->format_timestamp( absint( \$cron_activity['lastAt'] ) )" ), 'health cronMode and lastCronHitAt both come from the most recent driver' );
 t_check( false === strpos( $health_src, '$last_self_run > 0 ?' ), 'no self-runner-first precedence left in the health report' );
+/* envA T14: DISABLE_WP_CRON + loopback blocked; the self-runner last ran long ago. */
+$a = $C::resolve_cron_activity( $now - 86400 * 30, 0, $now - 120, 'portal-heartbeat', $now );
+t_same( array( 'portal_heartbeat', $now - 120 ), array( $a['mode'], $a['lastAt'] ), 'envA T14: old self-run + current heartbeat => portal_heartbeat with fresh lastAt' );
+$a = $C::resolve_cron_activity( $now - 86400, $now - 60, $now - 60, 'real-cron', $now );
+t_same( 'real_cron', $a['mode'], 'envA T14: old self-run + current real cron => real_cron' );
 
 /* ====================================================================== */
 echo "\n[5] UTC date handling under a non-UTC PHP timezone\n";

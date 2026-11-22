@@ -210,6 +210,37 @@ final class Mobo_Core_Product_Pricing_Policy {
 	 * @param bool $force Ignore the rate limit.
 	 * @return array Summary.
 	 */
+	/**
+	 * Prepared candidate query for pending override generations.
+	 *
+	 * After the 10.34.77 entity-meta retirement (fence active) the pending
+	 * generation is written to Custom Storage (wp_mobo_entity_meta) through the
+	 * post-meta filters, and wp_postmeta no longer holds it. Probing wp_postmeta
+	 * only made the sweeper blind on migrated sites: a lost/never-run retry
+	 * (DISABLE_WP_CRON, no traffic, killed request) was never re-scheduled or
+	 * driven by the runner (envA T14, 8092).
+	 *
+	 * @param int  $limit         Max rows.
+	 * @param bool|null $authoritative Null = ask the retirement worker (tests pass a bool).
+	 * @return string
+	 */
+	public static function pending_candidates_sql( $limit, $authoritative = null ) {
+		global $wpdb;
+		$limit = max( 1, min( 100, absint( $limit ) ) );
+		if ( null === $authoritative ) {
+			$authoritative = class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' )
+				&& Mobo_Core_Storage_Entity_Meta_Retirement::is_authoritative()
+				&& Mobo_Core_Storage_Entity_Meta_Retirement::is_managed_key( self::META_PENDING );
+		}
+		if ( $authoritative && class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) ) {
+			$table = preg_replace( '/[^A-Za-z0-9_]/', '', (string) Mobo_Core_Storage_Entity_Meta_Retirement::table_name() );
+			if ( '' !== $table ) {
+				return $wpdb->prepare( "SELECT DISTINCT woo_object_id FROM {$table} WHERE meta_key = %s AND COALESCE(meta_value,'') <> '' ORDER BY woo_object_id ASC LIMIT %d", self::META_PENDING, $limit );
+			}
+		}
+		return $wpdb->prepare( "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY meta_id ASC LIMIT %d", self::META_PENDING, $limit );
+	}
+
 	public static function sweep_stuck_requests( $limit = 20, $force = false ) {
 		global $wpdb;
 		$now = time();
@@ -221,8 +252,7 @@ final class Mobo_Core_Product_Pricing_Policy {
 		$current_connection = class_exists( 'Mobo_Core_Connection_Context' ) ? absint( Mobo_Core_Connection_Context::get_effective_connection_id() ) : 0;
 		$limit = max( 1, min( 100, absint( $limit ) ) );
 		$wpdb->last_error = '';
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- bounded indexed meta_key probe.
-		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY meta_id ASC LIMIT %d", self::META_PENDING, $limit ) );
+		$ids = $wpdb->get_col( self::pending_candidates_sql( $limit ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- prepared in pending_candidates_sql(); bounded indexed meta_key probe.
 		if ( '' !== trim( (string) $wpdb->last_error ) || ! is_array( $ids ) ) {
 			return array( 'status' => 'read-failed' );
 		}

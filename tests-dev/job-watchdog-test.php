@@ -180,4 +180,25 @@ $driven_logged = false;
 foreach ( (array) ( $events['events'] ?? array() ) as $event ) { $driven_logged = $driven_logged || 'runner-driven' === ( $event['type'] ?? '' ); }
 t_check( $driven_logged, '  runner-driven retry recorded in diagnostics' );
 
+/* envA T14 (B5): after the entity-meta retirement the pending generation lives in
+ * Custom Storage; the sweeper must probe wp_mobo_entity_meta, not wp_postmeta. */
+if ( ! class_exists( 'Mobo_Core_Storage_Entity_Meta_Retirement' ) ) {
+	final class Mobo_Core_Storage_Entity_Meta_Retirement {
+		public static $authoritative = true;
+		public static function is_authoritative() { return self::$authoritative; }
+		public static function is_managed_key( $k ) { return 0 === strpos( (string) $k, '_mobo_' ); }
+		public static function table_name() { return 'wp_mobo_entity_meta'; }
+	}
+}
+$q = Mobo_Core_Product_Pricing_Policy::pending_candidates_sql( 20 );
+t_check( false !== strpos( $q['q'], 'FROM wp_mobo_entity_meta' ), 'retired storage: sweeper probes wp_mobo_entity_meta' );
+Mobo_Core_Storage_Entity_Meta_Retirement::$authoritative = false;
+$q = Mobo_Core_Product_Pricing_Policy::pending_candidates_sql( 20 );
+t_check( false !== strpos( $q['q'], 'FROM wp_postmeta' ), 'legacy storage: sweeper still probes wp_postmeta' );
+Mobo_Core_Storage_Entity_Meta_Retirement::$authoritative = true;
+$GLOBALS['wpdb']->pending_meta_ids   = array();
+$GLOBALS['wpdb']->entity_pending_ids = array( '21' );
+$sweep = Mobo_Core_Product_Pricing_Policy::sweep_stuck_requests( 20, true );
+t_same( 1, $sweep['pending'] ?? null, 'retired storage: pending generation found (was 0 -> never retried)' );
+
 t_done();

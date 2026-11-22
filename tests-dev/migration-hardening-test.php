@@ -312,5 +312,48 @@ delete_option( 'mobo_core_schema_last_error' );
 $finalize->invoke( null, false );
 check( 'schema not proven -> postcondition error still reported', 0 === strpos( (string) get_option( 'mobo_core_schema_last_error' ), $M::POSTCONDITION_ERROR_PREFIX ) );
 
+echo "\n[10] envA B1: 10.31.71 lock recovery is one-shot (fresh install / old upgrade budgeted slices)\n";
+/* Declared at runtime, after the earlier sections, so their class_exists() paths are unchanged. */
+if ( ! class_exists( 'Mobo_Core_Lock' ) ) {
+	class Mobo_Core_Lock {
+		public static $calls = 0;
+		public static function force_release_all() { self::$calls++; return array( 'deleted' => 2, 'found' => 2 ); }
+	}
+}
+reset_state();
+$recovery = new ReflectionMethod( $M, 'apply_103171_runtime_lock_recovery' );
+$recovery->setAccessible( true );
+Mobo_Core_Lock::$calls = 0;
+$recovery->invoke( null, '' ); // activation of a fresh install
+$recovery->invoke( null, '' ); // budgeted cron slice 1 (db version still '')
+$recovery->invoke( null, '' ); // budgeted cron slice 2
+check( 'fresh install: locks force-released at most once (live cron lease survives later slices)', 1 === Mobo_Core_Lock::$calls );
+reset_state();
+Mobo_Core_Lock::$calls = 0;
+$recovery->invoke( null, '10.30.5' );
+$recovery->invoke( null, '10.30.5' );
+check( 'pre-10.31.71 upgrade: legacy lock cleanup runs once, not on every slice', 1 === Mobo_Core_Lock::$calls );
+check( '  and records the cleanup marker', false !== get_option( 'mobo_core_103171_lock_cleanup_at', false ) );
+reset_state();
+Mobo_Core_Lock::$calls = 0;
+$recovery->invoke( null, '10.33.67' );
+check( '10.33.67 upgrade: no lock cleanup at all', 0 === Mobo_Core_Lock::$calls );
+
+echo "\n[11] envA B3: grace/backoff bookkeeping is not migration progress (no loopback spin)\n";
+$P = array( $M, 'slice_iteration_progressed' );
+$grace_a = '10.33.67|identity:{"status":"fenced-grace","stateRevision":31}';
+$grace_b = '10.33.67|identity:{"status":"fenced-grace","stateRevision":32}';
+$core_g  = '10.33.67|identity:{"status":"fenced-grace","stateRevision":0}';
+check( 'waiting in grace, only stateRevision changed -> NOT progressed', false === call_user_func( $P, $grace_a, $grace_b, $core_g, $core_g, true ) );
+$before = '10.33.67|identity:{"status":"proof-complete","stateRevision":30}';
+$core_b = '10.33.67|identity:{"status":"proof-complete","stateRevision":0}';
+check( 'entering the grace (status transition) -> progressed', true === call_user_func( $P, $before, $grace_a, $core_b, $core_g, true ) );
+check( 'active (not waiting) worker with a new revision -> progressed', true === call_user_func( $P, $before, '10.33.67|identity:{"status":"proof-complete","stateRevision":31}', $core_b, $core_b, false ) );
+check( 'identical fingerprint -> not progressed', false === call_user_func( $P, $grace_a, $grace_a, $core_g, $core_g, false ) );
+$err_a = '10.33.67|entity:{"status":"copy","stateRevision":5,"lastError":"x"}';
+$err_b = '10.33.67|entity:{"status":"copy","stateRevision":6,"lastError":"x"}';
+$err_c = '10.33.67|entity:{"status":"copy","stateRevision":0,"lastError":"x"}';
+check( 'erroring worker re-persisting the same error -> not progressed', false === call_user_func( $P, $err_a, $err_b, $err_c, $err_c, true ) );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
