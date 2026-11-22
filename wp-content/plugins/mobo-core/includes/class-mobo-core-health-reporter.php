@@ -229,7 +229,7 @@ class Mobo_Core_Health_Reporter {
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
 			/* Heartbeat-only sites (no server cron, no self-runner) still run the
 			 * worker: report the latest driver run instead of "never". */
-			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : ( $last_cron_hit > 0 ? $last_cron_hit : absint( $cron_status['lastDriverRunAt'] ?? 0 ) ) ),
+			'lastCronHitAt'         => $this->format_timestamp( method_exists( 'Mobo_Core_Cron_Runner', 'latest_runner_activity_at' ) ? Mobo_Core_Cron_Runner::latest_runner_activity_at( $last_self_run, $last_cron_hit, absint( $cron_status['lastDriverRunAt'] ?? 0 ) ) : ( $last_self_run > 0 ? $last_self_run : ( $last_cron_hit > 0 ? $last_cron_hit : absint( $cron_status['lastDriverRunAt'] ?? 0 ) ) ) ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),
 			'lastWebhookSuccessAt'  => $this->format_timestamp( $this->get_last_webhook_success_timestamp( $cron_status ) ),
 

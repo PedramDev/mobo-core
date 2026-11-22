@@ -247,7 +247,15 @@ t_check( ! empty( $st['driverActive'] ) && 'portal-heartbeat' === $st['lastDrive
 $runner_src = (string) file_get_contents( $inc . 'class-mobo-core-cron-runner.php' );
 t_check( false !== strpos( $runner_src, 'self::record_driver_run( $source );' ), 'every runner start records its driver' );
 $health_src = (string) file_get_contents( $inc . 'class-mobo-core-health-reporter.php' );
-t_check( false !== strpos( $health_src, 'classify_cron_mode(' ) && false !== strpos( $health_src, "\$last_cron_hit : absint( \$cron_status['lastDriverRunAt'] ?? 0 )" ), 'health report uses the driver run for cronMode and lastCronHitAt' );
+t_check( false !== strpos( $health_src, 'classify_cron_mode(' ) && false !== strpos( $health_src, "latest_runner_activity_at( \$last_self_run, \$last_cron_hit, absint( \$cron_status['lastDriverRunAt'] ?? 0 ) )" ), 'health report uses the driver run for cronMode and lastCronHitAt' );
+/* envA T14 (B4): DISABLE_WP_CRON + loopback blocked; the self-runner last ran long ago. */
+t_same( 'portal_heartbeat', $C::classify_cron_mode( $now - 86400 * 30, 0, $now - 120, 'portal-heartbeat', $now ), 'old self-run + current heartbeat => portal_heartbeat (was self_runner forever)' );
+t_same( 'real_cron', $C::classify_cron_mode( $now - 86400, $now - 60, $now - 60, 'real-cron', $now ), 'old self-run + current real cron => real_cron' );
+t_same( 'real_cron', $C::classify_cron_mode( $now - 5, $now - 60, $now - 5, 'worker-continuation', $now ), 'real cron + its loopback continuation => real_cron (double-scheduling check stays reachable)' );
+t_same( 'self_runner', $C::classify_cron_mode( $now - 30, 0, $now - 30, 'webhook', $now ), 'self-runner-only site => self_runner' );
+t_same( 'self_runner', $C::classify_cron_mode( $now - 9000, $now - 8000, 0, '', $now ), 'nothing recent => historical label kept (Backend reports it stale)' );
+t_same( $now - 120, $C::latest_runner_activity_at( $now - 86400 * 30, 0, $now - 120 ), 'lastCronHitAt = freshest driver activity, not an old self-run' );
+t_same( 0, $C::latest_runner_activity_at( 0, 0, 0 ), 'never ran => 0' );
 
 /* ====================================================================== */
 echo "\n[5] UTC date handling under a non-UTC PHP timezone\n";

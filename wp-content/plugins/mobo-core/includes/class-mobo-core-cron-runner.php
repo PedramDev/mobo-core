@@ -404,17 +404,54 @@ class Mobo_Core_Cron_Runner {
 	 * @return string self_runner|real_cron|portal_heartbeat|other_driver|not_detected
 	 */
 	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now ) {
-		if ( absint( $last_self_run ) > 0 ) {
-			return 'self_runner';
-		}
-		if ( absint( $last_cron_hit ) > 0 ) {
+		$now             = absint( $now );
+		$last_self_run   = absint( $last_self_run );
+		$last_cron_hit   = absint( $last_cron_hit );
+		$last_driver_run = absint( $last_driver_run );
+		$heartbeat       = 'portal-heartbeat' === sanitize_key( (string) $driver_source );
+		$recent          = static function ( $at ) use ( $now ) {
+			return $at > 0 && ( $now - $at ) < HOUR_IN_SECONDS;
+		};
+		/* envA T14: the label must describe the driver that runs the site NOW. A
+		 * self-runner run months ago (loopback since blocked) used to pin the label
+		 * to self_runner forever while the real cron / Backend heartbeat drove the
+		 * runner, and real_cron was never reported once a continuation had run. */
+		if ( $recent( $last_cron_hit ) ) {
 			return 'real_cron';
 		}
-		$last_driver_run = absint( $last_driver_run );
-		if ( $last_driver_run > 0 && ( absint( $now ) - $last_driver_run ) < HOUR_IN_SECONDS ) {
-			return 'portal-heartbeat' === sanitize_key( (string) $driver_source ) ? 'portal_heartbeat' : 'other_driver';
+		if ( $heartbeat && $recent( $last_driver_run ) ) {
+			return 'portal_heartbeat';
+		}
+		if ( $recent( $last_self_run ) ) {
+			return 'self_runner';
+		}
+		if ( $recent( $last_driver_run ) ) {
+			return 'other_driver';
+		}
+		/* Nothing ran within the hour: keep the historical label so the Backend can
+		 * report a stale runner (it judges staleness from lastCronHitAt). */
+		if ( $last_self_run > 0 ) {
+			return 'self_runner';
+		}
+		if ( $last_cron_hit > 0 ) {
+			return 'real_cron';
 		}
 		return 'not_detected';
+	}
+
+	/**
+	 * Pure: the most recent runner activity of any driver (health lastCronHitAt).
+	 * Preferring the self-runner timestamp whenever it was ever non-zero froze
+	 * lastCronHitAt at an old self-run on sites whose loopback is now blocked, so
+	 * the Backend flagged "runner-stale" although real cron / heartbeat ran.
+	 *
+	 * @param int $last_self_run   Self-runner last run.
+	 * @param int $last_cron_hit   Real cron last hit.
+	 * @param int $last_driver_run Any driver last run.
+	 * @return int Unix time, 0 when nothing ever ran.
+	 */
+	public static function latest_runner_activity_at( $last_self_run, $last_cron_hit, $last_driver_run ) {
+		return max( 0, absint( $last_self_run ), absint( $last_cron_hit ), absint( $last_driver_run ) );
 	}
 
 	/**
