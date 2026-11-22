@@ -1170,6 +1170,26 @@ class Mobo_Core_Rest_Controller {
 			}
 		}
 
+		return self::locked_aware_response( $result );
+	}
+
+	/**
+	 * A runner that found its lease held ("locked") answers 423 + Retry-After like
+	 * the dispatcher, never "200 OK" for a slice that did nothing. The JSON body is
+	 * unchanged (success=false, status=locked), so existing callers keep working.
+	 *
+	 * @param mixed $result Runner result.
+	 * @return WP_REST_Response
+	 */
+	private static function locked_aware_response( $result ) {
+		if ( is_array( $result ) && 'locked' === (string) ( $result['status'] ?? '' ) ) {
+			$retry    = absint( $result['retryAfter'] ?? 0 );
+			$response = new WP_REST_Response( $result, 423 );
+			if ( $retry > 0 ) {
+				$response->header( 'Retry-After', (string) $retry );
+			}
+			return $response;
+		}
 		return rest_ensure_response( $result );
 	}
 

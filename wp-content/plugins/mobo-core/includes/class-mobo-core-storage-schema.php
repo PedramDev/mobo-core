@@ -505,6 +505,9 @@ final class Mobo_Core_Storage_Schema {
 		 * schema readiness represents the actual query contract, not just DDL intent. */
 		self::repair_required_indexes( $t );
 
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			Mobo_Core_Table_Cache::flush();
+		}
 		self::$ready_cache = null;
 		$ready             = self::validate();
 		if ( $ready ) {
