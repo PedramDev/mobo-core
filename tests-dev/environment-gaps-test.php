@@ -126,6 +126,18 @@ if ( Mobo_Core_Environment::can( 'exec' ) ) {
 }
 $cron_src = (string) file_get_contents( $plugin_dir . 'mobo-cron.php' );
 t_check( false !== strpos( $cron_src, "function_exists( 'wc_get_product' )" ) && false !== strpos( $cron_src, "'dependency-missing'" ), 'cron entry checks WooCommerce functions before running the worker' );
+/* envA T13: REST cron/heartbeat/health/webhook answered 404 rest_no_route while WC was inactive. */
+if ( ! class_exists( 'Mobo_Core_Dependencies' ) ) {
+	require $inc . 'class-mobo-core-dependencies.php';
+}
+$D = 'Mobo_Core_Dependencies';
+$routes = $D::dependency_missing_routes();
+t_check( ! array_diff( array( '/cron/run', '/worker/run', '/heartbeat', '/webhook' ), $routes ), 'WC inactive: Backend/cron REST routes stay registered' );
+t_check( ! in_array( '/health', $routes, true ) && ! in_array( '/health/report-now', $routes, true ), '  SECURITY: no open /health placeholder (Health_Read_Cache would serve the cached report without X-SEC)' );
+$dp = $D::dependency_missing_rest_payload( array( 'WooCommerce' ) );
+t_check( 503 === $dp['status'] && 'dependency-missing' === $dp['body']['status'] && isset( $dp['headers']['Retry-After'] ) && false === $dp['body']['success'], '  ...answering retryable 503 dependency-missing (not 404)' );
+$main_src = (string) file_get_contents( $plugin_dir . 'mobo-core.php' );
+t_check( false !== strpos( $main_src, 'register_dependency_missing_routes(' ), '  bootstrap registers them in the missing-dependency branch' );
 
 /* ====================================================================== */
 echo "\n[2] REST blocked by security plugins: narrow bypass\n";

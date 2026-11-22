@@ -876,6 +876,10 @@ add_action(
 		$missing_dependencies = Mobo_Core_Dependencies::get_missing_dependencies();
 		if ( ! empty( $missing_dependencies ) ) {
 			Mobo_Core_Dependencies::register_admin_notices( $missing_dependencies );
+			if ( method_exists( 'Mobo_Core_Dependencies', 'register_dependency_missing_routes' ) ) {
+				/* Backend/cron routes answer a retryable 503 dependency-missing, not 404. */
+				Mobo_Core_Dependencies::register_dependency_missing_routes( wp_list_pluck( (array) $missing_dependencies, 'name' ) );
+			}
 			return;
 		}
 
