@@ -69,17 +69,25 @@ final class Mobo_Core_Store_Currency_Guard {
 	public static function evaluate_change( $from, $to, $existing, $now ) {
 		$from = self::unit( $from );
 		$to   = self::unit( $to );
-		if ( '' === $from || '' === $to || $from === $to ) {
-			return null;
-		}
-		if ( is_array( $existing ) && ! empty( $existing['to'] ) && self::unit( $existing['to'] ) === $to ) {
+		if ( '' === $to ) {
 			return null;
 		}
 		/* A second change keeps the ORIGINAL priced unit as "from": prices were
 		 * written in that unit and are still wrong by from->to. */
 		$original_from = is_array( $existing ) && ! empty( $existing['from'] ) ? self::unit( $existing['from'] ) : $from;
+		/* Switched back to the priced unit: prices are correct again. Checked before
+		 * the from === to short-circuit, because the option hook passes the priced
+		 * unit as $from, so a revert (IRT -> IRR -> IRT) arrives as IRT -> IRT. */
+		if ( is_array( $existing ) && '' !== $original_from && $original_from === $to ) {
+			return array( 'resolved' => true );
+		}
+		if ( '' === $from || $from === $to ) {
+			return null;
+		}
+		if ( is_array( $existing ) && ! empty( $existing['to'] ) && self::unit( $existing['to'] ) === $to ) {
+			return null;
+		}
 		if ( $original_from === $to ) {
-			// Switched back to the priced unit: prices are correct again.
 			return array( 'resolved' => true );
 		}
 		$factor = self::factor( $original_from, $to );
@@ -161,7 +169,10 @@ final class Mobo_Core_Store_Currency_Guard {
 			update_option( self::OPTION_PRICED_UNIT, $current, false );
 			return;
 		}
-		if ( $priced !== $current ) {
+		if ( $priced !== $current || null !== self::current_event() ) {
+			/* Also re-evaluate a pending event when the units already agree: the
+			 * currency may have been switched back (directly in the DB, by a filter,
+			 * or before this fix), which must clear the stale alarm. */
 			self::record_change( $priced, $current );
 		}
 		$event = self::current_event();
@@ -174,6 +185,9 @@ final class Mobo_Core_Store_Currency_Guard {
 	public static function record_change( $from, $to ) {
 		if ( ! self::has_synced_catalog() ) {
 			update_option( self::OPTION_PRICED_UNIT, self::unit( $to ), false );
+			if ( null !== self::current_event() ) {
+				delete_option( self::OPTION_EVENT ); // No Mobo prices exist, so none can be wrong.
+			}
 			return null;
 		}
 		$event = self::evaluate_change( $from, $to, self::current_event(), time() );
@@ -232,7 +246,13 @@ final class Mobo_Core_Store_Currency_Guard {
 	 */
 	private static function resolve( $event ) {
 		delete_option( self::OPTION_EVENT );
-		if ( is_array( $event ) && ! empty( $event['to'] ) ) {
+		/* After Reprice or a manual correction, prices are in the CURRENT store unit.
+		 * Using the event's "to" was wrong when the currency moved again after the
+		 * event was recorded (dismissing raised an immediate reverse false alarm). */
+		$current = class_exists( 'Mobo_Core_Money_Policy' ) ? self::unit( Mobo_Core_Money_Policy::store_unit() ) : '';
+		if ( '' !== $current ) {
+			update_option( self::OPTION_PRICED_UNIT, $current, false );
+		} elseif ( is_array( $event ) && ! empty( $event['to'] ) ) {
 			update_option( self::OPTION_PRICED_UNIT, self::unit( $event['to'] ), false );
 		}
 		if ( is_array( $event ) && ! empty( $event['supported'] ) && class_exists( 'Mobo_Core_Money_Target_Settings' )

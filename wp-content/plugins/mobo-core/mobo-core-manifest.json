@@ -1,7 +1,7 @@
 {
   "version": "10.34.77",
   "algorithm": "sha256",
-  "generatedAt": "2026-11-22T00:50:05Z",
+  "generatedAt": "2026-11-22T00:51:08Z",
   "files": {
     "assets/admin/css/mobo-admin-components.css": "0a0589e2a37a5eee4e54e2008c41409ea4f9e5d44b6a614fc0409e8e8da360ed",
     "assets/admin/css/mobo-admin-core.css": "da27e853a70f179326d3a054d2ea2948afe5922abb79cc01c79910c431af263b",
@@ -408,7 +408,7 @@
     "includes/class-mobo-core-storage-schema.php": "bfc9a14f0a2443f73ba215c7e0aac5b5a700633317d00a5e989114965a6054cc",
     "includes/class-mobo-core-storage-state-parity.php": "be4c122c725b9d503de7e7539bf0e8b37035e77c6d051b4f88b4e9dcc7105a17",
     "includes/class-mobo-core-storage-terminal-meta-compat.php": "bc96d0562aab9bb19c01b91507320daa6d0b6b5a1112931d6a2fed903dd7695c",
-    "includes/class-mobo-core-store-currency-guard.php": "342d1daf156a3fa86ebf24d22e22ebf255653383825fe206b5e85deed05d4c5c",
+    "includes/class-mobo-core-store-currency-guard.php": "035e6e8f0dd698beddefacf798e73306b3286b32d2c6423e092ac36a5cb1a389",
     "includes/class-mobo-core-supplier-wallet-candidate-audit.php": "4f795d47a12fad1c16b87177e60402a56108011e0a0a19fbe40dce52b263daf8",
     "includes/class-mobo-core-support-access.php": "db6ebdc05a8f061cbd03a155a23cd2df6e3c056c4180aa10eb8a1278efe564ed",
     "includes/class-mobo-core-support-admin.php": "7e2d5fd7f219022786b5f9418636405d578cd0df8afa661a954e0ac109d5aea8",
