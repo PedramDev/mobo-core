@@ -1172,6 +1172,17 @@ add_action(
 			function () {
 				$rest = new Mobo_Core_Rest_Controller();
 				$rest->register_routes();
+				/* Mobo_Core_Rest_Controller::init() is never called on this path, so
+				 * its filters must be wired here. rest_api_init fires when the REST
+				 * server is created, before serve_request() applies
+				 * rest_authentication_errors and rest_post_dispatch:
+				 * - lift a security plugin's anonymous-REST block ONLY for this
+				 *   plugin's Backend routes carrying a valid machine credential;
+				 * - no-store cache headers on every /mobo-core/v1/ response. */
+				if ( false === has_filter( 'rest_authentication_errors', array( 'Mobo_Core_Rest_Controller', 'filter_rest_authentication_errors' ) ) ) {
+					add_filter( 'rest_authentication_errors', array( 'Mobo_Core_Rest_Controller', 'filter_rest_authentication_errors' ), 999 );
+				}
+				add_filter( 'rest_post_dispatch', array( $rest, 'harden_rest_response_cache' ), 10, 3 );
 			}
 		);
 

@@ -238,5 +238,15 @@ check( '5th failed attempt of a durable-write failure is NOT final (TRANSIENT_MA
 $q_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-webhook-queue.php' );
 check( 'queue marks processor results flagged retryable as transient', false !== strpos( $q_src, "'Database write failed (retryable): ' . \$message" ) );
 
+echo "\n[F6] REST security-plugin bypass and no-store headers are actually wired on REST requests\n";
+$main = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/mobo-core.php' );
+$pos  = strpos( $main, '$rest = new Mobo_Core_Rest_Controller();' );
+$blk  = false === $pos ? '' : substr( $main, $pos, 1500 );
+check( 'rest_api_init closure instantiates the controller', false !== $pos );
+check( '  and registers filter_rest_authentication_errors (priority 999) in the same closure', 1 === preg_match( "/add_filter\(\s*'rest_authentication_errors',\s*array\(\s*'Mobo_Core_Rest_Controller',\s*'filter_rest_authentication_errors'\s*\),\s*999\s*\)/", $blk ) );
+check( '  and registers harden_rest_response_cache on rest_post_dispatch', 1 === preg_match( "/add_filter\(\s*'rest_post_dispatch',\s*array\(\s*\\\$rest,\s*'harden_rest_response_cache'\s*\)/", $blk ) );
+$ctl_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-rest-controller.php' );
+check( 'the filter is still a public static callable', false !== strpos( $ctl_src, 'public static function filter_rest_authentication_errors( $result )' ) );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
