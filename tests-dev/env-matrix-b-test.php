@@ -261,5 +261,16 @@ $ps_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core
 check( 'parent attribute verification compares canonical forms', 1 === preg_match( '/function product_attributes_match_payload.{0,900}Mobo_Core_Unicode_Guard::canonical\( \$current \)/s', $ps_src ) );
 check( 'variation selection validation compares canonical forms', false !== strpos( $ps_src, '$value_canon = Mobo_Core_Unicode_Guard::canonical( $value );' ) );
 
+echo "\n[F8] Accelerated migration slice stops before memory_limit instead of fataling every pass\n";
+$MB = 1048576;
+check( '128M limit, 110 MiB used -> pressure (threshold 104 MiB = 128 - max(24, 15%))', true === Mobo_Core_Migration::slice_memory_pressure( 110 * $MB, 128 * $MB ) );
+check( '128M limit, 80 MiB used -> keep going', false === Mobo_Core_Migration::slice_memory_pressure( 80 * $MB, 128 * $MB ) );
+check( '512M limit, 430 MiB used -> pressure (15% reserve dominates)', true === Mobo_Core_Migration::slice_memory_pressure( 440 * $MB, 512 * $MB ) );
+check( 'unlimited memory_limit (-1 / 0) -> never pressure', false === Mobo_Core_Migration::slice_memory_pressure( 900 * $MB, 0 ) );
+$mig_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-migration.php' );
+check( 'loop releases the runtime object cache and checks pressure before each further iteration', 1 === preg_match( '/if \( \$iterations > 0 \) \{\s*self::release_slice_runtime_cache\(\);\s*if \( self::slice_memory_pressure\(\) \) \{\s*\$memory_stopped = true;\s*break;/', $mig_src ) );
+check( 'runtime cache release never flushes a persistent backend that lacks flush_runtime', false !== strpos( $mig_src, "wp_cache_supports( 'flush_runtime' )" ) );
+check( 'telemetry reports memoryStopped', false !== strpos( $mig_src, "\$telemetry['memoryStopped'] = \$memory_stopped;" ) );
+
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
