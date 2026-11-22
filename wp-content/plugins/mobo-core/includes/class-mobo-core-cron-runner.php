@@ -5,7 +5,7 @@
  * This class is intentionally independent from WP-Cron. It is triggered by a
  * server/cPanel cron that executes mobo-cron.php directly, by the authenticated
  * HTTP fallback (/wp-json/mobo-core/v1/cron/run with the Cron/Worker token in
- * X-SEC), or by WP-CLI/custom integrations. Query-token HTTP authentication is
+ * the X-Mobo-Cron-Token or X-SEC header), or by WP-CLI/custom integrations. Query-token HTTP authentication is
  * retained only for backward compatibility and is not the preferred setup.
  *
  * PHP 7.4 compatible.

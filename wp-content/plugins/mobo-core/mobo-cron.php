@@ -130,18 +130,32 @@ function mobo_core_cron_run() {
 	$is_http_request = isset( $_SERVER['REQUEST_METHOD'] ) && '' !== sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) );
 	if ( $is_http_request ) {
 		$expected = (string) get_option( 'mobo_core_cron_token', '' );
-		$provided = '';
+		$provided = array();
 
 		// Token authentication is used instead of a nonce because this is a machine-to-machine cron endpoint.
+		// O3: the X-Mobo-Cron-Token header keeps the secret out of web-server access logs;
+		// X-SEC and the legacy ?token= query form stay accepted for existing cron lines.
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
+		foreach ( array( 'HTTP_X_MOBO_CRON_TOKEN', 'HTTP_X_SEC' ) as $header_key ) {
+			if ( isset( $_SERVER[ $header_key ] ) ) {
+				$provided[] = sanitize_text_field( wp_unslash( $_SERVER[ $header_key ] ) );
+			}
+		}
 		if ( isset( $_GET['token'] ) ) {
-			$provided = sanitize_text_field( wp_unslash( $_GET['token'] ) );
-		} elseif ( isset( $_SERVER['HTTP_X_SEC'] ) ) {
-			$provided = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_SEC'] ) );
+			$provided[] = sanitize_text_field( wp_unslash( $_GET['token'] ) );
 		}
 		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
-		if ( '' === trim( $expected ) || '' === $provided || ! hash_equals( $expected, $provided ) ) {
+		$authorized = false;
+		if ( '' !== trim( $expected ) ) {
+			foreach ( $provided as $candidate ) {
+				if ( '' !== $candidate && hash_equals( $expected, $candidate ) ) {
+					$authorized = true;
+				}
+			}
+		}
+
+		if ( ! $authorized ) {
 			mobo_core_cron_emit_json( array( 'success' => false, 'status' => 'forbidden', 'message' => 'Forbidden.' ), 1, '', $base_ob_level, 403 );
 		}
 	}

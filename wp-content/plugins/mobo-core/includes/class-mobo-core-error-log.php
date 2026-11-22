@@ -651,7 +651,7 @@ final class Mobo_Core_Error_Log {
 		}
 		$replace = array(
 			/* Authorization headers / bearer tokens / cookies. */
-			'/\b(authorization|cookie|set-cookie|x-sec|x-mobo-[a-z\-]*signature|x-wp-nonce)\s*[:=]\s*[^\r\n,;]+/i' => '$1: [redacted]',
+			'/\b(authorization|cookie|set-cookie|x-sec|x-mobo-cron-token|x-mobo-[a-z\-]*signature|x-wp-nonce)\s*[:=]\s*[^\r\n,;]+/i' => '$1: [redacted]',
 			'/\b(bearer|basic)\s+[A-Za-z0-9._~+\/=\-]{6,}/i' => '$1 [redacted]',
 			/* key=value / "key":"value" secrets. */
 			'/(["\']?(?:license[_\-]?token|token|secret|password|passwd|pwd|pass|api[_\-]?key|security[_\-]?code|x[_\-]?sec|nonce|signature|sig|cookie|session|auth[a-z_\-]*|card[_\-]?number|cvv2?|iban|sheba|wallet[a-z_\-]*)["\']?\s*[:=]\s*)("[^"]*"|\'[^\']*\'|[^\s&,;}\]]+)/i' => '$1[redacted]',
