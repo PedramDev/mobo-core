@@ -2436,6 +2436,17 @@ class Mobo_Core_Migration {
 			return;
 		}
 
+		/* One-shot per installation. A fresh install keeps an empty db_version until
+		 * the whole pipeline finalizes (entity retirement grace >= 120 s), and every
+		 * budgeted migration pass runs INSIDE the real-cron runner lease. Repeating
+		 * force_release_all() there deleted the runner's own lease (and any
+		 * concurrent worker's lock) on every pass: each cron request ended as
+		 * "lock-lost" without processing webhooks, and parallel workers lost
+		 * mutual exclusion. Legacy transient residue only needs clearing once. */
+		if ( false !== get_option( 'mobo_core_103171_lock_cleanup_at', false ) ) {
+			return;
+		}
+
 		$lock_result = array(
 			'deleted' => 0,
 			'found'   => 0,
