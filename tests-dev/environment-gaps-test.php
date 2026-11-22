@@ -223,6 +223,14 @@ $GLOBALS['t_hpos'] = false;
 t_same( '', $RL::hpos_meta_table(), 'HPOS off => legacy wp_postmeta discovery only' );
 $sql = $RL::backfill_candidate_sql( 'hpos', 'wp_wc_orders_meta; DROP TABLE x' );
 t_check( false === strpos( $sql['select'], ';' ), 'HPOS table name is sanitized in SQL' );
+/* envA T12 (HPOS off): the CPT order store drops a nested meta_query (and logs
+ * _doing_it_wrong), so the summary must use the meta_key/meta_value shortcut that
+ * both stores honour, otherwise every shop_order is loaded in one REST request. */
+$qa = $RL::summary_query_args( 200, 3 );
+t_check( ! isset( $qa['meta_query'] ), 'revenue summary query has no nested meta_query (ignored by the CPT store)' );
+t_same( $RL::META_LEDGER_VERSION, $qa['meta_key'] ?? null, '  filters on the ledger version meta key' );
+t_same( (string) $RL::LEDGER_VERSION, $qa['meta_value'] ?? null, '  ...and value' );
+t_same( array( 200, 3, 'ids', 'shop_order' ), array( $qa['limit'], $qa['page'], $qa['return'], $qa['type'] ), '  paged, ids only, orders only' );
 
 /* ====================================================================== */
 echo "\n[4] cron health on heartbeat-only sites\n";

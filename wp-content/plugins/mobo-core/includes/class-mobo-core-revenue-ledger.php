@@ -567,6 +567,33 @@ class Mobo_Core_Revenue_Ledger {
 		return $summary;
 	}
 
+	/**
+	 * Pure: wc_get_orders() args for one page of ledger-bearing orders.
+	 *
+	 * Uses the top-level meta_key/meta_value shortcut, which BOTH order stores
+	 * honour (HPOS OrdersTableQuery remaps meta_key/meta_value into its meta
+	 * query; the CPT store passes them to WP_Query). A nested 'meta_query' is
+	 * dropped by the CPT store (WC_Data_Store_WP::get_wp_query_args skips it and
+	 * WC >= 9.2 logs _doing_it_wrong), so on posts storage the summary used to
+	 * load EVERY shop_order object inside one REST request (envA T12, HPOS off).
+	 *
+	 * @param int $limit Page size.
+	 * @param int $page  1-based page.
+	 * @return array
+	 */
+	public static function summary_query_args( $limit, $page ) {
+		return array(
+			'type'       => 'shop_order',
+			'limit'      => max( 1, absint( $limit ) ),
+			'page'       => max( 1, absint( $page ) ),
+			'return'     => 'ids',
+			'orderby'    => 'ID',
+			'order'      => 'ASC',
+			'meta_key'   => self::META_LEDGER_VERSION, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- bounded, paged; portable across CPT and HPOS.
+			'meta_value' => (string) self::LEDGER_VERSION, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- see above.
+		);
+	}
+
 	private function build_summary( $connection_id = 0 ) {
 		$connection_id = absint( $connection_id );
 		$all_time = array();
@@ -578,23 +605,7 @@ class Mobo_Core_Revenue_Ledger {
 		$limit = 200;
 
 		do {
-			$ids = wc_get_orders(
-				array(
-					'type'       => 'shop_order',
-					'limit'      => $limit,
-					'page'       => $page,
-					'return'     => 'ids',
-					'orderby'    => 'ID',
-					'order'      => 'ASC',
-					'meta_query' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Bounded/paged WooCommerce CRUD query keeps CPT and HPOS compatibility; direct SQL would be less portable.
-						array(
-							'key'     => self::META_LEDGER_VERSION,
-							'value'   => (string) self::LEDGER_VERSION,
-							'compare' => '=',
-						),
-					),
-				)
-			);
+			$ids = wc_get_orders( self::summary_query_args( $limit, $page ) );
 
 			if ( ! is_array( $ids ) || empty( $ids ) ) {
 				break;
