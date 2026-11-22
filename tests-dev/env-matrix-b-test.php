@@ -132,6 +132,7 @@ class Mobo_Core_Money_Policy {
 }
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-webhook-queue.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-image-integrity.php';
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-sync-event-store.php';
 
 $GLOBALS['__pass'] = 0; $GLOBALS['__fail'] = 0;
 function check( $label, $cond ) {
@@ -212,6 +213,30 @@ foreach ( glob( $tmpdir . '/*' ) as $f ) { @unlink( $f ); }
 $sync_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-image-sync.php' );
 check( 'importer checks the stored attachment before linking it', false !== strpos( $sync_src, '$stored_problem = $this->stored_attachment_problem( $attachment_id );' ) );
 check( '  and reports it with the storage prefix (retry + revival, never a permanent image defect)', 1 === preg_match( '/STORAGE_NOT_READY_PREFIX[^;]*stored copy in uploads is incomplete/s', $sync_src ) );
+
+echo "\n[F5] Product-sync durable-write failures (DB/disk full) stay transient: extended budget + auto re-arm\n";
+$E = 'Mobo_Core_Sync_Event_Store';
+foreach ( array(
+	'ProductUpdated could not durably create/update the product; event will retry without advancing the batch cursor.',
+	'Product revision watermark could not be persisted; mutation was deferred.',
+	'Variation ordering watermark could not be committed after mutation; event will retry.',
+	'Could not durably persist the authoritative variation seen-set; destructive finalization was deferred.',
+	'Full snapshot request could not be written (database write failure); delta event kept for retry.',
+	'Database write failed (retryable): ثبت نهایی Product Map محصول ساده ناموفق بود.',
+) as $m ) {
+	check( 'transient: ' . substr( $m, 0, 60 ), true === $E::is_transient_failure( $m ) );
+}
+foreach ( array(
+	'ProductUpdated ordering watermark is not comparable with the durable product watermark; mutation was blocked.',
+	'Equal-version ProductUpdated payload conflicts with the durable applied source hash; mutation was blocked.',
+	'Webhook event expired.',
+) as $m ) {
+	check( 'NOT transient (real conflict): ' . substr( $m, 0, 60 ), false === $E::is_transient_failure( $m ) );
+}
+$p = $E::failure_policy( 5, 5, true, 'ProductUpdated could not durably create/update the product; event will retry without advancing the batch cursor.', 7 );
+check( '5th failed attempt of a durable-write failure is NOT final (TRANSIENT_MAX_TRY applies)', false === $p['final'] && $p['transient'] );
+$q_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-webhook-queue.php' );
+check( 'queue marks processor results flagged retryable as transient', false !== strpos( $q_src, "'Database write failed (retryable): ' . \$message" ) );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );

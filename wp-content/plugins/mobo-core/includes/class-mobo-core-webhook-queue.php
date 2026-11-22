@@ -1340,6 +1340,14 @@ class Mobo_Core_Webhook_Queue {
 				$data      = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
 				$non_retryable = ! empty( $data['nonRetryable'] );
 				$is_payload_pull_failure = ! empty( $data['payloadPullFailed'] );
+				/* The processor states this is a durable-write failure to retry (DB or
+				 * disk full, lost connection). Make that visible to the transient
+				 * classification so the event keeps its extended budget and the
+				 * automatic re-arm instead of a terminal failure after 5 tries. */
+				if ( ! $non_retryable && ! empty( $data['retryable'] ) && class_exists( 'Mobo_Core_Sync_Event_Store' )
+					&& ! Mobo_Core_Sync_Event_Store::is_transient_failure( $message ) ) {
+					$message = 'Database write failed (retryable): ' . $message;
+				}
 
 				if ( $non_retryable ) {
 					$transitioned = $store->mark_failure( $event_id, $message, $try_count, true, $claim_token );

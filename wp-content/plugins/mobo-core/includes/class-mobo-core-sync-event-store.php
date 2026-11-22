@@ -70,6 +70,9 @@ class Mobo_Core_Sync_Event_Store {
 			'could not be saved', 'could not save', 'deadlock', 'lock wait timeout', 'gone away', 'lost connection',
 			'too many connections', 'is full', 'disk full', 'no space left', 'errno: 28', 'errno 28', 'quota',
 			'read-only', 'read only file', 'storage is not ready', 'storage not ready',
+			// The plugin's own durable-write failure wording (product/variant sync).
+			'could not be persisted', 'could not be committed', 'could not durably', 'could not persist',
+			'could not flush', 'database write failure',
 			// Network / Backend availability.
 			'timed out', 'timeout', 'curl error', 'could not resolve', 'connection refused', 'connection reset',
 			'http 500', 'http 502', 'http 503', 'http 504', 'http_request_failed', 'service unavailable', 'bad gateway',
