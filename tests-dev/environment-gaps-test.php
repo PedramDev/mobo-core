@@ -238,8 +238,21 @@ $st = $C::get_status();
 t_check( ! empty( $st['driverActive'] ) && 'portal-heartbeat' === $st['lastDriverSource'] && 0 === $st['lastHitAt'], 'get_status() exposes the driver run while lastHitAt stays real-cron only' );
 $runner_src = (string) file_get_contents( $inc . 'class-mobo-core-cron-runner.php' );
 t_check( false !== strpos( $runner_src, 'self::record_driver_run( $source );' ), 'every runner start records its driver' );
+/* B2 (forced-update staging 2026-11-22): the most recent driver wins. */
+$sep9 = $now - 75 * DAY_IN_SECONDS;
+t_same( 'real_cron', $C::classify_cron_mode( $sep9, $now - 2, $now - 2, 'real-cron', $now, false ), 'B2: disabled self-runner with a 2-month-old timestamp never masks a real cron hit 2 s ago' );
+t_same( 'real_cron', $C::classify_cron_mode( $sep9, $now - 2, $now - 2, 'real-cron', $now, true ), 'B2: stale self-runner (even if enabled) loses to a newer real cron hit' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 2 ), $C::resolve_cron_activity( $sep9, $now - 2, $now - 2, 'real-cron', $now, false ), 'B2: lastCronHitAt = the real cron hit, not the stale self-runner time' );
+t_same( array( 'mode' => 'self_runner', 'lastAt' => $now - 5 ), $C::resolve_cron_activity( $now - 5, $now - 600, $now - 5, 'self-runner', $now, true ), 'B2: enabled self-runner that ran last => self_runner' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 600 ), $C::resolve_cron_activity( $now - 5, $now - 600, $now - 700, 'portal-heartbeat', $now, false ), 'B2: disabled self-runner ignored even when newest' );
+t_same( array( 'mode' => 'not_detected', 'lastAt' => 0 ), $C::resolve_cron_activity( $sep9, 0, 0, '', $now, false ), 'B2: only a disabled self-runner timestamp => not_detected' );
+t_same( 'portal_heartbeat', $C::classify_cron_mode( 0, $now - 1800, $now - 30, 'portal-heartbeat', $now, false ), 'B2: heartbeat newer than the last real cron hit => portal_heartbeat' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 60 ), $C::resolve_cron_activity( $now - 60, $now - 60, $now - 60, 'self-runner', $now, true ), 'B2: tie prefers real cron' );
+t_same( 'other_driver', $C::classify_cron_mode( 0, 0, $now - 10, 'self-runner', $now, false ), 'B2: a fresh self-runner driver run while disabled is not labelled self_runner' );
 $health_src = (string) file_get_contents( $inc . 'class-mobo-core-health-reporter.php' );
-t_check( false !== strpos( $health_src, 'classify_cron_mode(' ) && false !== strpos( $health_src, "\$last_cron_hit : absint( \$cron_status['lastDriverRunAt'] ?? 0 )" ), 'health report uses the driver run for cronMode and lastCronHitAt' );
+t_check( false !== strpos( $health_src, "Mobo_Core_Cron_Runner::resolve_cron_activity( \$last_self_run, \$last_cron_hit, absint( \$cron_status['lastDriverRunAt'] ?? 0 ), (string) ( \$cron_status['lastDriverSource'] ?? '' ), time(), \$self_enabled )" ), 'health report resolves the most recent driver with the self-runner enabled flag' );
+t_check( false !== strpos( $health_src, "'cronMode'              => (string) \$cron_activity['mode']" ) && false !== strpos( $health_src, "'lastCronHitAt'         => \$this->format_timestamp( absint( \$cron_activity['lastAt'] ) )" ), 'health cronMode and lastCronHitAt both come from the most recent driver' );
+t_check( false === strpos( $health_src, '$last_self_run > 0 ?' ), 'no self-runner-first precedence left in the health report' );
 
 /* ====================================================================== */
 echo "\n[5] UTC date handling under a non-UTC PHP timezone\n";
