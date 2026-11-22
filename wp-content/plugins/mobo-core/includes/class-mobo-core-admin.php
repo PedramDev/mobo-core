@@ -5178,7 +5178,21 @@ type:{mobo_order_type_label}</textarea>
 						<div class="mobo-field mobo-field-full">
 							<label>Endpoint HTTP جایگزین، بدون Secret</label>
 							<input type="text" readonly dir="ltr" value="<?php echo esc_attr( $cron_endpoint ); ?>" onclick="this.select();">
-							<div class="mobo-help">این endpoint فقط fallback است. برای احراز هویت، Cron Token را در Header <code dir="ltr">X-SEC</code> بفرستید. URL دارای token برای سازگاری قدیمی پشتیبانی می‌شود، اما در UI نمایش داده نمی‌شود تا Secret وارد history/access log نشود. مسیر اصلی پیشنهادی همچنان اجرای مستقیم <code dir="ltr">mobo-cron.php</code> با PHP CLI است.</div>
+							<div class="mobo-help">این endpoint فقط fallback است. برای احراز هویت، Cron Token را در Header <code dir="ltr"><?php echo esc_html( Mobo_Core_Rest_Controller::CRON_TOKEN_HEADER ); ?></code> بفرستید (Header <code dir="ltr">X-SEC</code> هم پذیرفته می‌شود). URL دارای <code dir="ltr">?token=</code> فقط برای سازگاری با Cron Jobهای قدیمی پشتیبانی می‌شود و چون Secret را وارد access log وب‌سرور و history می‌کند، توصیه نمی‌شود و در UI نمایش داده نمی‌شود. مسیر اصلی پیشنهادی همچنان اجرای مستقیم <code dir="ltr">mobo-cron.php</code> با PHP CLI است.</div>
+						</div>
+						<?php
+						$cron_header_line = Mobo_Core_Rest_Controller::CRON_TOKEN_HEADER . ': YOUR_CRON_TOKEN';
+						$cron_curl_header = 'curl -fsS -o /dev/null -H "' . $cron_header_line . '" "' . $cron_endpoint . '"';
+						$cron_wget_header = 'wget -q -O /dev/null --header="' . $cron_header_line . '" "' . $cron_endpoint . '"';
+						?>
+						<div class="mobo-field mobo-field-full">
+							<label>Cron HTTP با Header (پیشنهادی برای HTTP) — curl</label>
+							<textarea rows="2" readonly dir="ltr" onclick="this.select();"><?php echo esc_textarea( $cron_curl_header ); ?></textarea>
+						</div>
+						<div class="mobo-field mobo-field-full">
+							<label>Cron HTTP با Header (پیشنهادی برای HTTP) — wget</label>
+							<textarea rows="2" readonly dir="ltr" onclick="this.select();"><?php echo esc_textarea( $cron_wget_header ); ?></textarea>
+							<div class="mobo-help">به‌جای <code dir="ltr">YOUR_CRON_TOKEN</code> مقدار فیلد «توکن Cron / Worker» را قرار دهید. اگر Cron Job فعلی شما از <code dir="ltr">?token=</code> استفاده می‌کند همچنان کار می‌کند؛ برای خارج نگه داشتن Secret از access log، آن را با یکی از این دو دستور جایگزین کنید.</div>
 						</div>
 					<?php endif; ?>
 				</div>

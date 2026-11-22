@@ -3,7 +3,7 @@
  * database unicode migration start/resume/pause A:3976/4016/4046.
  */
 import { test, expect } from '../lib/fixtures';
-import { actionForm, clickAndReadNotice, gotoTab, requireRendered, reveal, toAsciiDigits } from '../lib/admin';
+import { actionForm, clickAndReadNotice, gotoTab, note, requireRendered, reveal, toAsciiDigits } from '../lib/admin';
 import { columnExists, count, defaultConnectionId, getOption, lit, serializedField, t, tableExists } from '../lib/db';
 
 
@@ -13,12 +13,23 @@ function failedWebhooks(): number {
   return count(`SELECT COUNT(*) FROM ${t('mobo_sync_events')} WHERE ${scope}status = 'failed'`);
 }
 
+/**
+ * Failed rows that retry_failed_events() retired as superseded (status done,
+ * progress_json.superseded). -1 when the column is unavailable.
+ */
+function supersededWebhooks(): number {
+  if (!tableExists('mobo_sync_events') || !columnExists('mobo_sync_events', 'progress_json')) return -1;
+  const scope = columnExists('mobo_sync_events', 'connection_id') ? `connection_id = ${lit(defaultConnectionId())} AND ` : '';
+  return count(`SELECT COUNT(*) FROM ${t('mobo_sync_events')} WHERE ${scope}status = 'done' AND progress_json LIKE '%"superseded":true%'`);
+}
+
 const migrationStatus = () => serializedField(getOption('mobo_core_database_unicode_migration_state'), 'status');
 
 test.describe('Site health tab', () => {
-  test('"برگرداندن وب‌هوک‌های ناموفق به صف" re-queues failed webhook events', async ({ page }) => {
+  test('"برگرداندن وب‌هوک‌های ناموفق به صف" re-queues failed webhook events', async ({ page }, testInfo) => {
     await gotoTab(page, 'health');
     const before = failedWebhooks();
+    const supersededBefore = supersededWebhooks();
     const btn = actionForm(page, 'mobo_core_retry_failed_webhooks').locator('button[type="submit"]');
     await expect(btn).toHaveText('برگرداندن وب‌هوک‌های ناموفق به صف');
     const n = await clickAndReadNotice(page, btn);
@@ -26,9 +37,20 @@ test.describe('Site health tab', () => {
     const m = toAsciiDigits(n.message).match(/(\d+) وب‌هوک failed دوباره به صف برگشت/);
     expect(m, n.message).not.toBeNull();
     const requeued = Number(m![1]);
-    expect(requeued).toBe(Math.min(before, 1000));
+    // 10.34.77 retires failed rows already superseded by a newer event (status done,
+    // progress_json.superseded) and re-arms only the rest; the notice counts re-armed rows.
+    const considered = Math.min(before, 1000);
+    expect(requeued, 'never more than the failed rows considered').toBeLessThanOrEqual(considered);
+    expect(requeued).toBeGreaterThanOrEqual(0);
     expect(n.type).toBe(requeued > 0 ? 'success' : 'warning');
-    expect(failedWebhooks(), 'failed rows moved back to the queue').toBe(before - requeued);
+    const after = failedWebhooks();
+    const retired = before - requeued - after;
+    note(testInfo, `failed before=${before}, re-armed=${requeued}, retired as superseded=${retired}, failed after=${after}`);
+    expect(after, 're-armed rows left the failed state').toBeLessThanOrEqual(before - requeued);
+    expect(requeued + retired, 'only considered rows changed').toBeLessThanOrEqual(considered);
+    if (supersededBefore >= 0) {
+      expect(supersededWebhooks() - supersededBefore, 'every other row that left failed was retired as superseded').toBeGreaterThanOrEqual(retired);
+    }
   });
 
   test('"مشاهده جزئیات امن محیط PHP" opens the bounded diagnostics page', async ({ page, context }) => {

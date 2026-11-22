@@ -26,6 +26,17 @@ if ( '--child-cron' === $mode ) {
 	 * are hoisted by PHP and shared with this child. */
 	define( 'ABSPATH', __DIR__ . '/' );
 	$GLOBALS['t_options'] = array();
+	/* O3: optional HTTP mode "http:<credential>" exercises the token check. */
+	$http = isset( $argv[3] ) && 0 === strpos( (string) $argv[3], 'http:' ) ? substr( (string) $argv[3], 5 ) : '';
+	if ( '' !== $http ) {
+		$_SERVER['REQUEST_METHOD'] = 'GET';
+		$GLOBALS['t_options']['mobo_core_cron_token'] = 'cron-secret';
+		if ( 'header' === $http ) { $_SERVER['HTTP_X_MOBO_CRON_TOKEN'] = 'cron-secret'; }
+		if ( 'xsec' === $http ) { $_SERVER['HTTP_X_SEC'] = 'cron-secret'; }
+		if ( 'query' === $http ) { $_GET['token'] = 'cron-secret'; }
+		if ( 'wrong-header' === $http ) { $_SERVER['HTTP_X_MOBO_CRON_TOKEN'] = 'nope'; }
+		if ( 'stale-query-good-header' === $http ) { $_GET['token'] = 'old'; $_SERVER['HTTP_X_MOBO_CRON_TOKEN'] = 'cron-secret'; }
+	}
 	function wp_strip_all_tags( $t ) { return strip_tags( (string) $t ); }
 	final class Mobo_Core_Cron_Runner {
 		public static function record_real_cron_hit() { echo ''; }
@@ -107,10 +118,10 @@ require $inc . 'class-mobo-core-environment.php';
 /* ====================================================================== */
 echo "[1] WooCommerce inactive: mobo-cron.php\n";
 if ( Mobo_Core_Environment::can( 'exec' ) ) {
-	$run = static function ( $wc ) {
+	$run = static function ( $wc, $http = '' ) {
 		$out = array();
 		$code = 0;
-		exec( escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( __FILE__ ) . ' --child-cron ' . ( $wc ? 'wc' : 'nowc' ) . ' 2>&1', $out, $code );
+		exec( escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( __FILE__ ) . ' --child-cron ' . ( $wc ? 'wc' : 'nowc' ) . ( '' !== $http ? ' ' . escapeshellarg( 'http:' . $http ) : '' ) . ' 2>&1', $out, $code );
 		return array( $code, implode( "\n", $out ) );
 	};
 	$GLOBALS['plugin_dir'] = $plugin_dir;
@@ -121,6 +132,12 @@ if ( Mobo_Core_Environment::can( 'exec' ) ) {
 	list( $code, $out ) = $run( true );
 	$json = json_decode( $out, true );
 	t_check( is_array( $json ) && ! empty( $json['ranWorker'] ), 'WC active => worker runs' );
+	/* O3: HTTP mode accepts the token from the X-Mobo-Cron-Token header. */
+	foreach ( array( 'header' => true, 'xsec' => true, 'query' => true, 'stale-query-good-header' => true, 'wrong-header' => false, 'none' => false ) as $cred => $ok ) {
+		list( $code, $out ) = $run( true, $cred );
+		$json = json_decode( $out, true );
+		t_check( $ok ? ( is_array( $json ) && ! empty( $json['ranWorker'] ) ) : ( is_array( $json ) && 'forbidden' === ( $json['status'] ?? '' ) ), 'O3 mobo-cron.php HTTP mode, credential ' . $cred . ' => ' . ( $ok ? 'worker runs' : 'forbidden' ) . ( is_array( $json ) ? '' : ' (' . substr( $out, 0, 200 ) . ')' ) );
+	}
 } else {
 	t_check( true, 'exec() disabled on this run: child cron scenario skipped (covered on the normal run)' );
 }
@@ -164,6 +181,30 @@ $set( '/mobo-core/v1/cron/run', array(), array( 'token' => 'nope' ) );
 t_check( $block === $R::filter_rest_authentication_errors( $block ), 'wrong cron token keeps the error' );
 $set( '/mobo-core/v1/cron/run', array( 'X-SEC' => 'good-sec' ) );
 t_check( $block === $R::filter_rest_authentication_errors( $block ), 'cron route does not accept a Connection X-SEC instead of the cron token' );
+/* O3: token header (kept out of access logs); query form still accepted. */
+$set( '/mobo-core/v1/cron/run', array( 'X-Mobo-Cron-Token' => 'cron-secret' ) );
+t_same( null, $R::filter_rest_authentication_errors( $block ), 'O3: cron/run with the X-Mobo-Cron-Token header passes through' );
+$set( '/mobo-core/v1/cron/run', array( 'X-Mobo-Cron-Token' => 'nope' ) );
+t_check( $block === $R::filter_rest_authentication_errors( $block ), 'O3: wrong X-Mobo-Cron-Token keeps the error' );
+$set( '/mobo-core/v1/cron/run', array( 'X-Mobo-Cron-Token' => 'cron-secret' ), array( 'token' => 'stale' ) );
+t_same( null, $R::filter_rest_authentication_errors( $block ), 'O3: a valid header wins over a stale query token' );
+t_same( true, $R::cron_token_matches( 'cron-secret', array( '', 'cron-secret', 'x' ) ), 'O3: any matching candidate authorizes' );
+t_same( false, $R::cron_token_matches( '', array( '', '' ) ), 'O3: empty configured token never matches' );
+t_same( false, $R::cron_token_matches( 'cron-secret', array( 'cron-secre', array( 'cron-secret' ), null ) ), 'O3: near-miss / non-scalar candidates rejected' );
+/* check_cron_security() (the route permission callback) reads the header too. */
+final class T_Cron_Request {
+	public $h; public $p;
+	public function __construct( $h, $p ) { $this->h = $h; $this->p = $p; }
+	public function get_header( $k ) { $k = strtolower( str_replace( '-', '_', $k ) ); return isset( $this->h[ $k ] ) ? $this->h[ $k ] : null; }
+	public function get_param( $k ) { return isset( $this->p[ $k ] ) ? $this->p[ $k ] : null; }
+}
+$rc = ( new ReflectionClass( $R ) )->newInstanceWithoutConstructor();
+t_same( true, $rc->check_cron_security( new T_Cron_Request( array( 'x_mobo_cron_token' => 'cron-secret' ), array() ) ), 'O3: /cron/run permission accepts X-Mobo-Cron-Token' );
+t_same( true, $rc->check_cron_security( new T_Cron_Request( array(), array( 'token' => 'cron-secret' ) ) ), 'O3: /cron/run permission still accepts ?token= (existing cPanel lines)' );
+t_same( true, $rc->check_cron_security( new T_Cron_Request( array( 'x_sec' => 'cron-secret' ), array() ) ), 'O3: /cron/run permission still accepts X-SEC' );
+t_check( is_wp_error( $rc->check_cron_security( new T_Cron_Request( array( 'x_mobo_cron_token' => 'nope' ), array() ) ) ), 'O3: wrong header => 401' );
+$admin_src = (string) file_get_contents( $inc . 'class-mobo-core-admin.php' );
+t_check( false !== strpos( $admin_src, '--header="\' . $cron_header_line' ) && false !== strpos( $admin_src, "-H \"' . \$cron_header_line" ), 'O3: admin cron instructions show the header form (curl/wget) as recommended' );
 $ts = (string) time();
 WP_REST_Server::$raw = '{"token":"lic-1","x":1}';
 $sig = hash_hmac( 'sha256', $ts . "\nn1\n" . WP_REST_Server::$raw, 'lic-1' );
@@ -238,8 +279,21 @@ $st = $C::get_status();
 t_check( ! empty( $st['driverActive'] ) && 'portal-heartbeat' === $st['lastDriverSource'] && 0 === $st['lastHitAt'], 'get_status() exposes the driver run while lastHitAt stays real-cron only' );
 $runner_src = (string) file_get_contents( $inc . 'class-mobo-core-cron-runner.php' );
 t_check( false !== strpos( $runner_src, 'self::record_driver_run( $source );' ), 'every runner start records its driver' );
+/* B2 (forced-update staging 2026-11-22): the most recent driver wins. */
+$sep9 = $now - 75 * DAY_IN_SECONDS;
+t_same( 'real_cron', $C::classify_cron_mode( $sep9, $now - 2, $now - 2, 'real-cron', $now, false ), 'B2: disabled self-runner with a 2-month-old timestamp never masks a real cron hit 2 s ago' );
+t_same( 'real_cron', $C::classify_cron_mode( $sep9, $now - 2, $now - 2, 'real-cron', $now, true ), 'B2: stale self-runner (even if enabled) loses to a newer real cron hit' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 2 ), $C::resolve_cron_activity( $sep9, $now - 2, $now - 2, 'real-cron', $now, false ), 'B2: lastCronHitAt = the real cron hit, not the stale self-runner time' );
+t_same( array( 'mode' => 'self_runner', 'lastAt' => $now - 5 ), $C::resolve_cron_activity( $now - 5, $now - 600, $now - 5, 'self-runner', $now, true ), 'B2: enabled self-runner that ran last => self_runner' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 600 ), $C::resolve_cron_activity( $now - 5, $now - 600, $now - 700, 'portal-heartbeat', $now, false ), 'B2: disabled self-runner ignored even when newest' );
+t_same( array( 'mode' => 'not_detected', 'lastAt' => 0 ), $C::resolve_cron_activity( $sep9, 0, 0, '', $now, false ), 'B2: only a disabled self-runner timestamp => not_detected' );
+t_same( 'portal_heartbeat', $C::classify_cron_mode( 0, $now - 1800, $now - 30, 'portal-heartbeat', $now, false ), 'B2: heartbeat newer than the last real cron hit => portal_heartbeat' );
+t_same( array( 'mode' => 'real_cron', 'lastAt' => $now - 60 ), $C::resolve_cron_activity( $now - 60, $now - 60, $now - 60, 'self-runner', $now, true ), 'B2: tie prefers real cron' );
+t_same( 'other_driver', $C::classify_cron_mode( 0, 0, $now - 10, 'self-runner', $now, false ), 'B2: a fresh self-runner driver run while disabled is not labelled self_runner' );
 $health_src = (string) file_get_contents( $inc . 'class-mobo-core-health-reporter.php' );
-t_check( false !== strpos( $health_src, 'classify_cron_mode(' ) && false !== strpos( $health_src, "\$last_cron_hit : absint( \$cron_status['lastDriverRunAt'] ?? 0 )" ), 'health report uses the driver run for cronMode and lastCronHitAt' );
+t_check( false !== strpos( $health_src, "Mobo_Core_Cron_Runner::resolve_cron_activity( \$last_self_run, \$last_cron_hit, absint( \$cron_status['lastDriverRunAt'] ?? 0 ), (string) ( \$cron_status['lastDriverSource'] ?? '' ), time(), \$self_enabled )" ), 'health report resolves the most recent driver with the self-runner enabled flag' );
+t_check( false !== strpos( $health_src, "'cronMode'              => (string) \$cron_activity['mode']" ) && false !== strpos( $health_src, "'lastCronHitAt'         => \$this->format_timestamp( absint( \$cron_activity['lastAt'] ) )" ), 'health cronMode and lastCronHitAt both come from the most recent driver' );
+t_check( false === strpos( $health_src, '$last_self_run > 0 ?' ), 'no self-runner-first precedence left in the health report' );
 
 /* ====================================================================== */
 echo "\n[5] UTC date handling under a non-UTC PHP timezone\n";

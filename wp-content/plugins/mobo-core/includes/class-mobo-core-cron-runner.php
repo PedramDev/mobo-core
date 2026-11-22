@@ -5,7 +5,7 @@
  * This class is intentionally independent from WP-Cron. It is triggered by a
  * server/cPanel cron that executes mobo-cron.php directly, by the authenticated
  * HTTP fallback (/wp-json/mobo-core/v1/cron/run with the Cron/Worker token in
- * X-SEC), or by WP-CLI/custom integrations. Query-token HTTP authentication is
+ * the X-Mobo-Cron-Token or X-SEC header), or by WP-CLI/custom integrations. Query-token HTTP authentication is
  * retained only for backward compatibility and is not the preferred setup.
  *
  * PHP 7.4 compatible.
@@ -429,20 +429,61 @@ class Mobo_Core_Cron_Runner {
 	 * @param int    $last_driver_run Any driver last run.
 	 * @param string $driver_source Source of that run.
 	 * @param int    $now Unix time.
+	 * @param bool   $self_runner_enabled Whether the self-runner is currently enabled.
 	 * @return string self_runner|real_cron|portal_heartbeat|other_driver|not_detected
 	 */
-	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now ) {
-		if ( absint( $last_self_run ) > 0 ) {
-			return 'self_runner';
+	public static function classify_cron_mode( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled = true ) {
+		$activity = self::resolve_cron_activity( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled );
+		return $activity['mode'];
+	}
+
+	/**
+	 * Pure: most recent runner driver for health (B2). The newest of real cron,
+	 * self-runner and any other driver (Backend heartbeat, worker/run) wins, so a
+	 * stale self-runner timestamp left behind after switching to real cron never
+	 * masks a recent real cron hit. The self-runner counts only while enabled.
+	 * A driver run older than an hour gives no mode of its own (it still dates
+	 * lastAt when nothing newer exists). Ties prefer real cron.
+	 *
+	 * @param int    $last_self_run Self-runner last run.
+	 * @param int    $last_cron_hit Real cron last hit.
+	 * @param int    $last_driver_run Any driver last run.
+	 * @param string $driver_source Source of that run.
+	 * @param int    $now Unix time.
+	 * @param bool   $self_runner_enabled Whether the self-runner is currently enabled.
+	 * @return array{mode:string,lastAt:int}
+	 */
+	public static function resolve_cron_activity( $last_self_run, $last_cron_hit, $last_driver_run, $driver_source, $now, $self_runner_enabled = true ) {
+		$cron   = absint( $last_cron_hit );
+		$self   = $self_runner_enabled ? absint( $last_self_run ) : 0;
+		$driver = absint( $last_driver_run );
+		$source = sanitize_key( (string) $driver_source );
+
+		$mode = 'not_detected';
+		$at   = 0;
+		if ( $cron > 0 ) {
+			$mode = 'real_cron';
+			$at   = $cron;
 		}
-		if ( absint( $last_cron_hit ) > 0 ) {
-			return 'real_cron';
+		if ( $self > $at ) {
+			$mode = 'self_runner';
+			$at   = $self;
 		}
-		$last_driver_run = absint( $last_driver_run );
-		if ( $last_driver_run > 0 && ( absint( $now ) - $last_driver_run ) < HOUR_IN_SECONDS ) {
-			return 'portal-heartbeat' === sanitize_key( (string) $driver_source ) ? 'portal_heartbeat' : 'other_driver';
+		if ( $driver > $at && ( absint( $now ) - $driver ) < HOUR_IN_SECONDS ) {
+			if ( self::is_real_scheduler_source( $source ) ) {
+				$mode = 'real_cron';
+			} elseif ( 'self-runner' === $source && $self_runner_enabled ) {
+				$mode = 'self_runner';
+			} else {
+				$mode = 'portal-heartbeat' === $source ? 'portal_heartbeat' : 'other_driver';
+			}
+			$at = $driver;
 		}
-		return 'not_detected';
+
+		return array(
+			'mode'   => $mode,
+			'lastAt' => max( $at, $driver ),
+		);
 	}
 
 	/**
