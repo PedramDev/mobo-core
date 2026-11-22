@@ -211,6 +211,22 @@ class Mobo_Core_Image_Sync {
 	private $sideload_integrity_error = '';
 
 	/**
+	 * R5: Unix time until which the last download was not started because the
+	 * image host's per-site rate cap had no free slot (0 = not deferred).
+	 *
+	 * @var int
+	 */
+	private $rate_deferred_until = 0;
+
+	/**
+	 * R5: Unix time until which the image host is paused after it answered the
+	 * last download with 429/503/Retry-After (0 = not throttled).
+	 *
+	 * @var int
+	 */
+	private $throttled_until = 0;
+
+	/**
 	 * Request-local attachment resolution cache.
 	 *
 	 * Image resolution can ask for the same GUID/source several times while a row
@@ -1317,6 +1333,10 @@ class Mobo_Core_Image_Sync {
 		$host_state       = null;
 		$host_state_dirty = false;
 		$image_host       = '';
+		/* R5: per-host download cap / throttling pause seen in this pass. */
+		$rate_deferred    = 0;
+		$rate_gate        = array();
+		$rate_gate_count  = array();
 
 		if ( ! is_array( $rows ) || empty( $rows ) ) {
 			return array(
@@ -1455,6 +1475,34 @@ class Mobo_Core_Image_Sync {
 					continue;
 				}
 
+				/* R5: while the host's per-site cap has no free slot (or the host is
+				 * paused after a 429/503), rows that need a download wait without
+				 * counting an attempt. A short wait leaves bulk-claimed rows to the
+				 * single bulk release at the end of the pass (no per-row write); a
+				 * pause or an individually leased row is deferred, spread one cap
+				 * interval apart so later passes do not re-claim them all at once. */
+				if ( $attachment_id <= 0 && '' !== $image_host && '' !== $claim_token && class_exists( 'Mobo_Core_Image_Host_Rate_Limit' ) && method_exists( $queue, 'defer_claimed_until' ) ) {
+					if ( ! isset( $rate_gate[ $image_host ] ) ) {
+						$peek                     = Mobo_Core_Image_Host_Rate_Limit::peek( $image_host );
+						$rate_gate[ $image_host ] = empty( $peek['available'] ) ? max( time() + 1, (int) ceil( (float) $peek['retryAt'] ) ) : 0;
+					}
+					/* A row that will only relink an existing attachment sends no request. */
+					if ( $rate_gate[ $image_host ] > 0 && $this->find_existing_attachment( $image_guid, $url ) <= 0 ) {
+						if ( $bulk_claim && ! empty( $row['_mobo_bulk_claimed'] ) && $rate_gate[ $image_host ] - time() <= 30 ) {
+							$rate_deferred++;
+							$deferred++;
+							continue;
+						}
+						$spread = self::rate_spread_seconds( $image_host, isset( $rate_gate_count[ $image_host ] ) ? $rate_gate_count[ $image_host ] : 0 );
+						if ( $queue->defer_claimed_until( $id, $rate_gate[ $image_host ] + $spread, $claim_token ) ) {
+							$rate_gate_count[ $image_host ] = ( isset( $rate_gate_count[ $image_host ] ) ? $rate_gate_count[ $image_host ] : 0 ) + 1;
+							$rate_deferred++;
+							$deferred++;
+							continue;
+						}
+					}
+				}
+
 				if ( method_exists( $queue, 'begin_attempt_if_current' )
 					&& ! $queue->begin_attempt_if_current( $id, $try_count, $product_id, $image_guid, $url, $claim_token ) ) {
 					if ( method_exists( $queue, 'release_if_superseded' ) ) {
@@ -1514,6 +1562,26 @@ class Mobo_Core_Image_Sync {
 
 				if ( ! $can_reuse_queued_attachment ) {
 					$attachment_id = $this->resolve_image_attachment( $url, $product_id, $image_guid );
+				}
+
+				/* R5: the download was not made (cap) or was throttled (429/503/
+				 * Retry-After): give the attempt back and retry after the pause. */
+				$rate_until = $attachment_id <= 0 ? $this->last_rate_deferral_until() : 0;
+				if ( $rate_until > 0 && '' !== $claim_token && method_exists( $queue, 'defer_attempt_until' ) ) {
+					$gate_host = '' !== $image_host ? $image_host : 'unknown';
+					$spread    = self::rate_spread_seconds( $gate_host, isset( $rate_gate_count[ $gate_host ] ) ? $rate_gate_count[ $gate_host ] : 0 );
+					if ( $queue->defer_attempt_until( $id, $rate_until + $spread, $try_count, $this->get_last_image_error(), $claim_token ) ) {
+						$rate_gate[ $gate_host ]       = $rate_until;
+						$rate_gate_count[ $gate_host ] = ( isset( $rate_gate_count[ $gate_host ] ) ? $rate_gate_count[ $gate_host ] : 0 ) + 1;
+						$rate_deferred++;
+						$deferred++;
+						continue;
+					}
+					if ( method_exists( $queue, 'release_if_superseded' ) ) {
+						$queue->release_if_superseded( $id, $product_id, $image_guid, $url, $claim_token );
+					}
+					$deferred++;
+					continue;
 				}
 
 				if ( $attachment_id > 0 && $this->ensure_attachment_ready_for_linkage( $attachment_id, $url ) ) {
@@ -1717,11 +1785,28 @@ class Mobo_Core_Image_Sync {
 			'hostFailed'    => array_sum( $host_failed ),
 			'storageFailed' => $storage_failed,
 			'hostDeferred'  => $host_deferred,
+			'rateDeferred'  => $rate_deferred,
 			'openHosts'     => array_slice( $open_hosts, 0, 10 ),
 			'deferred'  => $deferred,
 			'excluded'  => $excluded,
 			'remaining' => $paused_for_upgrade || ( method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0 ),
 		);
+	}
+
+	/**
+	 * R5: extra delay for the n-th row of one host deferred in the same pass
+	 * (one cap interval per row, bounded), so deferred rows come back paced.
+	 *
+	 * @param string $host Image host.
+	 * @param int    $index Rows of this host already deferred in this pass.
+	 * @return int Seconds.
+	 */
+	private static function rate_spread_seconds( $host, $index ) {
+		if ( ! class_exists( 'Mobo_Core_Image_Host_Rate_Limit' ) ) {
+			return 0;
+		}
+		$interval = 60.0 / max( 1, Mobo_Core_Image_Host_Rate_Limit::rate_per_minute( $host ) );
+		return (int) min( 900, ceil( absint( $index ) * $interval ) );
 	}
 
 	/**
@@ -1815,7 +1900,9 @@ class Mobo_Core_Image_Sync {
 	 * @return int Attachment ID or 0.
 	 */
 	private function resolve_image_attachment( $url, $product_id, $image_guid, $allow_shared_local_conversion = true, $force_fresh = false, $refresh_generation = '' ) {
-		$this->last_image_error = '';
+		$this->last_image_error    = '';
+		$this->rate_deferred_until = 0;
+		$this->throttled_until     = 0;
 		$url                    = esc_url_raw( (string) $url );
 		$product_id             = absint( $product_id );
 		$image_guid             = sanitize_text_field( (string) $image_guid );
@@ -1971,6 +2058,24 @@ class Mobo_Core_Image_Sync {
 			}
 		}
 
+		/* R5: per-site cap of image requests per Source host, shared by every
+		 * runner. Without a free slot no request is sent; the caller defers the
+		 * work item without consuming its retry budget. */
+		$rate_host = self::image_source_host( $url );
+		$rate_slot = null;
+		if ( class_exists( 'Mobo_Core_Image_Host_Rate_Limit' ) ) {
+			$rate_slot = Mobo_Core_Image_Host_Rate_Limit::reserve( $rate_host );
+			if ( empty( $rate_slot['allowed'] ) ) {
+				$this->rate_deferred_until = max( time() + 1, (int) ceil( (float) $rate_slot['retryAt'] ) );
+				$this->set_last_image_error(
+					Mobo_Core_Image_Host_Rate_Limit::DEFERRED_PREFIX . ' ' . $rate_host
+					. ( 'throttled' === $rate_slot['reason'] ? ' is paused after it throttled image downloads' : ' per-site cap reached (' . Mobo_Core_Image_Host_Rate_Limit::rate_per_minute( $rate_host ) . '/min)' )
+					. '; next request at ' . gmdate( 'H:i:s', $this->rate_deferred_until ) . ' UTC.'
+				);
+				return 0;
+			}
+		}
+
 		$request_url = $url;
 		if ( $force_fresh ) {
 			$cache_token = '' !== $refresh_generation ? $refresh_generation : (string) time();
@@ -2010,9 +2115,23 @@ class Mobo_Core_Image_Sync {
 				Mobo_Core_Image_Size_Policy::begin_sideload();
 			}
 			$integrity_guard = $this->register_sideload_integrity_guard( true );
+			/* download_url() reports every non-200 status as `http_404`; capture the
+			 * real status and Retry-After so throttling and host errors are not
+			 * mistaken for a defect of this one image. */
+			$http_seen    = array( 'code' => 0, 'retryAfter' => null );
+			$http_capture = static function ( $response, $args, $http_url ) use ( &$http_seen ) {
+				unset( $http_url );
+				if ( ! is_wp_error( $response ) && is_array( $args ) && ! empty( $args['stream'] ) ) {
+					$http_seen['code']       = absint( wp_remote_retrieve_response_code( $response ) );
+					$http_seen['retryAfter'] = wp_remote_retrieve_header( $response, 'retry-after' );
+				}
+				return $response;
+			};
+			add_filter( 'http_response', $http_capture, 9, 3 );
 			try {
 				$attachment_id = media_sideload_image( $request_url, $product_id, null, 'id' );
 			} finally {
+				remove_filter( 'http_response', $http_capture, 9 );
 				$this->unregister_sideload_integrity_guard( $integrity_guard );
 				if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
 					Mobo_Core_Image_Size_Policy::end_sideload();
@@ -2028,6 +2147,14 @@ class Mobo_Core_Image_Sync {
 					/* Truncated/corrupt download or an image too large to decode:
 					 * report the real reason (it drives retry vs terminal). */
 					$this->set_last_image_error( $this->sideload_integrity_error );
+					return 0;
+				}
+				$error_data = $attachment_id->get_error_data();
+				$http_code  = absint( $http_seen['code'] );
+				if ( $http_code <= 0 && is_array( $error_data ) && isset( $error_data['code'] ) ) {
+					$http_code = absint( $error_data['code'] );
+				}
+				if ( $http_code > 0 && ( $http_code < 200 || $http_code >= 300 ) && $this->note_image_http_failure( $rate_host, $http_code, $http_seen['retryAfter'] ) ) {
 					return 0;
 				}
 
@@ -2050,6 +2177,10 @@ class Mobo_Core_Image_Sync {
 				$this->set_last_image_error( 'Image download/import returned no attachment.' );
 			}
 			return 0;
+		}
+
+		if ( is_array( $rate_slot ) && ! empty( $rate_slot['blockCount'] ) ) {
+			Mobo_Core_Image_Host_Rate_Limit::record_success( $rate_host );
 		}
 
 		/* Disk/quota full while WordPress copied the verified temp file into uploads
@@ -2093,6 +2224,45 @@ class Mobo_Core_Image_Sync {
 		return $attachment_id;
 	}
 
+
+	/**
+	 * R5: classify a non-2xx image response. A throttling response
+	 * (429/503/Retry-After) pauses the host for every runner and the row is
+	 * deferred without consuming an attempt; other 5xx/408 statuses get a
+	 * host-class message so the per-host breaker sees them.
+	 *
+	 * @param string $host Image host.
+	 * @param int    $code HTTP status.
+	 * @param mixed  $retry_after_header Retry-After header value.
+	 * @return bool True when the error message was set here.
+	 */
+	private function note_image_http_failure( $host, $code, $retry_after_header ) {
+		$code = absint( $code );
+		if ( class_exists( 'Mobo_Core_Image_Host_Rate_Limit' ) ) {
+			$retry_after = Mobo_Core_Image_Host_Rate_Limit::parse_retry_after( $retry_after_header, time() );
+			if ( Mobo_Core_Image_Host_Rate_Limit::is_throttle_response( $code, null !== $retry_after ) ) {
+				$until                 = Mobo_Core_Image_Host_Rate_Limit::record_throttle( $host, $retry_after );
+				$this->throttled_until = max( time() + Mobo_Core_Image_Host_Rate_Limit::THROTTLE_BASE_COOLDOWN, absint( $until ) );
+				$this->set_last_image_error( 'Image HTTP response was ' . $code . ' (image host ' . $host . ' is rate limiting; image downloads from it paused until ' . gmdate( 'H:i:s', $this->throttled_until ) . ' UTC).' );
+				return true;
+			}
+		}
+		if ( 408 === $code || ( $code >= 500 && $code <= 599 ) ) {
+			$this->set_last_image_error( 'Image HTTP response was ' . $code . ' from the image host.' );
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * R5: until when the last image resolution was deferred by the per-host cap
+	 * or a throttling response (0 = it was not).
+	 *
+	 * @return int
+	 */
+	public function last_rate_deferral_until() {
+		return max( absint( $this->rate_deferred_until ), absint( $this->throttled_until ) );
+	}
 
 	/**
 	 * Build a temporary whitelist filter for WordPress safe HTTP requests.
@@ -2288,6 +2458,11 @@ class Mobo_Core_Image_Sync {
 		}
 
 		$code = absint( wp_remote_retrieve_response_code( $response ) );
+
+		if ( ( $code < 200 || $code >= 300 ) && $this->note_image_http_failure( self::image_source_host( $url ), $code, wp_remote_retrieve_header( $response, 'retry-after' ) ) ) {
+			wp_delete_file( $tmp_file );
+			return 0;
+		}
 
 		if ( $code < 200 || $code >= 300 || ! file_exists( $tmp_file ) || filesize( $tmp_file ) <= 0 ) {
 			wp_delete_file( $tmp_file );

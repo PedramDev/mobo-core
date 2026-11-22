@@ -5800,6 +5800,7 @@ https://source.example/products/test-product/
 					<div class="mobo-card-head"><h2>صف تصویر</h2><p>در مسیر فعلی Sync، تصاویر به‌صورت non-blocking در Desired-State queue ثبت می‌شوند و Worker آن‌ها را جداگانه پردازش می‌کند.</p></div>
 					<div class="mobo-fields-grid">
 						<?php $this->int_field( 'حد پایه تصویر در هر Worker slice', 'mobo_core_images_per_run', 1, 10 ); ?>
+						<?php $this->int_field( 'سقف دریافت تصویر از هر میزبان تصویر Source / دقیقه', 'mobo_core_image_host_rate_per_minute', 1, 120, 30 ); ?>
 						<?php $this->bool_field( 'فعال بودن صف مستقل تصویر', 'mobo_core_image_queue_enabled' ); ?>
 						<?php $this->int_field( 'تعداد تلاش سریع تصویر قبل از Retry بلندمدت', 'mobo_core_image_max_try', 1, 20 ); ?>
 						<?php $this->int_field( 'فاصله پایه Retry سریع تصویر / ثانیه', 'mobo_core_image_retry_base_seconds', 30, 900 ); ?>
@@ -9676,6 +9677,7 @@ https://source.example/products/test-product/
 			'mobo_core_products_per_page'        => array( 1, 20 ),
 			'mobo_core_variants_per_page'        => array( 1, 100 ),
 			'mobo_core_images_per_run'           => array( 1, 10 ),
+			'mobo_core_image_host_rate_per_minute' => array( 1, 120 ),
 			'mobo_core_image_max_try'            => array( 1, 20 ),
 			'mobo_core_image_retry_base_seconds' => array( 30, 900 ),
 			'mobo_core_image_long_retry_seconds' => array( 3600, 604800 ),

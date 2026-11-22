@@ -22,6 +22,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Image_Queue {
 
+	/**
+	 * R5: newest rows (by id) inspected for priority claims. New products are
+	 * enqueued after the backlog, so their rows carry the highest ids; bounding
+	 * the window keeps the priority probe cheap on very large queues.
+	 */
+	const PRIORITY_ID_WINDOW = 5000;
+
 	/** @var bool|null Request-local table existence cache. */
 	private static $table_exists_cache = null;
 
@@ -983,7 +990,14 @@ class Mobo_Core_Image_Queue {
 
 		$table = self::table_name();
 		$now   = current_time( 'mysql', true );
-		$ids   = $wpdb->get_col(
+
+		/*
+		 * R5: images of products that have no featured image yet (new products)
+		 * are claimed before the backlog of products that already show an image.
+		 * The per-host download cap then slows only the backlog.
+		 */
+		$priority_ids = self::priority_due_ids( $connection_id, $now, $limit );
+		$ids          = $wpdb->get_col(
 			$wpdb->prepare(
 				"SELECT q.id FROM {$table} q
 				INNER JOIN {$wpdb->posts} p
@@ -1001,6 +1015,7 @@ class Mobo_Core_Image_Queue {
 		);
 
 		$ids = array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
+		$ids = array_slice( array_values( array_unique( array_merge( $priority_ids, $ids ) ) ), 0, $limit );
 		if ( empty( $ids ) ) {
 			return array();
 		}
@@ -1046,7 +1061,62 @@ class Mobo_Core_Image_Queue {
 		}
 		unset( $row );
 
+		/* Process priority rows first (the per-host cap may defer the tail). */
+		if ( ! empty( $priority_ids ) ) {
+			$rank = array_flip( $ids );
+			usort(
+				$rows,
+				static function ( $a, $b ) use ( $rank ) {
+					$ra = isset( $rank[ absint( $a['id'] ) ] ) ? $rank[ absint( $a['id'] ) ] : PHP_INT_MAX;
+					$rb = isset( $rank[ absint( $b['id'] ) ] ) ? $rank[ absint( $b['id'] ) ] : PHP_INT_MAX;
+					return $ra < $rb ? -1 : ( $ra > $rb ? 1 : 0 );
+				}
+			);
+		}
+
 		return $rows;
+	}
+
+	/**
+	 * R5: due rows of products without a featured image (storefront shows a
+	 * placeholder), featured position first, then FIFO. Only the newest PRIORITY_ID_WINDOW
+	 * rows are inspected, so the probe stays bounded on very large backlogs.
+	 *
+	 * @param int    $connection_id Connection ID.
+	 * @param string $now Current GMT datetime.
+	 * @param int    $limit Limit.
+	 * @return int[]
+	 */
+	private static function priority_due_ids( $connection_id, $now, $limit ) {
+		global $wpdb;
+		$table  = self::table_name();
+		$max_id = absint( $wpdb->get_var( "SELECT MAX(id) FROM {$table}" ) );
+		if ( $max_id <= 0 ) {
+			return array();
+		}
+		$ids = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT q.id FROM {$table} q
+				INNER JOIN {$wpdb->posts} p
+					ON p.ID = q.product_id
+					AND p.post_type = 'product'
+				WHERE q.id > %d AND q.connection_id = %d
+					AND ((q.status IN ('pending','attaching') AND (q.next_retry_at IS NULL OR q.next_retry_at <= %s))
+						OR (q.status = 'processing' AND q.locked_until IS NOT NULL AND q.locked_until < %s))
+					AND NOT EXISTS (
+						SELECT 1 FROM {$wpdb->postmeta} thumb
+						WHERE thumb.post_id = q.product_id AND thumb.meta_key = '_thumbnail_id' AND thumb.meta_value NOT IN ('', '0')
+					)
+				ORDER BY q.position_index ASC, q.updated_at ASC, q.id ASC
+				LIMIT %d",
+				max( 0, $max_id - self::PRIORITY_ID_WINDOW ),
+				$connection_id,
+				$now,
+				$now,
+				max( 1, absint( $limit ) )
+			)
+		);
+		return array_values( array_filter( array_map( 'absint', is_array( $ids ) ? $ids : array() ) ) );
 	}
 
 	/**
@@ -1078,6 +1148,52 @@ class Mobo_Core_Image_Queue {
 				current_time( 'mysql', true ),
 				$connection_id,
 				$id,
+				$claim_token
+			)
+		);
+		if ( 1 === absint( $updated ) ) {
+			self::invalidate_summary_cache();
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * R5: return a row whose attempt was begun but whose download was not made
+	 * (image host rate cap) or was answered with a throttling response
+	 * (429/503/Retry-After). The begun attempt is given back (try_count is
+	 * restored), so throttling never moves an image toward its retry limit.
+	 *
+	 * @param int    $id Row ID.
+	 * @param int    $until Unix time of the next eligible attempt.
+	 * @param int    $attempted_try_count Try count written by begin_attempt_if_current().
+	 * @param string $message Diagnostic message.
+	 * @param string $claim_token Exact persisted claim token.
+	 * @return bool
+	 */
+	public function defer_attempt_until( $id, $until, $attempted_try_count, $message, $claim_token ) {
+		global $wpdb;
+		$connection_id       = self::connection_id();
+		$id                  = absint( $id );
+		$until               = max( time() + 1, absint( $until ) );
+		$attempted_try_count = max( 1, absint( $attempted_try_count ) );
+		$claim_token         = sanitize_text_field( (string) $claim_token );
+		if ( $connection_id <= 0 || $id <= 0 || '' === $claim_token || ! self::table_exists() ) {
+			return false;
+		}
+		$table   = self::table_name();
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s
+				WHERE connection_id = %d AND id = %d AND status = 'processing' AND try_count = %d AND locked_until = %s",
+				$attempted_try_count - 1,
+				gmdate( 'Y-m-d H:i:s', $until ),
+				substr( sanitize_text_field( (string) $message ), 0, 1000 ),
+				current_time( 'mysql', true ),
+				$connection_id,
+				$id,
+				$attempted_try_count,
 				$claim_token
 			)
 		);

@@ -569,6 +569,7 @@ class Mobo_Core_Image_Refresh_Service {
 		$failed    = 0;
 		$skipped   = 0;
 		$superseded = 0;
+		$rate_deferred = 0;
 		$paused_for_upgrade = false;
 
 		$stopped_by_admin = false;
@@ -705,6 +706,19 @@ class Mobo_Core_Image_Refresh_Service {
 				continue;
 			}
 
+			/* R5: image host cap/throttle: give the attempt back and stop this pass
+			 * (the remaining rows would hit the same host limit). */
+			if ( ! empty( $result['rateDeferred'] ) && method_exists( $queue, 'defer_attempt_until' ) ) {
+				if ( $queue->defer_attempt_until( $id, absint( isset( $result['retryAt'] ) ? $result['retryAt'] : 0 ), $try_count, isset( $result['message'] ) ? (string) $result['message'] : '', $claim_token ) ) {
+					$rate_deferred++;
+					break;
+				}
+				if ( method_exists( $queue, 'last_write_failed' ) && $queue->last_write_failed() ) {
+					$write_failed = true;
+					break;
+				}
+			}
+
 			$message   = isset( $result['message'] ) ? $result['message'] : 'نوسازی تصویر ناموفق بود.';
 			/* Network/storage/worker failures are recoverable. Only an explicitly permanent result may become terminal. */
 			$committed = method_exists( $queue, 'mark_failure_if_current' )
@@ -736,7 +750,8 @@ class Mobo_Core_Image_Refresh_Service {
 				'failed'    => $failed,
 				'skipped'   => $skipped,
 				'superseded'=> $superseded,
-				'remaining' => $paused_for_upgrade || $queue->count_due() > 0,
+				'rateDeferred' => $rate_deferred,
+				'remaining' => $paused_for_upgrade || $rate_deferred > 0 || $queue->count_due() > 0,
 			)
 		);
 	
@@ -863,6 +878,17 @@ class Mobo_Core_Image_Refresh_Service {
 			 * for memory_limit); a too-large source is terminal instead of being
 			 * downloaded again on every retry. */
 			$import_error = method_exists( $image_sync, 'last_import_error' ) ? (string) $image_sync->last_import_error() : '';
+			/* R5: the per-host image cap or a 429/503 from the image host deferred
+			 * the download; the row waits without consuming a refresh attempt. */
+			$rate_until = method_exists( $image_sync, 'last_rate_deferral_until' ) ? absint( $image_sync->last_rate_deferral_until() ) : 0;
+			if ( $rate_until > 0 ) {
+				return array(
+					'success'      => false,
+					'rateDeferred' => true,
+					'retryAt'      => $rate_until,
+					'message'      => $import_error,
+				);
+			}
 			$too_large    = class_exists( 'Mobo_Core_Image_Integrity' ) && 0 === strpos( $import_error, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX );
 			return array(
 				'success'   => false,

@@ -618,6 +618,31 @@ class Mobo_Core_Image_Refresh_Queue {
 	 *
 	 * @return bool
 	 */
+	/**
+	 * R5: return a row whose download was deferred by the per-host image cap or
+	 * a throttling response; the begun attempt is given back.
+	 *
+	 * @param int    $id Row ID.
+	 * @param int    $until Unix time of the next eligible attempt.
+	 * @param int    $attempted_try_count Try count written by begin_attempt_if_current().
+	 * @param string $message Diagnostic message.
+	 * @param string $claim_token Exact persisted claim token.
+	 * @return bool
+	 */
+	public function defer_attempt_until( $id, $until, $attempted_try_count, $message, $claim_token ) {
+		global $wpdb;
+		$connection_id       = self::connection_id();
+		$id                  = absint( $id );
+		$until               = max( time() + 1, absint( $until ) );
+		$attempted_try_count = max( 1, absint( $attempted_try_count ) );
+		$claim_token         = sanitize_text_field( (string) $claim_token );
+		if ( $connection_id <= 0 || $id <= 0 || '' === $claim_token || ! self::table_exists() ) { return false; }
+		$table   = self::table_name();
+		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'pending', try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND try_count = %d AND locked_until = %s", $attempted_try_count - 1, gmdate( 'Y-m-d H:i:s', $until ), substr( sanitize_text_field( (string) $message ), 0, 1000 ), current_time( 'mysql', true ), $connection_id, $id, $attempted_try_count, $claim_token ) );
+		$this->write_failed = false === $updated;
+		return 1 === absint( $updated );
+	}
+
 	public function mark_failure_if_current( $id, $message, $try_count, $final_failed, $product_id, $image_guid, $old_attachment_id, $new_source_url, $claim_token = '' ) {
 		global $wpdb;
 		$connection_id = self::connection_id();
