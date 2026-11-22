@@ -627,6 +627,7 @@ class Mobo_Core_Migration {
 			'workerElapsedMs' => array( 'operational' => 0, 'identity' => 0, 'entity' => 0 ),
 		);
 		$previous = self::migration_progress_fingerprint();
+		$previous_core = self::migration_progress_fingerprint( false );
 		self::$accelerated_context = true;
 		/* The full pipeline pass (first and final iteration) stops between steps at
 		 * the slice's work deadline instead of running unbounded (8 s share took 38 s). */
@@ -671,7 +672,9 @@ class Mobo_Core_Migration {
 					$pipeline_elapsed_ms += (int) round( ( microtime( true ) - $pipeline_started ) * 1000 );
 				}
 				$current = self::migration_progress_fingerprint();
-				if ( $current !== $previous ) {
+				$current_core = self::migration_progress_fingerprint( false );
+				$waiting_now = self::migration_fingerprint_is_waiting( $current );
+				if ( self::slice_iteration_progressed( $previous, $current, $previous_core, $current_core, $waiting_now ) ) {
 					$progressed++;
 				}
 				if ( MOBO_CORE_VERSION === trim( (string) get_option( 'mobo_core_db_version', '' ) )
@@ -679,10 +682,11 @@ class Mobo_Core_Migration {
 					&& ! self::deferred_release_repairs_pending() ) {
 					break;
 				}
-				if ( $current === $previous || self::migration_fingerprint_is_waiting( $current ) ) {
+				if ( $current === $previous || $waiting_now ) {
 					break;
 				}
 				$previous = $current;
+				$previous_core = $current_core;
 			}
 		} finally {
 			self::$accelerated_context = false;
@@ -813,12 +817,40 @@ class Mobo_Core_Migration {
 	}
 
 	/** @return string */
-	private static function migration_progress_fingerprint() {
+	/**
+	 * Pure: whether one budgeted-slice iteration made real migration progress.
+	 *
+	 * A terminal worker that is only waiting out a time-based grace/backoff (or is
+	 * blocked/erroring) re-persists its state on every call, which bumps
+	 * stateRevision. Counting that as progress reported status "progressed", so the
+	 * Cron runner / self-runner kicked an immediate loopback continuation again and
+	 * again for the whole grace window (~1 request/s for 180 s per worker; envA
+	 * 8093, 10.33.67 -> 10.34.77). While waiting, only a change outside
+	 * stateRevision (status transition, cursor, version, error) is progress.
+	 *
+	 * @param string $previous      Full fingerprint before the iteration.
+	 * @param string $current       Full fingerprint after the iteration.
+	 * @param string $previous_core Fingerprint without stateRevision, before.
+	 * @param string $current_core  Fingerprint without stateRevision, after.
+	 * @param bool   $waiting_now   Active worker is waiting/blocked after the iteration.
+	 * @return bool
+	 */
+	public static function slice_iteration_progressed( $previous, $current, $previous_core, $current_core, $waiting_now ) {
+		if ( (string) $current === (string) $previous ) {
+			return false;
+		}
+		if ( ! $waiting_now ) {
+			return true;
+		}
+		return (string) $current_core !== (string) $previous_core;
+	}
+
+	private static function migration_progress_fingerprint( $include_revision = true ) {
 		$parts = array( trim( (string) get_option( 'mobo_core_db_version', '' ) ) );
 		foreach ( self::migration_worker_statuses() as $name => $state ) {
 			$parts[] = $name . ':' . wp_json_encode( array(
 				'status' => isset( $state['status'] ) ? $state['status'] : '',
-				'stateRevision' => isset( $state['stateRevision'] ) ? $state['stateRevision'] : 0,
+				'stateRevision' => ( $include_revision && isset( $state['stateRevision'] ) ) ? $state['stateRevision'] : 0,
 				'proofCursor' => isset( $state['proofCursor'] ) ? $state['proofCursor'] : 0,
 				'copyCursor' => isset( $state['copyCursor'] ) ? $state['copyCursor'] : 0,
 				'cleanupCursor' => isset( $state['cleanupCursor'] ) ? $state['cleanupCursor'] : 0,
