@@ -10,7 +10,7 @@ import { Page } from '@playwright/test';
 import { test, expect } from '../lib/fixtures';
 import { actionForm, cardAjax, clickAndReadNotice, gotoTab, note, postAjax, requireRendered } from '../lib/admin';
 import { getOption, getSetting, getState, serializedField } from '../lib/db';
-import { mockLog, waitForMockRequests } from '../lib/services';
+import { mockCursor, mockRequestsSince, waitForMockRequests } from '../lib/services';
 
 
 function syncState(): { status: string | null; syncId: string | null; repair: string | null } {
@@ -76,7 +76,7 @@ test.describe('Dashboard: product sync controls', () => {
   });
 
   test('running sync reaches the mock Source through the Backend', { tag: '@backend' }, async ({ page }, testInfo) => {
-    const baseline = await mockLog();
+    const baseline = await mockCursor();
     test.skip(baseline === null, 'mock Source /__control/log not reachable');
     await ensureRunning(page);
     // The dashboard's own status poll advances a bounded burst when the loopback runner is blocked.
@@ -85,7 +85,7 @@ test.describe('Dashboard: product sync controls', () => {
     let fresh: unknown[] = [];
     while (Date.now() < deadline && fresh.length === 0) {
       await postAjax(page, url, { action: 'mobo_core_get_sync_status', nonce });
-      fresh = await waitForMockRequests(baseline!.length, 5_000);
+      fresh = await waitForMockRequests(baseline!, 5_000);
     }
     note(testInfo, `mock Source received ${fresh.length} new request(s)`);
     expect(fresh.length, 'sync produced at least one request at the mock Source').toBeGreaterThan(0);
@@ -146,7 +146,7 @@ test.describe('Dashboard: product sync controls', () => {
   test('"به‌روزرسانی دسته‌بندی‌ها برای نگاشت" loads Source categories', { tag: '@backend' }, async ({ page }) => {
     await ensureNotRunning(page);
     const before = Number(getSetting('mobo_core_categories_mapping_loaded_at') || 0);
-    const baseline = await mockLog();
+    const baseline = await mockCursor();
     const btn = actionForm(page, 'mobo_core_sync_categories').locator('button[type="submit"]').first();
     await requireRendered(btn, 'category preload control');
     const n = await clickAndReadNotice(page, btn);
@@ -155,7 +155,7 @@ test.describe('Dashboard: product sync controls', () => {
     const after = Number(getSetting('mobo_core_categories_mapping_loaded_at') || getSetting('mobo_core_categories_last_sync_at') || 0);
     expect(after, 'category snapshot timestamp advanced').toBeGreaterThanOrEqual(before);
     expect(after).toBeGreaterThan(0);
-    if (baseline) expect((await mockLog())!.length, 'mock Source was queried').toBeGreaterThan(baseline.length);
+    if (baseline) expect((await mockRequestsSince(baseline))?.count ?? 0, 'mock Source was queried').toBeGreaterThan(0);
   });
 
   test('"حفظ محصول اصلی و کنار گذاشتن نسخه‌های تکراری" quarantines duplicates', async ({ page }) => {

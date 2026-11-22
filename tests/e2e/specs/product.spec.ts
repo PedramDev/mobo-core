@@ -143,49 +143,55 @@ test.describe('Products list: per-product pricing override modal', () => {
     const originalEnabled = postMeta(productId, '_mobo_pricing_override_enabled');
     const originalValue = postMeta(productId, '_mobo_pricing_override_value');
     const value = '12.5';
+    let saveAttempted = false;
 
-    await page.locator('input[name="mobo_pricing_mode"][value="custom"]').check();
-    await page.locator('#mobo-pricing-value').fill(value);
-    const [resp] = await Promise.all([
-      page.waitForResponse((r) => r.url().includes('admin-ajax.php') && (r.request().postData() || '').includes('mobo_core_save_product_pricing_override')),
-      page.locator('#mobo-pricing-save').click(),
-    ]);
-    const body = await resp.json();
-    expect(body.success, JSON.stringify(body)).toBe(true);
-    await expect(page.locator('#mobo-pricing-message')).toContainText(body.data.message);
-    if (body.data.status === 'applied') {
-      expect(postMeta(productId, '_mobo_pricing_override_enabled')).toBe('1');
-      expect(Number(postMeta(productId, '_mobo_pricing_override_value'))).toBeCloseTo(12.5, 4);
-      await page.waitForLoadState('load'); // modal reloads the list
-      await expect(page.locator(`#post-${productId} .mobo-pricing-state`)).toContainText('12.5');
-    } else {
-      expect(body.data.status).toBe('queued');
-      expect(postMeta(productId, '_mobo_pricing_override_pending'), 'durable pending request stored').toBeTruthy();
-    }
-
-    // Restore: global mode clears the product override (unless one existed before).
-    await filterProducts(page, 'mobo');
-    const target = page.locator(`a.mobo-pricing-row-action[data-product-id="${productId}"]`);
-    await page.locator('#the-list tr', { has: target }).hover();
-    await target.click();
-    await expect(page.locator('#mobo-pricing-modal')).toBeVisible();
-    if (originalEnabled === '1' && originalValue) {
+    try {
       await page.locator('input[name="mobo_pricing_mode"][value="custom"]').check();
-      await page.locator('#mobo-pricing-value').fill(originalValue);
-    } else {
-      await page.locator('input[name="mobo_pricing_mode"][value="global"]').check();
-    }
-    const [restore] = await Promise.all([
-      page.waitForResponse((r) => r.url().includes('admin-ajax.php') && (r.request().postData() || '').includes('mobo_core_save_product_pricing_override')),
-      page.locator('#mobo-pricing-save').click(),
-    ]);
-    const rb = await restore.json();
-    expect(rb.success, JSON.stringify(rb)).toBe(true);
-    if (rb.data.status === 'applied' && originalEnabled !== '1') {
-      expect(postMeta(productId, '_mobo_pricing_override_enabled') || '').not.toBe('1');
+      await page.locator('#mobo-pricing-value').fill(value);
+      saveAttempted = true;
+      const [resp] = await Promise.all([
+        page.waitForResponse((r) => r.url().includes('admin-ajax.php') && (r.request().postData() || '').includes('mobo_core_save_product_pricing_override')),
+        page.locator('#mobo-pricing-save').click(),
+      ]);
+      const body = await resp.json();
+      expect(body.success, JSON.stringify(body)).toBe(true);
+      await expect(page.locator('#mobo-pricing-message')).toContainText(body.data.message);
+      if (body.data.status === 'applied') {
+        expect(postMeta(productId, '_mobo_pricing_override_enabled')).toBe('1');
+        expect(Number(postMeta(productId, '_mobo_pricing_override_value'))).toBeCloseTo(12.5, 4);
+        await page.waitForLoadState('load'); // modal reloads the list
+        await expect(page.locator(`#post-${productId} .mobo-pricing-state`)).toContainText('12.5');
+      } else {
+        expect(body.data.status).toBe('queued');
+        expect(postMeta(productId, '_mobo_pricing_override_pending'), 'durable pending request stored').toBeTruthy();
+      }
+    } finally {
+      // Restore even when an assertion above failed: global mode clears the product
+      // override (or the pre-existing custom percentage is written back).
+      if (saveAttempted) {
+        await filterProducts(page, 'mobo');
+        const target = page.locator(`a.mobo-pricing-row-action[data-product-id="${productId}"]`);
+        await page.locator('#the-list tr', { has: target }).hover();
+        await target.click();
+        await expect(page.locator('#mobo-pricing-modal')).toBeVisible();
+        if (originalEnabled === '1' && originalValue) {
+          await page.locator('input[name="mobo_pricing_mode"][value="custom"]').check();
+          await page.locator('#mobo-pricing-value').fill(originalValue);
+        } else {
+          await page.locator('input[name="mobo_pricing_mode"][value="global"]').check();
+        }
+        const [restore] = await Promise.all([
+          page.waitForResponse((r) => r.url().includes('admin-ajax.php') && (r.request().postData() || '').includes('mobo_core_save_product_pricing_override')),
+          page.locator('#mobo-pricing-save').click(),
+        ]);
+        const rb = await restore.json();
+        expect(rb.success, JSON.stringify(rb)).toBe(true);
+        if (rb.data.status === 'applied' && originalEnabled !== '1') {
+          expect(postMeta(productId, '_mobo_pricing_override_enabled') || '').not.toBe('1');
+        }
+      }
     }
   });
-
   test('ajax mobo_core_save_product_pricing_override rejects an invalid nonce', async ({ page }) => {
     await page.goto('/wp-admin/edit.php?post_type=product');
     const res = await page.request.post('/wp-admin/admin-ajax.php', {
