@@ -30,6 +30,176 @@ class Mobo_Core_Image_Sync {
 	/** Seconds between storage-recovery revival probes (M5). */
 	const STORAGE_REVIVAL_INTERVAL = 600;
 
+	/** Per-host image breaker state (global option, bounded). */
+	const HOST_BREAKER_OPTION = 'mobo_core_image_host_breaker';
+	/** Window in which distinct failing images of one host are counted. */
+	const HOST_BREAKER_WINDOW = 900;
+	/** Distinct images of one host failing with host-level errors that open its breaker. */
+	const HOST_BREAKER_DISTINCT = 3;
+	const HOST_BREAKER_BASE_COOLDOWN = 120;
+	const HOST_BREAKER_MAX_COOLDOWN = 1800;
+	const HOST_BREAKER_MAX_HOSTS = 50;
+	const HOST_BREAKER_MAX_KEYS = 20;
+
+	/**
+	 * Pure: failure class of one image attempt.
+	 *  - storage: local storage/WebP service not ready (systemic for this site);
+	 *  - host: transport failure (timeout, DNS, connection refused) or HTTP
+	 *    5xx/429/408 from the image host (systemic only across distinct images);
+	 *  - item: everything that belongs to one image/source (404/410/403, invalid
+	 *    URL or image, integrity/readiness/too-large, policy-blocked, permanent).
+	 *
+	 * @param string $message Queue failure message.
+	 * @return string item|host|storage
+	 */
+	public static function classify_failure_message( $message ) {
+		$message = (string) $message;
+		if ( 0 === strpos( $message, 'Permanent:' ) ) {
+			return 'item';
+		}
+		foreach ( array( 'Image storage is not ready', 'Could not create a temporary image file.', 'WebP readiness service is unavailable.', 'WebP readiness verifier is unavailable.' ) as $marker ) {
+			if ( false !== strpos( $message, $marker ) ) {
+				return 'storage';
+			}
+		}
+		if ( 0 === strpos( $message, 'Image HTTP request failed:' ) || false !== strpos( $message, 'wp_media_http_request_failed' ) ) {
+			return 'host';
+		}
+		if ( preg_match( '/(?:\b|_)http_(5\d\d|429|408)\b/', $message ) || preg_match( '/^Image HTTP response was (5\d\d|429|408)\b/', $message ) ) {
+			return 'host';
+		}
+		return 'item';
+	}
+
+	/**
+	 * Pure: lower-case host of an image source URL ('' when none).
+	 *
+	 * @param string $url URL.
+	 * @return string
+	 */
+	public static function image_source_host( $url ) {
+		$host = wp_parse_url( (string) $url, PHP_URL_HOST );
+		return is_string( $host ) ? strtolower( trim( $host, " \t\n\r\0\x0B[]" ) ) : '';
+	}
+
+	/**
+	 * Pure: until when a host's breaker is open (0 = closed).
+	 *
+	 * @param array  $state Breaker state.
+	 * @param string $host Host.
+	 * @param int    $now Unix time.
+	 * @return int
+	 */
+	public static function host_breaker_open_until( $state, $host, $now ) {
+		$host = (string) $host;
+		if ( '' === $host || ! is_array( $state ) || ! isset( $state[ $host ] ) || ! is_array( $state[ $host ] ) ) {
+			return 0;
+		}
+		$until = absint( isset( $state[ $host ]['openUntil'] ) ? $state[ $host ]['openUntil'] : 0 );
+		return $until > absint( $now ) ? $until : 0;
+	}
+
+	/**
+	 * Pure: apply one attempt outcome to the per-host breaker. A single image that
+	 * keeps failing never opens its host (distinct image keys are counted); an
+	 * open host is probed again after its cooldown and reopens with an escalating
+	 * cooldown when the probe fails; any success closes and resets the host.
+	 *
+	 * @param array  $state Breaker state.
+	 * @param string $host Host.
+	 * @param string $outcome success|host_failure.
+	 * @param string $image_key Image identity (GUID or source URL).
+	 * @param int    $now Unix time.
+	 * @return array New state.
+	 */
+	public static function host_breaker_record( $state, $host, $outcome, $image_key, $now ) {
+		$state = is_array( $state ) ? $state : array();
+		$host  = (string) $host;
+		$now   = absint( $now );
+		if ( '' === $host || ! in_array( $outcome, array( 'success', 'host_failure' ), true ) ) {
+			return $state;
+		}
+		if ( 'success' === $outcome ) {
+			$entry = array( 'failures' => array(), 'openUntil' => 0, 'openCount' => 0, 'probe' => false, 'lastSuccessAt' => $now, 'lastEventAt' => $now );
+		} else {
+			$old   = isset( $state[ $host ] ) && is_array( $state[ $host ] ) ? $state[ $host ] : array();
+			$entry = array(
+				'failures'      => isset( $old['failures'] ) && is_array( $old['failures'] ) ? $old['failures'] : array(),
+				'openUntil'     => absint( isset( $old['openUntil'] ) ? $old['openUntil'] : 0 ),
+				'openCount'     => absint( isset( $old['openCount'] ) ? $old['openCount'] : 0 ),
+				'probe'         => ! empty( $old['probe'] ),
+				'lastSuccessAt' => absint( isset( $old['lastSuccessAt'] ) ? $old['lastSuccessAt'] : 0 ),
+				'lastEventAt'   => $now,
+			);
+			foreach ( $entry['failures'] as $key => $at ) {
+				if ( absint( $at ) + self::HOST_BREAKER_WINDOW < $now ) {
+					unset( $entry['failures'][ $key ] );
+				}
+			}
+			$key = substr( (string) $image_key, 0, 191 );
+			$entry['failures'][ '' !== $key ? $key : 'unknown' ] = $now;
+			if ( count( $entry['failures'] ) > self::HOST_BREAKER_MAX_KEYS ) {
+				asort( $entry['failures'] );
+				$entry['failures'] = array_slice( $entry['failures'], -self::HOST_BREAKER_MAX_KEYS, null, true );
+			}
+			$probe_failed = $entry['probe'] && $entry['openUntil'] > 0 && $now >= $entry['openUntil'];
+			if ( $probe_failed || count( $entry['failures'] ) >= self::HOST_BREAKER_DISTINCT ) {
+				$entry['openCount']++;
+				$entry['openUntil'] = $now + min( self::HOST_BREAKER_MAX_COOLDOWN, self::HOST_BREAKER_BASE_COOLDOWN * (int) pow( 2, min( 4, $entry['openCount'] - 1 ) ) );
+				$entry['probe']     = true;
+				$entry['failures']  = array();
+			}
+		}
+		$state[ $host ] = $entry;
+		if ( count( $state ) > self::HOST_BREAKER_MAX_HOSTS ) {
+			uasort(
+				$state,
+				static function ( $a, $b ) {
+					return absint( isset( $a['lastEventAt'] ) ? $a['lastEventAt'] : 0 ) - absint( isset( $b['lastEventAt'] ) ? $b['lastEventAt'] : 0 );
+				}
+			);
+			$state = array_slice( $state, -self::HOST_BREAKER_MAX_HOSTS, null, true );
+		}
+		return $state;
+	}
+
+	/**
+	 * Pure: failures of one image pass that count toward the image-stage circuit
+	 * breaker. Per-item failures never count. Host-level failures count only when
+	 * they span at least two distinct hosts and no host succeeded in the pass
+	 * (network/DNS outage); a single failing host is isolated by its own breaker.
+	 * Storage and internal (linkage/exception) failures always count.
+	 *
+	 * @param int   $storage_failed Storage-not-ready failures.
+	 * @param array $host_failed Host => host-level failure count.
+	 * @param array $successful_hosts Host => true for hosts that succeeded.
+	 * @param int   $internal_failed Internal failures.
+	 * @return int
+	 */
+	public static function circuit_failed_count( $storage_failed, $host_failed, $successful_hosts, $internal_failed ) {
+		$count       = absint( $storage_failed ) + absint( $internal_failed );
+		$host_failed = is_array( $host_failed ) ? array_filter( array_map( 'absint', $host_failed ) ) : array();
+		if ( count( $host_failed ) >= 2 && empty( $successful_hosts ) ) {
+			$count += array_sum( $host_failed );
+		}
+		return $count;
+	}
+
+	/** @return array Per-host breaker state. */
+	private function load_host_breaker() {
+		$state = get_option( self::HOST_BREAKER_OPTION, array() );
+		return is_array( $state ) ? $state : array();
+	}
+
+	/**
+	 * @param array $state Per-host breaker state.
+	 * @return void
+	 */
+	private function save_host_breaker( $state ) {
+		update_option( self::HOST_BREAKER_OPTION, is_array( $state ) ? $state : array(), false );
+	}
+
+
 	/**
 	 * Last image resolution error for queue diagnostics.
 	 *
@@ -1137,6 +1307,16 @@ class Mobo_Core_Image_Sync {
 		$touched   = array();
 		$link_rows = array();
 		$paused_for_upgrade = false;
+		/* Circuit accounting: only systemic failures may isolate the image stage. */
+		$item_failed      = 0;
+		$storage_failed   = 0;
+		$internal_failed  = 0;
+		$host_failed      = array();
+		$successful_hosts = array();
+		$host_deferred    = 0;
+		$host_state       = null;
+		$host_state_dirty = false;
+		$image_host       = '';
 
 		if ( ! is_array( $rows ) || empty( $rows ) ) {
 			return array(
@@ -1202,6 +1382,7 @@ class Mobo_Core_Image_Sync {
 
 				if ( $id <= 0 ) {
 					$failed++;
+					$item_failed++;
 					continue;
 				}
 
@@ -1211,6 +1392,7 @@ class Mobo_Core_Image_Sync {
 						: false;
 					if ( $committed ) {
 						$failed++;
+						$item_failed++;
 					} else {
 						$deferred++;
 					}
@@ -1223,6 +1405,7 @@ class Mobo_Core_Image_Sync {
 						: false;
 					if ( $committed ) {
 						$failed++;
+						$item_failed++;
 					} else {
 						$deferred++;
 					}
@@ -1254,6 +1437,21 @@ class Mobo_Core_Image_Sync {
 						}
 						$deferred++;
 					}
+					continue;
+				}
+
+				/* Per-host breaker: while the image host is isolated, defer rows that need
+				 * a download until its cooldown ends without counting an attempt, so the
+				 * item's try count/backoff and the other hosts' images are unaffected. */
+				$image_host = self::image_source_host( $url );
+				if ( null === $host_state ) {
+					$host_state = $this->load_host_breaker();
+				}
+				$host_open_until = $attachment_id <= 0 ? self::host_breaker_open_until( $host_state, $image_host, time() ) : 0;
+				if ( $host_open_until > 0 && '' !== $claim_token && method_exists( $queue, 'defer_claimed_until' )
+					&& $queue->defer_claimed_until( $id, $host_open_until + ( $id % 30 ), $claim_token ) ) {
+					$host_deferred++;
+					$deferred++;
 					continue;
 				}
 
@@ -1357,6 +1555,13 @@ class Mobo_Core_Image_Sync {
 					}
 					$link_rows[ $product_id ][] = $id;
 					$processed++;
+					if ( ! $can_reuse_queued_attachment && '' !== $image_host ) {
+						$successful_hosts[ $image_host ] = true;
+						if ( isset( $host_state[ $image_host ] ) ) {
+							$host_state       = self::host_breaker_record( $host_state, $image_host, 'success', '', time() );
+							$host_state_dirty = true;
+						}
+					}
 					continue;
 				}
 
@@ -1439,6 +1644,16 @@ class Mobo_Core_Image_Sync {
 					$deferred++;
 				} else {
 					$failed++;
+					$failure_class = $terminal_readiness ? 'item' : self::classify_failure_message( $message );
+					if ( 'storage' === $failure_class ) {
+						$storage_failed++;
+					} elseif ( 'host' === $failure_class && '' !== $image_host ) {
+						$host_failed[ $image_host ] = ( isset( $host_failed[ $image_host ] ) ? $host_failed[ $image_host ] : 0 ) + 1;
+						$host_state       = self::host_breaker_record( $host_state, $image_host, 'host_failure', '' !== $image_guid ? $image_guid : $url, time() );
+						$host_state_dirty = true;
+					} else {
+						$item_failed++;
+					}
 				}
 			}
 
@@ -1455,6 +1670,7 @@ class Mobo_Core_Image_Sync {
 				} catch ( \Throwable $e ) {
 					$link_ok = false;
 					$failed++;
+					$internal_failed++;
 					if ( class_exists( 'Mobo_Core_Logger' ) ) {
 						Mobo_Core_Logger::error( 'Image product linkage failed for product ' . $product_id . ' [' . get_class( $e ) . '].' );
 					}
@@ -1478,6 +1694,16 @@ class Mobo_Core_Image_Sync {
 			if ( $bulk_claim ) {
 				$queue->release_claimed_images( $claimed_ids, $batch_claim_token );
 			}
+			if ( $host_state_dirty && is_array( $host_state ) ) {
+				$this->save_host_breaker( $host_state );
+			}
+		}
+
+		$open_hosts = array();
+		foreach ( is_array( $host_state ) ? array_keys( $host_state ) : array() as $state_host ) {
+			if ( self::host_breaker_open_until( $host_state, $state_host, time() ) > 0 ) {
+				$open_hosts[] = (string) $state_host;
+			}
 		}
 
 		return array(
@@ -1485,6 +1711,13 @@ class Mobo_Core_Image_Sync {
 			'status'    => $paused_for_upgrade ? 'paused-for-upgrade' : 'processed',
 			'processed' => $processed,
 			'failed'    => $failed,
+			/* Only systemic failures feed the image-stage circuit breaker. */
+			'circuitFailed' => self::circuit_failed_count( $storage_failed, $host_failed, $successful_hosts, $internal_failed ),
+			'itemFailed'    => $item_failed,
+			'hostFailed'    => array_sum( $host_failed ),
+			'storageFailed' => $storage_failed,
+			'hostDeferred'  => $host_deferred,
+			'openHosts'     => array_slice( $open_hosts, 0, 10 ),
 			'deferred'  => $deferred,
 			'excluded'  => $excluded,
 			'remaining' => $paused_for_upgrade || ( method_exists( $queue, 'has_due' ) ? $queue->has_due() : $queue->count_due() > 0 ),

@@ -1478,6 +1478,9 @@ class Mobo_Core_Cron_Runner {
 						$prune_result = $prune->process_due( max( 1, min( 3, $image_limit ) ), max( 1, min( 4, $image_budget ) ) );
 						$result['prune']     = $prune_result;
 						$result['processed'] = absint( isset( $result['processed'] ) ? $result['processed'] : 0 ) + absint( isset( $prune_result['processed'] ) ? $prune_result['processed'] : 0 );
+						if ( array_key_exists( 'circuitFailed', $result ) ) {
+							$result['circuitFailed'] = absint( $result['circuitFailed'] ) + absint( isset( $prune_result['failed'] ) ? $prune_result['failed'] : 0 );
+						}
 						$result['failed']    = absint( isset( $result['failed'] ) ? $result['failed'] : 0 ) + absint( isset( $prune_result['failed'] ) ? $prune_result['failed'] : 0 );
 						$result['remaining'] = ! empty( $result['remaining'] ) || ! empty( $prune_result['remaining'] );
 						if ( 'empty' === sanitize_key( (string) ( isset( $result['status'] ) ? $result['status'] : '' ) ) && 'empty' !== sanitize_key( (string) ( isset( $prune_result['status'] ) ? $prune_result['status'] : '' ) ) ) {
@@ -1736,7 +1739,7 @@ class Mobo_Core_Cron_Runner {
 			$round['imageQueue'] = $this->merge_queue_counters(
 				$round['imageQueue'],
 				$late_image,
-				array( 'processed', 'failed' ),
+				array( 'processed', 'failed', 'circuitFailed', 'itemFailed', 'hostDeferred' ),
 				array( 'remaining' )
 			);
 			$round['imageQueue']['latePass'] = $late_image;
