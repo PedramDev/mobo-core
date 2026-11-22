@@ -78,6 +78,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 				'processed' => 0,
 				'updated'   => 0,
 				'failed'    => 0,
+				'itemFailed'=> 0,
 				'deferred'  => 0,
 				'samplesMs' => array(),
 				'lastFailed'=> false,
@@ -86,7 +87,11 @@ final class Mobo_Core_Runtime_Diagnostics {
 
 		$metric =& self::$buffer['stages'][ $stage ];
 		$processed = self::result_count( $result, array( 'processed', 'processedProducts', 'productSteps' ) );
-		$failed    = self::result_count( $result, array( 'failed' ) );
+		$raw_failed = self::result_count( $result, array( 'failed' ) );
+		/* A stage may report which of its failures are systemic (circuitFailed);
+		 * per-item failures (one bad source) then never trip the circuit breaker. */
+		$failed      = array_key_exists( 'circuitFailed', $result ) && is_numeric( $result['circuitFailed'] ) ? min( $raw_failed, absint( $result['circuitFailed'] ) ) : $raw_failed;
+		$item_failed = max( 0, $raw_failed - $failed );
 		$deferred  = self::result_count( $result, array( 'deferred' ) );
 		$status    = isset( $result['status'] ) ? sanitize_key( (string) $result['status'] ) : '';
 		$explicit_failure = array_key_exists( 'success', $result ) && false === $result['success'];
@@ -98,6 +103,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 		$metric['processed'] = absint( $metric['processed'] ) + $processed;
 		$metric['updated']   = absint( $metric['updated'] ) + self::result_count( $result, array( 'updated', 'finalized', 'warmed', 'success' ) );
 		$metric['failed']    = absint( $metric['failed'] ) + $failed;
+		$metric['itemFailed']= absint( isset( $metric['itemFailed'] ) ? $metric['itemFailed'] : 0 ) + $item_failed;
 		$metric['deferred']  = absint( $metric['deferred'] ) + $deferred;
 		$metric['lastFailed']= $is_failure;
 		$metric['samplesMs'][] = $elapsed_ms;
@@ -294,6 +300,7 @@ final class Mobo_Core_Runtime_Diagnostics {
 				'processed'            => absint( isset( $old['processed'] ) ? $old['processed'] : 0 ) + $incoming_processed,
 				'updated'              => absint( isset( $old['updated'] ) ? $old['updated'] : 0 ) + absint( isset( $incoming['updated'] ) ? $incoming['updated'] : 0 ),
 				'failed'               => absint( isset( $old['failed'] ) ? $old['failed'] : 0 ) + $incoming_failed,
+				'itemFailed'           => absint( isset( $old['itemFailed'] ) ? $old['itemFailed'] : 0 ) + absint( isset( $incoming['itemFailed'] ) ? $incoming['itemFailed'] : 0 ),
 				'deferred'             => absint( isset( $old['deferred'] ) ? $old['deferred'] : 0 ) + $incoming_deferred,
 				'recentMsPerItem'      => $recent_ms,
 				'ewmaMsPerItem'        => $recent_ms,
