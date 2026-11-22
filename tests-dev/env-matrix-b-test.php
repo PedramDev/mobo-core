@@ -131,6 +131,7 @@ class Mobo_Core_Money_Policy {
 	public static function compatibility_status( $connection_id = 0, $fresh = false ) { return self::$status; }
 }
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-webhook-queue.php';
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-image-integrity.php';
 
 $GLOBALS['__pass'] = 0; $GLOBALS['__fail'] = 0;
 function check( $label, $cond ) {
@@ -189,6 +190,28 @@ Mobo_Core_Money_Policy::$status = array( 'compatible' => false, 'code' => 'money
 check( 'store currency mismatch (admin action) is NOT deferred forever', false === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( $fence ) );
 Mobo_Core_Money_Policy::$status = array( 'compatible' => true, 'code' => 'compatible', 'requiresReprovision' => false );
 check( 'provisioned contract -> not deferred', false === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( $fence ) );
+
+echo "\n[F4] A short/empty STORED copy (disk full during copy or sub-size write) is detected\n";
+$tmpdir = sys_get_temp_dir() . '/envb-f4-' . getmypid();
+@mkdir( $tmpdir );
+$jpeg = "\xFF\xD8\xFF\xE0" . str_repeat( 'A', 6000 ) . "\xFF\xD9";
+file_put_contents( $tmpdir . '/full.jpg', $jpeg );
+file_put_contents( $tmpdir . '/short.jpg', substr( $jpeg, 0, 2400 ) );
+file_put_contents( $tmpdir . '/zero.jpg', '' );
+$webp = 'RIFF' . pack( 'V', 5000 ) . 'WEBPVP8 ' . str_repeat( 'B', 4992 );
+file_put_contents( $tmpdir . '/full.webp', $webp );
+file_put_contents( $tmpdir . '/short.webp', substr( $webp, 0, 2000 ) );
+check( 'complete JPEG -> ok', '' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/full.jpg' ) );
+check( 'JPEG cut at 40% -> jpeg-missing-eoi', 'jpeg-missing-eoi' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/short.jpg' ) );
+check( 'zero-byte stored file -> empty', 'empty' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/zero.jpg' ) );
+check( 'complete WebP -> ok', '' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/full.webp' ) );
+check( 'WebP shorter than its RIFF size -> webp-short-riff', 'webp-short-riff' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/short.webp' ) );
+check( 'missing file (media offload) -> "missing", which the importer ignores', 'missing' === Mobo_Core_Image_Integrity::stored_structure_problem( $tmpdir . '/nope.jpg' ) );
+foreach ( glob( $tmpdir . '/*' ) as $f ) { @unlink( $f ); }
+@rmdir( $tmpdir );
+$sync_src = file_get_contents( dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-image-sync.php' );
+check( 'importer checks the stored attachment before linking it', false !== strpos( $sync_src, '$stored_problem = $this->stored_attachment_problem( $attachment_id );' ) );
+check( '  and reports it with the storage prefix (retry + revival, never a permanent image defect)', 1 === preg_match( '/STORAGE_NOT_READY_PREFIX[^;]*stored copy in uploads is incomplete/s', $sync_src ) );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );

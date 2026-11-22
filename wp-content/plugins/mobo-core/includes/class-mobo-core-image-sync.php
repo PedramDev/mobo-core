@@ -1819,6 +1819,23 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
+		/* Disk/quota full while WordPress copied the verified temp file into uploads
+		 * or wrote its "-scaled" copy / sub-sizes: the stored bytes are short or
+		 * empty although the download was complete. Never link such an attachment;
+		 * report it as a storage condition so it is retried and revived once the
+		 * storage probe passes, never counted as a defect of the image. */
+		$stored_problem = $this->stored_attachment_problem( $attachment_id );
+		if ( '' !== $stored_problem ) {
+			if ( 'attachment' === get_post_type( $attachment_id ) ) {
+				wp_delete_attachment( $attachment_id, true );
+			}
+			$this->set_last_image_error(
+				( class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ? Mobo_Core_Image_Reimport_Ledger::STORAGE_NOT_READY_PREFIX : 'Image storage is not ready:' )
+				. ' stored copy in uploads is incomplete (' . $stored_problem . '); the uploads disk or quota is probably full.'
+			);
+			return 0;
+		}
+
 		/* The sideload API returning an attachment ID is not the final storage commit.
 		 * Verify the physical payload immediately; otherwise a mislabeled/corrupt WebP
 		 * source can create one unusable attachment on every retry. This attachment was
@@ -2275,6 +2292,47 @@ class Mobo_Core_Image_Sync {
 	 * @param string $url Image URL.
 	 * @return bool
 	 */
+	/**
+	 * Structural problem of a freshly sideloaded attachment's STORED files
+	 * (attached file + original_image + every generated size in metadata).
+	 *
+	 * @param int $attachment_id Attachment.
+	 * @return string '' when every stored file is complete, else "<file>:<reason>".
+	 */
+	private function stored_attachment_problem( $attachment_id ) {
+		$attachment_id = absint( $attachment_id );
+		if ( $attachment_id <= 0 || ! class_exists( 'Mobo_Core_Image_Integrity' ) || ! method_exists( 'Mobo_Core_Image_Integrity', 'stored_structure_problem' ) ) {
+			return '';
+		}
+		$file = function_exists( 'get_attached_file' ) ? (string) get_attached_file( $attachment_id, true ) : '';
+		if ( '' === $file ) {
+			return '';
+		}
+		$paths = array( $file );
+		$meta  = function_exists( 'wp_get_attachment_metadata' ) ? wp_get_attachment_metadata( $attachment_id, true ) : array();
+		if ( is_array( $meta ) ) {
+			$dir = dirname( $file );
+			if ( ! empty( $meta['original_image'] ) && is_string( $meta['original_image'] ) ) {
+				$paths[] = $dir . '/' . wp_basename( $meta['original_image'] );
+			}
+			foreach ( ( isset( $meta['sizes'] ) && is_array( $meta['sizes'] ) ? $meta['sizes'] : array() ) as $size ) {
+				if ( is_array( $size ) && ! empty( $size['file'] ) && is_string( $size['file'] ) ) {
+					$paths[] = $dir . '/' . wp_basename( $size['file'] );
+				}
+			}
+		}
+		foreach ( array_unique( $paths ) as $path ) {
+			$problem = Mobo_Core_Image_Integrity::stored_structure_problem( $path );
+			/* A missing local file is not a short write: media-offload/CDN plugins
+			 * delete local copies on purpose. Only bytes that exist and are empty
+			 * or structurally cut off prove a failed write. */
+			if ( '' !== $problem && 'missing' !== $problem && 'unreadable' !== $problem ) {
+				return sanitize_file_name( wp_basename( $path ) ) . ':' . $problem;
+			}
+		}
+		return '';
+	}
+
 	private function is_local_or_private_image_url( $url ) {
 		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
 

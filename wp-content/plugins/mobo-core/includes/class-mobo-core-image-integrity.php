@@ -168,6 +168,42 @@ final class Mobo_Core_Image_Integrity {
 	}
 
 	/**
+	 * Structure-only check of a file WordPress has already STORED in uploads
+	 * (original, "-scaled" copy or a generated sub-size). The downloaded temp
+	 * file passed inspect_file(); a short/empty stored copy therefore means the
+	 * write into uploads failed (disk/quota full, silent short write), not that
+	 * the source image is bad. No decode, no memory budget.
+	 *
+	 * @param string $path Stored file.
+	 * @return string '' when complete, otherwise a short reason code.
+	 */
+	public static function stored_structure_problem( $path ) {
+		$path = (string) $path;
+		if ( '' === $path || ! is_file( $path ) ) {
+			return 'missing';
+		}
+		$size = (int) @filesize( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- concurrent removal tolerated.
+		if ( $size <= 0 ) {
+			return 'empty';
+		}
+		$head   = '';
+		$tail   = '';
+		$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- read-only probe.
+		if ( ! is_resource( $handle ) ) {
+			return 'unreadable';
+		}
+		$head = (string) fread( $handle, 32 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		if ( $size > self::TAIL_BYTES ) {
+			fseek( $handle, -self::TAIL_BYTES, SEEK_END );
+		} else {
+			fseek( $handle, 0 );
+		}
+		$tail = (string) fread( $handle, self::TAIL_BYTES ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		return self::structure_problem( $head, $tail, $size );
+	}
+
+	/**
 	 * Header-only dimensions (no bitmap decode).
 	 *
 	 * @param string $path File.
