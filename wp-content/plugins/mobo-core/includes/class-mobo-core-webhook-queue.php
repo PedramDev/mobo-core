@@ -1255,6 +1255,20 @@ class Mobo_Core_Webhook_Queue {
 					$messages[] = 'Product creation deferred until the Product Map seed completes; no attempt consumed.';
 					continue;
 				}
+				if ( ! empty( $result['data']['awaitingProvisioning'] ) ) {
+					$deferred = $store->mark_pending_progress(
+						$event_id,
+						isset( $item['payload'] ) && is_array( $item['payload'] ) ? $item['payload'] : array(),
+						array( 'deferSeconds' => 300, 'awaitingProvisioning' => true ),
+						$claim_token
+					);
+					if ( ! $deferred ) {
+						$messages[] = 'Provisioning deferral could not be committed; the claim will expire and the event retries.';
+						break;
+					}
+					$messages[] = 'Source monetary contract not provisioned yet; event deferred without consuming an attempt.';
+					continue;
+				}
 				if ( ! empty( $result['data']['ownerUnavailable'] ) ) {
 					$deferred = $store->mark_pending_progress(
 						$event_id,
@@ -1600,6 +1614,30 @@ class Mobo_Core_Webhook_Queue {
 	 * @param int|null $payload_timeout Optional payload pull timeout.
 	 * @return array
 	 */
+	/**
+	 * Pure-ish: is this processor exception only the "monetary contract not yet
+	 * provisioned" fence of a freshly upgraded installation? Both the message and
+	 * the live contract status must agree, so a genuinely invalid payload or a
+	 * store-currency mismatch (admin action) still fails normally.
+	 *
+	 * @param Throwable $throwable Processor exception.
+	 * @return bool
+	 */
+	public static function is_awaiting_money_provisioning( $throwable ) {
+		if ( ! $throwable instanceof Throwable || ! class_exists( 'Mobo_Core_Money_Policy' ) ) {
+			return false;
+		}
+		if ( false === stripos( (string) $throwable->getMessage(), 'monetary contract is missing' ) ) {
+			return false;
+		}
+		try {
+			$status = Mobo_Core_Money_Policy::compatibility_status( 0, true );
+		} catch ( Throwable $e ) {
+			return false;
+		}
+		return is_array( $status ) && ! empty( $status['requiresReprovision'] );
+	}
+
 	private function process_item_safely_scoped( $item, $payload_timeout = null ) {
 		try {
 			$result = $this->process_item( $item, $payload_timeout );
@@ -1610,6 +1648,17 @@ class Mobo_Core_Webhook_Queue {
 				'data'    => array( 'creationDeferred' => true ),
 			);
 		} catch ( Throwable $throwable ) {
+			/* Upgrade window: a 10.33.x installation migrated to 10.34.x has no
+			 * Source monetary contract until the Backend's signed provisioning
+			 * arrives. Price-bearing events must wait for it, not burn their
+			 * attempts and end as terminal failures (lost price/stock updates). */
+			if ( self::is_awaiting_money_provisioning( $throwable ) ) {
+				return array(
+					'success' => false,
+					'message' => 'Source monetary contract is not provisioned yet; event deferred until signed Connection provisioning.',
+					'data'    => array( 'awaitingProvisioning' => true ),
+				);
+			}
 			/* Throwable messages can embed signed URLs, X-SEC or an absolute path;
 			 * neither the queue's last_error nor Logger may retain them. */
 			$message = 'Unhandled webhook processor exception (' . sanitize_key( get_class( $throwable ) ) . ').';

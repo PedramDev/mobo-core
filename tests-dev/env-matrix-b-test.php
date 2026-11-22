@@ -125,6 +125,12 @@ require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-migration.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-clone-guard.php';
 require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-health-read-cache.php';
+/* Money policy stub (F3): only the live contract status matters. */
+class Mobo_Core_Money_Policy {
+	public static $status = array();
+	public static function compatibility_status( $connection_id = 0, $fresh = false ) { return self::$status; }
+}
+require dirname( __DIR__ ) . '/wp-content/plugins/mobo-core/includes/class-mobo-core-webhook-queue.php';
 
 $GLOBALS['__pass'] = 0; $GLOBALS['__fail'] = 0;
 function check( $label, $cond ) {
@@ -173,6 +179,16 @@ check( 'clone: the copied original snapshot (other siteUrl, cloneSuspected=false
 check( 'clone: right URL but stale clone verdict is refused', false === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://staging.shop.example/', false ) ) );
 check( 'clone: its own fresh snapshot is served', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( $snap( 'https://staging.shop.example/', true ) ) );
 check( 'legacy snapshot without siteUrl/cloneSuspected fields is accepted unchanged', true === Mobo_Core_Health_Read_Cache::snapshot_matches_current_site( array( 'generatedAt' => time(), 'body' => array( 'data' => array( 'x' => 1 ) ) ) ) );
+
+echo "\n[F3] Upgraded-but-not-yet-provisioned site defers price events instead of failing them\n";
+$fence = new RuntimeException( 'Source monetary contract is missing or unsupported; signed Connection provisioning must refresh it.' );
+Mobo_Core_Money_Policy::$status = array( 'compatible' => false, 'code' => 'money_contract_missing', 'requiresReprovision' => true );
+check( 'missing contract (awaiting provisioning) -> deferred, no attempt consumed', true === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( $fence ) );
+check( 'other RuntimeException while unprovisioned -> normal failure path', false === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( new RuntimeException( 'Product payload integrity failed.' ) ) );
+Mobo_Core_Money_Policy::$status = array( 'compatible' => false, 'code' => 'money_unit_mismatch', 'requiresReprovision' => false );
+check( 'store currency mismatch (admin action) is NOT deferred forever', false === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( $fence ) );
+Mobo_Core_Money_Policy::$status = array( 'compatible' => true, 'code' => 'compatible', 'requiresReprovision' => false );
+check( 'provisioned contract -> not deferred', false === Mobo_Core_Webhook_Queue::is_awaiting_money_provisioning( $fence ) );
 
 echo "\n" . $GLOBALS['__pass'] . ' passed, ' . $GLOBALS['__fail'] . " failed\n";
 exit( $GLOBALS['__fail'] > 0 ? 1 : 0 );
