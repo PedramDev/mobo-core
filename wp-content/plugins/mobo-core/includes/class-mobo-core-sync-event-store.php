@@ -805,10 +805,17 @@ class Mobo_Core_Sync_Event_Store {
 			return $out;
 		}
 
-		$ignored = array( 'syncid', 'eventid', 'event_id', 'webhookid', 'webhook_id', 'sourcerevision', 'revision', 'eventversion', '_moboeventversion', 'version', 'entityversion' );
+		$ignored = array( 'syncid', 'eventid', 'event_id', 'webhookid', 'webhook_id', 'sourcerevision', 'revision', 'eventversion', '_moboeventversion', 'version', 'entityversion', 'entityguid' );
 		$out     = array();
 		foreach ( $value as $key => $item ) {
-			if ( in_array( strtolower( (string) $key ), $ignored, true ) ) {
+			$lower = strtolower( (string) $key );
+			/* envA T15: '_mobo*' keys (_moboWebhookForegroundContext, _moboQueueEventUuid,
+			 * ...) and entityGuid (rehydrated from the row's entity_guid column) are
+			 * added by this plugin while processing and persisted with a partially or
+			 * fully processed row. Comparing them made an identical re-delivery of the
+			 * same revision (Backend retry with a new event id) fail as an "ordering
+			 * conflict" instead of being recognised as a replay. */
+			if ( in_array( $lower, $ignored, true ) || 0 === strpos( $lower, '_mobo' ) ) {
 				continue;
 			}
 			$out[ $key ] = $this->canonicalize_event_payload_for_compare( $item );
