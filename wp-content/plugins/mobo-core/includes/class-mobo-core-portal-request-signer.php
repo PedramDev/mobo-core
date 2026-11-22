@@ -93,6 +93,11 @@ final class Mobo_Core_Portal_Request_Signer {
 		$headers['X-Mobo-Nonce']              = $nonce;
 		$headers['X-Mobo-Content-SHA256']     = $body_hash;
 		$headers['X-Mobo-Signature']          = $signature;
+		/* S1 hint for the Backend (unsigned, advisory): this installation's address
+		 * differs from the provisioned one, so it may be a clone of the licensed site. */
+		if ( class_exists( 'Mobo_Core_Clone_Guard' ) && Mobo_Core_Clone_Guard::is_clone_suspected() ) {
+			$headers['X-Mobo-Clone-Suspected'] = '1';
+		}
 
 		return $headers;
 	}
@@ -142,6 +147,9 @@ final class Mobo_Core_Portal_Request_Signer {
 			'publicKeyPem' => $identity['publicKey'],
 			'challenge' => $challenge,
 			'signature' => $signature,
+			/* S1: lets the Backend refuse to treat a clone as the original installation. */
+			'cloneSuspected' => class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::is_clone_suspected() : false,
+			'boundSite' => class_exists( 'Mobo_Core_Clone_Guard' ) ? (string) Mobo_Core_Clone_Guard::health_payload()['boundHome'] : '',
 		);
 	}
 

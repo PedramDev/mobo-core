@@ -27,6 +27,8 @@ class Mobo_Core_Image_Sync {
 	const FRESH_REIMPORT_ATTEMPT = 3;
 	/** Distinctive prefix of a readiness (WebP/subsize) failure message. */
 	const READINESS_FAILURE_PREFIX = 'Image file exists but final WebP/subsize validation failed:';
+	/** Seconds between storage-recovery revival probes (M5). */
+	const STORAGE_REVIVAL_INTERVAL = 600;
 
 	/**
 	 * Last image resolution error for queue diagnostics.
@@ -34,6 +36,9 @@ class Mobo_Core_Image_Sync {
 	 * @var string
 	 */
 	private $last_image_error = '';
+
+	/** @var string Integrity/decode-budget refusal recorded by the sideload guard. */
+	private $sideload_integrity_error = '';
 
 	/**
 	 * Request-local attachment resolution cache.
@@ -329,6 +334,10 @@ class Mobo_Core_Image_Sync {
 				? $queue->terminalize_due_missing_products( max( 25, min( 100, $limit * 20 ) ) )
 				: 0;
 
+			/* M5: once storage is healthy again, expedite rows that were only
+			 * waiting for disk/quota and revive (bounded) terminal readiness rows. */
+			$revived = $this->maybe_revive_storage_blocked_images( $queue );
+
 			/*
 			 * Claim the selected rows before any row-level validation. In particular,
 			 * missing/deleted products and malformed source identities are terminally
@@ -344,12 +353,38 @@ class Mobo_Core_Image_Sync {
 			$result = $this->process_queue_rows( $queue, $rows, $limit );
 			if ( is_array( $result ) ) {
 				$result['terminalized'] = absint( $terminalized );
+				$result['revived']      = absint( $revived );
 				$result['convergedImageHashes'] = $this->promote_pending_image_hashes( $queue, min( 10, max( 1, $limit ) ) );
 			}
 			return $result;
 		} finally {
 			Mobo_Core_Lock::release( 'image_queue_worker', $worker_lock );
 		}
+	}
+
+	/**
+	 * M5: after a storage outage, give storage-blocked images their turn back.
+	 *
+	 * Throttled to one probe per REVIVAL_INTERVAL. Only runs when the storage
+	 * probe passes, so it never churns while the disk is still full.
+	 *
+	 * @param Mobo_Core_Image_Queue $queue Queue.
+	 * @return int Rows expedited or revived.
+	 */
+	private function maybe_revive_storage_blocked_images( $queue ) {
+		if ( ! is_object( $queue ) || ! method_exists( $queue, 'revive_storage_blocked' ) || ! class_exists( 'Mobo_Core_Image_Storage' ) ) {
+			return 0;
+		}
+		$last = absint( get_option( 'mobo_core_image_storage_revival_at', 0 ) );
+		if ( $last > 0 && ( time() - $last ) < self::STORAGE_REVIVAL_INTERVAL ) {
+			return 0;
+		}
+		update_option( 'mobo_core_image_storage_revival_at', time(), false );
+		$storage = Mobo_Core_Image_Storage::check();
+		if ( empty( $storage['ready'] ) ) {
+			return 0;
+		}
+		return absint( $queue->revive_storage_blocked( 100 ) );
 	}
 
 	/**
@@ -1311,6 +1346,11 @@ class Mobo_Core_Image_Sync {
 						$deferred++;
 						continue;
 					}
+					/* M5: a successful import closes the identity's readiness history;
+					 * a later failure (new host problem) starts from a clean budget. */
+					if ( class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+						Mobo_Core_Image_Reimport_Ledger::forget( Mobo_Core_Image_Reimport_Ledger::key( $this->ledger_connection_id(), $image_guid, $url ) );
+					}
 					$touched[ $product_id ] = true;
 					if ( ! isset( $link_rows[ $product_id ] ) ) {
 						$link_rows[ $product_id ] = array();
@@ -1353,6 +1393,11 @@ class Mobo_Core_Image_Sync {
 				 * failure. Count it as deferred so Runtime Diagnostics/Circuit Breaker
 				 * do not isolate the image stage while it is correctly waiting.
 				 */
+				/* An image that can never be decoded within memory_limit is terminal
+				 * (bounded re-check after 7 days or with a new source file). */
+				if ( ! $terminal_readiness && class_exists( 'Mobo_Core_Image_Integrity' ) && 0 === strpos( $message, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX ) ) {
+					$terminal_readiness = true;
+				}
 				$failure_committed = method_exists( $queue, 'mark_failure_if_current' )
 					? $queue->mark_failure_if_current( $id, $message, $try_count, $product_id, $image_guid, $url, $terminal_readiness, $claim_token )
 					: true;
@@ -1494,6 +1539,16 @@ class Mobo_Core_Image_Sync {
 	 *
 	 * @return string
 	 */
+	/**
+	 * Reason of the last failed import (download guard, storage, sideload) for
+	 * callers such as the image refresh service.
+	 *
+	 * @return string
+	 */
+	public function last_import_error() {
+		return $this->get_last_image_error();
+	}
+
 	private function get_last_image_error() {
 		return sanitize_text_field( (string) $this->last_image_error );
 	}
@@ -1721,9 +1776,11 @@ class Mobo_Core_Image_Sync {
 			if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
 				Mobo_Core_Image_Size_Policy::begin_sideload();
 			}
+			$integrity_guard = $this->register_sideload_integrity_guard( true );
 			try {
 				$attachment_id = media_sideload_image( $request_url, $product_id, null, 'id' );
 			} finally {
+				$this->unregister_sideload_integrity_guard( $integrity_guard );
 				if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
 					Mobo_Core_Image_Size_Policy::end_sideload();
 				}
@@ -1734,6 +1791,12 @@ class Mobo_Core_Image_Sync {
 			if ( is_wp_error( $attachment_id ) ) {
 				$error_message = 'wp_media_' . substr( sanitize_key( (string) $attachment_id->get_error_code() ), 0, 64 );
 				$this->set_last_image_error( 'WordPress image sideload failed: ' . $error_message );
+				if ( '' !== $this->sideload_integrity_error ) {
+					/* Truncated/corrupt download or an image too large to decode:
+					 * report the real reason (it drives retry vs terminal). */
+					$this->set_last_image_error( $this->sideload_integrity_error );
+					return 0;
+				}
 
 				if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 					Mobo_Core_Logger::error( 'Mobo Core image sideload failed, trying unsafe-local fallback: ' . $error_message );
@@ -1987,6 +2050,20 @@ class Mobo_Core_Image_Sync {
 			return 0;
 		}
 
+		/* Truncated body with an intact header (dropped connection): compare the
+		 * declared Content-Length and the format's end marker before WordPress
+		 * creates an attachment and thumbnails from half an image. */
+		if ( class_exists( 'Mobo_Core_Image_Integrity' ) ) {
+			$encoding = strtolower( trim( (string) wp_remote_retrieve_header( $response, 'content-encoding' ) ) );
+			$declared = ( '' === $encoding || 'identity' === $encoding ) ? wp_remote_retrieve_header( $response, 'content-length' ) : '';
+			$problem  = Mobo_Core_Image_Integrity::inspect_file( $tmp_file, $declared );
+			if ( '' !== $problem ) {
+				wp_delete_file( $tmp_file );
+				$this->set_last_image_error( $problem );
+				return 0;
+			}
+		}
+
 		$file = array(
 			'name'     => $file_name,
 			'tmp_name' => $tmp_file,
@@ -2003,9 +2080,11 @@ class Mobo_Core_Image_Sync {
 		if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
 			Mobo_Core_Image_Size_Policy::begin_sideload();
 		}
+		$integrity_guard = $this->register_sideload_integrity_guard( false );
 		try {
 			$attachment_id = media_handle_sideload( $file, $product_id );
 		} finally {
+			$this->unregister_sideload_integrity_guard( $integrity_guard );
 			if ( class_exists( 'Mobo_Core_Image_Size_Policy' ) ) {
 				Mobo_Core_Image_Size_Policy::end_sideload();
 			}
@@ -2016,7 +2095,7 @@ class Mobo_Core_Image_Sync {
 		if ( is_wp_error( $attachment_id ) ) {
 			wp_delete_file( $tmp_file );
 			$error_message = 'wp_media_' . substr( sanitize_key( (string) $attachment_id->get_error_code() ), 0, 64 );
-			$this->set_last_image_error( 'WordPress media import failed: ' . $error_message );
+			$this->set_last_image_error( '' !== $this->sideload_integrity_error ? $this->sideload_integrity_error : 'WordPress media import failed: ' . $error_message );
 
 			if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
 				Mobo_Core_Logger::error( 'Mobo Core image fallback sideload failed: ' . $error_message );
@@ -2029,6 +2108,79 @@ class Mobo_Core_Image_Sync {
 		 * physical validation. The add_attachment bootstrap above leaves this row
 		 * marked incomplete if PHP stops before that final gate. */
 		return absint( $attachment_id );
+	}
+
+	/**
+	 * Install the per-sideload integrity guard.
+	 *
+	 * - http_response (download_url() streams into a temp file): a body shorter
+	 *   or longer than its Content-Length is turned into a WP_Error, so WordPress
+	 *   deletes the temp file instead of importing half an image.
+	 * - wp_handle_sideload_prefilter: before WordPress moves the file and builds
+	 *   thumbnails, the format end marker and the decode memory budget are
+	 *   checked without decoding the bitmap.
+	 *
+	 * @param bool $watch_http Also verify streamed HTTP bodies.
+	 * @return array Registered callbacks.
+	 */
+	private function register_sideload_integrity_guard( $watch_http ) {
+		$this->sideload_integrity_error = '';
+		if ( ! class_exists( 'Mobo_Core_Image_Integrity' ) ) {
+			return array();
+		}
+		$guard = array();
+		if ( $watch_http ) {
+			$guard['http_response'] = function ( $response, $args, $url ) {
+				unset( $url );
+				if ( is_wp_error( $response ) || ! is_array( $args ) || empty( $args['stream'] ) || empty( $args['filename'] ) ) {
+					return $response;
+				}
+				$code = absint( wp_remote_retrieve_response_code( $response ) );
+				if ( $code < 200 || $code >= 300 ) {
+					return $response;
+				}
+				$encoding = strtolower( trim( (string) wp_remote_retrieve_header( $response, 'content-encoding' ) ) );
+				if ( '' !== $encoding && 'identity' !== $encoding ) {
+					return $response;
+				}
+				$declared = wp_remote_retrieve_header( $response, 'content-length' );
+				$size     = is_file( (string) $args['filename'] ) ? (int) @filesize( (string) $args['filename'] ) : 0; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- concurrent removal tolerated.
+				if ( ! Mobo_Core_Image_Integrity::length_matches( $declared, $size ) ) {
+					$this->sideload_integrity_error = Mobo_Core_Image_Integrity::TRUNCATED_PREFIX . ' content-length-mismatch (' . absint( is_array( $declared ) ? end( $declared ) : $declared ) . ' declared, ' . $size . ' received)';
+					return new WP_Error( 'mobo_image_truncated', $this->sideload_integrity_error );
+				}
+				return $response;
+			};
+			add_filter( 'http_response', $guard['http_response'], 10, 3 );
+		}
+		$guard['wp_handle_sideload_prefilter'] = function ( $file ) {
+			if ( ! is_array( $file ) || empty( $file['tmp_name'] ) || ! empty( $file['error'] ) ) {
+				return $file;
+			}
+			$problem = Mobo_Core_Image_Integrity::inspect_file( (string) $file['tmp_name'], '' );
+			if ( '' !== $problem ) {
+				if ( 0 === strpos( $problem, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX ) && class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+					/* Re-enqueue must not download it again on every product sync;
+					 * revived by a new source file or the bounded 7-day re-check. */
+					$problem .= ' [' . Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER . ']';
+				}
+				$this->sideload_integrity_error = $problem;
+				$file['error'] = $problem;
+			}
+			return $file;
+		};
+		add_filter( 'wp_handle_sideload_prefilter', $guard['wp_handle_sideload_prefilter'], 5, 1 );
+		return $guard;
+	}
+
+	/**
+	 * @param array $guard Callbacks from register_sideload_integrity_guard().
+	 * @return void
+	 */
+	private function unregister_sideload_integrity_guard( $guard ) {
+		foreach ( is_array( $guard ) ? $guard : array() as $hook => $callback ) {
+			remove_filter( $hook, $callback, 'http_response' === $hook ? 10 : 5 );
+		}
 	}
 
 	/**
@@ -2257,12 +2409,54 @@ class Mobo_Core_Image_Sync {
 
 		$result = $refresh->ensure_webp_attachment_ready( $attachment_id );
 		if ( empty( $result['success'] ) ) {
-			$this->set_last_image_error( 'Image file exists but final WebP/subsize validation failed: ' . sanitize_text_field( isset( $result['message'] ) ? (string) $result['message'] : 'Unknown readiness error.' ) );
+			$readiness_message = sanitize_text_field( isset( $result['message'] ) ? (string) $result['message'] : 'Unknown readiness error.' );
+			/* M5: a full disk / exhausted quota while WordPress writes subsizes is a
+			 * property of the host at this moment, not of the image. Report it with
+			 * the storage prefix so it is never counted in the durable readiness
+			 * ledger, never triggers a fresh reimport and never becomes terminal.
+			 * A generic editor failure is re-probed: if storage is not ready right
+			 * after the failure, the write most likely failed for lack of space. */
+			if ( is_array( $result ) && isset( $result['code'] ) && 'too_large' === (string) $result['code'] && class_exists( 'Mobo_Core_Image_Integrity' ) ) {
+				/* Terminal like a too-large download (bounded 7-day re-check). */
+				$message = 0 === strpos( $readiness_message, Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX ) ? $readiness_message : Mobo_Core_Image_Integrity::TOO_LARGE_PREFIX . ' ' . $readiness_message;
+				$this->set_last_image_error( $message . ( class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ? ' [' . Mobo_Core_Image_Reimport_Ledger::TERMINAL_MARKER . ']' : '' ) );
+				return false;
+			}
+			if ( $this->is_storage_transient_readiness_failure( $result, $readiness_message ) ) {
+				$this->set_last_image_error( Mobo_Core_Image_Reimport_Ledger::STORAGE_NOT_READY_PREFIX . ' ' . $readiness_message );
+				return false;
+			}
+			$this->set_last_image_error( 'Image file exists but final WebP/subsize validation failed: ' . $readiness_message );
 			return false;
 		}
 
 		$this->attachment_readiness_cache[ $cache_key ] = true;
 		return true;
+	}
+
+	/**
+	 * Whether a failed readiness result was caused by temporary storage/quota
+	 * exhaustion (M5).
+	 *
+	 * @param array  $result Readiness result.
+	 * @param string $message Sanitized message.
+	 * @return bool
+	 */
+	private function is_storage_transient_readiness_failure( $result, $message ) {
+		if ( ! class_exists( 'Mobo_Core_Image_Reimport_Ledger' ) ) {
+			return false;
+		}
+		if ( is_array( $result ) && isset( $result['code'] ) && 'storage_not_ready' === (string) $result['code'] ) {
+			return true;
+		}
+		if ( Mobo_Core_Image_Reimport_Ledger::is_storage_transient_message( $message ) ) {
+			return true;
+		}
+		if ( class_exists( 'Mobo_Core_Image_Storage' ) ) {
+			$storage = Mobo_Core_Image_Storage::check();
+			return empty( $storage['ready'] );
+		}
+		return false;
 	}
 
 	private function mark_attachment_synced( $attachment_id, $image_guid, $url ) {

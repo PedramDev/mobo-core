@@ -87,7 +87,7 @@ class Mobo_Core_Iran_Date {
 		if ( is_numeric( $value ) ) {
 			return self::format( $format, absint( $value ) );
 		}
-		$timestamp = strtotime( (string) $value );
+		$timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( (string) $value ) : strtotime( (string) $value ) );
 		return false === $timestamp ? '—' : self::format( $format, $timestamp );
 	}
 

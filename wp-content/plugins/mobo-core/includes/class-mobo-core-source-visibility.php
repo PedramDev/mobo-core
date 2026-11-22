@@ -45,6 +45,10 @@ final class Mobo_Core_Source_Visibility {
 	const META_NATURAL_QTY     = '_mobo_source_natural_stock_qty';
 	const META_NATURAL_STATUS  = '_mobo_source_natural_stock_status';
 
+	/* M8: a quarantined non-canonical duplicate copy (see Mobo_Core_Quarantine_Sale_Guard)
+	 * reuses the same storefront guards and persisted out-of-stock overlay. */
+	const META_QUARANTINE_BLOCKED = '_mobo_quarantine_sale_blocked';
+
 	/** @var bool */
 	private static $initialized = false;
 
@@ -328,7 +332,8 @@ final class Mobo_Core_Source_Visibility {
 		$changed  = false;
 		$variable = $include_children && method_exists( $product, 'is_type' ) && $product->is_type( 'variable' );
 		if ( $variable && method_exists( $product, 'get_children' ) ) {
-			$parent_hidden = '1' === (string) get_post_meta( $post_id, self::META_HIDDEN, true );
+			$parent_hidden = '1' === (string) get_post_meta( $post_id, self::META_HIDDEN, true )
+				|| '1' === (string) get_post_meta( $post_id, self::META_QUARANTINE_BLOCKED, true );
 			foreach ( (array) $product->get_children() as $child_id ) {
 				$child_id = absint( $child_id );
 				if ( $child_id <= 0 ) {
@@ -517,11 +522,13 @@ final class Mobo_Core_Source_Visibility {
 		if ( $id <= 0 ) {
 			return false;
 		}
-		if ( '1' === (string) $product->get_meta( self::META_HIDDEN, true, 'edit' ) || '1' === (string) $product->get_meta( self::META_INACTIVE, true, 'edit' ) ) {
+		if ( '1' === (string) $product->get_meta( self::META_HIDDEN, true, 'edit' ) || '1' === (string) $product->get_meta( self::META_INACTIVE, true, 'edit' )
+			|| '1' === (string) $product->get_meta( self::META_QUARANTINE_BLOCKED, true, 'edit' ) ) {
 			return true;
 		}
 		$parent_id = method_exists( $product, 'get_parent_id' ) ? absint( $product->get_parent_id( 'edit' ) ) : 0;
-		return $parent_id > 0 && '1' === (string) get_post_meta( $parent_id, self::META_HIDDEN, true );
+		return $parent_id > 0 && ( '1' === (string) get_post_meta( $parent_id, self::META_HIDDEN, true )
+			|| '1' === (string) get_post_meta( $parent_id, self::META_QUARANTINE_BLOCKED, true ) );
 	}
 
 	/** @return bool */

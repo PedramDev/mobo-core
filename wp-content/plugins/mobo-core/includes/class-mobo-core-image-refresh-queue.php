@@ -23,6 +23,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 class Mobo_Core_Image_Refresh_Queue {
 
+	/** @var bool The last transition's write failed (see last_write_failed()). */
+	private $write_failed = false;
+
 	/**
 	 * Return table name.
 	 *
@@ -96,6 +99,9 @@ class Mobo_Core_Image_Refresh_Queue {
 		global $wpdb;
 
 		$table = self::table_name();
+		if ( class_exists( 'Mobo_Core_Table_Cache' ) ) {
+			return Mobo_Core_Table_Cache::exists( $table );
+		}
 
 		return $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
 	}
@@ -420,6 +426,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$now   = current_time( 'mysql', true );
 		$until = gmdate( 'Y-m-d H:i:s', time() + max( 30, absint( $ttl ) ) );
 		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'processing', locked_until = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND (status = 'pending' OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until < %s))", $until, $now, $connection_id, $id, $now ) );
+		$this->write_failed = false === $updated;
 		if ( 1 !== absint( $updated ) ) { return ''; }
 		$persisted = sanitize_text_field( (string) $wpdb->get_var( $wpdb->prepare( "SELECT locked_until FROM {$table} WHERE connection_id = %d AND id = %d AND status = 'processing' LIMIT 1", $connection_id, $id ) ) );
 		return ( '' !== $persisted && hash_equals( $until, $persisted ) ) ? $persisted : '';
@@ -447,6 +454,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$args = array( $try_count, current_time( 'mysql', true ), $connection_id, $id, $try_count, $product_id, $image_guid, $old_attachment_id, $new_source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
 		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET try_count = %d, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND try_count < %d AND product_id = %d AND image_guid = %s AND old_attachment_id = %d AND BINARY new_source_url = BINARY %s{$lease_sql}", $args ) );
+		$this->write_failed = false === $updated;
 		return 1 === absint( $updated );
 	}
 
@@ -521,6 +529,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$args = array( current_time( 'mysql', true ), $connection_id, $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
 		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'pending', locked_until = NULL, next_retry_at = NULL, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND NOT (product_id = %d AND image_guid = %s AND old_attachment_id = %d AND BINARY new_source_url = BINARY %s){$lease_sql}", $args ) );
+		$this->write_failed = false === $updated;
 		return 1 === absint( $updated );
 	}
 
@@ -540,6 +549,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$args = array( $new_attachment_id, sanitize_text_field( (string) $note ), current_time( 'mysql', true ), $connection_id, $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
 		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'done', new_attachment_id = %d, next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND old_attachment_id = %d AND BINARY new_source_url = BINARY %s{$lease_sql}", $args ) );
+		$this->write_failed = false === $updated;
 		return 1 === absint( $updated );
 	}
 
@@ -642,6 +652,7 @@ class Mobo_Core_Image_Refresh_Queue {
 			$sql = "UPDATE {$table} SET status = %s, try_count = %d, next_retry_at = %s, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND old_attachment_id = %d AND BINARY new_source_url = BINARY %s{$lease_sql}";
 		}
 		$updated = $wpdb->query( $wpdb->prepare( $sql, $args ) );
+		$this->write_failed = false === $updated;
 		return 1 === absint( $updated );
 	}
 
@@ -665,6 +676,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$args = array( sanitize_text_field( (string) $message ), current_time( 'mysql', true ), $connection_id, $id, $product_id, $image_guid, $old_attachment_id, $new_source_url );
 		if ( '' !== $claim_token ) { $args[] = $claim_token; }
 		$updated = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'skipped', next_retry_at = NULL, locked_until = NULL, last_error = %s, updated_at = %s WHERE connection_id = %d AND id = %d AND status = 'processing' AND product_id = %d AND image_guid = %s AND old_attachment_id = %d AND BINARY new_source_url = BINARY %s{$lease_sql}", $args ) );
+		$this->write_failed = false === $updated;
 		return 1 === absint( $updated );
 	}
 
@@ -887,7 +899,7 @@ class Mobo_Core_Image_Refresh_Queue {
 		$id = absint( $id );
 
 		if ( $connection_id <= 0 || $id <= 0 || ! self::table_exists() ) {
-			return;
+			return false;
 		}
 
 		$data = array_merge(
@@ -908,7 +920,20 @@ class Mobo_Core_Image_Refresh_Queue {
 			}
 		}
 
-		$wpdb->update( self::table_name(), $data, array( 'id' => $id, 'connection_id' => $connection_id ), $formats, array( '%d', '%d' ) );
+		$updated            = $wpdb->update( self::table_name(), $data, array( 'id' => $id, 'connection_id' => $connection_id ), $formats, array( '%d', '%d' ) );
+		$this->write_failed = false === $updated;
+		return false !== $updated;
+	}
+
+	/**
+	 * Whether the last queue transition failed to write (disk full, DB error) as
+	 * opposed to matching no row (superseded / lease lost). Workers stop the
+	 * batch instead of treating the row as superseded and continuing.
+	 *
+	 * @return bool
+	 */
+	public function last_write_failed() {
+		return $this->write_failed;
 	}
 
 	/**

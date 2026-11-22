@@ -172,6 +172,97 @@ final class Mobo_Core_Request_Deadline {
 	}
 
 	/**
+	 * Real-cron runner lock TTL: like the dispatcher lease (limit + 15 s within
+	 * [45, 90]), but never shorter than the slice budget + 15 s so a healthy slice
+	 * between two heartbeats can not lose its lock.
+	 *
+	 * @param int   $budget_seconds Effective runner budget.
+	 * @param mixed $raw_limit      Raw max_execution_time; null reads ini.
+	 * @return int
+	 */
+	public static function runner_lock_ttl( $budget_seconds = 0, $raw_limit = null ) {
+		return (int) min( self::LEASE_MAX_SECONDS, max( self::lease_ttl( $raw_limit ), absint( $budget_seconds ) + self::LEASE_MARGIN_SECONDS ) );
+	}
+
+	/**
+	 * Whether memory usage passed a share of the PHP memory limit (default 75 %).
+	 * Disabled-function safe: unknown usage or limit never stops work.
+	 *
+	 * @param float    $ratio Share of the limit.
+	 * @param int|null $usage Optional usage in bytes (tests).
+	 * @param mixed    $limit Optional raw memory_limit (tests).
+	 * @return bool
+	 */
+	public static function memory_pressure( $ratio = 0.75, $usage = null, $limit = null ) {
+		if ( null === $usage ) {
+			$usage = class_exists( 'Mobo_Core_Environment', false ) ? Mobo_Core_Environment::memory_usage( true ) : ( function_exists( 'memory_get_usage' ) ? memory_get_usage( true ) : 0 );
+		}
+		if ( null === $limit ) {
+			$limit = class_exists( 'Mobo_Core_Environment', false ) ? Mobo_Core_Environment::ini( 'memory_limit', '' ) : ini_get( 'memory_limit' );
+		}
+		$bytes = self::parse_bytes( $limit );
+		if ( $bytes <= 0 || absint( $usage ) <= 0 ) {
+			return false;
+		}
+		return absint( $usage ) >= (int) floor( $bytes * max( 0.1, min( 0.99, (float) $ratio ) ) );
+	}
+
+	/**
+	 * Free request-local caches (memory pressure only): Mobo's row cache, the
+	 * WordPress runtime object cache (only when no persistent object cache is in
+	 * use, so a shared Redis/Memcached is never wiped) and PHP cycles.
+	 *
+	 * @return void
+	 */
+	public static function release_request_memory() {
+		if ( class_exists( 'Mobo_Core_Storage_Row_Cache', false ) ) {
+			Mobo_Core_Storage_Row_Cache::flush_all();
+		}
+		$external = function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache();
+		if ( ! $external && function_exists( 'wp_cache_flush_runtime' ) ) {
+			wp_cache_flush_runtime();
+		}
+		if ( function_exists( 'gc_collect_cycles' ) ) {
+			gc_collect_cycles();
+		}
+	}
+
+	/**
+	 * Memory guard for long per-item loops: at >= $soft of memory_limit release the
+	 * request caches once; report true (stop now) only if still >= $hard afterwards.
+	 *
+	 * @param float $soft Share that triggers a cache release.
+	 * @param float $hard Share that stops the loop.
+	 * @return bool True when the caller must stop.
+	 */
+	public static function memory_guard( $soft = 0.6, $hard = 0.75 ) {
+		if ( ! self::memory_pressure( $soft ) ) {
+			return false;
+		}
+		self::release_request_memory();
+		return self::memory_pressure( $hard );
+	}
+
+	/**
+	 * php.ini shorthand bytes ("256M") to bytes; -1/empty/unparseable => 0 (unlimited/unknown).
+	 *
+	 * @param mixed $value Raw value.
+	 * @return int
+	 */
+	public static function parse_bytes( $value ) {
+		$value = trim( (string) $value );
+		if ( '' === $value || '-1' === $value || ! preg_match( '/^(\d+)\s*([kmg]?)b?$/i', $value, $m ) ) {
+			return 0;
+		}
+		$n    = (int) $m[1];
+		$unit = strtolower( $m[2] );
+		if ( 'g' === $unit ) { return $n * 1073741824; }
+		if ( 'm' === $unit ) { return $n * 1048576; }
+		if ( 'k' === $unit ) { return $n * 1024; }
+		return $n;
+	}
+
+	/**
 	 * What an ordinary (non mobo-cron.php) request may do about an unstamped
 	 * database during plugins_loaded. Storefront/admin/REST page loads never run the
 	 * heavy pipeline: 'nudge' only wakes the background runner; the budgeted worker

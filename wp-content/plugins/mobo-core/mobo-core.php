@@ -159,6 +159,10 @@ Mobo_Core_Autoloader::register();
  * REST route), so ordinary storefront requests stay lean.
  */
 require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-environment.php';
+/* Lease guard first: it must run before WooCommerce's shutdown logger, which can
+ * fatal again after a memory-limit fatal and stop all later shutdown callbacks. */
+require_once MOBO_CORE_PLUGIN_DIR . 'includes/class-mobo-core-shutdown-guard.php';
+Mobo_Core_Shutdown_Guard::register();
 Mobo_Core_Environment::on_shutdown( 'mobo_core_diagnostics_shutdown' );
 add_filter( 'rest_request_after_callbacks', 'mobo_core_diagnostics_rest_observer', 999, 3 );
 
@@ -539,6 +543,28 @@ add_action( 'update_option_woocommerce_currency', array( 'Mobo_Core_Store_Curren
 add_action( 'admin_notices', array( 'Mobo_Core_Store_Currency_Guard', 'render_notice' ) );
 add_action( 'admin_post_mobo_core_dismiss_currency_change', array( 'Mobo_Core_Store_Currency_Guard', 'handle_dismiss' ) );
 
+/* M8: quarantined non-canonical duplicate copies must not sell with a frozen price.
+ * The hot hooks stay tiny; the guard class loads only on a real quarantine change
+ * or a product trash/draft transition. */
+function mobo_core_quarantine_sale_guard_option_changed( $option ) {
+	if ( 0 === strpos( (string) $option, 'mobo_core_migration_quarantine_v1' ) ) {
+		Mobo_Core_Quarantine_Sale_Guard::schedule_reconcile();
+	}
+}
+add_action( 'added_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+add_action( 'updated_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+add_action( 'deleted_option', 'mobo_core_quarantine_sale_guard_option_changed', 10, 1 );
+function mobo_core_quarantine_sale_guard_transition( $new_status, $old_status, $post ) {
+	if ( $new_status === $old_status || ( 'trash' !== $new_status && 'draft' !== $new_status ) || ! is_object( $post ) || 'product' !== ( $post->post_type ?? '' ) ) {
+		return;
+	}
+	Mobo_Core_Quarantine_Sale_Guard::handle_transition( $new_status, $old_status, $post );
+}
+add_action( 'transition_post_status', 'mobo_core_quarantine_sale_guard_transition', 10, 3 );
+
+/* S1: clone/staging copy guard notice (Source purchases and wallet payments blocked). Lazy-loaded. */
+add_action( 'admin_notices', array( 'Mobo_Core_Clone_Guard', 'render_admin_notice' ) );
+
 /* B23: excluded products keep selling with frozen price/stock; warn on their edit screen. */
 add_action( 'admin_notices', array( 'Mobo_Core_Product_Exclusions', 'render_product_edit_notice' ) );
 
@@ -773,6 +799,15 @@ add_action(
 		if ( class_exists( '\Automattic\WooCommerce\Utilities\FeaturesUtil' ) ) {
 			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
 				'custom_order_tables',
+				MOBO_CORE_PLUGIN_FILE,
+				true
+			);
+			/* M9: Checkout Block / Store API pre-payment validation runs on the place
+			 * order POST only (woocommerce_store_api_checkout_update_order_from_request,
+			 * with an order_processed fallback), validates the submitted address and
+			 * stops checkout with a Store API RouteException (HTTP 400, Persian message). */
+			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+				'cart_checkout_blocks',
 				MOBO_CORE_PLUGIN_FILE,
 				true
 			);

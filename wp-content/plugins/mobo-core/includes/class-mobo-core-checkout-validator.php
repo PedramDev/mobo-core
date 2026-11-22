@@ -97,6 +97,10 @@ class Mobo_Core_Checkout_Validator {
 	private $active_order_route_connection_id = 0;
 	/** PERF04: a bounded recovery read must never be interpreted as an empty queue on SQL/corruption failure. */
 	private $order_recovery_read_failed = false;
+	/** @var array<int,bool> M9: Store API orders already validated in this request (order id => true). */
+	private $store_api_validated_order_ids = array();
+	/** @var array|null Held order-queue advisory lock: name + owning MySQL CONNECTION_ID(). */
+	private $active_order_queue_lock = null;
 
 	/**
 	 * Register validation hooks.
@@ -319,7 +323,16 @@ class Mobo_Core_Checkout_Validator {
 	public function init() {
 		add_action( 'woocommerce_check_cart_items', array( $this, 'validate_cart_notices' ), 20 );
 		add_action( 'woocommerce_after_checkout_validation', array( $this, 'validate_checkout_errors' ), 20, 2 );
-		add_action( 'woocommerce_store_api_checkout_update_order_meta', array( $this, 'validate_store_api_checkout_order' ), 20, 1 );
+		/* M9: Checkout Block / Store API. update_order_meta also fires on GET (checkout
+		 * page load with a draft order) and on PUT/PATCH draft updates, so it only freezes
+		 * line-item identity. The blocking pre-payment validation runs once on the place
+		 * order POST, against the address submitted in that request, and throws a Store
+		 * API RouteException (HTTP 400 + Persian message) instead of a plain Exception
+		 * (HTTP 500). order_processed is a fallback for builds that skipped the request
+		 * hook. */
+		add_action( 'woocommerce_store_api_checkout_update_order_meta', array( $this, 'snapshot_store_api_draft_order' ), 20, 1 );
+		add_action( 'woocommerce_store_api_checkout_update_order_from_request', array( $this, 'validate_store_api_checkout_request' ), 30, 2 );
+		add_action( 'woocommerce_store_api_checkout_order_processed', array( $this, 'validate_store_api_checkout_order' ), 3, 1 );
 		add_action( 'woocommerce_order_status_changed', array( $this, 'handle_order_status_changed' ), 20, 4 );
 		add_action( 'woocommerce_checkout_create_order_line_item', array( $this, 'capture_checkout_line_item_identity' ), 5, 4 );
 		add_action( 'woocommerce_checkout_order_processed', array( $this, 'capture_processed_order_identity' ), 5, 3 );
@@ -668,26 +681,78 @@ class Mobo_Core_Checkout_Validator {
 
 
 	/**
-	 * Checkout Block / Store API equivalent of classic checkout validation.
-	 * WooCommerce explicitly supports throwing here to stop payment safely.
+	 * Store API draft-order hook (GET checkout load, PUT/PATCH draft updates and the
+	 * POST itself). Never validates or throws: it only freezes line-item ownership
+	 * before any payment can run, even when validation toggles are off.
 	 *
 	 * @param WC_Order $order Draft checkout order.
 	 * @return void
-	 * @throws Exception When Mobo pre-purchase validation fails.
+	 */
+	public function snapshot_store_api_draft_order( $order ) {
+		$this->snapshot_order_line_item_identities( $order );
+	}
+
+	/**
+	 * Place-order POST: validate the order using the address submitted in THIS
+	 * request (not a stale session/customer address).
+	 *
+	 * @param WC_Order        $order Draft checkout order.
+	 * @param WP_REST_Request $request Store API request.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
+	 */
+	public function validate_store_api_checkout_request( $order, $request = null ) {
+		if ( ! $order instanceof WC_Order ) {
+			return;
+		}
+		$method = is_object( $request ) && method_exists( $request, 'get_method' ) ? strtoupper( (string) $request->get_method() ) : '';
+		if ( 'POST' !== $method ) {
+			return; /* Draft updates (PUT/PATCH) never block; only placing the order does. */
+		}
+		$this->snapshot_order_line_item_identities( $order );
+		$this->store_api_validated_order_ids[ absint( $order->get_id() ) ] = true;
+		$this->run_store_api_pre_payment_validation( $order, $this->store_api_submitted_destination( $request ) );
+	}
+
+	/**
+	 * Checkout Block / Store API fallback (woocommerce_store_api_checkout_order_processed,
+	 * POST only, after WooCommerce applied the submitted addresses). Skipped when the
+	 * request hook already validated this order.
+	 *
+	 * @param WC_Order $order Order.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
 	 */
 	public function validate_store_api_checkout_order( $order ) {
-		/* Checkout Blocks already has a persisted order at this hook. Freeze line-item
-		 * ownership before any payment can run, even when validation toggles are off. */
+		if ( ! $order instanceof WC_Order ) {
+			return;
+		}
 		$this->snapshot_order_line_item_identities( $order );
+		$order_id = absint( $order->get_id() );
+		if ( isset( $this->store_api_validated_order_ids[ $order_id ] ) ) {
+			return;
+		}
+		$this->store_api_validated_order_ids[ $order_id ] = true;
+		$this->run_store_api_pre_payment_validation( $order, null );
+	}
 
+	/**
+	 * Shared Store API pre-payment validation.
+	 *
+	 * @param WC_Order   $order Order.
+	 * @param array|null $destination Submitted country/state/city, or null to use the order.
+	 * @return void
+	 * @throws Exception Store API RouteException (HTTP 400) when validation fails.
+	 */
+	private function run_store_api_pre_payment_validation( $order, $destination ) {
 		$scope_error = $this->validate_auto_order_order_scope_pre_payment( $order );
 		if ( is_wp_error( $scope_error ) ) {
-			throw new Exception( sanitize_text_field( (string) $scope_error->get_error_message() ) );
+			$this->throw_store_api_checkout_error( 'mobo_core_checkout_order_scope', $scope_error->get_error_message() );
 		}
 
-		$destination_error = $this->validate_auto_order_destination_pre_payment( array(), $order );
+		$destination_error = $this->validate_auto_order_destination_pre_payment( array(), $order, $destination );
 		if ( is_wp_error( $destination_error ) ) {
-			throw new Exception( sanitize_text_field( (string) $destination_error->get_error_message() ) );
+			$this->throw_store_api_checkout_error( 'mobo_core_checkout_destination', $destination_error->get_error_message() );
 		}
 
 		if ( ! $this->has_active_checkout_validation_checks_for_current_cart() ) {
@@ -701,8 +766,65 @@ class Mobo_Core_Checkout_Validator {
 
 		$messages = isset( $result['errors'] ) && is_array( $result['errors'] ) ? $result['errors'] : array();
 		$messages = array_values( array_unique( array_filter( array_map( 'sanitize_text_field', $messages ) ) ) );
-		$message  = ! empty( $messages ) ? implode( ' | ', $messages ) : 'اعتبارسنجی خرید موبو ناموفق بود. لطفاً سبد خرید را بررسی و دوباره تلاش کنید.';
-		throw new Exception( $message );
+		$this->throw_store_api_checkout_error( 'mobo_core_checkout_validation', implode( ' | ', $messages ) );
+	}
+
+	/**
+	 * Destination (country/state/city) the order will be submitted with, read from
+	 * the Store API request body. Mirrors get_order_address_group_for_mobo(): the
+	 * shipping address when complete, otherwise billing.
+	 *
+	 * @param WP_REST_Request|null $request Request.
+	 * @return array|null Null when the request carries no usable address.
+	 */
+	private function store_api_submitted_destination( $request ) {
+		if ( ! is_object( $request ) ) {
+			return null;
+		}
+		$params = method_exists( $request, 'get_json_params' ) ? $request->get_json_params() : null;
+		if ( ! is_array( $params ) || ( ! isset( $params['shipping_address'] ) && ! isset( $params['billing_address'] ) ) ) {
+			$params = method_exists( $request, 'get_params' ) ? $request->get_params() : array();
+		}
+		$params = is_array( $params ) ? $params : array();
+		$read   = static function ( $group ) use ( $params ) {
+			$raw = isset( $params[ $group ] ) && is_array( $params[ $group ] ) ? $params[ $group ] : array();
+			$out = array();
+			foreach ( array( 'country', 'state', 'city', 'address_1' ) as $key ) {
+				$out[ $key ] = isset( $raw[ $key ] ) && is_scalar( $raw[ $key ] ) ? sanitize_text_field( (string) $raw[ $key ] ) : '';
+			}
+			return $out;
+		};
+		$shipping = $read( 'shipping_address' );
+		$billing  = $read( 'billing_address' );
+		if ( '' !== $shipping['country'] && '' !== $shipping['state'] && '' !== $shipping['city'] && '' !== $shipping['address_1'] ) {
+			$group = $shipping;
+		} elseif ( '' !== $billing['country'] || '' !== $billing['state'] || '' !== $billing['city'] ) {
+			$group = $billing;
+		} else {
+			return null;
+		}
+		return array( 'country' => $group['country'], 'state' => $group['state'], 'city' => $group['city'] );
+	}
+
+	/**
+	 * Stop a Store API checkout with HTTP 400 and a shopper-facing Persian message.
+	 * A plain Exception would become HTTP 500 "woocommerce_rest_unknown_server_error".
+	 *
+	 * @param string $code Error code.
+	 * @param string $message Message.
+	 * @return void
+	 * @throws Exception Always.
+	 */
+	private function throw_store_api_checkout_error( $code, $message ) {
+		$message = sanitize_text_field( (string) $message );
+		if ( '' === $message ) {
+			$message = 'اعتبارسنجی خرید موبو ناموفق بود. لطفاً سبد خرید را بررسی و دوباره تلاش کنید.';
+		}
+		$route_exception = 'Automattic\\WooCommerce\\StoreApi\\Exceptions\\RouteException';
+		if ( class_exists( $route_exception ) ) {
+			throw new $route_exception( sanitize_key( (string) $code ), $message, 400 );
+		}
+		throw new Exception( $message, 400 );
 	}
 
 	/**
@@ -1103,7 +1225,7 @@ class Mobo_Core_Checkout_Validator {
 	 * @param WC_Order|null $order Store API draft order, null for classic checkout.
 	 * @return true|WP_Error
 	 */
-	private function validate_auto_order_destination_pre_payment( $data, $order ) {
+	private function validate_auto_order_destination_pre_payment( $data, $order, $submitted_destination = null ) {
 		if ( ! class_exists( 'Mobo_Core_Checkout_Preflight' ) ) {
 			return true;
 		}
@@ -1113,7 +1235,11 @@ class Mobo_Core_Checkout_Validator {
 			if ( 'all_mobo' !== ( $scope['status'] ?? '' ) || $connection_id <= 0 || ! $this->auto_order_enabled_for_connection_ids( array( $connection_id ) ) ) {
 				return true;
 			}
-			$run = function () use ( $data, $order ) {
+			$run = function () use ( $data, $order, $submitted_destination ) {
+				if ( $order instanceof WC_Order && is_array( $submitted_destination ) && method_exists( 'Mobo_Core_Checkout_Preflight', 'validate_order_destination_values' ) ) {
+					/* M9: the address submitted with the place-order request. */
+					return Mobo_Core_Checkout_Preflight::validate_order_destination_values( $order, $submitted_destination );
+				}
 				return $order instanceof WC_Order
 					? Mobo_Core_Checkout_Preflight::validate_order( $order, $this->get_order_address_group_for_mobo( $order ) )
 					: Mobo_Core_Checkout_Preflight::validate_checkout_data( $data );
@@ -1235,6 +1361,11 @@ class Mobo_Core_Checkout_Validator {
 	 * @return bool
 	 */
 	private function is_mobo_cart_validation_effective() {
+		/* S1: a clone/staging copy must not clear/rebuild the original site's shared
+		 * Source cart during its own checkout; its orders are held for review. */
+		if ( $this->clone_guard_blocks_purchase() ) {
+			return false;
+		}
 		/*
 		 * Remote Mobo-cart validation is an optional pre-payment checkout check.
 		 * Automatic order submission performs its own mandatory authenticated
@@ -3690,6 +3821,11 @@ class Mobo_Core_Checkout_Validator {
 			$connection_id,
 			function () use ( $order_id, $old_status, $new_status, $connection_id ) {
 				if ( ! $this->is_order_submission_enabled() ) { return; }
+				if ( $this->clone_guard_blocks_purchase() ) {
+					/* S1: never queue a real Source purchase from a clone/staging copy. */
+					$this->hold_order_for_clone_review( absint( $order_id ), 'status_processing' );
+					return;
+				}
 				$this->queue_mobo_order_id_for_later(
 					absint( $order_id ),
 					array(
@@ -3771,10 +3907,12 @@ class Mobo_Core_Checkout_Validator {
 				}
 				if ( class_exists( 'Mobo_Core_Work_Queue_Store' ) && Mobo_Core_Work_Queue_Store::is_available() ) {
 					return $this->primary_order_row_store_ready()
+						&& $this->order_queue_lock_still_owned()
 						&& Mobo_Core_Work_Queue_Store::put( self::ORDER_QUEUE_TYPE, (string) $order_id, $item );
 				}
 				$queue = $this->get_option_backed_order_queue();
 				$queue[ (string) $order_id ] = $item;
+				if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
@@ -3981,16 +4119,61 @@ class Mobo_Core_Checkout_Validator {
 		if ( $connection_id <= 0 ) { return false; }
 		$db_name   = defined( 'DB_NAME' ) ? (string) DB_NAME : '';
 		$lock_name = 'mobo_order_q_' . substr( hash( 'sha256', $db_name . '|' . (string) $wpdb->prefix . '|' . $connection_id ), 0, 40 );
-		$acquired  = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 2 ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic option queue guard.
-		if ( '1' !== (string) $acquired ) {
+		/* GET_LOCK() belongs to the MySQL session. wpdb silently reconnects after
+		 * "server has gone away" (wait_timeout, proxy idle kill, max_allowed_packet),
+		 * and the new session no longer owns the lock while another worker may take
+		 * it. Record the owning CONNECTION_ID() with the acquisition and re-prove it
+		 * with IS_USED_LOCK() before every queue write and after the callback. */
+		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d) AS acquired, CONNECTION_ID() AS cid', $lock_name, 2 ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Atomic option queue guard.
+		$acquired = is_array( $row ) && array_key_exists( 'acquired', $row ) ? (string) $row['acquired'] : '';
+		$owner    = is_array( $row ) && isset( $row['cid'] ) ? absint( $row['cid'] ) : 0;
+		if ( '1' !== $acquired ) {
+			return false;
+		}
+		if ( $owner <= 0 ) {
+			/* Ownership cannot be proven later: never run the queue mutation. */
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the unprovable guard.
 			return false;
 		}
 
+		$previous_lock = $this->active_order_queue_lock;
+		$this->active_order_queue_lock = array( 'name' => $lock_name, 'cid' => $owner );
 		try {
-			return call_user_func( $callback );
+			$result = call_user_func( $callback );
+			if ( ! $this->order_queue_lock_still_owned() ) {
+				/* A reconnect happened during the mutation: report failure so callers
+				 * fall back to their durable recovery path instead of assuming the
+				 * read-modify-write was exclusive. */
+				return false;
+			}
+			return $result;
 		} finally {
-			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the connection-scoped queue guard.
+			if ( $this->order_queue_lock_still_owned() ) {
+				$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Release the connection-scoped queue guard.
+			}
+			$this->active_order_queue_lock = $previous_lock;
 		}
+	}
+
+	/**
+	 * Whether this request's MySQL session still owns the held order-queue lock.
+	 * False after a silent wpdb reconnect (new CONNECTION_ID()) or when no lock is
+	 * held. Never throws; any read failure counts as lost ownership.
+	 *
+	 * @return bool
+	 */
+	private function order_queue_lock_still_owned() {
+		global $wpdb;
+		$lock = $this->active_order_queue_lock;
+		if ( ! is_array( $lock ) || empty( $lock['name'] ) || absint( $lock['cid'] ?? 0 ) <= 0 || ! is_object( $wpdb ) ) {
+			return false;
+		}
+		$holder = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s)', (string) $lock['name'] ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Ownership proof for the queue guard.
+		$owned  = null !== $holder && '' !== (string) $holder && absint( $holder ) === absint( $lock['cid'] );
+		if ( ! $owned ) {
+			$this->debug_log( 'order_queue_lock_lost', array( 'expectedConnection' => absint( $lock['cid'] ), 'holder' => null === $holder ? 'none' : absint( $holder ) ) );
+		}
+		return $owned;
 	}
 
 	/**
@@ -4032,6 +4215,7 @@ class Mobo_Core_Checkout_Validator {
 					if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
 					$hash = (string) $read['row']['payload_hash'];
 					if ( '' !== $snapshot_hash && ! hash_equals( (string) $snapshot_hash, $hash ) ) { return false; }
+					if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 					return Mobo_Core_Work_Queue_Store::delete_key_if_hash( self::ORDER_QUEUE_TYPE, $key, $hash );
 				}
 				$queue = $this->get_option_backed_order_queue();
@@ -4039,6 +4223,7 @@ class Mobo_Core_Checkout_Validator {
 				$current_token = $this->order_queue_item_token( $queue[ $key ], $key );
 				if ( ! hash_equals( $expected_token, $current_token ) ) { return false; }
 				unset( $queue[ $key ] );
+				if ( ! $this->order_queue_lock_still_owned() ) { return false; }
 				return $this->save_option_backed_order_queue( $queue );
 			}
 		);
@@ -4095,6 +4280,11 @@ class Mobo_Core_Checkout_Validator {
 
 		if ( $this->order_was_already_sent_to_mobo( $order ) ) {
 			return false;
+		}
+
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$this->hold_order_for_clone_review( $order, 'queue_request' );
+			return new WP_Error( 'mobo_core_clone_guard_blocked', Mobo_Core_Clone_Guard::blocked_message() );
 		}
 
 		$scope = $this->get_order_mobo_item_scope( $order );
@@ -4334,6 +4524,18 @@ class Mobo_Core_Checkout_Validator {
 				continue;
 			}
 
+			/* S1: on a clone/staging copy (or an un-reprovisioned domain move) no queued,
+			 * running or uncertain order copied from the original may reach the Source,
+			 * not even for reconciliation. Hold it for manual review and retire the
+			 * queue marker so a later re-provisioning cannot silently replay it. */
+			if ( $this->clone_guard_blocks_purchase() ) {
+				$this->hold_order_for_clone_review( $order, 'queue_processor' );
+				$result['skipped']++;
+				$result['status'] = 'clone_guard_blocked';
+				$this->cleanup_order_queue_item( $queue_item );
+				continue;
+			}
+
 			if ( 'processing' !== sanitize_key( (string) $order->get_status() ) ) {
 				$nonprocessing_attempt_state = $this->get_order_submission_attempt_state( $order );
 				if ( 'running_recent' === $nonprocessing_attempt_state ) {
@@ -4388,7 +4590,7 @@ class Mobo_Core_Checkout_Validator {
 			 * Only a separately authorized administrator action may retry it.
 			 * A price-review order is terminal for automation in the same way. */
 			$durable_submit_status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
-			if ( in_array( $durable_submit_status, array( 'failed', 'aborted', 'price_review' ), true ) ) {
+			if ( in_array( $durable_submit_status, array( 'failed', 'aborted', 'price_review', 'blocked_clone' ), true ) ) {
 				$result['skipped']++;
 				$this->cleanup_order_queue_item( $queue_item );
 				continue;
@@ -5216,6 +5418,52 @@ class Mobo_Core_Checkout_Validator {
 		$this->append_order_log( $order, 'order_submission_blocked_scope', array( 'source' => sanitize_key( (string) $source ), 'scope' => $scope ) );
 	}
 
+	/** @return bool Whether the S1 clone guard currently refuses Source purchases. */
+	private function clone_guard_blocks_purchase() {
+		return class_exists( 'Mobo_Core_Clone_Guard' ) && Mobo_Core_Clone_Guard::is_purchase_blocked();
+	}
+
+	/**
+	 * S1: hold one paid order for manual review because this installation is a
+	 * suspected clone/staging copy (or a domain move that was not re-provisioned).
+	 * Nothing is sent to the Source. Running/uncertain/sent evidence copied from
+	 * the original site is never overwritten; only an idle/queued status becomes
+	 * the terminal "blocked_clone" (only an administrator retry can submit it).
+	 *
+	 * @param WC_Order|int $order Order or id.
+	 * @param string       $source Caller.
+	 * @return bool Whether a hold was recorded.
+	 */
+	private function hold_order_for_clone_review( $order, $source = '' ) {
+		if ( ! $order instanceof WC_Order ) {
+			$order = absint( $order ) > 0 && function_exists( 'wc_get_order' ) ? wc_get_order( absint( $order ) ) : null;
+		}
+		if ( ! $order instanceof WC_Order || ! class_exists( 'Mobo_Core_Clone_Guard' ) ) {
+			return false;
+		}
+		if ( 'yes' === (string) $order->get_meta( Mobo_Core_Clone_Guard::ORDER_META_BLOCKED, true ) ) {
+			return false; /* Already held: no duplicate notes on every worker pass. */
+		}
+		$status = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
+		$order->update_meta_data( Mobo_Core_Clone_Guard::ORDER_META_BLOCKED, 'yes' );
+		$order->update_meta_data( '_mobo_order_requires_review', 'yes' );
+		if ( in_array( $status, array( '', 'queued' ), true ) ) {
+			$order->delete_meta_data( '_mobo_order_submit_queued' );
+			$order->delete_meta_data( '_mobo_order_submit_context' );
+			$order->update_meta_data( '_mobo_order_submit_status', Mobo_Core_Clone_Guard::SUBMIT_STATUS );
+		}
+		$order->update_meta_data( '_mobo_order_last_error_code', Mobo_Core_Clone_Guard::ERROR_CODE );
+		$order->update_meta_data( '_mobo_order_last_error', Mobo_Core_Clone_Guard::blocked_message() );
+		$order->save();
+		$order->add_order_note( Mobo_Core_Clone_Guard::order_note() );
+		$this->append_order_log( $order, 'order_submission_blocked_clone_guard', array(
+			'source'  => sanitize_key( (string) $source ),
+			'status'  => $status,
+			'reasons' => Mobo_Core_Clone_Guard::health_payload()['reasons'],
+		) );
+		return true;
+	}
+
 	/** Human-readable explanation for the current fail-closed order policy. */
 	private function build_unsubmittable_order_message( $scope ) {
 		$status = sanitize_key( (string) ( is_array( $scope ) && isset( $scope['status'] ) ? $scope['status'] : 'invalid' ) );
@@ -5382,6 +5630,13 @@ class Mobo_Core_Checkout_Validator {
 	 * @return true|WP_Error
 	 */
 	private function fresh_checkout_route_preflight() {
+		/* S1: a clone/staging copy or an un-reprovisioned domain move never talks to
+		 * the Source (login, shared cart, checkout, Wallet, balance). Every outbound
+		 * Source request passes through this fence, so it is the hard backstop for
+		 * the entry-point holds below. */
+		if ( class_exists( 'Mobo_Core_Clone_Guard' ) && Mobo_Core_Clone_Guard::is_purchase_blocked() ) {
+			return Mobo_Core_Clone_Guard::blocked_error();
+		}
 		if ( ! class_exists( 'Mobo_Core_Connection_Repository' ) || ! Mobo_Core_Connection_Repository::table_exists() ) {
 			return true; // Only for pre-Connection-table upgrade compatibility.
 		}
@@ -5445,6 +5700,11 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$order_id = absint( $order->get_id() );
+		if ( $this->clone_guard_blocks_purchase() ) {
+			/* S1 entry fence for every purchase path (queue worker, admin retry, CLI). */
+			$this->hold_order_for_clone_review( $order, 'submit_entry' );
+			return new WP_Error( 'mobo_core_clone_guard_blocked', Mobo_Core_Clone_Guard::blocked_message(), array( 'requestMayHaveReachedServer' => false ) );
+		}
 		if ( $order_id <= 0 || ! class_exists( 'Mobo_Core_Lock' ) ) {
 			return new WP_Error( 'mobo_core_order_submission_lock_unavailable', 'Per-order submission lock is unavailable.' );
 		}
@@ -5573,6 +5833,11 @@ class Mobo_Core_Checkout_Validator {
 				$fresh->delete_meta_data( '_mobo_order_last_error' );
 				$fresh->delete_meta_data( '_mobo_order_failed_at' );
 				$fresh->delete_meta_data( '_mobo_order_uncertain_at' );
+				if ( 'yes' === (string) $fresh->get_meta( '_mobo_order_clone_blocked', true ) ) {
+					/* The administrator reviewed an S1 clone hold on the re-provisioned site. */
+					$fresh->delete_meta_data( '_mobo_order_clone_blocked' );
+					$fresh->delete_meta_data( '_mobo_order_requires_review' );
+				}
 				$this->clear_order_defer_backoff_meta( $fresh );
 				$fresh->save();
 			}
@@ -6830,7 +7095,7 @@ class Mobo_Core_Checkout_Validator {
 		}
 
 		$error_code = (string) $error->get_error_code();
-		if ( in_array( $error_code, array( 'mobo_core_shared_cart_lock_lost', 'mobo_core_order_submission_lock_lost', 'mobo_core_shared_cart_lock_unavailable', 'mobo_core_shared_cart_upgrade_barrier', 'mobo_core_mobo_json_error', 'mobo_core_mobo_credentials_missing', 'mobo_core_mobo_login_http_error', 'mobo_core_mobo_login_missing_cookie', 'mobo_core_order_auth_retry_failed' ), true ) ) {
+		if ( in_array( $error_code, array( 'mobo_core_shared_cart_lock_lost', 'mobo_core_order_submission_lock_lost', 'mobo_core_shared_cart_lock_unavailable', 'mobo_core_shared_cart_upgrade_barrier', 'mobo_core_mobo_json_error', 'mobo_core_mobo_credentials_missing', 'mobo_core_mobo_login_http_error', 'mobo_core_mobo_login_missing_cookie', 'mobo_core_order_auth_retry_failed', 'mobo_core_clone_guard_blocked' ), true ) ) {
 			return false;
 		}
 
@@ -7407,6 +7672,12 @@ class Mobo_Core_Checkout_Validator {
 			exit;
 		}
 
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$order->add_order_note( 'ارسال دستی به موبو انجام نشد. ' . Mobo_Core_Clone_Guard::blocked_message() );
+			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : $order->get_edit_order_url() );
+			exit;
+		}
+
 		$attempt_state    = $this->get_order_submission_attempt_state( $order );
 		$submit_status    = sanitize_key( (string) $order->get_meta( '_mobo_order_submit_status', true ) );
 		$verified_absent  = isset( $_POST['verified_absent'] ) && '1' === sanitize_text_field( wp_unslash( $_POST['verified_absent'] ) );
@@ -7652,11 +7923,27 @@ class Mobo_Core_Checkout_Validator {
 			return $state;
 		}
 
+		if ( $this->clone_guard_blocks_purchase() ) {
+			$state['label']   = 'سایت کپی/staging؛ خرید متوقف';
+			$state['tone']    = 'error';
+			$state['message'] = Mobo_Core_Clone_Guard::blocked_message();
+			return $state;
+		}
+
 		$connection_block_reason = $this->get_order_submission_connection_block_reason( $scope );
 		if ( '' !== $connection_block_reason ) {
 			$state['label']   = 'اتصال مالک آماده نیست';
 			$state['tone']    = 'error';
 			$state['message'] = $connection_block_reason;
+			return $state;
+		}
+
+		if ( 'blocked_clone' === $submit_status && 'processing' === sanitize_key( (string) $order->get_status() ) && ! in_array( $attempt_state, array( 'running_recent', 'running_stale', 'uncertain' ), true ) ) {
+			$state['label']      = 'نگه‌داشته‌شده (سایت کپی)؛ نیازمند بررسی';
+			$state['tone']       = 'warning';
+			$state['message']    = 'این سفارش زمانی پرداخت شد که سایت نسخه کپی یا دامنه آن تغییرکرده تشخیص داده شده بود و خودکار ارسال نشد. پیش از ارسال دستی بررسی کنید که این سفارش قبلاً از سایت اصلی در موبو ثبت نشده باشد.';
+			$state['canRetry']   = true;
+			$state['retryLabel'] = 'بررسی کردم؛ ارسال دستی به موبو';
 			return $state;
 		}
 

@@ -25,12 +25,25 @@ class Mobo_Core_Image_Prune_Queue {
 
 	const LEGACY_SEED_STATE_OPTION = 'mobo_core_image_prune_legacy_seed_state';
 	const SCAN_BATCH_SIZE          = 80;
+	/**
+	 * Physical deletion switch. Default '0' (owner rule: no automatic image
+	 * deletion in this release). While disabled a candidate is parked as
+	 * STATUS_AWAITING_APPROVAL without running the expensive reference proof;
+	 * enabling the switch re-queues parked rows with a fresh two-pass proof.
+	 */
+	const PHYSICAL_DELETE_OPTION   = 'mobo_core_image_prune_physical_delete';
+	const STATUS_AWAITING_APPROVAL = 'awaiting_approval';
+	/** Max other attachments inspected for a shared-file proof before refusing. */
+	const SHARED_FILE_SCAN_LIMIT   = 200;
 
 	/** @var bool|null */
 	private static $table_exists_cache = null;
 
 	/** @var array<int,array> Per-Connection request-local summary cache. */
 	private static $summary_cache = array();
+
+	/** @var bool A progress/status write failed in this slice (disk full, DB error). */
+	private $write_failed = false;
 
 	/** Return table name. */
 	public static function table_name() {
@@ -109,12 +122,201 @@ class Mobo_Core_Image_Prune_Queue {
 		self::$summary_cache = array();
 	}
 
+	/** Whether automatic physical deletion of stale Mobo media is enabled. */
+	public static function physical_delete_enabled() {
+		return class_exists( 'Mobo_Core_Settings' ) && Mobo_Core_Settings::enabled( self::PHYSICAL_DELETE_OPTION, '0' );
+	}
+
+	/**
+	 * Pure: first other attachment whose registered file family (main file,
+	 * original_image, generated and backup sizes) overlaps this attachment's.
+	 *
+	 * wp_delete_attachment( $id, true ) unlinks every file of the family, so any
+	 * overlap means deleting this attachment would break a live attachment row.
+	 *
+	 * @param string $own_relative This attachment's _wp_attached_file.
+	 * @param mixed  $own_metadata This attachment's unserialized metadata.
+	 * @param array  $others attachment_id => array( 'file' => relative, 'metadata' => mixed ).
+	 * @return int Conflicting attachment ID, 0 when no file is shared.
+	 */
+	public static function shared_family_conflict( $own_relative, $own_metadata, array $others ) {
+		$own = self::family_paths( $own_relative, $own_metadata );
+		if ( empty( $own ) ) {
+			return 0;
+		}
+		foreach ( $others as $other_id => $other ) {
+			$other_id = absint( $other_id );
+			if ( $other_id <= 0 || ! is_array( $other ) ) {
+				continue;
+			}
+			$paths = self::family_paths( isset( $other['file'] ) ? $other['file'] : '', isset( $other['metadata'] ) ? $other['metadata'] : array() );
+			if ( ! empty( array_intersect_key( $own, $paths ) ) ) {
+				return $other_id;
+			}
+		}
+		return 0;
+	}
+
+	/**
+	 * Pure: lower-cased relative family paths as a set.
+	 *
+	 * @param string $relative _wp_attached_file.
+	 * @param mixed  $metadata Metadata.
+	 * @return array<string,bool>
+	 */
+	public static function family_paths( $relative, $metadata ) {
+		$relative = ltrim( str_replace( '\\', '/', (string) $relative ), '/' );
+		if ( '' === $relative ) {
+			return array();
+		}
+		$files = array( $relative => 0 );
+		if ( class_exists( 'Mobo_Core_Legacy_Image_Policy' ) ) {
+			$files = Mobo_Core_Legacy_Image_Policy::family_files( $relative, $metadata );
+		}
+		$dir    = dirname( $relative );
+		$prefix = ( '.' === $dir || '' === $dir ) ? '' : $dir . '/';
+		if ( is_array( $metadata ) && isset( $metadata['backup_sizes'] ) && is_array( $metadata['backup_sizes'] ) ) {
+			foreach ( $metadata['backup_sizes'] as $backup ) {
+				if ( is_array( $backup ) && ! empty( $backup['file'] ) && is_string( $backup['file'] ) ) {
+					$files[ $prefix . basename( str_replace( '\\', '/', $backup['file'] ) ) ] = 0;
+				}
+			}
+		}
+		$set = array();
+		foreach ( array_keys( $files ) as $path ) {
+			$set[ strtolower( (string) $path ) ] = true;
+		}
+		return $set;
+	}
+
+	/**
+	 * M6: refuse deletion when another attachment row still references any file
+	 * of this attachment's family (duplicate attachment rows created by
+	 * importers, media-library plugins or historical Mobo collisions).
+	 *
+	 * Fails closed: a failed or oversized proof query keeps the attachment.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return string Empty when no file is shared, otherwise a retention reason.
+	 */
+	private function shared_file_reason( $attachment_id ) {
+		global $wpdb;
+		$attachment_id = absint( $attachment_id );
+		$relative      = ltrim( str_replace( '\\', '/', (string) get_post_meta( $attachment_id, '_wp_attached_file', true ) ), '/' );
+		if ( '' === $relative ) {
+			return ''; /* Database-only debt: no registered bytes to share. */
+		}
+		$metadata  = wp_get_attachment_metadata( $attachment_id );
+		$own_paths = array_keys( self::family_paths( $relative, $metadata ) );
+		if ( empty( $own_paths ) ) {
+			return 'Attachment file family could not be resolved; destructive cleanup refused.';
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $own_paths ), '%s' ) );
+		$args         = array_merge( array( $attachment_id ), $own_paths );
+		$wpdb->last_error = '';
+		$direct       = $wpdb->get_col(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- placeholders generated from the path list.
+				"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file' AND post_id <> %d AND LOWER(meta_value) IN ({$placeholders}) LIMIT 1",
+				$args
+			)
+		);
+		if ( ! is_array( $direct ) || '' !== (string) $wpdb->last_error ) {
+			return 'Shared-file proof query failed; destructive cleanup refused.';
+		}
+		$direct = array_values( array_filter( array_map( 'absint', $direct ) ) );
+		if ( ! empty( $direct ) ) {
+			return 'Physical file is shared with attachment #' . absint( $direct[0] ) . '; deleting it would break that attachment. Kept.';
+		}
+
+		/* Another attachment in the same directory may have generated a size file
+		 * with one of this family's names (or vice versa). Narrow by directory and
+		 * by serialized basename, then confirm on the unserialized metadata. */
+		$dir       = dirname( $relative );
+		$prefix    = ( '.' === $dir || '' === $dir ) ? '' : $dir . '/';
+		$likes     = array();
+		$like_args = array();
+		foreach ( $own_paths as $path ) {
+			$likes[]     = 'md.meta_value LIKE %s';
+			$like_args[] = '%' . $wpdb->esc_like( '"' . basename( $path ) . '"' ) . '%';
+		}
+		$args = array_merge(
+			array( $attachment_id, $wpdb->esc_like( $prefix ) . '%' ),
+			$like_args,
+			array( self::SHARED_FILE_SCAN_LIMIT + 1 )
+		);
+		$wpdb->last_error = '';
+		$rows = $wpdb->get_results(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- placeholders generated from the path list.
+				"SELECT af.post_id, af.meta_value AS attached_file, md.meta_value AS metadata
+				FROM {$wpdb->postmeta} af
+				INNER JOIN {$wpdb->postmeta} md ON md.post_id = af.post_id AND md.meta_key = '_wp_attachment_metadata'
+				WHERE af.meta_key = '_wp_attached_file' AND af.post_id <> %d AND af.meta_value LIKE %s
+					AND (" . implode( ' OR ', $likes ) . ')
+				LIMIT %d',
+				$args
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $rows ) || '' !== (string) $wpdb->last_error ) {
+			return 'Shared-file proof query failed; destructive cleanup refused.';
+		}
+		if ( count( $rows ) > self::SHARED_FILE_SCAN_LIMIT ) {
+			return 'Too many attachments share file names with this attachment; destructive cleanup refused.';
+		}
+		$others = array();
+		foreach ( $rows as $row ) {
+			$others[ absint( $row['post_id'] ) ] = array(
+				'file'     => (string) $row['attached_file'],
+				'metadata' => maybe_unserialize( (string) $row['metadata'] ),
+			);
+		}
+		$conflict = self::shared_family_conflict( $relative, $metadata, $others );
+		if ( $conflict > 0 ) {
+			return 'A generated image size file is shared with attachment #' . $conflict . '; deleting it would break that attachment. Kept.';
+		}
+		return '';
+	}
+
+	/**
+	 * Re-queue parked candidates once physical deletion has been enabled. The
+	 * proof restarts from scratch because references may have changed.
+	 *
+	 * @param int $limit Rows per call.
+	 * @return int
+	 */
+	private function requeue_awaiting_approval( $limit = 20 ) {
+		global $wpdb;
+		$connection_id = self::connection_id();
+		if ( $connection_id <= 0 ) {
+			return 0;
+		}
+		$table   = self::table_name();
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table}
+				SET status = 'pending', phase = 'postmeta', postmeta_cursor = 0, option_cursor = 0, post_cursor = 0, proof_pass = 0, try_count = 0, next_retry_at = NULL, last_error = NULL, updated_at = %s
+				WHERE connection_id = %d AND status = %s
+				ORDER BY id ASC LIMIT %d",
+				current_time( 'mysql', true ),
+				$connection_id,
+				self::STATUS_AWAITING_APPROVAL,
+				max( 1, min( 100, absint( $limit ) ) )
+			)
+		);
+		$updated = false === $updated ? 0 : absint( $updated );
+		if ( $updated > 0 ) {
+			self::invalidate_summary();
+		}
+		return $updated;
+	}
+
 	/** Compact queue summary for scheduler/admin health. */
 	public function get_summary() {
 		global $wpdb;
 		$connection_id = self::connection_id();
 		if ( $connection_id <= 0 || ! self::table_exists() ) {
-			return array( 'pending' => 0, 'due' => 0, 'failed' => 0, 'retained' => 0 );
+			return array( 'pending' => 0, 'due' => 0, 'failed' => 0, 'retained' => 0, 'awaitingApproval' => 0, 'physicalDelete' => self::physical_delete_enabled() );
 		}
 		if ( isset( self::$summary_cache[ $connection_id ] ) && is_array( self::$summary_cache[ $connection_id ] ) ) {
 			return self::$summary_cache[ $connection_id ];
@@ -127,11 +329,14 @@ class Mobo_Core_Image_Prune_Queue {
 		$due      = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= %s)", $connection_id, $now ) ) );
 		$failed   = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'failed'", $connection_id ) ) );
 		$retained = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = 'retained'", $connection_id ) ) );
+		$awaiting = absint( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE connection_id = %d AND status = %s", $connection_id, self::STATUS_AWAITING_APPROVAL ) ) );
 		self::$summary_cache[ $connection_id ] = array(
-			'pending'  => $pending,
-			'due'      => $due,
-			'failed'   => $failed,
-			'retained' => $retained,
+			'pending'          => $pending,
+			'due'              => $due,
+			'failed'           => $failed,
+			'retained'         => $retained,
+			'awaitingApproval' => $awaiting,
+			'physicalDelete'   => self::physical_delete_enabled(),
 		);
 		return self::$summary_cache[ $connection_id ];
 	}
@@ -252,6 +457,9 @@ class Mobo_Core_Image_Prune_Queue {
 		try {
 			$this->seed_legacy_candidates( min( 30, self::SCAN_BATCH_SIZE ) );
 			$this->cleanup_historical_rows();
+			if ( self::physical_delete_enabled() ) {
+				$this->requeue_awaiting_approval( 20 );
+			}
 			$table = self::table_name();
 			$now   = current_time( 'mysql', true );
 			$rows  = $wpdb->get_results(
@@ -267,10 +475,17 @@ class Mobo_Core_Image_Prune_Queue {
 				if ( microtime( true ) >= ( $deadline - 0.10 ) ) {
 					break;
 				}
+				$this->write_failed = false;
 				$outcome = $this->process_candidate_slice( $row );
 				$result['processed']++;
 				if ( 'processed' !== $outcome && isset( $result[ $outcome ] ) ) {
 					$result[ $outcome ]++;
+				}
+				if ( $this->write_failed ) {
+					/* Progress could not be persisted: stop instead of repeating the
+					 * same scan slice against a failing database. */
+					$result['writeFailed'] = true;
+					break;
 				}
 			}
 			$summary = $this->get_summary();
@@ -296,6 +511,13 @@ class Mobo_Core_Image_Prune_Queue {
 		if ( 'attachment' !== get_post_type( $attachment_id ) ) {
 			$this->mark_status( $id, 'done', 'Attachment no longer exists.' );
 			return 'deleted';
+		}
+
+		/* Owner rule: no automatic physical image deletion unless explicitly
+		 * enabled. Park the candidate (non-destructive, no expensive proof). */
+		if ( ! self::physical_delete_enabled() ) {
+			$this->mark_status( $id, self::STATUS_AWAITING_APPROVAL, 'Automatic physical image deletion is disabled; stale attachment kept.' );
+			return 'retained';
 		}
 
 		$identity = $this->read_attachment_identity( $attachment_id );
@@ -396,7 +618,7 @@ class Mobo_Core_Image_Prune_Queue {
 				/* Two complete bounded passes reduce the race window between a long-running
 				 * cross-store proof and the final destructive boundary. The second pass is
 				 * resumable exactly like the first and still never performs wildcard SQL. */
-				$wpdb->update(
+				$this->note_write( $wpdb->update(
 					self::table_name(),
 					array(
 						'phase'           => 'postmeta',
@@ -407,7 +629,7 @@ class Mobo_Core_Image_Prune_Queue {
 						'updated_at'      => current_time( 'mysql', true ),
 					),
 					array( 'id' => $id, 'connection_id' => self::connection_id() )
-				);
+				) );
 				return 'processed';
 			}
 			$this->advance_phase( $id, 'finalize' );
@@ -474,6 +696,16 @@ class Mobo_Core_Image_Prune_Queue {
 			$path_reason = $this->attachment_delete_path_safety_reason( $attachment_id );
 			if ( '' !== $path_reason ) {
 				$this->mark_status( $id, 'retained', $path_reason );
+				return 'retained';
+			}
+			/* M6: never unlink a file that another attachment row still uses. */
+			$shared_reason = $this->shared_file_reason( $attachment_id );
+			if ( '' !== $shared_reason ) {
+				$this->mark_status( $id, 'retained', $shared_reason );
+				return 'retained';
+			}
+			if ( ! self::physical_delete_enabled() ) {
+				$this->mark_status( $id, self::STATUS_AWAITING_APPROVAL, 'Automatic physical image deletion was disabled before the delete boundary; stale attachment kept.' );
 				return 'retained';
 			}
 
@@ -870,7 +1102,7 @@ class Mobo_Core_Image_Prune_Queue {
 	/** Defer a benign lock-contention retry without consuming destructive retries. */
 	private function defer_without_penalty( $id, $seconds, $message ) {
 		global $wpdb;
-		$wpdb->update(
+		$this->note_write( $wpdb->update(
 			self::table_name(),
 			array(
 				'phase'         => 'finalize',
@@ -879,8 +1111,17 @@ class Mobo_Core_Image_Prune_Queue {
 				'updated_at'    => current_time( 'mysql', true ),
 			),
 			array( 'id' => absint( $id ), 'connection_id' => self::connection_id() )
-		);
+		) );
 		self::invalidate_summary();
+	}
+
+	/** Record a failed write. @param mixed $result wpdb result. @return bool */
+	private function note_write( $result ) {
+		if ( false === $result ) {
+			$this->write_failed = true;
+			return false;
+		}
+		return true;
 	}
 
 	private function mark_status( $id, $status, $message, $try_count = null ) {
@@ -894,7 +1135,7 @@ class Mobo_Core_Image_Prune_Queue {
 		if ( null !== $try_count ) {
 			$data['try_count'] = absint( $try_count );
 		}
-		$wpdb->update( self::table_name(), $data, array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
+		$this->note_write( $wpdb->update( self::table_name(), $data, array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) ) );
 		self::invalidate_summary();
 	}
 
@@ -904,18 +1145,18 @@ class Mobo_Core_Image_Prune_Queue {
 		if ( ! in_array( $column, $allowed, true ) ) {
 			return;
 		}
-		$wpdb->update( self::table_name(), array( $column => absint( $cursor ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
+		$this->note_write( $wpdb->update( self::table_name(), array( $column => absint( $cursor ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) ) );
 	}
 
 	private function advance_phase( $id, $phase ) {
 		global $wpdb;
-		$wpdb->update( self::table_name(), array( 'phase' => sanitize_key( $phase ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) );
+		$this->note_write( $wpdb->update( self::table_name(), array( 'phase' => sanitize_key( $phase ), 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => absint( $id ), 'connection_id' => self::connection_id() ) ) );
 	}
 
 	private function schedule_retry( $id, $tries, $message ) {
 		global $wpdb;
 		$delay = min( HOUR_IN_SECONDS, 60 * max( 1, absint( $tries ) ) );
-		$wpdb->update(
+		$this->note_write( $wpdb->update(
 			self::table_name(),
 			array(
 				'phase'         => 'finalize',
@@ -925,7 +1166,7 @@ class Mobo_Core_Image_Prune_Queue {
 				'updated_at'    => current_time( 'mysql', true ),
 			),
 			array( 'id' => absint( $id ), 'connection_id' => self::connection_id() )
-		);
+		) );
 		self::invalidate_summary();
 	}
 

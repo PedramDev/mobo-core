@@ -1379,6 +1379,12 @@ class Mobo_Core_Admin {
 				<?php endif; ?>
 
 				<?php if ( class_exists( 'Mobo_Core_Product_Concurrency' ) ) : ?>
+					<?php
+					/* M8: converge quarantined copies (off sale / released) while an admin looks. */
+					if ( class_exists( 'Mobo_Core_Quarantine_Sale_Guard' ) && current_user_can( 'manage_woocommerce' ) ) {
+						Mobo_Core_Quarantine_Sale_Guard::reconcile( 10 );
+					}
+					?>
 					<?php if ( $duplicate_groups_count > 0 ) : ?>
 						<div class="mobo-message mobo-message-error mobo-duplicate-incident">
 							<strong>محصول تکراری نیاز به تصمیم دارد.</strong>
@@ -1391,7 +1397,7 @@ class Mobo_Core_Admin {
 										<?php
 										$product_guid = sanitize_text_field( (string) ( $duplicate_group['product_guid'] ?? '' ) );
 										$product_ids  = array_values( array_filter( array_map( 'absint', explode( ',', (string) ( $duplicate_group['ids'] ?? '' ) ) ) ) );
-										$preferred_id = $duplicate_map instanceof Mobo_Core_Product_Map ? absint( $duplicate_map->get_product_id( $product_guid ) ) : 0;
+										$preferred_id = absint( $duplicate_group['canonical_id'] ?? 0 ) > 0 ? absint( $duplicate_group['canonical_id'] ) : ( $duplicate_map instanceof Mobo_Core_Product_Map ? absint( $duplicate_map->get_product_id( $product_guid ) ) : 0 );
 										$canonical_id = $preferred_id > 0 && in_array( $preferred_id, $product_ids, true ) ? $preferred_id : ( ! empty( $product_ids ) ? absint( $product_ids[0] ) : 0 );
 										?>
 										<div class="mobo-duplicate-group">
@@ -1924,7 +1930,7 @@ class Mobo_Core_Admin {
 			if ( is_numeric( $last_sync_raw ) ) {
 				$last_sync_label = Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $last_sync_raw ) );
 			} else {
-				$last_sync_timestamp = strtotime( $last_sync_raw );
+				$last_sync_timestamp = ( class_exists( 'Mobo_Core_Environment' ) ? Mobo_Core_Environment::utc_strtotime( $last_sync_raw ) : strtotime( $last_sync_raw ) );
 				$last_sync_label = false !== $last_sync_timestamp
 					? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', $last_sync_timestamp )
 					: $last_sync_raw;
@@ -5070,7 +5076,7 @@ type:{mobo_order_type_label}</textarea>
 					</div>
 
 					<div class="mobo-status-grid">
-						<?php $this->status_box( 'Cron واقعی MoboCore', ! empty( $status['isActive'] ) ? ( ! empty( $status['isOverdue'] ) ? 'Hit قبلی ثبت شده؛ اکنون عقب افتاده' : 'Hit اخیر ثبت شده' ) : 'تشخیص داده نشده' ); ?>
+						<?php $this->status_box( 'Cron واقعی MoboCore', ! empty( $status['isActive'] ) ? ( ! empty( $status['isOverdue'] ) ? 'Hit قبلی ثبت شده؛ اکنون عقب افتاده' : 'Hit اخیر ثبت شده' ) : ( ! empty( $status['driverActive'] ) ? 'Cron سرور تشخیص داده نشد؛ کارها با Heartbeat بک‌اند اجرا می‌شوند' : 'تشخیص داده نشده' ) ); ?>
 						<?php $this->status_box( 'آخرین اجرای کران واقعی', ! empty( $status['lastHitAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastHitAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'آخرین اجرای کاملاً سالم Runner', ! empty( $status['lastSuccessAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['lastSuccessAt'] ) ) : '—' ); ?>
 						<?php $this->status_box( 'اجرای بعدی Cron، تقریبی', ! empty( $status['lastHitAt'] ) && ! empty( $status['nextEstimatedAt'] ) ? Mobo_Core_Iran_Date::format( 'Y-m-d H:i:s', absint( $status['nextEstimatedAt'] ) ) : '—' ); ?>

@@ -110,6 +110,11 @@ class Mobo_Core_Health_Reporter {
 			'webhookCredential'      => $webhook_auth,
 			'moneyContract'          => class_exists( 'Mobo_Core_Money_Policy' ) ? Mobo_Core_Money_Policy::compatibility_status( 0, true ) : array( 'compatible' => false, 'code' => 'money_policy_unavailable', 'requiresReprovision' => true ),
 			'licenseInstallation'   => class_exists( 'Mobo_Core_Portal_Request_Signer' ) ? Mobo_Core_Portal_Request_Signer::get_status() : array( 'identityReady' => false, 'opensslAvailable' => function_exists( 'openssl_sign' ) ),
+			/* S1: clone/staging copy or un-reprovisioned domain move. While true, Source
+			 * purchases and wallet payments are refused locally; the Backend should flag
+			 * the installation and must not treat it as the original site. */
+			'cloneSuspected'        => class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::is_clone_suspected() : false,
+			'siteBinding'           => class_exists( 'Mobo_Core_Clone_Guard' ) ? Mobo_Core_Clone_Guard::health_payload() : array( 'cloneSuspected' => false, 'purchaseBlocked' => false, 'bound' => false ),
 			'wordpressVersion'      => get_bloginfo( 'version' ),
 			'phpVersion'            => PHP_VERSION,
 			'wooCommerceVersion'    => $this->get_woocommerce_version(),
@@ -197,7 +202,9 @@ class Mobo_Core_Health_Reporter {
 			'storageWriteProbeCheckedAt' => isset( $disk['write_probe']['checked_at'] ) ? $this->format_timestamp( absint( $disk['write_probe']['checked_at'] ) ) : null,
 			'storageWriteProbeBytes'     => isset( $disk['write_probe']['bytes'] ) ? absint( $disk['write_probe']['bytes'] ) : 0,
 
-			'cronMode'              => $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ),
+			'cronMode'              => class_exists( 'Mobo_Core_Cron_Runner' ) && method_exists( 'Mobo_Core_Cron_Runner', 'classify_cron_mode' )
+				? Mobo_Core_Cron_Runner::classify_cron_mode( $last_self_run, $last_cron_hit, absint( $cron_status['lastDriverRunAt'] ?? 0 ), (string) ( $cron_status['lastDriverSource'] ?? '' ), time() )
+				: ( $last_self_run > 0 ? 'self_runner' : ( $last_cron_hit > 0 ? 'real_cron' : 'not_detected' ) ),
 			'cronRunner'            => class_exists( 'Mobo_Core_Cron_Runner' ) ? Mobo_Core_Cron_Runner::get_health_status() : array(),
 			'networkDependencies'  => class_exists( 'Mobo_Core_Network_Resilience' ) ? Mobo_Core_Network_Resilience::get_status() : array(),
 			'portalHeartbeat'       => array(
@@ -220,7 +227,9 @@ class Mobo_Core_Health_Reporter {
 			'storeCurrencyChange'    => class_exists( 'Mobo_Core_Store_Currency_Guard' ) ? Mobo_Core_Store_Currency_Guard::health_payload() : array( 'pending' => false ),
 			'settingsSnapshot'       => Mobo_Core_Settings::get_portal_settings_metadata(),
 			'upgradeBarrier'        => class_exists( 'Mobo_Core_Upgrade_Coordinator' ) ? Mobo_Core_Upgrade_Coordinator::get_status() : array( 'active' => false, 'status' => 'unavailable' ),
-			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : $last_cron_hit ),
+			/* Heartbeat-only sites (no server cron, no self-runner) still run the
+			 * worker: report the latest driver run instead of "never". */
+			'lastCronHitAt'         => $this->format_timestamp( $last_self_run > 0 ? $last_self_run : ( $last_cron_hit > 0 ? $last_cron_hit : absint( $cron_status['lastDriverRunAt'] ?? 0 ) ) ),
 			'lastSyncSuccessAt'     => $this->format_timestamp( $last_sync_success ),
 			'lastWebhookSuccessAt'  => $this->format_timestamp( $this->get_last_webhook_success_timestamp( $cron_status ) ),
 

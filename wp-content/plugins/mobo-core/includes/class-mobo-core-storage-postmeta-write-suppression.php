@@ -168,13 +168,11 @@ final class Mobo_Core_Storage_Postmeta_Write_Suppression {
 			'mobo_sync_incomplete'            => array( 'sync_incomplete_meta', 'incomplete' ),
 		);
 		if ( 'product' === $type && isset( $product_map[ $meta_key ] ) ) {
-			$table = Mobo_Core_Storage_Schema::table_name( 'products' );
-			$spec  = $product_map[ $meta_key ];
-			$row   = $wpdb->get_row( $wpdb->prepare( "SELECT {$spec[0]},{$spec[0]}_present FROM {$table} WHERE connection_id=%d AND woo_product_id=%d LIMIT 1", self::connection_id(), $object_id ), ARRAY_A );
+			$spec = $product_map[ $meta_key ];
+			$row  = self::terminal_row( 'products', 'woo_product_id', $product_map, $object_id );
 		} elseif ( 'product_variation' === $type && isset( $variant_map[ $meta_key ] ) ) {
-			$table = Mobo_Core_Storage_Schema::table_name( 'variants' );
-			$spec  = $variant_map[ $meta_key ];
-			$row   = $wpdb->get_row( $wpdb->prepare( "SELECT {$spec[0]},{$spec[0]}_present FROM {$table} WHERE connection_id=%d AND woo_variation_id=%d LIMIT 1", self::connection_id(), $object_id ), ARRAY_A );
+			$spec = $variant_map[ $meta_key ];
+			$row  = self::terminal_row( 'variants', 'woo_variation_id', $variant_map, $object_id );
 		} else {
 			return array( 'status'=>'not-applicable', 'reason'=>'unsupported_object_or_key', 'present'=>false, 'value'=>'' );
 		}
@@ -185,6 +183,49 @@ final class Mobo_Core_Storage_Postmeta_Write_Suppression {
 		elseif ( 'incomplete' === $spec[1] ) { $value = 1 === absint( $value ) ? '1' : '0'; }
 		else { $value = (string) $value; }
 		return array( 'status'=>'hit', 'reason'=>'', 'present'=>$present, 'value'=>$value );
+	}
+
+	/** @var int Terminal row SELECTs issued in this request (tests/diagnostics). */
+	public static $terminal_row_queries = 0;
+
+	/**
+	 * All terminal scalar columns of one Product/Variant row in ONE query, cached in
+	 * the request-local row cache (a write to the table invalidates the bucket).
+	 * Runtime-30s: terminal_current() used to issue one SELECT per meta key per
+	 * object, which dominated the post-fence Sync Health scan.
+	 *
+	 * @param string $bucket    'products' | 'variants'.
+	 * @param string $id_column Woo id column.
+	 * @param array  $map       meta key => array( column, kind ).
+	 * @param int    $object_id Woo object id.
+	 * @return array|null Row, or null when missing / on error.
+	 */
+	private static function terminal_row( $bucket, $id_column, $map, $object_id ) {
+		global $wpdb;
+		$connection_id = self::connection_id();
+		$table         = Mobo_Core_Storage_Schema::table_name( $bucket );
+		$cache_key     = 'terminal:' . $connection_id . ':' . absint( $object_id );
+		$cacheable     = class_exists( 'Mobo_Core_Storage_Row_Cache' );
+		if ( $cacheable ) {
+			$hit    = false;
+			$cached = Mobo_Core_Storage_Row_Cache::get( $bucket, $cache_key, $hit );
+			if ( $hit ) {
+				return is_array( $cached ) ? $cached : null;
+			}
+		}
+		$columns = array();
+		foreach ( $map as $spec ) {
+			$columns[ $spec[0] ] = $spec[0] . ',' . $spec[0] . '_present';
+		}
+		$wpdb->last_error = '';
+		self::$terminal_row_queries++;
+		$row = $wpdb->get_row( $wpdb->prepare( 'SELECT ' . implode( ',', $columns ) . " FROM {$table} WHERE connection_id=%d AND {$id_column}=%d LIMIT 1", $connection_id, absint( $object_id ) ), ARRAY_A );
+		$row = is_array( $row ) ? $row : null;
+		if ( $cacheable && '' === trim( (string) $wpdb->last_error ) ) {
+			Mobo_Core_Storage_Row_Cache::register_table( $bucket, $table );
+			Mobo_Core_Storage_Row_Cache::set( $bucket, $cache_key, $row, absint( $object_id ) );
+		}
+		return $row;
 	}
 
 	/**
