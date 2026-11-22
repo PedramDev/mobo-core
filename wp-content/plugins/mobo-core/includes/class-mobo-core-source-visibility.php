@@ -49,6 +49,14 @@ final class Mobo_Core_Source_Visibility {
 	 * reuses the same storefront guards and persisted out-of-stock overlay. */
 	const META_QUARANTINE_BLOCKED = '_mobo_quarantine_sale_blocked';
 
+	/* R1: a product created from a ProductUpdated payload whose Variants arrive in
+	 * separate UpdateVariant pages starts as a WC_Product_Simple. Until its Variant
+	 * topology is applied it must never be purchasable as that Simple parent (with the
+	 * lowest Variant price and the summed stock). Set only on products this plugin
+	 * creates in that state; released by release_awaiting_variants(). Existing
+	 * products are never flagged. */
+	const META_AWAITING_VARIANTS = '_mobo_awaiting_variants';
+
 	/** @var bool */
 	private static $initialized = false;
 
@@ -365,6 +373,79 @@ final class Mobo_Core_Source_Visibility {
 	}
 
 	/**
+	 * R1: whether a product being created must start blocked because its Variants
+	 * arrive separately. Pure decision (unit tested): only a NEW Simple object whose
+	 * payload carries variation attributes (= the Source topology may be variable).
+	 *
+	 * @param bool $is_new_product      The product is being created now.
+	 * @param bool $is_simple_object    The Woo object is a (non-variable) Simple product.
+	 * @param bool $payload_can_have_variants The payload proves variation attributes.
+	 * @return bool
+	 */
+	public static function should_await_variants( $is_new_product, $is_simple_object, $payload_can_have_variants ) {
+		return (bool) $is_new_product && (bool) $is_simple_object && (bool) $payload_can_have_variants;
+	}
+
+	/**
+	 * R1: flag an in-memory product (not saved yet) as awaiting its Variant topology.
+	 * Stock written afterwards through the normal Stock Policy path is persisted out
+	 * of stock and remembered as the natural Source state (see is_blocked()).
+	 *
+	 * @param WC_Product $product Product being created.
+	 * @return bool
+	 */
+	public static function mark_awaiting_variants( $product ) {
+		if ( ! is_object( $product ) || ! method_exists( $product, 'update_meta_data' ) ) {
+			return false;
+		}
+		$product->update_meta_data( self::META_AWAITING_VARIANTS, '1' );
+		return true;
+	}
+
+	/**
+	 * R1: release the "awaiting Variants" block once the Variant topology of the
+	 * product is applied (Simple Variant mapped, authoritative empty topology, or the
+	 * last authoritative Variant page of a Variable product).
+	 *
+	 * The remembered natural stock is restored only when the product now has a
+	 * purchasable topology (Variable with children, or a mapped Simple Variant whose
+	 * stock was written through the Stock Policy path). Otherwise (e.g. the Source
+	 * has no purchasable Variant) the overlay bookkeeping is dropped and the current
+	 * out-of-stock state is kept: a stale creation-time stock is never restored.
+	 *
+	 * @param int $post_id Product ID.
+	 * @return bool Whether a flag was released.
+	 */
+	public static function release_awaiting_variants( $post_id ) {
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || '1' !== (string) get_post_meta( $post_id, self::META_AWAITING_VARIANTS, true ) ) {
+			return false;
+		}
+		delete_post_meta( $post_id, self::META_AWAITING_VARIANTS );
+		$product = function_exists( 'wc_get_product' ) ? wc_get_product( $post_id ) : null;
+		if ( ! $product instanceof WC_Product ) {
+			return true;
+		}
+		/* The object may have been loaded with the flag still in its meta cache. */
+		if ( '' !== (string) $product->get_meta( self::META_AWAITING_VARIANTS, true, 'edit' ) ) {
+			$product->delete_meta_data( self::META_AWAITING_VARIANTS );
+		}
+		$variable    = method_exists( $product, 'is_type' ) && $product->is_type( 'variable' );
+		$purchasable = $variable
+			? count( (array) ( method_exists( $product, 'get_children' ) ? $product->get_children() : array() ) ) > 0
+			: '1' === (string) get_post_meta( $post_id, '_mobo_simple_variant_mapped', true );
+		if ( $purchasable && ! self::is_blocked( $product ) ) {
+			$product->save();
+			self::sync_persisted_stock( $post_id, true );
+		} else {
+			self::forget_natural_stock( $product );
+			$product->save();
+		}
+		self::log( 'info', 'R1: product left the awaiting-Variants state.', array( 'productId' => $post_id, 'restored' => $purchasable ) );
+		return true;
+	}
+
+	/**
 	 * @param WC_Product $product Product.
 	 * @return bool
 	 */
@@ -520,10 +601,14 @@ final class Mobo_Core_Source_Visibility {
 		}
 		$id = absint( $product->get_id() );
 		if ( $id <= 0 ) {
-			return false;
+			/* R1: a product still being created carries its awaiting-Variants flag in
+			 * memory only; its first stock write must already be the blocked overlay. */
+			return method_exists( $product, 'get_meta' )
+				&& '1' === (string) $product->get_meta( self::META_AWAITING_VARIANTS, true, 'edit' );
 		}
 		if ( '1' === (string) $product->get_meta( self::META_HIDDEN, true, 'edit' ) || '1' === (string) $product->get_meta( self::META_INACTIVE, true, 'edit' )
-			|| '1' === (string) $product->get_meta( self::META_QUARANTINE_BLOCKED, true, 'edit' ) ) {
+			|| '1' === (string) $product->get_meta( self::META_QUARANTINE_BLOCKED, true, 'edit' )
+			|| '1' === (string) $product->get_meta( self::META_AWAITING_VARIANTS, true, 'edit' ) ) {
 			return true;
 		}
 		$parent_id = method_exists( $product, 'get_parent_id' ) ? absint( $product->get_parent_id( 'edit' ) ) : 0;
