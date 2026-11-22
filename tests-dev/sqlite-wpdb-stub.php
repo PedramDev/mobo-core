@@ -65,6 +65,7 @@ final class Sqlite_Test_WPDB {
 	private function translate( $sql ) {
 		$sql = preg_replace( '/\bIF\s*\(/i', 'mobo_if(', $sql );
 		$sql = preg_replace( '/\bBINARY\s+/i', '', $sql );
+		$sql = preg_replace( '/^\s*INSERT\s+IGNORE\s+INTO\b/i', 'INSERT OR IGNORE INTO', $sql );
 		if ( preg_match( '/^\s*(UPDATE|DELETE)\b/i', $sql ) ) {
 			$sql = preg_replace( '/\s+ORDER BY\s+[^)]*?(\s+LIMIT\s+\d+)?\s*$/i', '', $sql );
 			$sql = preg_replace( '/\s+LIMIT\s+\d+\s*$/i', '', $sql );
